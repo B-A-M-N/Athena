@@ -1,0 +1,151 @@
+import json
+
+from athena.models.providers.openai_compat import OpenAICompatProvider
+from athena.protocol.messages import (
+    CapabilityResultBlock,
+    Message,
+    Role,
+    TextBlock,
+)
+from athena.protocol.models import ModelEventType, ModelRequest
+
+
+class _FakeSSEResponse:
+    """Fake httpx streaming response sur && aiter_lines().."""
+
+    def __init__(self, lines, status_code=200, content_type="text/event-stream"):
+        self.status_code = status_code
+        self.headers = {"content-type": content_type}
+        self._lines = lines
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+class _StreamCtx:
+    """Patches ``client.stream`` (sync method → async ctx manager)."""
+
+    def __init__(self, fake_resp):
+        self._fake = fake_resp
+
+    def __call__(self, *args, **kwargs):
+        return _AsyncCtxManager(self._fake)
+
+
+class _AsyncCtxManager:
+    def __init__(self, fake):
+        self._fake = fake
+
+    async def __aenter__(self):
+        return self._fake
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _provider():
+    return OpenAICompatProvider(
+        base_url="https://fake.invalid",
+        api_key="test-key",
+        model="gpt-test",
+        provider="fake-openai",
+    )
+
+
+def _user_request(text: str = "hello") -> ModelRequest:
+    return ModelRequest(
+        messages=(
+            Message(
+                id="m1",
+                role=Role.USER,
+                blocks=(TextBlock(type="text", text=text),),
+                created_at=None,
+                provenance=None,
+            ),
+        ),
+        model="gpt-test",
+        provider="fake-openai",
+        request_id="req-1",
+        system="sys prompt",
+    )
+
+
+async def test_stream_events_delta_and_done_with_usage(monkeypatch):
+    provider = _provider()
+    sse = [
+        'data: ' + json.dumps({"choices": [{"delta": {"content": "Hello"}}]}),
+        'data: ' + json.dumps({"usage": {"prompt_tokens": 10, "completion_tokens": 3}}),
+        "data: [DONE]",
+    ]
+    fake_resp = _FakeSSEResponse(sse)
+    monkeypatch.setattr(provider._client, "stream", _StreamCtx(fake_resp))
+
+    events = [e async for e in provider.complete(_user_request())]
+
+    text_deltas = [
+        e for e in events
+        if e.type == ModelEventType.DELTA and (e.delta.text or "") == "Hello"
+    ]
+    done = next(e for e in events if e.type == ModelEventType.DONE)
+    assert len(text_deltas) == 1
+    assert done.response is not None
+    assert done.response.usage is not None
+    assert done.response.usage.input_tokens == 10
+    assert done.response.usage.output_tokens == 3
+
+
+def test_translate_assistant_message_with_capability_call():
+    from athena.protocol.messages import CapabilityCallBlock
+
+    provider = _provider()
+    msg = Message(
+        id="m-a",
+        role=Role.ASSISTANT,
+        blocks=(
+            CapabilityCallBlock(
+                type="capability_call",
+                call_id="call-1",
+                capability_id="files.read",
+                arguments={"path": "/tmp/x"},
+            ),
+        ),
+        created_at=None,
+        provenance=None,
+    )
+    translated = provider._translate_message(msg)
+
+    assert translated["role"] == "assistant"
+    assert "tool_calls" in translated
+    assert translated["tool_calls"][0]["function"]["name"] == "files.read"
+    assert json.loads(translated["tool_calls"][0]["function"]["arguments"]) == {"path": "/tmp/x"}
+
+
+def test_translate_capability_result_to_tool_message():
+    provider = _provider()
+    msg = Message(
+        id="m-r",
+        role=Role.CAPABILITY,
+        blocks=(
+            CapabilityResultBlock(
+                type="capability_result",
+                call_id="call-1",
+                capability_id="files.read",
+                ok=True,
+                output="file contents",
+            ),
+        ),
+        created_at=None,
+        provenance=None,
+    )
+    translated = provider._translate_message(msg)
+
+    assert isinstance(translated, list)
+    assert translated[0]["role"] == "tool"
+    assert translated[0]["tool_call_id"] == "call-1"

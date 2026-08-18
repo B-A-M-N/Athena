@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+.tox/
+*.cover
+nosetests.xml
+junit.xml
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project-specific
+opencode.json
+.crush/
+a-shm
+a-wal
+d-shm
+d-wal
+f-shm
+f-wal
+*.db
+
+# Secrets
+.env
+.env.*
+!.env.example

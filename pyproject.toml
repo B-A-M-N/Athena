@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "athena-agent"
+version = "0.1.0"
+description = "Compact, local-first autonomous agent runtime with durable knowledge, structured delegation, universal execution, open capability protocols, and a single authoritative reasoning loop."
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Athena Contributors" }]
+readme = "README.md"
+dependencies = [
+    "httpx>=0.27",
+    "aiosqlite>=0.20",
+]
+
+[project.optional-dependencies]
+api = ["uvicorn>=0.30", "starlette>=0.38"]
+mcp = ["mcp>=1.0"]
+anthropic = ["anthropic>=0.39"]
+container = ["docker>=7.0"]
+cli = ["click>=8.1"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+athena = "athena.cli.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
