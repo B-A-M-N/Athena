@@ -94,6 +94,23 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
         )
         assert cli_sessions.returncode == 0, cli_sessions.stderr
         assert "no sessions" in cli_sessions.stdout.lower()
+        cli_task = subprocess.run(
+            [
+                str(cli),
+                "--db", str(tmp_path / f"{artifact.stem}.cli-task.db"),
+                "--workspace", str(cli_workspace),
+                "run", "2+2",
+            ],
+            cwd=tmp_path,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert cli_task.returncode == 0, cli_task.stderr
+        assert "4" in cli_task.stdout
+        assert "-> complete" in cli_task.stdout.lower()
 
         artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
         try:
