@@ -1,5 +1,6 @@
 """Tests for acceptance verification (P9)."""
 from __future__ import annotations
+import pytest
 
 import os
 import tempfile
@@ -33,12 +34,16 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.mark.athena_claim("BHV-129")
+@pytest.mark.athena_evidence("test", "invariant")
 def test_manual_verifier_always_false():
     v = _ManualVerifier()
     spec = VerificationSpec(type=VerificationType.MANUAL)
     assert _run(v.verify_one(_task(), spec)) is False
 
 
+@pytest.mark.athena_claim("BHV-129")
+@pytest.mark.athena_evidence("test", "invariant")
 def test_file_verifier_exists():
     v = _FileVerifier()
     with tempfile.NamedTemporaryFile(delete=False) as f:

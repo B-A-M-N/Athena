@@ -5,6 +5,7 @@ real in-memory stores -> background worker / scheduler) against a scripted fake
 model. Every test uses a fresh :func:`AthenaService.in_memory` instance.
 """
 from __future__ import annotations
+import pytest
 
 
 from athena.protocol.tasks import (
@@ -21,6 +22,8 @@ async def _status(svc, task_id) -> str | None:
     return await svc.get_task_status(task_id)
 
 
+@pytest.mark.athena_claim("BHV-024", "BHV-079")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_full_loop_returns_complete_with_answer(make_service):
     """start -> submit(wait=True) -> COMPLETE; the model's "4" is streamed."""
     svc = await make_service()
@@ -37,6 +40,8 @@ async def test_full_loop_returns_complete_with_answer(make_service):
     assert any("4" in (e.payload or {}).get("text", "") for e in deltas)
 
 
+@pytest.mark.athena_claim("BHV-016")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_non_blocking_submit_runs_via_worker(make_service):
     """Submit with wait=False; the background worker drives it to COMPLETE."""
     svc = await make_service()
@@ -50,6 +55,8 @@ async def test_non_blocking_submit_runs_via_worker(make_service):
     assert await svc.get_task_status(task.id) == TaskStatus.COMPLETE.value
 
 
+@pytest.mark.athena_claim("BHV-076", "BHV-078")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_cancel_park_result_is_cancelled(make_service):
     """A task parked on approval can be cancelled -> CANCELLED, not FAILED."""
     svc = await make_service(scripts=[
@@ -73,6 +80,8 @@ async def test_cancel_park_result_is_cancelled(make_service):
     assert (final.metadata or {}).get("status") == TaskStatus.CANCELLED.value
 
 
+@pytest.mark.athena_claim("BHV-134")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_budget_exhaustion_yields_partial_not_failed(make_service):
     """A tiny iteration budget ends PARTIAL, never FAILED, after real work."""
     svc = await make_service(scripts=[
@@ -100,6 +109,8 @@ async def test_budget_exhaustion_yields_partial_not_failed(make_service):
     assert result.status == TaskStatus.PARTIAL
 
 
+@pytest.mark.athena_claim("BHV-116")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_event_streaming_yields_lifecycle_events(make_service):
     """stream_events over a task yields TaskCreated + iteration + completion."""
     svc = await make_service()

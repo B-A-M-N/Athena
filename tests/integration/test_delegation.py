@@ -6,11 +6,14 @@ parks for approval the same way any effectful call does. After the grant the
 child is created with a FRESH session and runs through the SAME worker/kernel.
 """
 from __future__ import annotations
+import pytest
 
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskStatus
 from athena.protocol.ids import new_id
 
 
+@pytest.mark.athena_claim("BHV-087")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_parent_delegates_child_with_isolated_session(make_service):
     svc = await make_service(scripts=[
         # After any ok capability result: stop the (parent) loop.

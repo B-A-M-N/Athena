@@ -1,5 +1,6 @@
 """Skill selection/injection through the real SkillLifecycle + ContextCompiler."""
 from __future__ import annotations
+import pytest
 
 from athena.protocol.ids import new_id
 from athena.protocol.messages import Provenance, SourceType, TrustClass
@@ -37,6 +38,8 @@ async def _compile_objective(svc, objective: str) -> str:
     return "\n".join(m.text() for m in compiled.messages)
 
 
+@pytest.mark.athena_claim("BHV-105")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_skill_injected_when_trigger_in_objective(make_service):
     svc = await make_service()
     await _install_summarizer_skill(svc)

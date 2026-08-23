@@ -9,6 +9,7 @@ workspace.
 """
 
 from __future__ import annotations
+import pytest
 
 import os
 
@@ -39,6 +40,8 @@ def _write_req(ws_root: str, path: str, task="t1") -> CapabilityRequest:
     return req
 
 
+@pytest.mark.athena_claim("BHV-145")
+@pytest.mark.athena_evidence("test", "security")
 async def test_path_traversal_write_is_denied(tmp_path):
     fs = _fs(str(tmp_path))
     result = await fs.invoke(_write_req(str(tmp_path), "../../../etc/passwd"))
@@ -46,6 +49,8 @@ async def test_path_traversal_write_is_denied(tmp_path):
     assert "escape" in result.error.lower()
 
 
+@pytest.mark.athena_claim("BHV-145")
+@pytest.mark.athena_evidence("test", "security")
 async def test_absolute_path_outside_workspace_is_denied(tmp_path):
     fs = _fs(str(tmp_path))
     result = await fs.invoke(_write_req(str(tmp_path), "/tmp/athena_eval_evil"))
@@ -53,6 +58,8 @@ async def test_absolute_path_outside_workspace_is_denied(tmp_path):
     assert "escape" in result.error.lower() or "outside" in result.error.lower()
 
 
+@pytest.mark.athena_claim("BHV-145")
+@pytest.mark.athena_evidence("test", "security")
 async def test_symlink_escape_write_is_denied(tmp_path):
     outside = tmp_path.parent / "outside_secret.txt"
     outside.write_text("secret")
@@ -67,6 +74,8 @@ async def test_symlink_escape_write_is_denied(tmp_path):
     assert outside.read_text() == "secret"
 
 
+@pytest.mark.athena_claim("BHV-145")
+@pytest.mark.athena_evidence("test", "security")
 async def test_directory_traversal_via_dotdot_denied(tmp_path):
     sub = tmp_path / "sub"
     sub.mkdir()
@@ -76,17 +85,23 @@ async def test_directory_traversal_via_dotdot_denied(tmp_path):
     assert not (tmp_path / "escape.txt").exists()
 
 
+@pytest.mark.athena_claim("BHV-149")
+@pytest.mark.athena_evidence("test", "security")
 def test_execute_relative_cwd_escape_is_rejected(tmp_path):
     cap = ExecuteCapability(None, workspace=_ws(str(tmp_path)))
     # "../../.." resolves above the workspace -> must not escape.
     assert cap._resolve_cwd(_ws(str(tmp_path)), "../../../") is None
 
 
+@pytest.mark.athena_claim("BHV-149")
+@pytest.mark.athena_evidence("test", "security")
 def test_execute_absolute_cwd_outside_workspace_is_rejected(tmp_path):
     cap = ExecuteCapability(None, workspace=_ws(str(tmp_path)))
     assert cap._resolve_cwd(_ws(str(tmp_path)), "/etc") is None
 
 
+@pytest.mark.athena_claim("BHV-149")
+@pytest.mark.athena_evidence("test", "security")
 def test_execute_cwd_inside_workspace_is_allowed(tmp_path):
     cap = ExecuteCapability(None, workspace=_ws(str(tmp_path)))
     inside = str(tmp_path / "sub")

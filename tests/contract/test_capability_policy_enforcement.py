@@ -7,6 +7,8 @@ capability NEVER reaches its executor.
 
 from __future__ import annotations
 
+import pytest
+
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.registry import CapabilityRegistry
 from athena.policy.engine import PolicyDecision, PolicyVerdict
@@ -18,7 +20,6 @@ from athena.protocol.capabilities import (
     EffectClass,
 )
 from athena.protocol.tasks import CapabilityPolicy, WorkspaceSpec
-
 
 class _CountingExecutor:
     """Executor that records whether it was invoked (spy)."""
@@ -43,7 +44,6 @@ class _CountingExecutor:
         object.__setattr__(result, "call_id", getattr(request, "call_id", ""))
         return result
 
-
 def _fs_request(task_id="task-1") -> CapabilityRequest:
     return CapabilityRequest(
         capability_id="fs",
@@ -51,17 +51,16 @@ def _fs_request(task_id="task-1") -> CapabilityRequest:
         task_id=task_id,
     )
 
-
 def _workspace() -> WorkspaceSpec:
     return WorkspaceSpec(id="ws", root="/tmp/ws")
-
 
 def _dispatcher(engine, executor):
     reg = CapabilityRegistry()
     reg.register(executor)
     return CapabilityDispatcher(reg, engine)
 
-
+@pytest.mark.athena_claim("BHV-004", "BHV-043")
+@pytest.mark.athena_evidence("test", "invariant")
 class TestPolicyEnforcement:
     async def test_task_deny_never_calls_executor(self):
         executor = _CountingExecutor()
@@ -109,13 +108,11 @@ class TestPolicyEnforcement:
         assert result.status == CapabilityResultStatus.FAILED
         assert executor.invoked == 0
 
-
 class _AllowEngine:
     approvals = None
 
     def evaluate(self, request, *, autonomy=None):
         return PolicyDecision(PolicyVerdict.ALLOW, "allow", "stub.allow", ())
-
 
 class _DenyEngine:
     approvals = None

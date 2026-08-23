@@ -8,6 +8,8 @@ The offline profile rejects remote model providers.
 
 from __future__ import annotations
 
+import pytest
+
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.registry import CapabilityRegistry
 from athena.policy.engine import PolicyEngine
@@ -54,6 +56,8 @@ class _RecordingExecutor:
         )
 
 
+@pytest.mark.athena_claim("INV-004")
+@pytest.mark.athena_evidence("security", "invariant")
 async def test_task_deny_is_hard_ceiling_even_when_global_allows():
     """execute allowed globally (coding) but task deny -> DENY, no effect."""
     reg = CapabilityRegistry()
@@ -76,6 +80,8 @@ async def test_task_deny_is_hard_ceiling_even_when_global_allows():
     assert exec_.invocations == 0
 
 
+@pytest.mark.athena_claim("INV-004")
+@pytest.mark.athena_evidence("security")
 async def test_execute_outside_workspace_without_grant_is_denied():
     """Coding profile allows execute generally, but an escape is still denied."""
     reg = CapabilityRegistry()
@@ -99,6 +105,8 @@ async def test_execute_outside_workspace_without_grant_is_denied():
     assert exec_.invocations == 0
 
 
+@pytest.mark.athena_claim("BHV-008")
+@pytest.mark.athena_evidence("test", "security")
 def test_autonomous_grant_allows_build_cmd_outside_workspace():
     """INV-008: autonomous profile grants build/test commands outside ws."""
     engine = PolicyEngine(profile=AutonomyLevel.AUTONOMOUS)
@@ -116,6 +124,8 @@ def test_autonomous_grant_allows_build_cmd_outside_workspace():
     assert decision.decision == PV.ALLOW
 
 
+@pytest.mark.athena_claim("BHV-038")
+@pytest.mark.athena_evidence("test", "security")
 def test_offline_profile_rejects_remote_model_inference():
     """BHV-038: offline profile denies remote model provider use."""
     engine = PolicyEngine(profile=AutonomyLevel.OFFLINE)

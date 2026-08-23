@@ -36,6 +36,8 @@ def _make_request(
     )
 
 
+@pytest.mark.athena_claim("BHV-045")
+@pytest.mark.athena_evidence("test", "invariant")
 def test_call_grant_consumed_by_same_call():
     """The original call can use the grant once."""
     mgr = ApprovalManager()
@@ -60,6 +62,8 @@ def test_call_grant_consumed_by_same_call():
     assert grant2 is None, "CALL grant should be consumed after first use"
 
 
+@pytest.mark.athena_claim("BHV-047")
+@pytest.mark.athena_evidence("test", "security")
 def test_call_grant_not_consumable_by_different_task():
     """Task B cannot consume Task A's CALL grant even with identical args."""
     mgr = ApprovalManager()
@@ -82,6 +86,8 @@ def test_call_grant_not_consumable_by_different_task():
     assert grant is None, "different task must not consume another's CALL grant"
 
 
+@pytest.mark.athena_claim("BHV-047")
+@pytest.mark.athena_evidence("test", "security")
 def test_call_grant_not_consumable_by_different_call_id():
     """Same task, different call_id cannot consume the grant."""
     mgr = ApprovalManager()
@@ -103,6 +109,8 @@ def test_call_grant_not_consumable_by_different_call_id():
     assert grant is None, "different call_id must not consume the grant"
 
 
+@pytest.mark.athena_claim("BHV-047")
+@pytest.mark.athena_evidence("test", "security")
 def test_call_grant_rejected_on_argument_substitution():
     """Even with same call_id+task_id, different args must fail."""
     mgr = ApprovalManager()
@@ -127,6 +135,8 @@ def test_call_grant_rejected_on_argument_substitution():
     assert grant is None, "modified args must not match the grant"
 
 
+@pytest.mark.athena_claim("BHV-046")
+@pytest.mark.athena_evidence("test", "invariant")
 def test_task_scope_grant_still_works_without_call_id():
     """TASK-scoped grants do not require call_id matching."""
     mgr = ApprovalManager()

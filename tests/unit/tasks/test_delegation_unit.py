@@ -48,6 +48,8 @@ async def _spawn(delegation, parent_id, objective="child work"):
     )
 
 
+@pytest.mark.athena_claim("BHV-087", "BHV-092")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_spawn_child_sets_parent_task_id(env):
     manager, delegation, sessions = env
     parent = await _create(manager, sessions, "parent")
@@ -57,6 +59,8 @@ async def test_spawn_child_sets_parent_task_id(env):
     assert child.objective == "child work"
 
 
+@pytest.mark.athena_claim("BHV-091")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_max_child_depth_blocks_grandchildren(env):
     manager, delegation, sessions = env
     root = await _create(
@@ -72,6 +76,8 @@ async def test_max_child_depth_blocks_grandchildren(env):
         await _spawn(delegation, child.id)
 
 
+@pytest.mark.athena_claim("BHV-084", "BHV-085")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_child_budget_derived_from_parent(env):
     manager, delegation, sessions = env
     parent = await _create(

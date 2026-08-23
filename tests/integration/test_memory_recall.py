@@ -1,6 +1,7 @@
 """Memory scope isolation across sessions, through the real MemoryStore +
 ContextCompiler (the same path the kernel uses to build context)."""
 from __future__ import annotations
+import pytest
 
 from athena.protocol.ids import new_id
 from athena.protocol.memory import MemoryKind, MemoryRecord, MemoryScope
@@ -26,6 +27,8 @@ async def _seed_session_memory(svc, session_id: str, content: str) -> None:
     ))
 
 
+@pytest.mark.athena_claim("BHV-099")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_memory_recalled_in_session_but_not_other(make_service):
     svc = await make_service()
     session_a = new_id("session")

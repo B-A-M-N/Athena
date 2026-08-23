@@ -5,6 +5,7 @@ Under the default SUPERVISED profile an ``execute`` capability call is an ASK
 the approval grants an exact scoped grant and resumes the task.
 """
 from __future__ import annotations
+import pytest
 
 from athena.protocol.tasks import AgentRequest, TaskStatus
 from athena.protocol.ids import new_id
@@ -26,6 +27,8 @@ async def _request_execution(svc, prompt: str):
     )
 
 
+@pytest.mark.athena_claim("BHV-044")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_approve_granted_resumes_and_completes(make_service):
     svc = await make_service(scripts=[
         {"match": {"capability_result_ok": True},
@@ -50,6 +53,8 @@ async def test_approve_granted_resumes_and_completes(make_service):
     assert any(e.type == "CapabilityCompleted" for e in events)
 
 
+@pytest.mark.athena_claim("BHV-043")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_approve_denied_has_no_effect(make_service):
     svc = await make_service(scripts=[
         {"match": {"capability_result_ok": False},

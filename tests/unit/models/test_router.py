@@ -1,4 +1,5 @@
 from athena.models.fake import FakeModelProvider
+import pytest
 from athena.models.registry import ProviderRegistry
 from athena.models.router import CAP_TOOLS, ModelRequirements, ModelRouter
 from athena.protocol.models import PrivacyClass
@@ -21,6 +22,8 @@ def _fake(name: str, *, tool_calling=False, privacy=None):
     return FakeModelProvider(**kw)
 
 
+@pytest.mark.athena_claim("BHV-035")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_selects_fake_provider_when_tools_required():
     """BHV-034: provider declaring tool_calling is selected when tools required."""
     tools = _fake("tools", tool_calling=True)
@@ -34,6 +37,8 @@ async def test_selects_fake_provider_when_tools_required():
     assert sel.info.tool_calling is True
 
 
+@pytest.mark.athena_claim("BHV-035", "BHV-037")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_offline_policy_selects_only_local_models():
     """BHV-038: offline policy gates to LOCAL privacy only."""
     local = _fake("local", privacy=PrivacyClass.LOCAL)
@@ -48,6 +53,8 @@ async def test_offline_policy_selects_only_local_models():
     assert sel.provider == "local"
 
 
+@pytest.mark.athena_claim("BHV-035")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_router_has_no_provider_specific_branches():
     """INV-006: the router performs no provider-specific branching."""
     import inspect
@@ -66,6 +73,8 @@ async def test_router_has_no_provider_specific_branches():
         assert token.lower() not in src.lower()
 
 
+@pytest.mark.athena_claim("BHV-037")
+@pytest.mark.athena_evidence("test", "security")
 async def test_fallback_after_first_choice_fails_respects_privacy():
     """BHV-037: when the first choice fails, re-select respects locality."""
     local_a = _fake("local-a", privacy=PrivacyClass.LOCAL)

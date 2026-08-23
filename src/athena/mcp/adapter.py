@@ -55,7 +55,20 @@ class MCPToolExecutor:
         self._client = client
         self._tool_name = tool_name
 
-    async def invoke(self, request: CapabilityRequest) -> CapabilityResult:
+    async def invoke(
+        self,
+        request: CapabilityRequest,
+        *,
+        output_accumulator: Any = None,
+        context: Any = None,
+    ) -> CapabilityResult:
+        """Invoke the remote tool through the dispatcher executor protocol.
+
+        The dispatcher supplies the same optional streaming and invocation
+        context arguments to every capability executor. MCP tools do not use
+        either value, but accepting them keeps the MCP executor on the
+        canonical capability path.
+        """
         if not self._client.connected:
             return _fail(request, "MCP server is not connected")
         result = await self._client.call_tool(

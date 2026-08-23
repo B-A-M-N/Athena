@@ -36,6 +36,8 @@ async def test_decision_constructs_terminal_and_nonterminal():
     assert non.terminal is False
 
 
+@pytest.mark.athena_claim("BHV-005")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_final_text_with_no_criteria_is_terminal(evaluator):
     task = TaskSpec(id="t1", objective="hello")
     block = TextBlock(type="text", text="hi")
@@ -47,6 +49,8 @@ async def test_final_text_with_no_criteria_is_terminal(evaluator):
     assert decision.reason == "objective satisfied"
 
 
+@pytest.mark.athena_claim("BHV-005")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_capability_calls_are_not_terminal(evaluator):
     task = TaskSpec(id="t2", objective="do work")
     call = CapabilityCallBlock(capability_id="tools.execute", arguments={})
@@ -55,6 +59,8 @@ async def test_capability_calls_are_not_terminal(evaluator):
     assert decision.reason == "capability_calls_present"
 
 
+@pytest.mark.athena_claim("BHV-005", "BHV-006")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_truth_outranks_success_unverified_criteria(evaluator):
     """Claimed completion with unverified required criteria must be PARTIAL,
     never COMPLETE (BHV-005 / BHV-006)."""

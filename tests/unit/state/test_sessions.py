@@ -30,6 +30,17 @@ async def test_create_and_get_session(db):
     assert await repo.get("nope") is None
 
 
+async def test_list_all_sessions(db):
+    repo = SessionRepository(db)
+    await repo.create("sess_1", metadata={"foo": "bar"})
+    await repo.create("sess_2")
+
+    rows = await repo.list_all()
+
+    assert [row["id"] for row in rows] == ["sess_1", "sess_2"]
+    assert rows[0]["metadata"] == {"foo": "bar"}
+
+
 async def test_task_transition_legal(repo, db):
     store = TaskStore(db)
     await store.insert_task("task_1", "sess_1", None, "do a thing")
@@ -47,5 +58,4 @@ async def test_task_transition_illegal_rejected(repo, db):
         await store.transition("task_2", TaskStatus.RUNNING)
     row = await store.get("task_2")
     assert row["status"] == TaskStatus.COMPLETE.value
-
 

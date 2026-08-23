@@ -5,6 +5,7 @@ TaskSpec JSON, or model-visible credential surfaces (BHV-072, B-071 opacity).
 """
 
 from __future__ import annotations
+import pytest
 
 import json
 
@@ -37,6 +38,8 @@ def _recording_events() -> list:
     return events, sink
 
 
+@pytest.mark.athena_claim("BHV-072", "BHV-071")
+@pytest.mark.athena_evidence("test", "security")
 async def test_capability_event_payload_redacts_secret(tmp_path):
     """A secret-plaintext argument is REDACTED, not the raw value."""
     events, sink = _recording_events()
@@ -74,6 +77,8 @@ async def test_capability_event_payload_redacts_secret(tmp_path):
     assert redacted_found
 
 
+@pytest.mark.athena_claim("BHV-072")
+@pytest.mark.athena_evidence("test", "security")
 def test_event_make_payload_redacts_through_helper():
     """make_event stores whatever the caller passes; dispatcher scrubs args."""
     from athena.capabilities.dispatcher import _redact_event_payload
@@ -85,6 +90,8 @@ def test_event_make_payload_redacts_through_helper():
     assert payload["arguments"]["content"] == "[REDACTED]"
 
 
+@pytest.mark.athena_claim("BHV-071")
+@pytest.mark.athena_evidence("test", "security")
 def test_direct_secret_write_payload_never_leaks(tmp_path):
     """Credential-opaque describe/available do not expose the raw value."""
     secret_dir = tmp_path / "secrets"
@@ -99,6 +106,8 @@ def test_direct_secret_write_payload_never_leaks(tmp_path):
     assert mgr.resolve("api_key", owner_task="system") == _SECRET
 
 
+@pytest.mark.athena_claim("BHV-072")
+@pytest.mark.athena_evidence("test", "security")
 def test_resolved_secret_not_in_task_serialization(tmp_path):
     """The raw key must not appear in TaskSpec JSON or message payloads."""
     secret_dir = tmp_path / "secrets"

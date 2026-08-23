@@ -1,4 +1,5 @@
 
+import pytest
 from athena.context.compiler import ContextCompiler
 from athena.protocol.capabilities import CapabilityDescriptor
 from athena.protocol.messages import Role
@@ -17,6 +18,8 @@ class _CapRegistry:
         return list(self._descriptors)
 
 
+@pytest.mark.athena_claim("BHV-029")
+@pytest.mark.athena_evidence("test")
 async def test_compile_minimal_context():
     """Compile a minimal system + user objective context."""
     compiler = ContextCompiler()
@@ -32,6 +35,8 @@ async def test_compile_minimal_context():
     assert ctx.requirements is not None
 
 
+@pytest.mark.athena_claim("BHV-029")
+@pytest.mark.athena_evidence("test")
 async def test_to_request_includes_capabilities_when_registered():
     desc = CapabilityDescriptor(id="files.read", description="read", input_schema={})
     registry = _CapRegistry([desc])
@@ -44,6 +49,8 @@ async def test_to_request_includes_capabilities_when_registered():
     assert req.messages == tuple(ctx.messages)
 
 
+@pytest.mark.athena_claim("BHV-029")
+@pytest.mark.athena_evidence("test")
 async def test_bounded_context_within_token_budget():
     """BHV-029: compiled context stays within a small token budget."""
     compiler = ContextCompiler(

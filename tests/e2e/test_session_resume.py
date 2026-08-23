@@ -5,6 +5,7 @@ must see the prior transcript — the context compiler includes the session's
 history, so the resumed task models over the earlier exchange.
 """
 from __future__ import annotations
+import pytest
 
 
 from athena.protocol.tasks import (
@@ -37,6 +38,8 @@ async def _wait_terminal(svc, task_id, target=TaskStatus.COMPLETE.value, tries=3
     return await svc.get_task_status(task_id)
 
 
+@pytest.mark.athena_claim("BHV-026")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_resume_session_sees_prior_transcript(make_durable_service, durable_db_path):
     # --- Phase 1: create and complete a task that records a transcript. --- #
     svc1 = await make_durable_service(durable_db_path, scripts=_FIRST_SCRIPTS)

@@ -9,6 +9,7 @@
 """
 
 from __future__ import annotations
+import pytest
 
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.registry import CapabilityRegistry
@@ -48,6 +49,8 @@ def _write_req(content: str) -> PolicyRequest:
     return _policy_request(args={"path": "/ws/a", "content": content})
 
 
+@pytest.mark.athena_claim("BHV-045")
+@pytest.mark.athena_evidence("test", "invariant")
 def test_call_scope_approval_is_single_use():
     """BHV-045: same call-scoped approval cannot cover a second identical request."""
     mgr = ApprovalManager()
@@ -68,6 +71,8 @@ def test_call_scope_approval_is_single_use():
     assert second is None  # consumed on first use
 
 
+@pytest.mark.athena_claim("BHV-047")
+@pytest.mark.athena_evidence("test", "security")
 def test_grant_binds_to_exact_arguments_toctou_guard():
     """BHV-047: substituting args makes a previously matching grant not apply."""
     mgr = ApprovalManager()
@@ -88,6 +93,8 @@ def test_grant_binds_to_exact_arguments_toctou_guard():
     assert mgr.covers_request(_write_req(content="evil")) is None
 
 
+@pytest.mark.athena_claim("BHV-044")
+@pytest.mark.athena_evidence("test")
 def test_denied_approval_grant_is_rejected():
     """BHV-043: a denied approval cannot be granted afterwards -> no grant."""
     mgr = ApprovalManager()
@@ -124,6 +131,8 @@ class _DeniedExecutor:
         )
 
 
+@pytest.mark.athena_claim("BHV-043")
+@pytest.mark.athena_evidence("test", "security")
 async def test_deny_verdict_does_not_call_executor():
     """BHV-043 across the dispatcher: hard-deny never reaches the executor."""
     reg = CapabilityRegistry()

@@ -25,6 +25,8 @@ from athena.state.tasks import TaskStore
 ALL_STATUSES = set(TaskStatus)
 
 
+@pytest.mark.athena_claim("BHV-014", "BHV-015", "BHV-016", "BHV-024")
+@pytest.mark.athena_evidence("test", "invariant")
 class TestLegalTransitions:
     async def test_every_legal_transition_is_accepted(self, db):
         store = TaskStore(db)

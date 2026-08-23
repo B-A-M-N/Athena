@@ -1,4 +1,5 @@
 from decimal import Decimal
+import pytest
 from datetime import timedelta
 
 
@@ -11,6 +12,8 @@ from athena.protocol.tasks import (
 )
 
 
+@pytest.mark.athena_claim("BHV-014")
+@pytest.mark.athena_evidence("test", "invariant")
 def test_legal_and_illegal_transitions():
     assert TaskStatus.QUEUED in LEGAL_TRANSITIONS[TaskStatus.CREATED]
     assert TaskStatus.COMPLETE in LEGAL_TRANSITIONS[TaskStatus.RUNNING]
@@ -19,6 +22,8 @@ def test_legal_and_illegal_transitions():
     assert TaskStatus.RECOVERY_REQUIRED not in LEGAL_TRANSITIONS.get(TaskStatus.FAILED, set())
 
 
+@pytest.mark.athena_claim("BHV-083")
+@pytest.mark.athena_evidence("test", "invariant")
 def test_resource_budget_merged_with_takes_min():
     budget = ResourceBudget(
         max_agent_iterations=10,

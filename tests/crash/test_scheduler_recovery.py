@@ -6,6 +6,7 @@ exists via its deterministic ``_occurrence`` metadata key) or release it. A job
 that never fired must fire normally after restart.
 """
 from __future__ import annotations
+import pytest
 
 from datetime import datetime, timedelta, timezone
 
@@ -32,6 +33,8 @@ async def _read_run(db_path, job_id) -> dict | None:
         await db.close()
 
 
+@pytest.mark.athena_claim("BHV-098")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_claimed_occurrence_reconciled_to_fired_on_restart(
     make_durable_service, durable_db_path
 ):

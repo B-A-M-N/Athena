@@ -14,6 +14,8 @@ from athena.service.config import AthenaConfig, ProviderConfig
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_claim("BHV-065")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_artifact_store_injected_into_dispatcher():
     """The dispatcher constructed by AthenaService must hold the ArtifactStore
     (not None) so mutation before_ref can be captured durably."""
@@ -37,6 +39,8 @@ async def test_artifact_store_injected_into_dispatcher():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_claim("BHV-065")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_artifact_store_persists_artifacts():
     """ArtifactStore must durably store and load content-addressed blobs."""
     tmp = tempfile.mkdtemp(prefix="athena-art-")

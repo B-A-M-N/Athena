@@ -204,6 +204,16 @@ class SessionRepository:
             row["metadata"] = json.loads(row["metadata"])
         return row
 
+    async def list_all(self) -> list[dict]:
+        """Return every persisted session in creation order."""
+        rows = await self._db.fetch_all(
+            "SELECT * FROM sessions ORDER BY created_at ASC, rowid ASC"
+        )
+        for row in rows:
+            if row.get("metadata"):
+                row["metadata"] = json.loads(row["metadata"])
+        return rows
+
     async def append_message(self, message: Message) -> None:
         session_id: str | None = None
         if message.metadata:

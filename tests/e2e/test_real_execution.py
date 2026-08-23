@@ -10,6 +10,7 @@ runs first (no prior result) and a *terminal* script runs once its output
 marker is present.
 """
 from __future__ import annotations
+import pytest
 
 import json
 import os
@@ -61,6 +62,8 @@ async def _capability_outputs(svc, task_id) -> str:
     return "\n".join(parts)
 
 
+@pytest.mark.athena_claim("BHV-056")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_shell_execution_runs_real_runtime(make_service):
     """Model calls execute(shell, 'echo hello'); the real shell returns 'hello'."""
     svc = await make_service(scripts=[
@@ -74,6 +77,8 @@ async def test_shell_execution_runs_real_runtime(make_service):
     assert "hello" in outputs, f"shell output missing 'hello': {outputs!r}"
 
 
+@pytest.mark.athena_claim("BHV-056")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_python_execution_prints_4(make_service):
     svc = await make_service(scripts=[
         _term_after_ok(),
@@ -86,6 +91,8 @@ async def test_python_execution_prints_4(make_service):
     assert "4" in outputs, f"python stdout missing '4': {outputs!r}"
 
 
+@pytest.mark.athena_claim("BHV-058", "BHV-059")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_persistent_python_session_keeps_state(make_service):
     """Two execute calls in one task/session preserve runtime state: x=10 -> x*2==20."""
     svc = await make_service(scripts=[
@@ -105,6 +112,8 @@ async def test_persistent_python_session_keeps_state(make_service):
     assert "20" in outputs, f"persistent x*2 must be 20: {outputs!r}"
 
 
+@pytest.mark.athena_claim("BHV-052")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_fs_write_then_read_same_path(make_service):
     """fs.write then fs.read the same path: content on disk + mutation record."""
     svc = await make_service(scripts=[

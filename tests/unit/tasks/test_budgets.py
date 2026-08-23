@@ -1,6 +1,7 @@
 """Unit tests for BudgetTracker (BUILDSPEC §19)."""
 
 from __future__ import annotations
+import pytest
 
 from decimal import Decimal
 
@@ -18,6 +19,8 @@ def _task(task_id, *, budget=None, parent=None):
     )
 
 
+@pytest.mark.athena_claim("BHV-083")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_consume_decreases_remaining():
     tracker = BudgetTracker()
     tracker.register(_task("t", budget=ResourceBudget(max_agent_iterations=10)))
@@ -29,6 +32,8 @@ async def test_consume_decreases_remaining():
     assert after["iterations"] == 7
 
 
+@pytest.mark.athena_claim("BHV-084")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_exhausted_rolls_up_to_ancestor():
     tracker = BudgetTracker()
     root = _task("root", budget=ResourceBudget(max_agent_iterations=1))
@@ -43,6 +48,8 @@ async def test_exhausted_rolls_up_to_ancestor():
     assert await tracker.exhausted("child") is True
 
 
+@pytest.mark.athena_claim("BHV-083")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_remaining_keeps_decimal_cost_precision():
     tracker = BudgetTracker()
     tracker.register(_task("t", budget=ResourceBudget(max_cost_usd=Decimal("1.00"))))

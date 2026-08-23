@@ -40,6 +40,8 @@ async def _create(manager, sessions, objective, *, parent=None):
     return await manager.create(_spec(objective, session_id, parent=parent))
 
 
+@pytest.mark.athena_claim("BHV-076")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_cancel_sets_the_token(env):
     manager, cancellations, sessions = env
     task = await _create(manager, sessions, "one")
@@ -48,6 +50,8 @@ async def test_cancel_sets_the_token(env):
     assert cancellations.token(task.id).is_set() is True
 
 
+@pytest.mark.athena_claim("BHV-075", "BHV-076")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_cancel_propagates_to_children(env):
     manager, cancellations, sessions = env
     parent = await _create(manager, sessions, "parent")
@@ -64,6 +68,8 @@ async def test_cancel_propagates_to_children(env):
         assert row.metadata["status"] == TaskStatus.CANCELLED.value
 
 
+@pytest.mark.athena_claim("BHV-023")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_interrupt_sets_interrupted_recoverable(env):
     manager, cancellations, sessions = env
     task = await _create(manager, sessions, "interrupt me")

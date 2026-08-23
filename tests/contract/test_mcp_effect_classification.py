@@ -8,14 +8,16 @@ Inferring effects for a REMOTE MCP tool (BHV-111 / §92):
 
 from __future__ import annotations
 
+import pytest
+
 from athena.mcp.tools import infer_effects
 from athena.protocol.capabilities import EffectClass
-
 
 def _has(effects, cls) -> bool:
     return cls in effects
 
-
+@pytest.mark.athena_claim("BHV-109")
+@pytest.mark.athena_evidence("test", "invariant")
 class TestMcpEffectClassification:
     def test_remote_tool_never_local_only(self):
         # An innocuous tool name with a readOnlyHint is still a network op.

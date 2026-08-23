@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import pytest
 
 from athena.context.compression import ContextCompressor
 from athena.context.selection import Selection
@@ -26,6 +27,8 @@ def _sel(
     )
 
 
+@pytest.mark.athena_claim("BHV-032", "BHV-033")
+@pytest.mark.athena_evidence("test")
 async def test_compressing_older_turns_recap_present():
     """BHV-032/033: older turns are summarized, not lost — recap present."""
     now = datetime.now(timezone.utc)
@@ -45,6 +48,8 @@ async def test_compressing_older_turns_recap_present():
     assert "recency two" in joined
 
 
+@pytest.mark.athena_claim("BHV-032")
+@pytest.mark.athena_evidence("test")
 async def test_protected_items_never_dropped():
     """BHV-032: mandatory and approved selections survive compression."""
     now = datetime.now(timezone.utc)
@@ -68,6 +73,8 @@ async def test_protected_items_never_dropped():
     assert "old" not in names
 
 
+@pytest.mark.athena_claim("BHV-032")
+@pytest.mark.athena_evidence("test")
 async def test_small_transcript_has_recap():
     """Build a small transcript, compress, verify output has the recap."""
     now = datetime.now(timezone.utc)

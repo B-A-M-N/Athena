@@ -1,5 +1,6 @@
 """Scheduler -> Task -> Worker -> COMPLETE, with the occurrence marked FIRED."""
 from __future__ import annotations
+import pytest
 
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,8 @@ async def _wait_terminal(svc, task_id, target=TaskStatus.COMPLETE.value, tries=2
     return await svc.get_task_status(task_id)
 
 
+@pytest.mark.athena_claim("BHV-095")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_scheduled_job_fires_and_runs_to_complete(make_service):
     svc = await make_service()
 

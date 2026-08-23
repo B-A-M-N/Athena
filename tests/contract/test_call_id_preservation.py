@@ -9,6 +9,9 @@ absent so correlations stay lossless.
 
 from __future__ import annotations
 
+import tempfile
+import pytest
+
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.fs import FilesystemCapability
 from athena.capabilities.registry import CapabilityRegistry
@@ -20,24 +23,22 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.tasks import WorkspaceSpec
 
-
 class _AllowEngine:
     approvals = None
 
     def evaluate(self, request, *, autonomy=None):
         return PolicyDecision(PolicyVerdict.ALLOW, "allow", "stub.allow", ())
 
-
 def _dispatcher(executor):
     reg = CapabilityRegistry()
     reg.register(executor)
     return CapabilityDispatcher(reg, _AllowEngine())
 
-
 def _ws(tmp_path) -> WorkspaceSpec:
     return WorkspaceSpec(id="ws", root=str(tmp_path))
 
-
+@pytest.mark.athena_claim("BHV-116")
+@pytest.mark.athena_evidence("test", "invariant")
 class TestCallIdPreservation:
     async def test_dispatcher_assigns_a_call_id_when_absent(self, tmp_path):
         dispatcher = _dispatcher(FilesystemCapability())

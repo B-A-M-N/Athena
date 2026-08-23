@@ -4,6 +4,7 @@ These tests verify that a child task cannot escape the parent workspace
 boundary through path traversal, symlinks, or sibling-path confusion.
 """
 from __future__ import annotations
+import pytest
 
 import os
 import tempfile
@@ -25,6 +26,8 @@ def _make_parent(root: str) -> TaskSpec:
     )
 
 
+@pytest.mark.athena_claim("BHV-148", "BHV-090")
+@pytest.mark.athena_evidence("test", "security")
 def test_child_root_outside_parent_is_overridden():
     """A child supplying /tmp/outside is forced under the parent root."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -35,6 +38,8 @@ def test_child_root_outside_parent_is_overridden():
         assert "/outside-parent" not in scoped.root
 
 
+@pytest.mark.athena_claim("BHV-148")
+@pytest.mark.athena_evidence("test", "security")
 def test_sibling_path_confusion():
     """/parent-evil must not match /parent via startswith."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -48,6 +53,8 @@ def test_sibling_path_confusion():
         assert not scoped.root.startswith(evil_root)
 
 
+@pytest.mark.athena_claim("BHV-145")
+@pytest.mark.athena_evidence("test", "security")
 def test_dotdot_escape():
     """../escape from child root must not produce a path outside parent."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -60,6 +67,8 @@ def test_dotdot_escape():
         assert str(resolved).startswith(tmpdir)
 
 
+@pytest.mark.athena_claim("BHV-148")
+@pytest.mark.athena_evidence("test", "security")
 def test_absolute_outside_root():
     """An absolute path outside the parent root is rejected."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -78,6 +87,8 @@ def test_absolute_outside_root():
             assert outside not in rule.path
 
 
+@pytest.mark.athena_claim("BHV-148")
+@pytest.mark.athena_evidence("test", "security")
 def test_child_root_equal_to_parent_rejected():
     """Child root == parent root is not allowed (must be strict descendant)."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -89,6 +100,8 @@ def test_child_root_equal_to_parent_rejected():
         assert scoped.root.startswith(tmpdir)
 
 
+@pytest.mark.athena_claim("BHV-148")
+@pytest.mark.athena_evidence("test", "security")
 def test_symlink_escape():
     """A symlink from child to outside parent must not create an escape."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -107,6 +120,8 @@ def test_symlink_escape():
         assert str(Path(scoped.root).resolve()).startswith(parent_root)
 
 
+@pytest.mark.athena_claim("BHV-148")
+@pytest.mark.athena_evidence("test", "security")
 def test_nested_symlink_escape():
     """A nested symlink chain that ultimately escapes is caught."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -133,6 +148,8 @@ def test_nested_symlink_escape():
             assert resolved.startswith(parent_root), f"escape via symlink: {resolved}"
 
 
+@pytest.mark.athena_claim("BHV-053")
+@pytest.mark.athena_evidence("test", "security")
 def test_normal_child_workspace_still_works():
     """A legitimate child workspace under the parent is accepted."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -144,6 +161,8 @@ def test_normal_child_workspace_still_works():
         assert str(Path(scoped.root).resolve()).startswith(tmpdir)
 
 
+@pytest.mark.athena_claim("BHV-053")
+@pytest.mark.athena_evidence("test", "security")
 def test_parent_writable_narrower_than_child_request():
     """Child's writable rules are intersected with parent's."""
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -24,10 +24,8 @@ from athena.protocol.capabilities import (
 from athena.protocol.execution import ExecutionExitStatus, ExecutionResult
 from athena.protocol.tasks import WorkspaceSpec
 
-
 def _ws(tmp_path, *, writable=None) -> WorkspaceSpec:
     return WorkspaceSpec(id="ws", root=str(tmp_path), writable=tuple(writable or ()))
-
 
 def _req(op, path, **extra) -> CapabilityRequest:
     args = {"operation": op, "path": path, **extra}
@@ -35,13 +33,11 @@ def _req(op, path, **extra) -> CapabilityRequest:
     object.__setattr__(request, "call_id", "ws-call")
     return request
 
-
 def _exec_req(**args) -> CapabilityRequest:
     defaults = {"language": "shell", "code": "echo hi"}
     request = CapabilityRequest("execute", {**defaults, **args}, "task-1")
     object.__setattr__(request, "call_id", "exec-call")
     return request
-
 
 class _FakeExecManager:
     def __init__(self):
@@ -61,7 +57,8 @@ class _FakeExecManager:
         yield ExecutionEvent(type=ExecutionEventType.EXITED, execution_id=execution_id,
                              exit_status=ExecutionExitStatus.EXITED, exit_code=0)
 
-
+@pytest.mark.athena_claim("BHV-053", "BHV-145")
+@pytest.mark.athena_evidence("test", "invariant")
 class TestWorkspaceIsolation:
     async def test_write_inside_workspace_ok(self, tmp_path):
         cap = FilesystemCapability()
@@ -113,7 +110,8 @@ class TestWorkspaceIsolation:
         )
         assert result.status == CapabilityResultStatus.FAILED
 
-
+@pytest.mark.athena_claim("BHV-149")
+@pytest.mark.athena_evidence("test", "invariant")
 class TestExecuteCwd:
     async def test_relative_cwd_resolves_inside_workspace(self, tmp_path):
         mgr = _FakeExecManager()

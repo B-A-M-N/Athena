@@ -3,6 +3,9 @@
 A file-backed :class:`AthenaService` is required wherever state must survive a
 service restart/stop (session resume, crash recovery, scheduler recovery),
 because :meth:`AthenaService.in_memory` hard-codes ``db_path=":memory:"``.
+
+Athena owns the ``athena_claim``/``athena_evidence`` marker declarations in
+its tests; DSH injects the private reporter when it collects proof.
 """
 from __future__ import annotations
 

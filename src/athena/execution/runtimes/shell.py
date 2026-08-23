@@ -93,6 +93,10 @@ class _SubprocessSession:
         ).start()
 
     def close(self) -> None:
+        # A cancelled execution may be blocked in run() waiting for output.
+        # Wake that queue loop before killing the process so its bridge thread
+        # can return and the event loop's executor can shut down cleanly.
+        self.done.set()
         if self.process:
             kill_tree(self.process)
             try:

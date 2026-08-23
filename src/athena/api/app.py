@@ -387,7 +387,7 @@ def _lifespan(service: Any) -> Any:
     from collections.abc import AsyncIterator
 
     @asynccontextmanager
-    async def _manager() -> AsyncIterator[None]:
+    async def _manager(_app: Any = None) -> AsyncIterator[None]:
         start = getattr(service, "start", None)
         if callable(start):
             await start()

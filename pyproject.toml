@@ -13,15 +13,25 @@ readme = "README.md"
 dependencies = [
     "httpx>=0.27",
     "aiosqlite>=0.20",
+    "starlette>=0.38,<1.0",
+    "click>=8.1",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
-api = ["uvicorn>=0.30", "starlette>=0.38"]
+api = []
 mcp = ["mcp>=1.0"]
 anthropic = ["anthropic>=0.39"]
 container = ["docker>=7.0"]
-cli = ["click>=8.1"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+cli = []
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "build>=1.2",
+    "starlette>=0.38,<1.0",
+    "uvicorn>=0.30",
+    "click>=8.1",
+]
 
 [project.scripts]
 athena = "athena.cli.app:main"
@@ -29,6 +39,14 @@ athena = "athena.cli.app:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+athena = ["state/migrations/*.sql"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "athena_claim(*claim_ids): normative claim ids this test proves",
+  "athena_evidence(*kinds): evidence classes this test produces (test, invariant, security, e2e)",
+  "dsh_release: installed-artifact release acceptance lane",
+]

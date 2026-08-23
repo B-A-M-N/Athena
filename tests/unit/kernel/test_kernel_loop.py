@@ -106,6 +106,8 @@ async def _create(stack, objective, *, budget=None):
     return spec
 
 
+@pytest.mark.athena_claim("INV-001")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_end_to_end_simple_completes(stack):
     stack.provider._scripts = [
         {"match": {"user_contains": "hello"}, "respond": {"text": "hi there!", "done": True}}
@@ -122,6 +124,8 @@ async def test_end_to_end_simple_completes(stack):
     assert "ModelResponseCompleted" in types
 
 
+@pytest.mark.athena_claim("INV-001")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_scripted_capability_then_answer_runs_two_iterations(stack):
     # Match ordering: the capability-result-aware script comes first; on the
     # first call there is no result yet so it is skipped, then the capability
@@ -156,6 +160,8 @@ async def test_scripted_capability_then_answer_runs_two_iterations(stack):
     assert len(iterations) >= 1
 
 
+@pytest.mark.athena_claim("BHV-134")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_budget_exhaustion_is_partial_not_failed(stack):
     stack.provider._scripts = [
         {"match": {"user_contains": "work"}, "respond": {"text": "doing", "done": False}},
@@ -167,6 +173,8 @@ async def test_budget_exhaustion_is_partial_not_failed(stack):
     assert "budget" in result.summary.lower()
 
 
+@pytest.mark.athena_claim("BHV-076", "BHV-078")
+@pytest.mark.athena_evidence("test", "e2e")
 async def test_cancellation_mid_run_is_cancelled(stack):
     # First turn emits a capability call so the loop stays alive beyond turn 1
     # (a final-text turn would terminate immediately). Cancel while the second

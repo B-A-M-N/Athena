@@ -1,8 +1,11 @@
 
+import pytest
 from athena.context.provenance import TRUST_ORDER, merge_provenance, prov, trust_rank
 from athena.protocol.messages import SourceType, TrustClass, utcnow
 
 
+@pytest.mark.athena_claim("BHV-031")
+@pytest.mark.athena_evidence("test")
 def test_trust_order_user_content_above_configured_instruction():
     """BHV-031: user content outranks configured instructions."""
     u = TrustClass.USER_CONTENT
@@ -11,6 +14,8 @@ def test_trust_order_user_content_above_configured_instruction():
     assert trust_rank(u) < trust_rank(c)
 
 
+@pytest.mark.athena_claim("BHV-031")
+@pytest.mark.athena_evidence("test")
 def test_authority_is_highest_trust():
     assert TRUST_ORDER[0] is TrustClass.AUTHORITY
     assert trust_rank(TrustClass.AUTHORITY) == 0
@@ -18,6 +23,8 @@ def test_authority_is_highest_trust():
         assert trust_rank(TrustClass.AUTHORITY) < trust_rank(t)
 
 
+@pytest.mark.athena_claim("BHV-033")
+@pytest.mark.athena_evidence("test")
 def test_merge_provenance_combines_multiple_without_crashing():
     p1 = prov(SourceType.TASK, source_id="task-1", trust=TrustClass.USER_CONTENT)
     p2 = prov(
@@ -35,6 +42,8 @@ def test_merge_provenance_combines_multiple_without_crashing():
     assert "mem-1" in merged.source_id
 
 
+@pytest.mark.athena_claim("BHV-033")
+@pytest.mark.athena_evidence("test")
 def test_merge_provenance_empty_falls_back_to_runtime():
     merged = merge_provenance([])
     assert merged.trust is TrustClass.AGENT_CURATED

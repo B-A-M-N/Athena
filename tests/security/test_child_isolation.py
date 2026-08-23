@@ -4,6 +4,7 @@ exceed the parent's privileges.
 """
 
 from __future__ import annotations
+import pytest
 
 from decimal import Decimal
 
@@ -69,6 +70,8 @@ def _fs_write_req(task="child-1") -> CapabilityRequest:
     )
 
 
+@pytest.mark.athena_claim("BHV-089")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_child_policy_denies_execute_when_parent_denies_it():
     """Child (via _scope_policy) inherits parent's deny; execute stays DENIED."""
     parent_policy = CapabilityPolicy(allow=("fs",), deny=("execute",))
@@ -92,6 +95,8 @@ async def test_child_policy_denies_execute_when_parent_denies_it():
     assert exc.invocations == 0
 
 
+@pytest.mark.athena_claim("BHV-090")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_child_workspace_scoped_under_parent_rejects_outside_write(tmp_path):
     parent_root = str(tmp_path / "parent")
     (tmp_path / "parent").mkdir()
@@ -105,6 +110,8 @@ async def test_child_workspace_scoped_under_parent_rejects_outside_write(tmp_pat
     assert scoped.root != parent_root
 
 
+@pytest.mark.athena_claim("BHV-148")
+@pytest.mark.athena_evidence("test", "security")
 async def test_child_workspace_denies_write_outside_child_root(tmp_path):
     parent_root = tmp_path / "parent"
     parent_root.mkdir()
@@ -134,6 +141,8 @@ async def test_child_workspace_denies_write_outside_child_root(tmp_path):
     assert result.status == CapabilityResultStatus.FAILED
 
 
+@pytest.mark.athena_claim("BHV-084")
+@pytest.mark.athena_evidence("test", "invariant")
 async def test_child_budget_derived_from_parent_cannot_exceed():
     parent = TaskSpec(
         id="parent",
