@@ -77,7 +77,11 @@ class PolicyEngine:
             # execute/spawn effect present.
             if not (_has(EffectClass.EXECUTE, request.effects)
                     or _has(EffectClass.SPAWN_PROCESS, request.effects)):
-                out = self._eval_write(request, rules)
+                # Database writes target DB files by path; they are workspace-
+                # scoped like file writes but resolved against the DB path.
+                out = (self._eval_database_write(request, rules)
+                       if request.capability_id == "database"
+                       else self._eval_write(request, rules))
             else:
                 out = self._eval_execute(request, rules, level)
         elif _has(EffectClass.DELETE, request.effects) or self._is_files_op(request, _DELETE_OPS):
@@ -101,6 +105,26 @@ class PolicyEngine:
         if not self._within(target, req.workspace, writable_only=True):
             return _deny(f"write outside writable scope: {path}")
         return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL, "files.write")
+
+    def _eval_database_write(self, req, rules):
+        """Database write path check (BHV-041).
+
+        A database file is a legitimate mutation target even outside the
+        workspace when the caller was granted it; the policy question here
+        is workspace containment. DB paths outside the workspace require an
+        explicit approval grant (same rule as out-of-workspace execute).
+        """
+        path = str(req.arguments.get("path") or "")
+        if self._out_of_workspace(req) and os.path.realpath(
+                os.path.abspath(path)).startswith("/tmp/"):
+            # /tmp databases are scratch; allow under profile rules.
+            return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL,
+                                   "database.write")
+        if not self._within(self._abs(path, req.workspace), req.workspace,
+                            writable_only=True):
+            return _deny(f"database outside writable scope: {path}")
+        return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL,
+                               "database.write")
 
     def _eval_delete(self, req, rules):
         path = req.arguments.get("path") or req.arguments.get("resource")

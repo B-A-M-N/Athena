@@ -294,6 +294,10 @@ class AthenaService:
         )
         task_manager.add_finalize_observer(self._knowledge)
 
+        # Watch polling: file/process watchers push WatchObserved events
+        # into the durable stream while the service runs (P1 'watch').
+        self._watch_poll_task = asyncio.create_task(self._poll_watches())
+
         # 8. Models + router (with role-divided policies: "summarizer",
         # "judge", etc. can be pinned to specific models in config; roles
         # without an entry fall back to the user's primary/global choice).
@@ -1424,9 +1428,52 @@ class AthenaService:
         except Exception as exc:  # debugpy optional
             _logger.info("debugger capability unavailable: %s", exc)
 
+        # P1/P2 environment families.
+        from athena.capabilities.environment import (
+            DatabaseCapability, NetworkCapability, ServiceCapability,
+            WorkspaceCapability,
+        )
+        from athena.capabilities.watch import WatchCapability, WatchRegistry
+
+        registry.register(ServiceCapability())
+        registry.register(NetworkCapability())
+        self._database = DatabaseCapability()
+        registry.register(self._database)
+        self._watch_registry = WatchRegistry()
+        self._watches = WatchCapability(registry=self._watch_registry)
+        registry.register(self._watches)
+        from athena.causal.checkpoint import CheckpointManager
+
+        self._checkpoints = CheckpointManager()
+        registry.register(WorkspaceCapability(
+            checkpoint_manager=self._checkpoints))
+
     # ------------------------------------------------------------------ #
     # Fusion engines: shadow execution + execution-grounded world state
     # ------------------------------------------------------------------ #
+    async def _poll_watches(self) -> None:
+        """Background poll of registered watches -> WatchObserved events."""
+        events = None
+        while True:
+            await asyncio.sleep(2.0)
+            registry = getattr(self, "_watch_registry", None)
+            if registry is None or not (registry.file_watches
+                                        or registry.process_watches):
+                continue
+            if events is None:
+                try:
+                    events = self._require_events()
+                except Exception:
+                    continue
+
+            async def sink(type_, payload, task_id=None):
+                await events.append_event(type_, payload, task_id=task_id)
+
+            try:
+                await registry.poll_all(sink)
+            except Exception as exc:
+                _logger.debug("watch poll error: %s", exc)
+
     def shadow_engine(self):
         """Speculative-execution engine bound to this service's dispatcher."""
         from athena.shadow.engine import ShadowEngine

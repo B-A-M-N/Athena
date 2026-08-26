@@ -49,6 +49,12 @@ class Mascot:
     OBJ_APPROVAL = "[?]"
     OBJ_ARTIFACT = "[*]"
 
+    # ------------------------------------------------------------------
+    # Character registry. Each entry: {"label", "frames": {state: (a, b)}}
+    # Two animation frames per state; render() alternates them.
+    # ------------------------------------------------------------------
+    CHARACTERS = {}
+
     FRAMES = {
         "idle": (
             r"""
@@ -134,11 +140,170 @@ class Mascot:
         ),
     }
 
-    def __init__(self) -> None:
+    CAT_FRAMES = {
+        "idle": (
+            r"""
+     /\_/\
+    ( -.- )   zZ
+     > ^ <
+      """,
+            r"""
+     /\_/\
+    ( •‿• )
+     > ~ <   *blink*
+      """,
+        ),
+        "thinking": (
+            r"""
+     /\_/\   ?????
+    ( ⊙﹏⊙ )  ┌─┐
+     |    |  └─┤ think…
+      """,
+            r"""
+     /\_/\   ????
+    ( ⊙▽⊙ )  ┌─┐
+     |    |  └─┤ hmm…
+      """,
+        ),
+        "executing": (
+            r"""
+     /\_/\   ▨▤▹
+    ( =⍤= )  ▹▨▤  typing
+     /|   |\
+      """,
+            r"""
+     /\_/\   ◃▤▨
+    ( =◔= )  ▨◃▤  pouncing on bugs
+     /|   |\
+      """,
+        ),
+        "waiting": (
+            r"""
+     /\_/\
+    ( ˇ︵ˇ )
+     > ? <   ⏸ let me in…
+      """,
+            r"""
+     /\_/\
+    ( •︵• )
+     > ? <   ⏸ pretty please?
+      """,
+        ),
+        "done": (
+            r"""
+     /\_/\
+    ( ★‿★ )  ✓ caught it
+     \_~_/
+      """,
+            r"""
+     /\_/\   ✓ purr…
+    ( ‿‿‿ )
+     \_~_/
+      """,
+        ),
+        "failed": (
+            r"""
+     /\_/\   ✗ hiss
+    ( ✕﹏✕ )
+     > ~ <
+      """,
+            r"""
+     /\_/\   ✗ mrow.
+    ( ✕︵✕ )
+     > ~ <   ears flat
+      """,
+        ),
+    }
+
+    ROBOT_FRAMES = {
+        "idle": (
+            r"""
+      ┌───┐
+      │ ‿ │  [standby]
+     ╭┴─┴╮
+      """,
+            r"""
+      ┌───┐
+      │ ° │  [standby]
+     ╭┴─┴╮  ·
+      """,
+        ),
+        "thinking": (
+            r"""
+      ┌───┐
+      │ ▓▓│  [CPU 97%]
+     ╭┴─┴╮ ⟨⟨⟨
+      """,
+            r"""
+      ┌───┐
+      │ ▒▓│  [CPU 84%]
+     ╭┴─┴╮ ⟩⟩⟩ computing
+      """,
+        ),
+        "executing": (
+            r"""
+      ┌───┐  ▸▸
+      │ ◉ │  EXEC
+     ╭┴─┴╮  ▸▸▸
+      """,
+            r"""
+      ┌───┐  ▸▸
+      │ ◎ │  RUN
+     ╰┬─┬╯  ▸ ▸
+      """,
+        ),
+        "waiting": (
+            r"""
+      ┌───┐
+      │ ○?│  [HALT]
+     ╭┴─┴╮  awaiting input
+      """,
+            r"""
+      ┌───┐
+      │ ◇?│  [HALT]
+     ╭┴─┴╮  …authorization?
+      """,
+        ),
+        "done": (
+            r"""
+      ┌───┐
+      │ ^^│  ✓ EXIT 0
+     ╭┴─┴╮  task complete
+      """,
+            r"""
+      ┌───┐  ♪
+      │ ‿ │  ✓ SUCCESS
+     ╰┬─┬╯
+      """,
+        ),
+        "failed": (
+            r"""
+      ┌───┐
+      │ ✕✕│  ✗ SEGFAULT
+     ╭┴─┴╮  stack trace…
+      """,
+            r"""
+      ┌───┐
+      │ ❧❧│  ✗ ERROR
+     ╰┬─┬╯  dumping core…
+      """,
+        ),
+    }
+
+    def __init__(self, character: str = "owl") -> None:
+        self.character = character if character in self.CHARACTERS else "owl"
         self.state = "idle"
         self.object = ""       # carried activity object, e.g. "[>]"
         self.speech = ""       # short deterministic operational line
         self._frame = 0
+
+    @classmethod
+    def _register_characters(cls) -> None:
+        cls.CHARACTERS = {
+            "owl": {"label": "Athena's owl", "frames": cls.FRAMES},
+            "cat": {"label": "Terminal cat", "frames": cls.CAT_FRAMES},
+            "bot": {"label": "Little robot", "frames": cls.ROBOT_FRAMES},
+        }
 
     def observe(self, event_type: str) -> None:
         if event_type == "ModelDelta":
@@ -167,19 +332,38 @@ class Mascot:
             self.speech = "That did not work."
 
     def render(self, max_width: int = 24) -> list[str]:
-        frames = self.FRAMES.get(self.state, self.FRAMES["idle"])
-        art = frames[self._frame % len(frames)]
+        if not Mascot.CHARACTERS:
+            Mascot._register_characters()
+        frames = self.CHARACTERS[self.character]["frames"]
+        art = frames.get(self.state, frames["idle"])[
+            self._frame % 2]
         self._frame += 1
         lines = [ln.rstrip() for ln in art.strip("\n").splitlines()]
         width = max((len(ln) for ln in lines), default=0)
         pad = max(max_width - width, 0)
         left = " " * (pad // 2)
         out = [f"{left}{ln}" for ln in lines]
-        # Carried object + speech ride under the owl.
+        # Carried object + speech ride under the character.
         tag = f"{self.object} {self.speech}".strip()
         if tag:
             out.append(f"{left}{tag}"[:max_width])
         return out
+
+    def set_character(self, name: str) -> bool:
+        """Switch mascot character; returns False for unknown names."""
+        if not Mascot.CHARACTERS:
+            Mascot._register_characters()
+        if name not in self.CHARACTERS:
+            return False
+        self.character = name
+        return True
+
+    @classmethod
+    def available(cls) -> dict[str, str]:
+        """Character id -> label."""
+        if not cls.CHARACTERS:
+            cls._register_characters()
+        return {k: v["label"] for k, v in cls.CHARACTERS.items()}
 
 
 class _OIWindow:
@@ -241,7 +425,8 @@ class DualPaneSurface(OperatorSurface):
         self.oi_enabled = True
         self.oi_height = oi_height
         self.window = _OIWindow()
-        self.mascot = Mascot()
+        self.mascot = Mascot(
+            character=os.environ.get("ATHENA_MASCOT", "owl"))
         self._term_cols, self._term_rows = self._terminal_size()
         # When the terminal is too narrow for two readable panes, degrade to
         # single-column calm rendering (OI content still tagged inline).
