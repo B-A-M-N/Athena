@@ -25,12 +25,31 @@ class CapabilityRegistry:
     def __init__(self) -> None:
         self._by_id: dict[str, CapabilityExecutor] = {}
 
-    def register(self, executor: CapabilityExecutor) -> None:
-        """Register an executor by its descriptor id."""
+    def register(self, executor: CapabilityExecutor, *,
+                 authority: str = "native", replace: bool = False) -> None:
+        """Register an executor by its descriptor id.
+
+        Duplicate ids are a HARD error: later extensions (MCP, plugins,
+        synthesized capabilities) must never silently shadow a native
+        executor. Explicit replacement requires ``replace=True`` plus an
+        ``authority`` label and is audited via the returned audit dict.
+        """
         descriptor = getattr(executor, "descriptor", None)
         if descriptor is None or not isinstance(descriptor, CapabilityDescriptor):
             raise TypeError("executor must define a CapabilityDescriptor")
+        if descriptor.id in self._by_id and not replace:
+            raise ValueError(
+                f"capability '{descriptor.id}' already registered "
+                f"(authority={authority}); use replace=True to override")
+        audit = {
+            "capability_id": descriptor.id,
+            "replaced": self._by_id.get(descriptor.id).__class__.__name__
+            if descriptor.id in self._by_id else None,
+            "new_executor": executor.__class__.__name__,
+            "authority": authority,
+        }
         self._by_id[descriptor.id] = executor
+        return audit
 
     def unregister(self, capability_id: str) -> None:
         if capability_id in self._by_id:
@@ -84,12 +103,45 @@ class CapabilityRegistry:
 
 
 def validate_schema(schema: dict[str, Any], arguments: Mapping[str, Any]) -> list[str]:
-    """Lightweight JSON-schema subset validator used before policy evaluation.
+    """Exact JSON Schema validation used before policy evaluation (BHV-040).
 
-    Returns a list of human-readable validation problems. This keeps the
-    registry dependency-free while still enforcing required fields, unknown
-    property rejection and enum/type checks (BHV-040).
+    Uses the version-pinned `jsonschema` library so integers/booleans,
+    arrays, nested objects, additionalProperties, bounds, and combinators
+    are enforced for real. The deterministic repair engine's strict
+    revalidation is exactly as strong as this function.
+
+    Falls back to the lightweight subset validator only if jsonschema is
+    unavailable (it is a hard dependency; fallback exists for resilience).
     """
+    try:
+        import jsonschema
+        from jsonschema.validators import validator_for as _validator_for
+    except ImportError:
+        return _validate_schema_subset(schema, arguments)
+
+    # Athena's legacy 'allow_extra: False' == JSON Schema's
+    # 'additionalProperties: false'. Translate so existing descriptors keep
+    # their strictness under real validation.
+    effective = dict(schema)
+    if effective.pop("allow_extra", True) is False \
+            and "additionalProperties" not in effective:
+        effective["additionalProperties"] = False
+
+    validator_cls = _validator_for(
+        effective if effective.get("$schema") else
+        {**effective, "$schema": "https://json-schema.org/draft/2020-12/schema"})
+    validator = validator_cls(effective)
+    errors = []
+    instance = arguments if isinstance(arguments, dict) else (arguments,)
+    for err in sorted(validator.iter_errors(instance),
+                      key=lambda e: list(e.absolute_path)):
+        path = "/".join(str(p) for p in err.absolute_path) or "(root)"
+        errors.append(f"{path}: {err.message}")
+    return errors
+
+
+def _validate_schema_subset(schema: dict[str, Any], arguments: Mapping[str, Any]) -> list[str]:
+    """Legacy dependency-free subset validator (fallback only)."""
     errors: list[str] = []
     if not hasattr(arguments, "get") or not hasattr(arguments, "items"):
         return ["arguments must be an object"]
@@ -106,11 +158,16 @@ def validate_schema(schema: dict[str, Any], arguments: Mapping[str, Any]) -> lis
             continue
         value = arguments[prop]
         expected = spec.get("type")
+        # bool is an int subclass in Python — exclude explicitly.
         if expected == "string" and not isinstance(value, str):
             errors.append(f"{prop}: expected string")
         elif expected == "boolean" and not isinstance(value, bool):
             errors.append(f"{prop}: expected boolean")
-        elif expected == "number" and not isinstance(value, (int, float)):
+        elif expected == "integer" and (
+                not isinstance(value, int) or isinstance(value, bool)):
+            errors.append(f"{prop}: expected integer")
+        elif expected == "number" and (
+                isinstance(value, bool) or not isinstance(value, (int, float))):
             errors.append(f"{prop}: expected number")
         enum = spec.get("enum")
         if enum is not None and value not in enum:

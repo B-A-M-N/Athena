@@ -219,6 +219,9 @@ class CompositeVerifier:
         self._file = _FileVerifier()
         self._artifact = _ArtifactPredicateVerifier(artifact_store)
         self._capability = _CapabilityCheckVerifier(capability_registry)
+        # P1-22: the judge verifier needs the ModelRouter (which owns
+        # select()); a bare ProviderRegistry has no select(). Both are
+        # accepted; the router path is used when available.
         self._model = _ModelJudgmentVerifier(model_registry, trusted=model_judgment_trusted)
         self._manual = _ManualVerifier()
 

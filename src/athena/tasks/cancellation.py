@@ -85,15 +85,19 @@ class CancellationManager:
 
     # ------------------------------------------------------------------ #
     async def _cancel_impl(self, task_id: str, reason: str, *, root_id: str) -> None:
-        """Cancel a task and recursively every descendant (§20)."""
+        """Cancel a task and recursively every descendant (§20).
+
+        P1-20: execution cancellation runs for EVERY descendant, not only
+        the root — a delegated child's task must not be marked cancelled
+        while its processes remain alive.
+        """
         self.set_token(task_id, reason)
-        if self._exec is not None and task_id == root_id:
+        if self._exec is not None:
             try:
                 await self._exec.cancel_task(task_id)
             except Exception as exc:
                 _logger.warning(
-                    "runtime cancel failed for task %s: %s", task_id, exc
-                )
+                    "runtime cancel failed for task %s: %s", task_id, exc)
         await self._transition_status(task_id, TaskStatus.CANCELLED)
         children = await self._children_of(task_id)
         for child in children:

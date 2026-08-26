@@ -164,11 +164,26 @@ class RunState:
 # --------------------------------------------------------------------------- #
 # Message / result builders
 # --------------------------------------------------------------------------- #
+def _block_identity(block) -> tuple:
+    """Stable identity for dedup of streamed vs DONE-response blocks."""
+    kind = type(block).__name__
+    if kind == "CapabilityCallBlock":
+        return (kind, getattr(block, "call_id", ""))
+    if hasattr(block, "text"):
+        return (kind, hash(getattr(block, "text", "")))
+    return (kind, id(block))
+
+
 def _assistant_message(task: TaskSpec, response: ModelResponse) -> Message:
+    """Build the durable assistant message preserving ALL blocks.
+
+    A mixed assistant response — text + capability calls, or reasoning +
+    text + tool calls — must keep every block: providers (Anthropic
+    tool_use, OpenAI tool_calls) require the assistant turn to contain the
+    call before the matching result arrives. Stripping non-text blocks
+    breaks provider replay (BHV provider-history invariant).
+    """
     blocks = tuple(response.blocks or ())
-    text_blocks = [b for b in blocks if isinstance(b, TextBlock) and b.text]
-    if text_blocks:
-        blocks = tuple(text_blocks)
     return Message(
         id=new_id("msg"),
         role=Role.ASSISTANT,
@@ -250,12 +265,15 @@ class AgentKernel:
         budgets=None,
         cancellations=None,
         provider_usage_store=None,
+        router: "ModelRouter | None" = None,
     ) -> None:
         self._task_store = task_store
         self._events = events
         self._messages = messages
         self._registry = registry
-        self._router = ModelRouter(registry)
+        # ONE routing authority: the service-owned router carries role
+        # policies; the kernel never builds its own (P1-23).
+        self._router = router or ModelRouter(registry)
         self._compiler = context_compiler
         self._termination = termination
         self._model_sink = model_sink
@@ -380,6 +398,11 @@ class AgentKernel:
             calls = [b for b in response.blocks if isinstance(b, CapabilityCallBlock)]
 
             if calls:
+                # Persist the assistant turn (text/reasoning + calls) BEFORE
+                # dispatch: provider history requires the tool_use/tool_call
+                # to precede its result. The dispatch path appends results
+                # after; ordering is the replay invariant.
+                await self._append_response(task, response)
                 outcome = await self._dispatch(task, state, response, calls)
                 if outcome is not None:
                     return outcome
@@ -586,6 +609,12 @@ class AgentKernel:
             elif event.type.value == "failed":
                 raise ProviderError(event.error or "provider failed", code=event.code)
 
+        # ONE canonical assembly owner: the kernel merges streamed delta
+        # blocks with the provider's DONE response. Providers may emit
+        # tool-call blocks as deltas AND a DONE response carrying only
+        # text; the merged view (deltas first, then any DONE-only blocks
+        # not already present) is authoritative. Adapters never decide
+        # alone which streamed blocks survive.
         if final is None:
             final = ModelResponse(
                 request_id=request.request_id,
@@ -593,12 +622,16 @@ class AgentKernel:
                 provider=request.provider,
                 blocks=tuple(blocks),
             )
-        if not final.blocks and blocks:
-            final = ModelResponse(
-                request_id=final.request_id, model=final.model,
-                provider=final.provider, blocks=tuple(blocks),
-                finish_reason=final.finish_reason,
-            )
+        elif blocks:
+            have = {_block_identity(b) for b in final.blocks}
+            missing = [b for b in blocks if _block_identity(b) not in have]
+            if missing:
+                final = ModelResponse(
+                    request_id=final.request_id, model=final.model,
+                    provider=final.provider,
+                    blocks=tuple(list(final.blocks) + missing),
+                    finish_reason=final.finish_reason,
+                )
         state.input_tokens += _input_tokens_of(final, request)
         state.output_tokens += _output_tokens_of(final)
         state.cost += _cost_of(final)
@@ -759,7 +792,11 @@ class AgentKernel:
         return deadline is not None and utcnow() >= deadline
 
     async def _append_response(self, task: TaskSpec, response: ModelResponse) -> None:
+        if response.request_id and response.request_id in self._stored_responses:
+            return
         await self._messages.append(_assistant_message(task, response))
+        if response.request_id:
+            self._stored_responses.add(response.request_id)
 
     async def _append_final_response(self, task: TaskSpec, response: ModelResponse) -> None:
         """Persist a terminal text-only assistant answer to the session store.

@@ -193,7 +193,8 @@ class CapabilityDispatcher:
             "call_id": request.call_id, "capability_id": request.capability_id,
         }, request.task_id, causal_id=request.call_id)
 
-        effects = self._resolve_effects(executor.descriptor, request.arguments or {})
+        effects = self._resolve_effects_for(executor.descriptor,
+                                            request.arguments or {})
         policy_request = PolicyRequest(
             principal=self._principal,
             task_id=request.task_id,
@@ -302,6 +303,25 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
     # writes — even when an op name like "create" would suggest a write.
     _EXEC_CAPABILITIES = frozenset({"execute", "terminal_session", "process",
                                     "debugger", "shell", "bash"})
+
+    @staticmethod
+    def _resolve_effects_for(descriptor, arguments: Mapping[str, Any]) -> tuple[EffectClass, ...]:
+        """Contract-first effect resolution (P0-9).
+
+        Capabilities with declared operation maps use their own exact
+        classification; unknown operations FAIL rather than guess. Legacy
+        heuristic applies only to capabilities without a map.
+        """
+        from athena.capabilities.operations import (
+            CapabilityEffectError, resolve_operation_effects)
+
+        try:
+            contract_effects = resolve_operation_effects(descriptor, arguments)
+        except CapabilityEffectError as exc:
+            raise ValueError(str(exc)) from None
+        if contract_effects:
+            return contract_effects
+        return CapabilityDispatcher._resolve_effects(descriptor, arguments)
 
     @staticmethod
     def _resolve_effects(descriptor, arguments: Mapping[str, Any]) -> tuple[EffectClass, ...]:

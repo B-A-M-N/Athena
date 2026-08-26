@@ -330,13 +330,14 @@ class AthenaService:
             task_manager=task_manager,
             messages=messages,
             registry=model_registry,
+            router=router,
             context_compiler=compiler,
             termination=TerminationEvaluator(
                 acceptance_verifier=self._build_verifier(
                     execution=execution,
                     artifact_store=self._artifacts,
                     capability_registry=registry,
-                    model_registry=model_registry,
+                    model_registry=router,   # ModelRouter: judge role routing
                 ),
             ),
             dispatch_factory=self._dispatch_factory,

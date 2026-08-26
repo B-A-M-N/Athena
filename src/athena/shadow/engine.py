@@ -54,9 +54,11 @@ class ShadowBranch:
     proposal: list[dict] = field(default_factory=list)
     status: str = BranchStatus.PROPOSED
     results: list[CapabilityResult] = field(default_factory=list)
+    rejected_requests: list[CapabilityRequest] = field(default_factory=list)
     mutations: list[dict] = field(default_factory=list)
     verification: list[dict] = field(default_factory=list)
     error: str | None = None
+    commit_mutation_id: str | None = None
     created_at: str = field(default_factory=lambda: utcnow().isoformat())
 
 
@@ -162,16 +164,18 @@ class ShadowEngine:
                 result = await self._dispatcher.dispatch(
                     req, workspace=branch.shadow_workspace, profile=profile)
                 if isinstance(result, SuspendedCall):
-                    # Policy parked a call: auto-approve CALL-scope inside the
-                    # shadow ONLY (the shadow cannot touch reality).
-                    await self._service_approve(result.approval_id)
-                    args2 = dict(args)
-                    args2["call_id"] = result.request.call_id
-                    req2 = CapabilityRequest(
-                        capability_id=req.capability_id, arguments=args2,
-                        task_id=req.task_id, call_id=result.request.call_id)
-                    result = await self._dispatcher.dispatch(
-                        req2, workspace=branch.shadow_workspace, profile=profile)
+                    # A suspended call inside the shadow means policy wanted
+                    # a human decision. Auto-approval would be unsafe: the
+                    # "shadow" is filesystem isolation, NOT execution
+                    # isolation (spawned processes see the host). Fail the
+                    # branch honestly instead of granting silently.
+                    branch.error = (
+                        f"op {i} ({op['capability_id']}) requires approval; "
+                        "shadow branches do not auto-approve because shadow "
+                        "isolation is filesystem-level, not execution-level")
+                    branch.rejected_requests.append(result.request)
+                    branch.status = BranchStatus.FAILED
+                    return branch
                 if isinstance(result, Exception):
                     raise RuntimeError(str(result))
                 if result.status.value != "ok":
@@ -217,6 +221,34 @@ class ShadowEngine:
         loop = asyncio.get_running_loop()
         changes = await loop.run_in_executor(None, self._diff_trees, branch)
 
+        # Conflict detection (P0-15): every modified/deleted file must still
+        # match the base hash captured at branch open. If reality drifted,
+        # refuse to overwrite — return CONFLICT instead.
+        import hashlib
+
+        def _current_hash(path: str) -> str:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()[:16]
+
+        base_root = branch.base_workspace.root
+        conflicts = []
+        for rel, expected in changes.get("base_hashes", {}).items():
+            current_path = os.path.join(base_root, rel)
+            if not os.path.isfile(current_path):
+                conflicts.append({"resource": rel, "reason": "deleted_elsewhere"})
+                continue
+            if _current_hash(current_path) != expected:
+                conflicts.append({"resource": rel, "reason": "modified_elsewhere"})
+        if conflicts:
+            branch.status = BranchStatus.FAILED
+            branch.error = f"commit CONFLICT: {len(conflicts)} resource(s) changed outside the branch"
+            await loop.run_in_executor(None, self._cleanup, branch)
+            return {"status": "CONFLICT", "branch": branch.id,
+                    "conflicts": conflicts}
+
         def _apply():
             applied = {"written": [], "deleted": []}
             base_root = branch.base_workspace.root
@@ -238,6 +270,28 @@ class ShadowEngine:
         branch.mutations = [
             {"resource": w, "operation": "commit_write"} for w in applied["written"]
         ] + [{"resource": d, "operation": "commit_delete"} for d in applied["deleted"]]
+
+        # Record the commit as a durable mutation intent (P0-13): the most
+        # important step of a speculative transaction must be in the WAL.
+        if getattr(self, "_service", None) is not None:
+            store = getattr(self._service, "_store_mutations", None)
+            if store is not None:
+                try:
+                    mid = await store.record_intent(
+                        task_id=branch.task_id,
+                        resource=f"shadow-branch:{branch.id}",
+                        operation="commit",
+                        metadata={"written": applied["written"],
+                                  "deleted": applied["deleted"]},
+                    )
+                    await store.complete(mid,
+                                         after_hash=branch.id[-8:],
+                                         reversible=False)
+                    branch.commit_mutation_id = mid
+                except Exception as exc:
+                    _logger.warning("commit WAL record failed (branch %s): %s",
+                                    branch.id, exc)
+
         branch.status = BranchStatus.COMMITTED
         self._cleanup(branch)
         _logger.info("shadow branch %s committed: +%d/-%d files",
@@ -252,36 +306,50 @@ class ShadowEngine:
 
     # ------------------------------------------------------------------
     def _diff_trees(self, branch: ShadowBranch) -> dict:
+        """Content-hash tree diff (size comparison misses same-size edits)."""
         base_root = branch.base_workspace.root
         shadow_root = branch.shadow_workspace.root
         ignore = {".git", "__pycache__", "node_modules", ".venv"}
 
-        def walk(root: str) -> dict[str, tuple[int, int]]:
-            out: dict[str, tuple[int, int]] = {}
+        def _hash_file(path: str) -> str:
+            import hashlib
+            h = hashlib.sha256()
+            try:
+                if os.path.islink(path):
+                    return hashlib.sha256(
+                        ("link:" + os.readlink(path)).encode()).hexdigest()[:16]
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        h.update(chunk)
+                return h.hexdigest()[:16]
+            except OSError:
+                return "<unreadable>"
+
+        def walk(root: str) -> dict[str, str]:
+            out: dict[str, str] = {}
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames[:] = [d for d in dirnames if d not in ignore]
                 for name in filenames:
                     full = os.path.join(dirpath, name)
                     rel = os.path.relpath(full, root)
-                    try:
-                        st = os.stat(full)
-                        out[rel] = (st.st_mtime_ns, st.st_size)
-                    except OSError:
-                        pass
+                    out[rel] = _hash_file(full)
             return out
 
         base_files = walk(base_root)
         shadow_files = walk(shadow_root)
         modified, added, deleted = [], [], []
-        for rel, meta in shadow_files.items():
+        for rel, digest in shadow_files.items():
             if rel not in base_files:
                 added.append(rel)
-            elif base_files[rel][1] != meta[1]:
+            elif base_files[rel] != digest:
                 modified.append(rel)
         for rel in base_files:
             if rel not in shadow_files:
                 deleted.append(rel)
-        return {"modified": modified, "added": added, "deleted": deleted}
+        # Base content hashes recorded for conflict detection at commit.
+        return {"modified": modified, "added": added, "deleted": deleted,
+                "base_hashes": {**{r: base_files[r] for r in modified},
+                                **{r: base_files[r] for r in deleted}}}
 
     def _cleanup(self, branch: ShadowBranch) -> None:
         def _rm():

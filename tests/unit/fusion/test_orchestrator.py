@@ -45,6 +45,7 @@ async def test_experiment_commit_binds_claim_and_invalidates(fused, tmp_path):
             {"id": "file-exists",
              "command": f"test -f {ws.root}/src/feature.py"}],
         invariants=[],
+        profile="autonomous",
         auto_fork_on_failure=False,
     )
     assert result.status == "COMMITTED", result.error
@@ -96,6 +97,7 @@ async def test_invariant_violation_blocks_commit(fused):
             "create_dirs": True}}],
         invariants=[{"description": "system must remain healthy",
                      "probe": broken}],
+        profile="autonomous",
         auto_fork_on_failure=False,
     )
     assert result.status == "FAILED"

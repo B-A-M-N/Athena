@@ -162,6 +162,8 @@ PRESETS: dict[str, ProviderProfile] = {
                     keyless=True, protocol=Protocol.OPENAI_COMPAT),
     "llamacpp": _preset("llamacpp", "http://127.0.0.1:8080/v1",
                         keyless=True, protocol=Protocol.OPENAI_COMPAT),
+    "openai-compat": _preset("openai-compat", "",
+                             keyless=False, protocol=Protocol.OPENAI_COMPAT),
     "openai": ProviderProfile(
         id="openai", protocol=Protocol.OPENAI,
         base_url="https://api.openai.com/v1",
@@ -189,8 +191,19 @@ def resolve_profile(kind_or_id: str, *, base_url: str | None = None,
 
     Discovery failure never erases manual configuration: an explicit
     base_url/model_id always wins over the preset default.
+
+    P2-65: an unknown provider id is REJECTED rather than silently falling
+    back to the OpenAI hosted preset (which would send traffic to
+    api.openai.com unexpectedly). Generic OpenAI-compatible endpoints must
+    be explicit.
     """
-    preset = PRESETS.get(kind_or_id) or PRESETS["openai"]
+    preset = PRESETS.get(kind_or_id)
+    if preset is None:
+        known = ", ".join(sorted(PRESETS))
+        raise ValueError(
+            f"unknown provider profile {kind_or_id!r}; known: {known}. "
+            "For a custom OpenAI-compatible endpoint use kind='openai-compat' "
+            "with an explicit base_url.")
     overrides: dict[str, Any] = {}
     if base_url:
         overrides["base_url"] = base_url

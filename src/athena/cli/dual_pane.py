@@ -383,13 +383,15 @@ class _OIWindow:
             self._partial = rest
 
     def feed_delta(self, text: str) -> None:
-        """Model deltas arrive WITHOUT newlines: render the partial tail."""
+        """Model deltas arrive WITHOUT newlines: update the partial tail only.
+
+        Pure w.r.t. committed lines — the partial tail is rendered by
+        snapshot() as a VIEW of _partial, never appended to lines. This
+        prevents the duplicated-fragment bug (P2-44).
+        """
         if not text:
             return
         self._partial += text
-        # Show soft-wrapped tail so streaming text is visible immediately.
-        body = self._partial.splitlines() or [""]
-        self.lines.append(body[-1])
 
     def seal_partial(self) -> None:
         """Commit any trailing partial line (end of a turn / execution)."""
@@ -398,10 +400,15 @@ class _OIWindow:
             self._partial = ""
 
     def snapshot(self, height: int, width: int) -> list[str]:
-        """Last ``height`` lines, hard-truncated to ``width``."""
-        self.seal_partial()
+        """Last ``height`` lines INCLUDING the live partial tail.
+
+        PURE: does not mutate committed state (no seal_partial here).
+        """
+        committed = list(self.lines)
+        if self._partial:
+            committed.append(self._partial)
         out: list[str] = []
-        for line in list(self.lines)[-height:]:
+        for line in committed[-height:]:
             if width > 0 and len(line) > width:
                 line = line[: width - 1] + "…"
             out.append(line)
@@ -528,8 +535,8 @@ class DualPaneSurface(OperatorSurface):
             out.append(f"\x1b[{rows - self.oi_height - 1 + i};1H\x1b[K{row}")
         out.append(f"\x1b[{rows - 1};1H\x1b[K" + footer)
         out.append("\x1b8")      # restore cursor
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        self.output.write("".join(out))
+        self.output.flush()
 
     def snapshot_oi(self, height: int | None = None) -> list[str]:
         """Test/inspection hook: exact current OI window contents."""

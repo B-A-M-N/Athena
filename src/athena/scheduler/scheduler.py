@@ -21,6 +21,8 @@ from typing import Any, Mapping
 
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
+
+_logger = logging.getLogger("athena.scheduler")
 from athena.protocol.tasks import (
     CapabilityPolicy,
     DeliverySpec,

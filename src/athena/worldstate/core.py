@@ -213,12 +213,15 @@ class TaskWorldState:
                 state["recent_mutations"] = [
                     {"resource": r.get("resource"), "operation": r.get("operation"),
                      "status": r.get("status")} for r in recent]
-                unverified = sum(
-                    1 for r in rows
-                    if r.get("status") == "COMPLETED"
-                    and not any(c["status"] == ClaimStatus.VERIFIED
-                                for c in self.claims.for_task(self.task_id)))
-                state["mutations_since_verified_claim"] = unverified
+                # P1-37: c is a Claim dataclass — attribute access, not indexing.
+                # (The old c["status"] raised TypeError, was silently swallowed,
+                #  and the snapshot lost mutation-state information.)
+                verified_claims = [
+                    c for c in self.claims.for_task(self.task_id)
+                    if c.status == ClaimStatus.VERIFIED]
+                state["mutations_since_verified_claim"] = (
+                    len(rows) if not verified_claims else
+                    sum(1 for r in rows if r.get("status") == "COMPLETED"))
             except Exception as exc:
                 _logger.warning("world-state mutation query failed: %s", exc)
 

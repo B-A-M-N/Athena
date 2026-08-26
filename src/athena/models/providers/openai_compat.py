@@ -70,12 +70,33 @@ def _capability_schema(desc) -> dict[str, Any]:
 
 
 def _dumps_args(raw: str | dict) -> Any:
+    """Parse MODEL-PRODUCED tool ARGUMENTS (input JSON).
+
+    Returns {} on parse failure — the raw string is preserved upstream in
+    the ToolCallCandidate boundary so the repair engine can still see it.
+    Never use this for tool RESULTS; results are content, not input JSON.
+    """
     if isinstance(raw, dict):
         return raw
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
     except ValueError:
         return {}
+
+
+def serialize_tool_result(output: str | None) -> str:
+    """Serialize tool RESULT output as model-visible CONTENT.
+
+    Tool output is arbitrary text (stdout, summaries, errors), not JSON.
+    It must reach the next request verbatim — never round-tripped through
+    a JSON parser that would collapse ordinary text into {}.
+    """
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    return json.dumps(output, ensure_ascii=False, default=str)
 
 
 class OpenAICompatProvider:
@@ -189,7 +210,7 @@ class OpenAICompatProvider:
                 return [
                     {
                         "role": "tool",
-                        "content": _dumps_args(b.output),
+                        "content": serialize_tool_result(b.output),
                         "tool_call_id": b.call_id,
                     }
                     for b in results

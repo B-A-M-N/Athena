@@ -99,6 +99,15 @@ class FusionOrchestrator:
         """
         ws = await self._workspace_for(task_id)
         result = ExperimentResult()
+        # Capture the PRE-EXPERIMENT event position (P1-40): a failure fork
+        # must branch from BEFORE the experiment ran, not from after it.
+        pre_experiment_sequence = 0
+        try:
+            timeline = await self.forker.timeline(task_id)
+            pre_experiment_sequence = max(
+                (e["sequence"] for e in timeline), default=0)
+        except Exception as exc:
+            _logger.warning("pre-experiment timeline failed: %s", exc)
 
         # Pre-experiment checkpoint: the exact restore point if things go wrong.
         ckpt = await self.checkpoints.capture(
@@ -115,7 +124,8 @@ class FusionOrchestrator:
         if branch.status == "FAILED":
             result.status = "FAILED"
             result.error = branch.error
-            await self._fail_path(task_id, result, auto_fork_on_failure, ckpt_id)
+            await self._fail_path(task_id, result, auto_fork_on_failure, ckpt_id,
+                                  pre_experiment_sequence)
             return result
 
         # Criteria probes run INSIDE the shadow workspace. Commands written
@@ -144,7 +154,8 @@ class FusionOrchestrator:
             result.status = "FAILED"
             result.error = "acceptance criteria failed in shadow"
             await self.shadow.discard(branch, reason=result.error)
-            await self._fail_path(task_id, result, auto_fork_on_failure, ckpt_id)
+            await self._fail_path(task_id, result, auto_fork_on_failure, ckpt_id,
+                                  pre_experiment_sequence)
             return result
 
         # Invariant envelope BEFORE touching reality.
@@ -156,7 +167,8 @@ class FusionOrchestrator:
             result.error = "invariant violation: " + "; ".join(
                 v["description"] for v in report["violations"])
             await self.shadow.discard(branch, reason=result.error)
-            await self._fail_path(task_id, result, auto_fork_on_failure, ckpt_id)
+            await self._fail_path(task_id, result, auto_fork_on_failure, ckpt_id,
+                                  pre_experiment_sequence)
             return result
 
         # Commit and bind a claim to the evidence. Order matters:
@@ -277,13 +289,20 @@ class FusionOrchestrator:
         return await loop.run_in_executor(None, _run)
 
     async def _fail_path(self, task_id, result: ExperimentResult,
-                         auto_fork: bool, ckpt_id: str | None) -> None:
-        """On failure: discard handled by caller; optionally fork for retry."""
+                         auto_fork: bool, ckpt_id: str | None,
+                         pre_experiment_sequence: int | None = None) -> None:
+        """On failure: discard handled by caller; optionally fork for retry.
+
+        Forks branch from the PRE-EXPERIMENT event position (P1-40): the
+        alternate approach must not inherit the failed experiment's events.
+        """
         if not auto_fork or not task_id:
             return
         try:
-            timeline = await self.forker.timeline(task_id)
-            seq = max((e["sequence"] for e in timeline), default=0)
+            seq = pre_experiment_sequence
+            if seq is None:
+                timeline = await self.forker.timeline(task_id)
+                seq = max((e["sequence"] for e in timeline), default=0)
             outcome = await self.fork_from_event(
                 task_id=task_id, after_event_sequence=seq,
                 capture_checkpoint=False)

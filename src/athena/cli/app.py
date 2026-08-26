@@ -229,14 +229,13 @@ async def _cmd_run(o: Options, service: Any) -> int:
     # service boundary and hides the OI-style operator surface.
     task = await service.submit(request, wait=False)
     task_id = getattr(task, "id", task)
-    from athena.cli.chat import stream_task
-    from athena.cli.surface import OperatorSurface
+    from athena.cli.chat import stream_task, _surface_class
 
     result = await stream_task(
         service,
         task_id,
         autonomy=_autonomy(o.autonomy),
-        surface=OperatorSurface(details=o.details),
+        surface=_surface_class()(details=o.details),
     )
     if result is not None:
         from athena.cli.chat import render_summary
@@ -418,6 +417,16 @@ def _click_cli(click: Any):
     @click.pass_context
     def cancel(ctx, task_id):
         sys.exit(dispatch(base_options(ctx, "cancel", [task_id])))
+
+    @cli.command("oi-stream")
+    @click.option("--task", "task_id", default=None,
+                  help="Stream a specific task instead of the global tail.")
+    @click.pass_context
+    def oi_stream(ctx, task_id):
+        """Live OI window: unbuffered model/runtime stream + activity mascot."""
+        from athena.cli.oi_stream import main as _oi_main
+
+        sys.exit(_oi_main(["--task", task_id] if task_id else []))
 
     return cli
 
