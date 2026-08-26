@@ -152,6 +152,7 @@ class ContextCompiler:
         skill_loader: Any = None,
         workspace_reader: Any = None,
         capability_registry: Any = None,
+        artifact_store: Any = None,
         compressor: ContextCompressor | None = None,
         summarizer: Any = None,
         context_window: int = 128_000,
@@ -165,6 +166,7 @@ class ContextCompiler:
         self._skill_loader = skill_loader
         self._workspace_reader = workspace_reader
         self._capability_registry = capability_registry
+        self._artifact_store = artifact_store
         self._compressor = compressor or ContextCompressor(
             recent_turns=recent_verbatim_turns, summarizer=summarizer
         )
@@ -252,34 +254,61 @@ class ContextCompiler:
                     provenance=prov(SourceType.USER, trust=TrustClass.USER_CONTENT, scope="attachment"),
                 ))
             elif hasattr(att, 'kind') and hasattr(att, 'ref'):
-                # ContextRef or similar
-                if att.kind == "artifact" and self._artifact_store is not None:
-                    # Load artifact and create appropriate block
-                    try:
+                # ContextRef or similar — normalize into canonical blocks.
+                from athena.protocol.messages import (
+                    AudioBlock, FileRefBlock, ImageBlock,
+                )
+
+                def _block_for(kind: str, uri: str, mime: str | None):
+                    if mime and mime.startswith("image/"):
+                        return ImageBlock(type="image", data_path=uri, mime_type=mime)
+                    if mime and mime.startswith("audio/"):
+                        return AudioBlock(type="audio", data_path=uri, mime_type=mime)
+                    return FileRefBlock(type="file_ref", uri=uri, mime_type=mime)
+
+                block = None
+                ref_uri = getattr(att, "ref", "")
+                mime = getattr(att, "mime_type", None) or \
+                    (getattr(att, "summary", None) or "").split("mime=")[-1] or None
+                try:
+                    if att.kind == "artifact" and self._artifact_store is not None:
+                        from athena.protocol.artifacts import ArtifactRef
+                        from athena.protocol.messages import ArtifactRefBlock
+
                         ref = att.ref if isinstance(att.ref, ArtifactRef) else None
                         if ref is not None:
-                            data = await self._artifact_store.load(ref)
-                            # Create appropriate block based on mime type
-                            mime = ref.mime_type or "application/octet-stream"
-                            if mime.startswith("image/"):
-                                block = ImageBlock(type="image", data_path=ref.storage_path or ref.uri, mime_type=mime)
-                            elif mime.startswith("audio/"):
-                                block = AudioBlock(type="audio", data_path=ref.storage_path or ref.uri, mime_type=mime)
-                            else:
-                                block = FileRefBlock(type="file", data_path=ref.storage_path or ref.uri, mime_type=mime)
-                            text = f"[{block.type}: {ref.uri}]"
-                            entries.append(_Entry(
-                                name=f"attachment:{block.type}",
-                                text=text,
-                                tokens=estimate_tokens(text),
-                                role=Role.USER,
-                                category="attachment",
-                                trust=TrustClass.USER_CONTENT,
-                                mandatory=True,
-                                provenance=prov(SourceType.USER, trust=TrustClass.USER_CONTENT, scope="attachment"),
-                            ))
-                    except Exception:
-                        pass
+                            await self._artifact_store.load(ref)  # verify readable
+                            mime = ref.mime_type or mime or "application/octet-stream"
+                            block = ArtifactRefBlock(
+                                type="artifact_ref", uri=ref.uri, ref=ref)
+                            ref_uri = ref.uri
+                    if block is None:
+                        # file/session/task refs become explicit file_ref blocks
+                        block = _block_for(att.kind, str(ref_uri), mime)
+                except Exception as exc:
+                    # P1-24: failures are surfaced as a visible entry, not
+                    # silently swallowed.
+                    entries.append(_Entry(
+                        name=f"attachment:error:{ref_uri[:40]}",
+                        text=f"[attachment unavailable: {att.kind} {ref_uri} ({exc})]",
+                        tokens=16, role=Role.USER, category="attachment",
+                        trust=TrustClass.USER_CONTENT, mandatory=False,
+                        provenance=prov(SourceType.USER, trust=TrustClass.USER_CONTENT,
+                                        scope="attachment"),
+                    ))
+                    continue
+                if block is None:
+                    continue
+                entries.append(_Entry(
+                    name=f"attachment:{block.type}",
+                    text=f"[{block.type}: {ref_uri}]",
+                    tokens=estimate_tokens(str(ref_uri)),
+                    role=Role.USER,
+                    category="attachment",
+                    trust=TrustClass.USER_CONTENT,
+                    mandatory=True,
+                    provenance=prov(SourceType.USER, trust=TrustClass.USER_CONTENT, scope="attachment"),
+                ))
         return entries
 
     async def _load_capabilities(self, *, require_tools: bool = False) -> list[CapabilityDescriptor]:

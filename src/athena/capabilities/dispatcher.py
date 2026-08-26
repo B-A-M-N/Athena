@@ -144,14 +144,33 @@ class CapabilityDispatcher:
         # strict revalidation follows; policy/approval/execution all see the
         # exact canonical arguments. (Spec invariant: repair changes syntax
         # and representation only — never capability or trust.)
+        # If the provider boundary recorded a RAW unparseable arguments string
+        # for this call, give the repairer the original bytes so rules like
+        # double-decode / control-char escape can act on them.
+        from athena.models.compat.candidates import get_raw_candidate
+
+        repair_arguments = dict(request.arguments or {})
+        candidate = get_raw_candidate(request.call_id)
+        if (
+            candidate is not None
+            and candidate.parsed_arguments is None
+            and isinstance(candidate.raw_arguments, str)
+            and candidate.raw_arguments.strip() not in ("", "{}")
+        ):
+            repair_arguments = candidate.raw_arguments  # type: ignore[assignment]
+            completion_state = candidate.completion_state
+        else:
+            completion_state = "CLEAN"
+
         repaired_args, receipt = self.repairer.repair(
             call_id=request.call_id,
             tool_name=request.capability_id,
-            arguments=dict(request.arguments or {}),
+            arguments=repair_arguments,
             input_schema=executor.descriptor.input_schema,
             validate_fn=validate_schema,
             provider_profile_id=getattr(self, "_provider_profile_id", None),
             model_id=getattr(self, "_model_id", None),
+            completion_state=completion_state,
         )
         if receipt.outcome == "INVALID":
             result = CapabilityResult(

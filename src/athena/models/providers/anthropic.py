@@ -26,6 +26,7 @@ from athena.protocol.errors import (
     ProviderUnavailable,
 )
 from athena.protocol.ids import new_id
+from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
 from athena.protocol.messages import (
     CapabilityCallBlock,
     CapabilityResultBlock,
@@ -323,12 +324,21 @@ class AnthropicProvider:
                 index = payload.get("index", 0)
                 slot = tool_uses.get(index)
                 if slot is not None:
+                    raw_input = "".join(slot["input_tokens"]) or "{}"
                     try:
-                        arguments = json.loads(
-                            "".join(slot["input_tokens"]) or "{}"
-                        )
+                        arguments = json.loads(raw_input)
                     except ValueError:
                         arguments = {}
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    if arguments == {} and raw_input.strip() not in ("", "{}"):
+                        candidate = ToolCallCandidate.parse(
+                            slot["call_id"] or new_id("call"),
+                            slot["name"],
+                            raw_input,
+                        )
+                        if candidate.parsed_arguments is None:
+                            record_raw_candidate(candidate)
                     block = CapabilityCallBlock(
                         type="capability_call",
                         call_id=slot["call_id"] or new_id("call"),

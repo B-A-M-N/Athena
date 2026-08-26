@@ -38,6 +38,11 @@ try:
 except ImportError:  # pragma: no cover
     pexpect = None  # type: ignore[assignment]
 
+try:
+    import pyte
+except ImportError:  # pragma: no cover
+    pyte = None  # type: ignore[assignment]
+
 _MAX_SESSIONS_PER_TASK = 8
 _DEFAULT_WAIT_TIMEOUT = 15.0
 _MAX_WAIT_TIMEOUT = 60.0
@@ -54,12 +59,31 @@ def _result(request, ok=True, output="", error="", meta=None):
     )
 
 
+def new_screen(rows: int, cols: int):
+    """Create a pyte virtual terminal matching the PTY dimensions."""
+    return pyte.HistoryScreen(cols, rows, history=1000)
+
+
+def feed_screen(screen, text: str) -> None:
+    """Feed raw terminal output (with ANSI escapes) into the framebuffer."""
+    pyte.ByteStream(screen).feed(text.encode("utf-8", "replace"))
+
+
+def _tail_text(data, limit: int = 4000) -> str:
+    """Render a screen result (str or list of lines) as a tail-limited string."""
+    text = data if isinstance(data, str) else "\n".join(data)
+    return text[-limit:]
+
+
 class _Session:
-    """PTY session with its own accumulating output buffer.
+    """PTY session with a raw transcript buffer and a real screen framebuffer.
 
     Patterned on Panopticon's PTY adapter: pexpect's ``before`` is consumed
     by expect() calls, so the session keeps a persistent sanitized buffer of
-    everything received. ``screen`` returns this buffer, not ``child.before``.
+    everything received (``buffer``) *and* a pyte virtual terminal
+    (``screen_obj``) that emulates cursor movement, line wrapping,
+    alternate-screen overwrites and clears. ``screen()`` returns the
+    framebuffer display — what an actual 80x24 terminal would show.
     """
 
     _ANSI_RE = re.compile(
@@ -79,12 +103,17 @@ class _Session:
             dimensions=(rows, cols), env=env, cwd=cwd, timeout=None,
         )
         self.child = child
+        self.cmd_text = cmd
         self.rows = rows
         self.cols = cols
         self.buffer = ""
+        if pyte is not None:
+            self.screen_obj = new_screen(rows, cols)
+        else:  # pragma: no cover - pyte is a hard dep of this capability
+            self.screen_obj = None
 
     def drain(self, quiet_seconds: float = 0.3) -> str:
-        """Read all pending output into the buffer until quiet."""
+        """Read all pending output into the buffers until quiet."""
         deadline = time.time() + quiet_seconds
         while time.time() < deadline:
             try:
@@ -93,13 +122,26 @@ class _Session:
                     self.buffer += chunk
                     if len(self.buffer) > self._BUF_CAP:
                         self.buffer = self.buffer[-self._BUF_CAP:]
+                    if self.screen_obj is not None:
+                        try:
+                            feed_screen(self.screen_obj, chunk)
+                        except Exception:
+                            pass
                     deadline = time.time() + quiet_seconds
             except Exception:
                 break
         return self.screen()
 
-    def screen(self) -> str:
+    def screen(self) -> "str | list[str]":
+        if self.screen_obj is not None:
+            return self.screen_obj.display
         return self._ANSI_RE.sub("", self.buffer)
+
+    def cursor(self) -> tuple[int, int]:
+        """(row, col) of the cursor on the framebuffer, 0-indexed."""
+        if self.screen_obj is not None:
+            return (self.screen_obj.cursor.y, self.screen_obj.cursor.x)
+        return (0, 0)
 
     def alive(self) -> bool:
         return self.child.isalive()
@@ -187,11 +229,35 @@ class TerminalSessionCapability:
             rows = int(args.get("rows") or 24)
             cols = int(args.get("cols") or 80)
             cwd = args.get("cwd")
+            if cwd:
+                workspace = None
+                ctx = kwargs.get("context")
+                if ctx is not None:
+                    workspace = getattr(ctx, "workspace", None) or (
+                        ctx.get("workspace") if isinstance(ctx, dict) else None)
+                if workspace:
+                    ws_root = os.path.realpath(str(workspace))
+                    real = os.path.realpath(str(cwd))
+                    if not (real == ws_root or real.startswith(ws_root + os.sep)):
+                        return _result(
+                            request, ok=False,
+                            error=f"cwd outside workspace: {cwd}")
+                cwd = str(cwd)
             sess = await loop.run_in_executor(
                 None, lambda: _Session(sid, request.task_id, cmd, rows, cols, cwd=cwd))
             self._sessions[sid] = sess
             return _result(request, output=f"created {sid} ({cmd})",
                            meta={"session": sid})
+
+        if op == "list":
+            owned = [
+                {"session": s.id, "command": s.cmd_text,
+                 "alive": s.alive(), "rows": s.rows, "cols": s.cols}
+                for s in self._sessions.values()
+                if s.task_id == request.task_id
+            ]
+            return _result(request, output=f"{len(owned)} session(s)",
+                           meta={"sessions": owned})
 
         sess = self._own(request)
         if sess is None:
@@ -199,8 +265,11 @@ class TerminalSessionCapability:
 
         if op == "screen":
             data = await loop.run_in_executor(None, sess.drain)
-            return _result(request, output=data[-4000:], meta={
-                "session": sess.id, "alive": sess.alive()})
+            row, col = sess.cursor()
+            return _result(request, output=_tail_text(data), meta={
+                "session": sess.id, "alive": sess.alive(),
+                "cursor_row": row, "cursor_col": col,
+                "rows": sess.rows, "cols": sess.cols})
 
         if op == "write":
             await loop.run_in_executor(None, sess.child.write, str(args.get("text") or ""))
@@ -215,7 +284,7 @@ class TerminalSessionCapability:
                 return sess.drain()
 
             data = await loop.run_in_executor(None, _drain_send)
-            return _result(request, output=data[-4000:], meta={"session": sess.id})
+            return _result(request, output=_tail_text(data), meta={"session": sess.id})
 
         if op == "keys":
             raw = self._escape_keys(str(args.get("keys") or ""))
@@ -226,7 +295,7 @@ class TerminalSessionCapability:
                 return sess.drain()
 
             data = await loop.run_in_executor(None, _drain_keys)
-            return _result(request, output=data[-4000:], meta={"session": sess.id})
+            return _result(request, output=_tail_text(data), meta={"session": sess.id})
 
         if op == "wait_for":
             pattern = str(args.get("pattern") or "")
@@ -246,7 +315,7 @@ class TerminalSessionCapability:
                 deadline = _time.monotonic() + timeout
                 while _time.monotonic() < deadline:
                     sess.drain(quiet_seconds=0.1)
-                    if pattern in sess.screen():
+                    if pattern in "\n".join(sess.screen()):
                         return True
                     if not sess.alive():
                         return False
@@ -254,12 +323,12 @@ class TerminalSessionCapability:
                 return False
 
             matched = await loop.run_in_executor(None, _wait)
-            data = sess.screen()
+            data = _tail_text(sess.screen())
             if matched:
-                return _result(request, output=data[-4000:], meta={
+                return _result(request, output=data, meta={
                     "session": sess.id, "matched": True})
             reason = "eof" if not sess.alive() else "timeout"
-            return _result(request, ok=False, output=data[-4000:],
+            return _result(request, ok=False, output=data,
                            error=f"wait_for: {reason}",
                            meta={"session": sess.id, "matched": False})
 
@@ -269,6 +338,11 @@ class TerminalSessionCapability:
             await loop.run_in_executor(
                 None, sess.child.setwinsize, rows, cols)
             sess.rows, sess.cols = rows, cols
+            if getattr(sess, "screen_obj", None) is not None:
+                try:
+                    sess.screen_obj.resize(lines=rows, columns=cols)
+                except Exception:
+                    pass
             return _result(request, output="ok", meta={"session": sess.id})
 
         if op == "kill":

@@ -60,7 +60,8 @@ class DebuggerCapability:
             "port; set/clear breakpoints by file:line; continue, pause, step "
             "over/in/out; read stack frames and local variables; evaluate an "
             "expression inside a frame. Operations: launch/attach/breakpoint/"
-            "continue/pause/step/stack/variables/eval/detach/status."
+            "continue/pause/step/stack/variables/eval/detach/status. "
+            "(DAP client pending; launch/status/detach only)."
         ),
         input_schema={
             "type": "object",
@@ -92,6 +93,10 @@ class DebuggerCapability:
     )
 
     def __init__(self) -> None:
+        if debugpy is None:
+            raise ImportError(
+                "debugger capability requires debugpy; "
+                "install athena-agent[debug]")
         self._sessions: dict[str, dict[str, Any]] = {}
 
     def _own(self, request) -> dict | None:

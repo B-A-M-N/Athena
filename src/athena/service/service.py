@@ -21,6 +21,7 @@ background loop. ``AthenaService.stop()`` shuts down in reverse order.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import tempfile
@@ -301,6 +302,8 @@ class AthenaService:
         # Watch polling: file/process watchers push WatchObserved events
         # into the durable stream while the service runs (P1 'watch').
         self._watch_poll_task = asyncio.create_task(self._poll_watches())
+        # P1-32: structured shutdown registry for capability-owned resources.
+        self._shutdown_hooks: list[tuple[str, Any]] = []
 
         # 8. Models + router (with role-divided policies: "summarizer",
         # "judge", etc. can be pinned to specific models in config; roles
@@ -320,6 +323,7 @@ class AthenaService:
             memory_store=memory,
             skill_loader=skills_store,
             capability_registry=registry,
+            artifact_store=self._artifacts,
             summarizer=self._make_model_summarizer(model_registry),
             context_window=cfg.context_window,
             reserve_output=cfg.reserve_output,
@@ -363,8 +367,16 @@ class AthenaService:
             skills_store=skills_store,
         )
 
-        # 12b. Register schedule capability over the scheduler subsystem.
-        registry.register(ScheduleCapability(ScheduleAPI(self._scheduler, self._task_manager)))
+        # 12b. Register schedule capability AFTER the scheduler is constructed
+        # (P1-25: ScheduleAPI must capture a live scheduler, not None).
+        scheduler = Scheduler(
+            store=schedules,
+            task_manager=task_manager,
+            max_concurrent=cfg.scheduler_max_concurrent,
+            loop_interval_seconds=cfg.scheduler_interval_seconds,
+        )
+        self._scheduler = scheduler
+        registry.register(ScheduleCapability(ScheduleAPI(scheduler, task_manager)))
 
         # 12.5 Crash recovery: reconcile orphaned state before claiming new work.
         from athena.recovery.manager import RecoveryManager
@@ -390,14 +402,6 @@ class AthenaService:
         )
         self._worker = worker
         self._worker_task = asyncio.create_task(self._worker.run_forever())
-
-        scheduler = Scheduler(
-            store=schedules,
-            task_manager=task_manager,
-            max_concurrent=cfg.scheduler_max_concurrent,
-            loop_interval_seconds=cfg.scheduler_interval_seconds,
-        )
-        self._scheduler = scheduler
 
         # 14. MCP (best-effort).
         self._mcp = MCPAdapter(registry)
@@ -456,6 +460,19 @@ class AthenaService:
                         _logger.warning("interrupt task %s on stop failed: %s", tid, exc)
             except Exception as exc:
                 _logger.warning("interrupt-running-tasks on stop failed: %s", exc)
+
+        # Watch poller (P1-31): cancel and await before closing resources.
+        poll_task = getattr(self, "_watch_poll_task", None)
+        if poll_task is not None:
+            poll_task.cancel()
+            try:
+                await poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._watch_poll_task = None
+
+        # Capability-owned resources via shutdown registry (P1-32).
+        await self._run_shutdown_hooks()
 
         # MCP clients.
         for client in self._mcp_clients:
@@ -1463,6 +1480,31 @@ class AthenaService:
         self._checkpoints = CheckpointManager()
         registry.register(WorkspaceCapability(
             checkpoint_manager=self._checkpoints))
+
+        # Capability-owned resource teardown (P1-32).
+        if hasattr(self, "_terminals"):
+            self.register_shutdown_hook(
+                "terminal_sessions", self._terminals.close_all)
+        if hasattr(self, "_debugger"):
+            self.register_shutdown_hook(
+                "debugger_sessions", self._debugger.close_all)
+
+    def register_shutdown_hook(self, name: str, hook) -> None:
+        """Register a capability-owned resource teardown (P1-32)."""
+        self._shutdown_hooks.append((name, hook))
+
+    async def _run_shutdown_hooks(self) -> None:
+        for name, hook in reversed(self._shutdown_hooks):
+            try:
+                if asyncio.iscoroutinefunction(hook):
+                    await hook()
+                else:
+                    result = hook()
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception as exc:
+                _logger.warning("shutdown hook %s failed: %s", name, exc)
+        self._shutdown_hooks.clear()
 
     # ------------------------------------------------------------------ #
     # Fusion engines: shadow execution + execution-grounded world state

@@ -26,6 +26,7 @@ from athena.protocol.errors import (
     ProviderUnavailable,
 )
 from athena.protocol.ids import new_id
+from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
 from athena.protocol.messages import (
     CapabilityCallBlock,
     CapabilityResultBlock,
@@ -83,6 +84,20 @@ def _dumps_args(raw: str | dict) -> Any:
         return parsed if isinstance(parsed, dict) else {}
     except ValueError:
         return {}
+
+
+def _emit_candidate(
+    call_id: str,
+    capability_id: str,
+    raw: str | dict,
+) -> None:
+    """Preserve the RAW arguments string at the boundary when the canonical
+    parse fails, so the repair engine can act on original bytes."""
+    if isinstance(raw, dict):
+        return  # clean parse — nothing to preserve
+    candidate = ToolCallCandidate.parse(call_id, capability_id, raw)
+    if candidate.parsed_arguments is None:
+        record_raw_candidate(candidate)
 
 
 def serialize_tool_result(output: str | None) -> str:
@@ -296,6 +311,7 @@ class OpenAICompatProvider:
             for tc in delta.get("tool_calls") or []:
                 self._accumulate_tool_call(tc, tool_calls)
         for call in tool_calls.values():
+            _emit_candidate(call["call_id"], call["name"], call["arguments"])
             yield ModelEvent(
                 type=ModelEventType.DELTA,
                 request_id=request.request_id,
@@ -352,6 +368,11 @@ class OpenAICompatProvider:
                 blocks.append(TextBlock(type="text", text=message["content"]))
             for tc in message.get("tool_calls") or []:
                 fn = tc.get("function") or {}
+                _emit_candidate(
+                    tc.get("id") or new_id("call"),
+                    fn.get("name", ""),
+                    fn.get("arguments") or "{}",
+                )
                 blocks.append(
                     CapabilityCallBlock(
                         type="capability_call",
