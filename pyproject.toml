@@ -16,6 +16,7 @@ dependencies = [
     "starlette>=0.38,<1.0",
     "click>=8.1",
     "uvicorn>=0.30",
+    "pexpect>=4.9",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,7 @@ api = []
 mcp = ["mcp>=1.0"]
 anthropic = ["anthropic>=0.39"]
 container = ["docker>=7.0"]
+debug = ["debugpy>=1.8"]
 cli = []
 dev = [
     "pytest>=8.0",

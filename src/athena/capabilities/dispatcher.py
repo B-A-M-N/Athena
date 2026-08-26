@@ -250,6 +250,11 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
     # ------------------------------------------------------------------ #
     # Resolution / mutation
     # ------------------------------------------------------------------ #
+    # Capabilities whose operations are process/code operations, not file
+    # writes — even when an op name like "create" would suggest a write.
+    _EXEC_CAPABILITIES = frozenset({"execute", "terminal_session", "process",
+                                    "debugger", "shell", "bash"})
+
     @staticmethod
     def _resolve_effects(descriptor, arguments: Mapping[str, Any]) -> tuple[EffectClass, ...]:
         """Resolve the full concrete effect set for bound arguments (BHV-041).
@@ -261,7 +266,12 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
         op = str(arguments.get("operation") or arguments.get("action") or "").lower()
         want: tuple[EffectClass, ...]
 
-        if op in ("copy", "move"):
+        if descriptor.id in CapabilityDispatcher._EXEC_CAPABILITIES:
+            # Code/process capabilities: every operation is execution-shaped.
+            # READ_LOCAL covers screen/output inspection; WRITE_LOCAL covers
+            # side effects the spawned process may have.
+            want = (EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS)
+        elif op in ("copy", "move"):
             want = (EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL)
         elif op in ("write", "patch", "mkdir", "create", "update", "save"):
             want = (EffectClass.WRITE_LOCAL,)

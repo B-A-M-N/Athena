@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from athena.service.service import AthenaService
@@ -25,19 +27,19 @@ async def test_finalize_observer_registered(service):
 
 
 async def test_completed_task_records_episodic_memory(service):
-    from athena.memory.store import MemoryStore
-
-    spec = await service.submit(
-        _req("say the word banana"), wait=True
-    )
+    spec = await service.submit(_req("say the word banana"), wait=True)
     rows = await service._store_tasks.list_by_status(TaskStatus.COMPLETE)
     assert any(r["id"] == spec.id for r in rows)
-    # The pipeline stores an episodic record per completed task.
-    records = await service._memory.search("banana", scope=None, limit=50) if False else None
-    episodic = await service._memory.retrieve_by_recency(None, None, 100)
-    matches = [r for r in episodic if getattr(r, "task_id", None)]
-    content = [r.content for r in episodic]
-    assert any(spec.id in c or "banana" in c for c in content), content
+
+    # The knowledge pipeline is async post-finalization; poll briefly.
+    content: list[str] = []
+    for _ in range(40):
+        episodic = await service._memory.retrieve_by_recency(None, None, 100)
+        content = [r.content for r in episodic]
+        if any(spec.id in c or "banana" in c for c in content):
+            return
+        await asyncio.sleep(0.1)
+    pytest.fail(f"episodic memory not recorded; got {content!r}")
 
 
 def _req(prompt: str):

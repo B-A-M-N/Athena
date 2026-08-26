@@ -1407,6 +1407,22 @@ class AthenaService:
         registry.register(MemoryCapability(memory))
         registry.register(SkillsCapability(skills_store))
         registry.register(DelegateCapability(self._delegation))
+        # Computational-body capabilities (P0 roadmap).
+        from athena.capabilities.system import MachineCapability, ProcessCapability
+        from athena.capabilities.terminal_session import TerminalSessionCapability
+
+        self._terminals = TerminalSessionCapability()
+        registry.register(self._terminals)
+        self._processes = ProcessCapability()
+        registry.register(self._processes)
+        registry.register(MachineCapability())
+        try:
+            from athena.capabilities.debugger import DebuggerCapability
+
+            self._debugger = DebuggerCapability()
+            registry.register(self._debugger)
+        except Exception as exc:  # debugpy optional
+            _logger.info("debugger capability unavailable: %s", exc)
 
     def _register_providers(self, registry: ProviderRegistry) -> None:
         pcs = tuple(self.config.providers)

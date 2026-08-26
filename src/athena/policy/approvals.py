@@ -38,10 +38,14 @@ def args_digest(arguments: Mapping[str, Any]) -> str:
     A generated grant binds to the digest of the exact arguments that were
     approved; a resumed call with substituted arguments fails to match and is
     re-prompted (or denied) instead of silently bypassing policy.
+
+    ``call_id`` is EXCLUDED from the digest: it is transport bookkeeping, not
+    semantics. The approval flow itself adds the original call's id when
+    resuming a parked call; pinning the digest to it would make every exact
+    CALL-scope resume fail its own grant.
     """
-    canonical = json.dumps(
-        dict(arguments or {}), sort_keys=True, ensure_ascii=False, default=str
-    )
+    cleaned = {k: v for k, v in dict(arguments or {}).items() if k != "call_id"}
+    canonical = json.dumps(cleaned, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

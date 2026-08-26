@@ -71,7 +71,15 @@ class PolicyEngine:
             )
 
         if _has(EffectClass.WRITE_LOCAL, request.effects) or self._is_files_op(request, _WRITE_OPS):
-            out = self._eval_write(request, rules)
+            # Process-spawning capabilities carry WRITE_LOCAL as a secondary
+            # effect but must be evaluated as EXECUTE (they run code, not
+            # write files). Only route to _eval_write when there is no
+            # execute/spawn effect present.
+            if not (_has(EffectClass.EXECUTE, request.effects)
+                    or _has(EffectClass.SPAWN_PROCESS, request.effects)):
+                out = self._eval_write(request, rules)
+            else:
+                out = self._eval_execute(request, rules, level)
         elif _has(EffectClass.DELETE, request.effects) or self._is_files_op(request, _DELETE_OPS):
             out = self._eval_delete(request, rules)
         elif (_has(EffectClass.EXECUTE, request.effects)
