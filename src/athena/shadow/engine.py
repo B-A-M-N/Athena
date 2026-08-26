@@ -71,6 +71,16 @@ class ShadowEngine:
     def bind(self, dispatcher) -> None:
         self._dispatcher = dispatcher
 
+    def bind_service(self, service) -> None:
+        """Bind the owning service for approval resolution."""
+        self._service = service
+
+    async def _service_approve(self, approval_id: str) -> None:
+        svc = getattr(self, "_service", None)
+        if svc is None:
+            raise RuntimeError("ShadowEngine not bound to a service")
+        await svc.approve(approval_id, granted=True, scope="call")
+
     # ------------------------------------------------------------------
     # Branch lifecycle
     # ------------------------------------------------------------------
@@ -154,8 +164,7 @@ class ShadowEngine:
                 if isinstance(result, SuspendedCall):
                     # Policy parked a call: auto-approve CALL-scope inside the
                     # shadow ONLY (the shadow cannot touch reality).
-                    await self._dispatcher.approve(
-                        result.approval_id, granted=True, scope="call")
+                    await self._service_approve(result.approval_id)
                     args2 = dict(args)
                     args2["call_id"] = result.request.call_id
                     req2 = CapabilityRequest(

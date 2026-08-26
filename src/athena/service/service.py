@@ -1435,6 +1435,7 @@ class AthenaService:
             self._shadow = ShadowEngine()
         if self._shadow._dispatcher is None and self._dispatcher is not None:
             self._shadow.bind(self._dispatcher)
+        self._shadow.bind_service(self)
         return self._shadow
 
     def world_state(self, task_id: str | None = None):
