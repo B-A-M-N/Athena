@@ -331,6 +331,19 @@ class ContextCompiler:
     ) -> list[_Entry]:
         out: list[_Entry] = []
         transcript = list(recent) if recent else await self._load_transcript(task)
+        # ``!!`` direct escapes are durable audit records, but explicitly opt
+        # out of the next model context. Keeping this at the compiler boundary
+        # preserves one transcript while honoring the OI-style display-only
+        # escape semantics.
+        transcript = [
+            m
+            for m in transcript
+            if not (
+                getattr(m, "metadata", None)
+                and m.metadata.get("direct_execution")
+                and m.metadata.get("inject_into_context") is False
+            )
+        ]
         for i, m in enumerate(transcript):
             out.append(_message_entry(m, is_last=(i == len(transcript) - 1)))
         for rec in await self._load_memories(task):

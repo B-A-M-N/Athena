@@ -70,7 +70,7 @@ from athena.tasks.delegation import DelegationManager
 from athena.tasks.manager import TaskManager
 from athena.tasks.worker import TaskWorker, WorkerConfig
 
-from athena.protocol.events import Event
+from athena.protocol.events import Event, make_event
 from athena.protocol.ids import new_id
 from athena.protocol.policy import ApprovalScope, Principal
 from athena.protocol.tasks import (
@@ -489,11 +489,16 @@ class AthenaService:
         cwd: str | None = None,
         session_id: str | None = None,
         inject_into_context: bool = True,
+        on_approval=None,
     ) -> dict:
         """Execute code directly WITHOUT routing through the model loop.
 
         Used by the CLI ``!``/``!!`` shell escapes. The execution still flows
-        through policy and approval (safety), but bypasses AgentKernel inference.
+        through the canonical registry -> policy -> capability path and can
+        request approval, but bypasses AgentKernel inference. ``on_approval``
+        is an optional async callback receiving ``(approval_id, scopes)``;
+        interfaces use it to collect the human decision without making the
+        service own presentation concerns.
 
         Args:
             source: The code/shell command to execute.
@@ -501,62 +506,168 @@ class AthenaService:
             cwd: Working directory (must be within workspace root).
             session_id: Optional session to record the execution against.
             inject_into_context: If True, the result is recorded as a capability
-                result in the session transcript (the ``!`` form). If False,
-                the result is only returned/printed (the ``!!`` form).
+                result that future model turns may use (the ``!`` form). If
+                False, the result is recorded for audit but excluded from future
+                model context (the ``!!`` form).
+            on_approval: Optional async ``(approval_id, scopes)`` decision hook.
 
         Returns:
             A result dict with ``exit_code``, ``stdout``, ``stderr``, ``status``.
         """
-        execution = self._require_execution()
-        ws = self._default_workspace
-        # Resolve cwd within workspace
-        if cwd:
-            from pathlib import Path as _Path
-            root = _Path(ws.root).resolve()
-            if _Path(cwd).is_absolute():
-                candidate = _Path(cwd).resolve()
-            else:
-                candidate = (root / cwd).resolve()
-            if candidate != root and not str(candidate).startswith(str(root) + "/"):
-                cwd = None
-            else:
-                cwd = str(candidate)
-
-        from athena.protocol.execution import ExecutionRequest
-
-        # Map language to runtime name
-        runtime_name = language
-        if language in ("sh", "bash", "zsh"):
-            runtime_name = "shell"
-        elif language in ("py", "python3"):
-            runtime_name = "python"
-        elif language in ("js", "nodejs"):
-            runtime_name = "node"
-        elif language in ("ps1", "pwsh", "cmd"):
-            runtime_name = "powershell"
-
-        if runtime_name not in execution.available_runtimes():
-            return {"exit_code": 1, "stdout": "", "stderr": f"runtime unavailable: {language}", "status": "failed"}
-
-        task_id = new_id("direct")
-        exec_req = ExecutionRequest(
-            runtime=runtime_name,
-            source=source,
-            task_id=task_id,
-            workspace_id=ws.id,
-            cwd=cwd,
+        from athena.capabilities.dispatcher import SuspendedCall
+        from athena.protocol.capabilities import (
+            CapabilityRequest,
+            CapabilityResult,
+            CapabilityResultStatus,
         )
-        exec_id = new_id("exec")
-        result = await execution.execute(exec_req, exec_id)
 
-        status_str = result.status.value if result.status else "failed"
-        return {
-            "exit_code": result.exit_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "status": status_str,
-            "duration_ms": result.duration_ms,
+        dispatcher = self._dispatcher
+        if dispatcher is None:
+            raise RuntimeError("AthenaService not started")
+        ws = self._default_workspace
+        request = CapabilityRequest(
+            capability_id="execute",
+            arguments={
+                "language": language,
+                "code": source,
+                **({"cwd": cwd} if cwd is not None else {}),
+            },
+            # Direct escapes have no model task, so the task FK remains NULL;
+            # their session transcript and approval record are still durable.
+            task_id=None,
+            session_id=session_id,
+        )
+
+        async def _dispatch():
+            return await dispatcher.dispatch(
+                request,
+                workspace=ws,
+                profile=self.config.autonomy_level,
+            )
+
+        result = await _dispatch()
+        if isinstance(result, SuspendedCall):
+            approval_id = result.approval_id
+            scopes = [s.value for s in result.decision.approval_scope_options]
+            if not approval_id:
+                return {
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "approval required but no approval id was issued",
+                    "status": "failed",
+                }
+            if on_approval is None:
+                return {
+                    "approval_id": approval_id,
+                    "scopes": scopes,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "approval required",
+                    "status": "approval_required",
+                }
+            decision = on_approval(approval_id, scopes)
+            if hasattr(decision, "__await__"):
+                decision = await decision
+            granted = bool(getattr(decision, "granted", decision))
+            scope = getattr(decision, "scope", None)
+            await self.approve(approval_id, granted=granted, scope=scope)
+            if not granted:
+                result = CapabilityResult(
+                    request.call_id,
+                    request.capability_id,
+                    CapabilityResultStatus.FAILED,
+                    error="denied: approval not granted",
+                    metadata={"decision": "deny"},
+                )
+            else:
+                # The approval grant is exact and the request object is
+                # unchanged, so the dispatcher re-evaluates the same call.
+                result = await _dispatch()
+
+        if not isinstance(result, CapabilityResult):
+            return {
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "direct execute returned an invalid capability result",
+                "status": "failed",
+            }
+
+        ok = result.status is CapabilityResultStatus.OK
+        metadata = dict(result.metadata or {})
+        output = result.output or ""
+        error = result.error or ""
+        payload = {
+            "exit_code": metadata.get("exit_code", 0 if ok else 1),
+            "stdout": output if ok else output,
+            "stderr": "" if ok else error,
+            "status": "completed" if ok else "failed",
+            "duration_ms": metadata.get("duration_ms"),
+            "artifact_uri": result.ref_uri,
+            "session_id": session_id,
         }
+        await self._record_direct_result(
+            session_id=session_id,
+            source=source,
+            language=language,
+            result=result,
+            inject_into_context=inject_into_context,
+        )
+        return payload
+
+    async def _record_direct_result(
+        self,
+        *,
+        session_id: str | None,
+        source: str,
+        language: str,
+        result: Any,
+        inject_into_context: bool,
+    ) -> None:
+        """Persist a direct execution as a capability transcript message."""
+        if not session_id or self._store_messages is None:
+            return
+        from athena.protocol.messages import (
+            CapabilityCallBlock,
+            CapabilityResultBlock,
+            Message,
+            Provenance,
+            Role,
+            SourceType,
+            utcnow,
+        )
+
+        if self._sessions is not None and await self._sessions.get(session_id) is None:
+            await self._sessions.create(session_id)
+        call_id = getattr(result, "call_id", "") or new_id("call")
+        block_call = CapabilityCallBlock(
+            call_id=call_id,
+            capability_id="execute",
+            arguments={"language": language, "code": source},
+        )
+        block_result = CapabilityResultBlock(
+            call_id=call_id,
+            capability_id="execute",
+            ok=result.status.value == "ok",
+            output=result.output or "",
+            error=result.error,
+            metadata=dict(result.metadata or {}),
+            ref_uri=result.ref_uri,
+        )
+        await self._store_messages.append_to_session(
+            session_id,
+            Message(
+                id=new_id("msg"),
+                role=Role.CAPABILITY,
+                blocks=(block_call, block_result),
+                created_at=utcnow(),
+                provenance=Provenance(source_type=SourceType.CAPABILITY),
+                metadata={
+                    "session_id": session_id,
+                    "direct_execution": True,
+                    "inject_into_context": inject_into_context,
+                },
+            ),
+        )
 
     async def run_task(self, task_id: str) -> TaskSpec:
         """Drive the NAMED task through the kernel synchronously.
@@ -714,6 +825,15 @@ class AthenaService:
         effects = metadata.get("effects") or []
         primary_name = effects[0] if effects and isinstance(effects, list) else None
 
+        # Exact-args pinning is a TOCTOU guard for resuming THE approved call
+        # (CALL scope).  TASK/SESSION/PROJECT scopes authorize future calls and
+        # must not be pinned to one argument digest, or they never match.
+        pinned_digest = digest or None
+        pinned_call = call_id
+        if scope_choice != ApprovalScope.CALL:
+            pinned_digest = None
+            pinned_call = None
+
         try:
             if manager.state(approval_id) is None:
                 manager.create_request(
@@ -722,9 +842,13 @@ class AthenaService:
                     capability=cap,
                     effect=str(primary_name) if primary_name else None,
                     task_id=task_id,
+                    # SESSION-scoped grants are keyed on session_id in
+                    # ApprovalManager._covers_locked; omitting it makes every
+                    # session grant unmatchable and forces re-approval.
+                    session_id=metadata.get("session_id"),
                     approval_id=approval_id,
-                    args_digest=digest or None,
-                    call_id=call_id,
+                    args_digest=pinned_digest,
+                    call_id=pinned_call,
                 )
             manager.grant(approval_id, resolver="user")
         except Exception:
@@ -804,6 +928,148 @@ class AthenaService:
             "result": result,
             "events": [e.type for e in gathered],
         }
+
+    # ------------------------------------------------------------------ #
+    # Operator projections (stable views over canonical durable state)
+    # ------------------------------------------------------------------ #
+    # Each method projects ONE slice of the same canonical stores the kernel
+    # reads.  They never mutate state and never become a second execution
+    # path; the CLI renders them verbatim.
+
+    async def operator_permissions(self) -> dict:
+        """Active policy grants plus pending approval requests."""
+        grants: list[dict] = []
+        if self._policy is not None:
+            try:
+                for g in self._policy.approvals.list_active():
+                    grants.append(
+                        {
+                            "approval_id": g.id,
+                            "scope": getattr(g.scope, "value", str(g.scope)),
+                            "capability": g.capability,
+                            "resource_pattern": g.resource_pattern,
+                            "task_id": g.task_id,
+                            "session_id": g.session_id,
+                            "expires_at": (
+                                g.expires_at.isoformat() if g.expires_at else None
+                            ),
+                        }
+                    )
+            except Exception as exc:
+                _logger.warning("list_active grants failed: %s", exc)
+        pending: list[dict] = []
+        if self._store_approvals is not None:
+            try:
+                for rec in await self._store_approvals.list_pending():
+                    pending.append(
+                        {
+                            "approval_id": rec.get("id"),
+                            "capability_id": rec.get("capability_id"),
+                            "arguments": rec.get("arguments"),
+                            "created_at": rec.get("created_at"),
+                        }
+                    )
+            except Exception as exc:
+                _logger.warning("list_pending approvals failed: %s", exc)
+        return {"active_grants": grants, "pending": pending}
+
+    async def operator_diff(self, *, limit: int = 25) -> list[dict]:
+        """Recent file mutations from the write-ahead mutation ledger."""
+        if self._store_mutations is None:
+            return []
+        try:
+            rows = await self._store_mutations.list_recent(limit=limit)
+        except Exception as exc:
+            _logger.warning("mutation listing failed: %s", exc)
+            return []
+        return [
+            {
+                "id": r.get("id"),
+                "task_id": r.get("task_id"),
+                "resource": r.get("resource"),
+                "operation": r.get("operation"),
+                "status": r.get("status"),
+                "reversible": bool(r.get("reversible")),
+                "before_ref": r.get("before_ref") or r.get("before_state"),
+                "after_state": r.get("after_state"),
+                "created_at": r.get("created_at"),
+            }
+            for r in rows
+            if isinstance(r, dict)
+        ]
+
+    async def undo_mutation(self, mutation_id: str) -> dict:
+        """Roll back one completed mutation through the RollbackExecutor."""
+        if self._store_mutations is None:
+            return {"status": "error", "error": "mutation store unavailable"}
+        from athena.state.rollback import RollbackExecutor
+
+        executor = RollbackExecutor(self._store_mutations, self._artifacts)
+        try:
+            outcome = await executor.execute_inverse(mutation_id)
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+        # Emit an event so the surface and audit trail see the rollback.
+        try:
+            sink = self._forward_events(self._require_events())
+            await sink(
+                make_event(
+                    "MutationRolledBack",
+                    {
+                        "mutation_id": mutation_id,
+                        "outcome": outcome.get("status"),
+                        "rollback_id": outcome.get("rollback_id"),
+                    },
+                )
+            )
+        except Exception as exc:
+            _logger.warning("rollback event emission failed: %s", exc)
+        return outcome
+
+    async def operator_context_summary(self, session_id: str | None = None) -> dict:
+        """What the model would actually see next turn (bounded-context view)."""
+        info: dict = {"session_id": session_id}
+        if session_id and self._store_messages is not None:
+            try:
+                info["message_count"] = await self._store_messages.count_session_messages(
+                    session_id
+                )
+            except Exception as exc:
+                _logger.warning("session message count failed: %s", exc)
+        if self._compiler is not None:
+            try:
+                window = getattr(self._compiler, "context_window", None)
+                reserve = getattr(self._compiler, "reserve_output", None)
+                recent = getattr(self._compiler, "recent_verbatim_turns", None)
+                info["window"] = int(window) if window else None
+                info["reserve_output"] = int(reserve) if reserve else None
+                info["recent_verbatim_turns"] = int(recent) if recent else None
+            except Exception:
+                pass
+        return info
+
+    async def operator_artifacts(self, *, limit: int = 50) -> list[dict]:
+        """Artifact index across all tasks (evidence view)."""
+        if self._artifacts is None:
+            return []
+        try:
+            refs = await self._artifacts.list(limit=limit)
+        except Exception as exc:
+            _logger.warning("artifact listing failed: %s", exc)
+            return []
+        out: list[dict] = []
+        for ref in refs:
+            out.append(
+                {
+                    "uri": getattr(ref, "uri", None),
+                    "name": getattr(ref, "name", None),
+                    "mime_type": getattr(ref, "mime_type", None),
+                    "kind": getattr(ref, "kind", None),
+                    "task_id": getattr(ref, "task_id", None),
+                    "producer": getattr(ref, "producer", None),
+                }
+            )
+        return out
 
     # ------------------------------------------------------------------ #
     # Internal wiring

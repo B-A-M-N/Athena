@@ -187,8 +187,16 @@ class MutationStore:
 
     async def list_by_status(self, status: str) -> list[dict]:
         rows = await self._db.fetch_all(
-            "SELECT * FROM mutations WHERE status = ? ORDER BY created_at ASC",
+            "SELECT * FROM mutations WHERE status = ? ORDER BY created_at DESC",
             (status,),
+        )
+        return [_decode_mutation(r) for r in rows]
+
+    async def list_recent(self, *, limit: int = 25) -> list[dict]:
+        """Most recent mutations across all tasks (operator /diff view)."""
+        rows = await self._db.fetch_all(
+            "SELECT * FROM mutations ORDER BY created_at DESC LIMIT ?",
+            (int(limit),),
         )
         return [_decode_mutation(r) for r in rows]
 

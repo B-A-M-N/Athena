@@ -122,6 +122,7 @@ class Options:
     autonomy: str | None = None
     model: str | None = None
     verbose: bool = False
+    details: bool = False
     deny: bool = False
     artifact_root: str | None = None
     _providers: tuple[Any, ...] = ()
@@ -204,11 +205,20 @@ async def _cmd_run(o: Options, service: Any) -> int:
         workspace=workspace_spec(o.workspace),
         model_policy=_model_policy(o.model),
     )
-    task = await service.submit(request)
+    # Start streaming before waiting so an interactive approval can wake the
+    # parked task.  Waiting first deadlocks supervised execution at the
+    # service boundary and hides the OI-style operator surface.
+    task = await service.submit(request, wait=False)
     task_id = getattr(task, "id", task)
     from athena.cli.chat import stream_task
+    from athena.cli.surface import OperatorSurface
 
-    result = await stream_task(service, task_id, autonomy=_autonomy(o.autonomy))
+    result = await stream_task(
+        service,
+        task_id,
+        autonomy=_autonomy(o.autonomy),
+        surface=OperatorSurface(details=o.details),
+    )
     if result is not None:
         from athena.cli.chat import render_summary
 
@@ -298,8 +308,9 @@ def _click_cli(click: Any):
     @click.option("--autonomy", default=None, type=click.Choice(levels), help="Autonomy profile.")
     @click.option("--model", default=None, help="Model policy.")
     @click.option("--verbose", is_flag=True, help="Verbose output.")
+    @click.option("--details", is_flag=True, help="Show detailed model and task activity.")
     @click.pass_context
-    def cli(ctx: click.Context, config_path, db_path, workspace, autonomy, model, verbose) -> None:
+    def cli(ctx: click.Context, config_path, db_path, workspace, autonomy, model, verbose, details) -> None:
         obj = ctx.ensure_object(dict)
         obj.update(
             config_path=config_path,
@@ -308,6 +319,7 @@ def _click_cli(click: Any):
             autonomy=autonomy,
             model=model,
             verbose=verbose,
+            details=details,
         )
         if ctx.invoked_subcommand is None:
             # Bare `athena`/`athena chat` (no goal) lands in the interactive
@@ -325,12 +337,16 @@ def _click_cli(click: Any):
             autonomy=b.get("autonomy"),
             model=b.get("model"),
             verbose=bool(b.get("verbose")),
+            details=bool(b.get("details")),
         )
 
     @cli.command()
     @click.argument("objective", required=False)
+    @click.option("--details", "c_details", is_flag=True, help="Show detailed model and task activity.")
     @click.pass_context
-    def chat(ctx, objective):
+    def chat(ctx, objective, c_details):
+        if c_details:
+            ctx.ensure_object(dict)["details"] = True
         if objective:
             sys.exit(dispatch(base_options(ctx, "run", [objective])))
         sys.exit(dispatch(base_options(ctx, "chat")))
@@ -340,12 +356,14 @@ def _click_cli(click: Any):
     @click.option("--autonomy", "a_autonomy", type=click.Choice([a.value for a in AutonomyLevel]))
     @click.option("--workspace", "a_workspace", default=None)
     @click.option("--model", "a_model", default=None)
+    @click.option("--details", "r_details", is_flag=True, help="Show detailed model and task activity.")
     @click.pass_context
     def run(ctx, objective, **kw):
         o = base_options(ctx, "run", [objective])
         o.autonomy = kw.get("a_autonomy") or o.autonomy
         o.workspace = kw.get("a_workspace") or o.workspace
         o.model = kw.get("a_model") or o.model
+        o.details = bool(kw.get("r_details")) or o.details
         sys.exit(dispatch(o))
 
     @cli.command()
@@ -401,6 +419,7 @@ def _arg_parse(argv: list[str]) -> Options:
         sp.add_argument("--autonomy", default=None)
         sp.add_argument("--model", default=None)
         sp.add_argument("--verbose", action="store_true")
+        sp.add_argument("--details", action="store_true", help="Show detailed model and task activity.")
 
     for name, help_, pos in (
         ("run", "Submit a one-shot objective.", "objective"),
@@ -431,6 +450,7 @@ def _arg_parse(argv: list[str]) -> Options:
         autonomy=getattr(ns, "autonomy", None),
         model=getattr(ns, "model", None),
         verbose=getattr(ns, "verbose", False),
+        details=getattr(ns, "details", False),
         deny=getattr(ns, "deny", False) if command == "approve" else False,
     )
     if command == "run":

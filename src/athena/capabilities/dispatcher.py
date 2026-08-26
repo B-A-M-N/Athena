@@ -348,6 +348,8 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
             "execution_backend": workspace.execution_backend,
             "scope": scope.value,
             "requested_scope": [s.value for s in decision.approval_scope_options],
+            # SESSION-scoped grants must survive resolution; keyed on this.
+            "session_id": getattr(request, "session_id", None),
         }
 
         if self._approval_store is not None:

@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from typing import Any, AsyncIterator
 
-from athena.protocol.events import Event
+from athena.protocol.events import Event, make_event
+from athena.protocol.ids import new_id
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskResult
+from athena.cli.surface import ApprovalChoice, OperatorSurface
 
 _META_HELP = """\
 /help            show this help
@@ -27,6 +28,12 @@ _META_HELP = """\
 /new             start a fresh session
 /autonomy LEVEL  set autonomy (supervised|coding|autonomous|offline)
 /model POLICY    set model policy
+/details         toggle detailed event activity
+/permissions     show active policy grants and pending approvals
+/diff            show recent file mutations (mutation ledger)
+/undo MUTATION   roll back a completed mutation by id
+/compact         show context-window / compression settings
+/context         show what the next model turn will see
 !cmd             execute a shell command directly
 !!cmd            execute a shell command (output not injected into model context)
 """
@@ -57,6 +64,52 @@ def _model_policy(name: str | None):
     return ModelPolicy(allowed=(name,))
 
 
+async def _cmd_permissions(service: Any) -> None:
+    """Project active grants and pending approvals from canonical stores."""
+    view = await service.operator_permissions()
+    grants = view.get("active_grants") or []
+    pending = view.get("pending") or []
+    print("┌─ permissions ─────────────────────────")
+    if not grants:
+        print("│ no active grants")
+    for g in grants:
+        scope = g.get("scope") or "?"
+        cap = g.get("capability") or "*"
+        pattern = g.get("resource_pattern") or ""
+        expires = g.get("expires_at") or "no expiry"
+        line = f"│ grant {g.get('approval_id')} · {cap} · {scope}"
+        if pattern:
+            line += f" · {pattern}"
+        print(line)
+        print(f"│   expires: {expires}")
+    if not pending:
+        print("│ no pending approvals")
+    for p in pending:
+        print(f"│ pending {p.get('approval_id')} · {p.get('capability_id')}")
+    print("└──────────────────────────────────────")
+
+
+async def _cmd_diff(service: Any, limit: int) -> None:
+    """Project the mutation ledger (grouped file-change evidence)."""
+    rows = await service.operator_diff(limit=limit)
+    print("┌─ mutations ───────────────────────────")
+    if not rows:
+        print("│ (no recorded mutations)")
+    for r in rows:
+        status_icon = {
+            "COMPLETED": "✓",
+            "FAILED": "✗",
+            "ROLLED_BACK": "↩",
+        }.get(r.get("status"), "·")
+        reversible = "reversible" if r.get("reversible") else "one-way"
+        print(
+            f"│ {status_icon} {r.get('operation', '?'):10} "
+            f"{r.get('resource', '?')}  [{reversible}]"
+        )
+        print(f"│   id: {r.get('id')}  task: {r.get('task_id') or '—'}")
+    print("└──────────────────────────────────────")
+
+
 class ChatREPL:
     """Interactive loop binding a user to an ``AthenaService``."""
 
@@ -71,6 +124,7 @@ class ChatREPL:
         self.model_policy: str | None = getattr(options, "model", None) or getattr(config, "model", None)
         self.workspace = _workspace_spec(getattr(options, "workspace", None))
         self._active_task_id: str | None = None
+        self.surface = OperatorSurface(details=bool(getattr(options, "details", False)))
 
     # -- input ------------------------------------------------------------
 
@@ -154,6 +208,46 @@ class ChatREPL:
             self.model_policy = arg or None
             print(f"model: {self.model_policy}")
             return True
+        if name == "details":
+            self.surface.details = not self.surface.details
+            print(f"details: {'on' if self.surface.details else 'off'}")
+            return True
+        if name == "permissions":
+            await _cmd_permissions(self.service)
+            return True
+        if name == "diff":
+            limit = int(arg) if arg.isdigit() else 25
+            await _cmd_diff(self.service, limit)
+            return True
+        if name == "undo":
+            if not arg:
+                print("usage: /undo <mutation_id>")
+                return True
+            outcome = await self.service.undo_mutation(arg)
+            status = outcome.get("status")
+            if status == "ok":
+                print(f"rolled back {arg} (rollback {outcome.get('rollback_id')})")
+            else:
+                print(f"undo failed: {outcome.get('error', status)}")
+            return True
+        if name in ("compact", "context"):
+            summary = await self.service.operator_context_summary(self.session_id)
+            window = summary.get("window")
+            reserve = summary.get("reserve_output")
+            recent = summary.get("recent_verbatim_turns")
+            count = summary.get("message_count")
+            if name == "compact":
+                print(f"context window: {window or '?'} tokens")
+                print(f"output reserve: {reserve if reserve is not None else '?'} tokens")
+                print(f"recent verbatim turns: {recent if recent is not None else '?'}")
+                older = "compressed with provenance retained"
+                print(f"older transcript: {older}")
+            else:
+                print(f"session: {self.session_id or '(none yet)'}")
+                print(f"durable messages: {count if count is not None else '?'}")
+                print("next turn includes: objective, policy boundaries, recent turns,")
+                print("capability calls/results, relevant memories and skills.")
+            return True
         return False
 
     async def _submit_task(self, line: str) -> None:
@@ -166,7 +260,12 @@ class ChatREPL:
         )
         spec = await self.service.submit(request, wait=False)
         self._active_task_id = spec.id
-        result = await stream_task(self.service, spec.id, autonomy=self.autonomy)
+        result = await stream_task(
+            self.service,
+            spec.id,
+            autonomy=self.autonomy,
+            surface=self.surface,
+        )
         if result is not None:
             self.session_id = getattr(spec, "session_id", self.session_id)
             summary = getattr(result, "summary", "") or ""
@@ -183,27 +282,45 @@ class ChatREPL:
     async def _shell_escape(self, source: str, inject: bool) -> None:
         """Execute a shell command directly without model inference.
 
-        ``inject=True`` (the ``!`` form): result is shown AND recorded.
-        ``inject=False`` (the ``!!`` form): result is shown only.
+        ``inject=True`` (the ``!`` form): result is shown, recorded, and made
+        available to the next model turn. ``inject=False`` (the ``!!`` form):
+        result is shown and recorded for audit, but excluded from model context.
         """
         if not source.strip():
             print("empty command")
             return
-        print(f"$ {source}")
+
+        # A direct escape still belongs to the current durable session.  If
+        # this is the first interaction, establish the session before the
+        # service records the capability call/result.
+        if self.session_id is None:
+            self.session_id = new_id("session")
+
+        async def _approval(approval_id: str, scopes: list[str]) -> ApprovalChoice:
+            event = make_event(
+                "ApprovalRequested",
+                {
+                    "approval_id": approval_id,
+                    "capability_id": "execute",
+                    "scopes": scopes,
+                },
+                session_id=self.session_id,
+            )
+            await self.surface.render_event(event)
+            return await self.surface.choose_approval(event)
+
         result = await self.service.execute_direct(
             source,
             language="shell",
+            session_id=self.session_id,
+            inject_into_context=inject,
+            on_approval=_approval,
+        )
+        self.surface.render_direct_execution(
+            source,
+            result,
             inject_into_context=inject,
         )
-        stdout = result.get("stdout", "")
-        stderr = result.get("stderr", "")
-        if stdout:
-            print(stdout)
-        if stderr:
-            print(stderr, file=sys.stderr)
-        exit_code = result.get("exit_code")
-        if exit_code not in (0, None):
-            print(f"[exit {exit_code}]")
 
 
 # ---------------------------------------------------------------------------
@@ -217,42 +334,47 @@ async def stream_task(
     *,
     autonomy: AutonomyLevel = AutonomyLevel.SUPERVISED,
     on_approval: Any = None,
+    surface: OperatorSurface | None = None,
 ) -> TaskResult | None:
-    """Stream a task to terminal until it reaches a terminal status.
+    """Stream a task through the operator surface until it reaches a terminal status.
 
     When the task enters ``WAITING_APPROVAL`` (or emits an ``ApprovalRequested``
     event) the corresponding pending approval is offered to the ``on_approval``
-    callback (``(approval_id) -> bool``). A ``True`` reply resolves the approval
-    via ``service.approve(approval_id, granted=True)``; a ``False`` denies it.
+    callback (``(approval_id) -> bool``). Without a callback, the surface's
+    scope selector is used. A ``True`` reply resolves the approval via
+    ``service.approve(approval_id, granted=True)``; a ``False`` denies it.
     """
     assert task_id is not None
+    surface = surface or OperatorSurface()
     events_iter: AsyncIterator[Event] = service.stream_events(task_id, after_sequence=0)
-    async for event in events_iter:
-        # Surface approval requests for the interactive user.
-        if getattr(event, "type", "") == "ApprovalRequested":
+    try:
+        async for event in events_iter:
+            await surface.render_event(event)
+            if getattr(event, "type", "") != "ApprovalRequested":
+                continue
             payload = getattr(event, "payload", {}) or {}
             approval_id = payload.get("approval_id")
-            if approval_id and on_approval is not None:
-                granted = bool(await on_approval(approval_id))
-                await service.approve(approval_id, granted=granted)
-        # Render common event types; skip low-noise diagnostics.
-        etype = getattr(event, "type", "")
-        if etype == "TaskCreated":
-            pass
-        elif etype == "TaskStarted":
-            print(f"[task {task_id} started]")
-        elif etype == "TaskInterrupted":
-            print(f"[task {task_id} interrupted]")
-        elif etype == "TaskCompleted":
-            print(f"[task {task_id} complete]")
-        elif etype == "TaskFailed":
-            print(f"[task {task_id} failed]")
-        elif etype == "TaskCancelled":
-            print(f"[task {task_id} cancelled]")
-        elif etype == "ApprovalRequested":
-            payload = getattr(event, "payload", {}) or {}
-            print(f"[approval requested: {payload.get('approval_id')}]")
-    # Reached terminal status; return the final TaskResult.
+            if not approval_id:
+                continue
+            approval_key = str(approval_id)
+            if surface.approval_was_handled(approval_key):
+                continue
+            if on_approval is not None:
+                decision = await on_approval(approval_id)
+                if isinstance(decision, ApprovalChoice):
+                    choice = decision
+                else:
+                    choice = ApprovalChoice(bool(decision))
+            else:
+                choice = await surface.choose_approval(event)
+            surface.mark_approval_handled(approval_key)
+            await service.approve(
+                approval_id,
+                granted=choice.granted,
+                scope=choice.scope,
+            )
+    finally:
+        surface.finish()
     return await service.get_result(task_id)
 
 
