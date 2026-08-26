@@ -50,7 +50,10 @@ def _autonomy(value: str | None) -> AutonomyLevel:
     try:
         return AutonomyLevel(value.strip().lower())
     except ValueError:
-        return AutonomyLevel.SUPERVISED
+        valid = ", ".join(a.value for a in AutonomyLevel)
+        raise ValueError(
+            f"unknown autonomy {value!r}; choose one of: {valid}"
+        ) from None
 
 
 def build_config(o: "Options"):

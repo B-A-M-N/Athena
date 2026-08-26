@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from athena.protocol.tasks import TaskStatus
@@ -8,6 +9,8 @@ from athena.protocol.tasks import TaskStatus
 __all__ = [
     "CancellationManager",
 ]
+
+_logger = logging.getLogger("athena.cancellation")
 
 
 class CancellationManager:
@@ -87,8 +90,10 @@ class CancellationManager:
         if self._exec is not None and task_id == root_id:
             try:
                 await self._exec.cancel_task(task_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning(
+                    "runtime cancel failed for task %s: %s", task_id, exc
+                )
         await self._transition_status(task_id, TaskStatus.CANCELLED)
         children = await self._children_of(task_id)
         for child in children:
@@ -103,8 +108,13 @@ class CancellationManager:
             task = await self._tasks.get(task_id)
             if task is not None and _get_status(task) != status:
                 await self._tasks.transition(task_id, status)
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning(
+                "cancel transition to %s failed for task %s: %s",
+                status.value if hasattr(status, "value") else status,
+                task_id,
+                exc,
+            )
 
     async def _descendants_of(self, task_id: str) -> list[str]:
         out: list[str] = []

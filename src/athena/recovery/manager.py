@@ -93,8 +93,8 @@ class RecoveryManager:
             try:
                 await self._executions.mark_interrupted(exec_id)
                 count += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning("failed to recover execution %s: %s", exec_id, exc)
         return count
 
     async def _recover_runtime_sessions(self) -> int:
@@ -113,8 +113,8 @@ class RecoveryManager:
             try:
                 await self._runtime_sessions.mark_dead(sid)
                 count += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning("failed to mark runtime session %s dead: %s", sid, exc)
         return count
 
     async def _recover_mutations(self) -> int:
@@ -141,8 +141,8 @@ class RecoveryManager:
             try:
                 await self._mutations.mark_recovery_required(mid)
                 count += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning("failed to mark mutation %s recovery-required: %s", mid, exc)
         # PLANNED mutations never had their side effect started, so mark
         # them FAILED (the intent can be retried).
         for row in planned or []:
@@ -152,6 +152,6 @@ class RecoveryManager:
             try:
                 await self._mutations.mark_failed(mid, error="crash before effect started")
                 count += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning("failed to fail PLANNED mutation %s: %s", mid, exc)
         return count
