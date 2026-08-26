@@ -1424,6 +1424,34 @@ class AthenaService:
         except Exception as exc:  # debugpy optional
             _logger.info("debugger capability unavailable: %s", exc)
 
+    # ------------------------------------------------------------------ #
+    # Fusion engines: shadow execution + execution-grounded world state
+    # ------------------------------------------------------------------ #
+    def shadow_engine(self):
+        """Speculative-execution engine bound to this service's dispatcher."""
+        from athena.shadow.engine import ShadowEngine
+
+        if getattr(self, "_shadow", None) is None:
+            self._shadow = ShadowEngine()
+        if self._shadow._dispatcher is None and self._dispatcher is not None:
+            self._shadow.bind(self._dispatcher)
+        return self._shadow
+
+    def world_state(self, task_id: str | None = None):
+        """Execution-grounded structured reality for one task."""
+        from athena.worldstate import TaskWorldState
+
+        cache = getattr(self, "_world_states", None)
+        if cache is None:
+            cache = {}
+            self._world_states = cache
+        ws = cache.get(task_id or "")
+        if ws is None:
+            ws = TaskWorldState(service=self, task_id=task_id)
+            if task_id:
+                cache[task_id] = ws
+        return ws
+
     def _register_providers(self, registry: ProviderRegistry) -> None:
         pcs = tuple(self.config.providers)
         if not pcs:
