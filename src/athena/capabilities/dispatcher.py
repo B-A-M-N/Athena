@@ -73,6 +73,8 @@ class CapabilityDispatcher:
         registry: CapabilityRegistry,
         policy_engine: PolicyEngine,
         *,
+        repairer: Any = None,
+        candidates=None,
         principal: Principal | None = None,
         mutation_store: MutationStore | None = None,
         artifact_store=None,
@@ -82,6 +84,12 @@ class CapabilityDispatcher:
         self.registry = registry
         self.policy = policy_engine
         self._principal = principal or Principal("agent", "athena")
+        # Inference Compatibility Kernel: deterministic tool-input repair.
+        from athena.models.compat.toolrepair import ToolInputRepairer
+        from athena.models.compat.profiles import CompatibilityCandidates
+
+        self.repairer = repairer or ToolInputRepairer(
+            mode="safe", candidates=candidates or CompatibilityCandidates())
         self._mutation_store = mutation_store
         self._artifact_store = artifact_store
         self._approval_store = approval_store
@@ -128,6 +136,46 @@ class CapabilityDispatcher:
 
         executor = self.registry.executor_for(request.capability_id)
         self._inject_stores(executor)
+
+        # Inference Compatibility Kernel: deterministic repair BEFORE policy.
+        # Model-produced calls get one bounded schema-directed repair pass;
+        # strict revalidation follows; policy/approval/execution all see the
+        # exact canonical arguments. (Spec invariant: repair changes syntax
+        # and representation only — never capability or trust.)
+        repaired_args, receipt = self.repairer.repair(
+            call_id=request.call_id,
+            tool_name=request.capability_id,
+            arguments=dict(request.arguments or {}),
+            input_schema=executor.descriptor.input_schema,
+            validate_fn=validate_schema,
+            provider_profile_id=getattr(self, "_provider_profile_id", None),
+            model_id=getattr(self, "_model_id", None),
+        )
+        if receipt.outcome == "INVALID":
+            result = CapabilityResult(
+                request.call_id, request.capability_id,
+                CapabilityResultStatus.FAILED,
+                error="tool_input_invalid: "
+                      + "; ".join(receipt.issue_codes) or "invalid arguments",
+                metadata={"repair": receipt.to_dict()},
+            )
+            await self._emit(EV["CAPABILITY_FAILED"], {
+                "call_id": request.call_id,
+                "capability_id": request.capability_id,
+                "reason": "tool_input_invalid",
+                "error": result.error,
+            }, request.task_id, causal_id=request.call_id)
+            return result
+        if receipt.outcome == "REPAIRED":
+            object.__setattr__(request, "arguments", repaired_args)
+            await self._emit("ToolRepaired", {
+                "call_id": request.call_id,
+                "tool_name": request.capability_id,
+                "rules": receipt.rules,
+                "policy_version": receipt.repair_policy_version,
+                "schema_hash": receipt.schema_hash,
+            }, request.task_id, causal_id=request.call_id)
+
         errors = validate_schema(executor.descriptor.input_schema, request.arguments or {})
         if errors:
             result = CapabilityResult(
