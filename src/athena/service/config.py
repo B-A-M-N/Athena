@@ -64,25 +64,17 @@ def project_config_paths(cwd: str | None = None) -> list[Path]:
 
     Project config lives in ``.athena/config.toml``. We search upward from
     ``cwd`` (or the real cwd) to the filesystem root, returning every
-    ``.athena/config.toml`` found. Later (closer to cwd) paths override earlier
-    ones, so the full list is returned.
+    ``.athena/config.toml`` found, root-most FIRST and closest-to-cwd LAST so
+    that loading them in order gives project-local files higher precedence.
     """
     base = Path(cwd or os.getcwd()).resolve()
-    paths: list[Path] = []
-    for parent in [base, *base.reversed_parents()]:
-        candidate = parent / ".athena" / "config.toml"
-        paths.append(candidate)
-        if str(parent) == os.path.sep:
-            break
-    return paths
+    chain = [base, *_parent_chain(base)]
+    return [parent / ".athena" / "config.toml" for parent in reversed(chain)]
 
 
-def _reversed_parents(p: Path) -> list[Path]:
+def _parent_chain(p: Path) -> list[Path]:
     """Parents of ``p`` excluding ``p`` itself, from direct parent to root."""
     return list(p.parents)
-
-
-Path.reversed_parents = lambda self: list(self.parents)  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +274,20 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["scheduler_max_concurrent"] = config.scheduler_max_concurrent
     if config.profile is not None:
         d["profile"] = config.profile
+    if config.providers:
+        d["providers"] = [
+            {"kind": p.kind, "name": p.name, "model": p.model,
+             "credential_id": p.credential_id, "api_key": p.api_key,
+             "base_url": p.base_url, **dict(p.extra)}
+            for p in config.providers
+        ]
+    if config.mcp_servers:
+        d["mcp_servers"] = [
+            {"name": m.name, "command": m.command, "args": list(m.args),
+             "url": m.url, "env": dict(m.env), "secret_env": dict(m.secret_env),
+             "connect_timeout": m.connect_timeout}
+            for m in config.mcp_servers
+        ]
     if config.model_roles:
         d["model_roles"] = {k: dict(v) for k, v in config.model_roles.items()}
     if config.metadata:

@@ -95,7 +95,7 @@ async def test_proof_for_returns_usage_stats():
     executor = registry.executor_for(cap.id)
     for i in range(2):
         await executor.invoke(CapabilityRequest(
-            capability_id=cap.id, arguments={}, task_id="t",
+            capability_id=cap.id, arguments={}, task_id="task_1",
             call_id=f"c{i}"))
     proof = engine.proof_for(cap.id)
     assert proof["uses"] == 2
@@ -114,11 +114,11 @@ async def test_to_skill_candidate_requires_two_uses():
 
     executor = registry.executor_for(cap.id)
     await executor.invoke(CapabilityRequest(
-        capability_id=cap.id, arguments={}, task_id="t1", call_id="c1"))
+        capability_id=cap.id, arguments={}, task_id="task_1", call_id="c1"))
     assert engine.to_skill_candidate(cap.id) is None  # only one use
 
     await executor.invoke(CapabilityRequest(
-        capability_id=cap.id, arguments={}, task_id="t1", call_id="c2"))
+        capability_id=cap.id, arguments={}, task_id="task_1", call_id="c2"))
     candidate = engine.to_skill_candidate(cap.id)
     assert candidate is not None
     assert candidate.draft.name == "greeter"

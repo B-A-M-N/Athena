@@ -57,6 +57,7 @@ from athena.policy.engine import PolicyEngine
 from athena.scheduler.scheduler import Scheduler
 from athena.skills.lifecycle import SkillLifecycle, SkillStore
 from athena.skills.loader import SkillLoader
+from athena.kernel.continuations import ContinuationStore
 from athena.state.approvals import ApprovalStore
 from athena.state.database import Database
 from athena.state.events import EventStore
@@ -198,6 +199,7 @@ class AthenaService:
         approvals = ApprovalStore(db)
         mutations = MutationStore(db)
         schedules = ScheduleStore(db)
+        continuations = ContinuationStore(db)
         self._sessions = sessions
         self._store_tasks = tasks
         self._store_events = events
@@ -205,6 +207,7 @@ class AthenaService:
         self._store_approvals = approvals
         self._store_mutations = mutations
         self._store_schedules = schedules
+        self._store_continuations = continuations
 
         # 2. Credentials (SecretManager owns resolution + leases).
         self._secrets = SecretManager(
@@ -259,6 +262,7 @@ class AthenaService:
             policy,
             mutation_store=mutations,
             approval_store=approvals,
+            continuation_store=continuations,
             event_sink=self._forward_events(events),
             artifact_store=self._artifacts,
         )
@@ -845,6 +849,17 @@ class AthenaService:
             await self._kernel.notify_approval_resolved(
                 task_id, "granted" if granted else "denied"
             )
+
+        # Durable continuation (review item 19): the parked call is now
+        # resolved, so retire its continuation row. Failure-isolated.
+        store_cont = getattr(self, "_store_continuations", None)
+        if store_cont is not None and metadata.get("call_id"):
+            try:
+                for cont in await store_cont.pending(task_id):
+                    if cont.get("call_id") == metadata.get("call_id"):
+                        await store_cont.mark_resolved(cont["id"])
+            except Exception as exc:
+                _logger.warning("continuation resolve failed for %s: %s", approval_id, exc)
 
     def _install_grant(
         self,

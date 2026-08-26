@@ -72,8 +72,18 @@ class SyntheticCapability:
 class SynthesisEngine:
     """Registers temporary capabilities born from execution traces."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, restricted_env: bool = True) -> None:
+        self._restricted_env = restricted_env
         self._synthetic: dict[str, SyntheticCapability] = {}
+
+    def _child_env(self) -> dict:
+        if not self._restricted_env:
+            return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        allowed = ("PATH", "PYTHONIOENCODING", "LANG", "LC_ALL", "TMPDIR",
+                   "HOME", "VIRTUAL_ENV")
+        env = {k: os.environ[k] for k in allowed if k in os.environ}
+        env["PYTHONIOENCODING"] = "utf-8"
+        return env
 
     def synthesize(
         self,
@@ -120,7 +130,7 @@ class SynthesisEngine:
                 [sys.executable, "-c", child],
                 input=json.dumps(case.get("args") or {}),
                 capture_output=True, text=True, timeout=timeout,
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                env=self._child_env())
             return proc.stdout, proc.stderr, proc.returncode
 
         for i, case in enumerate(cases or []):
@@ -168,6 +178,9 @@ class SynthesisEngine:
         child = _child_code(repr(cap.code))
 
         class _Executor:
+            def __init__(self, engine_ref):
+                self.engine = engine_ref
+
             descriptor = CapabilityDescriptor(
                 id=cap.id,
                 description=f"[synthetic] {cap.description} "
@@ -180,6 +193,14 @@ class SynthesisEngine:
             )
 
             async def invoke(self, request, output_accumulator=None, context=None):
+                # P1-18: enforce task scoping — a task-scoped synthetic must
+                # not be callable by another task.
+                if cap.task_id and request.task_id != cap.task_id:
+                    return CapabilityResult(
+                        request.call_id, request.capability_id,
+                        CapabilityResultStatus.FAILED,
+                        error=f"synthetic capability {cap.id} is scoped to "
+                              f"task {cap.task_id}")
                 loop = asyncio.get_running_loop()
 
                 def _run():
@@ -188,7 +209,7 @@ class SynthesisEngine:
                         [sys.executable, "-c", child],
                         input=payload, capture_output=True,
                         text=True, timeout=30,
-                        env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                        env=self.engine._child_env())
 
                 proc = await loop.run_in_executor(None, _run)
                 ok = proc.returncode == 0 and "__RESULT__" in proc.stdout
@@ -207,7 +228,7 @@ class SynthesisEngine:
                     CapabilityResultStatus.FAILED,
                     error=(proc.stderr or "synthetic failed")[-500:])
 
-        registry.register(_Executor())
+        registry.register(_Executor(engine_ref=self))
         self._synthetic[cap.id] = cap
         _logger.info("ephemeral capability registered: %s", cap.id)
         return True

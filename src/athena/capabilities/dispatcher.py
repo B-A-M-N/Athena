@@ -79,6 +79,7 @@ class CapabilityDispatcher:
         mutation_store: MutationStore | None = None,
         artifact_store=None,
         approval_store: ApprovalStore | None = None,
+        continuation_store=None,
         event_sink=None,
     ) -> None:
         self.registry = registry
@@ -93,6 +94,7 @@ class CapabilityDispatcher:
         self._mutation_store = mutation_store
         self._artifact_store = artifact_store
         self._approval_store = approval_store
+        self._continuation_store = continuation_store
         self._event_sink = event_sink
         self._suspended: dict[str, SuspendedCall] = {}
         self._resume_expiry: dict[str, datetime] = {}
@@ -456,6 +458,22 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
                     args_digest=digest,
                     call_id=request.call_id,
                 )
+
+        if self._continuation_store is not None:
+            # Durable continuation (review item 19): the kernel's parked call
+            # is in-memory only, so persist enough to reconstruct it after a
+            # restart. Failure-isolated — approval parking must not break.
+            try:
+                await self._continuation_store.record(
+                    task_id=request.task_id,
+                    call_id=request.call_id,
+                    capability_id=request.capability_id,
+                    canonical_arguments=dict(arguments),
+                    effects=tuple(effects or ()),
+                    workspace_id=workspace.id,
+                )
+            except Exception:
+                pass
 
         self._resume_expiry[approval_id] = expires_at
         return approval_id
