@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import tempfile
+from typing import Any, Mapping
 
 from athena.artifacts.store import ArtifactStore
 from athena.capabilities.delegate import DelegateCapability
@@ -36,6 +37,8 @@ from athena.capabilities.registry import CapabilityRegistry
 from athena.capabilities.skills import SkillsCapability
 from athena.context.compiler import ContextCompiler
 from athena.execution.manager import ExecutionManager
+from athena.knowledge.pipeline import KnowledgePipeline
+from athena.models.router import ModelRouter
 from athena.execution.runtimes import PythonRuntime, ShellRuntime
 from athena.execution.runtimes.powershell import PowerShellRuntime
 from athena.execution.runtimes.node import NodeRuntime
@@ -280,17 +283,36 @@ class AthenaService:
         self._cancellations = cancellations
         task_manager._cancellations = cancellations  # noqa: SLF001
 
-        # 8. Models + router.
+        # Post-finalization knowledge pipeline (BUILDSPEC 64/68): every
+        # completed/partial task feeds memory + skill candidates. Bound after
+        # all stores exist; the observer itself is failure-isolated.
+        self._knowledge = KnowledgePipeline(
+            messages=messages,
+            memory_store=memory,
+            skill_lifecycle=skill_lifecycle,
+            events=events,
+        )
+        task_manager.add_finalize_observer(self._knowledge)
+
+        # 8. Models + router (with role-divided policies: "summarizer",
+        # "judge", etc. can be pinned to specific models in config; roles
+        # without an entry fall back to the user's primary/global choice).
         model_registry = ProviderRegistry()
         self._register_providers(model_registry)
         self._model_registry = model_registry
+        router = ModelRouter(
+            model_registry, role_policies=self._role_policies(cfg.model_roles)
+        )
+        self._router = router
 
-        # 9. Context compiler.
+        # 9. Context compiler (with a model-backed compression summarizer so older
+        # transcript is genuinely summarized, not just truncated).
         compiler = ContextCompiler(
             message_store=messages,
             memory_store=memory,
             skill_loader=skills_store,
             capability_registry=registry,
+            summarizer=self._make_model_summarizer(model_registry),
             context_window=cfg.context_window,
             reserve_output=cfg.reserve_output,
             workspace_reader=self._workspace_reader(),
@@ -916,6 +938,51 @@ class AthenaService:
             wait=True,
         )
 
+    async def list_interrupted(self) -> list[dict]:
+        """Tasks parked by shutdown/crash, still awaiting completion."""
+        if self._store_tasks is None:
+            return []
+        try:
+            rows = await self._store_tasks.list_by_status(TaskStatus.INTERRUPTED)
+        except Exception as exc:
+            _logger.warning("interrupted task listing failed: %s", exc)
+            return []
+        out = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            out.append(
+                {
+                    "id": row.get("id"),
+                    "objective": row.get("objective"),
+                    "session_id": row.get("session_id"),
+                    "created_at": row.get("created_at"),
+                }
+            )
+        return out
+
+    async def resume_task(self, task_id: str) -> TaskSpec:
+        """Re-queue an INTERRUPTED task so it runs to completion.
+
+        The task keeps its original objective, acceptance criteria, workspace,
+        capability policy, and budget — this is a continuation of the SAME
+        durable work, not a new conversation turn.
+        """
+        if self._store_tasks is None or self._task_manager is None:
+            raise RuntimeError("AthenaService not started")
+        row = await self._store_tasks.get(task_id)
+        if row is None:
+            raise KeyError(f"Task not found: {task_id}")
+        status = (row.get("status") or "").upper()
+        if status == "RUNNING":
+            # Already claimed by a live worker.
+            return await self.get_task(task_id)
+        if status in ("COMPLETE", "FAILED", "CANCELLED"):
+            raise ValueError(f"task {task_id} is terminal ({status}); cannot resume")
+        # INTERRUPTED (and QUEUED re-queue): hand back to the worker pool.
+        await self._task_manager.enqueue(task_id)
+        return await self.get_task(task_id)
+
     async def inspect(self, task_id: str) -> dict:
         """A focused, human-inspection summary of a task's life."""
         task = await self.get_task(task_id)
@@ -1081,6 +1148,36 @@ class AthenaService:
         meta = {"autonomy": autonomy.value}
         if request.metadata:
             meta.update(request.metadata)
+        # Acceptance criteria (BHV-005): ``metadata["acceptance_criteria"]``
+        # carries human-specified checks. Each entry becomes a required
+        # Criterion so the termination evaluator audits claimed completion.
+        criteria: list = []
+        raw_criteria = meta.pop("acceptance_criteria", None)
+        if isinstance(raw_criteria, (list, tuple)):
+            from athena.protocol.tasks import Criterion, VerificationSpec, VerificationType
+
+            for i, item in enumerate(raw_criteria):
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                # "command:..." prefix selects an executable probe; otherwise
+                # the criterion is model-judged against task evidence.
+                if text.lower().startswith("command:"):
+                    verification = VerificationSpec(
+                        type=VerificationType.COMMAND,
+                        command=text.split(":", 1)[1].strip(),
+                    )
+                else:
+                    verification = VerificationSpec(
+                        type=VerificationType.MODEL_JUDGMENT,
+                        predicate=text,
+                    )
+                criteria.append(Criterion(
+                    id=f"ac_{i+1}",
+                    description=text,
+                    verification=verification,
+                    required=True,
+                ))
         # Normalize requested_capabilities into the task's capability policy
         cap_policy = None
         if request.requested_capabilities:
@@ -1107,6 +1204,8 @@ class AthenaService:
             context_refs=tuple(context_refs),
             metadata=meta,
         )
+        if criteria:
+            spec_kwargs["acceptance_criteria"] = tuple(criteria)
         if cap_policy is not None:
             spec_kwargs["capability_policy"] = cap_policy
         return TaskSpec(**spec_kwargs)
@@ -1154,6 +1253,110 @@ class AthenaService:
         async def sink(event: Event) -> None:
             await events.append(event)
         return sink
+
+    def _role_policies(self, raw: Any) -> dict:
+        """Normalize config ``model_roles`` into router role policies.
+
+        Accepts ``{"summarizer": {"allowed": ["x/y"], "privacy": "...",
+        "max_cost_usd": 0.01}}``. Invalid entries are logged and skipped.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        from athena.protocol.tasks import ModelPolicy
+
+        out: dict[str, Any] = {}
+        for role, spec in dict(raw or {}).items():
+            if not isinstance(spec, Mapping):
+                _logger.warning("model_roles[%r] ignored: not a table", role)
+                continue
+            allowed = tuple(str(a) for a in (spec.get("allowed") or ()) if a)
+            max_cost = None
+            raw_cost = spec.get("max_cost_usd")
+            if raw_cost is not None:
+                try:
+                    max_cost = Decimal(str(raw_cost))
+                except (InvalidOperation, ValueError):
+                    _logger.warning(
+                        "model_roles[%r].max_cost_usd invalid: %r", role, raw_cost
+                    )
+            out[str(role)] = ModelPolicy(
+                role=str(role),
+                allowed=allowed,
+                privacy=str(spec.get("privacy") or "local-preferred"),
+                require_tools=bool(spec.get("require_tools", False)),
+                max_cost_usd=max_cost,
+            )
+        return out
+
+    def _make_model_summarizer(self, model_registry: Any):
+        """Build the compression summarizer used by the context compiler.
+
+        Uses the ``summarizer`` role's model policy (falling back to the
+        user's primary choice when no role entry exists). On any failure it
+        returns None, and ContextCompressor falls back to deterministic
+        truncation — so offline/test operation is unaffected.
+        """
+        if model_registry is None:
+            return None
+
+        async def _summarize(text: str) -> str | None:
+            try:
+                from athena.protocol.tasks import ModelPolicy
+
+                selection = await self._router.select(
+                    policy=ModelPolicy(role="summarizer", require_tools=False)
+                )
+                provider = model_registry.provider_for(selection.provider)
+                from athena.protocol.ids import new_id
+                from athena.protocol.messages import (
+                    Message,
+                    Provenance,
+                    Role,
+                    SourceType,
+                    TextBlock,
+                    TrustClass,
+                    utcnow,
+                )
+                from athena.protocol.models import ModelRequest
+
+                prompt = (
+                    "Summarize the following agent-work transcript excerpt into "
+                    "at most 6 sentences, preserving decisions, file changes, "
+                    "and unresolved issues. Output ONLY the summary.\n\n" + text[-8000:]
+                )
+                request = ModelRequest(
+                    messages=(Message(
+                        id=new_id("msg"),
+                        role=Role.USER,
+                        blocks=(TextBlock(type="text", text=prompt),),
+                        created_at=utcnow(),
+                        provenance=Provenance(
+                            source_type=SourceType.RUNTIME,
+                            trust=TrustClass.AGENT_CURATED,
+                            scope="context_compression",
+                        ),
+                    ),),
+                    model=selection.model,
+                    provider=selection.provider,
+                    request_id=new_id("sum"),
+                )
+                parts: list[str] = []
+                async for event in provider.complete(request):
+                    if getattr(event, "type", None) is not None and event.type.value == "done":
+                        resp = event.response
+                        if resp is not None:
+                            from athena.protocol.messages import TextBlock as _TB
+                            parts[:] = [
+                                b.text for b in resp.blocks
+                                if isinstance(b, _TB) and b.text
+                            ]
+                summary = " ".join(parts).strip()
+                return summary or None
+            except Exception as exc:
+                _logger.debug("model summarizer unavailable (%s); using truncation", exc)
+                return None
+
+        return _summarize
 
     @staticmethod
     async def _sync_skills(lifecycle: SkillLifecycle, discovered) -> None:

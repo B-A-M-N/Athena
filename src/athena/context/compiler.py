@@ -153,6 +153,7 @@ class ContextCompiler:
         workspace_reader: Any = None,
         capability_registry: Any = None,
         compressor: ContextCompressor | None = None,
+        summarizer: Any = None,
         context_window: int = 128_000,
         reserve_output: int = 4096,
         recent_verbatim_turns: int = 8,
@@ -164,7 +165,9 @@ class ContextCompiler:
         self._skill_loader = skill_loader
         self._workspace_reader = workspace_reader
         self._capability_registry = capability_registry
-        self._compressor = compressor or ContextCompressor(recent_turns=recent_verbatim_turns)
+        self._compressor = compressor or ContextCompressor(
+            recent_turns=recent_verbatim_turns, summarizer=summarizer
+        )
         self.context_window = context_window
         self.reserve_output = reserve_output
         self.recent_verbatim_turns = recent_verbatim_turns

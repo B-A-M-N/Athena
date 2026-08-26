@@ -152,7 +152,11 @@ class _ModelJudgmentVerifier:
         if self._registry is None:
             return False
         try:
-            selection = await self._registry.select()
+            from athena.protocol.tasks import ModelPolicy
+
+            selection = await self._registry.select(
+                policy=ModelPolicy(role="judge", require_tools=False)
+            )
             provider = self._registry.provider_for(selection.provider)
         except Exception as exc:
             _logger.warning("model judgment: selection failed: %s", exc)

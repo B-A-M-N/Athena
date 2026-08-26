@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -23,6 +24,8 @@ from athena.protocol.tasks import (
 from athena.state.events import EventStore
 from athena.state.sessions import SessionRepository
 from athena.state.tasks import TaskStore
+
+_logger = logging.getLogger("athena.tasks")
 
 __all__ = [
     "TaskManager",
@@ -88,6 +91,14 @@ class TaskManager:
         self._budgets = budgets
         self._cancellations = cancellations
         self._running_emitted: set[str] = set()
+        # Optional post-finalization observers (knowledge pipeline). Each is an
+        # async callable ``(task, result)`` invoked AFTER the terminal state is
+        # durable; observer failures never affect the finalized result.
+        self._finalize_observers: list[Any] = []
+
+    def add_finalize_observer(self, observer: Any) -> None:
+        """Register an async ``(task, result)`` post-finalization hook."""
+        self._finalize_observers.append(observer)
 
     def set_budget_tracker(self, budgets: Any) -> None:
         """Late-bind the budget authority (construction-order tolerant, §19)."""
@@ -275,6 +286,20 @@ class TaskManager:
             self._budgets.consume_result(task_id, usage)
         if self._cancellations is not None:
             self._cancellations.reset(task_id)
+
+        # Post-finalization knowledge pipeline (BUILDSPEC 64/68): observers see
+        # the DURABLE result and may propose memory/skill candidates. Their
+        # failures are logged, never propagated — finalization already landed.
+        for observer in self._finalize_observers:
+            try:
+                await observer(resolved, result)
+            except Exception as exc:
+                _logger.warning(
+                    "finalize observer %s failed for task %s: %s",
+                    getattr(observer, "__name__", type(observer).__name__),
+                    task_id,
+                    exc,
+                )
 
         return result
 

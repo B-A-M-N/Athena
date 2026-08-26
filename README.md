@@ -72,6 +72,54 @@ context handling:
 Neither escape routes through model inference. Both belong to the current
 durable session and appear in `/sessions`, `/diff`, and the audit trail.
 
+### Role-divided models
+
+Different roles can use different models. Roles without an assignment fall
+back to whatever the user configured globally (the "primary" choice):
+
+```toml
+# athena.toml (or ATHENA_MODEL_ROLES='{"summarizer":{"allowed":["prov/cheap"]}}')
+[model_roles.summarizer]
+allowed = ["openai/gpt-4o-mini"]     # cheap model for context compression
+max_cost_usd = 0.01
+
+[model_roles.judge]
+allowed = ["anthropic/claude-sonnet-4"]   # acceptance-criteria judging
+
+[model_roles.primary]
+allowed = ["anthropic/claude-opus-4"]     # main reasoning loop
+```
+
+Built-in roles: `primary` (task reasoning), `summarizer` (context compression),
+`judge` (model-judged acceptance criteria). A caller's explicit allowlist
+always wins over role defaults.
+
+### Post-task knowledge pipeline
+
+Every completed or partial task feeds Athena's durable knowledge: an episodic
+record of the task outcome is saved immediately, conservative lesson
+candidates are stored as `pending_promotion` (never auto-trusted), and skill
+drafts are validated and recorded for explicit promotion later (BHV-099/102/107).
+
+### Acceptance criteria
+
+```bash
+athena run "fix the failing test" --criteria "command:pytest -q;no TODO left in src"
+```
+
+`command:` criteria run as executable probes; the rest are judged by the
+`judge`-role model against task evidence. Claimed completion with unverified
+criteria resolves to PARTIAL with the unresolved items recorded — never a
+false COMPLETE.
+
+### Resume after crash/shutdown
+
+```text
+/interrupted          # list tasks parked by shutdown or crash
+/resume [task_id]     # re-queue the original durable task (same objective,
+                      # criteria, workspace, policy) — not a new conversation
+```
+
 Example:
 
 ```

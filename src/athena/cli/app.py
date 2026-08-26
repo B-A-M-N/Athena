@@ -56,6 +56,20 @@ def _autonomy(value: str | None) -> AutonomyLevel:
         ) from None
 
 
+def _criteria_metadata(o: "Options") -> dict:
+    """Parse ``o.criteria`` (semicolon-separated) into request metadata.
+
+    Entries prefixed ``command:`` become executable acceptance probes;
+    everything else is model-judged. Semicolons avoid clashing with the
+    shell pipes/quotes people already use inside probe commands.
+    """
+    raw = getattr(o, "criteria", None)
+    if not raw:
+        return {}
+    items = [part.strip() for part in str(raw).split(";") if part.strip()]
+    return {"acceptance_criteria": items} if items else {}
+
+
 def build_config(o: "Options"):
     """Build the real ``athena.service.config.AthenaConfig`` from flags/env.
 
@@ -126,6 +140,7 @@ class Options:
     model: str | None = None
     verbose: bool = False
     details: bool = False
+    criteria: str | None = None
     deny: bool = False
     artifact_root: str | None = None
     _providers: tuple[Any, ...] = ()
@@ -207,6 +222,7 @@ async def _cmd_run(o: Options, service: Any) -> int:
         autonomy=_autonomy(o.autonomy),
         workspace=workspace_spec(o.workspace),
         model_policy=_model_policy(o.model),
+        metadata=_criteria_metadata(o),
     )
     # Start streaming before waiting so an interactive approval can wake the
     # parked task.  Waiting first deadlocks supervised execution at the
@@ -360,6 +376,7 @@ def _click_cli(click: Any):
     @click.option("--workspace", "a_workspace", default=None)
     @click.option("--model", "a_model", default=None)
     @click.option("--details", "r_details", is_flag=True, help="Show detailed model and task activity.")
+    @click.option("--criteria", "r_criteria", default=None, help="Acceptance criteria separated by ';'. Prefix 'command:' for an executable probe.")
     @click.pass_context
     def run(ctx, objective, **kw):
         o = base_options(ctx, "run", [objective])
@@ -367,6 +384,7 @@ def _click_cli(click: Any):
         o.workspace = kw.get("a_workspace") or o.workspace
         o.model = kw.get("a_model") or o.model
         o.details = bool(kw.get("r_details")) or o.details
+        o.criteria = kw.get("r_criteria") or o.criteria
         sys.exit(dispatch(o))
 
     @cli.command()
@@ -423,6 +441,7 @@ def _arg_parse(argv: list[str]) -> Options:
         sp.add_argument("--model", default=None)
         sp.add_argument("--verbose", action="store_true")
         sp.add_argument("--details", action="store_true", help="Show detailed model and task activity.")
+        sp.add_argument("--criteria", default=None, help="Acceptance criteria separated by ';'. Prefix 'command:' for an executable probe.")
 
     for name, help_, pos in (
         ("run", "Submit a one-shot objective.", "objective"),
@@ -454,6 +473,7 @@ def _arg_parse(argv: list[str]) -> Options:
         model=getattr(ns, "model", None),
         verbose=getattr(ns, "verbose", False),
         details=getattr(ns, "details", False),
+        criteria=getattr(ns, "criteria", None),
         deny=getattr(ns, "deny", False) if command == "approve" else False,
     )
     if command == "run":

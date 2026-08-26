@@ -18,6 +18,7 @@ Config layering (deterministic precedence, lowest to highest):
 """
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -152,6 +153,10 @@ class AthenaConfig:
     scheduler_interval_seconds: float = 1.0
     scheduler_max_concurrent: int = 0
     profile: str | None = None
+    # Role-divided models (Hermes-style): role name -> {"allowed": [...],
+    # "privacy": "...", "max_cost_usd": "0.01"}. Roles without an entry fall
+    # back to the user's global/primary choice.
+    model_roles: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -277,6 +282,8 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["scheduler_max_concurrent"] = config.scheduler_max_concurrent
     if config.profile is not None:
         d["profile"] = config.profile
+    if config.model_roles:
+        d["model_roles"] = {k: dict(v) for k, v in config.model_roles.items()}
     if config.metadata:
         d["metadata"] = dict(config.metadata)
     return d
@@ -312,6 +319,7 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         scheduler_interval_seconds=float(data.get("scheduler_interval_seconds", 1.0)),
         scheduler_max_concurrent=int(data.get("scheduler_max_concurrent", 0)),
         profile=data.get("profile"),
+        model_roles=dict(data.get("model_roles") or {}),
         metadata=data.get("metadata") or {},
     )
 
@@ -345,6 +353,10 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_SCHEDULER_INTERVAL_SECONDS": ("scheduler_interval_seconds", float),
         "ATHENA_SCHEDULER_MAX_CONCURRENT": ("scheduler_max_concurrent", int),
         "ATHENA_PROFILE": ("profile", str),
+        "ATHENA_MODEL_ROLES": (
+            "model_roles",
+            lambda v: json.loads(v) if isinstance(v, str) else v,
+        ),
         "ATHENA_SKILLS_PATHS": ("skills_paths", lambda v: tuple(p.strip() for p in v.split(",") if p.strip())),
     }
     for env_name, (key, cast) in env_map.items():

@@ -34,6 +34,9 @@ _META_HELP = """\
 /undo MUTATION   roll back a completed mutation by id
 /compact         show context-window / compression settings
 /context         show what the next model turn will see
+/criteria LIST   set acceptance criteria (';'-separated; 'command:' prefix = probe); bare to clear
+/interrupted     list tasks parked by shutdown or crash
+/resume [TASK]   re-queue an interrupted task (or the most recent one)
 !cmd             execute a shell command directly
 !!cmd            execute a shell command (output not injected into model context)
 """
@@ -125,6 +128,9 @@ class ChatREPL:
         self.workspace = _workspace_spec(getattr(options, "workspace", None))
         self._active_task_id: str | None = None
         self.surface = OperatorSurface(details=bool(getattr(options, "details", False)))
+        self.criteria: list[str] = list(
+            (getattr(options, "criteria") or "").split(";")
+        ) if getattr(options, "criteria", None) else []
 
     # -- input ------------------------------------------------------------
 
@@ -230,6 +236,57 @@ class ChatREPL:
             else:
                 print(f"undo failed: {outcome.get('error', status)}")
             return True
+        if name == "criteria":
+            if not arg:
+                self.criteria = []
+                print("acceptance criteria cleared")
+            else:
+                self.criteria = [c.strip() for c in arg.split(";") if c.strip()]
+                for i, c in enumerate(self.criteria, 1):
+                    kind = "command probe" if c.lower().startswith("command:") else "model-judged"
+                    print(f"  ac_{i} [{kind}] {c}")
+            return True
+        if name == "interrupted":
+            rows = await self.service.list_interrupted()
+            if not rows:
+                print("(no interrupted tasks)")
+            for r in rows:
+                objective = (r.get("objective") or "")[:60]
+                print(f"{r.get('id')}  {objective}")
+            return True
+        if name == "resume":
+            if not self.session_id:
+                self.session_id = new_id("session")
+            async def _approval(approval_id: str, scopes: list[str]) -> ApprovalChoice:
+                event = make_event(
+                    "ApprovalRequested",
+                    {"approval_id": approval_id, "capability_id": "execute", "scopes": scopes},
+                    session_id=self.session_id,
+                )
+                await self.surface.render_event(event)
+                return await self.surface.choose_approval(event)
+
+            task_id = arg or None
+            if task_id is None:
+                rows = await self.service.list_interrupted()
+                if not rows:
+                    print("(no interrupted tasks to resume)")
+                    return True
+                task_id = rows[0]["id"]
+                print(f"resuming most recent: {task_id}")
+            from athena.cli.chat import stream_task as _stream
+            spec = await self.service.resume_task(task_id)
+            self._active_task_id = spec.id
+            result = await _stream(self.service, spec.id, autonomy=self.autonomy, surface=self.surface)
+            if result is not None:
+                status = getattr(result, "status", None)
+                s = status.value if hasattr(status, "value") else str(status)
+                summary = getattr(result, "summary", "") or ""
+                if summary:
+                    print(summary)
+                print(f"[task {spec.id} -> {s}]")
+            self._active_task_id = None
+            return True
         if name in ("compact", "context"):
             summary = await self.service.operator_context_summary(self.session_id)
             window = summary.get("window")
@@ -257,6 +314,9 @@ class ChatREPL:
             autonomy=self.autonomy,
             workspace=self.workspace,
             model_policy=_model_policy(self.model_policy),
+            metadata=(
+                {"acceptance_criteria": list(self.criteria)} if self.criteria else {}
+            ),
         )
         spec = await self.service.submit(request, wait=False)
         self._active_task_id = spec.id

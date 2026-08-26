@@ -9,8 +9,8 @@ crosses a privacy, locality, or cost boundary that policy has not authorized.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Protocol, Sequence
+from dataclasses import dataclass, replace
+from typing import Callable, Mapping, Protocol, Sequence
 
 from athena.protocol.errors import ModelUnavailable, ProviderUnavailable
 from athena.protocol.models import ModelInfo, PrivacyClass
@@ -93,10 +93,49 @@ def _candidate_key(info: ModelInfo) -> tuple:
 
 
 class ModelRouter:
-    """Deterministic policy-driven selection over registered models."""
+    """Deterministic policy-driven selection over registered models.
 
-    def __init__(self, registry: ModelSource) -> None:
+    ``role_policies`` maps a role name ("summarizer", "judge", "coder", ...)
+    to a fallback :class:`ModelPolicy`. When a caller passes a policy whose
+    ``allowed`` is empty and whose role has an entry, the role's allowlist is
+    merged in — so auxiliary roles can be pinned to specific models without
+    every call site knowing the configuration.
+    """
+
+    def __init__(
+        self,
+        registry: ModelSource,
+        *,
+        role_policies: Mapping[str, ModelPolicy] | None = None,
+    ) -> None:
         self._registry = registry
+        self._role_policies: dict[str, ModelPolicy] = dict(role_policies or {})
+
+    def set_role_policy(self, role: str, policy: ModelPolicy) -> None:
+        """Assign (or replace) the default policy for a role."""
+        self._role_policies[role] = policy
+
+    def _resolve_policy(self, policy: ModelPolicy) -> ModelPolicy:
+        """Merge role defaults into a caller-supplied policy.
+
+        A caller's explicit allowlist always wins; role defaults only fill in
+        when the caller did not constrain models itself. Unknown roles fall
+        back to the "primary" role policy if one exists (user's global choice).
+        """
+        allowed = tuple(policy.allowed or ())
+        if allowed:
+            return policy
+        role_policy = self._role_policies.get(policy.role)
+        if role_policy is None and policy.role != "primary":
+            role_policy = self._role_policies.get("primary")
+        if role_policy is None:
+            return policy
+        return replace(
+            policy,
+            allowed=tuple(role_policy.allowed or ()),
+            privacy=role_policy.privacy or policy.privacy,
+            max_cost_usd=role_policy.max_cost_usd or policy.max_cost_usd,
+        )
 
     async def select(
         self,
@@ -104,7 +143,7 @@ class ModelRouter:
         policy: ModelPolicy | None = None,
         requirements: ModelRequirements | None = None,
     ) -> ModelSelection:
-        policy = policy or ModelPolicy()
+        policy = self._resolve_policy(policy or ModelPolicy())
         requirements = requirements or ModelRequirements()
         models = list(await self._registry.list_models())
 
