@@ -113,6 +113,18 @@ async def _cmd_diff(service: Any, limit: int) -> None:
     print("└──────────────────────────────────────")
 
 
+def _surface_class():
+    """Prefer the dual-pane surface; degrade gracefully if unavailable."""
+    try:
+        from athena.cli.dual_pane import DualPaneSurface
+
+        return DualPaneSurface
+    except Exception:
+        from athena.cli.surface import OperatorSurface
+
+        return OperatorSurface
+
+
 class ChatREPL:
     """Interactive loop binding a user to an ``AthenaService``."""
 
@@ -127,7 +139,8 @@ class ChatREPL:
         self.model_policy: str | None = getattr(options, "model", None) or getattr(config, "model", None)
         self.workspace = _workspace_spec(getattr(options, "workspace", None))
         self._active_task_id: str | None = None
-        self.surface = OperatorSurface(details=bool(getattr(options, "details", False)))
+        surface_cls = _surface_class()
+        self.surface = surface_cls(details=bool(getattr(options, "details", False)))
         self.criteria: list[str] = list(
             (getattr(options, "criteria") or "").split(";")
         ) if getattr(options, "criteria", None) else []

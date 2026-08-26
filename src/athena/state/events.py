@@ -113,6 +113,34 @@ class EventStore:
         )
         return [_row_to_event(r) for r in rows]
 
+    async def list_recent(
+        self,
+        *,
+        after_rowid: int = 0,
+        limit: int = 200,
+    ) -> list[Event]:
+        """Global tail across all tasks, ordered by insertion (rowid).
+
+        ``after_rowid`` is the last rowid seen by the caller (the viewer's
+        cursor); only newer events are returned. Distinct from per-task
+        ``sequence``, which resets per task.
+        """
+        rows = await self._db.fetch_all(
+            "SELECT *, rowid AS _rid FROM events WHERE rowid > ? "
+            "ORDER BY rowid ASC LIMIT ?",
+            (after_rowid, int(limit)),
+        )
+        out = []
+        for r in rows:
+            ev = _row_to_event(r)
+            try:
+                rid = int(r.get("_rid") or 0)
+            except (TypeError, ValueError):
+                rid = after_rowid
+            object.__setattr__(ev, "_rowid", rid)  # frozen dataclass
+            out.append(ev)
+        return out
+
     async def list_for_session(self, session_id: str) -> list[Event]:
         rows = await self._db.fetch_all(
             "SELECT * FROM events WHERE session_id = ? "

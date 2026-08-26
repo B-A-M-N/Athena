@@ -749,6 +749,23 @@ class AthenaService:
                 return
             await asyncio.sleep(0.1)
 
+    async def stream_all(self, after_rowid: int = 0, limit: int = 200):
+        """Yield events across ALL tasks in insertion order (live tail).
+
+        Backs the OI stream viewer: a read-only global subscription to the
+        canonical event log. Never terminates; the caller cancels it.
+        """
+        events = self._require_events()
+        cursor = after_rowid
+        while True:
+            items = await events.list_recent(after_rowid=cursor, limit=limit)
+            for ev in items:
+                rid = getattr(ev, "_rowid", None)
+                if isinstance(rid, int) and rid > cursor:
+                    cursor = rid
+                yield ev
+            await asyncio.sleep(0.15)
+
     async def get_task_status(self, task_id: str) -> str | None:
         """Return the task's status string (from ``metadata["status"]``), or None."""
         try:
