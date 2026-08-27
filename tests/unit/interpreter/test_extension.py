@@ -29,6 +29,7 @@ from athena.interpreter import (
     InterpreterContext,
     InterpreterExtension,
     InterpreterObservation,
+    InterpreterProposal,
 )
 from athena.protocol.errors import RequestCancelled
 from athena.protocol.ids import new_id
@@ -227,3 +228,56 @@ async def test_interpreter_subturn_does_not_touch_durable_history(stack):
     await ext.interpret(_observation(), ctx)
     after = await stack.messages.list_session_messages(task.session_id)
     assert len(after) == len(before)
+
+
+# --------------------------------------------------------------------- #
+# canonical dispatch of interpreter proposals (P0.2 completion)
+# --------------------------------------------------------------------- #
+class _RecordingShim:
+    """Stand-in for CapabilityDispatchShim recording dispatched calls."""
+
+    def __init__(self, sink):
+        self._sink = sink
+
+    async def dispatch(self, task, calls):
+        from athena.kernel.dispatch import DispatchResult
+        from athena.protocol.messages import CapabilityResultBlock
+        calls = list(calls or ())
+        self._sink.extend(calls)
+        results = tuple(
+            CapabilityResultBlock(
+                call_id=c.call_id, capability_id=c.capability_id,
+                ok=True, output="ok",
+            )
+            for c in calls
+        )
+        return DispatchResult(results=results)
+
+
+async def test_proposal_dispatches_through_canonical_path(stack):
+    task = await _persisted_task(stack)
+    ctx = _context(stack.kernel, task)
+    proposal = InterpreterProposal(
+        capability_id="runtime.evaluate",
+        arguments={"code": "repr(obj)"},
+        rationale="inspect the failing object",
+    )
+    dispatched: list = []
+    stack.kernel._dispatch_factory = lambda t: _RecordingShim(dispatched)
+    outcome = await stack.kernel.dispatch_interpreter_proposal(proposal, ctx)
+    assert outcome is not None and outcome.results
+    assert len(dispatched) == 1
+    assert dispatched[0].capability_id == "runtime.evaluate"
+    assert dispatched[0].arguments == {"code": "repr(obj)"}
+    rows = await stack.events.list_for_task(task.id)
+    proposal_events = [e for e in rows if e.type == "InterpreterProposalDispatched"]
+    assert proposal_events, "canonical dispatch must be inspectable"
+    assert proposal_events[0].payload.get("role") == "interpreter"
+
+
+async def test_proposal_dispatch_without_factory_is_none(stack):
+    task = await _persisted_task(stack)
+    ctx = _context(stack.kernel, task)
+    stack.kernel._dispatch_factory = None
+    proposal = InterpreterProposal(capability_id="runtime.evaluate", arguments={})
+    assert await stack.kernel.dispatch_interpreter_proposal(proposal, ctx) is None

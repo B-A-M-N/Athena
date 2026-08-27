@@ -83,6 +83,7 @@ from athena.kernel.dispatch import DispatchResult, SuspendedCall
 from athena.kernel.lifecycle import TaskLifecycle
 from athena.kernel.termination import TerminationDecision, TerminationEvaluator
 from athena.interpreter.context import InterpreterContext  # noqa: F401 (annotation)
+from athena.interpreter.protocol import InterpreterProposal  # noqa: F401 (annotation)
 
 __all__ = ["AgentKernel"]
 
@@ -718,6 +719,35 @@ class AgentKernel:
             "subturn": True,
         }, task)
         return response
+
+    async def dispatch_interpreter_proposal(
+        self,
+        proposal: "InterpreterProposal",
+        context: "InterpreterContext",
+    ) -> "DispatchResult | None":
+        """Route an interpreter proposal through the CANONICAL dispatch path.
+
+        A proposal carries no authority: it becomes a CapabilityCallBlock and
+        rides the same dispatch shim the primary loop uses — repair →
+        policy → approval → execution → durable evidence. No special-cased
+        interpreter execution lane exists.
+        """
+        if self._dispatch_factory is None:
+            return None
+        task = context.run_state.task
+        call = CapabilityCallBlock(
+            call_id=new_id("call"),
+            capability_id=proposal.capability_id,
+            arguments=dict(proposal.arguments or {}),
+        )
+        shim = self._dispatch_factory(task)
+        await self._emit("InterpreterProposalDispatched", {
+            "capability_id": proposal.capability_id,
+            "call_id": call.call_id,
+            "rationale": proposal.rationale,
+            "role": "interpreter",
+        }, task)
+        return await shim.dispatch(task, [call])
 
     async def _compile_for_prompts(
         self, task: TaskSpec, *, system: str, user_prompt: str
