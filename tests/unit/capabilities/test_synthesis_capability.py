@@ -173,6 +173,33 @@ async def test_synthesis_create_uses_canonical_dispatcher(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_task_generated_capability_can_be_explicitly_deprecated():
+    fabric = CapabilityFabric(CapabilityRegistry())
+    capability = SynthesisCapability(SynthesisEngine(), fabric)
+    created = await capability.invoke(CapabilityRequest(
+        capability_id="synthesis", task_id="task-deprecate", call_id="create-deprecate",
+        arguments={
+            "operation": "create", "name": "retirable_helper",
+            "description": "A helper with an explicit lifecycle",
+            "code": "def run(args):\n    return {'ok': True}\n",
+            "input_schema": {"type": "object"},
+            "effects": ["READ_LOCAL"],
+            "validation_cases": [{"args": {}}],
+        },
+    ))
+    generated_id = json.loads(created.output)["capability_id"]
+    assert fabric.has(generated_id, task_id="task-deprecate")
+
+    retired = await capability.invoke(CapabilityRequest(
+        capability_id="synthesis", task_id="task-deprecate", call_id="deprecate",
+        arguments={"operation": "deprecate", "capability_id": generated_id},
+    ))
+
+    assert retired.status is CapabilityResultStatus.OK
+    assert not fabric.has(generated_id, task_id="task-deprecate")
+
+
+@pytest.mark.asyncio
 @pytest.mark.athena_scenario("SYNTH-005")
 async def test_synthesis_generates_strict_input_schema_from_fixtures():
     fabric = CapabilityFabric(CapabilityRegistry())

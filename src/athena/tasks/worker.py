@@ -63,6 +63,7 @@ class TaskWorker:
         self._last_store_error_at: float | None = None
         self._claimed_count = 0
         self._completed_count = 0
+        self._active_kernel_tasks: set[asyncio.Task] = set()
 
     async def stop(self) -> None:
         """Signal the background loop to stop and await its graceful exit."""
@@ -132,6 +133,9 @@ class TaskWorker:
             if task_id is None:
                 await asyncio.sleep(self._config.poll_wait_s)
                 continue
+            current = asyncio.current_task()
+            if current is not None:
+                self._active_kernel_tasks.add(current)
             try:
                 result = await self._run_claimed(task_id)
                 if await self._maybe_retry(task_id, result):
@@ -143,6 +147,9 @@ class TaskWorker:
                 # degraded health signal so operators/recovery can retry it.
                 self._record_store_error("finalization", exc)
                 await asyncio.sleep(self._failure_backoff())
+            finally:
+                if current is not None:
+                    self._active_kernel_tasks.discard(current)
 
     async def _maybe_retry(self, task_id: str, result: TaskResult) -> bool:
         if self._config.max_retries <= 0:
@@ -240,6 +247,17 @@ class TaskWorker:
         self._last_store_error_kind = kind
         self._last_store_error = str(error)
         self._last_store_error_at = asyncio.get_running_loop().time()
+        if _database_is_closed(error):
+            # A closed connection is not a retryable outage for this worker.
+            # In production it means the owning process is being torn down;
+            # in crash-recovery tests it represents the same boundary. Stop
+            # claiming and cancel any in-flight kernel work so a restarted
+            # service is the only owner left to reconcile the task.
+            self._stop.set()
+            current = asyncio.current_task()
+            for task in tuple(self._active_kernel_tasks):
+                if task is not current and not task.done():
+                    task.cancel()
 
     def _record_store_recovered(self) -> None:
         self._consecutive_store_failures = 0
@@ -254,3 +272,9 @@ class TaskWorker:
     @property
     def _max_parallel(self) -> int:
         return max(1, self._config.max_parallel)
+
+
+def _database_is_closed(error: BaseException) -> bool:
+    """Recognize terminal connection loss without masking other DB failures."""
+    text = str(error).casefold()
+    return "closed database" in text or "no active connection" in text

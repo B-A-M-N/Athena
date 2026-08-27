@@ -12,6 +12,7 @@ from athena.protocol.artifacts import ArtifactRef
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResultStatus,
+    EffectClass,
 )
 from athena.research.models import EvidenceObject, SourceRecord
 from athena.research.policy import SourcePolicy, SourcePolicyError, canonicalize_uri
@@ -278,9 +279,91 @@ async def test_fetch_rejects_non_allowlisted_source_before_network(monkeypatch):
     assert called is False
 
 
+@pytest.mark.asyncio
+async def test_plan_assess_and_bundle_require_verified_evidence():
+    store = _MemoryResearchStore()
+    artifacts = _MemoryArtifacts()
+    capability = ResearchCapability(
+        store,
+        artifact_store=artifacts,
+        source_policy=SourcePolicy(allowed_domains=("example.test",)),
+    )
+    context = SimpleNamespace(workspace=SimpleNamespace(id="repo"))
+
+    plan = await capability.invoke(CapabilityRequest(
+        capability_id="research", task_id="task-plan", call_id="plan-1",
+        arguments={
+            "operation": "plan",
+            "objective": "verify the release status",
+            "requirements": [{
+                "id": "release-status",
+                "claim_id": "claim-release-status",
+                "question": "Is the release ready?",
+                "queries": ["status=ready"],
+            }],
+        },
+    ), context=context)
+    plan_payload = json.loads(plan.output)
+    gap = plan_payload["requirements"][0]["gap"]
+
+    before = await capability.invoke(CapabilityRequest(
+        capability_id="research", task_id="task-plan", call_id="assess-1",
+        arguments={"operation": "assess"},
+    ), context=context)
+    assert json.loads(before.output)["ready"] is False
+
+    source = await capability.invoke(CapabilityRequest(
+        capability_id="research", task_id="task-plan", call_id="source-1",
+        arguments={
+            "operation": "record_source", "uri": "https://example.test/release",
+            "content": "status=ready", "title": "release snapshot",
+        },
+    ), context=context)
+    source_id = json.loads(source.output)["source"]["id"]
+    evidence = await capability.invoke(CapabilityRequest(
+        capability_id="research", task_id="task-plan", call_id="evidence-1",
+        arguments={
+            "operation": "record_evidence", "source_id": source_id,
+            "claim_id": "claim-release-status", "claim": "The release is ready.",
+            "excerpt": "status=ready",
+        },
+    ), context=context)
+    evidence_id = json.loads(evidence.output)["evidence"]["id"]
+
+    assessed = await capability.invoke(CapabilityRequest(
+        capability_id="research", task_id="task-plan", call_id="assess-2",
+        arguments={"operation": "assess", "gap_ids": [gap["id"]]},
+    ), context=context)
+    assessed_payload = json.loads(assessed.output)
+    assert assessed_payload["ready"] is True
+    assert assessed_payload["gaps"][0]["status"] == "CLOSED"
+    assert assessed_payload["gaps"][0]["evidence_ids"] == [evidence_id]
+
+    bundle = await capability.invoke(CapabilityRequest(
+        capability_id="research", task_id="task-plan", call_id="bundle-1",
+        arguments={"operation": "bundle"},
+    ), context=context)
+    bundle_payload = json.loads(bundle.output)
+    assert bundle_payload["ready"] is True
+    assert bundle_payload["evidence"][0]["id"] == evidence_id
+
+
 def test_research_effect_contract_is_exact():
     descriptor = ResearchCapability.descriptor
     assert descriptor.resolve_effects({"operation": "sources"})
     assert descriptor.resolve_effects({"operation": "record_source"})
-    with pytest.raises(ValueError):
-        descriptor.resolve_effects({"operation": "fetch"})
+    assert descriptor.resolve_effects({"operation": "fetch"}) == frozenset({
+        EffectClass.WRITE_LOCAL,
+        EffectClass.NETWORK_READ,
+    })
+    assert descriptor.resolve_effects({"operation": "plan"}) == frozenset({
+        EffectClass.READ_LOCAL,
+        EffectClass.WRITE_LOCAL,
+    })
+    assert descriptor.resolve_effects({"operation": "assess"}) == frozenset({
+        EffectClass.READ_LOCAL,
+        EffectClass.WRITE_LOCAL,
+    })
+    assert descriptor.resolve_effects({"operation": "bundle"}) == frozenset({
+        EffectClass.READ_LOCAL,
+    })

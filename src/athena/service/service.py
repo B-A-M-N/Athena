@@ -230,9 +230,15 @@ class AthenaService:
         self._default_workspace = workspace
 
         # 1. State: DB + stores (migrations apply lazily on first query).
-        db = Database(cfg.db_path or DEFAULT_DB_PATH())
+        db_path = cfg.db_path or DEFAULT_DB_PATH()
+        db = Database(db_path)
         await db._ensure_ready()  # noqa: SLF001 - apply migrations exactly once, deterministically
         self._db = db
+        self._runtime_state_root = (
+            tempfile.mkdtemp(prefix="athena-runtime-")
+            if db_path == ":memory:"
+            else os.path.join(os.path.dirname(os.path.abspath(db_path)), "fusion")
+        )
         sessions = SessionRepository(db)
         tasks = TaskStore(db)
         events = EventStore(db)
@@ -400,9 +406,10 @@ class AthenaService:
                     execution=execution,
                     dispatcher=self._dispatcher,
                     artifact_store=self._artifacts,
-                    capability_registry=registry,
+                    capability_registry=fabric,
                     model_registry=router,   # ModelRouter: judge role routing
                     evidence_provider=self._verification_evidence,
+                    inference_broker=self._make_judge_broker(),
                 ),
             ),
             dispatch_factory=self._dispatch_factory,
@@ -451,6 +458,7 @@ class AthenaService:
             loop_interval_seconds=cfg.scheduler_interval_seconds,
         )
         self._scheduler = scheduler
+        events.subscribe(scheduler.notify_event)
         registry.register(ScheduleCapability(ScheduleAPI(scheduler, task_manager)))
 
         # 12.5 Crash recovery: reconcile orphaned state before claiming new work.
@@ -461,6 +469,7 @@ class AthenaService:
             mutation_store=mutations,
             execution_store=execution_store,
             runtime_session_store=runtime_sessions,
+            event_store=events,
         )
         try:
             recovery_summary = await recovery.recover()
@@ -532,6 +541,8 @@ class AthenaService:
                 await self._scheduler.stop()
             except Exception as exc:
                 _logger.warning("scheduler stop failed: %s", exc)
+            if self._store_events is not None:
+                self._store_events.unsubscribe(self._scheduler.notify_event)
             self._scheduler = None
 
         # 3. INTERRUPT active tasks (recoverable), never CANCEL (P0-23).
@@ -922,6 +933,18 @@ class AthenaService:
             task = await self.get_task(task_id)
             status = (task.metadata or {}).get("status")
             if status in {s.value for s in TERMINAL_STATUSES}:
+                manager = self._task_manager
+                if manager is not None and hasattr(manager, "wait_for_finalization"):
+                    remaining = max(deadline - time.monotonic(), 0.0)
+                    try:
+                        await manager.wait_for_finalization(
+                            task_id, timeout=remaining,
+                        )
+                    except TimeoutError:
+                        # The durable result is still authoritative. A slow
+                        # optional observer must not turn a completed task
+                        # into an unavailable one for callers with a deadline.
+                        pass
                 return task
             if time.monotonic() >= deadline:
                 return task
@@ -1603,7 +1626,7 @@ class AthenaService:
 
     def _build_verifier(
         self, *, execution, dispatcher, artifact_store, capability_registry,
-        model_registry, evidence_provider=None,
+        model_registry, evidence_provider=None, inference_broker=None,
     ):
         """Build the acceptance verifier for the kernel."""
         from athena.kernel.verifiers import CompositeVerifier
@@ -1614,7 +1637,22 @@ class AthenaService:
             capability_registry=capability_registry,
             model_registry=model_registry,
             evidence_provider=evidence_provider,
+            inference_broker=inference_broker,
         )
+
+    def _make_judge_broker(self):
+        """Return a late-bound broker for task-scoped judge inference."""
+        async def _broker(*, task, system_prompt, user_prompt):
+            kernel = self._kernel
+            if kernel is None:
+                raise RuntimeError("judge broker: kernel not constructed")
+            return await kernel.judge_subturn(
+                task=task,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
+        return _broker
 
     async def _verification_evidence(self, task: TaskSpec) -> dict[str, Any]:
         """Collect a bounded projection of durable task observations for a judge."""
@@ -1649,6 +1687,25 @@ class AthenaService:
                               for ref in result.artifacts],
             }
         result_data = evidence.get("result", {})
+        if self._research_store is not None:
+            try:
+                workspace_id = task.workspace.id if task.workspace else None
+                sources = await self._research_store.list_sources(
+                    task_id=task.id, project_id=workspace_id, limit=50,
+                )
+                research_evidence = await self._research_store.list_evidence(
+                    task_id=task.id, project_id=workspace_id, limit=75,
+                )
+                gaps = await self._research_store.list_gaps(
+                    task_id=task.id, limit=100,
+                )
+                evidence["research"] = {
+                    "sources": [source.to_record() for source in sources],
+                    "evidence": [item.to_record() for item in research_evidence],
+                    "gaps": [gap.to_record() for gap in gaps],
+                }
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                _logger.warning("research evidence lookup failed: %s", exc)
         return {
             "evidence": evidence,
             "artifacts": result_data.get("artifacts", []),
@@ -1881,6 +1938,9 @@ class AthenaService:
             mutation_store=self._store_mutations,
             mutation_observer=self._on_mutation_completed,
         ))
+        from athena.capabilities.fusion import FusionCapability
+
+        registry.register(FusionCapability(self))
 
         # Capability-owned resource teardown (P1-32).
         if hasattr(self, "_terminals"):
@@ -1994,11 +2054,26 @@ class AthenaService:
         from athena.shadow.engine import ShadowEngine
 
         if getattr(self, "_shadow", None) is None:
-            self._shadow = ShadowEngine()
+            state_root = getattr(self, "_runtime_state_root", None)
+            roots_parent = (
+                os.path.join(state_root, "shadows") if state_root else None
+            )
+            self._shadow = ShadowEngine(
+                roots_parent=roots_parent,
+                state_root=state_root,
+            )
         if self._shadow._dispatcher is None and self._dispatcher is not None:
             self._shadow.bind(self._dispatcher)
         self._shadow.bind_service(self)
         return self._shadow
+
+    def fusion_orchestrator(self):
+        """Return the service-owned, single-agent fusion orchestrator."""
+        from athena.fusion.orchestrator import FusionOrchestrator
+
+        if getattr(self, "_fusion", None) is None:
+            self._fusion = FusionOrchestrator(self)
+        return self._fusion
 
     def world_state(self, task_id: str | None = None):
         """Execution-grounded structured reality for one task."""
@@ -2019,6 +2094,11 @@ class AthenaService:
         pcs = tuple(self.config.providers)
         if not pcs:
             registry.register("fake", FakeModelProvider(
+                # Keep the dependency-free default useful for local CLI smoke
+                # runs and packaged installs.  Explicit provider entries still
+                # control their own scripts; this only covers an otherwise
+                # unconfigured service.
+                scripts=list(_DEFAULT_ANSWER_SCRIPTS),
                 tool_calling=True, model="fake-1", provider="fake"))
             registry.set_profile("fake", resolve_profile("fake", model_id="fake-1"))
             registry.set_model_profile(

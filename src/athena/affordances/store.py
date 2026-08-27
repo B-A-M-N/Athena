@@ -167,5 +167,19 @@ class GeneratedCapabilityStore:
         await self._db.execute(
             "DELETE FROM generated_capabilities WHERE id = ?", (capability_id,))
 
+    async def disable(self, capability_id: str, *, owner: str | None = None) -> bool:
+        """Retire a durable definition without destroying its audit record."""
+        await self._ensure()
+        clauses = ["id = ?", "enabled = 1"]
+        params: list[str] = [capability_id]
+        if owner:
+            clauses.append("owner = ?")
+            params.append(owner)
+        cursor = await self._db.execute(
+            "UPDATE generated_capabilities SET enabled = 0 "
+            "WHERE " + " AND ".join(clauses), tuple(params)
+        )
+        return cursor.rowcount > 0
+
 
 __all__ = ["GeneratedCapabilityStore"]

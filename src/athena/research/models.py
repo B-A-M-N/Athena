@@ -248,14 +248,16 @@ class ResearchGap:
         task_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> ResearchGap:
+        gap_metadata = dict(metadata or {})
+        identity = gap_metadata.get("requirement_id") or ""
         return cls(
-            id=_stable_id("gap", objective, question, task_id or ""),
+            id=_stable_id("gap", objective, question, task_id or "", identity),
             objective=objective,
             question=question,
             kind=kind,
             required=required,
             task_id=task_id,
-            metadata=dict(metadata or {}),
+            metadata=gap_metadata,
         )
 
     def to_record(self) -> dict[str, Any]:

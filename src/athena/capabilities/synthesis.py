@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from athena.affordances.models import AffordanceScope
+from athena.affordances.models import AffordanceScope, DependencyRequirement
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
@@ -36,15 +36,15 @@ class SynthesisCapability:
         id="synthesis",
         description=(
             "Create a task-local deterministic capability from Python source, "
-            "or explicitly promote a validated tool to project/user scope. "
+            "or explicitly promote/deprecate a validated tool. "
             "The source is sandbox-validated before registration. Operations: "
-            "create/promote."
+            "create/promote/deprecate."
         ),
         input_schema={
             "type": "object",
             "required": ["operation"],
             "properties": {
-                "operation": {"type": "string", "enum": ["create", "promote"]},
+                "operation": {"type": "string", "enum": ["create", "promote", "deprecate"]},
                 "name": {"type": "string", "pattern": _NAME.pattern},
                 "description": {"type": "string", "minLength": 1, "maxLength": 1000},
                 "code": {"type": "string", "minLength": 1, "maxLength": 200_000},
@@ -65,12 +65,28 @@ class SynthesisCapability:
                 },
                 "capability_id": {"type": "string", "minLength": 1},
                 "scope": {"type": "string", "enum": ["project", "user"]},
+                "required_dependencies": {
+                    "type": "array", "maxItems": 64,
+                    "items": {
+                        "type": "object", "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string", "minLength": 1, "maxLength": 128},
+                            "manager": {"type": "string", "enum": ["python"]},
+                            "version": {"type": "string", "maxLength": 64},
+                            "reason": {"type": "string", "maxLength": 1000},
+                            "required_for": {"type": "string", "maxLength": 256},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
             },
             "oneOf": [
                 {"properties": {"operation": {"const": "create"}},
                  "required": ["name", "description", "code", "validation_cases"]},
                 {"properties": {"operation": {"const": "promote"}},
                  "required": ["capability_id", "scope"]},
+                {"properties": {"operation": {"const": "deprecate"}},
+                 "required": ["capability_id"]},
             ],
             "additionalProperties": False,
         },
@@ -90,6 +106,24 @@ class SynthesisCapability:
                            error="generated capabilities require a task scope")
         args = dict(request.arguments or {})
         operation = str(args.get("operation") or "")
+        if operation == "deprecate":
+            workspace = getattr(context, "workspace", None)
+            try:
+                deprecated = await self._fabric.deprecate(
+                    str(args.get("capability_id") or ""),
+                    task_id=request.task_id,
+                    project_id=getattr(workspace, "id", None),
+                    user_id="athena",
+                    scope=args.get("scope"),
+                )
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                return _result(request, ok=False, error=str(exc))
+            if not deprecated:
+                return _result(request, ok=False, error="capability is unknown, not owned, or already deprecated")
+            return _result(request, output=json.dumps({
+                "capability_id": args["capability_id"],
+                "status": "deprecated",
+            }))
         if operation == "promote":
             if context is None:
                 return _result(request, ok=False,
@@ -134,6 +168,16 @@ class SynthesisCapability:
         output_schema = (
             dict(output_schema_arg) if output_schema_arg is not None else None
         )
+        required_dependencies = tuple(
+            DependencyRequirement(
+                name=str(dependency["name"]),
+                manager=str(dependency.get("manager") or "python"),
+                version=dependency.get("version"),
+                reason=str(dependency.get("reason") or ""),
+                required_for=dependency.get("required_for"),
+            )
+            for dependency in args.get("required_dependencies") or ()
+        )
 
         cap = self._engine.synthesize(
             name=name,
@@ -149,6 +193,7 @@ class SynthesisCapability:
                 "request_call_id": request.call_id,
             },
             validation_cases=validation_cases,
+            required_dependencies=required_dependencies,
         )
         cap = await self._engine.validate(
             cap,
@@ -168,6 +213,9 @@ class SynthesisCapability:
             "input_schema": cap.input_schema,
             "output_schema": cap.output_schema or {},
             "effects": sorted(args.get("effects") or (EffectClass.READ_LOCAL.value,)),
+            "required_dependencies": [
+                dependency.__dict__ for dependency in required_dependencies
+            ],
         }, sort_keys=True, separators=(",", ":")).encode()
         cap.id = "synth_" + hashlib.sha256(identity).hexdigest()[:20]
         if not cap.validation.get("all_passed"):

@@ -4,6 +4,7 @@ import pytest
 
 import os
 import tempfile
+from types import SimpleNamespace
 
 from athena.protocol.tasks import (
     Criterion,
@@ -14,9 +15,13 @@ from athena.protocol.tasks import (
 )
 from athena.kernel.verifiers import (
     CompositeVerifier,
+    _CapabilityCheckVerifier,
     _FileVerifier,
     _ManualVerifier,
+    _ModelJudgmentVerifier,
 )
+from athena.protocol.messages import TextBlock
+from athena.protocol.models import ModelResponse
 
 
 def _task(ws_root: str = "/tmp") -> TaskSpec:
@@ -99,3 +104,52 @@ def test_composite_no_verification_spec():
     )
     results = _run(v.verify(_task(), criteria))
     assert results == [False]
+
+
+def test_capability_check_uses_task_scoped_fabric():
+    calls = []
+
+    class Fabric:
+        def has(self, capability_id, **scope):
+            calls.append((capability_id, scope))
+            return True
+
+    task = TaskSpec(
+        id="task-7",
+        objective="test",
+        metadata={"project_id": "project-2", "user_id": "user-3"},
+    )
+    spec = VerificationSpec(
+        type=VerificationType.CAPABILITY_CHECK,
+        capability="generated.check",
+    )
+    assert _run(_CapabilityCheckVerifier(Fabric()).verify_one(task, spec)) is True
+    assert calls == [(
+        "generated.check",
+        {"task_id": "task-7", "project_id": "project-2", "user_id": "user-3"},
+    )]
+
+
+def test_model_judgment_uses_kernel_broker():
+    calls = []
+
+    async def broker(**kwargs):
+        calls.append(kwargs)
+        return ModelResponse(
+            request_id="judge-1",
+            model="judge-model",
+            provider="judge-provider",
+            blocks=(TextBlock(text="YES"),),
+        )
+
+    task = _task()
+    spec = VerificationSpec(
+        type=VerificationType.MODEL_JUDGMENT,
+        predicate="the result is correct",
+    )
+    verifier = _ModelJudgmentVerifier(
+        SimpleNamespace(), inference_broker=broker,
+    )
+    assert _run(verifier.verify_one(task, spec)) is True
+    assert calls and calls[0]["task"] == task
+    assert "the result is correct" in calls[0]["user_prompt"]

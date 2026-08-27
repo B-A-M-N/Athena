@@ -11,19 +11,28 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import os
+import shutil
 import sys
+from collections import deque
+from collections.abc import Mapping
 from typing import Any, Callable, TextIO
 
-from athena.cli.dual_pane import Mascot, _OIWindow
+from athena.cli.dual_pane import (
+    Mascot,
+    _MASCOT_OFF,
+    resolve_mascot_name,
+)
+from athena.cli.layout import Rect
+from athena.cli.input import PromptController
+from athena.cli.projection import ProjectionState
+from athena.cli.render.ansi import CellGridDiffRenderer
+from athena.cli.render.scene import render_scene_lines
+from athena.cli.scene import build_oi_scene
+from athena.cli.terminal import TerminalSession
 
-_CLEAR = "\x1b[2J\x1b[H"
 _DIM = "\x1b[2m"
 _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
-
-_ERR_PREFIX = "[err] "
-
 
 class OIStreamViewer:
     """Full-pane OI window: raw stream + mascot header + inline approvals."""
@@ -38,6 +47,7 @@ class OIStreamViewer:
         output: TextIO | None = None,
         error: TextIO | None = None,
         input_fn: Callable[[str], str] | None = None,
+        mascot: str | None = None,
     ) -> None:
         self.service = service
         self.task_id = task_id
@@ -45,24 +55,54 @@ class OIStreamViewer:
         self.interactive = sys.stdin.isatty() if interactive is None else interactive
         self.output = output or sys.stdout
         self.error = error or sys.stderr
-        self._input_fn = input_fn or input
-        self.mascot = Mascot()
-        self.window = _OIWindow(max_lines=max_lines)
-        self._pending_approval: dict | None = None
-        self._status = "starting"
-        self._err_partial = ""  # unterminated stderr fragment across chunks
+        self._input_fn = input_fn
+        character = resolve_mascot_name(mascot)
+        self.mascot_enabled = character not in _MASCOT_OFF
+        self.mascot = Mascot(
+            character=character if self.mascot_enabled else "owl"
+        )
+        self._handled_approvals: set[str] = set()
+        self._last_policy_reason = ""
+        self._last_target = ""
+        self.projection = ProjectionState(stream=deque(maxlen=max_lines))
+        self.scene = build_oi_scene(self.projection, Rect(0, 0, 80, 24))
+        self.prompt = PromptController(input_fn=input_fn, output=self.output)
+        self._renderer = CellGridDiffRenderer(self.output)
+        self._terminal_session = TerminalSession(
+            self.output,
+            enabled=self.interactive,
+        )
+
+    def open(self) -> None:
+        """Enter the OI viewer's screen only when attached to a real TTY."""
+        self._terminal_session.open()
+
+    def close(self) -> None:
+        """Restore cursor/screen state after task completion or interruption."""
+        self._terminal_session.close()
+
+    @property
+    def _pending_approval(self) -> dict | None:
+        """Compatibility view; approval state belongs to the projection."""
+        return self.projection.pending_approval
+
+    @property
+    def _status(self) -> str:
+        """Compatibility label for callers of the older stream API."""
+        if self.projection.status == "EXECUTING":
+            return "running"
+        if self.projection.status == "APPROVAL":
+            return "WAITING FOR APPROVAL"
+        return self.projection.status.lower()
 
     # -- ingestion ------------------------------------------------------
     async def handle_event(self, event: Any) -> None:
         etype = str(getattr(event, "type", ""))
         payload = dict(getattr(event, "payload", {}) or {})
-        self.mascot.observe(etype)
+        self.projection.reduce(etype, payload)
+        self.mascot.observe(etype, payload)
 
-        if etype == "ModelDelta":
-            text = str(payload.get("text") or "")
-            if text:
-                self.window.feed_delta(text)
-        elif etype == "ModelResponseCompleted":
+        if etype == "ModelResponseCompleted":
             # Non-streaming providers: payload carries only provider/model,
             # so pull the final answer from the task's durable result.
             text = str(payload.get("text") or payload.get("summary") or "")
@@ -76,54 +116,36 @@ class OIStreamViewer:
                     pass
             if text:
                 final = f"◆ {text}"
-                tail = (self.window._partial or "").strip()
-                committed = list(self.window.lines)[-1:] if self.window.lines else []
-                last = tail or (committed[-1] if committed else "")
-                if last.strip() != final.strip():
-                    self.window.seal_partial()
-                    self.window.feed(final + "\n")
+                last = list(self.projection.stream)[-1:] or []
+                if not last or last[-1].strip() != final.strip():
+                    self.projection.feed_stream(final + "\n")
         elif etype == "CapabilityCompleted":
             out = str(payload.get("output") or "")
             if out.strip():
-                self.window.seal_partial()
-                self.window.feed(out if out.endswith("\n") else out + "\n")
-        elif etype == "StdoutChunk":
-            self.window.feed(str(payload.get("data") or ""))
-        elif etype == "StderrChunk":
-            data = str(payload.get("data") or "")
-            if data:
-                # Rejoin a fragment split across chunks: drop the held
-                # delta-view partial, prepend it, and re-feed as one stream.
-                held = f"{_ERR_PREFIX}{self._err_partial}" if self._err_partial else ""
-                if held and self.window._partial == held:
-                    self.window._partial = ""
-                data = self._err_partial + data
-                self._err_partial = ""
-                lines = data.split("\n")
-                tail = lines.pop()  # unterminated partial after last newline
-                for ln in lines:
-                    self.window.feed(f"{_ERR_PREFIX}{ln}\n")
-                if tail:
-                    # Partial line: hold as delta so the next chunk continues it.
-                    self._err_partial = tail
-                    self.window.feed_delta(f"{_ERR_PREFIX}{tail}")
+                self.projection.feed_stream(out if out.endswith("\n") else out + "\n")
         elif etype == "CapabilityRequested":
-            args = payload.get("arguments") or {}
-            code = args.get("code")
-            if code:
-                first = str(code).splitlines()[0][:100]
-                lang = args.get("language", "?")
-                self.window.seal_partial()
-                self.window.feed(f"$ [{lang}] {first}\n")
+            raw_args = payload.get("arguments")
+            args = raw_args if isinstance(raw_args, Mapping) else {}
+            if args:
+                self._last_target = str(
+                    payload.get("target")
+                    or payload.get("resource")
+                    or args.get("path")
+                    or args.get("file")
+                    or args.get("resource")
+                    or ""
+                )
         elif etype == "ApprovalRequested":
-            self._pending_approval = payload
-            self._status = "WAITING FOR APPROVAL"
-            await self._offer_approval(payload)
-        elif etype == "ApprovalResolved":
-            self._pending_approval = None
-            self._status = "running"
-        elif etype.startswith("Task"):
-            self._status = etype.removeprefix("Task").lower() or self._status
+            approval_id = str(payload.get("approval_id") or "")
+            # The kernel emits a count-only ApprovalRequested summary after
+            # the dispatcher emits the actionable request. Preserve the
+            # detailed request and never prompt twice for one approval.
+            if approval_id and approval_id not in self._handled_approvals:
+                await self._offer_approval(payload)
+            elif not approval_id and self._handled_approvals:
+                self.projection.ignore_approval_summary()
+        elif etype == "PolicyDecisionMade":
+            self._last_policy_reason = str(payload.get("reason") or "")
 
     # -- approvals -------------------------------------------------------
     async def _offer_approval(self, payload: dict) -> None:
@@ -131,12 +153,18 @@ class OIStreamViewer:
         scopes = [str(s) for s in payload.get("scopes") or ()] or ["call"]
         aid = payload.get("approval_id")
         cap = payload.get("capability_id") or "capability"
+        target = payload.get("target") or payload.get("resource") or payload.get("path") or self._last_target
+        reason = payload.get("reason") or payload.get("policy_reason") or self._last_policy_reason
         self._write(f"\n{_BOLD}APPROVAL REQUIRED{_RESET}  capability={cap}  id={aid}")
+        if target:
+            self._write(f"  target: {target}")
+        if reason:
+            self._write(f"  reason: {reason}")
         for i, s in enumerate(scopes, 1):
             self._write(f"  {i}) {s}")
-        self._write("  d) deny")
+        self._write("  d) deny  (the task is paused)")
         try:
-            raw = self._input_fn(f"approve [{1}-{len(scopes)}/d]> ")
+            raw = self.prompt.read(f"approve [{1}-{len(scopes)}/d]> ")
         except (EOFError, KeyboardInterrupt):
             raw = "d"
         choice = raw.strip().lower()
@@ -148,28 +176,33 @@ class OIStreamViewer:
             scope = scopes[0]
         if self.service is not None and aid:
             await self.service.approve(aid, granted=granted, scope=scope)
-        self._pending_approval = None
-        self._status = "running"
+        if aid:
+            self._handled_approvals.add(str(aid))
+        self.projection.acknowledge_approval(granted=granted, scope=scope)
 
     # -- rendering --------------------------------------------------------
-    def render(self, height: int = 24) -> None:
-        m = self.mascot.render(max_width=30)
-        state = self.mascot.state.upper()
-        self._write(_CLEAR)
-        self._write(f"{_BOLD}╭─ OI LIVE ─ state: {state} ─ {'─' * 20}{_RESET}")
-        mascot_lines = m[:3]
-        body_height = max(height - len(mascot_lines) - 2, 1)
-        body = self.window.snapshot(body_height, width=58)
-        for i in range(body_height):
-            text = body[i] if i < len(body) else ""
-            is_err = text.startswith(_ERR_PREFIX) or text.startswith("[err]")
-            color = "\x1b[31m" if is_err else ""
-            side = mascot_lines[i] if i < len(mascot_lines) else ""
-            self._write(f"{color}{text:<58}{_RESET}{side}")
-        for ln in mascot_lines[len(body):]:
-            self._write(ln)
-        tail = f"{_DIM}{self._status}{_RESET}"
-        self._write(f"╰─ {tail} " + "─" * 30)
+    def render(self, height: int | None = None) -> None:
+        if height is None:
+            _, height = shutil.get_terminal_size((80, 24))
+        width, _ = shutil.get_terminal_size((80, max(height, 1)))
+        width = max(width, 40)
+        self.scene = build_oi_scene(self.projection, Rect(0, 0, width, max(height, 1)))
+        m = self.mascot.render(max_width=30) if self.mascot_enabled else []
+        state = self.projection.status
+        lines = [f"{_BOLD}╭─ OI LIVE ─ state: {state} ─ {'─' * 20}{_RESET}"]
+        body = render_scene_lines(
+            self.projection,
+            self.scene,
+            width=width,
+            height=max(height - 2, 1),
+            buddy_lines=([f"BUDDY · {state}"] + m) if self.mascot_enabled else (),
+            buddy_enabled=self.mascot_enabled,
+        )
+        lines.extend(body)
+        display_status = self.projection.status.lower()
+        tail = f"{_DIM}{display_status}{_RESET}"
+        lines.append(f"╰─ {tail} " + "─" * max(width - len(display_status) - 8, 1))
+        self._renderer.draw(lines, columns=width)
 
     def _write(self, text: str, *, end: str = "\n", stream: TextIO | None = None) -> None:
         target = stream or self.output
@@ -184,6 +217,7 @@ async def run_viewer(
     output: TextIO | None = None,
     error: TextIO | None = None,
     input_fn: Callable[[str], str] | None = None,
+    mascot: str | None = None,
 ) -> int:
     viewer = OIStreamViewer(
         service=service,
@@ -191,53 +225,73 @@ async def run_viewer(
         output=output,
         error=error,
         input_fn=input_fn,
+        mascot=mascot,
     )
-    cursor = 0  # rowid for global tail
-    viewer._write(_CLEAR)
-    if viewer.task_id:
-        # Task-scoped: stream_events yields incrementally while the task runs;
-        # handle+render each event as it arrives, track highest sequence seen,
-        # and return once the generator ends at a terminal status.
-        last_seq = -1
-        async for ev in service.stream_events(viewer.task_id, after_sequence=0):
-            seq = getattr(ev, "sequence", None)
-            if isinstance(seq, int) and seq > last_seq:
-                last_seq = seq
-            await viewer.handle_event(ev)
+    viewer.open()
+    try:
+        cursor = 0  # rowid for global tail
+        if viewer.task_id:
+            # Task-scoped: stream_events yields incrementally while the task runs;
+            # handle+render each event as it arrives, track highest sequence seen,
+            # and return once the generator ends at a terminal status.
+            last_seq = -1
+            async for ev in service.stream_events(viewer.task_id, after_sequence=0):
+                seq = getattr(ev, "sequence", None)
+                if isinstance(seq, int) and seq > last_seq:
+                    last_seq = seq
+                await viewer.handle_event(ev)
+                viewer.render()
+            # Terminal: one final render so nothing appended since the last event
+            # frame is missed, then exit cleanly instead of looping forever.
             viewer.render()
-        # Terminal: one final render so nothing appended since the last event
-        # frame is missed, then exit cleanly instead of looping forever.
-        viewer.render()
-        return 0
-    # Global tail: cursor-poll list_recent forever.
-    while True:
-        items = await service._require_events().list_recent(after_rowid=cursor)
-        for ev in items:
-            rid = getattr(ev, "_rowid", None)
-            if isinstance(rid, int):
-                cursor = max(cursor, rid)
-            await viewer.handle_event(ev)
-        if items:
-            viewer.render()
-        await asyncio.sleep(0.15)
+            return 0
+        # Global tail: cursor-poll list_recent forever.
+        while True:
+            items = await service._require_events().list_recent(after_rowid=cursor)
+            for ev in items:
+                rid = getattr(ev, "_rowid", None)
+                if isinstance(rid, int):
+                    cursor = max(cursor, rid)
+                await viewer.handle_event(ev)
+            if items:
+                viewer.render()
+            await asyncio.sleep(0.15)
+    finally:
+        viewer.close()
 
 
 def main(argv: list[str] | None = None) -> int:
+    import argparse
+
     argv = list(sys.argv[1:] if argv is None else argv)
-    task_id = None
-    if "--task" in argv:
-        i = argv.index("--task")
-        task_id = argv[i + 1] if i + 1 < len(argv) else None
-    db_path = os.environ.get("ATHENA_DB")
+    parser = argparse.ArgumentParser(prog="athena oi-stream")
+    parser.add_argument("--task", default=None)
+    parser.add_argument("--config", dest="config_path", default=None)
+    parser.add_argument("--db", dest="db_path", default=None)
+    parser.add_argument("--workspace", default=None)
+    parser.add_argument("--mascot", default=None)
+    ns = parser.parse_args(argv)
+    task_id = ns.task
+
     from athena.cli.app import build_config, build_service
 
-    config = build_config(_opts(db_path))
+    options = _opts(ns.db_path)
+    options.config_path = ns.config_path
+    options.workspace = ns.workspace
+    options.mascot = ns.mascot
+    config = build_config(options)
     service = build_service(config)
+
+    from athena.cli.dual_pane import configure_mascots
+
+    configure_mascots(getattr(config, "mascots", None))
 
     async def _runner():
         await service.start()
         try:
-            return await run_viewer(service, task_id)
+            return await run_viewer(
+                service, task_id, mascot=getattr(config, "mascot", None)
+            )
         finally:
             await service.stop()
 

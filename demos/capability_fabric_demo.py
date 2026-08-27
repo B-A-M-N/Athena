@@ -53,7 +53,8 @@ from athena.protocol.events import make_event
 
 # The recording is intentionally readable: each of the eight gaps between the
 # nine stages is long enough to understand the current card and right-hand
-# stream.  VHS captures real time, so this produces a roughly 90-second demo.
+# stream. VHS captures real time; these values target roughly 90 seconds while
+# keeping the actual event sequence fast enough to finish inside the tape.
 LIVE_SCENE_CADENCE_S = 10.0
 EVENT_PAUSE_S = 0.45
 
@@ -392,22 +393,27 @@ def _capability_turn(
     output: str,
     *,
     runtime: str = "python",
+    call_id: str | None = None,
 ) -> list[Any]:
     """Return a capability/execution sequence rendered by the real surface."""
+    call_id = call_id or "demo-" + capability_id.replace(".", "-")
+    execution_id = call_id + "-exec"
     return [
         _event("CapabilityRequested", {
+            "call_id": call_id,
             "capability_id": capability_id,
             "arguments": arguments,
         }),
-        _event("CapabilityStarted", {"capability_id": capability_id}),
-        _event("ExecutionStarted", {"runtime": runtime}),
-        _event("StdoutChunk", {"data": output}),
+        _event("CapabilityStarted", {"call_id": call_id, "capability_id": capability_id}),
+        _event("ExecutionStarted", {"call_id": call_id, "execution_id": execution_id, "runtime": runtime}),
+        _event("StdoutChunk", {"execution_id": execution_id, "data": output}),
         _event("ExecutionExited", {
+            "execution_id": execution_id,
             "runtime": runtime,
             "exit_status": "success",
             "exit_code": 0,
         }),
-        _event("CapabilityCompleted", {"capability_id": capability_id}),
+        _event("CapabilityCompleted", {"call_id": call_id, "capability_id": capability_id}),
     ]
 
 
@@ -503,9 +509,11 @@ def _events_for_stage(stage: int, data: DemoData) -> list[Any]:
                 "this action needs your approval."
             ),
             _event("ApprovalRequested", {
+                "call_id": "demo-execute",
                 "approval_id": "demo-approval-01",
                 "capability_id": "execute",
                 "scopes": ["call", "task", "session"],
+                "reason": "execution can change the local workspace",
             }),
             _event("ApprovalResolved", {
                 "approval_id": "demo-approval-01",
@@ -516,6 +524,7 @@ def _events_for_stage(stage: int, data: DemoData) -> list[Any]:
                 "execute",
                 {"language": "python", "code": "verify_manifest(paths)"},
                 "policy: task scope\nexecution: allowed\nhelper: project.verify_manifest\n",
+                call_id="demo-execute",
             ),
         ]
     if stage == 8:
@@ -554,8 +563,12 @@ async def _run_surface(
 ) -> None:
     """Project the event sequence through the production CLI surface."""
     surface = DualPaneSurface(details=False)
-    print("Athena console (type /help for commands; Ctrl-D to exit)")
-    print("athena> verify the next release using the available affordances")
+    # The demo owns the same composed-surface lifecycle as the REPL. Keeping
+    # the presentation clock alive during reading pauses makes the recording
+    # preserve real elapsed time instead of collapsing static intervals.
+    surface.open()
+    surface.render_idle()
+    surface.render_user_message("Verify the next release using the available affordances.")
     pause = 0.0 if speed == 0 else EVENT_PAUSE_S / max(speed, 0.0001)
     cadence = 0.0 if speed == 0 else LIVE_SCENE_CADENCE_S / max(speed, 0.0001)
 
@@ -571,8 +584,9 @@ async def _run_surface(
     # read, just as the real REPL does before its next input call.
     await asyncio.sleep(3.0 / max(speed, 1.0) if speed else 0.0)
     surface.finish()
-    print("\n[task demo-task -> COMPLETE]")
-    print("athena> ", end="", flush=True)
+    surface.render_result(status="COMPLETE")
+    surface.set_prompt("")
+    surface.close()
 
 
 def run_live(scenes: list[SceneScript], data: DemoData, *, speed: float) -> None:

@@ -29,6 +29,7 @@ _META_HELP = """\
 /autonomy LEVEL  set autonomy (supervised|coding|autonomous|offline)
 /model POLICY    set model policy
 /details         toggle detailed event activity
+/scroll PANE DIRECTION  inspect conversation/OI history (up|down|bottom)
 /permissions     show active policy grants and pending approvals
 /diff            show recent file mutations (mutation ledger)
 /undo MUTATION   roll back a completed mutation by id
@@ -37,6 +38,7 @@ _META_HELP = """\
 /criteria LIST   set acceptance criteria (';'-separated; 'command:' prefix = probe); bare to clear
 /interrupted     list tasks parked by shutdown or crash
 /resume [TASK]   re-queue an interrupted task (or the most recent one)
+/mascot [NAME]   list or switch the mascot/buddy ('off' hides it)
 !cmd             execute a shell command directly
 !!cmd            execute a shell command (output not injected into model context)
 """
@@ -76,14 +78,26 @@ def _model_policy(name: str | None):
     return ModelPolicy(allowed=(name,))
 
 
-async def _cmd_permissions(service: Any) -> None:
+def _model_label(config: Any = None) -> str:
+    """Give the instrument rail the configured provider/model identity."""
+    providers = tuple(getattr(config, "providers", ()) or ())
+    if providers:
+        provider = providers[0]
+        return (
+            f"{getattr(provider, 'name', 'model')} / "
+            f"{getattr(provider, 'model', '')}"
+        ).rstrip(" /")
+    return os.environ.get("OPENROUTER_MODEL", "local / fake-1")
+
+
+async def _cmd_permissions(service: Any, surface: OperatorSurface) -> None:
     """Project active grants and pending approvals from canonical stores."""
     view = await service.operator_permissions()
     grants = view.get("active_grants") or []
     pending = view.get("pending") or []
-    print("┌─ permissions ─────────────────────────")
+    surface.render_notice("┌─ permissions ─────────────────────────")
     if not grants:
-        print("│ no active grants")
+        surface.render_notice("│ no active grants")
     for g in grants:
         scope = g.get("scope") or "?"
         cap = g.get("capability") or "*"
@@ -92,21 +106,21 @@ async def _cmd_permissions(service: Any) -> None:
         line = f"│ grant {g.get('approval_id')} · {cap} · {scope}"
         if pattern:
             line += f" · {pattern}"
-        print(line)
-        print(f"│   expires: {expires}")
+        surface.render_notice(line)
+        surface.render_notice(f"│   expires: {expires}")
     if not pending:
-        print("│ no pending approvals")
+        surface.render_notice("│ no pending approvals")
     for p in pending:
-        print(f"│ pending {p.get('approval_id')} · {p.get('capability_id')}")
-    print("└──────────────────────────────────────")
+        surface.render_notice(f"│ pending {p.get('approval_id')} · {p.get('capability_id')}")
+    surface.render_notice("└──────────────────────────────────────")
 
 
-async def _cmd_diff(service: Any, limit: int) -> None:
+async def _cmd_diff(service: Any, limit: int, surface: OperatorSurface) -> None:
     """Project the mutation ledger (grouped file-change evidence)."""
     rows = await service.operator_diff(limit=limit)
-    print("┌─ mutations ───────────────────────────")
+    surface.render_notice("┌─ mutations ───────────────────────────")
     if not rows:
-        print("│ (no recorded mutations)")
+        surface.render_notice("│ (no recorded mutations)")
     for r in rows:
         status_icon = {
             "COMPLETED": "✓",
@@ -114,12 +128,12 @@ async def _cmd_diff(service: Any, limit: int) -> None:
             "ROLLED_BACK": "↩",
         }.get(r.get("status"), "·")
         reversible = "reversible" if r.get("reversible") else "one-way"
-        print(
+        surface.render_notice(
             f"│ {status_icon} {r.get('operation', '?'):10} "
             f"{r.get('resource', '?')}  [{reversible}]"
         )
-        print(f"│   id: {r.get('id')}  task: {r.get('task_id') or '—'}")
-    print("└──────────────────────────────────────")
+        surface.render_notice(f"│   id: {r.get('id')}  task: {r.get('task_id') or '—'}")
+    surface.render_notice("└──────────────────────────────────────")
 
 
 def _surface_class():
@@ -132,6 +146,30 @@ def _surface_class():
         from athena.cli.surface import OperatorSurface
 
         return OperatorSurface
+
+
+def _make_surface(
+    *,
+    details: bool = False,
+    mascot: str | None = None,
+    display: str | None = None,
+    model_label: str | None = None,
+    animations: bool = True,
+    reduced_motion: bool = False,
+):
+    """Build the preferred surface, forwarding the mascot choice when the
+    surface supports one (the plain OperatorSurface has no mascot column)."""
+    surface_cls = _surface_class()
+    if surface_cls.__name__ == "DualPaneSurface":
+        return surface_cls(
+            details=details,
+            mascot=mascot,
+            display=display,
+            model_label=model_label,
+            animations=animations,
+            reduced_motion=reduced_motion,
+        )
+    return surface_cls(details=details)
 
 
 class ChatREPL:
@@ -148,8 +186,18 @@ class ChatREPL:
         self.model_policy: str | None = getattr(options, "model", None) or getattr(config, "model", None)
         self.workspace = _workspace_spec(getattr(options, "workspace", None))
         self._active_task_id: str | None = None
-        surface_cls = _surface_class()
-        self.surface = surface_cls(details=bool(getattr(options, "details", False)))
+        option_animations = getattr(options, "animations", None)
+        config_animations = getattr(config, "animations", True)
+        self.surface = _make_surface(
+            details=bool(getattr(options, "details", False)),
+            mascot=getattr(options, "mascot", None) or getattr(config, "mascot", None),
+            display=getattr(options, "display", None) or getattr(config, "display", None),
+            model_label=_model_label(config),
+            animations=bool(
+                config_animations if option_animations is None else option_animations
+            ),
+            reduced_motion=bool(getattr(options, "reduced_motion", False) or getattr(config, "reduced_motion", False)),
+        )
         self.criteria: list[str] = list(
             (getattr(options, "criteria") or "").split(";")
         ) if getattr(options, "criteria", None) else []
@@ -161,7 +209,10 @@ class ChatREPL:
 
         def _get() -> str:
             try:
-                return (input(prompt) or "").strip()
+                reader = getattr(self.surface, "read_prompt", None)
+                if callable(reader):
+                    return (reader(prompt) or "").strip()
+                return (self.surface._input_fn(prompt) or "").strip()
             except EOFError:
                 return ""
 
@@ -170,11 +221,25 @@ class ChatREPL:
     # -- main loop --------------------------------------------------------
 
     async def run_forever(self) -> int:
-        print("Athena console (type /help for commands; Ctrl-D to exit)")
+        opener = getattr(self.surface, "open", None)
+        closer = getattr(self.surface, "close", None)
+        if callable(opener):
+            opener()
+        try:
+            return await self._run_loop()
+        finally:
+            async_closer = getattr(self.surface, "aclose", None)
+            if callable(async_closer):
+                await async_closer()
+            elif callable(closer):
+                closer()
+
+    async def _run_loop(self) -> int:
+        self.surface.render_idle()
         while True:
             line = await self._read_line()
             if line == "":
-                print()
+                self.surface.render_notice("")
                 return 0
             try:
                 if line.startswith("/"):
@@ -186,8 +251,24 @@ class ChatREPL:
                     await self._shell_escape(source, inject=not skip)
                 else:
                     await self._submit_task(line)
-            except (EOFError, KeyboardInterrupt):
-                print()
+            except EOFError:
+                self.surface.render_notice("")
+                continue
+            except KeyboardInterrupt:
+                task_id = self._active_task_id
+                if task_id:
+                    try:
+                        await self.service.cancel(task_id)
+                    except Exception as exc:
+                        self.surface.render_notice(f"Cancellation could not be requested: {exc}")
+                    else:
+                        self.surface.render_notice(
+                            f"Cancellation requested for {task_id}.",
+                            status="INTERRUPTED",
+                        )
+                    self._active_task_id = None
+                else:
+                    self.surface.render_notice("")
                 continue
         return 0
 
@@ -202,19 +283,19 @@ class ChatREPL:
         if name in ("exit", "quit"):
             raise SystemExit(0)
         if name == "help":
-            print(_META_HELP)
+            self.surface.render_notice(_META_HELP)
             return True
         if name == "cancel":
             if self._active_task_id:
                 await self.service.cancel(self._active_task_id)
-                print(f"cancel requested for {self._active_task_id}")
+                self.surface.render_notice(f"cancel requested for {self._active_task_id}")
             else:
-                print("(no active task)")
+                self.surface.render_notice("(no active task)")
             return True
         if name == "sessions":
             sessions = await self.service.list_sessions()
             if not sessions:
-                print("(no sessions)")
+                self.surface.render_notice("(no sessions)")
             for s in sessions:
                 sid = s.get("id") if isinstance(s, dict) else getattr(s, "id", s)
                 title = (
@@ -222,59 +303,68 @@ class ChatREPL:
                     if isinstance(s, dict)
                     else (getattr(s, "title", None) or getattr(s, "objective", "") or "")
                 )
-                print(f"{sid}\t{title or ''}")
+                self.surface.render_notice(f"{sid}\t{title or ''}")
             return True
         if name == "new":
             self.session_id = None
-            print("(fresh session)")
+            self.surface.render_notice("(fresh session)")
             return True
         if name == "autonomy":
             self.autonomy = _autonomy(arg)
-            print(f"autonomy: {self.autonomy.value}")
+            self.surface.render_notice(f"autonomy: {self.autonomy.value}")
             return True
         if name == "model":
             self.model_policy = arg or None
-            print(f"model: {self.model_policy}")
+            self.surface.render_notice(f"model: {self.model_policy}")
             return True
         if name == "details":
             self.surface.details = not self.surface.details
-            print(f"details: {'on' if self.surface.details else 'off'}")
+            self.surface.render_notice(f"details: {'expanded' if self.surface.details else 'collapsed'}")
+            repaint = getattr(self.surface, "repaint_oi", None)
+            if callable(repaint):
+                repaint(force=True)
+            return True
+        if name == "scroll":
+            self._cmd_scroll(arg)
+            return True
+        if name == "mascot":
+            self._cmd_mascot(arg)
             return True
         if name == "permissions":
-            await _cmd_permissions(self.service)
+            await _cmd_permissions(self.service, self.surface)
             return True
         if name == "diff":
             limit = int(arg) if arg.isdigit() else 25
-            await _cmd_diff(self.service, limit)
+            await _cmd_diff(self.service, limit, self.surface)
             return True
         if name == "undo":
             if not arg:
-                print("usage: /undo <mutation_id>")
+                self.surface.render_notice("usage: /undo <mutation_id>")
                 return True
             outcome = await self.service.undo_mutation(arg)
             status = outcome.get("status")
             if status == "ok":
-                print(f"rolled back {arg} (rollback {outcome.get('rollback_id')})")
+                self.surface.render_notice(f"rolled back {arg} (rollback {outcome.get('rollback_id')})")
             else:
-                print(f"undo failed: {outcome.get('error', status)}")
+                self.surface.render_notice(f"undo failed: {outcome.get('error', status)}")
             return True
         if name == "criteria":
             if not arg:
                 self.criteria = []
-                print("acceptance criteria cleared")
+                self.surface.render_notice("acceptance criteria cleared")
             else:
                 self.criteria = [c.strip() for c in arg.split(";") if c.strip()]
                 for i, c in enumerate(self.criteria, 1):
                     kind = "command probe" if c.lower().startswith("command:") else "model-judged"
-                    print(f"  ac_{i} [{kind}] {c}")
+                    self.surface.render_notice(f"  ac_{i} [{kind}] {c}")
             return True
         if name == "interrupted":
             rows = await self.service.list_interrupted()
             if not rows:
-                print("(no interrupted tasks)")
+                self.surface.render_notice("(no interrupted tasks)")
             for r in rows:
                 objective = (r.get("objective") or "")[:60]
-                print(f"{r.get('id')}  {objective}")
+                self.surface.render_notice(f"{r.get('id')}  {objective}")
             return True
         if name == "resume":
             if not self.session_id:
@@ -292,10 +382,10 @@ class ChatREPL:
             if task_id is None:
                 rows = await self.service.list_interrupted()
                 if not rows:
-                    print("(no interrupted tasks to resume)")
+                    self.surface.render_notice("(no interrupted tasks to resume)")
                     return True
                 task_id = rows[0]["id"]
-                print(f"resuming most recent: {task_id}")
+                self.surface.render_notice(f"resuming most recent: {task_id}")
             from athena.cli.chat import stream_task as _stream
             spec = await self.service.resume_task(task_id)
             self._active_task_id = spec.id
@@ -305,9 +395,7 @@ class ChatREPL:
                 value = getattr(status, "value", None)
                 s = str(value if value is not None else status)
                 summary = getattr(result, "summary", "") or ""
-                if summary:
-                    print(summary)
-                print(f"[task {spec.id} -> {s}]")
+                self.surface.render_result(summary, status=s)
             self._active_task_id = None
             return True
         if name in ("compact", "context"):
@@ -317,20 +405,82 @@ class ChatREPL:
             recent = summary.get("recent_verbatim_turns")
             count = summary.get("message_count")
             if name == "compact":
-                print(f"context window: {window or '?'} tokens")
-                print(f"output reserve: {reserve if reserve is not None else '?'} tokens")
-                print(f"recent verbatim turns: {recent if recent is not None else '?'}")
+                self.surface.render_notice(f"context window: {window or '?'} tokens")
+                self.surface.render_notice(f"output reserve: {reserve if reserve is not None else '?'} tokens")
+                self.surface.render_notice(f"recent verbatim turns: {recent if recent is not None else '?'}")
                 older = "compressed with provenance retained"
-                print(f"older transcript: {older}")
+                self.surface.render_notice(f"older transcript: {older}")
             else:
-                print(f"session: {self.session_id or '(none yet)'}")
-                print(f"durable messages: {count if count is not None else '?'}")
-                print("next turn includes: objective, policy boundaries, recent turns,")
-                print("capability calls/results, relevant memories and skills.")
+                self.surface.render_notice(f"session: {self.session_id or '(none yet)'}")
+                self.surface.render_notice(f"durable messages: {count if count is not None else '?'}")
+                self.surface.render_notice("next turn includes: objective, policy boundaries, recent turns,")
+                self.surface.render_notice("capability calls/results, relevant memories and skills.")
             return True
         return False
 
+    def _cmd_mascot(self, arg: str) -> None:
+        """List or switch the visible mascot/buddy (only one shows at a time)."""
+        try:
+            from athena.cli.dual_pane import Mascot
+        except Exception:
+            self.surface.render_notice("(mascot unavailable)")
+            return
+        setter = getattr(self.surface, "set_mascot", None)
+        mascot = getattr(self.surface, "mascot", None)
+        enabled = bool(getattr(self.surface, "mascot_enabled", False))
+        current = getattr(mascot, "character", None)
+        if not arg:
+            shown = current if enabled else "off"
+            self.surface.render_notice(f"mascot: {shown or '?'}")
+            for cid, label in sorted(Mascot.available().items()):
+                marker = "*" if enabled and cid == current else " "
+                self.surface.render_notice(f"  {marker} {cid:10} {label}")
+            self.surface.render_notice("usage: /mascot NAME | off")
+            return
+        if setter is None:
+            self.surface.render_notice("(current surface has no mascot)")
+            return
+        choice = arg.strip().lower()
+        if setter(choice):
+            state = "off" if not getattr(self.surface, "mascot_enabled", True) else choice
+            self.surface.render_notice(f"mascot: {state}")
+            repaint = getattr(self.surface, "repaint_oi", None)
+            if callable(repaint):
+                repaint(force=True)
+        else:
+            valid = ", ".join(sorted(Mascot.available()))
+            self.surface.render_notice(f"unknown mascot {arg!r}; choose one of: {valid}, off")
+
+    def _cmd_scroll(self, arg: str) -> None:
+        """Move a retained pane viewport without interrupting the task."""
+        parts = arg.split()
+        if len(parts) < 2:
+            self.surface.render_notice("usage: /scroll left|right up|down|bottom [lines]")
+            return
+        pane, direction = parts[0], parts[1].lower()
+        if direction == "bottom":
+            fn = getattr(self.surface, "scroll_to_bottom", None)
+            if fn is None or not fn(pane):
+                self.surface.render_notice("scrolling is unavailable on the current surface")
+            return
+        try:
+            amount = int(parts[2]) if len(parts) > 2 else 5
+        except ValueError:
+            self.surface.render_notice("scroll amount must be a number")
+            return
+        if direction == "up":
+            amount = abs(amount)
+        elif direction == "down":
+            amount = -abs(amount)
+        else:
+            self.surface.render_notice("direction must be up, down, or bottom")
+            return
+        fn = getattr(self.surface, "scroll", None)
+        if fn is None or not fn(pane, amount):
+            self.surface.render_notice("scrolling is unavailable on the current surface")
+
     async def _submit_task(self, line: str) -> None:
+        self.surface.render_user_message(line)
         request = AgentRequest(
             prompt=line,
             session_id=self.session_id,
@@ -352,14 +502,11 @@ class ChatREPL:
         if result is not None:
             self.session_id = getattr(spec, "session_id", self.session_id)
             summary = getattr(result, "summary", "") or ""
-            if summary:
-                print()
-                print(summary)
             status = getattr(result, "status", None)
             status_str = (
                 status.value if status is not None and hasattr(status, "value") else str(status)
             )
-            print(f"\n[task {spec.id} -> {status_str}]")
+            self.surface.render_result(summary, status=status_str)
         self._active_task_id = None
 
     async def _shell_escape(self, source: str, inject: bool) -> None:
@@ -370,8 +517,10 @@ class ChatREPL:
         result is shown and recorded for audit, but excluded from model context.
         """
         if not source.strip():
-            print("empty command")
+            self.surface.render_notice("empty command")
             return
+
+        self.surface.render_user_message(f"! {source}")
 
         # A direct escape still belongs to the current durable session.  If
         # this is the first interaction, establish the session before the
@@ -457,7 +606,8 @@ async def stream_task(
                 scope=choice.scope,
             )
     finally:
-        surface.finish()
+        flush = getattr(surface, "flush_task", None) or surface.finish
+        flush()
     return await service.get_result(task_id)
 
 

@@ -44,7 +44,12 @@ class SkillsCapability:
     def __init__(self, skills_store=None) -> None:
         self.skills_store = skills_store
 
-    async def invoke(self, request: CapabilityRequest) -> CapabilityResult:
+    async def invoke(
+        self, request: CapabilityRequest, *, context=None, **kwargs
+    ) -> CapabilityResult:
+        # Skills currently resolve through their injected store, but all
+        # capabilities receive the dispatcher context uniformly.
+        del context, kwargs
         args = request.arguments or {}
         op = args.get("operation", "search")
         call_id = request.call_id or new_id("call")

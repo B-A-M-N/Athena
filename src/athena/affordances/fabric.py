@@ -242,6 +242,44 @@ class CapabilityFabric:
         if not overlay:
             self._task.pop(task_id, None)
 
+    async def deprecate(
+        self, capability_id: str, *, task_id: str | None = None,
+        project_id: str | None = None, user_id: str | None = None,
+        scope: str | None = None,
+    ) -> bool:
+        """Retire one generated overlay while keeping its provenance record."""
+        record = self._records.get(capability_id)
+        if record is None or record.scope.value not in {"task", "project", "user"}:
+            return False
+        record_scope = record.scope.value
+        if scope and scope != record_scope:
+            return False
+        if record_scope == "task":
+            if record.task_scope != task_id:
+                return False
+            self._task.get(task_id or "", {}).pop(capability_id, None)
+        elif record_scope == "project":
+            if record.project_scope != project_id:
+                return False
+            if self._store is not None and not await self._store.disable(
+                capability_id, owner=project_id
+            ):
+                return False
+            self._project.get(project_id or "", {}).pop(capability_id, None)
+        else:
+            if record.user_scope != user_id:
+                return False
+            if self._store is not None and not await self._store.disable(
+                capability_id, owner=user_id
+            ):
+                return False
+            self._user.get(user_id or "", {}).pop(capability_id, None)
+        self._history.setdefault(capability_id, []).append({
+            "event": "deprecated", "scope": record_scope,
+            "owner": record.task_scope or record.project_scope or record.user_scope,
+        })
+        return True
+
     def executor_for(
         self, capability_id: str, *, task_id: str | None = None,
         project_id: str | None = None, user_id: str | None = None,

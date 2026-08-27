@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+projection='{"title":"ATHENA OI // BRIDGE","status":"ACTIVE","oi":["operation=verify-release","event=CapabilityCompleted"]}'
+output="$({ printf '%s\n' "$projection"; } | cargo run --manifest-path native/Cargo.toml --offline -- \
+  --headless --bridge-stdin --command 'printf "native-pty-ok\\n"' 2>&1)"
+
+printf '%s\n' "$output"
+rg -q 'native-pty-ok' <<<"$output"
+rg -q 'ATHENA OI // BRIDGE' <<<"$output"
+rg -q 'event=CapabilityCompleted' <<<"$output"
+printf '%s\n' 'native-smoke: PASS — PTY/core/projection bridge'

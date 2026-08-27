@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import inspect
+import logging
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -8,6 +10,8 @@ from aiosqlite import IntegrityError
 
 from athena.protocol.events import Event, make_event
 from athena.state.database import Database
+
+_logger = logging.getLogger("athena.events")
 
 
 class EventStore:
@@ -31,6 +35,19 @@ class EventStore:
 
     def __init__(self, db: Database) -> None:
         self._db = db
+        self._subscribers: list[Any] = []
+
+    def subscribe(self, callback: Any) -> None:
+        """Register an event observer after durable append succeeds."""
+        if callback not in self._subscribers:
+            self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: Any) -> None:
+        """Remove an event observer without affecting the event log."""
+        try:
+            self._subscribers.remove(callback)
+        except ValueError:
+            pass
 
     async def append_event(
         self,
@@ -65,6 +82,19 @@ class EventStore:
                         f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         self._values(event),
                     )
+                for callback in tuple(self._subscribers):
+                    try:
+                        outcome = callback(event)
+                        if inspect.isawaitable(outcome):
+                            await outcome
+                    except Exception:
+                        # Observers are projections. A broken observer must
+                        # never turn a committed canonical event into a failed
+                        # write or cause a producer to retry it.
+                        _logger.warning(
+                            "event subscriber failed for %s", event.type,
+                            exc_info=True,
+                        )
                 return event
             except IntegrityError as exc:
                 # Retry only on a genuine (task_id, sequence) UNIQUE collision

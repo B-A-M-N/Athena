@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -30,7 +30,7 @@ from athena.protocol.tasks import (
     TaskSpec,
     WorkspaceSpec,
 )
-from athena.scheduler.claims import claim_next
+from athena.scheduler.claims import Claim, _to_claim, claim_next
 from athena.scheduler.triggers import TriggerType, TriggerSpec, next_fire
 from athena.state.schedules import ScheduleStore
 
@@ -212,29 +212,85 @@ class Scheduler:
             job = await self._store.get_job_id(claim.job_id)
             if job is None:
                 break
-            template = _template_from_job(job)
-            occurrence_key = f"{claim.job_id}|{claim.scheduled_for}"
-            spec = template.build_task_spec(job["id"], occurrence_key=occurrence_key)
-            try:
-                created = await self._tm.create(spec)
-            except Exception:
-                await self._store.release_claim(
-                    claim.claim_id, job["id"], claim.scheduled_for
-                )
-                raise
-            task_id = created.id if created is not None else None
-            if task_id is not None:
-                await self._tm.enqueue(task_id)
-            next_run, disable = self._next_run(job, claim)
-            await self._store.complete_claim(
-                claim.claim_id,
-                job["id"],
-                task_id,
-                next_run=next_run,
-                disable=disable,
-            )
+            await self._fire_claim(job, claim)
             fires += 1
         return fires
+
+    async def notify_event(self, event: Any) -> int:
+        """Fire matching EVENT jobs using the same durable claim path.
+
+        The event ID is the occurrence identity. Replayed or multiply-delivered
+        events therefore produce at most one task per job, even across a
+        scheduler restart.
+        """
+        event_type = str(getattr(event, "type", ""))
+        payload = dict(getattr(event, "payload", {}) or {})
+        event_id = str(getattr(event, "id", "") or "")
+        if not event_id:
+            return 0
+        if getattr(event, "task_id", None) is not None:
+            payload.setdefault("task_id", event.task_id)
+        if getattr(event, "session_id", None) is not None:
+            payload.setdefault("session_id", event.session_id)
+
+        fired = 0
+        for job in await self._store.list_jobs(enabled_only=True):
+            trigger = _trigger_from_job(job)
+            if trigger is None or trigger.type is not TriggerType.EVENT:
+                continue
+            if trigger.event_name and trigger.event_name != event_type:
+                continue
+            if not _filters_match(trigger.event_filters, payload):
+                continue
+            if trigger.end_at is not None and utcnow() > trigger.end_at:
+                await self._store.set_enabled(job["id"], False)
+                continue
+            if trigger.times is not None:
+                count = await self._store.count_runs(job["id"])
+                if count >= trigger.times:
+                    await self._store.set_enabled(job["id"], False)
+                    continue
+            scheduled_for = f"event:{event_id}"
+            claim = await self._store.claim_next_due(job["id"], scheduled_for)
+            if claim is None:
+                continue
+            await self._fire_claim(job, _to_claim(claim), event=event)
+            fired += 1
+        return fired
+
+    async def _fire_claim(self, job: dict, claim: Claim, *, event: Any = None) -> None:
+        template = _template_from_job(job)
+        occurrence_key = f"{claim.job_id}|{claim.scheduled_for}"
+        metadata = dict(template.metadata)
+        if event is not None:
+            metadata["_trigger_event"] = {
+                "id": getattr(event, "id", None),
+                "type": getattr(event, "type", None),
+                "payload": dict(getattr(event, "payload", {}) or {}),
+            }
+        template = replace(template, metadata=metadata)
+        spec = template.build_task_spec(job["id"], occurrence_key=occurrence_key)
+        try:
+            created = await self._tm.create(spec)
+        except Exception:
+            await self._store.release_claim(
+                claim.claim_id, job["id"], claim.scheduled_for
+            )
+            raise
+        task_id = created.id if created is not None else None
+        if task_id is not None:
+            await self._tm.enqueue(task_id)
+        trigger = _trigger_from_job(job)
+        disable = bool(
+            trigger is not None
+            and trigger.times is not None
+            and await self._store.count_runs(job["id"]) >= trigger.times
+        )
+        next_run, time_disable = self._next_run(job, claim)
+        await self._store.complete_claim(
+            claim.claim_id, job["id"], task_id,
+            next_run=next_run, disable=disable or time_disable,
+        )
 
     def _next_run(self, job: dict, claim) -> tuple[str | None, bool]:
         """Compute the next occurrence and whether the job is exhausted.
@@ -245,6 +301,8 @@ class Scheduler:
         """
         trigger = _trigger_from_job(job)
         if trigger is None:
+            return None, False
+        if trigger.type is TriggerType.EVENT:
             return None, False
         scheduled_for = _to_dt(claim.scheduled_for) or utcnow()
         nxt = next_fire(trigger, scheduled_for)
@@ -311,6 +369,16 @@ class Scheduler:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
             except asyncio.TimeoutError:
                 continue
+
+
+def _filters_match(filters: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
+    """Match scalar event filters exactly; nested mappings use equality."""
+    for key, expected in dict(filters or {}).items():
+        if payload.get(key) != expected:
+            return False
+    return True
+
+
 
 
 __all__ = ["ScheduledJob", "Scheduler", "TaskTemplate", "TriggerSpec"]

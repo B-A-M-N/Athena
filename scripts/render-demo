@@ -18,7 +18,7 @@
 # Usage:
 #   scripts/render-demo                                  # default: capability_fabric
 #   scripts/render-demo capability_fabric                # explicit demo name
-#   ATHENA_DEMO_TIMEOUT=150 scripts/render-demo ...     # override timeout (s)
+#   ATHENA_DEMO_TIMEOUT=420 scripts/render-demo ...     # override timeout (s)
 #
 # Exit codes:
 #   0  success — final gif exists, decoded, and passed checks
@@ -36,7 +36,7 @@ cd "${REPO_ROOT}"
 
 # --- configuration ---------------------------------------------------------
 DEMO_NAME="${1:-capability_fabric}"
-DEMO_TIMEOUT="${ATHENA_DEMO_TIMEOUT:-120}"  # readable recording is ~90s
+DEMO_TIMEOUT="${ATHENA_DEMO_TIMEOUT:-420}"  # readable recording is ~90s
 TAPE_PATH="demos/${DEMO_NAME}.tape"
 FINAL_PATH="demos/${DEMO_NAME}.gif"
 LOCK_PATH="${FINAL_PATH}.lock"
@@ -60,11 +60,17 @@ fi
 # mktemp inside demos/ so the temp is on the same filesystem as the final
 # target — atomic rename is then guaranteed.
 TMP_PATH="$(mktemp "${DEMO_DIR}/.${DEMO_NAME}.XXXXXX.gif")"
+STATUS_PATH="${TMP_PATH}.status"
+SESSION_NAME="athena-vhs-$$"
 cleanup() {
     local rc=$?
     # Remove any temp artifact; the previous known-good final gif is left
     # untouched on failure (the whole point of atomic rename).
     rm -f -- "${TMP_PATH}" 2>/dev/null || true
+    rm -f -- "${STATUS_PATH}" 2>/dev/null || true
+    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
+        tmux kill-session -t "${SESSION_NAME}" 2>/dev/null || true
+    fi
     # Drop the temp symlink/lockfile if we made one (no-op for flock fd).
     return "${rc}"
 }
@@ -76,9 +82,41 @@ trap cleanup EXIT INT TERM
 echo "render-demo: tape=${TAPE_PATH} timeout=${DEMO_TIMEOUT}s temp=${TMP_PATH}"
 START_TS=$(date +%s)
 set +e
-timeout --foreground --kill-after=5 "${DEMO_TIMEOUT}" \
-    vhs -q -o "${TMP_PATH}" "${TAPE_PATH}"
-VHS_RC=$?
+# VHS needs a controlling pseudo-terminal with non-zero dimensions while it
+# starts its recorder. In a pipe/CI invocation, util-linux `script` can expose
+# a 0x0 PTY; use a fixed-size tmux pane instead so VHS gets the same 160x45
+# operator surface that the tape configures.
+if [[ -t 0 && -t 1 ]]; then
+    timeout --foreground --kill-after=5 "${DEMO_TIMEOUT}" \
+        vhs -q -o "${TMP_PATH}" "${TAPE_PATH}"
+    VHS_RC=$?
+else
+    if ! command -v tmux >/dev/null 2>&1; then
+        echo "render-demo: tmux not on PATH; cannot provide VHS a sized PTY" >&2
+        VHS_RC=2
+    else
+        printf -v VHS_CMD 'vhs -q -o %q %q' "${TMP_PATH}" "${TAPE_PATH}"
+        printf -v STATUS_QUOTED '%q' "${STATUS_PATH}"
+        TMUX_CMD="${VHS_CMD}; rc=\$?; printf '%s\\n' \"\$rc\" > ${STATUS_QUOTED}; exit \"\$rc\""
+        if ! tmux new-session -d -s "${SESSION_NAME}" -x 160 -y 45 "${TMUX_CMD}"; then
+            echo "render-demo: could not create the VHS PTY session" >&2
+            VHS_RC=4
+        else
+            VHS_RC=124
+            DEADLINE=$(( $(date +%s) + DEMO_TIMEOUT ))
+            while tmux has-session -t "${SESSION_NAME}" 2>/dev/null; do
+                if (( $(date +%s) >= DEADLINE )); then
+                    tmux kill-session -t "${SESSION_NAME}" 2>/dev/null || true
+                    break
+                fi
+                sleep 1
+            done
+            if [[ -s "${STATUS_PATH}" ]]; then
+                VHS_RC="$(<"${STATUS_PATH}")"
+            fi
+        fi
+    fi
+fi
 set -e
 END_TS=$(date +%s)
 ELAPSED=$((END_TS - START_TS))
@@ -152,9 +190,11 @@ if command -v ffmpeg >/dev/null 2>&1; then
     FRAMES="$(printf '%s' "${PROBE_OUT}" | tr '\r' '\n' | awk '/frame= *[0-9]+/ { match($0, /frame= *[0-9]+/); s=substr($0, RSTART, RLENGTH); gsub(/frame= *|[^0-9]/, "", s); last=s } END { print last+0 }')"
 
     # Bounded assertions: the demo is intentionally ~90s and the default
-    # timeout is 120s. Leave a ten-second margin so an unexpectedly long tape
+    # timeout is 420s. Leave a ten-second margin so an unexpectedly long tape
     # cannot silently pass just because the renderer eventually finished.
-    MIN_DURATION="10.0"
+    # The public demo is intentionally a readable ~90-second walkthrough.
+    # Reject the old "GIF exists but is only a couple seconds" failure mode.
+    MIN_DURATION="80.0"
     MAX_DURATION="$(awk -v t="${DEMO_TIMEOUT}" 'BEGIN { printf "%.3f", t-10 }')"
     MIN_FRAMES="15"
 

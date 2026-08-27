@@ -59,3 +59,40 @@ async def test_scheduled_job_fires_and_runs_to_complete(make_service):
 
     # Re-running a tick never double-fires the same occurrence.
     assert await svc._scheduler.tick() == 0
+
+
+@pytest.mark.athena_claim("BHV-095")
+@pytest.mark.athena_evidence("test", "e2e")
+async def test_event_schedule_fires_once_from_canonical_event(make_service):
+    svc = await make_service()
+    job_id = "job-event-artifact"
+    await svc._store_schedules.upsert_job(
+        job_id,
+        "artifact watcher",
+        payload={"template": {"objective": "EVENT_SCHEDULED"}},
+        trigger_spec={
+            "type": "event",
+            "event_name": "ArtifactCreated",
+            "event_filters": {"kind": "report"},
+            "times": 1,
+        },
+        enabled=True,
+        next_run=None,
+    )
+
+    event = await svc._store_events.append_event(
+        "ArtifactCreated", {"kind": "report", "uri": "artifact://report"}
+    )
+    assert event.id
+    assert await svc._store_schedules.count_runs(job_id) == 1
+    run = await svc._store_schedules.last_run(job_id)
+    assert run is not None
+    assert run["status"] == "FIRED"
+    assert run["scheduled_for"] == f"event:{event.id}"
+
+    # Re-delivery of the same canonical event is idempotent.
+    assert await svc._scheduler.notify_event(event) == 0
+    assert await svc._store_schedules.count_runs(job_id) == 1
+    job = await svc._store_schedules.get_job(job_id)
+    assert job is not None
+    assert job["enabled"] is False

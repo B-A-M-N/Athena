@@ -56,3 +56,12 @@ async def test_cron_every_minute_advances_one_minute():
     t0 = _dt(2026, 3, 15, 10, 30, 15)
     nxt = next_fire(trigger, t0)
     assert nxt == _dt(2026, 3, 15, 10, 31, 0)
+
+
+async def test_event_trigger_is_advanced_by_event_delivery():
+    trigger = TriggerSpec(
+        type=TriggerType.EVENT,
+        event_name="ArtifactCreated",
+        event_filters={"kind": "report"},
+    )
+    assert next_fire(trigger, _dt(2026, 3, 15, 10, 30, 15)) is None

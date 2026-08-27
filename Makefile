@@ -1,4 +1,4 @@
-.PHONY: format format-check lint typecheck compile test check scenarios arch-lint
+.PHONY: format format-check lint typecheck compile test check scenarios arch-lint native-check native-test native-smoke
 
 UV ?= uv
 RUFF := $(UV) run ruff
@@ -38,6 +38,15 @@ scenarios:
 
 arch-lint:
 	$(PYTHON) scripts/architecture-lint
+
+native-check:
+	cargo check --manifest-path native/Cargo.toml --offline
+
+native-test:
+	cargo test --manifest-path native/Cargo.toml --offline
+
+native-smoke:
+	scripts/native-smoke
 
 # The default merge gate is deterministic and does not mutate the checkout.
 # Use `make format` to apply the formatter and `make test` for the full suite.

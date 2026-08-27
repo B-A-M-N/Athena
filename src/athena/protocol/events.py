@@ -52,6 +52,7 @@ class EventCategory(str, enum.Enum):
     CAPABILITY_COMPLETED = "CapabilityCompleted"
     CAPABILITY_FAILED = "CapabilityFailed"
     RUNTIME_SESSION_CREATED = "RuntimeSessionCreated"
+    RUNTIME_STATE_LOST = "RuntimeStateLost"
     EXECUTION_STARTED = "ExecutionStarted"
     STDOUT_CHUNK = "StdoutChunk"
     STDERR_CHUNK = "StderrChunk"
@@ -73,6 +74,8 @@ class EventCategory(str, enum.Enum):
     TASK_FAILED = "TaskFailed"
     TASK_CANCELLED = "TaskCancelled"
     TASK_INTERRUPTED = "TaskInterrupted"
+    STRATEGY_SELECTED = "StrategySelected"
+    AFFORDANCE_GAP_DETECTED = "AffordanceGapDetected"
 
 
 # Core event type names (BUILDSPEC section 82).

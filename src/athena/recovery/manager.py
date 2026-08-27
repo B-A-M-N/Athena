@@ -28,25 +28,31 @@ class RecoveryManager:
         mutation_store: MutationStore | None = None,
         execution_store: ExecutionStore | None = None,
         runtime_session_store: RuntimeSessionStore | None = None,
+        event_store=None,
         lease_timeout_seconds: float = 300.0,
     ) -> None:
         self._tasks = task_store
         self._mutations = mutation_store
         self._executions = execution_store
         self._runtime_sessions = runtime_session_store
+        self._events = event_store
+        self._runtime_state_loss_count = 0
         self._lease_timeout = lease_timeout_seconds
 
     async def recover(self) -> dict[str, int]:
         """Run all recovery passes and return a summary of reconciled items."""
+        self._runtime_state_loss_count = 0
         summary = {
             "tasks_interrupted": 0,
             "executions_interrupted": 0,
             "runtime_sessions_cleaned": 0,
+            "runtime_state_lost": 0,
             "mutations_recovered": 0,
         }
         summary["tasks_interrupted"] = await self._recover_tasks()
         summary["executions_interrupted"] = await self._recover_executions()
         summary["runtime_sessions_cleaned"] = await self._recover_runtime_sessions()
+        summary["runtime_state_lost"] = self._runtime_state_loss_count
         if self._mutations is not None:
             summary["mutations_recovered"] = await self._recover_mutations()
         return summary
@@ -113,6 +119,24 @@ class RecoveryManager:
             try:
                 await self._runtime_sessions.mark_dead(sid)
                 count += 1
+                if self._events is not None:
+                    try:
+                        await self._events.append_event(
+                            "RuntimeStateLost",
+                            {
+                                "runtime_session_id": sid,
+                                "backend": row.get("backend"),
+                                "reason": "Athena restarted without a reattachable runtime process",
+                            },
+                            task_id=row.get("task_id"),
+                        )
+                        self._runtime_state_loss_count += 1
+                    except Exception as exc:
+                        # Session truth still wins if observability is
+                        # temporarily unavailable during startup recovery.
+                        _logger.warning(
+                            "failed to emit runtime state loss for %s: %s", sid, exc
+                        )
             except Exception as exc:
                 _logger.warning("failed to mark runtime session %s dead: %s", sid, exc)
         return count

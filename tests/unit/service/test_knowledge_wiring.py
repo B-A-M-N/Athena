@@ -7,7 +7,13 @@ import asyncio
 import pytest
 
 from athena.service.service import AthenaService
+from athena.protocol.capabilities import (
+    CapabilityRequest,
+    CapabilityRequestOrigin,
+    CapabilityResultStatus,
+)
 from athena.protocol.tasks import TaskStatus
+from athena.research.models import EvidenceObject, SourceRecord
 
 
 @pytest.fixture
@@ -72,3 +78,49 @@ async def test_role_parsing(service):
     )
     assert policies["summarizer"].allowed == ("prov/cheap",)
     assert "bad" not in policies
+
+
+async def test_fusion_is_registered_on_the_model_dispatch_surface(service):
+    task = await service.submit(_req("prepare a fusion surface probe"), wait=True)
+    assert service._fabric.has("fusion", task_id=task.id)
+    result = await service._dispatcher.dispatch(
+        CapabilityRequest(
+            capability_id="fusion",
+            arguments={"operation": "status", "branch_id": "missing-branch"},
+            task_id=task.id,
+            call_id="fusion-status",
+            origin=CapabilityRequestOrigin.MODEL,
+        ),
+        workspace=service._default_workspace,
+    )
+
+    # The request reached FusionCapability through the real dispatcher. A
+    # missing branch is an executor-level failure, not an unavailable tool or
+    # an effect-envelope rejection.
+    assert result.status is CapabilityResultStatus.FAILED
+    assert result.error == "branch not found"
+
+
+async def test_acceptance_evidence_includes_task_scoped_research(service):
+    task = await service.submit(_req("verify a captured research claim"), wait=True)
+    content = b"status=ready"
+    artifact = await service._artifacts.save(
+        task_id=task.id, content=content, mime_type="text/plain",
+        producer="test.research",
+    )
+    source = SourceRecord.for_uri(
+        artifact.uri, title="captured release", content_hash=artifact.hash,
+        artifact_uri=artifact.uri, task_id=task.id,
+    )
+    await service._research_store.save_source(source)
+    evidence = EvidenceObject.for_content(
+        source_id=source.id, claim_id="release-status",
+        extracted_claim="The release is ready.",
+        exact_supporting_excerpt="status=ready", task_id=task.id,
+    )
+    await service._research_store.save_evidence(evidence)
+
+    collected = await service._verification_evidence(task)
+    research = collected["evidence"]["research"]
+    assert research["sources"][0]["id"] == source.id
+    assert research["evidence"][0]["id"] == evidence.id

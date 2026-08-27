@@ -162,6 +162,7 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
     "synthesis": {
         "create": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
         "promote": frozenset({EffectClass.WRITE_LOCAL}),
+        "deprecate": frozenset({EffectClass.WRITE_LOCAL}),
     },
     "scratch": {
         "run": frozenset({EffectClass.READ_LOCAL, EffectClass.EXECUTE,
@@ -178,6 +179,9 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "gaps": frozenset({EffectClass.READ_LOCAL}),
         "close_gap": frozenset({EffectClass.WRITE_LOCAL}),
         "verify": frozenset({EffectClass.READ_LOCAL}),
+        "plan": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        "assess": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        "bundle": frozenset({EffectClass.READ_LOCAL}),
     },
     "artifacts": {
         "list": frozenset({EffectClass.READ_LOCAL}),
@@ -209,6 +213,16 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
     "execute": {
         "": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
         "execute": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+    },
+    "fusion": {
+        "run": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL,
+                           EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS,
+                           EffectClass.DELETE}),
+        "status": frozenset({EffectClass.READ_LOCAL}),
+        "commit": frozenset({EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
+        "discard": frozenset({EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
+        "fork": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        "checkpoint": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
     },
 }
 

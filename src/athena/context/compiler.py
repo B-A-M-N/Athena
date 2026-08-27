@@ -55,6 +55,7 @@ from athena.protocol.messages import (
 from athena.protocol.models import ModelRequest
 from athena.protocol.tasks import TaskSpec
 from athena.skills.selector import SkillSelector
+from athena.strategy import StrategyGuidance, select_strategy
 
 __all__ = [
     "CompiledContext",
@@ -95,6 +96,11 @@ class CompiledContext:
     omitted_refs: tuple[str, ...] = ()
     compression: CompressionRecord = field(default_factory=CompressionRecord)
     capability_definitions: tuple[CapabilityDescriptor, ...] = ()
+    strategy: StrategyGuidance = field(
+        default_factory=lambda: StrategyGuidance(
+            route="direct", rationale="Use the smallest available capability."
+        )
+    )
 
     def to_request(
         self,
@@ -222,6 +228,15 @@ class ContextCompiler:
 
         corpus = await self._collect_entries(task, recent_messages)
 
+        capabilities = tuple(
+            await self._load_capabilities(
+                task=task,
+                require_tools=bool(task.model_policy.require_tools),
+            )
+        )
+        strategy = select_strategy(task.objective, (d.id for d in capabilities))
+        required.append(_strategy_entry(strategy))
+
         final_entries, record, omitted = await self._bound_and_compress(
             required, corpus, input_budget
         )
@@ -239,12 +254,8 @@ class ContextCompiler:
             provenance_map=provenance_map,
             omitted_refs=tuple(omitted),
             compression=record,
-            capability_definitions=tuple(
-                await self._load_capabilities(
-                    task=task,
-                    require_tools=bool(task.model_policy.require_tools),
-                )
-            ),
+            capability_definitions=capabilities,
+            strategy=strategy,
         )
 
     async def _process_attachments(
@@ -752,6 +763,26 @@ def _task_entry(task: TaskSpec) -> _Entry:
         trust=TrustClass.USER_CONTENT,
         mandatory=True,
         provenance=prov(SourceType.TASK, source_id=task.id, trust=TrustClass.USER_CONTENT),
+    )
+
+
+def _strategy_entry(strategy: StrategyGuidance) -> _Entry:
+    candidates = ", ".join(strategy.candidates) or "none"
+    text = (
+        "Affordance strategy guidance (the model retains authority over actual calls): "
+        f"route={strategy.route}; candidates={candidates}; {strategy.rationale}"
+    )
+    if strategy.missing_affordance:
+        text += f" Missing affordance: {strategy.missing_affordance}."
+    return _Entry(
+        name="strategy:guidance",
+        text=text,
+        tokens=estimate_tokens(text),
+        role=Role.SYSTEM,
+        category="runtime_guidance",
+        trust=TrustClass.CONFIGURED_INSTRUCTION,
+        mandatory=True,
+        provenance=prov(SourceType.SYSTEM, trust=TrustClass.CONFIGURED_INSTRUCTION, scope="strategy"),
     )
 
 

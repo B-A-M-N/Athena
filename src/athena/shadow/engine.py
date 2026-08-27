@@ -17,10 +17,12 @@ All state is durable (mutation ledger + events) so branches are auditable.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from athena.capabilities.dispatcher import SuspendedCall
 from athena.protocol.capabilities import (
@@ -30,7 +32,7 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
-from athena.protocol.tasks import NetworkPolicy, WorkspaceSpec
+from athena.protocol.tasks import NetworkPolicy, PathRule, WorkspaceSpec
 
 __all__ = ["BranchStatus", "ShadowBranch", "ShadowEngine"]
 
@@ -49,6 +51,7 @@ class BranchStatus:
     FAILED = "FAILED"         # verification failed / execution error
     COMMITTED = "COMMITTED"
     DISCARDED = "DISCARDED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
 
 
 @dataclass
@@ -78,10 +81,16 @@ class ShadowBranch:
 class ShadowEngine:
     """Creates isolated workspace clones, runs proposals, commits or discards."""
 
-    def __init__(self, *, dispatcher=None, roots_parent: str | None = None) -> None:
+    def __init__(
+        self, *, dispatcher=None, roots_parent: str | None = None,
+        state_root: str | None = None,
+    ) -> None:
         self._dispatcher = dispatcher
         self._branches: dict[str, ShadowBranch] = {}
         self._roots_parent = roots_parent or "/tmp/athena-shadow"
+        self._state_root = Path(state_root or self._roots_parent)
+        self._branch_state = self._state_root / "branches.json"
+        self._load_branches()
 
     def bind(self, dispatcher) -> None:
         self._dispatcher = dispatcher
@@ -89,6 +98,14 @@ class ShadowEngine:
     def bind_service(self, service) -> None:
         """Bind the owning service for approval resolution."""
         self._service = service
+
+    def get_branch(self, branch_id: str) -> ShadowBranch | None:
+        """Return an in-process branch by ID for status/control operations."""
+        return self._branches.get(branch_id)
+
+    def list_branches(self) -> list[ShadowBranch]:
+        """Return known branch records in creation order."""
+        return list(self._branches.values())
 
     async def _service_approve(self, approval_id: str) -> None:
         svc = getattr(self, "_service", None)
@@ -163,6 +180,7 @@ class ShadowEngine:
         )
         branch.proposal = proposal
         self._branches[bid] = branch
+        self._persist_branches()
         _logger.info("shadow branch %s opened for task %s (%d ops)",
                      bid, task_id, len(proposal))
         return branch
@@ -187,6 +205,7 @@ class ShadowEngine:
         if profile is not None:
             branch.policy_profile = profile
         branch.status = BranchStatus.EXECUTING
+        self._persist_branches()
         try:
             for i, op in enumerate(branch.proposal):
                 args = dict(op.get("arguments") or {})
@@ -211,6 +230,7 @@ class ShadowEngine:
                         "isolation is filesystem-level, not execution-level")
                     branch.rejected_requests.append(result.request)
                     branch.status = BranchStatus.FAILED
+                    self._persist_branches()
                     return branch
                 if isinstance(result, Exception):
                     raise result
@@ -219,11 +239,14 @@ class ShadowEngine:
                         f"op {i} ({op['capability_id']}) failed: {result.error}")
                     branch.results.append(result)
                     branch.status = BranchStatus.FAILED
+                    self._persist_branches()
                     return branch
                 branch.results.append(result)
+                self._persist_branches()
         except Exception as exc:  # noqa: BLE001 - branch must become FAILED
             branch.error = f"branch execution error: {exc}"
             branch.status = BranchStatus.FAILED
+            self._persist_branches()
         return branch
 
     async def record_verification(
@@ -237,6 +260,7 @@ class ShadowEngine:
         if not all_ok and not branch.error:
             failed = [c.get("id") for c in criteria_results if not c.get("passed")]
             branch.error = f"criteria unverified: {failed}"
+        self._persist_branches()
 
     # ------------------------------------------------------------------
     # Commit / discard
@@ -267,6 +291,7 @@ class ShadowEngine:
         if conflicts:
             branch.status = BranchStatus.FAILED
             branch.error = f"commit CONFLICT: {len(conflicts)} resource(s) changed outside the branch"
+            self._persist_branches()
             await self._cleanup(branch)
             return {"status": "CONFLICT", "branch": branch.id,
                     "conflicts": conflicts}
@@ -281,6 +306,7 @@ class ShadowEngine:
             except (OSError, UnicodeDecodeError) as exc:
                 branch.status = BranchStatus.FAILED
                 branch.error = f"cannot create canonical commit plan for {rel}: {exc}"
+                self._persist_branches()
                 await self._cleanup(branch)
                 return {"status": "FAILED", "branch": branch.id,
                         "error": branch.error}
@@ -323,6 +349,7 @@ class ShadowEngine:
                 else:
                     reason = "commit dispatch returned incomplete results"
                 branch.error = f"commit not applied: {reason}"
+                self._persist_branches()
                 await self._cleanup(branch)
                 return {"status": "FAILED", "branch": branch.id,
                         "error": branch.error}
@@ -348,6 +375,7 @@ class ShadowEngine:
         ] + [{"resource": d, "operation": "commit_delete"} for d in applied["deleted"]]
 
         branch.status = BranchStatus.COMMITTED
+        self._persist_branches()
         await self._cleanup(branch)
         _logger.info("shadow branch %s committed: +%d/-%d files",
                      branch.id, len(applied["written"]), len(applied["deleted"]))
@@ -356,6 +384,7 @@ class ShadowEngine:
     async def discard(self, branch: ShadowBranch, reason: str = "") -> dict:
         branch.status = BranchStatus.DISCARDED
         branch.error = branch.error or reason or None
+        self._persist_branches()
         await self._cleanup(branch)
         return {"status": "discarded", "branch": branch.id, "reason": reason}
 
@@ -454,3 +483,105 @@ class ShadowEngine:
         def _rm():
             shutil.rmtree(branch.shadow_workspace.root, ignore_errors=True)
         await asyncio.get_running_loop().run_in_executor(None, _rm)
+        self._persist_branches()
+
+    # ------------------------------------------------------------------
+    # Durable branch metadata
+    # ------------------------------------------------------------------
+    def _persist_branches(self) -> None:
+        """Persist branch metadata atomically; contents stay in the shadow root."""
+        try:
+            self._state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            records = [_branch_record(branch) for branch in self._branches.values()]
+            tmp = self._branch_state.with_suffix(".tmp")
+            tmp.write_text(json.dumps(records, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self._branch_state)
+        except OSError:
+            _logger.warning("could not persist shadow branch state", exc_info=True)
+
+    def _load_branches(self) -> None:
+        """Reload metadata and mark incomplete branches needing reconciliation."""
+        try:
+            records = json.loads(self._branch_state.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return
+        if not isinstance(records, list):
+            return
+        changed = False
+        for record in records:
+            if not isinstance(record, dict) or not record.get("id"):
+                continue
+            try:
+                status = str(record.get("status") or BranchStatus.PROPOSED)
+                shadow_root = str(record["shadow_workspace"]["root"])
+                if status in {
+                    BranchStatus.PROPOSED, BranchStatus.EXECUTING,
+                    BranchStatus.VERIFIED,
+                } and not os.path.isdir(shadow_root):
+                    status = BranchStatus.RECOVERY_REQUIRED
+                    record["error"] = (
+                        "shadow workspace is missing after restart; "
+                        "commit outcome requires operator reconciliation"
+                    )
+                    changed = True
+                branch = ShadowBranch(
+                    id=str(record["id"]),
+                    task_id=record.get("task_id"),
+                    base_workspace=_workspace_from_record(record["base_workspace"]),
+                    shadow_workspace=_workspace_from_record(record["shadow_workspace"]),
+                    proposal=[dict(item) for item in record.get("proposal") or ()],
+                    status=status,
+                    verification=[dict(item) for item in record.get("verification") or ()],
+                    mutations=[dict(item) for item in record.get("mutations") or ()],
+                    base_manifest=dict(record.get("base_manifest") or {}),
+                    error=record.get("error"),
+                    policy_profile=record.get("policy_profile"),
+                    created_at=str(record.get("created_at") or utcnow().isoformat()),
+                )
+            except (KeyError, TypeError, ValueError):
+                _logger.warning("ignoring malformed shadow branch record")
+                continue
+            self._branches[branch.id] = branch
+        if changed:
+            self._persist_branches()
+
+
+def _workspace_record(workspace: WorkspaceSpec) -> dict:
+    return {
+        "id": workspace.id,
+        "root": workspace.root,
+        "readable": [{"path": rule.path, "allow": rule.allow} for rule in workspace.readable],
+        "writable": [{"path": rule.path, "allow": rule.allow} for rule in workspace.writable],
+        "temp_root": workspace.temp_root,
+        "execution_backend": workspace.execution_backend,
+        "network_policy": workspace.network_policy.value,
+    }
+
+
+def _workspace_from_record(record: dict) -> WorkspaceSpec:
+    return WorkspaceSpec(
+        id=str(record["id"]),
+        root=str(record["root"]),
+        readable=tuple(PathRule(**dict(rule)) for rule in record.get("readable") or ()),
+        writable=tuple(PathRule(**dict(rule)) for rule in record.get("writable") or ()),
+        temp_root=record.get("temp_root"),
+        execution_backend=str(record.get("execution_backend") or "local"),
+        network_policy=NetworkPolicy(str(record.get("network_policy") or "allow")),
+    )
+
+
+def _branch_record(branch: ShadowBranch) -> dict:
+    return {
+        "id": branch.id,
+        "task_id": branch.task_id,
+        "base_workspace": _workspace_record(branch.base_workspace),
+        "shadow_workspace": _workspace_record(branch.shadow_workspace),
+        "proposal": branch.proposal,
+        "status": branch.status,
+        "verification": branch.verification,
+        "mutations": branch.mutations,
+        "base_manifest": branch.base_manifest,
+        "error": branch.error,
+        "policy_profile": branch.policy_profile,
+        "created_at": branch.created_at,
+    }

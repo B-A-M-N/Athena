@@ -339,14 +339,19 @@ Source authority is a ranking/classification signal, never authorization. A
 source URI must pass an explicit pre-acquisition `SourcePolicy`; an empty
 external-domain allowlist denies HTTP(S) sources by default. Captured local
 artifact snapshots can be verified byte-for-byte against their supporting
-excerpt. The current live route records and queries durable source/evidence/gap
-records; a full search/crawl/index implementation and network acquisition
-workflow remain future work.
+excerpt. The current live route supports policy-controlled network
+acquisition, artifact-backed snapshots, bounded lexical search/indexing,
+durable source/evidence/gap records, excerpt verification, and deterministic
+`research:plan`, `research:assess`, and `research:bundle` operations. Those
+operations sequence explicit requirements and only close gaps backed by
+verified captured evidence. Open-ended retrieval, semantic ranking, and
+autonomous acquisition/critique remain future work.
 
 Archivist's in-memory planner/critic loop is intentionally not imported. A
-future `research.deep` or `research.verify_claim` workflow may compose search,
-fetch, extraction, indexing, and verification capabilities, but it cannot own
-its own replanning brain or bypass Athena policy.
+future `research.deep` or `research.verify_claim` workflow may extend the
+current bounded plan/assess/bundle surface with search, fetch, extraction,
+indexing, gap closure, and verification capabilities, but it cannot own its
+own replanning brain or bypass Athena policy.
 
 Research survives compaction in the same way generated machinery does: source
 snapshots, hashes, evidence, contradictions, gaps, and provenance remain
@@ -525,7 +530,7 @@ complete.
 | GeneratedCapability | **Partial**; model-visible task-scoped creation, hashes, proof records, and project/user rehydration exist, but proof evolution, promotion UX, and fully enforced sandbox semantics remain incomplete. |
 | Declarative nested workflows | **Partial**; models, SQLite storage, validation, execution, and a capability route exist; kernel-level strategy integration and full conformance are incomplete. |
 | Reflection | **Partial**; scoped/ranked capability reflection plus workflow/skill search and description are live; broader resource/runtime/device/permission discovery is incomplete. |
-| Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, and pre-acquisition source policy exist; acquisition, indexing, gap-driven workflows, contradiction analysis, and full completion verification remain incomplete. |
+| Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, and deterministic plan/assess/bundle operations are live; semantic retrieval, autonomous acquisition/critique, and full completion verification remain incomplete. |
 | Dependency acquisition | **Partial**; a governed Python route exists; manager breadth, locking, environment reproducibility, and full policy coverage remain. |
 | Tiered validation | **Partial**; task admission now records parse/interface/security/format/lint checks, candidate/project/user tiers can require Ruff/Mypy, and exact JSON Schema is compiled; generated-test planning, independent evidence, and optional Semgrep remain incomplete. |
 | Promotion and retention | **Partial**; explicit project/user promotion paths exist, but durable generated proof, supersession, quality scoring, and garbage collection remain. |

@@ -6,6 +6,11 @@ from athena.cli.oi_stream import OIStreamViewer
 from athena.protocol.events import make_event
 
 
+class _TTY(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 @pytest.mark.asyncio
 @pytest.mark.athena_scenario("PROJECTION-001")
 async def test_oi_viewer_renders_to_configured_output_and_keeps_partials():
@@ -29,3 +34,46 @@ async def test_oi_viewer_does_not_write_to_process_stdout(capsys):
 
     assert capsys.readouterr().out == ""
     assert "result" in output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_oi_viewer_does_not_prompt_twice_for_kernel_approval_summary():
+    class _Service:
+        def __init__(self):
+            self.approvals = []
+
+        async def approve(self, approval_id, *, granted, scope=None):
+            self.approvals.append((approval_id, granted, scope))
+
+    service = _Service()
+    viewer = OIStreamViewer(
+        service=service,
+        interactive=True,
+        input_fn=lambda _prompt: "1",
+        output=StringIO(),
+    )
+    await viewer.handle_event(make_event(
+        "ApprovalRequested",
+        {
+            "approval_id": "approval-oi",
+            "capability_id": "execute",
+            "scopes": ["call", "task"],
+            "reason": "execution requires authorization",
+        },
+    ))
+    await viewer.handle_event(make_event("ApprovalRequested", {"calls": 1}))
+
+    assert service.approvals == [("approval-oi", True, "call")]
+    assert viewer._pending_approval is None
+    assert viewer._status == "running"
+
+
+def test_oi_viewer_restores_tty_screen_lifecycle():
+    output = _TTY()
+    viewer = OIStreamViewer(output=output, interactive=True)
+
+    viewer.open()
+    viewer.close()
+
+    assert "\x1b[?1049h" in output.getvalue()
+    assert "\x1b[?1049l" in output.getvalue()

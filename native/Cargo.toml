@@ -1,0 +1,23 @@
+[package]
+name = "athena-terminal"
+version = "0.1.0"
+description = "Athena's native terminal frontend (development preview)"
+license = "MIT"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "athena_terminal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "athena-terminal"
+path = "src/main.rs"
+
+# Keep terminal emulation upstream-tracked. Athena-specific windowing and
+# composition belongs in this crate and must not be mixed into the engine.
+[dependencies]
+alacritty_terminal = { git = "https://github.com/alacritty/alacritty.git", rev = "55f12aae2930b48d8727ae49ea1e472af16a9247" }
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"

@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, WorkspaceSpec
+
+OPENROUTER_DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
 
 
 def _env(*names: str) -> str | None:
@@ -70,6 +73,26 @@ def _criteria_metadata(o: "Options") -> dict:
     return {"acceptance_criteria": items} if items else {}
 
 
+def _openrouter_free_model(value: str | None) -> str:
+    """Validate the env-selected OpenRouter model stays on free capacity.
+
+    The automatic OpenRouter wiring is intentionally a free-inference path.
+    An explicit model override is supported, but a paid model must not enter
+    that path by accident or through a copied shell profile. OpenRouter's
+    documented free model variants use the ``:free`` suffix; ``openrouter/free``
+    is also accepted as the provider's free router.
+    """
+    model = (value or OPENROUTER_DEFAULT_MODEL).strip()
+    if not model:
+        model = OPENROUTER_DEFAULT_MODEL
+    if model.lower() != "openrouter/free" and not model.lower().endswith(":free"):
+        raise ValueError(
+            "OPENROUTER_MODEL must identify a free route (use a model ending "
+            "in ':free' or 'openrouter/free')"
+        )
+    return model
+
+
 def build_config(o: "Options"):
     """Build the real ``athena.service.config.AthenaConfig`` from flags/env.
 
@@ -90,6 +113,10 @@ def build_config(o: "Options"):
             ),
             "autonomy": _autonomy(o.autonomy).value if o.autonomy else None,
             "artifact_root": o.artifact_root,
+            "mascot": o.mascot,
+            "display": getattr(o, "display", None),
+            "animations": getattr(o, "animations", None),
+            "reduced_motion": True if getattr(o, "reduced_motion", False) else None,
         },
     )
     if config.workspace_root is None:
@@ -104,9 +131,7 @@ def build_config(o: "Options"):
             ProviderConfig(
                 kind="openai-compat",
                 name="openrouter",
-                model=os.environ.get(
-                    "OPENROUTER_MODEL", "poolside/laguna-s-2.1:free"
-                ),
+                model=_openrouter_free_model(os.environ.get("OPENROUTER_MODEL")),
                 credential_id="OPENROUTER_API_KEY",
                 base_url="https://openrouter.ai/api/v1",
                 extra={"headers": {"X-Title": "Athena"}},
@@ -131,8 +156,53 @@ def build_service(config) -> Any:
     return AthenaService(config=config)
 
 
+def _doctor_display(o: "Options", config: Any) -> int:
+    """Report the selected terminal projection without starting Athena."""
+    from athena.cli.framebuffer import pillow_available
+    from athena.cli.layout import compute_layout
+    from athena.cli.render.kitty import KittyCapabilityProbe, select_renderer
+
+    requested = str(o.display or getattr(config, "display", None) or "auto")
+    columns, rows = shutil.get_terminal_size((120, 30))
+    env_override = os.environ.get("ATHENA_KITTY_CONFIRMED", "").lower() in {
+        "1", "true", "yes"
+    }
+    tty = bool(
+        getattr(sys.stdout, "isatty", lambda: False)()
+        and getattr(sys.stdin, "isatty", lambda: False)()
+    )
+    confirmed = env_override or (
+        KittyCapabilityProbe.probe(sys.stdout, sys.stdin) if tty else False
+    )
+    selected = select_renderer(
+        requested,
+        capability_confirmed=confirmed and pillow_available(),
+    )
+    layout = compute_layout(columns, rows, requested)
+    print(f"terminal: {columns}x{rows}  tty={'yes' if tty else 'no'}")
+    print(f"requested: {requested}")
+    print(f"kitty graphics: {'confirmed' if confirmed else 'not confirmed'}")
+    print(f"Pillow framebuffer: {'available' if pillow_available() else 'missing'}")
+    print(f"selected: {selected}  layout: {layout.mode.value}")
+    if requested in {"auto", "glass"} and selected != "glass":
+        print("note: Glass needs a confirmed Kitty graphics transport; ANSI is safe.")
+    return 0
+
+
 class ServiceUnavailable(Exception):
     pass
+
+
+def _register_config_mascots(config) -> None:
+    """Register user-defined mascot characters from config (UI-only concern)."""
+    definitions = getattr(config, "mascots", None)
+    if not definitions:
+        return
+    try:
+        from athena.cli.dual_pane import configure_mascots
+    except Exception:  # pragma: no cover
+        return
+    configure_mascots(definitions)
 
 
 def workspace_spec(root: str | None) -> WorkspaceSpec | None:
@@ -165,6 +235,10 @@ class Options:
     model: str | None = None
     verbose: bool = False
     details: bool = False
+    mascot: str | None = None
+    display: str | None = None
+    animations: bool | None = None
+    reduced_motion: bool = False
     criteria: str | None = None
     deny: bool = False
     artifact_root: str | None = None
@@ -173,7 +247,25 @@ class Options:
 
 def dispatch(o: Options) -> int:
     """Run a parsed command synchronously (asyncio.run at the top)."""
-    config = build_config(o)
+    try:
+        config = build_config(o)
+    except ValueError as exc:
+        print(f"athena configuration error: {exc}", file=sys.stderr)
+        return 2
+    if not o.mascot:
+        o.mascot = getattr(config, "mascot", None)
+    if not o.display:
+        o.display = getattr(config, "display", None)
+    if o.animations is None:
+        o.animations = getattr(config, "animations", True)
+    if not o.reduced_motion:
+        o.reduced_motion = bool(getattr(config, "reduced_motion", False))
+    _register_config_mascots(config)
+    if o.command == "doctor":
+        if o.args and o.args[0] != "display":
+            print("athena doctor: supported target is 'display'", file=sys.stderr)
+            return 2
+        return _doctor_display(o, config)
     try:
         service = build_service(config)
     except ServiceUnavailable as exc:
@@ -212,7 +304,7 @@ async def _run(o: Options, service: Any) -> int:
     if cmd == "chat":
         from athena.cli.chat import ChatREPL
 
-        repl = ChatREPL(service=service, options=o)
+        repl = ChatREPL(service=service, config=getattr(service, "config", None), options=o)
         return await repl.run_forever()
     if cmd == "run":
         return await _cmd_run(o, service)
@@ -227,13 +319,18 @@ async def _run(o: Options, service: Any) -> int:
 
         sess_id = o.args[0]
         resumed = await _resume(service, sess_id)
-        repl = ChatREPL(service=service, options=o)
+        repl = ChatREPL(service=service, config=getattr(service, "config", None), options=o)
         repl.session_id = (getattr(resumed, "session_id", None) or sess_id)
         return await repl.run_forever()
     if cmd == "approve":
         return await _cmd_approve(o, service)
     if cmd == "cancel":
         return await _cmd_cancel(o, service)
+    if cmd == "oi-stream":
+        from athena.cli.oi_stream import run_viewer
+
+        task_id = o.args[0] if o.args else None
+        return await run_viewer(service, task_id, mascot=o.mascot)
     return 2
 
 
@@ -249,40 +346,59 @@ async def _cmd_run(o: Options, service: Any) -> int:
         model_policy=_model_policy(o.model),
         metadata=_criteria_metadata(o),
     )
-    # Start streaming before waiting so an interactive approval can wake the
-    # parked task.  Waiting first deadlocks supervised execution at the
-    # service boundary and hides the OI-style operator surface.
-    task = await service.submit(request, wait=False)
-    task_id = getattr(task, "id", task)
-    from athena.cli.chat import stream_task, _surface_class
-
-    result = await stream_task(
-        service,
-        task_id,
-        autonomy=_autonomy(o.autonomy),
-        surface=_surface_class()(details=o.details),
+    surface = None
+    from athena.cli.chat import _make_surface, _model_label
+    surface = _make_surface(
+        details=o.details,
+        mascot=o.mascot,
+        display=o.display,
+        model_label=_model_label(getattr(service, "config", None)),
+        animations=True if o.animations is None else o.animations,
+        reduced_motion=o.reduced_motion,
     )
-    if result is not None:
-        from athena.cli.chat import render_summary
+    opener = getattr(surface, "open", None)
+    closer = getattr(surface, "close", None)
+    if callable(opener):
+        opener()
+    try:
+        surface.render_user_message(objective)
+        # Start streaming before waiting so an interactive approval can wake
+        # the parked task. Waiting first deadlocks supervised execution at the
+        # service boundary and hides the OI-style operator surface.
+        task = await service.submit(request, wait=False)
+        task_id = getattr(task, "id", task)
+        from athena.cli.chat import stream_task
 
-        summary = getattr(result, "summary", "") or ""
-        if summary:
-            print()
-            print("--- Result ---")
-            print(summary)
-        extra = render_summary(result)
-        if extra:
-            print()
-            print(extra)
-        status = getattr(result, "status", None)
-        status_str = (
-            status.value if status is not None and hasattr(status, "value") else str(status)
+        result = await stream_task(
+            service,
+            task_id,
+            autonomy=_autonomy(o.autonomy),
+            surface=surface,
         )
-        print(f"\n[task {task_id} -> {status_str}]")
+        if result is not None:
+            from athena.cli.chat import render_summary
+
+            summary = getattr(result, "summary", "") or ""
+            extra = render_summary(result)
+            if extra:
+                surface.render_notice(extra)
+            status = getattr(result, "status", None)
+            status_str = (
+                status.value
+                if status is not None and hasattr(status, "value")
+                else str(status)
+            )
+            surface.render_result(summary, status=status_str)
+            return 0
+        # No result available: expose status anyway.
+        surface.render_notice(f"[task {task_id} has no result yet]", status="PENDING")
         return 0
-    # No result available: expose status anyway.
-    print(f"\n[task {task_id} has no result yet]", file=sys.stderr)
-    return 0
+    finally:
+        async_closer = getattr(surface, "aclose", None)
+        if callable(async_closer):
+            await async_closer()
+        elif callable(closer):
+            closer()
 
 
 async def _cmd_sessions(service: Any) -> int:
@@ -350,10 +466,14 @@ def _click_cli(click: Any):
     @click.option("--workspace", default=None, help="Workspace root directory.")
     @click.option("--autonomy", default=None, type=click.Choice(levels), help="Autonomy profile.")
     @click.option("--model", default=None, help="Model policy.")
+    @click.option("--mascot", default=None, help="Mascot/buddy character (e.g. owl, cat, bot, off).")
+    @click.option("--display", type=click.Choice(["auto", "glass", "ansi", "plain"]), default=None, help="Display frontend: auto, glass, ansi, or plain.")
+    @click.option("--no-animations", "no_animations", is_flag=True, help="Disable presentation animation.")
+    @click.option("--reduced-motion", is_flag=True, help="Use reduced-motion presentation.")
     @click.option("--verbose", is_flag=True, help="Verbose output.")
     @click.option("--details", is_flag=True, help="Show detailed model and task activity.")
     @click.pass_context
-    def cli(ctx: click.Context, config_path, db_path, workspace, autonomy, model, verbose, details) -> None:
+    def cli(ctx: click.Context, config_path, db_path, workspace, autonomy, model, mascot, display, no_animations, reduced_motion, verbose, details) -> None:
         obj = ctx.ensure_object(dict)
         obj.update(
             config_path=config_path,
@@ -361,6 +481,10 @@ def _click_cli(click: Any):
             workspace=workspace,
             autonomy=autonomy,
             model=model,
+            mascot=mascot,
+            display=display,
+            animations=False if no_animations else None,
+            reduced_motion=reduced_motion,
             verbose=verbose,
             details=details,
         )
@@ -379,9 +503,23 @@ def _click_cli(click: Any):
             workspace=b.get("workspace"),
             autonomy=b.get("autonomy"),
             model=b.get("model"),
+            mascot=b.get("mascot"),
+            display=b.get("display"),
+            animations=b.get("animations"),
+            reduced_motion=bool(b.get("reduced_motion")),
             verbose=bool(b.get("verbose")),
             details=bool(b.get("details")),
         )
+
+    @cli.group()
+    def doctor():
+        """Diagnose local runtime and display capabilities."""
+
+    @doctor.command("display")
+    @click.pass_context
+    def doctor_display(ctx):
+        """Check terminal geometry, Pillow, and Kitty transport support."""
+        sys.exit(dispatch(base_options(ctx, "doctor", ["display"])))
 
     @cli.command()
     @click.argument("objective", required=False)
@@ -446,12 +584,23 @@ def _click_cli(click: Any):
     @cli.command("oi-stream")
     @click.option("--task", "task_id", default=None,
                   help="Stream a specific task instead of the global tail.")
+    @click.option("--config", "oi_config_path", default=None,
+                  help="Path to the Athena config file.")
+    @click.option("--db", "oi_db_path", default=None,
+                  help="Path to the Athena persistence DB.")
+    @click.option("--workspace", "oi_workspace", default=None,
+                  help="Workspace root directory.")
+    @click.option("--mascot", "oi_mascot", default=None,
+                  help="Mascot/buddy character.")
     @click.pass_context
-    def oi_stream(ctx, task_id):
+    def oi_stream(ctx, task_id, oi_config_path, oi_db_path, oi_workspace, oi_mascot):
         """Live OI window: unbuffered model/runtime stream + activity mascot."""
-        from athena.cli.oi_stream import main as _oi_main
-
-        sys.exit(_oi_main(["--task", task_id] if task_id else []))
+        o = base_options(ctx, "oi-stream", [task_id] if task_id else [])
+        o.config_path = oi_config_path or o.config_path
+        o.db_path = oi_db_path or o.db_path
+        o.workspace = oi_workspace or o.workspace
+        o.mascot = oi_mascot or o.mascot
+        sys.exit(dispatch(o))
 
     return cli
 
@@ -473,6 +622,10 @@ def _arg_parse(argv: list[str]) -> Options:
         sp.add_argument("--workspace", default=None)
         sp.add_argument("--autonomy", default=None)
         sp.add_argument("--model", default=None)
+        sp.add_argument("--mascot", default=None, help="Mascot/buddy character (e.g. owl, cat, bot, off).")
+        sp.add_argument("--display", choices=["auto", "glass", "ansi", "plain"], default=None)
+        sp.add_argument("--no-animations", dest="no_animations", action="store_true")
+        sp.add_argument("--reduced-motion", action="store_true")
         sp.add_argument("--verbose", action="store_true")
         sp.add_argument("--details", action="store_true", help="Show detailed model and task activity.")
         sp.add_argument("--criteria", default=None, help="Acceptance criteria separated by ';'. Prefix 'command:' for an executable probe.")
@@ -495,6 +648,12 @@ def _arg_parse(argv: list[str]) -> Options:
     sp.add_argument("objective", nargs="?", default=None)
     sp = sub.add_parser("sessions", help="List sessions.")
     globals_(sp)
+    sp = sub.add_parser("doctor", help="Diagnose local runtime/display support.")
+    globals_(sp)
+    sp.add_argument("target", nargs="?", choices=["display"], default="display")
+    sp = sub.add_parser("oi-stream", help="Stream the live OI projection.")
+    globals_(sp)
+    sp.add_argument("--task", dest="task_id", default=None)
 
     ns = p.parse_args(argv)
     command = ns.command or "chat"
@@ -505,12 +664,20 @@ def _arg_parse(argv: list[str]) -> Options:
         workspace=getattr(ns, "workspace", None),
         autonomy=getattr(ns, "autonomy", None),
         model=getattr(ns, "model", None),
+        mascot=getattr(ns, "mascot", None),
+        display=getattr(ns, "display", None),
+        animations=False if getattr(ns, "no_animations", False) else None,
+        reduced_motion=getattr(ns, "reduced_motion", False),
         verbose=getattr(ns, "verbose", False),
         details=getattr(ns, "details", False),
         criteria=getattr(ns, "criteria", None),
         deny=getattr(ns, "deny", False) if command == "approve" else False,
     )
-    if command == "run":
+    if command == "doctor":
+        o.args = [ns.target]
+    if command == "oi-stream":
+        o.args = [ns.task_id] if ns.task_id else []
+    elif command == "run":
         o.args = [ns.objective]
     elif command in ("inspect", "resume", "cancel", "approve"):
         o.args = [getattr(ns, "task_id" if command in ("inspect", "cancel") else ("session_id" if command == "resume" else "approval_id"), "")]

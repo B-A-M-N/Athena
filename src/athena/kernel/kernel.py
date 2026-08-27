@@ -521,11 +521,19 @@ class AgentKernel:
                     task.session_id, exc,
                 )
                 recent = []
-        return await self._compiler.compile(
+        compiled = await self._compiler.compile(
             task,
             recent_messages=_textable_messages(recent),
             workspace=task.workspace.root if task.workspace else None,
         )
+        strategy = compiled.strategy
+        await self._emit("StrategySelected", strategy.to_dict(), task)
+        if strategy.missing_affordance:
+            await self._emit("AffordanceGapDetected", {
+                "missing_affordance": strategy.missing_affordance,
+                "route": strategy.route,
+            }, task)
+        return compiled
 
     async def _select_model(
         self, task: TaskSpec, compiled: CompiledContext, *, exclude: frozenset[str] = frozenset()
@@ -754,6 +762,34 @@ class AgentKernel:
             "subturn": True,
         }, task)
         return response
+
+    async def judge_subturn(
+        self,
+        *,
+        task: TaskSpec,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> ModelResponse:
+        """Broker one task-scoped acceptance-judge inference.
+
+        Acceptance verification is auxiliary work, but it is still inference
+        on behalf of a task. It therefore uses the task's active RunState when
+        available, the normal router with the ``judge`` role, the normal
+        provider usage store, and the normal cancellation/accounting path.
+        The judge response is deliberately not appended as an assistant turn.
+        """
+        state = self._runs.get(task.id)
+        if state is None:
+            state = RunState(task)
+        if state.cancel.is_set():
+            raise RequestCancelled("judge subturn cancelled")
+        role_policy = replace(task.model_policy, role="judge", require_tools=False)
+        judge_task = replace(task, model_policy=role_policy)
+        compiled = await self._compile_for_prompts(
+            judge_task, system=system_prompt, user_prompt=user_prompt
+        )
+        selection = await self._select_model(judge_task, compiled)
+        return await self._invoke(judge_task, state, selection, compiled)
 
     async def dispatch_interpreter_proposal(
         self,

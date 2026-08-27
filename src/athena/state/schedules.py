@@ -260,6 +260,13 @@ class ScheduleStore:
         )
         return _decode_run(row) if row else None
 
+    async def count_runs(self, job_id: str) -> int:
+        row = await self._db.fetch_one(
+            "SELECT COUNT(*) AS count FROM job_runs WHERE job_id = ?",
+            (job_id,),
+        )
+        return int(row.get("count", 0)) if row else 0
+
     async def _job_enabled(self, job_id: str) -> bool:
         row = await self._db.fetch_one(
             "SELECT enabled FROM scheduled_jobs WHERE id = ?", (job_id,)

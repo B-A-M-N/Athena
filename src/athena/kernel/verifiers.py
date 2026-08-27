@@ -10,17 +10,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Protocol
 
-from athena.protocol.messages import (
-    Message,
-    Provenance,
-    Role,
-    SourceType,
-    TextBlock,
-    TrustClass,
-    utcnow,
-)
+from athena.protocol.messages import TextBlock
 from athena.protocol.capabilities import CapabilityRequest, CapabilityRequestOrigin
-from athena.protocol.models import ModelRequest
 from athena.protocol.tasks import (
     Criterion,
     TaskSpec,
@@ -148,16 +139,22 @@ class _ArtifactPredicateVerifier:
 class _CapabilityCheckVerifier:
     """Verify a capability is registered and available."""
 
-    def __init__(self, registry: Any = None) -> None:
-        self._registry = registry
+    def __init__(self, fabric: Any = None) -> None:
+        self._fabric = fabric
 
     async def verify_one(self, task: TaskSpec, spec: VerificationSpec) -> bool:
         if not spec.capability:
             return False
-        if self._registry is None:
+        if self._fabric is None:
             return False
         try:
-            return self._registry.has(spec.capability)
+            metadata = dict(task.metadata or {})
+            return self._fabric.has(
+                spec.capability,
+                task_id=task.id,
+                project_id=metadata.get("project_id"),
+                user_id=metadata.get("user_id"),
+            )
         except Exception:
             return False
 
@@ -168,23 +165,19 @@ class _ModelJudgmentVerifier:
     def __init__(
         self, registry: Any = None, *, trusted: bool = False,
         evidence_provider: Any = None,
+        inference_broker: Any = None,
     ) -> None:
+        # ``registry`` remains accepted for source compatibility, but model
+        # access is intentionally brokered by the kernel. A verifier must not
+        # open an unmetered provider stream beside the task's reasoning loop.
         self._registry = registry
         self._trusted = trusted
         self._evidence_provider = evidence_provider
+        self._inference_broker = inference_broker
 
     async def verify_one(self, task: TaskSpec, spec: VerificationSpec) -> bool:
-        if self._registry is None:
-            return False
-        try:
-            from athena.protocol.tasks import ModelPolicy
-
-            selection = await self._registry.select(
-                policy=ModelPolicy(role="judge", require_tools=False)
-            )
-            provider = self._registry.provider_for(selection.provider)
-        except Exception as exc:
-            _logger.warning("model judgment: selection failed: %s", exc)
+        if self._inference_broker is None:
+            _logger.warning("model judgment: no kernel inference broker bound")
             return False
         metadata = dict(task.metadata or {})
         evidence = metadata.get("verification_evidence", metadata.get("evidence", {}))
@@ -214,27 +207,18 @@ class _ModelJudgmentVerifier:
             f"Reply with ONLY: YES or NO."
         )
         try:
-            from athena.protocol.ids import new_id
-            messages = (Message(
-                id=new_id("msg"),
-                role=Role.USER,
-                blocks=(TextBlock(type="text", text=prompt),),
-                created_at=utcnow(),
-                provenance=Provenance(source_type=SourceType.RUNTIME, trust=TrustClass.AGENT_CURATED, scope="verify"),
-            ),)
-            request = ModelRequest(
-                messages=messages,
-                model=selection.model,
-                provider=selection.provider,
-                request_id=f"verify_{id(spec)}",
+            response = await self._inference_broker(
+                task=task,
+                system_prompt=(
+                    "You are Athena's acceptance-criteria judge. "
+                    "Evaluate only the supplied task evidence."
+                ),
+                user_prompt=prompt,
             )
-            text_parts: list[str] = []
-            async for event in provider.complete(request):
-                if event.type.value == "delta" and event.delta:
-                    if event.delta.text:
-                        text_parts.append(event.delta.text)
-                elif event.type.value == "done" and event.response:
-                    text_parts = [b.text for b in event.response.blocks if isinstance(b, TextBlock)]
+            text_parts = [
+                block.text for block in getattr(response, "blocks", ())
+                if isinstance(block, TextBlock) and block.text
+            ]
             answer = " ".join(text_parts).strip().upper()
             return answer.startswith("YES")
         except Exception as exc:
@@ -261,6 +245,7 @@ class CompositeVerifier:
         capability_registry: Any = None,
         model_registry: Any = None,
         evidence_provider: Any = None,
+        inference_broker: Any = None,
         model_judgment_trusted: bool = False,
     ) -> None:
         # ``execution`` is retained in the signature for source compatibility,
@@ -270,13 +255,11 @@ class CompositeVerifier:
         self._file = _FileVerifier()
         self._artifact = _ArtifactPredicateVerifier(artifact_store)
         self._capability = _CapabilityCheckVerifier(capability_registry)
-        # P1-22: the judge verifier needs the ModelRouter (which owns
-        # select()); a bare ProviderRegistry has no select(). Both are
-        # accepted; the router path is used when available.
         self._model = _ModelJudgmentVerifier(
             model_registry,
             trusted=model_judgment_trusted,
             evidence_provider=evidence_provider,
+            inference_broker=inference_broker,
         )
         self._manual = _ManualVerifier()
 

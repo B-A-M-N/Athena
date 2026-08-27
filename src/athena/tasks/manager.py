@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
@@ -95,6 +96,11 @@ class TaskManager:
         # async callable ``(task, result)`` invoked AFTER the terminal state is
         # durable; observer failures never affect the finalized result.
         self._finalize_observers: list[Any] = []
+        # ``finalize_with_result`` makes the task terminal before observers
+        # run. Keep a small per-task barrier so waiters do not return during
+        # that visibility window and fork/cross-interface snapshots remain
+        # stable.
+        self._finalization_events: dict[str, asyncio.Event] = {}
 
     def add_finalize_observer(self, observer: Any) -> None:
         """Register an async ``(task, result)`` post-finalization hook."""
@@ -272,36 +278,56 @@ class TaskManager:
             created_at=utcnow(),
         )
 
+        barrier = self._finalization_events.setdefault(task_id, asyncio.Event())
+
         # Status + result MUST land atomically (§86): do the transition and the
         # result persistence inside a single DB transaction so a crash cannot
         # leave a terminal task with no result. Events are append-only side
         # effects emitted after commit.
-        await self._finalize_atomically(task_id, status, result)
+        try:
+            await self._finalize_atomically(task_id, status, result)
 
-        self._running_emitted.discard(task_id)
+            self._running_emitted.discard(task_id)
 
-        await self._emit(resolved, status)
+            await self._emit(resolved, status)
 
-        if self._budgets is not None:
-            self._budgets.consume_result(task_id, usage)
-        if self._cancellations is not None:
-            self._cancellations.reset(task_id)
+            if self._budgets is not None:
+                self._budgets.consume_result(task_id, usage)
+            if self._cancellations is not None:
+                self._cancellations.reset(task_id)
 
-        # Post-finalization knowledge pipeline (BUILDSPEC 64/68): observers see
-        # the DURABLE result and may propose memory/skill candidates. Their
-        # failures are logged, never propagated — finalization already landed.
-        for observer in self._finalize_observers:
-            try:
-                await observer(resolved, result)
-            except Exception as exc:
-                _logger.warning(
-                    "finalize observer %s failed for task %s: %s",
-                    getattr(observer, "__name__", type(observer).__name__),
-                    task_id,
-                    exc,
-                )
+            # Post-finalization knowledge pipeline (BUILDSPEC 64/68): observers see
+            # the DURABLE result and may propose memory/skill candidates. Their
+            # failures are logged, never propagated — finalization already landed.
+            for observer in self._finalize_observers:
+                try:
+                    await observer(resolved, result)
+                except Exception as exc:
+                    _logger.warning(
+                        "finalize observer %s failed for task %s: %s",
+                        getattr(observer, "__name__", type(observer).__name__),
+                        task_id,
+                        exc,
+                    )
 
-        return result
+            return result
+        finally:
+            barrier.set()
+
+    async def wait_for_finalization(self, task_id: str, *, timeout: float | None = None) -> None:
+        """Wait for current-process post-finalization observers, if any.
+
+        A terminal task loaded from a previous process has no in-memory barrier
+        and is already safe to observe. This makes restart and API callers
+        compatible while closing the in-process terminal/observer race.
+        """
+        barrier = self._finalization_events.get(task_id)
+        if barrier is None or barrier.is_set():
+            return
+        if timeout is None:
+            await barrier.wait()
+        else:
+            await asyncio.wait_for(barrier.wait(), timeout=max(float(timeout), 0.0))
 
     async def _finalize_atomically(
         self, task_id: str, status: TaskStatus, result: TaskResult

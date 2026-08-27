@@ -43,7 +43,13 @@ class ScheduleAPI:
             payload={"template": {"objective": objective, "session_id": session_id}},
             trigger_spec=self._scheduler_trigger_spec(trigger_spec),
             enabled=True,
-            next_run=trigger_spec.at.isoformat() if trigger_spec.at else utcnow().isoformat(),
+            next_run=(
+                trigger_spec.at.isoformat()
+                if trigger_spec.at
+                else None
+                if trigger_spec.type is TriggerType.EVENT
+                else utcnow().isoformat()
+            ),
         )
         return {"job_id": job_id, "name": name, "enabled": True}
 
@@ -81,7 +87,16 @@ class ScheduleAPI:
             at=at,
             interval_seconds=interval,
             cron=cron,
+            event_name=trigger.get("event_name"),
+            event_filters=dict(trigger.get("event_filters") or {}),
             timezone=trigger.get("timezone", "UTC"),
+            end_at=(
+                datetime.fromisoformat(trigger["end_at"])
+                if isinstance(trigger.get("end_at"), str)
+                else trigger.get("end_at")
+            ),
+            times=trigger.get("times"),
+            metadata=dict(trigger.get("metadata") or {}),
         )
 
     def _scheduler_trigger_spec(self, spec: TriggerSpec) -> dict[str, Any]:
@@ -90,7 +105,12 @@ class ScheduleAPI:
             "at": spec.at.isoformat() if spec.at else None,
             "interval_seconds": spec.interval_seconds,
             "cron": spec.cron,
+            "event_name": spec.event_name,
+            "event_filters": dict(spec.event_filters),
             "timezone": spec.timezone,
+            "end_at": spec.end_at.isoformat() if spec.end_at else None,
+            "times": spec.times,
+            "metadata": dict(spec.metadata),
         }
 
 
@@ -111,7 +131,7 @@ class ScheduleCapability:
                 "trigger": {"type": "object"},
             },
         },
-        effects=frozenset({EffectClass.WRITE_LOCAL}),
+        effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         origin=CapabilityOrigin.NATIVE,
     )
 

@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Run a small ANSI/PTY smoke test suitable for Termux.
+
+This intentionally tests Athena *inside the host terminal*. It does not test
+the future native Athena window; it verifies the portable surface that should
+work in Termux, tmux, CI PTYs, and ordinary terminals.
+
+Usage:
+    scripts/termux-smoke
+    ATHENA_SMOKE_MODE=cli ATHENA_BIN=athena scripts/termux-smoke
+"""
+
+from __future__ import annotations
+
+import os
+import pty
+import re
+import select
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+_ANSI = re.compile(
+    r"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[()][0-2A-Z])"
+)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _clean(value: bytes) -> str:
+    text = value.decode("utf-8", "replace")
+    return _ANSI.sub("", text).replace("\x1b", "")
+
+
+def _set_size(fd: int, columns: int, rows: int) -> None:
+    # TIOCSWINSZ is available on Termux and Unix-like hosts. Keep the import
+    # local so the script still reports a useful error on unusual platforms.
+    import fcntl
+    import termios
+
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+
+
+def _argv() -> list[str]:
+    if os.environ.get("ATHENA_SMOKE_MODE", "demo").strip().lower() != "cli":
+        return [
+            sys.executable,
+            str(_REPO_ROOT / "demos" / "capability_fabric_demo.py"),
+            "--speed",
+            "0",
+        ]
+    configured = os.environ.get("ATHENA_BIN", "athena")
+    return shlex.split(configured) + [
+        "--display",
+        "ansi",
+        "--db",
+        # Replaced by main() so the path remains isolated from the user's DB.
+        "__ATHENA_DB__",
+        "--workspace",
+        "__ATHENA_WORKSPACE__",
+        "run",
+        "2+2",
+    ]
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="athena-termux-") as root:
+        root_path = Path(root)
+        argv = _argv()
+        if "__ATHENA_DB__" in argv:
+            argv[argv.index("__ATHENA_DB__")] = str(root_path / "athena.db")
+        if "__ATHENA_WORKSPACE__" in argv:
+            argv[argv.index("__ATHENA_WORKSPACE__")] = str(root_path / "workspace")
+        (root_path / "workspace").mkdir()
+
+        env = os.environ.copy()
+        env["TERM"] = env.get("TERM", "xterm-256color")
+        env["ATHENA_DISPLAY"] = "ansi"
+        source = str(_REPO_ROOT / "src")
+        env["PYTHONPATH"] = source + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        )
+        # The smoke test is deterministic and must not accidentally spend a
+        # developer's provider quota or depend on network/model availability.
+        env.pop("OPENROUTER_API_KEY", None)
+        env.pop("OPENROUTER_MODEL", None)
+
+        master, slave = pty.openpty()
+        try:
+            _set_size(slave, 160, 45)
+            process = subprocess.Popen(
+                argv,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                close_fds=True,
+                start_new_session=True,
+                env=env,
+            )
+        except OSError as exc:
+            os.close(master)
+            os.close(slave)
+            print(f"termux-smoke: could not start {' '.join(argv)}: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            try:
+                os.close(slave)
+            except OSError:
+                pass
+
+        captured = bytearray()
+        deadline = time.monotonic() + float(os.environ.get("ATHENA_SMOKE_TIMEOUT", "20"))
+        timed_out = False
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                try:
+                    captured.extend(os.read(master, 1_000_000))
+                except OSError:
+                    pass
+                break
+            readable, _, _ = select.select([master], [], [], 0.25)
+            if readable:
+                try:
+                    captured.extend(os.read(master, 1_000_000))
+                except OSError:
+                    break
+        else:
+            timed_out = True
+
+        if timed_out:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=3)
+
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+        if process.poll() is None:
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+
+        output = _clean(bytes(captured))
+        required = (
+            "ATHENA",
+            "CONVERSATION",
+            "ATHENA OI",
+            "WORKSPACE MAP",
+            "RUNTIME GRAPH",
+            "BUDDY",
+        )
+        if os.environ.get("ATHENA_SMOKE_MODE", "demo").strip().lower() == "cli":
+            required += ("4", "COMPLETE")
+        missing = [marker for marker in required if marker not in output]
+        if timed_out:
+            print("termux-smoke: timeout; captured output:", file=sys.stderr)
+            print(output[-4000:], file=sys.stderr)
+            return 1
+        if process.returncode != 0 or missing:
+            print(
+                f"termux-smoke: failed (exit={process.returncode}, missing={missing})",
+                file=sys.stderr,
+            )
+            print(output[-4000:], file=sys.stderr)
+            return 1
+
+        print("termux-smoke: PASS — ANSI/PTTY surface rendered in a 160x45 host terminal")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

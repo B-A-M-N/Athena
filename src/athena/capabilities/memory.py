@@ -61,7 +61,13 @@ class MemoryCapability:
     def __init__(self, memory_store=None) -> None:
         self.memory_store = memory_store
 
-    async def invoke(self, request: CapabilityRequest) -> CapabilityResult:
+    async def invoke(
+        self, request: CapabilityRequest, *, context=None, **kwargs
+    ) -> CapabilityResult:
+        # The dispatcher supplies an InvocationContext to every capability.
+        # Memory currently needs no workspace fields, but it must still honor
+        # the common invocation contract.
+        del context, kwargs
         args = request.arguments or {}
         op = args.get("operation", "recall")
         call_id = request.call_id or new_id("call")

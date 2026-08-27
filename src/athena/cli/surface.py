@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Mapping, TextIO
 
 
 @dataclass(frozen=True)
@@ -48,15 +48,48 @@ class OperatorSurface:
         )
         self.details = details
         self._input_fn = input_fn or input
+        self._input_supplied = input_fn is not None
         self._model_text = ""
         self._stdout = ""
         self._stderr = ""
         self._handled_approvals: set[str] = set()
         self._last_capability: str | None = None
+        self._last_policy_reason: str = ""
+        self._last_target: str = ""
 
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
+    def render_idle(self) -> None:
+        """Show the interface's empty/ready state.
+
+        This is deliberately a presentation helper.  The service remains
+        responsible for sessions and task state; the surface only gives the
+        operator a useful starting point.
+        """
+        self._write("Athena console · ready (type /help for commands; Ctrl-D to exit)")
+
+    def render_user_message(self, text: str) -> None:
+        """Project one operator message into the conversational surface."""
+        text = str(text or "").strip()
+        if text:
+            self._write_block(text, prefix="you> ")
+
+    def render_result(self, summary: str = "", *, status: str | None = None) -> None:
+        """Project a final task result without exposing runtime internals."""
+        self._flush_all()
+        if summary:
+            self._write_block(str(summary), prefix="assistant> ")
+        if status:
+            self._write(f"[task -> {status}]")
+
+    def render_notice(self, text: str, *, status: str | None = None) -> None:
+        """Project an operator/control notice without a fake task event."""
+        if text:
+            self._write(str(text))
+        if status:
+            self._write(f"[status -> {status}]")
+
     async def render_event(self, event: Any) -> None:
         """Render one canonical event without changing application state."""
         event_type = str(getattr(event, "type", ""))
@@ -70,6 +103,15 @@ class OperatorSurface:
                 self._model_text += text
             return
 
+        if event_type == "ModelRequestStarted":
+            self._write("  · thinking")
+            return
+
+        if event_type == "ModelReasoningDelta":
+            if self.details:
+                self._write("  · reasoning update")
+            return
+
         if event_type == "ModelResponseCompleted":
             self._flush_model()
             provider = payload.get("provider")
@@ -78,14 +120,59 @@ class OperatorSurface:
                 self._write(f"  model: {provider or 'unknown'}/{model or 'unknown'}")
             return
 
+        if event_type == "ModelRequestFailed":
+            self._flush_model()
+            reason = payload.get("error") or payload.get("reason") or "provider error"
+            self._write(f"  ✗ model request failed: {reason}", stream=self.error)
+            return
+
+        if event_type in {"ContextCompressed", "RuntimeSessionCreated"}:
+            if self.details:
+                label = {
+                    "ContextCompressed": "context compressed with provenance retained",
+                    "RuntimeSessionCreated": "runtime session created",
+                }[event_type]
+                self._write(f"  · {label}")
+            return
+
         if event_type == "CapabilityRequested":
             self._flush_model()
+            arguments = payload.get("arguments")
+            if isinstance(arguments, Mapping):
+                self._last_target = str(
+                    payload.get("target")
+                    or payload.get("resource")
+                    or arguments.get("path")
+                    or arguments.get("file")
+                    or arguments.get("resource")
+                    or ""
+                )
             self._render_capability_request(payload)
             return
 
         if event_type == "CapabilityStarted":
             capability = payload.get("capability_id") or self._last_capability or "capability"
             self._write(f"  · {capability} started")
+            return
+
+        if event_type == "CapabilityValidated":
+            if self.details:
+                capability = payload.get("capability_id") or self._last_capability or "capability"
+                self._write(f"  · {capability} validated")
+            return
+
+        if event_type == "PolicyDecisionMade":
+            decision = str(payload.get("decision") or "recorded").lower()
+            reason = payload.get("reason")
+            self._last_policy_reason = str(reason or "")
+            detail = f": {reason}" if self.details and reason else ""
+            self._write(f"  policy · {decision}{detail}")
+            return
+
+        if event_type == "CapabilityProgress":
+            if self.details:
+                progress = payload.get("message") or payload.get("progress") or "active"
+                self._write(f"  · progress: {progress}")
             return
 
         if event_type in {"CapabilityCompleted", "CapabilityFailed"}:
@@ -151,6 +238,49 @@ class OperatorSurface:
             self._write(f"  artifact · {label}{ref or 'created'}")
             return
 
+        if event_type in {"TaskCreated", "TaskQueued"}:
+            if self.details:
+                self._write(f"[task {event_type.removeprefix('Task').lower()}]")
+            return
+
+        if event_type in {"TaskBlocked", "ChildTaskCreated", "ChildTaskCompleted", "ToolRepaired"}:
+            if event_type == "TaskBlocked":
+                self._write("[task blocked]", stream=self.error)
+            elif self.details:
+                label = event_type.removeprefix("Task").lower() if event_type.startswith("Task") else event_type
+                self._write(f"  · {label}")
+            return
+
+        if event_type in {
+            "MutationRecorded", "MutationRecordFailed", "MutationRolledBack",
+            "MemoryCandidateCreated", "MemoryWritten", "SkillCandidateCreated",
+            "SkillActivated", "InterpreterProposalDispatched",
+            "ToolInputCorrectionExhausted", "RecoveryStarted", "RecoveryCompleted",
+        }:
+            labels = {
+                "MutationRecorded": "mutation recorded",
+                "MutationRecordFailed": "mutation record failed",
+                "MutationRolledBack": "mutation rolled back",
+                "MemoryCandidateCreated": "memory candidate captured",
+                "MemoryWritten": "knowledge saved",
+                "SkillCandidateCreated": "skill candidate captured",
+                "SkillActivated": "skill activated",
+                "InterpreterProposalDispatched": "computer proposal dispatched",
+                "ToolInputCorrectionExhausted": "tool repair budget exhausted",
+                "RecoveryStarted": "recovery started",
+                "RecoveryCompleted": "recovery completed",
+            }
+            message = labels[event_type]
+            self._write(
+                f"  {'✗' if event_type in {'MutationRecordFailed', 'ToolInputCorrectionExhausted'} else '·'} {message}",
+                stream=(
+                    self.error
+                    if event_type in {"MutationRecordFailed", "ToolInputCorrectionExhausted"}
+                    else None
+                ),
+            )
+            return
+
         if event_type == "TaskStarted":
             self._write("[task started]")
         elif event_type == "TaskCompleted":
@@ -168,16 +298,20 @@ class OperatorSurface:
         elif event_type == "TaskInterrupted":
             self._flush_all()
             self._write("[task interrupted]")
-        elif event_type == "TaskStateChanged" and self.details:
+        elif event_type == "TaskStateChanged":
             status = payload.get("status") or payload.get("to") or "changed"
-            self._write(f"  state: {status}")
+            if self.details or str(status).upper() in {
+                "WAITING_APPROVAL", "WAITING_INPUT", "BLOCKED", "RECOVERY_REQUIRED",
+            }:
+                self._write(f"  state: {status}")
         elif event_type == "TaskIterationStarted" and self.details:
             self._write(f"  iteration {payload.get('iteration', '?')}")
 
     def _render_capability_request(self, payload: dict[str, Any]) -> None:
         capability = str(payload.get("capability_id") or "capability")
         self._last_capability = capability
-        arguments = payload.get("arguments") or {}
+        raw_arguments = payload.get("arguments")
+        arguments = raw_arguments if isinstance(raw_arguments, Mapping) else {}
         self._write("")
         self._write(f"┌─ {capability} ─────────────────────────")
         if capability in self._CODE_CAPABILITIES:
@@ -244,6 +378,12 @@ class OperatorSurface:
         self._write("")
         self._write("┌─ approval required ───────────────────")
         self._write(f"│ capability: {capability}")
+        target = payload.get("target") or payload.get("resource") or payload.get("path") or self._last_target
+        reason = payload.get("reason") or payload.get("policy_reason") or self._last_policy_reason
+        if target:
+            self._write(f"│ target: {target}")
+        if reason:
+            self._write(f"│ reason: {reason}")
         self._write("│ choose authorization scope:")
         for index, scope in enumerate(scopes, start=1):
             self._write(f"│   {index}) {scope}")
@@ -282,6 +422,12 @@ class OperatorSurface:
         # Calling it directly keeps deterministic embedders/test doubles out
         # of the process-wide executor; real terminal input is already a
         # deliberate pause in the interactive surface.
+        reader = getattr(self, "read_prompt", None)
+        if callable(reader):
+            import asyncio
+
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, reader, prompt)
         return self._input_fn(prompt)
 
     # ------------------------------------------------------------------

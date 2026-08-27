@@ -70,6 +70,11 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
         env = os.environ.copy()
         env["PYTHONPATH"] = str(purelib)
         env.pop("PYTHONHOME", None)
+        # Release acceptance must exercise the deterministic built-in fake
+        # provider. Do not let a developer's ambient provider credentials turn
+        # this artifact test into a network/model-availability test.
+        env.pop("OPENROUTER_API_KEY", None)
+        env.pop("OPENROUTER_MODEL", None)
 
         cli = prefix / "bin" / "athena"
         cli_help = subprocess.run(

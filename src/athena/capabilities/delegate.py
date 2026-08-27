@@ -50,7 +50,7 @@ class DelegateCapability:
             "collect (wait for and return the child result), and cancel."
         ),
         input_schema=_INPUT_SCHEMA,
-        effects=frozenset({EffectClass.SPAWN_PROCESS}),
+        effects=frozenset({EffectClass.READ_LOCAL, EffectClass.SPAWN_PROCESS}),
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -141,7 +141,7 @@ class DelegateCapability:
             child_id, timeout=timeout if timeout is None else float(timeout),
         )
         return CapabilityResult(
-            call_id, self.descriptor.id, _result_status(result.status),
+            call_id, self.descriptor.id, _result_status(result),
             output=_format_result(result),
             ref_uri=f"task:{child_id}",
             metadata={

@@ -14,6 +14,7 @@ import hashlib
 import json
 import socket
 import sqlite3
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -45,8 +46,10 @@ class ResearchCapability:
         description=(
             "Durable evidence-backed research records: record and list source "
             "snapshots, extract exact evidence, link evidence to Athena claims, "
-            "track research gaps, search the local corpus, and verify excerpts. "
-            "External fetching is a separate allowlisted operation."
+            "track research gaps, search the local corpus, verify excerpts, and "
+            "plan/assess/bundle explicit research requirements. Planning is "
+            "deterministic and local; external fetching is a separate "
+            "allowlisted operation."
         ),
         input_schema={
             "type": "object",
@@ -54,7 +57,7 @@ class ResearchCapability:
             "properties": {
                 "operation": {"type": "string", "enum": [
                     "fetch", "record_source", "sources", "search", "record_evidence", "evidence",
-                    "record_gap", "gaps", "close_gap", "verify",
+                    "record_gap", "gaps", "close_gap", "verify", "plan", "assess", "bundle",
                 ]},
                 "uri": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "title": {"type": "string", "maxLength": 1000},
@@ -77,9 +80,33 @@ class ResearchCapability:
                 "contradicts": {"type": "array", "items": {"type": "string"}},
                 "objective": {"type": "string", "minLength": 1, "maxLength": 20_000},
                 "question": {"type": "string", "minLength": 1, "maxLength": 20_000},
+                "requirements": {
+                    "type": "array", "maxItems": 50,
+                    "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["question"],
+                        "properties": {
+                            "id": {"type": "string", "maxLength": 128},
+                            "question": {"type": "string", "minLength": 1, "maxLength": 20_000},
+                            "claim_id": {"type": "string", "maxLength": 128},
+                            "kind": {"type": "string", "enum": list(_GAP_KINDS)},
+                            "required": {"type": "boolean"},
+                            "queries": {
+                                "type": "array", "maxItems": 5,
+                                "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+                            },
+                        },
+                    },
+                },
+                "queries": {
+                    "type": "array", "maxItems": 10,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+                },
+                "gap_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}},
                 "kind": {"type": "string", "enum": list(_GAP_KINDS)},
                 "required": {"type": "boolean"},
                 "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                "claim_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}},
                 "query": {"type": "string", "maxLength": 2000},
                 "status": {"type": "string", "enum": ["OPEN", "CLOSED"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
@@ -89,7 +116,11 @@ class ResearchCapability:
             },
             "additionalProperties": False,
         },
-        effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        effects=frozenset({
+            EffectClass.READ_LOCAL,
+            EffectClass.WRITE_LOCAL,
+            EffectClass.NETWORK_READ,
+        }),
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -128,6 +159,12 @@ class ResearchCapability:
                 return await self._close_gap(request, args)
             if operation == "verify":
                 return await self._verify(request, args, context)
+            if operation == "plan":
+                return await self._plan(request, args, context)
+            if operation == "assess":
+                return await self._assess(request, args, context)
+            if operation == "bundle":
+                return await self._bundle(request, args, context)
             return _result(request, ok=False, error=f"unknown operation: {operation}")
         except (KeyError, SourcePolicyError, ValueError) as exc:
             return _result(request, ok=False, error=str(exc))
@@ -465,28 +502,248 @@ class ResearchCapability:
             evidence, request, context, self._store.get_source
         ):
             return _result(request, ok=False, error=f"unknown evidence: {evidence_id}")
+        verification = await self._verify_evidence(evidence, source)
+        return _result(request, output=_json({
+            **verification,
+            "evidence_id": evidence.id,
+            "source_id": source.id,
+        }))
+
+    async def _plan(self, request, args, context) -> CapabilityResult:
+        """Persist a bounded research plan and retrieve local candidates.
+
+        Planning is intentionally deterministic.  It creates durable gaps for
+        explicit requirements and searches only already captured snapshots;
+        acquisition remains the separate policy-controlled ``fetch`` route.
+        """
+        if not request.task_id:
+            return _result(request, ok=False, error="plan requires a task")
+        objective = str(args.get("objective") or "").strip()
+        raw_requirements = args.get("requirements")
+        if not objective:
+            return _result(request, ok=False, error="plan requires objective")
+        if not isinstance(raw_requirements, list) or not raw_requirements:
+            return _result(request, ok=False, error="plan requires requirements")
+        global_queries = _strings(args.get("queries"), limit=10)
+        plan_input = {
+            "task_id": request.task_id,
+            "objective": objective,
+            "requirements": raw_requirements,
+            "queries": global_queries,
+        }
+        plan_id = "plan_" + hashlib.sha256(
+            json.dumps(plan_input, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()[:24]
+        planned: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_requirements):
+            if not isinstance(raw, Mapping):
+                return _result(request, ok=False, error="plan requirements must be objects")
+            question = str(raw.get("question") or "").strip()
+            if not question:
+                return _result(request, ok=False, error="each plan requirement needs a question")
+            requirement_id = str(raw.get("id") or f"requirement-{index + 1}")
+            claim_id = str(raw.get("claim_id") or "").strip() or None
+            queries = _strings(raw.get("queries"), limit=5) or global_queries or [question]
+            metadata = {
+                **dict(args.get("metadata") or {}),
+                "plan_id": plan_id,
+                "requirement_id": requirement_id,
+                "claim_id": claim_id,
+                "queries": queries,
+            }
+            gap = ResearchGap.create(
+                objective, question,
+                kind=str(raw.get("kind") or args.get("kind") or "unsupported_claim"),
+                required=bool(raw.get("required", True)),
+                task_id=request.task_id,
+                metadata=metadata,
+            )
+            await self._store.save_gap(gap)
+            candidates: list[dict[str, Any]] = []
+            for query in queries:
+                candidates.extend(await self._search_content(
+                    query,
+                    task_id=request.task_id,
+                    project_id=getattr(getattr(context, "workspace", None), "id", None),
+                    limit=5,
+                ))
+            planned.append({
+                "id": requirement_id,
+                "claim_id": claim_id,
+                "question": question,
+                "gap": gap.to_record(),
+                "queries": queries,
+                "candidate_count": len(candidates),
+                "candidates": _unique_candidates(candidates),
+            })
+        return _result(request, output=_json({
+            "plan_id": plan_id,
+            "objective": objective,
+            "requirements": planned,
+        }))
+
+    async def _assess(self, request, args, context) -> CapabilityResult:
+        """Assess captured evidence and close only durably verified gaps."""
+        if not request.task_id:
+            return _result(request, ok=False, error="assess requires a task")
+        gap_ids = {str(value) for value in args.get("gap_ids") or ()}
+        requested_evidence = {str(value) for value in args.get("evidence_ids") or ()}
+        requested_claims = {str(value) for value in args.get("claim_ids") or ()}
+        workspace_id = getattr(getattr(context, "workspace", None), "id", None)
+        gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
+        evidence = await self._store.list_evidence(
+            task_id=request.task_id, project_id=workspace_id, limit=200,
+        )
+        visible: list[EvidenceObject] = []
+        for item in evidence:
+            if await _evidence_visible(item, request, context, self._store.get_source):
+                visible.append(item)
+        by_id = {item.id: item for item in visible}
+        assessed: list[dict[str, Any]] = []
+        for gap in gaps:
+            if gap_ids and gap.id not in gap_ids:
+                assessed.append(gap.to_record())
+                continue
+            metadata = dict(gap.metadata)
+            requirement_id = str(metadata.get("requirement_id") or "")
+            claim_id = str(metadata.get("claim_id") or "")
+            candidates = [
+                item for item in visible
+                if (
+                    (requested_evidence and item.id in requested_evidence)
+                    or (requested_claims and item.claim_id in requested_claims)
+                    or (claim_id and item.claim_id == claim_id)
+                    or (requirement_id and item.metadata.get("requirement_id") == requirement_id)
+                )
+            ]
+            checks: list[dict[str, Any]] = []
+            for item in candidates:
+                source = await self._store.get_source(item.source_id)
+                if source is not None:
+                    checks.append({
+                        "evidence_id": item.id,
+                        **await self._verify_evidence(item, source),
+                    })
+            candidate_ids = {item.id for item in candidates}
+            conflicts = [
+                item.id for item in candidates
+                if any(
+                    related_id in candidate_ids
+                    or (
+                        related_id in by_id
+                        and by_id[related_id].claim_id is not None
+                        and by_id[related_id].claim_id == item.claim_id
+                    )
+                    for related_id in item.contradicts
+                )
+            ]
+            verified = [
+                check["evidence_id"] for check in checks
+                if check.get("status") == "verified"
+            ]
+            can_close = bool(candidates) and bool(verified) and not conflicts and all(
+                check.get("status") == "verified" for check in checks
+            )
+            updated = gap
+            if gap.status == "OPEN" and can_close:
+                updated = await self._store.close_gap(
+                    gap.id, evidence_ids=tuple(verified), task_id=request.task_id,
+                ) or gap
+            record = updated.to_record()
+            record["assessment"] = {
+                "candidate_evidence_ids": [item.id for item in candidates],
+                "verification": checks,
+                "verified_evidence_ids": verified,
+                "conflicts": conflicts,
+                "closed_now": updated.status == "CLOSED" and gap.status != "CLOSED",
+            }
+            assessed.append(record)
+        required_open = [
+            record["id"] for record in assessed
+            if record.get("required", True) and record.get("status") != "CLOSED"
+        ]
+        return _result(request, output=_json({
+            "ready": not required_open,
+            "required_open_gaps": required_open,
+            "gaps": assessed,
+        }))
+
+    async def _bundle(self, request, args, context) -> CapabilityResult:
+        """Return a bounded, task-scoped research packet for synthesis/judgment."""
+        if not request.task_id:
+            return _result(request, ok=False, error="bundle requires a task")
+        workspace_id = getattr(getattr(context, "workspace", None), "id", None)
+        limit = int(args.get("limit") or 50)
+        sources = await self._store.list_sources(
+            task_id=request.task_id, project_id=workspace_id, limit=limit,
+        )
+        evidence = await self._store.list_evidence(
+            task_id=request.task_id, project_id=workspace_id, limit=limit,
+        )
+        gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
+        required_open = [gap.id for gap in gaps if gap.required and gap.status != "CLOSED"]
+        unverified_closed: list[str] = []
+        for gap in gaps:
+            if gap.status != "CLOSED" or not gap.required:
+                continue
+            if not gap.evidence_ids:
+                unverified_closed.append(gap.id)
+                continue
+            for evidence_id in gap.evidence_ids:
+                item = await self._store.get_evidence(evidence_id)
+                source = await self._store.get_source(item.source_id) if item else None
+                if item is None or source is None or (await self._verify_evidence(item, source))["status"] != "verified":
+                    unverified_closed.append(gap.id)
+                    break
+        return _result(request, output=_json({
+            "ready": not required_open and not unverified_closed,
+            "required_open_gaps": required_open,
+            "unverified_closed_gaps": unverified_closed,
+            "sources": [source.to_record() for source in sources],
+            "evidence": [item.to_record() for item in evidence],
+            "gaps": [gap.to_record() for gap in gaps],
+        }))
+
+    async def _verify_evidence(
+        self, evidence: EvidenceObject, source: SourceRecord,
+    ) -> dict[str, Any]:
         if not source.artifact_uri or self._artifacts is None:
-            return _result(request, output=_json({
-                "status": "unverified", "reason": "source snapshot not captured",
-                "evidence_id": evidence.id,
-            }))
+            return {"status": "unverified", "reason": "source snapshot not captured"}
         content = await self._artifacts.load(source.artifact_uri)
         content_hash = hashlib.sha256(content).hexdigest()
         hash_matches = not source.content_hash or content_hash == source.content_hash
-        found = hash_matches and (
-            evidence.exact_supporting_excerpt.encode("utf-8") in content
-        )
-        return _result(request, output=_json({
+        found = hash_matches and evidence.exact_supporting_excerpt.encode("utf-8") in content
+        return {
             "status": "verified" if found else "invalid",
-            "evidence_id": evidence.id,
-            "source_id": source.id,
             "content_hash": content_hash,
             "hash_matches": hash_matches,
-        }))
+        }
 
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)
+
+
+def _strings(value: Any, *, limit: int) -> list[str]:
+    """Return bounded, non-empty strings from a schema-validated list."""
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value[:limit] if str(item).strip()]
+
+
+def _unique_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate local search hits while preserving query/rank order."""
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        source = candidate.get("source") if isinstance(candidate, Mapping) else None
+        source_id = str(source.get("id") or "") if isinstance(source, Mapping) else ""
+        key = source_id or json.dumps(candidate, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+    return result
 
 
 async def _index_snapshot(

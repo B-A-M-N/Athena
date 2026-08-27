@@ -154,6 +154,17 @@ class AthenaConfig:
     research_allowed_domains: tuple[str, ...] = ()
     research_denied_domains: tuple[str, ...] = ()
     research_allow_private_network: bool = False
+    # Terminal UI: which mascot/buddy the surfaces show (a registered
+    # character name, or "off" to hide the mascot column). ``mascots``
+    # registers user-defined characters ([mascots.<name>] in TOML) with
+    # "label" plus a "frames" table of state -> art string(s).
+    mascot: str | None = None
+    mascots: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    # Terminal presentation: auto/glass/ansi/plain. Glass requires a
+    # confirmed Kitty graphics transport; otherwise it falls back to ANSI.
+    display: str = "auto"
+    animations: bool = True
+    reduced_motion: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -301,6 +312,16 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["research_denied_domains"] = list(config.research_denied_domains)
     if config.research_allow_private_network:
         d["research_allow_private_network"] = True
+    if config.mascot is not None:
+        d["mascot"] = config.mascot
+    if config.mascots:
+        d["mascots"] = {k: dict(v) for k, v in config.mascots.items()}
+    if config.display != "auto":
+        d["display"] = config.display
+    if not config.animations:
+        d["animations"] = False
+    if config.reduced_motion:
+        d["reduced_motion"] = True
     if config.metadata:
         d["metadata"] = dict(config.metadata)
     return d
@@ -327,6 +348,10 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
             return tuple(v.strip() for v in value.split(",") if v.strip())
         return tuple(str(v).strip() for v in (value or ()) if str(v).strip())
 
+    display = str(data.get("display", "auto")).strip().lower()
+    if display not in {"auto", "glass", "ansi", "plain"}:
+        display = "auto"
+
     return AthenaConfig(
         db_path=data.get("db_path"),
         workspace_root=data.get("workspace_root"),
@@ -346,6 +371,15 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         research_denied_domains=_domains(data.get("research_denied_domains")),
         research_allow_private_network=bool(
             data.get("research_allow_private_network", False)),
+        mascot=data.get("mascot"),
+        mascots={
+            str(k): dict(v)
+            for k, v in (data.get("mascots") or {}).items()
+            if isinstance(v, dict)
+        },
+        display=display,
+        animations=bool(data.get("animations", True)),
+        reduced_motion=bool(data.get("reduced_motion", False)),
         metadata=data.get("metadata") or {},
     )
 
@@ -363,7 +397,8 @@ def _env_map() -> dict[str, Any]:
         ATHENA_ARTIFACT_ROOT, ATHENA_CONTEXT_WINDOW,
         ATHENA_WORKER_MAX_PARALLEL, ATHENA_SCHEDULER_INTERVAL_SECONDS,
         ATHENA_SCHEDULER_MAX_CONCURRENT, ATHENA_PROFILE,
-        ATHENA_SKILLS_PATHS (comma-separated)
+        ATHENA_SKILLS_PATHS (comma-separated), ATHENA_MASCOT,
+        ATHENA_DISPLAY, ATHENA_ANIMATIONS, ATHENA_REDUCED_MOTION
     """
     result: dict[str, Any] = {}
     env_map: dict[str, tuple[str, Callable[[Any], Any]]] = {
@@ -379,6 +414,16 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_SCHEDULER_INTERVAL_SECONDS": ("scheduler_interval_seconds", float),
         "ATHENA_SCHEDULER_MAX_CONCURRENT": ("scheduler_max_concurrent", int),
         "ATHENA_PROFILE": ("profile", str),
+        "ATHENA_MASCOT": ("mascot", str),
+        "ATHENA_DISPLAY": ("display", str),
+        "ATHENA_ANIMATIONS": (
+            "animations",
+            lambda v: str(v).strip().lower() not in {"0", "false", "no", "off"},
+        ),
+        "ATHENA_REDUCED_MOTION": (
+            "reduced_motion",
+            lambda v: str(v).strip().lower() in {"1", "true", "yes", "on"},
+        ),
         "ATHENA_MODEL_ROLES": (
             "model_roles",
             lambda v: json.loads(v) if isinstance(v, str) else v,

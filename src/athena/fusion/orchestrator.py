@@ -70,8 +70,12 @@ class FusionOrchestrator:
     def __init__(self, service: Any) -> None:
         self.service = service
         self.shadow = service.shadow_engine()
+        state_root = getattr(service, "_runtime_state_root", None)
         self.checkpoints = CheckpointManager(
-            root="/tmp/athena-checkpoints")
+            root=(
+                os.path.join(state_root, "checkpoints")
+                if state_root else "/tmp/athena-checkpoints"
+            ))
         self.forker = TaskForker(service=service, checkpoint_manager=self.checkpoints)
 
     # ------------------------------------------------------------------

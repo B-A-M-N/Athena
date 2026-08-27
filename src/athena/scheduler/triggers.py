@@ -65,10 +65,10 @@ def next_fire(trigger: TriggerSpec, after: datetime) -> datetime | None:
     if kind is TriggerType.CRON:
         return _next_cron(trigger, after)
     if kind is TriggerType.EVENT:
-        # EVENT triggers are not implemented in v1; reject loudly rather than
-        # silently compute nothing (spec anti-bloat rule).
-        raise NotImplementedError(
-            "EVENT trigger type is not supported in this version")
+        # Event triggers are advanced by Scheduler.notify_event(), not by a
+        # wall-clock calculation. Returning None keeps time-based callers from
+        # accidentally firing an event job during a normal tick.
+        return None
     return None
 
 

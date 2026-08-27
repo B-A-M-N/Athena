@@ -61,3 +61,7 @@ demos/*.gif.lock
 .claude/
 # Demo render output (published by scripts/render-demo; reproducible from tape)
 demos/*.gif
+!demos/capability_fabric.gif
+
+# Native Rust build output
+native/target/

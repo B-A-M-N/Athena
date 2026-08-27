@@ -28,7 +28,11 @@ import sys
 import tempfile
 from dataclasses import dataclass
 
-from athena.affordances.models import AffordanceScope, GeneratedCapability
+from athena.affordances.models import (
+    AffordanceScope,
+    DependencyRequirement,
+    GeneratedCapability,
+)
 from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
 from athena.execution.process_tree import kill_tree, sandbox_argv, spawn_owned
 from athena.protocol.capabilities import (
@@ -83,6 +87,7 @@ class SyntheticCapability:
     successes: int = 0
     failures: int = 0
     validation_cases: list[dict] | None = None
+    required_dependencies: tuple[DependencyRequirement, ...] = ()
     # This is calculated by Athena's sandbox contract, not trusted from the
     # generated source or its declared effects.
     effective_effects: frozenset[str] = _GENERATED_EFFECTIVE_AUTHORITY
@@ -242,6 +247,7 @@ class SynthesisEngine:
         task_id: str | None = None,
         provenance: dict | None = None,
         validation_cases: list[dict] | None = None,
+        required_dependencies: tuple[DependencyRequirement, ...] = (),
     ) -> SyntheticCapability:
         """Create (but do not yet trust) a synthetic capability.
 
@@ -264,6 +270,7 @@ class SynthesisEngine:
             provenance=provenance or {},
             validation={},
             validation_cases=[dict(case) for case in validation_cases or []],
+            required_dependencies=required_dependencies,
             effective_effects=_GENERATED_EFFECTIVE_AUTHORITY,
         )
 
@@ -558,6 +565,7 @@ class SynthesisEngine:
             output_schema=cap.output_schema,
             declared_effects=frozenset(self._effect_values(cap)),
             effective_authority=frozenset(self._authority_values(cap)),
+            required_dependencies=cap.required_dependencies,
             scope=scope,
             task_scope=cap.task_id if scope is AffordanceScope.TASK else None,
             project_scope=project_scope,
@@ -647,6 +655,7 @@ class SynthesisEngine:
             provenance=dict(generated.provenance),
             validation=proof,
             validation_cases=[],
+            required_dependencies=generated.required_dependencies,
             uses=int(usage.get("uses", 0)),
             successes=int(usage.get("successes", 0)),
             failures=int(usage.get("failures", 0)),
@@ -723,6 +732,7 @@ class SynthesisEngine:
             id=cap.id, name=cap.name, description=cap.description,
             implementation=cap.code, input_schema=cap.input_schema,
             output_schema=cap.output_schema,
+            required_dependencies=cap.required_dependencies,
             declared_effects=frozenset(self._effect_values(cap)),
             effective_authority=frozenset(self._authority_values(cap)),
             scope=scope, project_scope=project_id,

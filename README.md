@@ -34,8 +34,11 @@ unbounded collection of loosely coordinated agents.
 Requires Python 3.12 or newer.
 
 ```bash
-pip install -e ".[dev,cli]"
+pip install -e ".[dev,cli,glass]"
 ```
+
+The optional `glass` extra installs Pillow for the hosted raster OI renderer;
+ANSI/plain operation does not require it.
 
 ## Development
 
@@ -59,6 +62,15 @@ active development.
 ```bash
 athena --help
 athena chat
+
+# hosted raster OI on a Kitty-compatible graphics transport
+athena --display glass chat
+
+# universal terminal fallback
+athena --display ansi chat
+
+# inspect the host terminal and renderer decision
+athena doctor display
 ```
 
 Inside the console, direct commands use the same policy and execution path as
@@ -82,7 +94,14 @@ athena run "explain the files in this project" --autonomy autonomous
 Athena keeps the key in its credential boundary and does not write it to the
 config, task state, or repository. The default is configured as the free
 `poolside/laguna-s-2.1:free` route; availability on shared free capacity can
-vary. Other `:free` model IDs can be selected with `OPENROUTER_MODEL`.
+vary. OpenRouter currently lists that model as a zero-cost, rate-limited free
+variant with tool-calling support; availability, terms, and provider behavior
+can change. See the [OpenRouter free-variant
+documentation](https://openrouter.ai/docs/guides/routing/model-variants/free)
+and [current model page](https://openrouter.ai/poolside/laguna-s-2.1-20260720%3Afree)
+before using it for sensitive work. Other `:free` model IDs can be selected
+with `OPENROUTER_MODEL`. Free-route privacy and training terms are provider
+terms, not Athena guarantees; keep secrets out of prompts.
 
 ## Architecture at a glance
 
@@ -289,9 +308,9 @@ normalized incrementally rather than hidden behind a false clean claim.
 ## Demo (work in progress)
 
 The offline Capability Fabric showcase is reproducible with VHS and uses the
-same `DualPaneSurface` that powers `athena chat` and `athena run`. The
-committed recording is a generated preview of the current operator surface.
-It is expected to change while the UI and pacing are refined:
+same projection and instrument surface that power `athena chat` and
+`athena run`. It is a development preview—not a product video—and is expected
+to change while the chassis, CRT scene, animation, and pacing are refined:
 
 ![Athena operator surface — Capability Fabric demo](demos/capability_fabric.gif)
 
@@ -315,11 +334,27 @@ verifies VHS exit 0 and that the resulting GIF decodes (GIF89a magic,
 1280x720, frame count, bounded duration), and atomically renames the temp
 into place. A bounded timeout kills the whole VHS process group on overrun and
 leaves any previous known-good GIF untouched. Rendering requires `vhs` and
-`ffmpeg` on `PATH`.
+`ffmpeg` on `PATH`; non-interactive rendering also uses `tmux` to provide VHS
+a correctly sized PTY.
 
 Direct `vhs demos/capability_fabric.tape` still works for ad-hoc local
 capture but does not provide the lock, timeout, or decode validation used by
 the stable-beta gate.
+
+### Termux / host-terminal smoke test
+
+Termux is a supported host-terminal target for the ANSI surface. From a
+checkout, run the deterministic PTY visual smoke test:
+
+```bash
+scripts/termux-smoke
+```
+
+It launches the fixture-backed demo in a 160×45 pseudo-terminal and checks
+that the conversation well, OI scene, workspace map, runtime graph, and Buddy
+all render before the process exits. To exercise an installed CLI instead,
+use `ATHENA_SMOKE_MODE=cli ATHENA_BIN=athena scripts/termux-smoke`; that path
+uses a temporary database/workspace and never inherits OpenRouter credentials.
 
 For a quick local preview, pass a higher speed multiplier to the driver:
 
@@ -333,9 +368,13 @@ primitives but no model provider, network, database, or host mutation.
 
 Research uses the same durable Task and evidence model. A source is fetched
 only after passing source/network policy, retained as an artifact-backed
-snapshot, and linked to claims through locators and supporting excerpts. A
-future research workflow may search, retrieve, index, challenge, and fill
-evidence gaps, but it does not create a separate research brain.
+snapshot, and linked to claims through locators and supporting excerpts.
+Bounded lexical search, snapshot indexing, evidence verification, gap
+tracking, and the deterministic `research:plan`, `research:assess`, and
+`research:bundle` operations are live. Those operations sequence explicit
+requirements and captured evidence without creating a separate research brain;
+open-ended retrieval, semantic ranking, and autonomous research planning
+remain in development.
 
 ## Current limitations
 
@@ -349,17 +388,31 @@ subsystem is complete.
 
 ## Operator surface
 
-`athena chat` and `athena run` use a calm operator surface over
-Athena's durable task events. Generated Python/shell code, runtime output,
-artifacts, and failures remain visible, but noisy deltas are grouped into
-readable execution cards. Supervised actions open a selectable approval menu
-for call/task/session/project scope; the UI submits that decision through
-`AthenaService`, so it never becomes a second agent loop or execution path.
+`athena chat` and `athena run` use a calm operator surface over Athena's
+durable task events. The two apertures are equal in logical size: the left is
+the readable `YOU`/`ATHENA` conversation well, and the right is the OI scene
+viewport. The buddy is an entity inside that viewport, never a permanent
+sidebar that steals OI content width. Approval, history, live stream, runtime
+graphs, failures, recovery, and delegated work are projections of the same
+canonical events.
+
+The current hosted Glass path renders the right CRT as a bounded Pillow
+framebuffer and presents it through the Kitty Graphics Protocol. Kitty and
+WezTerm are the primary supported hosts for this path; Athena probes the
+active TTY and falls back safely when graphics support is not confirmed.
+`ATHENA_KITTY_CONFIRMED=1` may be used in a controlled launcher when probing
+is unavailable. ANSI is the safe default/fallback and keeps the same scene
+semantics in cell text. The native Athena terminal development slice is documented in
+[`docs/NATIVE_TERMINAL_FRONTEND.md`](docs/NATIVE_TERMINAL_FRONTEND.md); it is
+separate from the Python package and is not yet the default shipped frontend.
+Noisy deltas are coalesced, animation is presentation-only, and reduced motion
+is available with `ATHENA_REDUCED_MOTION=1` or `--reduced-motion`.
 
 `athena inspect TASK_ID` is a deep task-observability command that surfaces
 durable provider/model usage rows and task activity for a given task.
 `athena oi-stream` opens the live OI window as a full-pane first-class view:
-an unbuffered model/runtime stream with a mascot header and inline approvals.
+the same bounded OI scene used by the dual-pane surface, with an unbuffered
+model/runtime stream, an in-scene Buddy, and inline approvals.
 
 ### Stable views (REPL meta-commands)
 
@@ -372,7 +425,9 @@ an unbuffered model/runtime stream with a mascot header and inline approvals.
 | `/criteria LIST` | Set acceptance criteria for the next task (`;`-separated; `command:` prefix = probe). |
 | `/interrupted`, `/resume [ID]` | List/re-queue tasks parked by shutdown or crash. |
 | `/context` | What the next model turn will see (durable messages + inclusion rules). |
-| `/details` | Toggle raw model deltas and per-event diagnostics. |
+| `/details` | Expand or collapse the compact reasoning/status treatment. |
+| `/scroll left|right up|down|bottom` | Inspect retained conversation or OI history without losing the live tail. |
+| `/mascot [NAME]` | Select `owl`, `cat`, `bot`, a configured character, or `off`. |
 | `/cancel`, `/sessions`, `/new`, `/autonomy`, `/model` | Task/session control. |
 
 > **Note:** `CheckpointManager` snapshots are **workspace-file snapshots**
