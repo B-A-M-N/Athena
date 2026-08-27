@@ -42,27 +42,30 @@ class MutationStore:
         """Persist a PLANNED intent BEFORE the side effect (write-ahead)."""
         mid = mutation_id or new_id("mut")
         now = utcnow().isoformat()
-        await self._db.execute(
-            "INSERT INTO mutations("
-            "id, task_id, execution_id, resource, operation, reversible, "
-            "before_state, after_state, status, before_ref, inverse, created_at, metadata"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                mid,
-                task_id,
-                execution_id,
-                resource,
-                operation,
-                0,
-                json.dumps(before_ref) if before_ref is not None else None,
-                None,
-                PLANNED,
-                before_ref,
-                json.dumps(inverse) if inverse is not None else None,
-                now,
-                json.dumps(dict(metadata or {})),
-            ),
-        )
+        async with self._db.transaction() as db:
+            sequence = await self._next_sequence(db, task_id)
+            await db.execute_raw(
+                "INSERT INTO mutations("
+                "id, task_id, execution_id, resource, operation, sequence, reversible, "
+                "before_state, after_state, status, before_ref, inverse, created_at, metadata"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mid,
+                    task_id,
+                    execution_id,
+                    resource,
+                    operation,
+                    sequence,
+                    0,
+                    json.dumps(before_ref) if before_ref is not None else None,
+                    None,
+                    PLANNED,
+                    before_ref,
+                    json.dumps(inverse) if inverse is not None else None,
+                    now,
+                    json.dumps(dict(metadata or {})),
+                ),
+            )
         return mid
 
     async def mark_started(self, mutation_id: str) -> None:
@@ -141,28 +144,46 @@ class MutationStore:
         """
         mid = mutation_id or new_id("mut")
         now = utcnow().isoformat()
-        await self._db.execute(
-            "INSERT INTO mutations("
-            "id, task_id, execution_id, resource, operation, reversible, "
-            "before_state, after_state, status, before_ref, inverse, created_at, metadata"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                mid,
-                task_id,
-                execution_id,
-                resource,
-                operation,
-                1 if reversible else 0,
-                json.dumps(before_ref) if before_ref is not None else before_state,
-                json.dumps(after_state) if after_state is not None else None,
-                COMPLETED,
-                before_ref,
-                json.dumps(inverse) if inverse is not None else None,
-                now,
-                json.dumps(dict(metadata or {})),
-            ),
-        )
+        async with self._db.transaction() as db:
+            sequence = await self._next_sequence(db, task_id)
+            await db.execute_raw(
+                "INSERT INTO mutations("
+                "id, task_id, execution_id, resource, operation, sequence, reversible, "
+                "before_state, after_state, status, before_ref, inverse, created_at, metadata"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mid,
+                    task_id,
+                    execution_id,
+                    resource,
+                    operation,
+                    sequence,
+                    1 if reversible else 0,
+                    json.dumps(before_ref) if before_ref is not None else before_state,
+                    json.dumps(after_state) if after_state is not None else None,
+                    COMPLETED,
+                    before_ref,
+                    json.dumps(inverse) if inverse is not None else None,
+                    now,
+                    json.dumps(dict(metadata or {})),
+                ),
+            )
         return mid
+
+    @staticmethod
+    async def _next_sequence(db: Database, task_id: str | None) -> int:
+        """Allocate a monotonic sequence inside the mutation transaction."""
+        if task_id is None:
+            row = await db.fetch_one_raw(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
+                "FROM mutations WHERE task_id IS NULL"
+            )
+        else:
+            row = await db.fetch_one_raw(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
+                "FROM mutations WHERE task_id = ?", (task_id,)
+            )
+        return int((row or {}).get("sequence") or 1)
 
     async def mark_reversible(self, mutation_id: str, reversible: bool = True) -> None:
         await self._db.execute(
@@ -177,6 +198,14 @@ class MutationStore:
         if row is None:
             return None
         return _decode_mutation(row)
+
+    async def sequence_for(self, mutation_id: str) -> int | None:
+        row = await self._db.fetch_one(
+            "SELECT sequence FROM mutations WHERE id = ?", (mutation_id,)
+        )
+        if row is None or row.get("sequence") is None:
+            return None
+        return int(row["sequence"])
 
     async def list_for_task(self, task_id: str) -> list[dict]:
         rows = await self._db.fetch_all(
