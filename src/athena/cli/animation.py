@@ -10,6 +10,10 @@ from typing import Callable
 
 
 _logger = logging.getLogger("athena.cli.animation")
+_ACTIVE_STATES = frozenset({
+    "THINKING", "READING", "SEARCHING", "TOOLS", "EXECUTING", "APPROVAL",
+    "FAILURE", "RECOVERING", "DELEGATED",
+})
 
 
 @dataclass
@@ -38,7 +42,11 @@ class OIAnimator:
 
     def tick(self, dt: float) -> bool:
         """Advance presentation only; never changes semantic state."""
-        if self.reduced_motion:
+        if self.reduced_motion or (
+            self.visual.semantic_state.upper() not in _ACTIVE_STATES
+            and self.visual.transition >= 1.0
+        ):
+            self.visual.dirty = False
             return False
         self.visual.phase = (self.visual.phase + max(float(dt), 0.0) * 2.0) % 1.0
         self.visual.transition = min(1.0, self.visual.transition + max(float(dt), 0.0) * 3.0)
@@ -49,7 +57,7 @@ class OIAnimator:
 class AnimationClock:
     """Low-rate async clock that invalidates only the OI viewport."""
 
-    def __init__(self, callback: Callable[[float], None], *, enabled: bool = True, reduced_motion: bool = False) -> None:
+    def __init__(self, callback: Callable[[float], bool | None], *, enabled: bool = True, reduced_motion: bool = False) -> None:
         self.callback = callback
         self.enabled = enabled and not reduced_motion
         self.reduced_motion = reduced_motion
@@ -67,16 +75,22 @@ class AnimationClock:
 
     async def _run(self) -> None:
         self._last = time.monotonic()
+        interval = 0.10
         try:
             while True:
-                await asyncio.sleep(0.10)
+                await asyncio.sleep(interval)
                 now = time.monotonic()
                 dt = now - self._last
                 self._last = now
                 try:
-                    self.callback(dt)
+                    active = self.callback(dt)
+                    # A settled scene can sleep at a lower cadence. Callback
+                    # compatibility is intentional: legacy callbacks that
+                    # return None remain active rather than silently freezing.
+                    interval = 0.10 if active is not False else 0.50
                 except Exception:  # noqa: BLE001 - animation must not kill the REPL
                     _logger.warning("OI animation callback failed", exc_info=True)
+                    interval = 0.10
         except asyncio.CancelledError:
             return
 

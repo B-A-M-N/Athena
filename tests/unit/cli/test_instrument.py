@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from io import StringIO
 
 import pytest
@@ -76,6 +78,11 @@ def test_animation_is_presentation_only_and_reduced_motion_is_still() -> None:
     reduced.set_state("EXECUTING", "graph")
     assert reduced.tick(0.25) is False
     assert reduced.visual.phase == 0
+
+    idle = OIAnimator()
+    idle.visual.transition = 1.0
+    assert idle.tick(0.25) is False
+    assert idle.visual.dirty is False
 
 
 def test_animation_transitions_between_semantic_buddy_anchors() -> None:
@@ -185,6 +192,62 @@ def test_terminal_session_is_idempotent_for_non_tty() -> None:
     session.close()
     session.close()
     assert output.getvalue() == ""
+
+
+class _TTYBuffer(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_terminal_session_restores_handlers_and_screen_on_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = _TTYBuffer()
+    previous = {
+        signal.SIGINT: signal.SIG_IGN,
+        signal.SIGTERM: signal.SIG_DFL,
+    }
+    if hasattr(signal, "SIGHUP"):
+        previous[signal.SIGHUP] = signal.SIG_IGN
+    installed: list[tuple[int, object]] = []
+    monkeypatch.setattr(signal, "getsignal", lambda signum: previous[signum])
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: installed.append((signum, handler)))
+
+    session = TerminalSession(output)
+    session.open()
+    session.close()
+    session.close()
+
+    assert output.getvalue() == TerminalSession.ENTER + TerminalSession.LEAVE
+    assert [signum for signum, _handler in installed[:2]] == [signal.SIGINT, signal.SIGTERM]
+    restored = installed[2:]
+    assert {signum: handler for signum, handler in restored} == previous
+    assert session.active is False
+
+
+def test_terminal_session_signal_cleanup_preserves_default_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = _TTYBuffer()
+    installed: list[tuple[int, object]] = []
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(signal, "getsignal", lambda _signum: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: installed.append((signum, handler)))
+    monkeypatch.setattr(os, "kill", lambda pid, signum: killed.append((pid, signum)))
+
+    session = TerminalSession(output)
+    session.open()
+    with pytest.raises(KeyboardInterrupt):
+        session._handle_signal(signal.SIGINT, None)
+    assert session.active is False
+
+    session.open()
+    session._handle_signal(signal.SIGTERM, None)
+    assert session.active is False
+    assert killed == [(os.getpid(), signal.SIGTERM)]
+
+    if hasattr(signal, "SIGHUP"):
+        session.open()
+        session._handle_signal(signal.SIGHUP, None)
+        assert killed[-1] == (os.getpid(), signal.SIGHUP)
 
 
 @pytest.mark.asyncio

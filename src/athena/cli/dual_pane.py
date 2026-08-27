@@ -762,16 +762,18 @@ class DualPaneSurface(OperatorSurface):
             self.output.flush()
         self.terminal_session.close()
 
-    def _animation_tick(self, dt: float) -> None:
+    def _animation_tick(self, dt: float) -> bool:
         # ANSI/plain surfaces are event-driven cell projections; repainting
         # them ten times per second only burns terminal bandwidth because the
         # cell scene has no animated layer.  The retained pixel scene owns the
         # animation clock when Glass is actually active.
         if not self._full_screen or self.display != "glass":
-            return
+            return False
+        if not self.animator.tick(dt):
+            return False
         self.mascot.advance(dt)
-        self.animator.tick(dt)
-        self.repaint_oi(force=True)
+        self.repaint_oi(force=False)
+        return True
 
     def read_prompt(self, prompt: str = "athena> ") -> str:
         value = self.prompt.read(prompt)
