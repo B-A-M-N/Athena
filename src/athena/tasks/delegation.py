@@ -148,6 +148,22 @@ class DelegationManager:
         task = await self._tasks.get(child_task_id)
         return _status_of(task)
 
+    async def is_descendant(self, parent_task_id: str, child_task_id: str) -> bool:
+        """Return whether ``child_task_id`` belongs to the parent's subtree."""
+        if not parent_task_id or not child_task_id or parent_task_id == child_task_id:
+            return False
+        current = child_task_id
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            task = await self._tasks.get(current)
+            if task is None:
+                return False
+            current = task.parent_task_id
+            if current == parent_task_id:
+                return True
+        return False
+
     async def get_result(self, child_task_id: str) -> TaskResult | None:
         """Return the child's terminal result, or ``None`` while still active."""
         result = await self._tasks.get_result(child_task_id)

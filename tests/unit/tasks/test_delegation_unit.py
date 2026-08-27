@@ -59,6 +59,17 @@ async def test_spawn_child_sets_parent_task_id(env):
     assert child.objective == "child work"
 
 
+async def test_descendant_ownership_is_explicit(env):
+    manager, delegation, sessions = env
+    parent = await _create(manager, sessions, "parent")
+    child_id = await _spawn(delegation, parent.id)
+    sibling = await _create(manager, sessions, "sibling")
+
+    assert await delegation.is_descendant(parent.id, child_id) is True
+    assert await delegation.is_descendant(sibling.id, child_id) is False
+    assert await delegation.is_descendant(parent.id, parent.id) is False
+
+
 @pytest.mark.athena_claim("BHV-091")
 @pytest.mark.athena_evidence("test", "invariant")
 async def test_max_child_depth_blocks_grandchildren(env):

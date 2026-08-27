@@ -56,19 +56,27 @@ class _SkillsStore:
 
 
 class _ScheduleAPI:
-    async def list_jobs(self):
+    async def list_jobs(self, **kwargs):
         return [{"id": "job-1", "name": "nightly", "enabled": True}]
 
-    async def inspect(self, job_id):
+    async def inspect(self, job_id, **kwargs):
         return {"id": job_id, "name": "nightly", "enabled": True}
 
 
 class _DelegationHandle:
+    async def is_descendant(self, parent_task_id, child_task_id):
+        return parent_task_id == "task-dispatch-contracts" and child_task_id == "child-1"
+
     async def status_of(self, child_task_id):
         return TaskStatus.COMPLETE
 
     async def collect(self, child_task_id, *, timeout=None):
         return TaskResult(child_task_id, TaskStatus.COMPLETE, summary="child finished")
+
+
+class _PendingDelegationHandle(_DelegationHandle):
+    async def collect(self, child_task_id, *, timeout=None):
+        return TaskResult(child_task_id, TaskStatus.WAITING_APPROVAL)
 
 
 async def test_memory_and_skills_accept_dispatcher_context(tmp_path):
@@ -122,6 +130,32 @@ async def test_delegate_read_operations_fit_descriptor_effect_envelope(tmp_path)
     assert "COMPLETE" in status.output
     assert collected.status is CapabilityResultStatus.OK
     assert "child finished" in collected.output
+
+
+async def test_delegate_rejects_child_outside_requesting_subtree(tmp_path):
+    dispatcher = _dispatcher(
+        DelegateCapability(_DelegationHandle()), profile=AutonomyLevel.SUPERVISED
+    )
+    result = await _dispatch(
+        dispatcher,
+        _request("delegate", "status", child_task_id="other-child"),
+        WorkspaceSpec(id="repo", root=str(tmp_path)),
+    )
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "not owned" in (result.error or "")
+
+
+async def test_delegate_collect_does_not_report_pending_as_success(tmp_path):
+    dispatcher = _dispatcher(
+        DelegateCapability(_PendingDelegationHandle()), profile=AutonomyLevel.SUPERVISED
+    )
+    result = await _dispatch(
+        dispatcher,
+        _request("delegate", "collect", child_task_id="child-1", timeout=0),
+        WorkspaceSpec(id="repo", root=str(tmp_path)),
+    )
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "not complete" in (result.error or "")
 
 
 async def test_research_fetch_reaches_executor_after_effect_resolution(

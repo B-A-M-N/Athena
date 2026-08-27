@@ -107,12 +107,13 @@ class ScheduleStore:
             (next_run, now, job_id),
         )
 
-    async def set_enabled(self, job_id: str, enabled: bool) -> None:
+    async def set_enabled(self, job_id: str, enabled: bool) -> bool:
         now = utcnow().isoformat()
-        await self._db.execute(
+        cursor = await self._db.execute(
             "UPDATE scheduled_jobs SET enabled = ?, updated_at = ? WHERE id = ?",
             (1 if enabled else 0, now, job_id),
         )
+        return bool(cursor.rowcount)
 
     async def claim_next_due(self, job_id: str, scheduled_for: str) -> dict | None:
         """Atomically claim one occurrence of a job.
@@ -285,13 +286,19 @@ class ScheduleStore:
     async def delete_job(self, job_id: str) -> bool:
         """Delete a job and its run history."""
         try:
-            await self._db.execute(
-                "DELETE FROM job_runs WHERE job_id = ?", (job_id,)
-            )
-            await self._db.execute(
-                "DELETE FROM scheduled_jobs WHERE id = ?", (job_id,)
-            )
-            return True
+            async with self._db.transaction():
+                existing = await self._db.fetch_one_raw(
+                    "SELECT id FROM scheduled_jobs WHERE id = ?", (job_id,)
+                )
+                if existing is None:
+                    return False
+                await self._db.execute_raw(
+                    "DELETE FROM job_runs WHERE job_id = ?", (job_id,)
+                )
+                await self._db.execute_raw(
+                    "DELETE FROM scheduled_jobs WHERE id = ?", (job_id,)
+                )
+                return True
         except Exception:
             return False
 
