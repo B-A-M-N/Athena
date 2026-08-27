@@ -144,3 +144,26 @@ async def test_research_fetch_reaches_executor_after_effect_resolution(
 
     assert result.status is CapabilityResultStatus.OK
     assert result.output == "fetch stub reached"
+
+
+async def test_research_run_reaches_executor_after_effect_resolution(tmp_path, monkeypatch):
+    capability = ResearchCapability(store=object())
+
+    async def fake_run(request, args, context):
+        return CapabilityResult(
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output="run stub reached",
+        )
+
+    monkeypatch.setattr(capability, "_run", fake_run)
+    dispatcher = _dispatcher(capability)
+    result = await _dispatch(
+        dispatcher,
+        _request("research", "run", objective="verify release"),
+        WorkspaceSpec(id="repo", root=str(tmp_path)),
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    assert result.output == "run stub reached"

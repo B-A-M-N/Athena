@@ -373,11 +373,12 @@ Research uses the same durable Task and evidence model. A source is fetched
 only after passing source/network policy, retained as an artifact-backed
 snapshot, and linked to claims through locators and supporting excerpts.
 Bounded lexical search, snapshot indexing, evidence verification, gap
-tracking, and the deterministic `research:plan`, `research:assess`, and
-`research:bundle` operations are live. Those operations sequence explicit
-requirements and captured evidence without creating a separate research brain;
-open-ended retrieval, semantic ranking, and autonomous research planning
-remain in development.
+tracking, and the deterministic `research:plan`, `research:assess`,
+`research:bundle`, and `research:run` operations are live. `research:run`
+composes an explicit objective, requirements, selected source captures, exact
+evidence excerpts, contradiction checks, and a final readiness bundle without
+creating a separate research brain. Open-ended retrieval, semantic ranking,
+and autonomous research planning remain in development.
 
 ## Current limitations
 

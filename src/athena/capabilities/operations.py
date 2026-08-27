@@ -182,6 +182,13 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "plan": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "assess": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "bundle": frozenset({EffectClass.READ_LOCAL}),
+        # The bounded workflow may capture allowlisted sources, persist
+        # evidence/gaps, and verify a task-scoped packet in one dispatch.
+        "run": frozenset({
+            EffectClass.READ_LOCAL,
+            EffectClass.WRITE_LOCAL,
+            EffectClass.NETWORK_READ,
+        }),
     },
     "artifacts": {
         "list": frozenset({EffectClass.READ_LOCAL}),

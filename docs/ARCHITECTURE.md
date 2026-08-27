@@ -342,16 +342,18 @@ artifact snapshots can be verified byte-for-byte against their supporting
 excerpt. The current live route supports policy-controlled network
 acquisition, artifact-backed snapshots, bounded lexical search/indexing,
 durable source/evidence/gap records, excerpt verification, and deterministic
-`research:plan`, `research:assess`, and `research:bundle` operations. Those
-operations sequence explicit requirements and only close gaps backed by
-verified captured evidence. Open-ended retrieval, semantic ranking, and
-autonomous acquisition/critique remain future work.
+`research:plan`, `research:assess`, `research:bundle`, and `research:run`
+operations. `research:run` composes an explicit objective, requirements,
+selected captures, exact evidence excerpts, contradiction checks, and a final
+readiness bundle. These operations only close gaps backed by verified captured
+evidence. Open-ended retrieval, semantic ranking, and autonomous
+acquisition/critique remain future work.
 
 Archivist's in-memory planner/critic loop is intentionally not imported. A
 future `research.deep` or `research.verify_claim` workflow may extend the
-current bounded plan/assess/bundle surface with search, fetch, extraction,
-indexing, gap closure, and verification capabilities, but it cannot own its
-own replanning brain or bypass Athena policy.
+current bounded plan/assess/bundle/run surface with richer retrieval,
+extraction, indexing, gap closure, and verification capabilities, but it
+cannot own its own replanning brain or bypass Athena policy.
 
 Research survives compaction in the same way generated machinery does: source
 snapshots, hashes, evidence, contradictions, gaps, and provenance remain
@@ -532,7 +534,7 @@ complete.
 | GeneratedCapability | **Partial**; model-visible task-scoped creation, hashes, dependency locks, proof evolution, candidate retention, project/user rehydration, and deprecation exist; promotion UX and fully enforced sandbox semantics remain incomplete. |
 | Declarative nested workflows | **Partial**; models, SQLite storage, validation, execution, and a capability route exist; kernel-level strategy integration and full conformance are incomplete. |
 | Reflection | **Partial**; scoped/ranked capability reflection plus workflow/skill search and description are live; broader resource/runtime/device/permission discovery is incomplete. |
-| Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, and deterministic plan/assess/bundle operations are live; semantic retrieval, autonomous acquisition/critique, and full completion verification remain incomplete. |
+| Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, and deterministic plan/assess/bundle/run operations are live; semantic retrieval, autonomous acquisition/critique, and full completion verification remain incomplete. |
 | Dependency acquisition | **Partial**; a governed Python route records resolved versions, source metadata, file hashes, and environment fingerprints; manager breadth, lock replay, and full policy coverage remain. |
 | Tiered validation | **Partial**; task admission now records parse/interface/security/format/lint checks, candidate/project/user tiers can require Ruff/Mypy, and exact JSON Schema is compiled; generated-test planning, independent evidence, and optional Semgrep remain incomplete. |
 | Promotion and retention | **Partial**; explicit project/user promotion paths, durable generated proof, candidate retention, lifecycle history, quality scoring, deprecation, and garbage collection exist; richer review/supersession UX remains. |

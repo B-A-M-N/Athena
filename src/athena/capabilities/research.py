@@ -28,7 +28,12 @@ from athena.protocol.capabilities import (
     EffectClass,
 )
 from athena.research.models import EvidenceObject, ResearchGap, SourceRecord
-from athena.research.policy import SourcePolicy, SourcePolicyError, classify_source
+from athena.research.policy import (
+    SourcePolicy,
+    SourcePolicyError,
+    canonicalize_uri,
+    classify_source,
+)
 
 _SOURCE_TYPES = ("web", "paper", "documentation", "dataset", "code", "local")
 _EVIDENCE_TYPES = ("quote", "measurement", "observation", "derivation", "execution")
@@ -58,6 +63,7 @@ class ResearchCapability:
                 "operation": {"type": "string", "enum": [
                     "fetch", "record_source", "sources", "search", "record_evidence", "evidence",
                     "record_gap", "gaps", "close_gap", "verify", "plan", "assess", "bundle",
+                    "run",
                 ]},
                 "uri": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "title": {"type": "string", "maxLength": 1000},
@@ -101,6 +107,44 @@ class ResearchCapability:
                 "queries": {
                     "type": "array", "maxItems": 10,
                     "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+                },
+                "source_specs": {
+                    "type": "array", "maxItems": 10,
+                    "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["uri"],
+                        "properties": {
+                            "uri": {"type": "string", "minLength": 1, "maxLength": 4096},
+                            "title": {"type": "string", "maxLength": 1000},
+                            "source_type": {"type": "string", "enum": list(_SOURCE_TYPES)},
+                            "content": {"type": "string", "maxLength": 10_000_000},
+                            "artifact_uri": {"type": "string", "maxLength": 4096},
+                            "published_at": {"type": "string", "maxLength": 128},
+                            "metadata": {"type": "object", "additionalProperties": True},
+                        },
+                    },
+                },
+                "extractions": {
+                    "type": "array", "maxItems": 100,
+                    "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["claim", "excerpt"],
+                        "properties": {
+                            "source_id": {"type": "string", "maxLength": 128},
+                            "uri": {"type": "string", "maxLength": 4096},
+                            "claim_id": {"type": "string", "maxLength": 128},
+                            "claim": {"type": "string", "minLength": 1, "maxLength": 20_000},
+                            "excerpt": {"type": "string", "minLength": 1, "maxLength": 20_000},
+                            "locator": {"type": "object", "additionalProperties": True},
+                            "evidence_type": {"type": "string", "enum": list(_EVIDENCE_TYPES)},
+                            "extraction_method": {"type": "string", "maxLength": 128},
+                            "extraction_model": {"type": "string", "maxLength": 256},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            "corroborates": {"type": "array", "items": {"type": "string"}},
+                            "contradicts": {"type": "array", "items": {"type": "string"}},
+                            "metadata": {"type": "object", "additionalProperties": True},
+                        },
+                    },
                 },
                 "gap_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}},
                 "kind": {"type": "string", "enum": list(_GAP_KINDS)},
@@ -165,6 +209,8 @@ class ResearchCapability:
                 return await self._assess(request, args, context)
             if operation == "bundle":
                 return await self._bundle(request, args, context)
+            if operation == "run":
+                return await self._run(request, args, context)
             return _result(request, ok=False, error=f"unknown operation: {operation}")
         except (KeyError, SourcePolicyError, ValueError) as exc:
             return _result(request, ok=False, error=str(exc))
@@ -704,6 +750,172 @@ class ResearchCapability:
             "gaps": [gap.to_record() for gap in gaps],
         }))
 
+    async def _run(self, request, args, context) -> CapabilityResult:
+        """Run one bounded, explicit research workflow.
+
+        This is orchestration over the durable primitives above, not a second
+        planner or a hidden inference loop.  The caller supplies requirements
+        (or the objective deterministically becomes one requirement), chooses
+        the source captures to attempt, and supplies exact extraction excerpts.
+        Every source/evidence operation remains task-scoped and the outer
+        ``research:run`` dispatch declares the complete effect envelope.
+        """
+        if not request.task_id:
+            return _result(request, ok=False, error="run requires a task")
+        objective = str(args.get("objective") or "").strip()
+        if not objective:
+            return _result(request, ok=False, error="run requires objective")
+
+        raw_requirements = args.get("requirements")
+        if not isinstance(raw_requirements, list) or not raw_requirements:
+            queries = _strings(args.get("queries"), limit=10)
+            raw_requirements = [{
+                "id": "objective",
+                "claim_id": "research-objective",
+                "question": objective,
+                "queries": queries or [objective],
+            }]
+
+        plan_result = await self._plan(
+            request,
+            {**args, "objective": objective, "requirements": raw_requirements},
+            context,
+        )
+        if plan_result.status is not CapabilityResultStatus.OK:
+            return _result(request, ok=False, error=plan_result.error or "research plan failed")
+        plan = _decode_object(plan_result.output)
+        gap_ids = [
+            str(item["gap"]["id"])
+            for item in plan.get("requirements", [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("gap"), Mapping)
+            and item["gap"].get("id")
+        ]
+
+        captures: list[dict[str, Any]] = []
+        capture_errors: list[dict[str, Any]] = []
+        source_specs = args.get("source_specs")
+        if isinstance(source_specs, list):
+            for index, raw_spec in enumerate(source_specs[:10]):
+                if not isinstance(raw_spec, Mapping):
+                    capture_errors.append({"index": index, "error": "source spec must be an object"})
+                    continue
+                spec = dict(raw_spec)
+                source_result = (
+                    await self._record_source(request, spec, context)
+                    if "content" in spec or "artifact_uri" in spec
+                    else await self._fetch(request, spec, context)
+                )
+                if source_result.status is not CapabilityResultStatus.OK:
+                    capture_errors.append({
+                        "index": index,
+                        "uri": spec.get("uri"),
+                        "error": source_result.error or "source capture failed",
+                    })
+                    continue
+                payload = _decode_object(source_result.output)
+                source = payload.get("source")
+                if isinstance(source, Mapping):
+                    captures.append(dict(source))
+
+        # Search after capture as well as during planning, so the response
+        # reports the corpus that actually exists at the end of this run.
+        search_results: list[dict[str, Any]] = []
+        search_errors: list[dict[str, Any]] = []
+        search_queries = _strings(args.get("queries"), limit=10)
+        for item in raw_requirements:
+            if isinstance(item, Mapping):
+                search_queries.extend(_strings(item.get("queries"), limit=5))
+        for query in _unique_strings(search_queries):
+            search_result = await self._search(
+                request, {"query": query, "limit": int(args.get("limit") or 50)}, context
+            )
+            if search_result.status is not CapabilityResultStatus.OK:
+                search_errors.append({"query": query, "error": search_result.error or "search failed"})
+                continue
+            search_results.append({"query": query, **_decode_object(search_result.output)})
+
+        sources_by_id: dict[str, Mapping[str, Any]] = {
+            str(source["id"]): source
+            for source in captures
+            if source.get("id")
+        }
+        for source in await self._store.list_sources(
+            task_id=request.task_id,
+            project_id=getattr(getattr(context, "workspace", None), "id", None),
+            limit=200,
+        ):
+            sources_by_id.setdefault(source.id, source.to_record())
+        sources_by_uri = {
+            str(source.get("canonical_uri")): source
+            for source in sources_by_id.values()
+            if source.get("canonical_uri")
+        }
+
+        evidence_records: list[dict[str, Any]] = []
+        evidence_errors: list[dict[str, Any]] = []
+        extractions = args.get("extractions")
+        if isinstance(extractions, list):
+            for index, raw_extraction in enumerate(extractions[:100]):
+                if not isinstance(raw_extraction, Mapping):
+                    evidence_errors.append({"index": index, "error": "extraction must be an object"})
+                    continue
+                extraction = dict(raw_extraction)
+                source_id = str(extraction.get("source_id") or "")
+                if not source_id and extraction.get("uri"):
+                    try:
+                        source_id = str(sources_by_uri[canonicalize_uri(str(extraction["uri"]))]["id"])
+                    except (KeyError, SourcePolicyError):
+                        source_id = ""
+                evidence_args = {
+                    key: value for key, value in extraction.items()
+                    if key not in {"source_id", "uri"}
+                }
+                evidence_args.update({"source_id": source_id, "operation": "record_evidence"})
+                evidence_result = await self._record_evidence(request, evidence_args, context)
+                if evidence_result.status is not CapabilityResultStatus.OK:
+                    evidence_errors.append({
+                        "index": index,
+                        "source_id": source_id,
+                        "error": evidence_result.error or "evidence recording failed",
+                    })
+                    continue
+                evidence = _decode_object(evidence_result.output).get("evidence")
+                if isinstance(evidence, Mapping):
+                    evidence_records.append(dict(evidence))
+
+        assessed_result = await self._assess(
+            request,
+            {"gap_ids": gap_ids},
+            context,
+        )
+        assessed = _decode_object(assessed_result.output) if assessed_result.status is CapabilityResultStatus.OK else {
+            "ready": False,
+            "error": assessed_result.error or "research assessment failed",
+        }
+        bundle_result = await self._bundle(request, {"limit": args.get("limit")}, context)
+        bundle = _decode_object(bundle_result.output) if bundle_result.status is CapabilityResultStatus.OK else {
+            "ready": False,
+            "error": bundle_result.error or "research bundle failed",
+        }
+        ready = bool(bundle.get("ready")) and not (
+            capture_errors or search_errors or evidence_errors
+        )
+        return _result(request, output=_json({
+            "workflow": "bounded-research",
+            "objective": objective,
+            "plan": plan,
+            "captures": captures,
+            "capture_errors": capture_errors,
+            "search": search_results,
+            "search_errors": search_errors,
+            "evidence": evidence_records,
+            "evidence_errors": evidence_errors,
+            "assessment": assessed,
+            "bundle": bundle,
+            "ready": ready,
+        }))
+
     async def _verify_evidence(
         self, evidence: EvidenceObject, source: SourceRecord,
     ) -> dict[str, Any]:
@@ -729,6 +941,27 @@ def _strings(value: Any, *, limit: int) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item).strip() for item in value[:limit] if str(item).strip()]
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    """Deduplicate bounded workflow queries without changing their order."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _decode_object(value: str) -> dict[str, Any]:
+    """Decode an internal capability response without trusting its shape."""
+    try:
+        decoded = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return dict(decoded) if isinstance(decoded, Mapping) else {}
 
 
 def _unique_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
