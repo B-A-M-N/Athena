@@ -28,9 +28,11 @@ test:
 # scenarios: run the named scenario families and emit the JSON evidence
 #            manifest (scenarios-manifest.json).  Exit 0 iff every REQUIRED
 #            scenario passed; declared gaps appear as "missing".
-# arch-lint: architecture boundary scan of src/athena.  EXPECTED RED while
-#            the known kernel ModelRouter fallback defect (P1-23 residual)
-#            is open — do not "fix" by editing this target.
+# arch-lint: architecture boundary scan of src/athena.  The historical
+#            "EXPECTED RED" note applied to the kernel's `router or
+#            ModelRouter(registry)` fallback (P1-23 residual) — that defect
+#            is FIXED (router is required and raises on None,
+#            src/athena/kernel/kernel.py); the lint is expected GREEN.
 scenarios:
 	$(PYTHON) scripts/scenarios --output scenarios-manifest.json
 
@@ -43,9 +45,8 @@ arch-lint:
 # because they protect the highest-risk contracts.
 #
 # Appended (P1.29/P1.30/P1.32): the scenario manifest and the architecture
-# lint are part of the gate.  NOTE: arch-lint is EXPECTED RED while the
-# kernel's `router or ModelRouter(registry)` fallback defect (P1-23 residual,
-# src/athena/kernel/kernel.py) is open — that is the lint doing its job.
+# lint are part of the gate.  The kernel router-fallback defect that once
+# made arch-lint run red is fixed; the lint is part of the GREEN gate.
 check: lint typecheck compile
 	$(PYTEST) -q \
 		tests/unit/affordances/test_validation.py \
