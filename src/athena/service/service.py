@@ -1717,92 +1717,27 @@ class AthenaService:
     def _make_model_summarizer(self, model_registry: Any):
         """Build the compression summarizer used by the context compiler.
 
-        Uses the ``summarizer`` role's model policy (falling back to the
-        user's primary choice when no role entry exists). On any failure it
-        returns None, and ContextCompressor falls back to deterministic
-        truncation — so offline/test operation is unaffected.
+        Delegates to the kernel's ``utility_inference`` (the single inference
+        path for task-less auxiliary model work): same router, same metering,
+        same usage store. On any failure it returns None, and
+        ContextCompressor falls back to deterministic truncation — so
+        offline/test operation is unaffected.
         """
         if model_registry is None:
             return None
 
         async def _summarize(text: str) -> str | None:
-            try:
-                from athena.protocol.tasks import ModelPolicy
-
-                selection = await self._router.select(
-                    policy=ModelPolicy(role="summarizer", require_tools=False)
-                )
-                provider = model_registry.provider_for(selection.provider)
-                from athena.protocol.ids import new_id
-                from athena.protocol.messages import (
-                    Message,
-                    Provenance,
-                    Role,
-                    SourceType,
-                    TextBlock,
-                    TrustClass,
-                    utcnow,
-                )
-                from athena.protocol.models import ModelRequest
-
-                prompt = (
-                    "Summarize the following agent-work transcript excerpt into "
-                    "at most 6 sentences, preserving decisions, file changes, "
-                    "and unresolved issues. Output ONLY the summary.\n\n" + text[-8000:]
-                )
-                request = ModelRequest(
-                    messages=(Message(
-                        id=new_id("msg"),
-                        role=Role.USER,
-                        blocks=(TextBlock(type="text", text=prompt),),
-                        created_at=utcnow(),
-                        provenance=Provenance(
-                            source_type=SourceType.RUNTIME,
-                            trust=TrustClass.AGENT_CURATED,
-                            scope="context_compression",
-                        ),
-                    ),),
-                    model=selection.model,
-                    provider=selection.provider,
-                    request_id=new_id("sum"),
-                )
-                parts: list[str] = []
-                usage_id = None
-                if self._provider_usage_store is not None:
-                    try:
-                        usage_id = await self._provider_usage_store.record_attempt(
-                            provider=selection.provider,
-                            model=selection.model,
-                            metadata={"role": "summarizer",
-                                      "purpose": "context_compression"},
-                        )
-                    except Exception:
-                        usage_id = None
-                async for event in provider.complete(request):
-                    if getattr(event, "type", None) is not None and event.type.value == "done":
-                        resp = event.response
-                        if resp is not None:
-                            from athena.protocol.messages import TextBlock as _TB
-                            parts[:] = [
-                                b.text for b in resp.blocks
-                                if isinstance(b, _TB) and b.text
-                            ]
-                            if usage_id is not None:
-                                try:
-                                    usage = getattr(resp, "usage", None)
-                                    await self._provider_usage_store.record_completion(
-                                        usage_id,
-                                        input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
-                                        output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
-                                    )
-                                    usage_id = None
-                                except Exception:
-                                    pass
-                summary = " ".join(parts).strip()
-                return summary or None
-            except Exception as exc:
-                _logger.debug("model summarizer unavailable (%s); using truncation", exc)
+            kernel = self._kernel
+            if kernel is None:
                 return None
+            prompt = (
+                "Summarize the following agent-work transcript excerpt into "
+                "at most 6 sentences, preserving decisions, file changes, "
+                "and unresolved issues. Output ONLY the summary.\n\n" + text[-8000:]
+            )
+            return await kernel.utility_inference(
+                system_prompt="", user_prompt=prompt, role="summarizer",
+            )
 
         return _summarize
 

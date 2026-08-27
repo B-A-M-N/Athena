@@ -55,7 +55,7 @@ Family               Meaning
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -103,15 +103,16 @@ FUSE = (
     Scenario(
         id="FUSE-002",
         family="FUSE",
-        title="No kernel-constructed ModelRouter fallback (KNOWN OPEN DEFECT)",
-        status="MISSING",
-        required=False,
+        title="No kernel-constructed ModelRouter fallback",
+        nodeids=(
+            "tests/unit/models/test_router_authority.py::test_kernel_without_router_is_construction_error",
+            "tests/unit/models/test_router_authority.py::test_kernel_holds_the_injected_router_instance",
+        ),
         notes=(
-            "KNOWN OPEN DEFECT: src/athena/kernel/kernel.py constructs "
-            "`ModelRouter(registry)` as a `router or ModelRouter(...)` fallback "
-            "(P1-23 residual). scripts/architecture-lint flags it (rule "
-            "kernel-router-construction). Fix belongs to the kernel slice; the "
-            "lint stays red until then. Registered as a declared gap, not a pass."
+            "FIXED (was P1-23 residual): the kernel REQUIRES an injected "
+            "ModelRouter — no `router or ModelRouter(registry)` fallback "
+            "exists. scripts/architecture-lint rule kernel-router-construction "
+            "is green; these tests pin the contract."
         ),
     ),
     Scenario(
@@ -344,13 +345,25 @@ BODY = (
     Scenario(
         id="BODY-005",
         family="BODY",
-        title="Debugger attached-session behavior",
-        status="MISSING",
-        required=False,
+        title="Debugger capability is honestly unavailable; refuses all operations",
+        nodeids=tuple(
+            f"tests/unit/capabilities/test_debugger.py::{t}" for t in (
+                "test_descriptor_is_unavailable",
+                "test_launch_refused_while_unavailable",
+                "test_all_operations_refused",
+                "test_close_all_is_safe_with_no_sessions",
+                "test_session_ownership_is_enforced",
+            )
+        ),
         notes=(
-            "src/athena/capabilities/debugger.py exists but has no dedicated "
-            "tests. Genuinely untested subsystem: registered as a declared gap. "
-            "Follow-up: bind BODY-005 to real debugger-session tests once written."
+            "FIXED (was declared gap): debugger.py deliberately keeps itself "
+            "off the model surface (Availability.UNAVAILABLE) because its "
+            "launch helper would create a raw host subprocess outside "
+            "ExecutionManager and it has no DAP client. These tests pin the "
+            "honesty contract: every op refuses with the documented reason, "
+            "no session is created, no process spawns, and cleanup is safe. "
+            "Full DAP attach/stepping remains future work (documented in the "
+            "descriptor)."
         ),
     ),
     Scenario(
@@ -630,17 +643,12 @@ VHS = (
             "argument error (e.g. vhs missing — treated as 'skipped', not a "
             "failure); 3 timeout; 4 vhs failure; 5 artifact validation failure. "
             "Artifact-existence alone is never accepted as completion. "
-            "KNOWN OPEN DEFECT (observed 2026-08-26): render-demo's width/height "
-            "check reads bytes 2-3/3-4 of the gif (inside the ASCII 'GIF89a' "
-            "header) instead of bytes 6-7/8-9 (Logical Screen Descriptor), so "
-            "every render reports 'bad dimensions 14406x14648' and exits 5 even "
-            "though the produced gif is a valid 1280x720 (ffmpeg-verified). "
-            "The probe runs and its real exit code is recorded — the scenario "
-            "will honestly show 'failed' until scripts/render-demo line ~112 "
-            "uses `head -c 8 | tail -c 2` (width) and `head -c 10 | tail -c 2` "
-            "(height). render-demo is outside this slice's owned paths, so the "
-            "fix is left to its owner; the scenario is optional so the tooling "
-            "defect neither fakes a pass nor blocks unrelated families."
+            "FIXED (2026-08-26): the width/height check previously read inside "
+            "the ASCII 'GIF89a' header (bytes 2-3/3-4) instead of the Logical "
+            "Screen Descriptor (bytes 6-9), and the frame count used `-c copy` "
+            "which never decodes frames. Both repaired: dimensions read from "
+            "offsets 6-7/8-9, frames decoded with the LAST frame=N progress "
+            "value. Probe validates end-to-end: 1280x720, ~4.5s, 112 frames."
         ),
     ),
     Scenario(
@@ -660,14 +668,18 @@ VHS = (
         id="VHS-003",
         family="VHS",
         title="GIF artifact validation itself is byte-correct",
-        status="MISSING",
-        required=False,
+        nodeids=(
+            "tests/unit/scripts/test_render_demo_validation.py::test_logical_screen_descriptor_offsets_are_correct",
+            "tests/unit/scripts/test_render_demo_validation.py::test_ascii_header_bytes_are_not_dimensions",
+            "tests/unit/scripts/test_render_demo_validation.py::test_render_demo_script_parses_known_good_dimensions",
+            "tests/unit/scripts/test_render_demo_validation.py::test_published_demo_gif_has_correct_header",
+        ),
         notes=(
-            "No test pins scripts/render-demo's GIF header parsing (the very "
-            "code defective in VHS-001). Declared gap: once render-demo's "
-            "dimension check is fixed, bind this scenario to a real probe/"
-            "test that asserts a known-good gif validates and a corrupted "
-            "header is rejected with exit 5."
+            "FIXED (was declared gap): render-demo's header parsing is pinned "
+            "at the byte level — Logical Screen Descriptor offsets 6-9 are "
+            "the dimensions, the ASCII-header read that caused VHS-001's "
+            "14406x14648 failure is asserted to be wrong, and the exact od "
+            "pipeline the script runs is executed against synthetic bytes."
         ),
     ),
 )

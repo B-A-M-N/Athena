@@ -19,9 +19,9 @@ spec = importlib.util.spec_from_file_location(
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
-import dataclasses
+import dataclasses  # noqa: E402 — must load the runner module first
 
-import tests.scenarios.registry as reg
+import tests.scenarios.registry as reg  # noqa: E402
 
 fake = dataclasses.replace(
     reg.SCENARIOS[0], id="ZZZ-999", family="FUSE",

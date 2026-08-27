@@ -806,6 +806,91 @@ class AgentKernel:
             return
         await self.dispatch_interpreter_proposal(proposal, context)
 
+    async def utility_inference(
+        self, *, system_prompt: str, user_prompt: str, role: str = "summarizer",
+    ) -> "ModelResponse | None":
+        """Route ONE task-less auxiliary inference through this kernel.
+
+        For auxiliary model work that is not a reasoning turn of any task
+        (context compression today; embedding/judging helpers later): the
+        kernel remains the only component that selects a model, opens a
+        provider request, or meters usage. Uses the SAME ModelRouter with
+        the caller-named role policy, records usage in the SAME
+        provider-usage store, and returns the response text blocks — or
+        None on any failure (auxiliary inference is best-effort by
+        contract; the caller's deterministic fallback applies).
+
+        Emits no task events (there is no task); the usage row carries
+        role metadata so `athena inspect` renders it with its true role.
+        """
+        if self._provider_usage_store is None or self._registry is None:
+            return None
+        try:
+            from athena.protocol.messages import Role, TextBlock
+            from athena.protocol.tasks import ModelPolicy
+
+            selection = await self._router.select(
+                policy=ModelPolicy(role=role, require_tools=False)
+            )
+            provider = self._registry.provider_for(selection.provider)
+            usage_id = await self._provider_usage_store.record_attempt(
+                provider=selection.provider,
+                model=selection.model,
+                metadata={"role": role, "purpose": "utility_inference"},
+            )
+            message = Message(
+                id=new_id("msg"),
+                role=Role.USER,
+                blocks=(TextBlock(text=user_prompt),),
+                created_at=utcnow(),
+                provenance=Provenance(
+                    source_type=SourceType.SYSTEM,
+                    trust=TrustClass.CONFIGURED_INSTRUCTION,
+                ),
+            )
+            request = ModelRequest(
+                messages=(message,),
+                model=selection.model,
+                provider=selection.provider,
+                request_id=new_id("sum"),
+            )
+            parts: list[str] = []
+            async for event in provider.complete(request):
+                if getattr(event, "type", None) is not None and \
+                        event.type.value == "done":
+                    resp = event.response
+                    if resp is None:
+                        continue
+                    for block in resp.blocks:
+                        if isinstance(block, TextBlock) and block.text:
+                            parts.append(block.text)
+                    usage = getattr(resp, "usage", None)
+                    try:
+                        await self._provider_usage_store.record_completion(
+                            usage_id,
+                            input_tokens=getattr(usage, "input_tokens", 0)
+                            if usage else 0,
+                            output_tokens=getattr(usage, "output_tokens", 0)
+                            if usage else 0,
+                        )
+                        usage_id = None
+                    except Exception:
+                        pass
+            if usage_id is not None:
+                # started but never completed (stream ended without done)
+                try:
+                    await self._provider_usage_store.record_completion(
+                        usage_id, input_tokens=0, output_tokens=0,
+                        metadata={"state": "no_done_event"},
+                    )
+                except Exception:
+                    pass
+            return " ".join(parts).strip() or None
+        except Exception:
+            _logger.debug("utility_inference failed; deterministic fallback",
+                          exc_info=True)
+            return None
+
     async def _compile_for_prompts(
         self, task: TaskSpec, *, system: str, user_prompt: str
     ) -> CompiledContext:

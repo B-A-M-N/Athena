@@ -1,8 +1,8 @@
-import pytest
-
 """dispatch_many preflight: validate/repair ALL before ANY executes (item 69)."""
 
 import asyncio
+
+import pytest
 
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.registry import CapabilityRegistry

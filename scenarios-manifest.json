@@ -1,0 +1,1734 @@
+{
+  "generated_at": "2026-08-27T04:43:38.654514+00:00",
+  "repo_root": "/home/bamn/Athena",
+  "scenarios": [
+    {
+      "scenario": "FUSE-001",
+      "family": "FUSE",
+      "title": "Single ModelRouter construction; kernel receives injected router",
+      "required": false,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/models/test_role_router.py::test_router_exposes_selected_provider_without_second_authority"
+          ],
+          "nodeids": [
+            "tests/unit/models/test_role_router.py::test_router_exposes_selected_provider_without_second_authority"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.542,
+          "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
+        }
+      ],
+      "duration_s": 0.542,
+      "notes": "RoleRouter exposes the selected provider without building a second authority. The single sanctioned ModelRouter construction site is src/athena/service/service.py; see FUSE-002 and scripts/architecture-lint."
+    },
+    {
+      "scenario": "FUSE-002",
+      "family": "FUSE",
+      "title": "No kernel-constructed ModelRouter fallback",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/models/test_router_authority.py::test_kernel_without_router_is_construction_error",
+            "tests/unit/models/test_router_authority.py::test_kernel_holds_the_injected_router_instance"
+          ],
+          "nodeids": [
+            "tests/unit/models/test_router_authority.py::test_kernel_without_router_is_construction_error",
+            "tests/unit/models/test_router_authority.py::test_kernel_holds_the_injected_router_instance"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.61,
+          "tail": "..                                                                       [100%]\n2 passed in 0.06s\n"
+        }
+      ],
+      "duration_s": 0.61,
+      "notes": "FIXED (was P1-23 residual): the kernel REQUIRES an injected ModelRouter \u2014 no `router or ModelRouter(registry)` fallback exists. scripts/architecture-lint rule kernel-router-construction is green; these tests pin the contract."
+    },
+    {
+      "scenario": "FUSE-003",
+      "family": "FUSE",
+      "title": "Direct execution routes through the dispatcher and records audit",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/service/test_direct_execution.py::test_direct_execution_routes_through_dispatcher_and_records_audit"
+          ],
+          "nodeids": [
+            "tests/unit/service/test_direct_execution.py::test_direct_execution_routes_through_dispatcher_and_records_audit"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.597,
+          "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
+        }
+      ],
+      "duration_s": 0.597,
+      "notes": "Direct shell path uses the same dispatch/audit authority as the kernel loop."
+    },
+    {
+      "scenario": "FUSE-004",
+      "family": "FUSE",
+      "title": "Kernel loop drives model+capabilities to completion under one authority",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/kernel/test_kernel_loop.py::test_end_to_end_simple_completes",
+            "tests/unit/kernel/test_kernel_loop.py::test_scripted_capability_then_answer_runs_two_iterations"
+          ],
+          "nodeids": [
+            "tests/unit/kernel/test_kernel_loop.py::test_end_to_end_simple_completes",
+            "tests/unit/kernel/test_kernel_loop.py::test_scripted_capability_then_answer_runs_two_iterations"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.625,
+          "tail": "..                                                                       [100%]\n2 passed in 0.08s\n"
+        }
+      ],
+      "duration_s": 0.625
+    },
+    {
+      "scenario": "SYNTH-001",
+      "family": "SYNTH",
+      "title": "Generated capabilities validate against fixtures before admission",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/synthesis/test_synthesis.py::test_validate_passes_good_capability",
+            "tests/unit/synthesis/test_synthesis.py::test_validate_catches_failing_case",
+            "tests/unit/synthesis/test_synthesis.py::test_validate_reports_invalid_generated_schema_as_admission_failure"
+          ],
+          "nodeids": [
+            "tests/unit/synthesis/test_synthesis.py::test_validate_passes_good_capability",
+            "tests/unit/synthesis/test_synthesis.py::test_validate_catches_failing_case",
+            "tests/unit/synthesis/test_synthesis.py::test_validate_reports_invalid_generated_schema_as_admission_failure"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.761,
+          "tail": "...                                                                      [100%]\n3 passed in 0.24s\n"
+        }
+      ],
+      "duration_s": 0.761
+    },
+    {
+      "scenario": "SYNTH-002",
+      "family": "SYNTH",
+      "title": "Registration refuses unvalidated generated code; validated code runs",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/synthesis/test_synthesis.py::test_register_ephemeral_refuses_unvalidated",
+            "tests/unit/synthesis/test_synthesis.py::test_register_ephemeral_registers_validated_and_invokes"
+          ],
+          "nodeids": [
+            "tests/unit/synthesis/test_synthesis.py::test_register_ephemeral_refuses_unvalidated",
+            "tests/unit/synthesis/test_synthesis.py::test_register_ephemeral_registers_validated_and_invokes"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.718,
+          "tail": "..                                                                       [100%]\n2 passed in 0.19s\n"
+        }
+      ],
+      "duration_s": 0.718
+    },
+    {
+      "scenario": "SYNTH-003",
+      "family": "SYNTH",
+      "title": "Generated authority derives from sandbox profile, not declared effects",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/synthesis/test_synthesis.py::test_generated_authority_is_sandbox_profile_not_declared_effects"
+          ],
+          "nodeids": [
+            "tests/unit/synthesis/test_synthesis.py::test_generated_authority_is_sandbox_profile_not_declared_effects"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.524,
+          "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
+        }
+      ],
+      "duration_s": 0.524
+    },
+    {
+      "scenario": "SYNTH-004",
+      "family": "SYNTH",
+      "title": "Generated machinery reuse: proof stats and skill promotion after two uses",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/synthesis/test_synthesis.py::test_proof_for_returns_usage_stats",
+            "tests/unit/synthesis/test_synthesis.py::test_to_skill_candidate_requires_two_uses"
+          ],
+          "nodeids": [
+            "tests/unit/synthesis/test_synthesis.py::test_proof_for_returns_usage_stats",
+            "tests/unit/synthesis/test_synthesis.py::test_to_skill_candidate_requires_two_uses"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.886,
+          "tail": "..                                                                       [100%]\n2 passed in 0.37s\n"
+        }
+      ],
+      "duration_s": 0.886
+    },
+    {
+      "scenario": "SYNTH-005",
+      "family": "SYNTH",
+      "title": "Model can synthesize a task-local tool with strict generated schema",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_model_can_create_task_local_tool",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_generates_strict_input_schema_from_fixtures",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_output_schema_inference_distinguishes_booleans"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_synthesis_capability.py::test_model_can_create_task_local_tool",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_generates_strict_input_schema_from_fixtures",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_output_schema_inference_distinguishes_booleans"
+          ],
+          "exit_code": 0,
+          "duration_s": 1.781,
+          "tail": "...                                                                      [100%]\n3 passed in 1.23s\n"
+        }
+      ],
+      "duration_s": 1.781
+    },
+    {
+      "scenario": "AUTH-001",
+      "family": "AUTH",
+      "title": "Generated-capability promotion is policy checked and task scoped",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_promotion_is_policy_checked",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_requires_task_scope"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_promotion_is_policy_checked",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_requires_task_scope"
+          ],
+          "exit_code": 0,
+          "duration_s": 2.101,
+          "tail": "..                                                                       [100%]\n2 passed in 1.49s\n"
+        }
+      ],
+      "duration_s": 2.101
+    },
+    {
+      "scenario": "AUTH-002",
+      "family": "AUTH",
+      "title": "Restored generated tools re-check source and authority against profile",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/affordances/test_fabric.py::test_restore_executor_rechecks_source_and_output_contract",
+            "tests/unit/affordances/test_fabric.py::test_restore_executor_rejects_persisted_source_escape",
+            "tests/unit/affordances/test_fabric.py::test_restore_executor_rejects_persisted_authority_outside_profile"
+          ],
+          "nodeids": [
+            "tests/unit/affordances/test_fabric.py::test_restore_executor_rechecks_source_and_output_contract",
+            "tests/unit/affordances/test_fabric.py::test_restore_executor_rejects_persisted_source_escape",
+            "tests/unit/affordances/test_fabric.py::test_restore_executor_rejects_persisted_authority_outside_profile"
+          ],
+          "exit_code": 0,
+          "duration_s": 3.153,
+          "tail": "...                                                                      [100%]\n3 passed in 2.35s\n"
+        }
+      ],
+      "duration_s": 3.153
+    },
+    {
+      "scenario": "AUTH-003",
+      "family": "AUTH",
+      "title": "Scratch/generated execution rejects host escape before running",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_scratch.py::test_scratch_rejects_host_escape_before_execution",
+            "tests/unit/affordances/test_validation.py::test_source_validation_rejects_host_escape_primitives_before_execution"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_scratch.py::test_scratch_rejects_host_escape_before_execution",
+            "tests/unit/affordances/test_validation.py::test_source_validation_rejects_host_escape_primitives_before_execution"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.636,
+          "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
+        }
+      ],
+      "duration_s": 0.636
+    },
+    {
+      "scenario": "AUTH-004",
+      "family": "AUTH",
+      "title": "Task deny is a hard ceiling for capability policy containment",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/security/test_policy_bypass.py::test_task_deny_is_hard_ceiling_even_when_global_allows",
+            "tests/contract/test_capability_policy_enforcement.py::TestPolicyEnforcement::test_task_deny_never_calls_executor"
+          ],
+          "nodeids": [
+            "tests/security/test_policy_bypass.py::test_task_deny_is_hard_ceiling_even_when_global_allows",
+            "tests/contract/test_capability_policy_enforcement.py::TestPolicyEnforcement::test_task_deny_never_calls_executor"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.644,
+          "tail": "..                                                                       [100%]\n2 passed in 0.08s\n"
+        }
+      ],
+      "duration_s": 0.644
+    },
+    {
+      "scenario": "COMPAT-001",
+      "family": "COMPAT",
+      "title": "Provider streams translate and accumulate without losing content",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/models/test_openai_compat.py::test_stream_events_delta_and_done_with_usage",
+            "tests/unit/models/test_anthropic.py::test_anthropic_stream_accumulates_reasoning_text_and_tool_call",
+            "tests/unit/models/test_response_accumulator.py::test_accumulator_merges_mixed_stream_without_duplicate_text",
+            "tests/unit/models/test_response_accumulator.py::test_registry_invoke_uses_the_same_accumulator"
+          ],
+          "nodeids": [
+            "tests/unit/models/test_openai_compat.py::test_stream_events_delta_and_done_with_usage",
+            "tests/unit/models/test_anthropic.py::test_anthropic_stream_accumulates_reasoning_text_and_tool_call",
+            "tests/unit/models/test_response_accumulator.py::test_accumulator_merges_mixed_stream_without_duplicate_text",
+            "tests/unit/models/test_response_accumulator.py::test_registry_invoke_uses_the_same_accumulator"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.638,
+          "tail": "....                                                                     [100%]\n4 passed in 0.11s\n"
+        }
+      ],
+      "duration_s": 0.638
+    },
+    {
+      "scenario": "COMPAT-002",
+      "family": "COMPAT",
+      "title": "Assistant-turn replay preserves mixed text/tool history across providers",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/kernel/test_model_tool_history.py::test_openai_and_anthropic_replay_preserve_mixed_assistant_turn",
+            "tests/unit/kernel/test_model_tool_history.py::test_kernel_stream_assembly_keeps_text_and_tool_delta"
+          ],
+          "nodeids": [
+            "tests/unit/kernel/test_model_tool_history.py::test_openai_and_anthropic_replay_preserve_mixed_assistant_turn",
+            "tests/unit/kernel/test_model_tool_history.py::test_kernel_stream_assembly_keeps_text_and_tool_delta"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.572,
+          "tail": "..                                                                       [100%]\n2 passed in 0.09s\n"
+        }
+      ],
+      "duration_s": 0.573
+    },
+    {
+      "scenario": "COMPAT-003",
+      "family": "COMPAT",
+      "title": "Deterministic tool-input repair fixes real malformations only",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/models/test_compat_kernel.py::test_alias_repair_builtin",
+            "tests/unit/models/test_compat_kernel.py::test_numeric_string_coercion",
+            "tests/unit/models/test_compat_kernel.py::test_double_encoded_json",
+            "tests/unit/models/test_compat_kernel.py::test_repair_is_idempotent"
+          ],
+          "nodeids": [
+            "tests/unit/models/test_compat_kernel.py::test_alias_repair_builtin",
+            "tests/unit/models/test_compat_kernel.py::test_numeric_string_coercion",
+            "tests/unit/models/test_compat_kernel.py::test_double_encoded_json",
+            "tests/unit/models/test_compat_kernel.py::test_repair_is_idempotent"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.624,
+          "tail": "....                                                                     [100%]\n4 passed in 0.10s\n"
+        }
+      ],
+      "duration_s": 0.624
+    },
+    {
+      "scenario": "COMPAT-004",
+      "family": "COMPAT",
+      "title": "Repair never invents data: unknown fields invalid, streams never repaired",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/models/test_compat_kernel.py::test_unknown_required_field_is_invalid_not_invented",
+            "tests/unit/models/test_compat_kernel.py::test_interrupted_stream_never_repaired",
+            "tests/unit/models/test_toolcall_candidates.py::test_parse_never_manufactures_empty_dict",
+            "tests/unit/models/test_toolcall_candidates.py::test_empty_candidate_is_not_rewritten_as_an_empty_object"
+          ],
+          "nodeids": [
+            "tests/unit/models/test_compat_kernel.py::test_unknown_required_field_is_invalid_not_invented",
+            "tests/unit/models/test_compat_kernel.py::test_interrupted_stream_never_repaired",
+            "tests/unit/models/test_toolcall_candidates.py::test_parse_never_manufactures_empty_dict",
+            "tests/unit/models/test_toolcall_candidates.py::test_empty_candidate_is_not_rewritten_as_an_empty_object"
+          ],
+          "exit_code": 0,
+          "duration_s": 2.077,
+          "tail": "....                                                                     [100%]\n4 passed in 0.19s\n"
+        }
+      ],
+      "duration_s": 2.077
+    },
+    {
+      "scenario": "COMPAT-005",
+      "family": "COMPAT",
+      "title": "Prefix-cache telemetry is honest and boundary-marked",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/models/test_compat_kernel.py::test_prefix_tracker_stable_then_boundary",
+            "tests/unit/models/test_compat_kernel.py::test_prefix_tracker_marks_model_and_profile_changes_as_boundaries",
+            "tests/unit/models/test_compat_kernel.py::test_usage_record_openai_cached_tokens",
+            "tests/unit/models/test_compat_kernel.py::test_usage_record_anthropic_cache_write",
+            "tests/unit/models/test_compat_kernel.py::test_no_cache_hit_inferred_without_telemetry"
+          ],
+          "nodeids": [
+            "tests/unit/models/test_compat_kernel.py::test_prefix_tracker_stable_then_boundary",
+            "tests/unit/models/test_compat_kernel.py::test_prefix_tracker_marks_model_and_profile_changes_as_boundaries",
+            "tests/unit/models/test_compat_kernel.py::test_usage_record_openai_cached_tokens",
+            "tests/unit/models/test_compat_kernel.py::test_usage_record_anthropic_cache_write",
+            "tests/unit/models/test_compat_kernel.py::test_no_cache_hit_inferred_without_telemetry"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.926,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.03s\n"
+        }
+      ],
+      "duration_s": 0.926
+    },
+    {
+      "scenario": "COMPAT-006",
+      "family": "COMPAT",
+      "title": "Repaired arguments flow through dispatch preflight and are durable",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_dispatch_many_preflight.py::test_preflight_repaired_arguments_are_used",
+            "tests/unit/capabilities/test_tool_repair_store.py::test_parallel_repair_receipt_is_durable_and_replayable"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_dispatch_many_preflight.py::test_preflight_repaired_arguments_are_used",
+            "tests/unit/capabilities/test_tool_repair_store.py::test_parallel_repair_receipt_is_durable_and_replayable"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.886,
+          "tail": "..                                                                       [100%]\n2 passed in 0.15s\n"
+        }
+      ],
+      "duration_s": 0.886
+    },
+    {
+      "scenario": "BODY-001",
+      "family": "BODY",
+      "title": "PTY terminal sessions: create, send, screen, kill with task ownership",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_terminal_session.py::test_create_send_screen_kill",
+            "tests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_terminal_session.py::test_create_send_screen_kill",
+            "tests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced"
+          ],
+          "exit_code": 0,
+          "duration_s": 2.036,
+          "tail": "..                                                                       [100%]\n=============================== warnings summary ===============================\ntests/unit/capabilities/test_terminal_session.py::test_create_send_screen_kill\ntests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced\n  /usr/lib/python3.12/pty.py:95: DeprecationWarning: This process (pid=2653293) is multi-threaded, use of forkpty() may lead to deadlocks in the child.\n    pid, fd = os.forkpty()\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n2 passed, 2 warnings in 1.43s\n"
+        }
+      ],
+      "duration_s": 2.036
+    },
+    {
+      "scenario": "BODY-002",
+      "family": "BODY",
+      "title": "Terminal screen emulation reproduces rendered output",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_screen_emulator.py::test_overwrite_moves_cursor_and_replaces",
+            "tests/unit/capabilities/test_screen_emulator.py::test_scrolling_keeps_last_rows",
+            "tests/unit/capabilities/test_screen_emulator.py::test_alternate_screen_overwrite_via_cursor_reposition"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_screen_emulator.py::test_overwrite_moves_cursor_and_replaces",
+            "tests/unit/capabilities/test_screen_emulator.py::test_scrolling_keeps_last_rows",
+            "tests/unit/capabilities/test_screen_emulator.py::test_alternate_screen_overwrite_via_cursor_reposition"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.579,
+          "tail": "...                                                                      [100%]\n3 passed in 0.06s\n"
+        }
+      ],
+      "duration_s": 0.579
+    },
+    {
+      "scenario": "BODY-003",
+      "family": "BODY",
+      "title": "Real runtimes execute and keep state (shell, python, persistent session)",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/e2e/test_real_execution.py::test_shell_execution_runs_real_runtime",
+            "tests/e2e/test_real_execution.py::test_python_execution_prints_4",
+            "tests/e2e/test_real_execution.py::test_persistent_python_session_keeps_state"
+          ],
+          "nodeids": [
+            "tests/e2e/test_real_execution.py::test_shell_execution_runs_real_runtime",
+            "tests/e2e/test_real_execution.py::test_python_execution_prints_4",
+            "tests/e2e/test_real_execution.py::test_persistent_python_session_keeps_state"
+          ],
+          "exit_code": 0,
+          "duration_s": 4.542,
+          "tail": "...                                                                      [100%]\n3 passed in 4.01s\n"
+        }
+      ],
+      "duration_s": 4.542
+    },
+    {
+      "scenario": "BODY-004",
+      "family": "BODY",
+      "title": "Process identity and owned-process signal semantics",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/execution/test_process_identity.py::test_owned_process_requires_matching_start_identity",
+            "tests/unit/capabilities/test_system.py::test_process_signal_missing_pid",
+            "tests/unit/capabilities/test_system.py::test_process_tree_and_usage"
+          ],
+          "nodeids": [
+            "tests/unit/execution/test_process_identity.py::test_owned_process_requires_matching_start_identity",
+            "tests/unit/capabilities/test_system.py::test_process_signal_missing_pid",
+            "tests/unit/capabilities/test_system.py::test_process_tree_and_usage"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.498,
+          "tail": "...                                                                      [100%]\n3 passed in 0.07s\n"
+        }
+      ],
+      "duration_s": 0.498
+    },
+    {
+      "scenario": "BODY-005",
+      "family": "BODY",
+      "title": "Debugger capability is honestly unavailable; refuses all operations",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_debugger.py::test_descriptor_is_unavailable",
+            "tests/unit/capabilities/test_debugger.py::test_launch_refused_while_unavailable",
+            "tests/unit/capabilities/test_debugger.py::test_all_operations_refused",
+            "tests/unit/capabilities/test_debugger.py::test_close_all_is_safe_with_no_sessions",
+            "tests/unit/capabilities/test_debugger.py::test_session_ownership_is_enforced"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_debugger.py::test_descriptor_is_unavailable",
+            "tests/unit/capabilities/test_debugger.py::test_launch_refused_while_unavailable",
+            "tests/unit/capabilities/test_debugger.py::test_all_operations_refused",
+            "tests/unit/capabilities/test_debugger.py::test_close_all_is_safe_with_no_sessions",
+            "tests/unit/capabilities/test_debugger.py::test_session_ownership_is_enforced"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.524,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.03s\n"
+        }
+      ],
+      "duration_s": 0.524,
+      "notes": "FIXED (was declared gap): debugger.py deliberately keeps itself off the model surface (Availability.UNAVAILABLE) because its launch helper would create a raw host subprocess outside ExecutionManager and it has no DAP client. These tests pin the honesty contract: every op refuses with the documented reason, no session is created, no process spawns, and cleanup is safe. Full DAP attach/stepping remains future work (documented in the descriptor)."
+    },
+    {
+      "scenario": "BODY-006",
+      "family": "BODY",
+      "title": "Machine introspection reports truthful, redacted environment",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_system.py::test_machine_overview",
+            "tests/unit/capabilities/test_system.py::test_machine_env_redacts_secrets"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_system.py::test_machine_overview",
+            "tests/unit/capabilities/test_system.py::test_machine_env_redacts_secrets"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.552,
+          "tail": "..                                                                       [100%]\n2 passed in 0.02s\n"
+        }
+      ],
+      "duration_s": 0.552
+    },
+    {
+      "scenario": "WORLD-001",
+      "family": "WORLD",
+      "title": "World-state registry projects claims, contradictions and unknowns",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_world_state_snapshot_shape",
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_invariant_envelope_detects_violation"
+          ],
+          "nodeids": [
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_world_state_snapshot_shape",
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_invariant_envelope_detects_violation"
+          ],
+          "exit_code": 0,
+          "duration_s": 1.795,
+          "tail": "..                                                                       [100%]\n2 passed in 1.23s\n"
+        }
+      ],
+      "duration_s": 1.795
+    },
+    {
+      "scenario": "WORLD-002",
+      "family": "WORLD",
+      "title": "World state survives restart and stays per-task scoped",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/worldstate/test_store.py::test_persistence_across_restart",
+            "tests/unit/worldstate/test_store.py::test_registry_without_store_is_in_memory",
+            "tests/unit/worldstate/test_store.py::test_mutations_get_durable_task_sequences"
+          ],
+          "nodeids": [
+            "tests/unit/worldstate/test_store.py::test_persistence_across_restart",
+            "tests/unit/worldstate/test_store.py::test_registry_without_store_is_in_memory",
+            "tests/unit/worldstate/test_store.py::test_mutations_get_durable_task_sequences"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.756,
+          "tail": "...                                                                      [100%]\n3 passed in 0.25s\n"
+        }
+      ],
+      "duration_s": 0.756
+    },
+    {
+      "scenario": "WORLD-003",
+      "family": "WORLD",
+      "title": "Invalidation flips persist and mark claims contradicted",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/worldstate/test_store.py::test_invalidation_flip_persisted_and_scoped",
+            "tests/unit/worldstate/test_store.py::test_mark_contradicted"
+          ],
+          "nodeids": [
+            "tests/unit/worldstate/test_store.py::test_invalidation_flip_persisted_and_scoped",
+            "tests/unit/worldstate/test_store.py::test_mark_contradicted"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.752,
+          "tail": "..                                                                       [100%]\n2 passed in 0.25s\n"
+        }
+      ],
+      "duration_s": 0.752
+    },
+    {
+      "scenario": "CLAIM-001",
+      "family": "CLAIM",
+      "title": "Claims go stale after a dependent mutation",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_claims_go_stale_after_dependent_mutation"
+          ],
+          "nodeids": [
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_claims_go_stale_after_dependent_mutation"
+          ],
+          "exit_code": 0,
+          "duration_s": 1.365,
+          "tail": ".                                                                        [100%]\n1 passed in 0.73s\n"
+        }
+      ],
+      "duration_s": 1.365
+    },
+    {
+      "scenario": "CLAIM-002",
+      "family": "CLAIM",
+      "title": "Experiment commit binds claims and invalidates stale ones",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/fusion/test_orchestrator.py::test_experiment_commit_binds_claim_and_invalidates"
+          ],
+          "nodeids": [
+            "tests/unit/fusion/test_orchestrator.py::test_experiment_commit_binds_claim_and_invalidates"
+          ],
+          "exit_code": 0,
+          "duration_s": 2.443,
+          "tail": ".                                                                        [100%]\n1 passed in 1.79s\n"
+        }
+      ],
+      "duration_s": 2.443
+    },
+    {
+      "scenario": "CLAIM-003",
+      "family": "CLAIM",
+      "title": "Claim leases are not consumed until execution finishes",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/kernel/test_continuation_store.py::test_claim_is_not_consumed_until_execution_finishes",
+            "tests/unit/kernel/test_continuation_store.py::test_restart_releases_claims_and_lists_recoverable_tasks"
+          ],
+          "nodeids": [
+            "tests/unit/kernel/test_continuation_store.py::test_claim_is_not_consumed_until_execution_finishes",
+            "tests/unit/kernel/test_continuation_store.py::test_restart_releases_claims_and_lists_recoverable_tasks"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.699,
+          "tail": "..                                                                       [100%]\n2 passed in 0.23s\n"
+        }
+      ],
+      "duration_s": 0.699
+    },
+    {
+      "scenario": "TX-001",
+      "family": "TX",
+      "title": "Shadow commit applies proven changes only",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_shadow_commit_applies_proven_changes"
+          ],
+          "nodeids": [
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_shadow_commit_applies_proven_changes"
+          ],
+          "exit_code": 0,
+          "duration_s": 1.825,
+          "tail": ".                                                                        [100%]\n1 passed in 1.25s\n"
+        }
+      ],
+      "duration_s": 1.825
+    },
+    {
+      "scenario": "TX-002",
+      "family": "TX",
+      "title": "Shadow discard leaves reality untouched; commit requires verification",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_shadow_discard_leaves_reality_untouched",
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_commit_requires_verified_branch"
+          ],
+          "nodeids": [
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_shadow_discard_leaves_reality_untouched",
+            "tests/unit/shadow/test_shadow_and_worldstate.py::test_commit_requires_verified_branch"
+          ],
+          "exit_code": 0,
+          "duration_s": 2.838,
+          "tail": "..                                                                       [100%]\n2 passed in 2.32s\n"
+        }
+      ],
+      "duration_s": 2.838
+    },
+    {
+      "scenario": "TX-003",
+      "family": "TX",
+      "title": "Shadow diffs detect same-size content edits and conflicts",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/shadow/test_shadow_manifest.py::test_shadow_diff_detects_same_size_content_edit",
+            "tests/unit/shadow/test_shadow_manifest.py::test_shadow_conflict_rejects_same_size_concurrent_edit"
+          ],
+          "nodeids": [
+            "tests/unit/shadow/test_shadow_manifest.py::test_shadow_diff_detects_same_size_content_edit",
+            "tests/unit/shadow/test_shadow_manifest.py::test_shadow_conflict_rejects_same_size_concurrent_edit"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.406,
+          "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
+        }
+      ],
+      "duration_s": 0.406
+    },
+    {
+      "scenario": "TX-004",
+      "family": "TX",
+      "title": "Effect contracts are truthful: routing, WAL-before-effect, reversibility",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_effect_routing.py::test_exec_capabilities_resolve_to_execute_effects",
+            "tests/unit/capabilities/test_effect_routing.py::test_policy_routes_terminal_session_to_execute_not_write",
+            "tests/unit/capabilities/test_fs_mutations.py::test_write_ahead_intent_precedes_side_effect",
+            "tests/unit/capabilities/test_fs_mutations.py::test_delete_snapshot_failure_is_not_reversible"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_effect_routing.py::test_exec_capabilities_resolve_to_execute_effects",
+            "tests/unit/capabilities/test_effect_routing.py::test_policy_routes_terminal_session_to_execute_not_write",
+            "tests/unit/capabilities/test_fs_mutations.py::test_write_ahead_intent_precedes_side_effect",
+            "tests/unit/capabilities/test_fs_mutations.py::test_delete_snapshot_failure_is_not_reversible"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.484,
+          "tail": "....                                                                     [100%]\n4 passed in 0.08s\n"
+        }
+      ],
+      "duration_s": 0.485
+    },
+    {
+      "scenario": "TX-005",
+      "family": "TX",
+      "title": "Failed/invalidated experiments are discarded, never committed",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/fusion/test_orchestrator.py::test_failed_criteria_discards_and_auto_forks",
+            "tests/unit/fusion/test_orchestrator.py::test_invariant_violation_blocks_commit"
+          ],
+          "nodeids": [
+            "tests/unit/fusion/test_orchestrator.py::test_failed_criteria_discards_and_auto_forks",
+            "tests/unit/fusion/test_orchestrator.py::test_invariant_violation_blocks_commit"
+          ],
+          "exit_code": 0,
+          "duration_s": 3.411,
+          "tail": "..                                                                       [100%]\n2 passed in 2.93s\n"
+        }
+      ],
+      "duration_s": 3.411
+    },
+    {
+      "scenario": "FORK-001",
+      "family": "FORK",
+      "title": "Fork creates a new task with causal metadata; unknown task rejected",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/causal/test_fork_checkpoint.py::test_fork_creates_new_task_with_metadata",
+            "tests/unit/causal/test_fork_checkpoint.py::test_fork_unknown_task_raises"
+          ],
+          "nodeids": [
+            "tests/unit/causal/test_fork_checkpoint.py::test_fork_creates_new_task_with_metadata",
+            "tests/unit/causal/test_fork_checkpoint.py::test_fork_unknown_task_raises"
+          ],
+          "exit_code": 0,
+          "duration_s": 2.253,
+          "tail": "..                                                                       [100%]\n2 passed in 1.78s\n"
+        }
+      ],
+      "duration_s": 2.253
+    },
+    {
+      "scenario": "FORK-002",
+      "family": "FORK",
+      "title": "Checkpoint capture/restore with concurrent-change rejection",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_capture_and_restore",
+            "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_restore_rejects_concurrent_workspace_change",
+            "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_materialize_creates_independent_workspace"
+          ],
+          "nodeids": [
+            "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_capture_and_restore",
+            "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_restore_rejects_concurrent_workspace_change",
+            "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_materialize_creates_independent_workspace"
+          ],
+          "exit_code": 0,
+          "duration_s": 1.403,
+          "tail": "...                                                                      [100%]\n3 passed in 0.87s\n"
+        }
+      ],
+      "duration_s": 1.403
+    },
+    {
+      "scenario": "FORK-003",
+      "family": "FORK",
+      "title": "Fusion forks from events with checkpoints and speculative cleanup",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/fusion/test_orchestrator.py::test_fork_from_event_with_checkpoint",
+            "tests/unit/causal/test_fork_checkpoint.py::test_fork_task_creation_failure_removes_speculative_session"
+          ],
+          "nodeids": [
+            "tests/unit/fusion/test_orchestrator.py::test_fork_from_event_with_checkpoint",
+            "tests/unit/causal/test_fork_checkpoint.py::test_fork_task_creation_failure_removes_speculative_session"
+          ],
+          "exit_code": 0,
+          "duration_s": 2.797,
+          "tail": "..                                                                       [100%]\n2 passed in 2.27s\n"
+        }
+      ],
+      "duration_s": 2.797
+    },
+    {
+      "scenario": "ENV-001",
+      "family": "ENV",
+      "title": "Environment capability gates database access on workspace context",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_environment.py::test_database_requires_workspace_context",
+            "tests/unit/capabilities/test_environment.py::test_database_read_connection_cannot_attach_or_mutate"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_environment.py::test_database_requires_workspace_context",
+            "tests/unit/capabilities/test_environment.py::test_database_read_connection_cannot_attach_or_mutate"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.446,
+          "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
+        }
+      ],
+      "duration_s": 0.446
+    },
+    {
+      "scenario": "ENV-002",
+      "family": "ENV",
+      "title": "Project adaptation: skills discovered from environment are injected",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/integration/test_skill_injection.py::test_skill_injected_when_trigger_in_objective"
+          ],
+          "nodeids": [
+            "tests/integration/test_skill_injection.py::test_skill_injected_when_trigger_in_objective"
+          ],
+          "exit_code": 0,
+          "duration_s": 1.189,
+          "tail": ".                                                                        [100%]\n1 passed in 0.67s\n"
+        }
+      ],
+      "duration_s": 1.189
+    },
+    {
+      "scenario": "ENV-003",
+      "family": "ENV",
+      "title": "Watch capability observes filesystem/process reality truthfully",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_watch.py::test_file_watch_detects_same_size_edit_with_preserved_timestamp",
+            "tests/unit/capabilities/test_watch.py::test_process_exit_observation_is_one_shot_and_truthful"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_watch.py::test_file_watch_detects_same_size_edit_with_preserved_timestamp",
+            "tests/unit/capabilities/test_watch.py::test_process_exit_observation_is_one_shot_and_truthful"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.505,
+          "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
+        }
+      ],
+      "duration_s": 0.505
+    },
+    {
+      "scenario": "RECOVERY-001",
+      "family": "RECOVERY",
+      "title": "Running tasks recover after hard kill; parallelism is real",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/crash/test_hard_crash_recovery.py::test_running_task_recovered_after_hard_crash",
+            "tests/crash/test_hard_crash_recovery.py::test_worker_parallelism_real"
+          ],
+          "nodeids": [
+            "tests/crash/test_hard_crash_recovery.py::test_running_task_recovered_after_hard_crash",
+            "tests/crash/test_hard_crash_recovery.py::test_worker_parallelism_real"
+          ],
+          "exit_code": 0,
+          "duration_s": 4.282,
+          "tail": "..                                                                       [100%]\n2 passed in 3.80s\n"
+        }
+      ],
+      "duration_s": 4.282
+    },
+    {
+      "scenario": "RECOVERY-002",
+      "family": "RECOVERY",
+      "title": "Task states reconcile truthfully across restart",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/crash/test_task_recovery.py::test_running_task_becomes_interrupted_on_hard_stop",
+            "tests/crash/test_task_recovery.py::test_queued_task_survives_restart",
+            "tests/crash/test_task_recovery.py::test_mutation_intent_wal_survives_crash"
+          ],
+          "nodeids": [
+            "tests/crash/test_task_recovery.py::test_running_task_becomes_interrupted_on_hard_stop",
+            "tests/crash/test_task_recovery.py::test_queued_task_survives_restart",
+            "tests/crash/test_task_recovery.py::test_mutation_intent_wal_survives_crash"
+          ],
+          "exit_code": 0,
+          "duration_s": 29.449,
+          "tail": "...                                                                      [100%]\n3 passed in 28.92s\n"
+        }
+      ],
+      "duration_s": 29.45
+    },
+    {
+      "scenario": "RECOVERY-003",
+      "family": "RECOVERY",
+      "title": "Scheduler occurrences reconcile on restart; no double fire",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/crash/test_scheduler_recovery.py::test_claimed_occurrence_reconciled_to_fired_on_restart",
+            "tests/crash/test_scheduler_recovery.py::test_job_not_fired_before_stop_fires_after_restart"
+          ],
+          "nodeids": [
+            "tests/crash/test_scheduler_recovery.py::test_claimed_occurrence_reconciled_to_fired_on_restart",
+            "tests/crash/test_scheduler_recovery.py::test_job_not_fired_before_stop_fires_after_restart"
+          ],
+          "exit_code": 0,
+          "duration_s": 3.63,
+          "tail": "..                                                                       [100%]\n2 passed in 3.18s\n"
+        }
+      ],
+      "duration_s": 3.63
+    },
+    {
+      "scenario": "PROJECTION-001",
+      "family": "PROJECTION",
+      "title": "OI viewer renders events to configured output, never process stdout",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/cli/test_oi_stream.py::test_oi_viewer_renders_to_configured_output_and_keeps_partials",
+            "tests/unit/cli/test_oi_stream.py::test_oi_viewer_does_not_write_to_process_stdout"
+          ],
+          "nodeids": [
+            "tests/unit/cli/test_oi_stream.py::test_oi_viewer_renders_to_configured_output_and_keeps_partials",
+            "tests/unit/cli/test_oi_stream.py::test_oi_viewer_does_not_write_to_process_stdout"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.532,
+          "tail": "..                                                                       [100%]\n2 passed in 0.02s\n"
+        }
+      ],
+      "duration_s": 0.532
+    },
+    {
+      "scenario": "PROJECTION-002",
+      "family": "PROJECTION",
+      "title": "CLI surface groups code/runtime output and shares the execution surface",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/cli/test_surface.py::test_surface_groups_code_and_runtime_output",
+            "tests/unit/cli/test_surface.py::test_direct_shell_escape_uses_the_same_execution_surface"
+          ],
+          "nodeids": [
+            "tests/unit/cli/test_surface.py::test_surface_groups_code_and_runtime_output",
+            "tests/unit/cli/test_surface.py::test_direct_shell_escape_uses_the_same_execution_surface"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.71,
+          "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
+        }
+      ],
+      "duration_s": 0.71
+    },
+    {
+      "scenario": "PROJECTION-003",
+      "family": "PROJECTION",
+      "title": "Operator API views project consistent read-only snapshots",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/service/test_operator_views.py::test_operator_permissions_empty",
+            "tests/unit/service/test_operator_views.py::test_operator_diff_empty",
+            "tests/unit/service/test_operator_views.py::test_operator_artifacts_empty"
+          ],
+          "nodeids": [
+            "tests/unit/service/test_operator_views.py::test_operator_permissions_empty",
+            "tests/unit/service/test_operator_views.py::test_operator_diff_empty",
+            "tests/unit/service/test_operator_views.py::test_operator_artifacts_empty"
+          ],
+          "exit_code": 0,
+          "duration_s": 2.747,
+          "tail": "...                                                                      [100%]\n3 passed in 1.94s\n"
+        }
+      ],
+      "duration_s": 2.747
+    },
+    {
+      "scenario": "VHS-001",
+      "family": "VHS",
+      "title": "Demo render publishes a validated gif or a documented failure code",
+      "required": false,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "probe",
+          "command": [
+            "scripts/render-demo",
+            "capability_fabric"
+          ],
+          "exit_code": 0,
+          "duration_s": 20.963,
+          "tail": "render-demo: tape=demos/capability_fabric.tape timeout=60s temp=demos/.capability_fabric.6CpOWf.gif\nrender-demo: vhs exited rc=0 after 21s\nrender-demo: validated demos/.capability_fabric.6CpOWf.gif \u2014 1280x720, 4.480s, 112 frames\nrender-demo: published demos/capability_fabric.gif\n",
+          "probe_exit": "success"
+        }
+      ],
+      "duration_s": 20.963,
+      "notes": "Probe contract (scripts/render-demo header): 0 success; 2 tool/argument error (e.g. vhs missing \u2014 treated as 'skipped', not a failure); 3 timeout; 4 vhs failure; 5 artifact validation failure. Artifact-existence alone is never accepted as completion. FIXED (2026-08-26): the width/height check previously read inside the ASCII 'GIF89a' header (bytes 2-3/3-4) instead of the Logical Screen Descriptor (bytes 6-9), and the frame count used `-c copy` which never decodes frames. Both repaired: dimensions read from offsets 6-7/8-9, frames decoded with the LAST frame=N progress value. Probe validates end-to-end: 1280x720, ~4.5s, 112 frames."
+    },
+    {
+      "scenario": "VHS-002",
+      "family": "VHS",
+      "title": "Demo driver consumes the generated-capability fabric fixtures",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_create_uses_canonical_dispatcher"
+          ],
+          "nodeids": [
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_create_uses_canonical_dispatcher"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.913,
+          "tail": ".                                                                        [100%]\n1 passed in 0.22s\n"
+        }
+      ],
+      "duration_s": 0.913,
+      "notes": "demos/capability_fabric_demo.py drives the same capability-fabric path (fixtures in demos/fixtures/capability_fabric.jsonl) that this bound test pins; the tape renders that driver."
+    },
+    {
+      "scenario": "VHS-003",
+      "family": "VHS",
+      "title": "GIF artifact validation itself is byte-correct",
+      "required": true,
+      "status": "passed",
+      "evidence": [
+        {
+          "kind": "pytest",
+          "command": [
+            "/home/bamn/Athena/.venv/bin/python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-header",
+            "tests/unit/scripts/test_render_demo_validation.py::test_logical_screen_descriptor_offsets_are_correct",
+            "tests/unit/scripts/test_render_demo_validation.py::test_ascii_header_bytes_are_not_dimensions",
+            "tests/unit/scripts/test_render_demo_validation.py::test_render_demo_script_parses_known_good_dimensions",
+            "tests/unit/scripts/test_render_demo_validation.py::test_published_demo_gif_has_correct_header"
+          ],
+          "nodeids": [
+            "tests/unit/scripts/test_render_demo_validation.py::test_logical_screen_descriptor_offsets_are_correct",
+            "tests/unit/scripts/test_render_demo_validation.py::test_ascii_header_bytes_are_not_dimensions",
+            "tests/unit/scripts/test_render_demo_validation.py::test_render_demo_script_parses_known_good_dimensions",
+            "tests/unit/scripts/test_render_demo_validation.py::test_published_demo_gif_has_correct_header"
+          ],
+          "exit_code": 0,
+          "duration_s": 0.929,
+          "tail": "....                                                                     [100%]\n4 passed in 0.06s\n"
+        }
+      ],
+      "duration_s": 0.929,
+      "notes": "FIXED (was declared gap): render-demo's header parsing is pinned at the byte level \u2014 Logical Screen Descriptor offsets 6-9 are the dimensions, the ASCII-header read that caused VHS-001's 14406x14648 failure is asserted to be wrong, and the exact od pipeline the script runs is executed against synthetic bytes."
+    }
+  ],
+  "families": {
+    "FUSE": {
+      "description": "one AgentKernel/model/task/execution authority",
+      "total": 4,
+      "passed": 4,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "SYNTH": {
+      "description": "generated machinery (construction, validation, registration, reuse)",
+      "total": 5,
+      "passed": 5,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "AUTH": {
+      "description": "generated-capability authority enforcement and policy containment",
+      "total": 4,
+      "passed": 4,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "COMPAT": {
+      "description": "provider compatibility, replay, normalization, tool repair, caching",
+      "total": 6,
+      "passed": 6,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "BODY": {
+      "description": "PTY, runtime, process, debugger, machine behavior",
+      "total": 6,
+      "passed": 6,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "WORLD": {
+      "description": "TaskWorldState projection correctness",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "CLAIM": {
+      "description": "claim/evidence binding and staleness",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "TX": {
+      "description": "shadow execution, commit/discard, effect truthfulness",
+      "total": 5,
+      "passed": 5,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "FORK": {
+      "description": "causal task branching",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "ENV": {
+      "description": "environment discovery and project adaptation",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "RECOVERY": {
+      "description": "hard-kill/restart truthfulness",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "PROJECTION": {
+      "description": "consistent CLI/OI/raw/body/API views",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    },
+    "VHS": {
+      "description": "deterministic demo rendering and artifact validation",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "missing": 0,
+      "skipped": 0
+    }
+  },
+  "summary": {
+    "total": 51,
+    "passed": 51,
+    "failed": 0,
+    "missing": 0,
+    "skipped": 0,
+    "required_not_passed": []
+  }
+}

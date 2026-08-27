@@ -1,8 +1,8 @@
-import pytest
-
 """ToolCallCandidate boundary: raw malformed tool arguments survive to repair."""
 
 import json
+
+import pytest
 
 from athena.models.compat.candidates import (
     ToolCallCandidate,

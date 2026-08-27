@@ -109,8 +109,10 @@ fi
 # GIF89a magic + width/height are at fixed byte offsets in the Logical
 # Screen Descriptor (after the 6-byte header).
 MAGIC="$(head -c 6 "${TMP_PATH}")"
-WIDTH_HEX="$(head -c 4 "${TMP_PATH}" | tail -c 2 | od -An -tu2 --endian=little | tr -d ' ')"
-HEIGHT_HEX="$(head -c 5 "${TMP_PATH}" | tail -c 2 | od -An -tu2 --endian=little | tr -d ' ')"
+# Width/height are little-endian u16 at offsets 6-7 and 8-9 (Logical Screen
+# Descriptor follows the 6-byte "GIF89a" header).
+WIDTH_HEX="$(head -c 8 "${TMP_PATH}" | tail -c 2 | od -An -tu2 --endian=little | tr -d ' ')"
+HEIGHT_HEX="$(head -c 10 "${TMP_PATH}" | tail -c 2 | od -An -tu2 --endian=little | tr -d ' ')"
 
 if [[ "${MAGIC}" != "GIF89a" && "${MAGIC}" != "GIF87a" ]]; then
     echo "render-demo: bad magic ${MAGIC@Q}; expected GIF89a" >&2
@@ -127,7 +129,9 @@ fi
 # this should always be available, but tolerate absence with a clear error
 # rather than a false pass.
 if command -v ffmpeg >/dev/null 2>&1; then
-    PROBE_OUT="$(ffmpeg -v error -i "${TMP_PATH}" -map 0:v:0 -c copy -f null - 2>&1 || true)"
+    # Decode (not -c copy): copy never decodes frames, so no "frame=" lines
+    # are ever printed and the count would always be 0.
+    PROBE_OUT="$(ffmpeg -nostats -i "${TMP_PATH}" -map 0:v:0 -f null - 2>&1 || true)"
     META_OUT="$(ffmpeg -hide_banner -i "${TMP_PATH}" 2>&1 || true)"
     # Duration in seconds, rounded to one decimal, from ffmpeg's "Duration: HH:MM:SS.xx" line.
     DURATION_S="$(printf '%s\n' "${META_OUT}" | sed -n 's/.*Duration: \([0-9:]*\.[0-9]\+\).*/\1/p' | head -1)"
@@ -142,9 +146,10 @@ if command -v ffmpeg >/dev/null 2>&1; then
         else if (NF == 2) { printf "%.3f", ($1*60) + $2 }
         else { printf "%.3f", $1 }
     }')"
-    # Frame count from "frame= N" lines in the probe (copy -f null prints these).
-    FRAMES="$(printf '%s\n' "${PROBE_OUT}" | awk '/^frame= *[0-9]+/ { gsub(/^frame= */, "", $0); print $0; exit }')"
-    FRAMES="${FRAMES:-0}"
+    # Frame count: ffmpeg's progress output uses CR-separated updates on one
+    # logical line; normalize CRs to newlines, then take the LAST "frame=N"
+    # value (the final count, not an early progress sample).
+    FRAMES="$(printf '%s' "${PROBE_OUT}" | tr '\r' '\n' | awk '/frame= *[0-9]+/ { match($0, /frame= *[0-9]+/); s=substr($0, RSTART, RLENGTH); gsub(/frame= *|[^0-9]/, "", s); last=s } END { print last+0 }')"
 
     # Bounded assertions: tape ~4s, allow 1.5s..DEMO_TIMEOUT/2 (so a 60s
     # timeout lets through up to 30s, but a 92s tape would not silently
