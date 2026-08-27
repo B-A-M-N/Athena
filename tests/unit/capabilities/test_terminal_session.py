@@ -24,6 +24,7 @@ def term():
     cap.close_all()
 
 
+@pytest.mark.athena_scenario("BODY-001")
 async def test_create_send_screen_kill(term, tmp_path):
     context = type("Context", (), {
         "workspace": WorkspaceSpec(id="w", root=str(tmp_path)),
@@ -48,6 +49,7 @@ async def test_create_send_screen_kill(term, tmp_path):
     assert "terminated" in (r.output or "")
 
 
+@pytest.mark.athena_scenario("BODY-001")
 async def test_task_ownership_enforced(term, tmp_path):
     context = type("Context", (), {
         "workspace": WorkspaceSpec(id="w", root=str(tmp_path)),

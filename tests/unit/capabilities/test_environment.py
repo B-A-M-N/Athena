@@ -23,6 +23,7 @@ def _request(**arguments):
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("ENV-001")
 async def test_database_requires_workspace_context(tmp_path):
     path = tmp_path / "data.db"
     result = await DatabaseCapability().invoke(

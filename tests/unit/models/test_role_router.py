@@ -87,6 +87,7 @@ async def test_caller_allowlist_wins_over_role(registry):
     assert sel.model == "pricey"
 
 
+@pytest.mark.athena_scenario("FUSE-001")
 def test_router_exposes_selected_provider_without_second_authority(registry):
     router = ModelRouter(registry)
     assert router.provider_for("prov") is registry.provider_for("prov")

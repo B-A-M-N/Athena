@@ -35,6 +35,7 @@ async def _read_run(db_path, job_id) -> dict | None:
 
 @pytest.mark.athena_claim("BHV-098")
 @pytest.mark.athena_evidence("test", "e2e")
+@pytest.mark.athena_scenario("RECOVERY-003")
 async def test_claimed_occurrence_reconciled_to_fired_on_restart(
     make_durable_service, durable_db_path
 ):

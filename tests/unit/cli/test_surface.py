@@ -69,6 +69,7 @@ async def test_surface_selects_approval_scope_and_routes_to_service():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("PROJECTION-002")
 async def test_direct_shell_escape_uses_the_same_execution_surface():
     class DirectService:
         async def execute_direct(

@@ -40,6 +40,7 @@ class _Executor:
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("COMPAT-006")
 async def test_parallel_repair_receipt_is_durable_and_replayable(tmp_path):
     db = Database(":memory:")
     store = ToolRepairStore(db)

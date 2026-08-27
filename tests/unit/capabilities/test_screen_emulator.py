@@ -29,6 +29,7 @@ def term():
 
 # -- pyte framebuffer feeding logic (pure, no PTY) -------------------------
 
+@pytest.mark.athena_scenario("BODY-002")
 def test_overwrite_moves_cursor_and_replaces():
     s = new_screen(4, 10)
     feed_screen(s, "abcdefghij")
@@ -63,6 +64,7 @@ def test_alternate_screen_overwrite_via_cursor_reposition():
     assert len(s.display) == 2
 
 
+@pytest.mark.athena_scenario("BODY-002")
 def test_scrolling_keeps_last_rows():
     s = new_screen(3, 5)
     feed_screen(s, "a\r\nb\r\nc\r\nd")

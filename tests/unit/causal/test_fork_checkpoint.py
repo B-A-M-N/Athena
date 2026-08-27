@@ -24,6 +24,7 @@ async def svc():
             pass
 
 
+@pytest.mark.athena_scenario("FORK-001")
 async def test_fork_creates_new_task_with_metadata(svc):
     task = await svc.submit(AgentRequest(prompt="x"), wait=True)
 
@@ -84,6 +85,7 @@ async def test_timeline_lists_task_events(svc):
         assert {"sequence", "type", "payload_bits"} <= set(entry)
 
 
+@pytest.mark.athena_scenario("FORK-002")
 async def test_checkpoint_capture_and_restore(tmp_path: Path):
     ws = tmp_path / "ws"
     (ws / "sub").mkdir(parents=True)

@@ -1,3 +1,5 @@
+import pytest
+
 """ToolCallCandidate boundary: raw malformed tool arguments survive to repair."""
 
 import json
@@ -43,6 +45,7 @@ def test_parse_failure_keeps_raw_and_none():
     assert c.raw_arguments == raw  # exactly as sent
 
 
+@pytest.mark.athena_scenario("COMPAT-004")
 def test_parse_never_manufactures_empty_dict():
     # non-dict valid JSON must NOT become parsed_arguments
     c = ToolCallCandidate.parse("call-3", "fs", "[1,2]")
@@ -135,6 +138,7 @@ def test_repair_control_char_string_via_candidate_path():
     assert args == {"command": "echo a\nb"}
 
 
+@pytest.mark.athena_scenario("COMPAT-004")
 def test_empty_candidate_is_not_rewritten_as_an_empty_object():
     candidate = ToolCallCandidate.parse("call-empty", "fs.read", "")
     repairer = ToolInputRepairer(mode="safe")

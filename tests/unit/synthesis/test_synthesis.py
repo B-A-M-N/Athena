@@ -31,6 +31,7 @@ def _make_cap(engine, code=GOOD_CODE, name="greeter"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("SYNTH-001")
 async def test_validate_passes_good_capability():
     engine = SynthesisEngine()
     cap = _make_cap(engine)
@@ -41,6 +42,7 @@ async def test_validate_passes_good_capability():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("SYNTH-001")
 async def test_validate_catches_failing_case():
     engine = SynthesisEngine()
     cap = _make_cap(engine, code=BAD_CODE, name="broken")
@@ -50,6 +52,7 @@ async def test_validate_catches_failing_case():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("SYNTH-001")
 async def test_validate_reports_invalid_generated_schema_as_admission_failure():
     engine = SynthesisEngine()
     cap = _make_cap(engine)
@@ -62,6 +65,7 @@ async def test_validate_reports_invalid_generated_schema_as_admission_failure():
     assert "static validation" in result.validation["details"][0]["error"]
 
 
+@pytest.mark.athena_scenario("SYNTH-002")
 def test_register_ephemeral_refuses_unvalidated():
     engine = SynthesisEngine()
     registry = CapabilityRegistry()
@@ -72,6 +76,7 @@ def test_register_ephemeral_refuses_unvalidated():
         registry.resolve("synth_greeter")
 
 
+@pytest.mark.athena_scenario("SYNTH-003")
 def test_generated_authority_is_sandbox_profile_not_declared_effects():
     engine = SynthesisEngine()
     cap = engine.synthesize(
@@ -91,6 +96,7 @@ def test_generated_authority_is_sandbox_profile_not_declared_effects():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("SYNTH-002")
 async def test_register_ephemeral_registers_validated_and_invokes():
     engine = SynthesisEngine()
     registry = CapabilityRegistry()
@@ -111,6 +117,7 @@ async def test_register_ephemeral_registers_validated_and_invokes():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("SYNTH-004")
 async def test_proof_for_returns_usage_stats():
     engine = SynthesisEngine()
     registry = CapabilityRegistry()
@@ -136,6 +143,7 @@ async def test_proof_for_returns_usage_stats():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("SYNTH-004")
 async def test_to_skill_candidate_requires_two_uses():
     engine = SynthesisEngine()
     registry = CapabilityRegistry()

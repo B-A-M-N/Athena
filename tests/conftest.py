@@ -6,6 +6,12 @@ because :meth:`AthenaService.in_memory` hard-codes ``db_path=":memory:"``.
 
 Athena owns the ``athena_claim``/``athena_evidence`` marker declarations in
 its tests; DSH injects the private reporter when it collects proof.
+
+The ``athena_scenario`` marker is metadata-only: it names the stable-beta
+scenario family (see ``tests/scenarios/registry.py``) a test provides
+evidence for.  It never selects or skips tests — ``scripts/scenarios`` binds
+scenarios to concrete node IDs and runs them by ID; the marker exists so a
+reader of a test file can trace it back to its release-gate scenario.
 """
 from __future__ import annotations
 
@@ -16,6 +22,17 @@ import pytest
 
 from athena.service.service import AthenaService
 from athena.service.config import AthenaConfig, ProviderConfig
+
+# Marker registered here (not pyproject.toml) so it stays a tests-tree-only
+# concern; registering also silences the strict-marker warning.
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "athena_scenario(*scenario_ids): stable-beta scenario family evidence "
+        "(see tests/scenarios/registry.py); metadata only, never selects tests",
+    )
 
 
 @pytest.fixture

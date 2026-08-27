@@ -42,6 +42,7 @@ async def _read_task(db_path, task_id) -> dict:
 
 @pytest.mark.athena_claim("BHV-080")
 @pytest.mark.athena_evidence("test", "e2e")
+@pytest.mark.athena_scenario("RECOVERY-002")
 async def test_running_task_becomes_interrupted_on_hard_stop(
     make_durable_service, durable_db_path
 ):

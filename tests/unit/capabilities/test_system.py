@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import os
 
 
@@ -17,6 +18,7 @@ def _req(cap, op, **args):
     )
 
 
+@pytest.mark.athena_scenario("BODY-006")
 async def test_machine_overview():
     cap = MachineCapability()
     r = await cap.invoke(_req("machine", "overview"))
@@ -32,6 +34,7 @@ async def test_machine_toolchain_and_env():
     assert "$HOME" in (r.output or "") or "/" in (r.output or "")
 
 
+@pytest.mark.athena_scenario("BODY-006")
 async def test_machine_env_redacts_secrets():
     cap = MachineCapability()
     os.environ["ATHENA_TEST_SECRET_KEY_XYZ"] = "supersecret"

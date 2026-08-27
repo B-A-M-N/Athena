@@ -1,3 +1,5 @@
+import pytest
+
 """dispatch_many preflight: validate/repair ALL before ANY executes (item 69)."""
 
 import asyncio
@@ -116,6 +118,7 @@ def test_preflight_all_valid_batch_executes_everything():
     assert [len(e.invocations) for e in execs] == [1, 1]
 
 
+@pytest.mark.athena_scenario("COMPAT-006")
 def test_preflight_repaired_arguments_are_used():
     exec_ = _read_exec(schema={
         "properties": {"path": {"type": "string"}},

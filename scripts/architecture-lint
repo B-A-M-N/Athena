@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Architecture lint: mechanically check the audit's prohibited structural
+patterns in src/athena (audit item P1.32).
+
+The stable-beta audit requires that a handful of authority boundaries be
+enforceable by tooling, not just convention.  This script scans the source
+tree with simple, reviewable rules and exits non-zero listing every
+violation with file:line.  It never edits files and never infers a violation
+without a concrete textual match; allow-listed matches are printed as INFO.
+
+Rules (audit-mandated)
+----------------------
+router-construction
+    ``ModelRouter(`` may be constructed only in src/athena/service/service.py
+    (the single sanctioned construction site).  Everywhere else is a second
+    routing authority.
+
+provider-invocation-outside-authority
+    Direct ``.complete(`` / ``.stream(`` calls on provider objects are legal
+    only inside src/athena/models/ (providers themselves) and
+    src/athena/kernel/ (the inference authority).  Heuristic: the receiver
+    expression must mention provider/model; unrelated ``stream``/``complete``
+    methods (httpx streams, mutation stores, execution managers) are noise
+    the receiver filter removes.
+
+subprocess-outside-approved-backends
+    ``subprocess`` / ``os.system`` usage is legal only inside
+    src/athena/execution/, src/athena/capabilities/, src/athena/affordances/
+    plus the file-level allow-list below (modules that legitimately spawn
+    owned workers or validate generated code).  Allow-listed hits are INFO.
+
+raw-db-outside-state
+    ``aiosqlite.connect`` / ``sqlite3.connect`` may appear only inside
+    src/athena/state/.  (src/athena/capabilities/environment.py is a known,
+    documented exception: it implements the read-only task database view with
+    a deny-by-default sqlite authorizer — allow-listed, reported as INFO.)
+
+scheduler-watcher-inference
+    src/athena/scheduler/ and src/athena/capabilities/watch.py must not
+    import athena.models or call providers — scheduling/observation must not
+    become a second inference authority.
+
+kernel-router-construction
+    ``self._router = ... ModelRouter(`` inside src/athena/kernel/ — the
+    kernel must receive an injected router.  The current
+    ``router or ModelRouter(registry)`` fallback in kernel.py is a KNOWN
+    OPEN DEFECT (P1-23 residual): the lint flags it; the fix belongs to the
+    kernel slice, not the lint.
+
+Adding a rule is a one-line addition to the RULES table below plus (option
+ally) a checker entry in CHECKERS.
+
+Usage
+-----
+    scripts/architecture-lint            # scan src/athena, exit 1 on violation
+    scripts/architecture-lint --root .
+    scripts/architecture-lint --quiet    # violations only, no INFO lines
+
+Exit codes: 0 clean, 1 violations found, 2 usage/scan error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC = "src/athena"
+
+# ---------------------------------------------------------------------------
+# Data tables — new rules are one-line additions here.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Rule:
+    id: str
+    description: str
+    pattern: re.Pattern          # matched against each physical line
+    include: tuple[str, ...]     # path prefixes (relative to src/athena/) scanned
+    exclude: tuple[str, ...]     # path prefixes exempt from VIOLATION reporting
+    allow: tuple[str, ...]       # path prefixes reported as INFO, not violations
+    receiver_filter: str | None = None  # optional regex the text before the
+                                        # match must also match (noise gating)
+
+
+def _r(pattern: str) -> re.Pattern:
+    return re.compile(pattern)
+
+
+RULES: tuple[Rule, ...] = (
+    Rule(
+        id="router-construction",
+        description="ModelRouter constructed outside the sanctioned site "
+                    "(src/athena/service/service.py)",
+        pattern=_r(r"\bModelRouter\s*\("),
+        include=("",),
+        exclude=("service/service.py", "models/", "protocol/models.py"),
+        allow=(),
+    ),
+    Rule(
+        id="provider-invocation-outside-authority",
+        description="direct .complete(/.stream( on a provider object outside "
+                    "src/athena/models/ and src/athena/kernel/",
+        pattern=_r(r"\.(?:complete|stream)\s*\("),
+        include=("",),
+        exclude=("models/", "kernel/"),
+        allow=(),
+        receiver_filter=_r(
+            r"(?i)\b(?:self\.)?_?[A-Za-z_]*provider_?[A-Za-z_]*\s*\.\s*"
+            r"(?:complete|stream)\s*\("),
+    ),
+    Rule(
+        id="subprocess-outside-approved-backends",
+        description="subprocess/os.system creation outside src/athena/execution/, "
+                    "capabilities/, affordances/ (plus file allow-list)",
+        pattern=_r(r"\b(?:subprocess\.(?:run|Popen|call|check_call|check_output)"
+                   r"\s*\(|asyncio\.create_subprocess_(?:exec|shell)\s*\("
+                   r"|os\.system\s*\()"),
+        include=("",),
+        exclude=("execution/", "capabilities/", "affordances/"),
+        allow=(
+            # owned short-lived workers / generated-code validation:
+            "causal/checkpoint.py",       # checkpoint worker child process
+            "synthesis/engine.py",        # sandboxed generated-code validation
+            "worldstate/core.py",         # read-only `git status` projection
+            "fusion/orchestrator.py",     # comment-only mention (no call)
+        ),
+    ),
+    Rule(
+        id="raw-db-outside-state",
+        description="raw sqlite/DB connection outside src/athena/state/",
+        pattern=_r(r"\b(?:aiosqlite|sqlite3)\.connect\s*\("),
+        include=("",),
+        exclude=("state/",),
+        allow=(
+            "capabilities/environment.py",  # read-only task DB view w/ authorizer
+        ),
+    ),
+    Rule(
+        id="scheduler-watcher-inference",
+        description="athena.models import or provider call inside scheduler/ "
+                    "or capabilities/watch.py",
+        pattern=_r(r"\b(?:from\s+athena\.models|import\s+athena\.models|"
+                   r"provider\s*\.\s*(?:complete|stream)\s*\()"),
+        include=("scheduler/", "capabilities/watch.py"),
+        exclude=(),
+        allow=(),
+    ),
+    Rule(
+        id="kernel-router-construction",
+        description="kernel constructs its own ModelRouter instead of "
+                    "receiving an injected one (KNOWN OPEN DEFECT in "
+                    "kernel.py: `router or ModelRouter(registry)`)",
+        pattern=_r(r"self\._router\s*=[^=].*\bModelRouter\s*\("),
+        include=("kernel/",),
+        exclude=(),
+        allow=(),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Checker
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Hit:
+    rule: str
+    path: str
+    line: int
+    text: str
+    severity: str  # "violation" | "info"
+
+
+def _classify(rule: Rule, rel: str) -> str | None:
+    """Return 'info'/'violation' for rel against the rule, or None to skip."""
+    if not rel.startswith(rule.include):
+        pass
+    if not any(rel.startswith(p) for p in rule.include):
+        return None
+    if any(rel.startswith(p) for p in rule.exclude):
+        return None
+    if any(rel.startswith(p) for p in rule.allow):
+        return "info"
+    return "violation"
+
+
+def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
+    hits: list[Hit] = []
+    src_dir = root / SRC
+    if not src_dir.is_dir():
+        raise SystemExit(f"architecture-lint: {src_dir} not found")
+
+    files = sorted(
+        p for p in src_dir.rglob("*.py")
+        if not (skip_tests and "/tests/" in str(p))
+    )
+    for path in files:
+        rel = str(path.relative_to(src_dir))
+        active = [(rule, _classify(rule, rel)) for rule in RULES]
+        active = [(r, sev) for r, sev in active if sev]
+        if not active:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"architecture-lint: cannot read {path}: {exc}",
+                  file=sys.stderr)
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue  # comments are documentation, not construction
+            for rule, sev in active:
+                m = rule.pattern.search(line)
+                if not m:
+                    continue
+                if rule.receiver_filter is not None:
+                    window = line[max(0, m.start() - 60):m.end() + 1]
+                    if not rule.receiver_filter.search(window):
+                        continue
+                hits.append(Hit(rule.id, f"{SRC}/{rel}", lineno,
+                                line.strip(), sev))
+    return hits
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="scripts/architecture-lint",
+        description="Scan src/athena for audit-prohibited structural patterns.")
+    parser.add_argument("--root", default=str(REPO_ROOT),
+                        help="repository root (default: auto-detected)")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="suppress INFO (allow-listed) lines")
+    parser.add_argument("--list-rules", action="store_true",
+                        help="print the rule table and exit")
+    args = parser.parse_args(argv)
+
+    if args.list_rules:
+        for rule in RULES:
+            print(f"{rule.id}: {rule.description}")
+            print(f"    pattern={rule.pattern.pattern!r}")
+            if rule.allow:
+                print(f"    allow (INFO)={', '.join(rule.allow)}")
+        return 0
+
+    hits = scan(Path(args.root))
+    violations = [h for h in hits if h.severity == "violation"]
+    infos = [h for h in hits if h.severity == "info"]
+
+    for h in infos:
+        if not args.quiet:
+            print(f"INFO  [{h.rule}] {h.path}:{h.line}: allow-listed: {h.text}")
+    for h in violations:
+        print(f"ERROR [{h.rule}] {h.path}:{h.line}: {h.text}")
+
+    if not args.quiet:
+        for rule in RULES:
+            rule_viol = [h for h in violations if h.rule == rule.id]
+            rule_info = [h for h in infos if h.rule == rule.id]
+            if rule_viol or rule_info:
+                print(f"    {rule.id}: {len(rule_viol)} violation(s), "
+                      f"{len(rule_info)} allow-listed")
+        print(f"architecture-lint: {len(violations)} violation(s), "
+              f"{len(infos)} allow-listed INFO")
+    else:
+        print(f"architecture-lint: {len(violations)} violation(s)")
+
+    return 1 if violations else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

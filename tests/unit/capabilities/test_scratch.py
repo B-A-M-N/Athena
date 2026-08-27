@@ -37,6 +37,7 @@ async def test_scratch_runs_once_without_registering_or_promoting():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("AUTH-003")
 async def test_scratch_rejects_host_escape_before_execution():
     scratch = ScratchManager()
     capability = ScratchCapability(SynthesisEngine(), scratch)

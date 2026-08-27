@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Scenario runner: executes the release-gate scenario families and emits a
+machine-readable evidence manifest (audit items P1.29/P1.30).
+
+What it does
+------------
+1. Loads the declarative scenario registry (``tests/scenarios/registry.py``),
+   which binds named scenario IDs (e.g. ``SYNTH-001``) to real pytest node
+   IDs or a documented probe command.
+2. Runs each selected scenario's evidence:
+     * pytest scenarios -> ``python -m pytest -q <nodeids...>`` (one pytest
+       invocation per scenario; exit 0 = passed, anything else = failed);
+     * probe scenarios  -> the probe argv from the repo root. The only probe
+       today is ``scripts/render-demo`` whose exit-code contract is
+       documented in its header: 0 success, 2 tool/argument error, 3 timeout,
+       4 vhs failure, 5 artifact validation failure. Exit 2 with ``vhs``
+       absent from PATH means "skipped" (environment lacks the renderer), not
+       a failure.
+3. Writes a JSON manifest to ``--output`` (default ``scenarios-manifest.json``):
+
+       {
+         "generated_at": "...",
+         "repo_root": "...",
+         "scenarios": [
+           {"scenario": "SYNTH-001", "family": "SYNTH",
+            "title": "...", "required": true,
+            "status": "passed|failed|missing|skipped",
+            "evidence": [{"kind": "pytest"|"probe", "ref": "...",
+                          "exit_code": 0, "duration_s": 1.2, ...}],
+            "duration_s": 3.4, "notes": "..."}
+         ],
+         "families": {"SYNTH": {"passed": 4, "failed": 0, "missing": 1, ...}},
+         "summary": {"total": 50, "passed": 47, "failed": 0,
+                     "missing": 2, "skipped": 1, "required_missing": 0}
+       }
+
+4. Exit code: 0 iff every REQUIRED scenario is ``passed``.  A required
+   scenario that is ``missing`` (declared gap in the registry) or ``failed``
+   (its evidence ran and did not pass) makes the run fail.  Optional
+   scenarios may be ``missing``/``skipped`` without failing the run.
+
+Honesty rules
+-------------
+* A scenario is only ``passed`` when its bound evidence ran *in this
+  invocation* and exited zero.  Nothing is inferred from previous runs,
+  file existence, or scenario titles.
+* Registry entries with ``status="MISSING"`` are declared gaps: they are
+  reported as ``missing`` and never executed.
+
+Usage
+-----
+    scripts/scenarios                              # all families
+    scripts/scenarios --family SYNTH --family COMPAT
+    scripts/scenarios --output /tmp/scm.json
+    scripts/scenarios --list                       # registry dump, no runs
+    scripts/scenarios --only SYNTH-001             # single scenario by id
+
+Environment
+-----------
+``ATHENA_PYTHON`` overrides the interpreter used for pytest (default: the
+``python3`` on PATH; the Makefile passes the venv interpreter via ``uv run``).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from tests.scenarios.registry import (  # noqa: E402  (path setup above)
+    FAMILY_DESCRIPTIONS,
+    FAMILY_ORDER,
+    SCENARIOS,
+    Scenario,
+)
+
+# render-demo exit codes (contract fixed in that script's header).
+RENDER_DEMO_EXIT_NAMES = {
+    0: "success",
+    2: "tool-or-argument-error",
+    3: "timeout",
+    4: "vhs-failure",
+    5: "artifact-validation-failure",
+}
+
+
+def _python() -> str:
+    return os.environ.get("ATHENA_PYTHON", sys.executable or "python3")
+
+
+def _child_env() -> dict[str, str]:
+    """Environment for pytest children: THIS worktree's src wins.
+
+    Without this, an editable install pointing at another checkout (e.g. the
+    main repo while running from an agent worktree) would silently test the
+    wrong code and the manifest would be dishonest evidence.
+    """
+    env = dict(os.environ)
+    src = str(REPO_ROOT / "src")
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = src + (os.pathsep + existing if existing else "")
+    return env
+
+
+def _run(argv: list[str], *, timeout: float) -> dict:
+    """Run one command; return an evidence record with the REAL exit code."""
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            argv, cwd=REPO_ROOT, timeout=timeout, env=_child_env(),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        rc, out = proc.returncode, proc.stdout
+    except subprocess.TimeoutExpired as exc:
+        rc = 124
+        out = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(
+            exc.stdout, bytes) else (exc.stdout or "")
+    except OSError as exc:
+        rc = 127
+        out = f"{type(exc).__name__}: {exc}"
+    return {
+        "kind": "probe",
+        "command": argv,
+        "exit_code": rc,
+        "duration_s": round(time.monotonic() - started, 3),
+        "tail": out[-2000:],
+    }
+
+
+def _run_pytest(nodeids: list[str]) -> dict:
+    """Run one pytest invocation over the scenario's node IDs."""
+    argv = [_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "--no-header", *nodeids]
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            argv, cwd=REPO_ROOT, timeout=1200, env=_child_env(),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        rc, out = proc.returncode, proc.stdout
+    except subprocess.TimeoutExpired:
+        rc = 124
+        out = "pytest timed out after 1200s"
+    except OSError as exc:
+        rc = 127
+        out = f"{type(exc).__name__}: {exc}"
+    return {
+        "kind": "pytest",
+        "command": argv,
+        "nodeids": nodeids,
+        "exit_code": rc,
+        "duration_s": round(time.monotonic() - started, 3),
+        "tail": out[-2000:],
+    }
+
+
+def _vhs_probe_skipped(record: dict) -> bool:
+    """Probe exited 2 because the renderer is not installed -> 'skipped'.
+
+    render-demo exits 2 for tool/argument errors; when the failure is simply
+    ``vhs not on PATH`` the evidence exists but could not be produced in this
+    environment, so the scenario is *skipped*, not failed.  Any other exit
+    (3/4/5, or 2 with a different message) is a real failure.
+    """
+    if record["exit_code"] != 2:
+        return False
+    return "vhs not on PATH" in record.get("tail", "")
+
+
+def execute_scenario(sc: Scenario) -> dict:
+    """Run one scenario; return its manifest entry with an honest status."""
+    entry = {
+        "scenario": sc.id,
+        "family": sc.family,
+        "title": sc.title,
+        "required": sc.required,
+        "status": None,
+        "evidence": [],
+        "duration_s": 0.0,
+    }
+    if sc.notes:
+        entry["notes"] = sc.notes
+
+    if sc.status == "MISSING":
+        entry["status"] = "missing"
+        return entry
+
+    started = time.monotonic()
+    if sc.nodeids:
+        record = _run_pytest(list(sc.nodeids))
+        entry["evidence"].append(record)
+        entry["status"] = "passed" if record["exit_code"] == 0 else "failed"
+    elif sc.probe:
+        record = _run(list(sc.probe), timeout=float(
+            os.environ.get("ATHENA_DEMO_TIMEOUT", 60)) + 30.0)
+        record["probe_exit"] = RENDER_DEMO_EXIT_NAMES.get(
+            record["exit_code"], f"exit-{record['exit_code']}")
+        entry["evidence"].append(record)
+        if record["exit_code"] == 0:
+            entry["status"] = "passed"
+        elif _vhs_probe_skipped(record):
+            entry["status"] = "skipped"
+        else:
+            entry["status"] = "failed"
+    else:  # registry validation makes this unreachable
+        entry["status"] = "missing"
+    entry["duration_s"] = round(time.monotonic() - started, 3)
+    return entry
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="scripts/scenarios",
+        description="Run release-gate scenario families and emit an "
+                    "evidence manifest (P1.29/P1.30).",
+    )
+    parser.add_argument(
+        "--output", "-o", default="scenarios-manifest.json",
+        help="path for the JSON evidence manifest (default: %(default)s)")
+    parser.add_argument(
+        "--family", action="append", default=None,
+        help="restrict to a family (repeatable): " + ", ".join(FAMILY_ORDER))
+    parser.add_argument(
+        "--only", action="append", default=None,
+        help="restrict to individual scenario ids (repeatable), e.g. SYNTH-001")
+    parser.add_argument(
+        "--list", action="store_true",
+        help="print the registry without running anything")
+    parser.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="only print the summary line")
+    args = parser.parse_args(argv)
+
+    if args.list:
+        for sc in SCENARIOS:
+            print(f"{sc.id:<15} {sc.status:<8} "
+                  f"{'required' if sc.required else 'optional':<9} {sc.title}")
+            for n in sc.nodeids:
+                print(f"                pytest  {n}")
+            if sc.probe:
+                print(f"                probe   {' '.join(sc.probe)}")
+        return 0
+
+    selected = SCENARIOS
+    if args.family:
+        unknown = [f for f in args.family if f not in FAMILY_ORDER]
+        if unknown:
+            parser.error(f"unknown family(ies): {', '.join(unknown)}")
+        selected = tuple(s for s in selected if s.family in set(args.family))
+    if args.only:
+        known = {s.id for s in SCENARIOS}
+        unknown = [i for i in args.only if i not in known]
+        if unknown:
+            parser.error(f"unknown scenario id(s): {', '.join(unknown)}")
+        selected = tuple(s for s in selected if s.id in set(args.only))
+
+    entries = []
+    for sc in selected:
+        if not args.quiet:
+            print(f"[..] {sc.id} {sc.title}", flush=True)
+        entry = execute_scenario(sc)
+        entries.append(entry)
+        if not args.quiet:
+            print(f"[{entry['status']:>7}] {sc.id} "
+                  f"({entry['duration_s']}s)", flush=True)
+
+    families: dict[str, dict] = {}
+    for fam in FAMILY_ORDER:
+        fam_entries = [e for e in entries if e["family"] == fam]
+        if not fam_entries:
+            continue
+        counts = Counter(e["status"] for e in fam_entries)
+        families[fam] = {
+            "description": FAMILY_DESCRIPTIONS[fam],
+            "total": len(fam_entries),
+            **{k: counts.get(k, 0)
+               for k in ("passed", "failed", "missing", "skipped")},
+        }
+
+    summary = Counter(e["status"] for e in entries)
+    required_missing = [
+        e["scenario"] for e in entries
+        if e["required"] and e["status"] != "passed"
+    ]
+    manifest = {
+        "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "repo_root": str(REPO_ROOT),
+        "scenarios": entries,
+        "families": families,
+        "summary": {
+            "total": len(entries),
+            "passed": summary.get("passed", 0),
+            "failed": summary.get("failed", 0),
+            "missing": summary.get("missing", 0),
+            "skipped": summary.get("skipped", 0),
+            "required_not_passed": required_missing,
+        },
+    }
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    s = manifest["summary"]
+    print(f"\nscenarios: {s['total']} total, {s['passed']} passed, "
+          f"{s['failed']} failed, {s['missing']} missing, {s['skipped']} skipped")
+    print(f"manifest: {out_path}")
+    if s["required_not_passed"]:
+        print("REQUIRED scenarios not passed: "
+              + ", ".join(s["required_not_passed"]))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

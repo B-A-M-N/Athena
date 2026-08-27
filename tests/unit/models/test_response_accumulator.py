@@ -17,6 +17,7 @@ def _request() -> ModelRequest:
     )
 
 
+@pytest.mark.athena_scenario("COMPAT-001")
 def test_accumulator_merges_mixed_stream_without_duplicate_text():
     request = _request()
     accumulator = ModelResponseAccumulator(request)
