@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 
 import pytest
 
-from athena.cli.animation import OIAnimator
+from athena.cli.animation import AnimationClock, OIAnimator
 from athena.cli.framebuffer import OIFrameBuffer, pillow_available
+from athena.cli.dual_pane import DualPaneSurface
 from athena.cli.layout import LayoutMode, compute_layout
 from athena.cli.projection import ProjectionState
 from athena.cli.render.ansi import CellGridDiffRenderer, cell_width, fit_cells
@@ -105,6 +107,15 @@ def test_glass_framebuffer_caches_static_scene_layer() -> None:
     assert len(framebuffer._base_frames) == 1
 
 
+def test_animation_clock_only_repaints_the_glass_layer() -> None:
+    surface = DualPaneSurface(output=StringIO(), error=StringIO(), interactive=False)
+    surface._full_screen = True
+    surface.display = "ansi"
+    surface.repaint_oi = lambda **_: pytest.fail("ANSI animation should not repaint")
+
+    surface._animation_tick(0.1)
+
+
 def test_oi_scene_renders_observed_entities_instead_of_demo_fixtures() -> None:
     state = ProjectionState()
     state.reduce(
@@ -174,6 +185,24 @@ def test_terminal_session_is_idempotent_for_non_tty() -> None:
     session.close()
     session.close()
     assert output.getvalue() == ""
+
+
+@pytest.mark.asyncio
+async def test_animation_clock_awaited_shutdown_handles_callback_failure() -> None:
+    calls = 0
+
+    def broken_callback(_dt: float) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("paint failed")
+
+    clock = AnimationClock(broken_callback)
+    clock.start()
+    await asyncio.sleep(0.12)
+    await clock.stop_async()
+    assert clock._task is None
+    assert calls >= 1
+    await clock.stop_async()
 
 
 def test_display_settings_round_trip_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -17,6 +17,7 @@ All state is durable (mutation ledger + events) so branches are auditable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ class BranchStatus:
     PROPOSED = "PROPOSED"
     EXECUTING = "EXECUTING"
     VERIFIED = "VERIFIED"     # criteria passed in shadow
+    COMMITTING = "COMMITTING" # real-workspace mutation is in flight
     FAILED = "FAILED"         # verification failed / execution error
     COMMITTED = "COMMITTED"
     DISCARDED = "DISCARDED"
@@ -74,6 +76,12 @@ class ShadowBranch:
     base_manifest: dict[str, str] = field(default_factory=dict)
     error: str | None = None
     commit_mutation_id: str | None = None
+    commit_plan: list[dict] = field(default_factory=list)
+    commit_outcome: dict = field(default_factory=dict)
+    commit_state: str = "NOT_STARTED"
+    commit_started_at: str | None = None
+    commit_completed_at: str | None = None
+    checkpoint_id: str | None = None
     policy_profile: str | None = None
     created_at: str = field(default_factory=lambda: utcnow().isoformat())
 
@@ -87,7 +95,10 @@ class ShadowEngine:
     ) -> None:
         self._dispatcher = dispatcher
         self._branches: dict[str, ShadowBranch] = {}
-        self._roots_parent = roots_parent or "/tmp/athena-shadow"
+        self._roots_parent = roots_parent or (
+            os.path.join(state_root, "shadows")
+            if state_root else "/tmp/athena-shadow"
+        )
         self._state_root = Path(state_root or self._roots_parent)
         self._branch_state = self._state_root / "branches.json"
         self._load_branches()
@@ -106,6 +117,11 @@ class ShadowEngine:
     def list_branches(self) -> list[ShadowBranch]:
         """Return known branch records in creation order."""
         return list(self._branches.values())
+
+    def attach_checkpoint(self, branch: ShadowBranch, checkpoint_id: str | None) -> None:
+        """Persist the checkpoint that defines the branch's restore boundary."""
+        branch.checkpoint_id = checkpoint_id
+        self._persist_branches()
 
     async def _service_approve(self, approval_id: str) -> None:
         svc = getattr(self, "_service", None)
@@ -327,9 +343,21 @@ class ShadowEngine:
                 origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
             ))
 
+        # Write the batch intent before any real-workspace mutation.  The
+        # content itself stays in the shadow tree; the durable plan records
+        # enough identity to reconcile the corresponding mutation-ledger rows
+        # without duplicating workspace data in branch metadata.
+        branch.commit_plan = [_commit_plan_record(request) for request in requests]
+        branch.commit_state = "PLANNED"
+        branch.status = BranchStatus.COMMITTING
+        branch.commit_started_at = utcnow().isoformat()
+        self._persist_branches()
+
         if requests:
             if self._dispatcher is None:
                 raise RuntimeError("ShadowEngine not bound to a dispatcher")
+            branch.commit_state = "APPLYING"
+            self._persist_branches()
             outcomes = await self._dispatcher.dispatch_many(
                 requests,
                 workspace=branch.base_workspace,
@@ -342,6 +370,7 @@ class ShadowEngine:
             suspended = [item for item in outcomes if isinstance(item, SuspendedCall)]
             if failed or suspended or len(outcomes) != len(requests):
                 branch.status = BranchStatus.FAILED
+                branch.commit_state = "FAILED"
                 if failed:
                     reason = failed[0].error or "capability request failed"
                 elif suspended:
@@ -349,6 +378,8 @@ class ShadowEngine:
                 else:
                     reason = "commit dispatch returned incomplete results"
                 branch.error = f"commit not applied: {reason}"
+                branch.commit_outcome = {"status": "failed", "reason": reason}
+                branch.commit_completed_at = utcnow().isoformat()
                 self._persist_branches()
                 await self._cleanup(branch)
                 return {"status": "FAILED", "branch": branch.id,
@@ -374,6 +405,9 @@ class ShadowEngine:
             {"resource": w, "operation": "commit_write"} for w in applied["written"]
         ] + [{"resource": d, "operation": "commit_delete"} for d in applied["deleted"]]
 
+        branch.commit_outcome = dict(applied)
+        branch.commit_state = "APPLIED"
+        branch.commit_completed_at = utcnow().isoformat()
         branch.status = BranchStatus.COMMITTED
         self._persist_branches()
         await self._cleanup(branch)
@@ -383,6 +417,7 @@ class ShadowEngine:
 
     async def discard(self, branch: ShadowBranch, reason: str = "") -> dict:
         branch.status = BranchStatus.DISCARDED
+        branch.commit_state = "DISCARDED"
         branch.error = branch.error or reason or None
         self._persist_branches()
         await self._cleanup(branch)
@@ -485,19 +520,70 @@ class ShadowEngine:
         await asyncio.get_running_loop().run_in_executor(None, _rm)
         self._persist_branches()
 
+    async def reconcile_startup(self, event_store=None) -> int:
+        """Fail closed on branches interrupted during real-workspace commit.
+
+        A branch in ``COMMITTING``/``PLANNED``/``APPLYING`` state has a
+        durable intent but no durable terminal outcome. The mutation ledger
+        remains authoritative for individual effects; this layer refuses to
+        replay or infer the batch result. An operator can inspect the plan
+        and explicitly discard or recover it after reconciling those rows.
+        """
+        count = 0
+        for branch in self._branches.values():
+            if branch.status != BranchStatus.COMMITTING and branch.commit_state not in {
+                "PLANNED", "APPLYING",
+            }:
+                continue
+            branch.status = BranchStatus.RECOVERY_REQUIRED
+            branch.commit_state = "RECOVERY_REQUIRED"
+            branch.error = (
+                "process stopped during branch commit; reconcile the durable "
+                "mutation ledger before deciding whether to discard or recover"
+            )
+            self._persist_branches()
+            count += 1
+            if event_store is not None:
+                try:
+                    await event_store.append_event(
+                        "ShadowBranchRecoveryRequired",
+                        {
+                            "branch_id": branch.id,
+                            "commit_state": branch.commit_state,
+                            "commit_plan": branch.commit_plan,
+                            "reason": branch.error,
+                        },
+                        task_id=branch.task_id,
+                    )
+                except Exception as exc:  # pragma: no cover - telemetry only
+                    _logger.warning(
+                        "could not emit shadow recovery event for %s: %s",
+                        branch.id, exc,
+                    )
+        return count
+
     # ------------------------------------------------------------------
     # Durable branch metadata
     # ------------------------------------------------------------------
     def _persist_branches(self) -> None:
-        """Persist branch metadata atomically; contents stay in the shadow root."""
+        """Persist branch metadata atomically and fail closed on I/O errors."""
+        self._state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        records = [_branch_record(branch) for branch in self._branches.values()]
+        tmp = self._branch_state.with_suffix(".tmp")
+        payload = json.dumps(records, sort_keys=True)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self._branch_state)
         try:
-            self._state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            records = [_branch_record(branch) for branch in self._branches.values()]
-            tmp = self._branch_state.with_suffix(".tmp")
-            tmp.write_text(json.dumps(records, sort_keys=True), encoding="utf-8")
-            os.replace(tmp, self._branch_state)
-        except OSError:
-            _logger.warning("could not persist shadow branch state", exc_info=True)
+            directory_fd = os.open(self._state_root, os.O_DIRECTORY)
+        except (AttributeError, OSError):
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def _load_branches(self) -> None:
         """Reload metadata and mark incomplete branches needing reconciliation."""
@@ -516,7 +602,7 @@ class ShadowEngine:
                 shadow_root = str(record["shadow_workspace"]["root"])
                 if status in {
                     BranchStatus.PROPOSED, BranchStatus.EXECUTING,
-                    BranchStatus.VERIFIED,
+                    BranchStatus.VERIFIED, BranchStatus.COMMITTING,
                 } and not os.path.isdir(shadow_root):
                     status = BranchStatus.RECOVERY_REQUIRED
                     record["error"] = (
@@ -535,6 +621,12 @@ class ShadowEngine:
                     mutations=[dict(item) for item in record.get("mutations") or ()],
                     base_manifest=dict(record.get("base_manifest") or {}),
                     error=record.get("error"),
+                    commit_plan=[dict(item) for item in record.get("commit_plan") or ()],
+                    commit_outcome=dict(record.get("commit_outcome") or {}),
+                    commit_state=str(record.get("commit_state") or "NOT_STARTED"),
+                    commit_started_at=record.get("commit_started_at"),
+                    commit_completed_at=record.get("commit_completed_at"),
+                    checkpoint_id=record.get("checkpoint_id"),
                     policy_profile=record.get("policy_profile"),
                     created_at=str(record.get("created_at") or utcnow().isoformat()),
                 )
@@ -582,6 +674,28 @@ def _branch_record(branch: ShadowBranch) -> dict:
         "mutations": branch.mutations,
         "base_manifest": branch.base_manifest,
         "error": branch.error,
+        "commit_plan": branch.commit_plan,
+        "commit_outcome": branch.commit_outcome,
+        "commit_state": branch.commit_state,
+        "commit_started_at": branch.commit_started_at,
+        "commit_completed_at": branch.commit_completed_at,
+        "checkpoint_id": branch.checkpoint_id,
         "policy_profile": branch.policy_profile,
         "created_at": branch.created_at,
+    }
+
+
+def _commit_plan_record(request: CapabilityRequest) -> dict:
+    """Serialize a non-secret identity record for one commit request."""
+    arguments = request.arguments
+    content = arguments.get("content")
+    return {
+        "call_id": request.call_id,
+        "capability_id": request.capability_id,
+        "operation": arguments.get("operation"),
+        "path": arguments.get("path"),
+        "content_sha256": (
+            hashlib.sha256(str(content).encode("utf-8")).hexdigest()
+            if content is not None else None
+        ),
     }

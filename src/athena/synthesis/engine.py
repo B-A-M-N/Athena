@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from athena.affordances.models import (
     AffordanceScope,
@@ -92,6 +92,10 @@ class SyntheticCapability:
     # generated source or its declared effects.
     effective_effects: frozenset[str] = _GENERATED_EFFECTIVE_AUTHORITY
     output_schema: dict | None = None
+    lifecycle_state: str = "DRAFT"
+    supersedes: tuple[str, ...] = ()
+    dependency_lock: dict = field(default_factory=dict)
+    last_used_at: str | None = None
 
 
 class SynthesisEngine:
@@ -299,6 +303,7 @@ class SynthesisEngine:
         cap.code = source_validation.code
         source_record = source_validation.to_dict()
         if not source_validation.passed:
+            cap.lifecycle_state = "REJECTED"
             cap.validation = {
                 "tier": source_validation.tier.value,
                 "cases_total": len(cases or []),
@@ -326,6 +331,7 @@ class SynthesisEngine:
             if cap.output_schema is not None:
                 _compile_validator(cap.output_schema)
         except (SchemaError, SyntaxError, TypeError, ValueError) as exc:
+            cap.lifecycle_state = "REJECTED"
             cap.validation = {
                 "tier": source_validation.tier.value,
                 "cases_total": len(cases or []),
@@ -406,19 +412,23 @@ class SynthesisEngine:
             "source": source_record,
             "details": details,
         }
+        cap.lifecycle_state = "VALIDATED" if cap.validation["all_passed"] else "REJECTED"
         return cap
 
     # ------------------------------------------------------------------
     # Registration into the live registry (ephemeral, task-scoped)
     # ------------------------------------------------------------------
-    def _build_executor(self, cap: SyntheticCapability, *, proof_sink=None):
+    def _build_executor(
+        self, cap: SyntheticCapability, *, proof_sink=None, candidate_sink=None,
+    ):
         """Build the canonical executor closure for one validated record."""
         child = _child_code(repr(cap.code))
 
         class _Executor:
-            def __init__(self, engine_ref, proof_sink_ref):
+            def __init__(self, engine_ref, proof_sink_ref, candidate_sink_ref):
                 self.engine = engine_ref
                 self.proof_sink = proof_sink_ref
+                self.candidate_sink = candidate_sink_ref
 
             descriptor = CapabilityDescriptor(
                 id=cap.id,
@@ -460,24 +470,47 @@ class SynthesisEngine:
                 stdout, stderr, returncode = await _run()
                 ok = returncode == 0 and "__RESULT__" in stdout
                 cap.uses += 1
+                from athena.protocol.messages import utcnow
+                cap.last_used_at = utcnow().isoformat()
 
                 async def _persist_proof() -> str | None:
+                    errors: list[str] = []
                     if self.proof_sink is None:
-                        return None
-                    try:
-                        await self.proof_sink(
-                            cap.id, self.engine._proof_record(cap),
-                        )
-                    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                        # The execution result remains truthful, but a
-                        # durable proof failure is surfaced in result metadata
-                        # and logs instead of silently degrading auditability.
-                        _logger.error(
-                            "generated capability proof persistence failed for %s: %s",
-                            cap.id, exc,
-                        )
-                        return str(exc)
-                    return None
+                        pass
+                    else:
+                        try:
+                            await self.proof_sink(
+                                cap.id, self.engine._proof_record(cap),
+                            )
+                        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                            # The execution result remains truthful, but a
+                            # durable proof failure is surfaced in result metadata
+                            # and logs instead of silently degrading auditability.
+                            _logger.error(
+                                "generated capability proof persistence failed for %s: %s",
+                                cap.id, exc,
+                            )
+                            errors.append(str(exc))
+                    if (
+                        self.candidate_sink is not None
+                        and cap.task_id
+                        and cap.uses >= 2
+                        and cap.successes >= 2
+                    ):
+                        cap.lifecycle_state = "CANDIDATE"
+                        try:
+                            await self.candidate_sink(
+                                self.engine._generated_record(
+                                    cap, scope=AffordanceScope.CANDIDATE,
+                                )
+                            )
+                        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                            _logger.error(
+                                "generated candidate persistence failed for %s: %s",
+                                cap.id, exc,
+                            )
+                            errors.append(str(exc))
+                    return "; ".join(errors) or None
 
                 if ok:
                     try:
@@ -532,12 +565,30 @@ class SynthesisEngine:
                         if proof_error else {}
                     ))
 
-        return _Executor(engine_ref=self, proof_sink_ref=proof_sink)
+        return _Executor(
+            engine_ref=self,
+            proof_sink_ref=proof_sink,
+            candidate_sink_ref=candidate_sink,
+        )
 
     @staticmethod
     def _proof_record(cap: SyntheticCapability) -> dict:
+        live_quality = (
+            cap.successes / cap.uses if cap.uses else 0.0
+        )
+        validation_quality = (
+            cap.validation.get("cases_passed", 0)
+            / cap.validation.get("cases_total", 1)
+            if cap.validation.get("cases_total") else 0.0
+        )
         return {
             **dict(cap.validation),
+            "lifecycle_state": cap.lifecycle_state,
+            "quality_score": round(
+                (validation_quality + live_quality) / (2 if cap.uses else 1),
+                4,
+            ),
+            "last_used_at": cap.last_used_at,
             "fixture_count": len(cap.validation_cases or []),
             "fixture_hashes": [
                 hashlib.sha256(
@@ -552,10 +603,41 @@ class SynthesisEngine:
             },
         }
 
+    @staticmethod
+    def _dependency_lock(cap: SyntheticCapability) -> dict:
+        """Return a reproducible identity for the generated dependency set.
+
+        A generated record may carry additional environment metadata supplied
+        by a caller, but the dependency fingerprint is always derived from
+        the declared requirements rather than trusted input.  This makes a
+        promoted capability explainable after restart and lets a later
+        resolver detect that its dependency environment has changed.
+        """
+        requirements = [
+            {
+                "name": dependency.name,
+                "manager": dependency.manager,
+                "version": dependency.version,
+                "reason": dependency.reason,
+                "required_for": dependency.required_for,
+            }
+            for dependency in cap.required_dependencies
+        ]
+        encoded = json.dumps(
+            requirements, sort_keys=True, separators=(",", ":")
+        ).encode()
+        return {
+            **dict(cap.dependency_lock or {}),
+            "format": 1,
+            "requirements": requirements,
+            "fingerprint": hashlib.sha256(encoded).hexdigest(),
+        }
+
     def _generated_record(
         self, cap: SyntheticCapability, *, scope: AffordanceScope,
         project_scope: str | None = None, user_scope: str | None = None,
     ) -> GeneratedCapability:
+        proof = self._proof_record(cap)
         return GeneratedCapability(
             id=cap.id,
             name=cap.name,
@@ -567,12 +649,24 @@ class SynthesisEngine:
             effective_authority=frozenset(self._authority_values(cap)),
             required_dependencies=cap.required_dependencies,
             scope=scope,
-            task_scope=cap.task_id if scope is AffordanceScope.TASK else None,
+            task_scope=(
+                cap.task_id
+                if scope in {AffordanceScope.TASK, AffordanceScope.CANDIDATE}
+                else None
+            ),
             project_scope=project_scope,
             user_scope=user_scope,
             provenance=cap.provenance,
             validation_state="VALIDATED",
-            proof_record=self._proof_record(cap),
+            proof_record=proof,
+            lifecycle_state=cap.lifecycle_state,
+            supersedes=cap.supersedes,
+            dependency_lock=self._dependency_lock(cap),
+            last_used_at=cap.last_used_at,
+            use_count=cap.uses,
+            success_count=cap.successes,
+            failure_count=cap.failures,
+            quality_score=float(proof.get("quality_score") or 0.0),
         )
 
     def register_ephemeral(self, registry, cap: SyntheticCapability) -> bool:
@@ -582,7 +676,10 @@ class SynthesisEngine:
             return False
 
         proof_sink = getattr(registry, "update_generated_proof", None)
-        executor = self._build_executor(cap, proof_sink=proof_sink)
+        candidate_sink = getattr(registry, "persist_generated_candidate", None)
+        executor = self._build_executor(
+            cap, proof_sink=proof_sink, candidate_sink=candidate_sink
+        )
         generated = self._generated_record(
             cap,
             scope=AffordanceScope.TASK if cap.task_id
@@ -657,13 +754,18 @@ class SynthesisEngine:
             validation_cases=[],
             required_dependencies=generated.required_dependencies,
             uses=int(usage.get("uses", 0)),
-            successes=int(usage.get("successes", 0)),
-            failures=int(usage.get("failures", 0)),
+            successes=int(usage.get("successes", generated.success_count)),
+            failures=int(usage.get("failures", generated.failure_count)),
             # Stored metadata is checked above but is never the source of
             # runtime authority. Rehydration derives the envelope from the
             # current Athena profile so old records cannot widen execution.
             effective_effects=_GENERATED_EFFECTIVE_AUTHORITY,
+            lifecycle_state=generated.lifecycle_state,
+            supersedes=generated.supersedes,
+            dependency_lock=dict(generated.dependency_lock),
+            last_used_at=generated.last_used_at,
         )
+        cap.uses = int(usage.get("uses", generated.use_count))
         executor = self._build_executor(cap, proof_sink=proof_sink)
         self._synthetic[cap.id] = cap
         self._executors[cap.id] = executor
@@ -684,6 +786,11 @@ class SynthesisEngine:
             "effects": sorted(getattr(e, "value", str(e)) for e in cap.effects),
             "effective_authority": sorted(cap.effective_effects),
             "code_hash": hashlib.sha256(cap.code.encode()).hexdigest(),
+            "lifecycle_state": cap.lifecycle_state,
+            "quality_score": self._proof_record(cap).get("quality_score", 0.0),
+            "last_used_at": cap.last_used_at,
+            "supersedes": list(cap.supersedes),
+            "dependency_lock": self._dependency_lock(cap),
         }
 
     def promote(self, surface, cap_id: str, *, scope: AffordanceScope,
@@ -721,6 +828,7 @@ class SynthesisEngine:
             )
             return False
         cap.code = source_validation.code
+        cap.lifecycle_state = "PROMOTED"
         cap.validation["tier"] = promotion_tier.value
         cap.validation["source"] = source_validation.to_dict()
         # Formatting is part of the canonical source contract. Rebuild the
@@ -728,6 +836,7 @@ class SynthesisEngine:
         proof_sink = getattr(surface, "update_generated_proof", None)
         executor = self._build_executor(cap, proof_sink=proof_sink)
         source_task_id = cap.task_id
+        proof = self._proof_record(cap)
         generated = GeneratedCapability(
             id=cap.id, name=cap.name, description=cap.description,
             implementation=cap.code, input_schema=cap.input_schema,
@@ -738,7 +847,15 @@ class SynthesisEngine:
             scope=scope, project_scope=project_id,
             user_scope=user_id if scope is AffordanceScope.USER else None,
             provenance={**cap.provenance, "promoted_from": "task"},
-            validation_state="PROMOTED", proof_record=self._proof_record(cap),
+            validation_state="PROMOTED", proof_record=proof,
+            lifecycle_state="PROMOTED",
+            supersedes=cap.supersedes,
+            dependency_lock=self._dependency_lock(cap),
+            use_count=cap.uses,
+            success_count=cap.successes,
+            failure_count=cap.failures,
+            quality_score=float(proof.get("quality_score") or 0.0),
+            last_used_at=cap.last_used_at,
         )
         if scope is AffordanceScope.PROJECT:
             surface.register_project(project_id, executor, generated=generated)
@@ -756,6 +873,7 @@ class SynthesisEngine:
         cap = self._synthetic.get(cap_id)
         if cap is None or cap.uses < 2 or cap.successes < cap.uses:
             return None
+        cap.lifecycle_state = "CANDIDATE"
         from athena.skills.candidates import SkillCandidate
         from athena.skills.models import Skill
 

@@ -7,6 +7,7 @@ import json
 import pytest
 
 from athena.capabilities.registry import CapabilityRegistry
+from athena.affordances.models import DependencyRequirement, AffordanceScope
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResultStatus,
@@ -93,6 +94,26 @@ def test_generated_authority_is_sandbox_profile_not_declared_effects():
     assert cap.effective_effects == frozenset({
         EffectClass.READ_LOCAL.value, EffectClass.EXECUTE.value,
     })
+
+
+def test_generated_record_carries_reproducible_dependency_lock():
+    engine = SynthesisEngine()
+    cap = engine.synthesize(
+        name="locked_helper",
+        description="uses an explicitly recorded dependency set",
+        code=GOOD_CODE,
+        required_dependencies=(
+            DependencyRequirement("httpx", version="0.28.1", reason="fetch"),
+        ),
+    )
+
+    generated = engine._generated_record(
+        cap, scope=AffordanceScope.PROJECT, project_scope="repo"
+    )
+    lock = generated.dependency_lock
+    assert lock["format"] == 1
+    assert lock["requirements"][0]["name"] == "httpx"
+    assert len(lock["fingerprint"]) == 64
 
 
 @pytest.mark.asyncio

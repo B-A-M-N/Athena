@@ -250,15 +250,18 @@ Evidence / research
     durable support for factual claims and decisions
 ```
 
-The generated-machinery lifecycle is scoped and explicit:
+The generated-machinery lifecycle is scoped, durable, and explicit:
 
 ```text
 SCRATCH → TASK → CANDIDATE → PROJECT → USER → SYSTEM
 ```
 
 Task-local machinery is visible only to its owning Task and is removed at
-terminal cleanup. Project and user promotion are separate operations. System
-promotion is a normal release concern, never autonomous self-modification.
+terminal cleanup. Repeatedly successful task machinery can be retained as a
+durable, reviewable candidate with validation proof, dependency fingerprint,
+usage history, and lifecycle records. Project and user promotion are separate
+operations. System promotion is a normal release concern, never autonomous
+self-modification.
 
 Generated code expands behavior, not authority. A model-declared effect list
 is audit metadata, not permission. Effective authority is calculated outside
@@ -381,10 +384,12 @@ remain in development.
 Athena is not a giant predefined-tool agent, a collection of independently
 reasoning subagents, or a claim that every present backend is production-ready.
 The architecture document records the current alignment boundary. In
-particular, full host isolation, durable causal replay, deep research/indexing,
-and some specialized runtime/UI backends remain active implementation work.
-Types, registries, and documentation are not by themselves evidence that a
-subsystem is complete.
+particular, full host isolation, process reattachment after restart, semantic
+research/indexing, the native terminal frontend, and some specialized
+runtime/UI backends remain active implementation work. A restart deliberately
+marks in-process runtime sessions lost and emits `RuntimeStateLost`; Athena
+does not guess that an old process is still safe to reuse. Types, registries,
+and documentation are not by themselves evidence that a subsystem is complete.
 
 ## Operator surface
 

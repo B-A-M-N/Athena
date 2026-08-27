@@ -69,6 +69,11 @@ class CapabilityFabric:
         if not project_id:
             raise ValueError("project overlay requires project_id")
         self._check(executor)
+        if generated is not None and self._equivalent(generated, "project", project_id):
+            self._history.setdefault(generated.id, []).append({
+                "event": "deduplicated", "scope": "project", "owner": project_id,
+            })
+            return
         self._install(self._project.setdefault(project_id, {}), executor)
         self._record(executor, generated, "project", project_id)
         self._persist_if_durable(generated, owner=project_id)
@@ -77,6 +82,11 @@ class CapabilityFabric:
         if not user_id:
             raise ValueError("user overlay requires user_id")
         self._check(executor)
+        if generated is not None and self._equivalent(generated, "user", user_id):
+            self._history.setdefault(generated.id, []).append({
+                "event": "deduplicated", "scope": "user", "owner": user_id,
+            })
+            return
         self._install(self._user.setdefault(user_id, {}), executor)
         self._record(executor, generated, "user", user_id)
         self._persist_if_durable(generated, owner=user_id)
@@ -89,7 +99,29 @@ class CapabilityFabric:
         self._history.setdefault(generated.id, []).append({
             "event": "registered", "scope": scope, "owner": owner,
             "descriptor": executor.descriptor.id,
+            "lifecycle_state": generated.lifecycle_state,
         })
+
+    def _equivalent(
+        self, generated: GeneratedCapability, scope: str, owner: str,
+    ) -> bool:
+        """Avoid installing two active overlays for identical machinery."""
+        for existing in self._records.values():
+            existing_owner = (
+                existing.project_scope if scope == "project"
+                else existing.user_scope
+            )
+            if (
+                existing.scope.value == scope
+                and existing_owner == owner
+                and existing.lifecycle_state != "DEPRECATED"
+                and existing.code_hash == generated.code_hash
+                and existing.schema_hash == generated.schema_hash
+                and existing.declared_effects == generated.declared_effects
+                and existing.required_dependencies == generated.required_dependencies
+            ):
+                return True
+        return False
 
     def _persist_if_durable(
         self, generated: GeneratedCapability | None, *, owner: str,
@@ -160,6 +192,27 @@ class CapabilityFabric:
         }:
             return
         updated = replace(record, proof_record=dict(proof_record))
+        usage = dict(proof_record.get("usage") or {})
+        updated = replace(
+            updated,
+            lifecycle_state=str(
+                proof_record.get("lifecycle_state") or updated.lifecycle_state
+            ),
+            quality_score=float(
+                proof_record.get("quality_score") or updated.quality_score
+            ),
+            use_count=int(usage.get("uses", updated.use_count)),
+            success_count=int(usage.get("successes", updated.success_count)),
+            failure_count=int(usage.get("failures", updated.failure_count)),
+            last_used_at=proof_record.get("last_used_at") or updated.last_used_at,
+            lifecycle_history=tuple(
+                list(updated.lifecycle_history) + [{
+                    "event": "proof_updated",
+                    "usage": usage,
+                    "quality_score": proof_record.get("quality_score"),
+                }]
+            )[-100:],
+        )
         self._records[capability_id] = updated
         owner = (
             updated.project_scope if updated.scope is AffordanceScope.PROJECT
@@ -175,6 +228,41 @@ class CapabilityFabric:
             "scope": updated.scope.value,
             "owner": owner,
             "usage": dict(proof_record.get("usage") or {}),
+        })
+
+    async def persist_generated_candidate(
+        self, generated: GeneratedCapability,
+    ) -> None:
+        """Retain a proven task capability as a reviewable candidate.
+
+        Candidates are durable records, not active overlays.  They therefore
+        do not enter the task/project/user executor maps and cannot become
+        callable merely because a task used them repeatedly.  Promotion still
+        requires the explicit synthesis operation and a fresh target-scope
+        validation pass.
+        """
+        if self._store is None or generated.scope is not AffordanceScope.CANDIDATE:
+            return
+        owner = generated.task_scope or str(
+            generated.provenance.get("task_id") or ""
+        )
+        if not owner:
+            raise RuntimeError(
+                f"candidate {generated.id} has no owning task"
+            )
+        history = list(generated.lifecycle_history)
+        history.append({
+            "event": "candidate_created",
+            "owner": owner,
+            "quality_score": generated.quality_score,
+            "use_count": generated.use_count,
+        })
+        await self._store.save(
+            replace(generated, lifecycle_history=tuple(history[-100:])),
+            owner=owner,
+        )
+        self._history.setdefault(generated.id, []).append({
+            "event": "candidate_created", "scope": "candidate", "owner": owner,
         })
 
     async def load_persisted(
@@ -274,6 +362,12 @@ class CapabilityFabric:
             ):
                 return False
             self._user.get(user_id or "", {}).pop(capability_id, None)
+        self._records[capability_id] = replace(
+            record, lifecycle_state="DEPRECATED",
+            lifecycle_history=tuple(list(record.lifecycle_history) + [{
+                "event": "deprecated", "scope": record_scope,
+            }])[-100:],
+        )
         self._history.setdefault(capability_id, []).append({
             "event": "deprecated", "scope": record_scope,
             "owner": record.task_scope or record.project_scope or record.user_scope,

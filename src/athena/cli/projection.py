@@ -244,6 +244,10 @@ class ProjectionState:
                     operation.progress = sanitize_terminal_text(payload.get("message") or payload.get("progress") or "active")
                 elif etype == "CapabilityCompleted":
                     operation.state = "complete"
+                    output = sanitize_terminal_text(payload.get("output") or "")
+                    if output:
+                        operation.output.extend(output.splitlines() or [output])
+                        self.feed_stream(output)
                     if self.active_operation_id == operation.id:
                         self.active_operation_id = None
                 else:

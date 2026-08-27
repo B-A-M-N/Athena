@@ -763,7 +763,11 @@ class DualPaneSurface(OperatorSurface):
         self.terminal_session.close()
 
     def _animation_tick(self, dt: float) -> None:
-        if not self._full_screen:
+        # ANSI/plain surfaces are event-driven cell projections; repainting
+        # them ten times per second only burns terminal bandwidth because the
+        # cell scene has no animated layer.  The retained pixel scene owns the
+        # animation clock when Glass is actually active.
+        if not self._full_screen or self.display != "glass":
             return
         self.mascot.advance(dt)
         self.animator.tick(dt)
@@ -1197,21 +1201,22 @@ class DualPaneSurface(OperatorSurface):
         seam = max(self.PANE_GAP - 2, 0)
         prefix = " " * cabinet_x
 
+        # The two apertures are recesses in one instrument chassis.  Keep the
+        # seam deliberately quiet: a conventional TUI box around each side
+        # makes the surface read as two unrelated applications.  The block
+        # seam is cabinet relief, not a third pane.
+        seam_fill = "░" * max(seam, 1)
+
         def cabinet_row(left_value: str, right_value: str) -> str:
             left_panel = "▐" + self._fit(left_value, op_inner_w) + "▌"
             right_panel = "▐" + self._fit(right_value, oi_inner_w) + "▌"
-            return (
-                prefix + "│" + left_panel + "│" + " " * seam + "│"
-                + right_panel + "│"
-            )
+            return prefix + "│" + left_panel + seam_fill + right_panel + "│"
 
         top = (
-            prefix + "╭" + "─" * left_w + "┬" + "─" * seam + "┬"
-            + "─" * right_w + "╮"
+            prefix + "╭" + "─" * (left_w + len(seam_fill) + right_w + 2) + "╮"
         )
         bottom = (
-            prefix + "╰" + "─" * left_w + "┴" + "─" * seam + "┴"
-            + "─" * right_w + "╯"
+            prefix + "╰" + "─" * (left_w + len(seam_fill) + right_w + 2) + "╯"
         )
         lines[op_y] = self._fit(top, cols)
         lines[op_y + 1] = self._fit(cabinet_row(left_title, right_title), cols)

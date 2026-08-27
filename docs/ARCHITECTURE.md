@@ -167,7 +167,7 @@ core operating model rather than optional polish:
 
 | Augmentation | Athena contract | Current status |
 | --- | --- | --- |
-| Persistent computational sessions | Runtime state is keyed by Task/runtime session, serialized through the ExecutionManager path, and audited with execution events. | **Live in-process**; restart adoption and full backend conformance remain incomplete. |
+| Persistent computational sessions | Runtime state is keyed by Task/runtime session, serialized through the ExecutionManager path, and audited with execution events. | **Live in-process**; startup explicitly marks prior sessions dead and emits `RuntimeStateLost`; process reattachment and full backend conformance remain incomplete. |
 | Reflection and progressive disclosure | The fabric can search/describe visible capabilities, workflows, and skills; ContextCompiler selects ranked relevant affordances while retaining foundational creation/reflection routes. | **Live for the current surface**; runtime/device/permission/dependency discovery remains partial. |
 | One canonical response accumulator | Provider deltas and terminal responses assemble into one mixed `ModelResponse`, preserving text, reasoning, and parallel tool calls exactly once. | **Live** in kernel and registry collection paths. |
 | Adaptive output artifacts | Large/structured execution output is retained as immutable, task-owned artifacts with bounded previews and explicit list/read/slice/search follow-up operations. | **Live for local artifacts**; richer MIME-aware extraction and fully nonblocking large-file I/O remain incomplete. |
@@ -474,9 +474,11 @@ The scopes mean:
 
 Retention is evidence-based. Store creator Task, source event sequence,
 validation evidence, code/schema/dependency hashes, environment constraints,
-successful executions, failures, supersession, and usage. Lifecycle management
-must eventually provide deduplication, versioning, deprecation, quality
-scoring, and garbage collection.
+successful executions, failures, supersession, and usage. The current store and
+fabric provide scoped deduplication, lifecycle history, durable proof updates,
+quality/usage counters, explicit deprecation, and garbage collection. Review
+UX, richer supersession workflows, and system-level release controls remain
+future work.
 
 Compaction must not erase a useful learned affordance. A future context turn
 should be able to retrieve the promoted capability, skill, workflow, and its
@@ -525,15 +527,15 @@ complete.
 | Design area | Current alignment |
 | --- | --- |
 | One AgentKernel, Task, policy, execution, and durable event model | **Mostly aligned**; existing core contracts support this model. |
-| Affordance Fabric and task/project/user overlays | **Partial**; fabric, live task-scoped synthesis, durable project/user records, and ownership filtering exist, but lifecycle history and promotion UX remain incomplete. |
+| Affordance Fabric and task/project/user overlays | **Partial**; fabric, live task-scoped synthesis, durable project/user/candidate records, ownership filtering, lifecycle history, and proof updates exist; review and promotion UX remain incomplete. |
 | Scratch lifecycle | **Partial**; records exist, but the kernel does not yet choose scratch/composition/synthesis through one explicit strategy surface. |
-| GeneratedCapability | **Partial**; model-visible task-scoped creation, hashes, proof records, and project/user rehydration exist, but proof evolution, promotion UX, and fully enforced sandbox semantics remain incomplete. |
+| GeneratedCapability | **Partial**; model-visible task-scoped creation, hashes, dependency locks, proof evolution, candidate retention, project/user rehydration, and deprecation exist; promotion UX and fully enforced sandbox semantics remain incomplete. |
 | Declarative nested workflows | **Partial**; models, SQLite storage, validation, execution, and a capability route exist; kernel-level strategy integration and full conformance are incomplete. |
 | Reflection | **Partial**; scoped/ranked capability reflection plus workflow/skill search and description are live; broader resource/runtime/device/permission discovery is incomplete. |
 | Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, and deterministic plan/assess/bundle operations are live; semantic retrieval, autonomous acquisition/critique, and full completion verification remain incomplete. |
-| Dependency acquisition | **Partial**; a governed Python route exists; manager breadth, locking, environment reproducibility, and full policy coverage remain. |
+| Dependency acquisition | **Partial**; a governed Python route records resolved versions, source metadata, file hashes, and environment fingerprints; manager breadth, lock replay, and full policy coverage remain. |
 | Tiered validation | **Partial**; task admission now records parse/interface/security/format/lint checks, candidate/project/user tiers can require Ruff/Mypy, and exact JSON Schema is compiled; generated-test planning, independent evidence, and optional Semgrep remain incomplete. |
-| Promotion and retention | **Partial**; explicit project/user promotion paths exist, but durable generated proof, supersession, quality scoring, and garbage collection remain. |
+| Promotion and retention | **Partial**; explicit project/user promotion paths, durable generated proof, candidate retention, lifecycle history, quality scoring, deprecation, and garbage collection exist; richer review/supersession UX remains. |
 | Authority inheritance and isolation | **Not release-ready** until every generated/shadow/verification path is backed by a real restricted backend. |
 
 This table is an alignment guard. It prevents class names, comments, or

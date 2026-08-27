@@ -265,3 +265,19 @@ def test_frame_degrades_to_single_column_when_terminal_is_narrow(monkeypatch):
     surface = DualPaneSurface(output=_TTY(), interactive=True)
     assert surface.dual is False
     assert surface._full_screen is False
+
+
+def test_instrument_frame_is_one_chassis_with_inset_apertures(tty_surface):
+    surface, _ = tty_surface
+    lines = surface._frame_lines()
+    aperture_top = lines[surface.layout.operator.y]
+    aperture_bottom = lines[surface.layout.operator.bottom - 1]
+
+    assert aperture_top.count("╭") == 1
+    assert aperture_top.count("╮") == 1
+    assert aperture_bottom.count("╰") == 1
+    assert aperture_bottom.count("╯") == 1
+    assert "┬" not in aperture_top
+    assert "┴" not in aperture_bottom
+    # The inset seam is cabinet relief, not another boxed pane.
+    assert "░" in lines[surface.layout.operator.y + 1]

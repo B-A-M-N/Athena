@@ -259,14 +259,58 @@ class OIFrameBuffer:
         return FrameBuffer(encoded.getvalue(), width, height)
 
     def _draw_buddy(self, draw: Any, x: int, y: int, scale: int, status: str, phase: float, ink: Color, accent: Color, warn: Color, bad: Color) -> None:
+        """Draw one small scene character with restrained state cues.
+
+        Buddy is deliberately an entity in the OI scene, not a second pane or
+        a text dashboard.  The pose stays stable while the semantic state
+        chooses the accent and a few bounded presentation details.
+        """
+        status = str(status).upper()
         color = bad if status in {"FAILURE", "BLOCKED"} else warn if status == "APPROVAL" else accent
-        width = scale * 5
-        draw.rounded_rectangle((x - width, y - scale * 2, x + width, y + scale * 2), radius=scale // 2, outline=color, fill=(16, 28, 51, 238), width=max(1, scale // 6))
-        draw.ellipse((x - scale * 2, y - scale // 2, x - scale, y + scale // 2), fill=ink)
-        draw.ellipse((x + scale, y - scale // 2, x + scale * 2, y + scale // 2), fill=ink)
-        draw.line((x, y - scale * 2, x + (scale if phase > 0.5 else -scale), y - scale * 4), fill=color, width=max(1, scale // 6))
-        draw.arc((x - scale * 2, y, x + scale * 2, y + scale * 2), 10, 170, fill=ink, width=max(1, scale // 6))
-        self._text(draw, (x - width, y + scale * 3), status.lower(), self._font(max(9, scale // 2)), color)
+        stroke = max(1, scale // 6)
+        body_w = scale * 4
+        body_top = y - scale * 2
+        body_bottom = y + scale * 2
+        screen_top = y - scale
+        screen_bottom = y + scale // 2
+        draw.rounded_rectangle(
+            (x - body_w, body_top, x + body_w, body_bottom),
+            radius=max(2, scale // 2), outline=color,
+            fill=(16, 28, 51, 238), width=stroke,
+        )
+        # Monitor face and phosphor eyes.  A phase offset gives the eyes a
+        # tiny scan/breathing movement without changing scene semantics.
+        draw.rounded_rectangle(
+            (x - scale * 2, screen_top, x + scale * 2, screen_bottom),
+            radius=max(1, scale // 4), outline=(100, 148, 191, 180),
+            fill=(9, 20, 39, 245), width=stroke,
+        )
+        eye_y = y - scale // 3 + (1 if phase > 0.72 else 0)
+        eye = bad if status in {"FAILURE", "BLOCKED"} else ink
+        draw.ellipse((x - scale * 2 + stroke, eye_y, x - scale + stroke, eye_y + max(2, scale // 2)), fill=eye)
+        draw.ellipse((x + scale - stroke, eye_y, x + scale * 2 - stroke, eye_y + max(2, scale // 2)), fill=eye)
+        # Antenna and feet make the silhouette readable at small CRT sizes.
+        antenna_x = x + (scale if phase > 0.5 else -scale)
+        draw.line((x, body_top, antenna_x, y - scale * 4), fill=color, width=stroke)
+        draw.ellipse((antenna_x - stroke, y - scale * 4 - stroke, antenna_x + stroke, y - scale * 4 + stroke), fill=color)
+        draw.line((x - scale * 2, body_bottom, x - scale * 3, body_bottom + scale), fill=color, width=stroke)
+        draw.line((x + scale * 2, body_bottom, x + scale * 3, body_bottom + scale), fill=color, width=stroke)
+
+        # State-specific props stay inside the OI viewport: an execution
+        # pulse, an approval card, or a failure marker.  These are visual
+        # explanations of canonical state, never synthetic progress.
+        if status in {"EXECUTING", "READING", "SEARCHING"}:
+            pulse = int((phase % 1.0) * scale * 3)
+            draw.arc((x - body_w - pulse, y - scale * 3 - pulse, x + body_w + pulse, y + scale * 3 + pulse), 200, 340, fill=color, width=stroke)
+        elif status == "APPROVAL":
+            card_x = x + body_w + scale
+            draw.rounded_rectangle((card_x, y - scale, card_x + scale * 4, y + scale * 2), radius=2, outline=warn, fill=(30, 35, 54, 245), width=stroke)
+            draw.line((card_x + scale, y, card_x + scale * 3, y), fill=warn, width=stroke)
+        elif status in {"FAILURE", "BLOCKED"}:
+            draw.line((x + body_w + scale, y - scale, x + body_w + scale * 2, y + scale), fill=bad, width=stroke)
+            draw.line((x + body_w + scale * 2, y - scale, x + body_w + scale, y + scale), fill=bad, width=stroke)
+
+        self._text(draw, (x - body_w, body_bottom + scale + 1), status.lower(), self._font(max(9, scale // 2)), color)
 
 
 __all__ = ["FrameBuffer", "OIFrameBuffer", "pillow_available"]

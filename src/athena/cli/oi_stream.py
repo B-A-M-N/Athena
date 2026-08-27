@@ -102,28 +102,7 @@ class OIStreamViewer:
         self.projection.reduce(etype, payload)
         self.mascot.observe(etype, payload)
 
-        if etype == "ModelResponseCompleted":
-            # Non-streaming providers: payload carries only provider/model,
-            # so pull the final answer from the task's durable result.
-            text = str(payload.get("text") or payload.get("summary") or "")
-            if not text and self.service is not None:
-                try:
-                    task_id = getattr(event, "task_id", None)
-                    if task_id:
-                        result = await self.service.get_result(task_id)
-                        text = str(getattr(result, "summary", "") or "")
-                except Exception:
-                    pass
-            if text:
-                final = f"◆ {text}"
-                last = list(self.projection.stream)[-1:] or []
-                if not last or last[-1].strip() != final.strip():
-                    self.projection.feed_stream(final + "\n")
-        elif etype == "CapabilityCompleted":
-            out = str(payload.get("output") or "")
-            if out.strip():
-                self.projection.feed_stream(out if out.endswith("\n") else out + "\n")
-        elif etype == "CapabilityRequested":
+        if etype == "CapabilityRequested":
             raw_args = payload.get("arguments")
             args = raw_args if isinstance(raw_args, Mapping) else {}
             if args:

@@ -126,6 +126,7 @@ class FusionOrchestrator:
         branch = await self.shadow.open_branch(
             task_id=task_id, base_workspace=ws, proposal=proposal,
             profile=profile)
+        self.shadow.attach_checkpoint(branch, ckpt_id)
         result.branch_id = branch.id
 
         branch = await self.shadow.execute_branch(branch, profile=profile)

@@ -478,6 +478,20 @@ class AthenaService:
         except Exception as exc:
             _logger.warning("crash recovery failed: %s", exc)
 
+        # Fusion branches have a separate durable batch boundary. A branch
+        # interrupted while applying real-workspace mutations must be marked
+        # recovery-required before workers can claim fresh work; never replay
+        # or infer a partially applied speculative commit at startup.
+        try:
+            shadow_recovered = await self.shadow_engine().reconcile_startup(events)
+            if shadow_recovered:
+                _logger.warning(
+                    "shadow branches require operator reconciliation: %d",
+                    shadow_recovered,
+                )
+        except Exception as exc:
+            _logger.warning("shadow branch recovery failed: %s", exc)
+
         # 12.75 Durable approval recovery: a resolved continuation is not
         # ordinary queued work. It belongs to a task that was already parked
         # in WAITING_APPROVAL, so the worker would never claim it. Recover the

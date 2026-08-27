@@ -63,6 +63,15 @@ class GeneratedCapability:
     validation_state: str = "DRAFT"
     proof_record: Mapping[str, Any] = field(default_factory=dict)
     version: int = 1
+    lifecycle_state: str = "DRAFT"
+    supersedes: tuple[str, ...] = ()
+    quality_score: float = 0.0
+    use_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    last_used_at: str | None = None
+    dependency_lock: Mapping[str, Any] = field(default_factory=dict)
+    lifecycle_history: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         computed_code_hash = hashlib.sha256(
@@ -113,6 +122,15 @@ class GeneratedCapability:
             "validation_state": self.validation_state,
             "proof_record": dict(self.proof_record),
             "version": self.version,
+            "lifecycle_state": self.lifecycle_state,
+            "supersedes": list(self.supersedes),
+            "quality_score": self.quality_score,
+            "use_count": self.use_count,
+            "success_count": self.success_count,
+            "failure_count": self.failure_count,
+            "last_used_at": self.last_used_at,
+            "dependency_lock": dict(self.dependency_lock),
+            "lifecycle_history": [dict(event) for event in self.lifecycle_history],
         }
 
     @classmethod
@@ -145,6 +163,17 @@ class GeneratedCapability:
             validation_state=str(data.get("validation_state") or "DRAFT"),
             proof_record=dict(data.get("proof_record") or {}),
             version=int(data.get("version") or 1),
+            lifecycle_state=str(data.get("lifecycle_state") or "DRAFT"),
+            supersedes=tuple(str(item) for item in data.get("supersedes") or ()),
+            quality_score=float(data.get("quality_score") or 0.0),
+            use_count=int(data.get("use_count") or 0),
+            success_count=int(data.get("success_count") or 0),
+            failure_count=int(data.get("failure_count") or 0),
+            last_used_at=data.get("last_used_at"),
+            dependency_lock=dict(data.get("dependency_lock") or {}),
+            lifecycle_history=tuple(
+                dict(event) for event in data.get("lifecycle_history") or ()
+            ),
         )
 
 

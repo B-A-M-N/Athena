@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Callable
+
+
+_logger = logging.getLogger("athena.cli.animation")
 
 
 @dataclass
@@ -56,9 +60,10 @@ class AnimationClock:
         if not self.enabled or self._task is not None:
             return
         try:
-            self._task = asyncio.create_task(self._run())
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._task = None
+            return
+        self._task = loop.create_task(self._run())
 
     async def _run(self) -> None:
         self._last = time.monotonic()
@@ -68,7 +73,10 @@ class AnimationClock:
                 now = time.monotonic()
                 dt = now - self._last
                 self._last = now
-                self.callback(dt)
+                try:
+                    self.callback(dt)
+                except Exception:  # noqa: BLE001 - animation must not kill the REPL
+                    _logger.warning("OI animation callback failed", exc_info=True)
         except asyncio.CancelledError:
             return
 
@@ -90,6 +98,8 @@ class AnimationClock:
             await task
         except asyncio.CancelledError:
             pass
+        except Exception:  # noqa: BLE001 - teardown must remain best-effort
+            _logger.warning("OI animation task failed during shutdown", exc_info=True)
 
 
 __all__ = ["AnimationClock", "OIAnimator", "OIVisualState"]

@@ -119,6 +119,97 @@ async def test_generated_store_scopes_user_records(tmp_path):
     await db.close()
 
 
+async def test_generated_candidate_lifecycle_is_durable_and_gc_explicit(tmp_path):
+    db = Database(str(tmp_path / "candidate.db"))
+    store = GeneratedCapabilityStore(db)
+    candidate = GeneratedCapability(
+        id="gen.candidate",
+        name="candidate",
+        description="candidate lifecycle",
+        implementation="def run(args):\n    return args\n",
+        input_schema={"type": "object"},
+        scope=AffordanceScope.CANDIDATE,
+        task_scope="task-1",
+        lifecycle_state="CANDIDATE",
+        proof_record={"all_passed": True},
+        quality_score=0.8,
+        dependency_lock={"fingerprint": "env-1"},
+    )
+    await store.save(candidate, owner="task-1")
+    await store.save(
+        GeneratedCapability.from_record({
+            **candidate.to_record(),
+            "use_count": 2,
+            "success_count": 2,
+            "proof_record": {"all_passed": True, "usage": {"uses": 2}},
+        }),
+        owner="task-1",
+    )
+    loaded = await store.get(candidate.id, task_id="task-1")
+    assert loaded is not None
+    assert loaded.lifecycle_state == "CANDIDATE"
+    assert loaded.dependency_lock["fingerprint"] == "env-1"
+    assert await store.history(candidate.id, owner="task-1")
+
+    await store.transition(candidate.id, "PROMOTED", owner="task-1", reason="reviewed")
+    promoted = await store.get(candidate.id, task_id="task-1")
+    assert promoted is not None and promoted.lifecycle_state == "PROMOTED"
+    assert any(
+        event.get("to") == "PROMOTED"
+        for event in await store.history(candidate.id, owner="task-1")
+    )
+
+    assert await store.disable(candidate.id, owner="task-1") is True
+    assert await store.get(candidate.id, task_id="task-1") is None
+    history = await store.history(candidate.id, owner="task-1")
+    assert any(event.get("to") == "DEPRECATED" for event in history)
+    assert await store.garbage_collect() == 1
+    assert await store.history(candidate.id, owner="task-1") == []
+    await db.close()
+
+
+async def test_candidate_can_be_explicitly_promoted_without_cross_scope_collision(tmp_path):
+    db = Database(str(tmp_path / "candidate-promotion.db"))
+    store = GeneratedCapabilityStore(db)
+    candidate = GeneratedCapability(
+        id="gen.promote",
+        name="promote",
+        description="candidate promotion",
+        implementation="def run(args):\n    return args\n",
+        input_schema={"type": "object"},
+        scope=AffordanceScope.CANDIDATE,
+        task_scope="task-1",
+        provenance={"task_id": "task-1"},
+        lifecycle_state="CANDIDATE",
+        validation_state="VALIDATED",
+        proof_record={"all_passed": True},
+    )
+    await store.save(candidate, owner="task-1")
+
+    promoted = GeneratedCapability.from_record(
+        {
+            **candidate.to_record(),
+            "scope": AffordanceScope.PROJECT.value,
+            "task_scope": None,
+            "project_scope": "repo",
+            "lifecycle_state": "PROMOTED",
+            "validation_state": "PROMOTED",
+            "provenance": {"task_id": "task-1", "promoted_from": "task"},
+        }
+    )
+    await store.save(promoted, owner="repo")
+
+    loaded = await store.get(promoted.id, project_id="repo")
+    assert loaded is not None
+    assert loaded.scope is AffordanceScope.PROJECT
+    assert loaded.lifecycle_state == "PROMOTED"
+    assert any(
+        event.get("to") == "PROMOTED"
+        for event in await store.history(promoted.id, owner="repo")
+    )
+    await db.close()
+
+
 async def test_fabric_rehydrates_only_visible_promoted_records(tmp_path):
     db = Database(str(tmp_path / "rehydrate.db"))
     store = GeneratedCapabilityStore(db)
