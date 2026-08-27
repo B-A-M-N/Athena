@@ -44,6 +44,7 @@ from athena.context.compiler import ContextCompiler
 from athena.execution.manager import ExecutionManager
 from athena.knowledge.pipeline import KnowledgePipeline
 from athena.models.router import ModelRouter
+from athena.interpreter import InterpreterExtension
 from athena.models.compat.profiles import ModelProfile, resolve_profile
 from athena.execution.runtimes import PythonRuntime, ShellRuntime
 from athena.execution.runtimes.powershell import PowerShellRuntime
@@ -255,6 +256,8 @@ class AthenaService:
         self._generated_store = GeneratedCapabilityStore(db)
         from athena.research import ResearchStore
         self._research_store = ResearchStore(db)
+        from athena.state.provider_usage import ProviderUsageStore
+        self._provider_usage = ProviderUsageStore(db)
 
         # 2. Credentials (SecretManager owns resolution + leases).
         self._secrets = SecretManager(
@@ -404,6 +407,7 @@ class AthenaService:
             ),
             dispatch_factory=self._dispatch_factory,
             continuation_store=continuations,
+            interpreter=self._make_interpreter(),
         )
         self._kernel = kernel
 
@@ -1763,6 +1767,17 @@ class AthenaService:
                     request_id=new_id("sum"),
                 )
                 parts: list[str] = []
+                usage_id = None
+                if self._provider_usage is not None:
+                    try:
+                        usage_id = await self._provider_usage.record_attempt(
+                            provider=selection.provider,
+                            model=selection.model,
+                            metadata={"role": "summarizer",
+                                      "purpose": "context_compression"},
+                        )
+                    except Exception:
+                        usage_id = None
                 async for event in provider.complete(request):
                     if getattr(event, "type", None) is not None and event.type.value == "done":
                         resp = event.response
@@ -1772,6 +1787,17 @@ class AthenaService:
                                 b.text for b in resp.blocks
                                 if isinstance(b, _TB) and b.text
                             ]
+                            if usage_id is not None:
+                                try:
+                                    usage = getattr(resp, "usage", None)
+                                    await self._provider_usage.record_completion(
+                                        usage_id,
+                                        input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+                                        output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+                                    )
+                                    usage_id = None
+                                except Exception:
+                                    pass
                 summary = " ".join(parts).strip()
                 return summary or None
             except Exception as exc:
@@ -1779,6 +1805,26 @@ class AthenaService:
                 return None
 
         return _summarize
+
+    def _make_interpreter(self):
+        """Build the interpreter fusion extension bound to this service's kernel.
+
+        The broker closes over ``self._kernel`` late: the extension is passed
+        INTO the kernel constructor, so the kernel does not exist yet when
+        this method runs. The closure resolves the kernel at subturn time —
+        if the kernel never lands (construction failure), the broker raises
+        and fusion is skipped (the primary loop is unaffected).
+        """
+        async def _broker(*, context, system_prompt, user_prompt):
+            kernel = self._kernel
+            if kernel is None:
+                raise RuntimeError("interpreter broker: kernel not constructed")
+            return await kernel.interpreter_subturn(
+                context=context, system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
+        return InterpreterExtension(inference_broker=_broker)
 
     @staticmethod
     async def _sync_skills(lifecycle: SkillLifecycle, discovered) -> None:

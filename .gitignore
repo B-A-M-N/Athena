@@ -52,3 +52,6 @@ f-wal
 .env
 .env.*
 !.env.example
+
+# Demo render single-writer locks (runtime artifacts of scripts/render-demo)
+demos/*.gif.lock

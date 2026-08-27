@@ -279,6 +279,31 @@ def _block_of(suspended) -> CapabilityCallBlock:
     )
 
 
+def _observation_from_result(task, result: CapabilityResultBlock):
+    """Build an InterpreterObservation from a failed capability result.
+
+    Keeps the payload small (audit P0.2: producers artifactize anything
+    large); None when there is nothing interpretive to offer.
+    """
+    from athena.interpreter.protocol import InterpreterObservation
+
+    error_text = (result.error or "")[:2000]
+    output_text = (result.output or "")[:4000]
+    if not error_text and not output_text:
+        return None
+    return InterpreterObservation(
+        kind=f"capability.failed:{result.capability_id}",
+        payload={
+            "call_id": result.call_id,
+            "capability_id": result.capability_id,
+            "error": error_text,
+            "output": output_text,
+        },
+        task_id=task.id,
+        session_id=task.session_id,
+    )
+
+
 class AgentKernel:
     """The single authoritative reasoning loop (INV-001).
 
@@ -303,6 +328,7 @@ class AgentKernel:
         provider_usage_store=None,
         continuation_store=None,
         router: "ModelRouter",
+        interpreter=None,
     ) -> None:
         self._task_store = task_store
         self._events = events
@@ -325,6 +351,12 @@ class AgentKernel:
         self._dispatch_factory = dispatch_factory
         self._provider_usage_store = provider_usage_store
         self._continuation_store = continuation_store
+        # Kernel-owned interpreter fusion hook (audit P0.2). The extension
+        # itself carries no authority — it receives observations and returns
+        # proposals; every subturn and every dispatch routes through the
+        # kernel's own inference/dispatch paths. Opt-in: producers only
+        # offer observations when the service wires the extension in.
+        self._interpreter = interpreter
         self._lifecycle = TaskLifecycle(manager=task_manager)
         if budgets is not None:
             self._lifecycle.set_budget_tracker(budgets)
@@ -752,6 +784,28 @@ class AgentKernel:
         }, task)
         return await shim.dispatch(task, [call])
 
+    async def _offer_observation(self, task, state, observation) -> None:
+        """Offer one observation to the interpreter extension and dispatch
+        any proposal it returns through the canonical path.
+
+        One observation → at most one subturn → at most one proposal →
+        canonical dispatch. Failures are logged, never fatal to the primary
+        loop (the result that triggered the observation is already durable).
+        """
+        from athena.interpreter.context import InterpreterContext
+
+        context = InterpreterContext(
+            task_id=task.id,
+            session_id=task.session_id,
+            run_state=state,
+        )
+        proposal = await self._interpreter.interpret(observation, context)
+        if proposal is None:
+            return
+        if not proposal.is_executable():
+            return
+        await self.dispatch_interpreter_proposal(proposal, context)
+
     async def _compile_for_prompts(
         self, task: TaskSpec, *, system: str, user_prompt: str
     ) -> CompiledContext:
@@ -1008,6 +1062,28 @@ class AgentKernel:
             return await self._approval_path(task, state, outcome)
 
         await self._append_results(task, outcome.results)
+        # Loop-side observation producer (audit P0.2 completion): a FAILED
+        # capability result is an execution-grounded observation. Offer it
+        # to the interpreter extension (when the service wired one in) so
+        # the kernel can reason about body failures without piping raw
+        # runtime output into the primary context. The extension's subturn
+        # and its proposal's dispatch both meter through this kernel.
+        if self._interpreter is not None:
+            for result in outcome.results:
+                if not isinstance(result, CapabilityResultBlock):
+                    continue
+                if result.ok:
+                    continue
+                observation = _observation_from_result(task, result)
+                if observation is None:
+                    continue
+                try:
+                    await self._offer_observation(task, state, observation)
+                except Exception:  # noqa: BLE001 — fusion must not kill the loop
+                    _logger.warning(
+                        "interpreter fusion failed for %s observation",
+                        observation.kind, exc_info=True,
+                    )
         exhausted: list[str] = []
         max_cycles = int(response.metadata.get("max_tool_correction_cycles", 2))
         for result in outcome.results:
