@@ -48,6 +48,9 @@ f-shm
 f-wal
 *.db
 
+# Demo render lock files (scripts/render-demo flock artifacts)
+demos/*.lock
+
 # Secrets
 .env
 .env.*

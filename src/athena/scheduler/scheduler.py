@@ -284,6 +284,18 @@ class Scheduler:
                 self._task.cancel()
             self._task = None
 
+    def is_running(self) -> bool:
+        """True iff the background tick loop task exists and is not done.
+
+        Public readiness predicate (health checks read this instead of poking
+        ``_task``). Same semantics as the loop-guard in :meth:`start`: a
+        scheduler that was never started, has been stopped, or whose loop
+        task has already completed reports ``False``.
+        """
+        return self._task is not None and not (
+            self._task.done() if hasattr(self._task, "done") else True
+        )
+
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
