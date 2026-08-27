@@ -71,6 +71,8 @@ def spawn_owned(
         )
         root_abs = os.path.realpath(os.path.abspath(sandbox_root))
         my_env["PATH"] = _namespace_path(my_env.get("PATH", ""), root_abs)
+        if "PYTHONPATH" in my_env:
+            my_env["PYTHONPATH"] = _namespace_path(my_env["PYTHONPATH"], root_abs)
         # The process now starts in the namespace's path.  Passing the host
         # cwd to Popen would be both redundant and misleading.
         cwd = None

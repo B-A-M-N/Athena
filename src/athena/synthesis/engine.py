@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from athena.affordances.models import (
@@ -70,6 +71,21 @@ def _child_code(cap_code_repr: str) -> str:
     )
 
 
+def _namespace_python_paths(
+    paths: Sequence[str], root: str
+) -> tuple[str, ...]:
+    """Map host workspace paths to the sandbox's ``/workspace`` mount."""
+    root_abs = os.path.realpath(os.path.abspath(root))
+    mapped: list[str] = []
+    for path in paths:
+        path_abs = os.path.realpath(os.path.abspath(path))
+        if path_abs == root_abs or path_abs.startswith(root_abs + os.sep):
+            mapped.append("/workspace" + path_abs[len(root_abs):])
+        else:
+            raise ValueError("dependency import path escaped workspace")
+    return tuple(mapped)
+
+
 @dataclass
 class SyntheticCapability:
     """A generated, validated, task-scoped executable capability."""
@@ -112,12 +128,15 @@ class SynthesisEngine:
         self._synthetic: dict[str, SyntheticCapability] = {}
         self._executors: dict[str, object] = {}
 
-    def _child_env(self) -> dict:
+    def _child_env(self, python_paths: Sequence[str] = ()) -> dict:
         if not self._restricted_env:
-            return {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        allowed = ("PATH", "PYTHONIOENCODING", "LANG", "LC_ALL", "TMPDIR")
-        env = {k: os.environ[k] for k in allowed if k in os.environ}
-        env["PYTHONIOENCODING"] = "utf-8"
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        else:
+            allowed = ("PATH", "PYTHONIOENCODING", "LANG", "LC_ALL", "TMPDIR")
+            env = {k: os.environ[k] for k in allowed if k in os.environ}
+            env["PYTHONIOENCODING"] = "utf-8"
+        if python_paths:
+            env["PYTHONPATH"] = os.pathsep.join(python_paths)
         return env
 
     @staticmethod
@@ -136,6 +155,7 @@ class SynthesisEngine:
         timeout: float,
         workspace_root: str | None = None,
         effects: set[str] | None = None,
+        python_paths: Sequence[str] = (),
     ) -> tuple[str, str, int]:
         """Run generated code inside the same namespace boundary as runtimes.
 
@@ -153,7 +173,7 @@ class SynthesisEngine:
         try:
             proc = spawn_owned(
                 [sys.executable, "-c", child],
-                env=self._child_env(),
+                env=self._child_env(python_paths),
                 sandbox_root=root,
                 network_policy=network,
                 sandbox_writable=writable,
@@ -181,6 +201,7 @@ class SynthesisEngine:
         timeout: float,
         workspace_root: str | None = None,
         effects: set[str] | None = None,
+        python_paths: Sequence[str] = (),
     ) -> tuple[str, str, int]:
         """Async equivalent of :meth:`_run_child` for live validation/invocation.
 
@@ -205,7 +226,9 @@ class SynthesisEngine:
             )
             proc = await asyncio.create_subprocess_exec(
                 *argv,
-                env=self._child_env(),
+                env=self._child_env(
+                    _namespace_python_paths(python_paths, root)
+                ),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -342,6 +365,35 @@ class SynthesisEngine:
             }
             return cap
 
+        try:
+            dependency_paths = self._dependency_paths(
+                cap.required_dependencies,
+                workspace_root,
+                expected_fingerprint=None,
+            )
+            dependency_metadata = self._dependency_metadata(
+                cap.required_dependencies, workspace_root
+            )
+        except ValueError as exc:
+            cap.lifecycle_state = "REJECTED"
+            cap.validation = {
+                "tier": source_validation.tier.value,
+                "cases_total": len(cases or []),
+                "cases_passed": 0,
+                "all_passed": False,
+                "source": source_record,
+                "details": [{
+                    "case": "dependencies",
+                    "passed": False,
+                    "error": str(exc),
+                }],
+            }
+            return cap
+        cap.dependency_lock = {
+            **dict(cap.dependency_lock or {}),
+            **dependency_metadata,
+        }
+
         child = _child_code(repr(cap.code))
         from athena.capabilities.registry import validate_schema
 
@@ -352,6 +404,7 @@ class SynthesisEngine:
                 timeout=timeout,
                 workspace_root=workspace_root,
                 effects=self._authority_values(cap),
+                python_paths=dependency_paths,
             )
 
         for i, case in enumerate(cases or []):
@@ -415,6 +468,44 @@ class SynthesisEngine:
         cap.lifecycle_state = "VALIDATED" if cap.validation["all_passed"] else "REJECTED"
         return cap
 
+    @staticmethod
+    def _dependency_paths(
+        requirements: Sequence[DependencyRequirement],
+        workspace_root: str | None,
+        *,
+        expected_fingerprint: str | None,
+    ) -> tuple[str, ...]:
+        if not requirements:
+            return ()
+        if not workspace_root:
+            raise ValueError(
+                "generated capability dependencies require a workspace context"
+            )
+        from athena.execution.dependencies import resolve_dependency_environment
+
+        environment = resolve_dependency_environment(
+            workspace_root,
+            requirements,
+            expected_fingerprint=expected_fingerprint,
+        )
+        return environment.python_path
+
+    @staticmethod
+    def _dependency_metadata(
+        requirements: Sequence[DependencyRequirement],
+        workspace_root: str | None,
+    ) -> dict:
+        if not requirements:
+            return {}
+        if not workspace_root:
+            raise ValueError(
+                "generated capability dependencies require a workspace context"
+            )
+        from athena.execution.dependencies import resolve_dependency_environment
+
+        environment = resolve_dependency_environment(workspace_root, requirements)
+        return environment.to_metadata()
+
     # ------------------------------------------------------------------
     # Registration into the live registry (ephemeral, task-scoped)
     # ------------------------------------------------------------------
@@ -459,15 +550,31 @@ class SynthesisEngine:
                     workspace_root = (
                         context.workspace.root if context is not None else None
                     )
+                    dependency_paths = self.engine._dependency_paths(
+                        cap.required_dependencies,
+                        workspace_root,
+                        expected_fingerprint=(
+                            cap.dependency_lock.get("environment_fingerprint")
+                            if cap.dependency_lock else None
+                        ),
+                    )
                     return await self.engine._run_child_async(
                         child,
                         payload,
                         timeout=30,
                         workspace_root=workspace_root,
                         effects=self.engine._authority_values(cap),
+                        python_paths=dependency_paths,
                     )
 
-                stdout, stderr, returncode = await _run()
+                try:
+                    stdout, stderr, returncode = await _run()
+                except ValueError as exc:
+                    return CapabilityResult(
+                        request.call_id, request.capability_id,
+                        CapabilityResultStatus.FAILED,
+                        error=f"dependency environment unavailable: {exc}",
+                    )
                 ok = returncode == 0 and "__RESULT__" in stdout
                 cap.uses += 1
                 from athena.protocol.messages import utcnow
@@ -694,7 +801,13 @@ class SynthesisEngine:
         _logger.info("ephemeral capability registered: %s", cap.id)
         return True
 
-    def restore_executor(self, generated: GeneratedCapability, *, proof_sink=None):
+    def restore_executor(
+        self,
+        generated: GeneratedCapability,
+        *,
+        proof_sink=None,
+        workspace_root: str | None = None,
+    ):
         """Rehydrate an already validated project/user capability.
 
         The persisted source is syntax/schema checked again before an executor
@@ -738,6 +851,15 @@ class SynthesisEngine:
         _compile_validator(generated.input_schema)
         if generated.output_schema is not None:
             _compile_validator(generated.output_schema)
+        if generated.required_dependencies and workspace_root:
+            self._dependency_paths(
+                generated.required_dependencies,
+                workspace_root,
+                expected_fingerprint=(
+                    generated.dependency_lock.get("environment_fingerprint")
+                    if generated.dependency_lock else None
+                ),
+            )
         proof = dict(generated.proof_record)
         usage = dict(proof.pop("usage", {}))
         cap = SyntheticCapability(

@@ -443,7 +443,9 @@ class AthenaService:
         registry.register(SynthesisCapability(self._synthesis, fabric))
         await fabric.load_persisted(
             lambda generated: self._synthesis.restore_executor(
-                generated, proof_sink=fabric.update_generated_proof,
+                generated,
+                proof_sink=fabric.update_generated_proof,
+                workspace_root=workspace.root,
             ),
             project_id=workspace.id,
             user_id="athena",

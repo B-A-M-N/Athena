@@ -20,6 +20,7 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     EffectClass,
 )
+from athena.execution.dependencies import environment_fingerprint, record_hashes
 from athena.protocol.execution import ExecutionRequest
 from athena.protocol.messages import utcnow
 
@@ -152,22 +153,15 @@ def _record_installed_package(
     resolved_version = str(distribution.version or "")
     if not resolved_version:
         raise ValueError(f"could not resolve installed version for {name}")
-    record_hashes: list[str] = []
-    record_text = distribution.read_text("RECORD")
-    if record_text:
-        for line in record_text.splitlines():
-            parts = line.split(",", 2)
-            if len(parts) >= 2 and parts[1].startswith("sha256="):
-                record_hashes.append(f"{parts[0]}:{parts[1]}")
-        record_hashes.sort()
-    return {
+    hashes = record_hashes(distribution)
+    record = {
         "name": name,
         "manager": "python",
         "requested_version": requested_version or None,
         "resolved_version": resolved_version,
         "source": "python-index",
         "target": target,
-        "record_hashes": record_hashes[:10_000],
+        "record_hashes": hashes,
         "environment": {
             "python": platform.python_version(),
             "implementation": platform.python_implementation(),
@@ -177,6 +171,12 @@ def _record_installed_package(
         "owner": {"task_id": task_id, "call_id": call_id},
         "recorded_at": utcnow().isoformat(),
     }
+    record["environment_fingerprint"] = environment_fingerprint(({
+        "name": name,
+        "resolved_version": resolved_version,
+        "record_hashes": hashes,
+    },))
+    return record
 
 
 def _write_lock(context, record: dict) -> None:

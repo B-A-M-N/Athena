@@ -3,21 +3,64 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+from types import SimpleNamespace
 
 import pytest
 
 from athena.capabilities.registry import CapabilityRegistry
-from athena.affordances.models import DependencyRequirement, AffordanceScope
+from athena.affordances.models import (
+    AffordanceScope,
+    DependencyRequirement,
+    GeneratedCapability,
+)
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResultStatus,
     EffectClass,
 )
 from athena.protocol.errors import CapabilityUnavailable
+from athena.protocol.tasks import WorkspaceSpec
+from athena.execution.dependencies import environment_fingerprint
 from athena.synthesis.engine import SynthesisEngine
 
 GOOD_CODE = "def run(args):\n    return {'echo': args.get('msg', '')}\n"
 BAD_CODE = "def run(args):\n    raise RuntimeError('boom')\n"
+
+
+def _write_locked_dependency(root):
+    target = root / ".athena" / "dependencies"
+    package = target / "demo_dep"
+    dist_info = target / "demo_dep-1.2.3.dist-info"
+    package.mkdir(parents=True)
+    dist_info.mkdir()
+    content = b"VALUE = 'from locked dependency'\n"
+    (package / "__init__.py").write_bytes(content)
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: demo-dep\nVersion: 1.2.3\n"
+    )
+    digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest())
+    digest = digest.rstrip(b"=").decode("ascii")
+    record_line = f"demo_dep/__init__.py,sha256={digest},{len(content)}\n"
+    (dist_info / "RECORD").write_text(record_line)
+    package_record = {
+        "name": "demo-dep",
+        "resolved_version": "1.2.3",
+        "record_hashes": [f"demo_dep/__init__.py:sha256={digest}"],
+    }
+    environment = environment_fingerprint((package_record,))
+    (root / ".athena" / "dependencies.lock.json").write_text(json.dumps({
+        "format": 1,
+        "packages": {
+            "demo-dep": {
+                "resolved_version": "1.2.3",
+                "record_hashes": package_record["record_hashes"],
+                "environment_fingerprint": environment,
+            }
+        },
+    }))
+    return environment
 
 
 def _make_cap(engine, code=GOOD_CODE, name="greeter"):
@@ -50,6 +93,92 @@ async def test_validate_catches_failing_case():
     result = await engine.validate(cap, [{"args": {}}])
     assert result.validation["all_passed"] is False
     assert result.validation["cases_passed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_required_dependencies_are_importable_only_from_verified_lock(tmp_path):
+    environment = _write_locked_dependency(tmp_path)
+    engine = SynthesisEngine()
+    cap = engine.synthesize(
+        name="dependency_helper",
+        description="uses a locked workspace dependency",
+        code=(
+            "import demo_dep\n\n"
+            "def run(args):\n"
+            "    return {'value': demo_dep.VALUE}\n"
+        ),
+        input_schema={"type": "object", "additionalProperties": False},
+        required_dependencies=(DependencyRequirement("demo-dep", version="1.2.3"),),
+        task_id="task-deps",
+    )
+
+    validated = await engine.validate(
+        cap, [{"args": {}, "expect_output_contains": "from locked dependency"}],
+        workspace_root=str(tmp_path),
+    )
+
+    if not validated.validation["all_passed"]:
+        raise AssertionError(json.dumps(validated.validation, indent=2, default=str))
+    assert validated.dependency_lock["environment_fingerprint"] == environment
+    registry = CapabilityRegistry()
+    assert engine.register_ephemeral(registry, validated) is True
+    result = await registry.executor_for("synth_dependency_helper").invoke(
+        CapabilityRequest(
+            capability_id="synth_dependency_helper",
+            arguments={},
+            task_id="task-deps",
+            call_id="call-deps",
+        ),
+        context=SimpleNamespace(workspace=WorkspaceSpec(
+            id="repo", root=str(tmp_path)
+        )),
+    )
+    assert result.status is CapabilityResultStatus.OK
+    assert json.loads(result.output) == {"value": "from locked dependency"}
+
+
+@pytest.mark.asyncio
+async def test_required_dependency_without_lock_is_rejected(tmp_path):
+    target = tmp_path / ".athena" / "dependencies"
+    (target / "demo_dep").mkdir(parents=True)
+    (target / "demo_dep" / "__init__.py").write_text("VALUE = 'unlocked'\n")
+    engine = SynthesisEngine()
+    cap = engine.synthesize(
+        name="unlocked_helper",
+        description="must not use an unrecorded import",
+        code="import demo_dep\ndef run(args):\n    return demo_dep.VALUE\n",
+        required_dependencies=(DependencyRequirement("demo-dep"),),
+    )
+
+    rejected = await engine.validate(cap, [{"args": {}}], workspace_root=str(tmp_path))
+
+    assert rejected.validation["all_passed"] is False
+    assert rejected.validation["details"][0]["case"] == "dependencies"
+    assert "lock" in rejected.validation["details"][0]["error"]
+
+
+def test_restore_rejects_changed_dependency_environment(tmp_path):
+    _write_locked_dependency(tmp_path)
+    engine = SynthesisEngine()
+    generated = engine._generated_record(
+        engine.synthesize(
+            name="restore_dependency",
+            description="restore check",
+            code="import demo_dep\n\n\ndef run(args):\n    return demo_dep.VALUE\n",
+            required_dependencies=(DependencyRequirement("demo-dep", version="1.2.3"),),
+        ),
+        scope=AffordanceScope.PROJECT,
+        project_scope="repo",
+    )
+    generated = GeneratedCapability.from_record({
+        **generated.to_record(), "dependency_lock": {
+            **dict(generated.dependency_lock),
+            "environment_fingerprint": "changed",
+        }
+    })
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        engine.restore_executor(generated, workspace_root=str(tmp_path))
 
 
 @pytest.mark.asyncio
