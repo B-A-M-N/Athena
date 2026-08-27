@@ -355,9 +355,15 @@ class OIFrameBuffer:
             fill=(9, 20, 39, 245), width=stroke,
         )
         eye_y = y - scale // 3 + (1 if phase > 0.72 else 0)
+        eye_shift = 0
+        if status in {"READING", "SEARCHING", "INSPECTING"}:
+            eye_shift = int((phase - 0.5) * max(scale // 2, 1))
+        elif status in {"FAILURE", "BLOCKED"}:
+            eye_shift = -max(scale // 4, 1)
         eye = bad if status in {"FAILURE", "BLOCKED"} else ink
-        draw.ellipse((x - scale * 2 + stroke, eye_y, x - scale + stroke, eye_y + max(2, scale // 2)), fill=eye)
-        draw.ellipse((x + scale - stroke, eye_y, x + scale * 2 - stroke, eye_y + max(2, scale // 2)), fill=eye)
+        eye_height = max(2, scale // 2)
+        draw.ellipse((x - scale * 2 + stroke + eye_shift, eye_y, x - scale + stroke + eye_shift, eye_y + eye_height), fill=eye)
+        draw.ellipse((x + scale - stroke + eye_shift, eye_y, x + scale * 2 - stroke + eye_shift, eye_y + eye_height), fill=eye)
         # Antenna and feet make the silhouette readable at small CRT sizes.
         antenna_x = x + (scale if phase > 0.5 else -scale)
         draw.line((x, body_top, antenna_x, y - scale * 4), fill=color, width=stroke)
@@ -365,12 +371,25 @@ class OIFrameBuffer:
         draw.line((x - scale * 2, body_bottom, x - scale * 3, body_bottom + scale), fill=color, width=stroke)
         draw.line((x + scale * 2, body_bottom, x + scale * 3, body_bottom + scale), fill=color, width=stroke)
 
-        # State-specific props stay inside the OI viewport: an execution
-        # pulse, an approval card, or a failure marker.  These are visual
+        # State-specific clips stay inside the OI viewport. They are visual
         # explanations of canonical state, never synthetic progress.
-        if status in {"EXECUTING", "READING", "SEARCHING"}:
+        if status == "THINKING":
+            antenna_x = x + (scale * 2 if phase > 0.5 else -scale * 2)
+            draw.arc((x - scale * 5, y - scale * 5, x + scale * 5, y + scale * 5), 205, 335, fill=color, width=stroke)
+        elif status in {"READING", "SEARCHING", "INSPECTING"}:
+            scan_y = screen_top + int((phase % 1.0) * max(screen_bottom - screen_top, 1))
+            draw.line((x - scale * 2, scan_y, x + scale * 2, scan_y), fill=color, width=stroke)
+            if status == "SEARCHING":
+                draw.arc((x + body_w, y - scale, x + body_w + scale * 3, y + scale * 2), 250, 80, fill=color, width=stroke)
+            elif status == "INSPECTING":
+                draw.ellipse((x + body_w, y - scale * 2, x + body_w + scale * 2, y), outline=color, width=stroke)
+                draw.line((x + body_w + scale, y, x + body_w + scale * 2, y + scale), fill=color, width=stroke)
+        elif status in {"EXECUTING", "DELEGATED"}:
             pulse = int((phase % 1.0) * scale * 3)
             draw.arc((x - body_w - pulse, y - scale * 3 - pulse, x + body_w + pulse, y + scale * 3 + pulse), 200, 340, fill=color, width=stroke)
+            if status == "DELEGATED":
+                draw.line((x + body_w, y, x + body_w + scale * 2, y - scale * 2), fill=color, width=stroke)
+                draw.line((x + body_w, y, x + body_w + scale * 2, y + scale * 2), fill=color, width=stroke)
         elif status == "APPROVAL":
             card_x = x + body_w + scale
             draw.rounded_rectangle((card_x, y - scale, card_x + scale * 4, y + scale * 2), radius=2, outline=warn, fill=(30, 35, 54, 245), width=stroke)
@@ -378,6 +397,21 @@ class OIFrameBuffer:
         elif status in {"FAILURE", "BLOCKED"}:
             draw.line((x + body_w + scale, y - scale, x + body_w + scale * 2, y + scale), fill=bad, width=stroke)
             draw.line((x + body_w + scale * 2, y - scale, x + body_w + scale, y + scale), fill=bad, width=stroke)
+            draw.line((x - body_w - scale, y + scale, x - body_w, y + scale * 2), fill=bad, width=stroke)
+        elif status == "RECOVERING":
+            draw.arc((x - body_w - scale * 2, y - scale * 2, x + body_w + scale * 2, y + scale * 2), 190, 350, fill=color, width=stroke)
+            draw.line((x - body_w - scale, y - scale, x - body_w - scale * 2, y), fill=color, width=stroke)
+        elif status in {"SUCCESS", "COMPLETE"}:
+            draw.arc((x - body_w - scale, y - scale * 4, x + body_w + scale, y + scale * 4), 190, 350, fill=color, width=stroke)
+            draw.line((x + body_w + scale, y, x + body_w + scale * 2, y + scale), fill=color, width=stroke)
+            draw.line((x + body_w + scale * 2, y + scale, x + body_w + scale * 4, y - scale), fill=color, width=stroke)
+        elif status in {"GENERATED", "GENERATED_TOOL", "CONSTRUCTING"}:
+            cube_x = x + body_w + scale
+            draw.polygon(
+                [(cube_x, y), (cube_x + scale, y - scale // 2),
+                 (cube_x + scale * 2, y), (cube_x + scale, y + scale // 2)],
+                outline=color,
+            )
 
         self._text(draw, (x - body_w, body_bottom + scale + 1), status.lower(), self._font(max(9, scale // 2)), color)
 
