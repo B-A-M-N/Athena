@@ -24,8 +24,10 @@ import json
 import os
 import socket
 import subprocess
+from typing import Any
 from urllib.parse import urlparse
 
+from athena.network import pinned_sync_transport, resolve_addresses
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
@@ -180,25 +182,68 @@ class NetworkCapability:
         description=(
             "Network diagnostics: HTTP requests (method/headers/body), raw "
             "TCP connect probes, DNS resolution, listening sockets, active "
-            "connections, ping. Read-only observations of machine networking."
+            "connections, ping. Restricted outbound requests pin the DNS "
+            "address checked by policy."
         ),
         input_schema={
-            "type": "object",
-            "required": ["operation"],
-            "properties": {
-                "operation": {"type": "string", "enum": [
-                    "http", "tcp_connect", "dns", "listeners",
-                    "connections", "ping"]},
-                "url": {"type": "string"},
-                "method": {"type": "string"},
-                "host": {"type": "string"},
-                "port": {"type": "integer"},
-                "name": {"type": "string"},
-                "timeout": {"type": "number"},
-                "headers": {"type": "object", "additionalProperties": {"type": "string"}},
-                "body": {"type": "string"},
-                "follow_redirects": {"type": "boolean"},
-            },
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"const": "http"},
+                        "url": {"type": "string", "minLength": 1},
+                        "method": {"type": "string", "minLength": 1, "maxLength": 16},
+                        "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30},
+                        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "body": {"type": "string", "maxLength": 2_000_000},
+                        "follow_redirects": {"type": "boolean"},
+                    },
+                    "required": ["operation", "url"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"const": "tcp_connect"},
+                        "host": {"type": "string", "minLength": 1},
+                        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                        "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30},
+                    },
+                    "required": ["operation", "host", "port"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"const": "dns"},
+                        "name": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["operation", "name"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {"operation": {"const": "listeners"}},
+                    "required": ["operation"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {"operation": {"const": "connections"}},
+                    "required": ["operation"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"const": "ping"},
+                        "host": {"type": "string", "minLength": 1},
+                        "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30},
+                    },
+                    "required": ["operation", "host"],
+                    "additionalProperties": False,
+                },
+            ],
         },
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.NETWORK_READ,
                            EffectClass.NETWORK_WRITE}),
@@ -223,7 +268,7 @@ class NetworkCapability:
             return _result(request, ok=False,
                            error="network denied by workspace policy")
 
-        def _check_restricted_host(host: str) -> str | None:
+        def _restricted_addresses(host: str) -> tuple[str | None, tuple[str, ...]]:
             """Reject localhost/private/metadata targets in restricted mode.
 
             Resolve names before connecting so a public-looking hostname that
@@ -232,20 +277,19 @@ class NetworkCapability:
             restricted mode because a redirect target is a new destination.
             """
             if policy_name != "restricted":
-                return None
+                return None, ()
             candidate = host.strip().strip("[]").lower().rstrip(".")
             if not candidate or candidate in {"localhost", "localhost.localdomain"}:
-                return "restricted network policy rejects local targets"
+                return "restricted network policy rejects local targets", ()
             try:
                 addresses = {ipaddress.ip_address(candidate)}
+                address_strings: tuple[str, ...] = (candidate,)
             except ValueError:
                 try:
-                    addresses = {
-                        ipaddress.ip_address(info[4][0])
-                        for info in socket.getaddrinfo(candidate, None)
-                    }
+                    address_strings = resolve_addresses(candidate, 0)
+                    addresses = {ipaddress.ip_address(address) for address in address_strings}
                 except (OSError, socket.gaierror):
-                    return f"unable to resolve host under restricted network policy: {host}"
+                    return f"unable to resolve host under restricted network policy: {host}", ()
             if any(
                 address.is_private
                 or address.is_loopback
@@ -255,8 +299,8 @@ class NetworkCapability:
                 or address.is_unspecified
                 for address in addresses
             ):
-                return f"restricted network policy rejects private/local host: {host}"
-            return None
+                return f"restricted network policy rejects private/local host: {host}", ()
+            return None, tuple(address_strings)
 
         if op == "http":
             url = str(args.get("url") or "")
@@ -267,7 +311,8 @@ class NetworkCapability:
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 return _result(request, ok=False,
                                error="url must use http or https and include a host")
-            restricted_error = _check_restricted_host(parsed.hostname)
+            hostname = parsed.hostname
+            restricted_error, pinned_addresses = _restricted_addresses(hostname)
             if restricted_error:
                 return _result(request, ok=False, error=restricted_error)
             follow_redirects = bool(args.get("follow_redirects", False))
@@ -278,22 +323,35 @@ class NetworkCapability:
             import httpx
 
             def _http():
-                with httpx.Client(
-                    timeout=timeout,
-                    follow_redirects=follow_redirects,
-                ) as c:
-                    resp = c.request(
-                        method, url,
+                client_args: dict[str, Any] = {
+                    "timeout": timeout,
+                    "follow_redirects": follow_redirects,
+                }
+                if policy_name == "restricted":
+                    client_args["trust_env"] = False
+                    client_args["transport"] = pinned_sync_transport(
+                        hostname, pinned_addresses
+                    )
+                with httpx.Client(**client_args) as c:
+                    with c.stream(
+                        method,
+                        url,
                         headers=dict(args.get("headers") or {}),
                         content=args.get("body"),
-                    )
-                    body = resp.text
-                    return {
-                        "status": resp.status_code,
-                        "headers": dict(resp.headers),
-                        "body_head": body[:2000],
-                        "elapsed_ms": int(resp.elapsed.total_seconds() * 1000),
-                    }
+                    ) as resp:
+                        body = b""
+                        for chunk in resp.iter_bytes():
+                            body += chunk
+                            if len(body) >= 8192:
+                                body = body[:8192]
+                                break
+                        return {
+                            "status": resp.status_code,
+                            "headers": dict(resp.headers),
+                            "body_head": body.decode(resp.encoding or "utf-8", errors="replace"),
+                            "body_truncated": len(body) >= 8192,
+                            "elapsed_ms": int(resp.elapsed.total_seconds() * 1000),
+                        }
 
             try:
                 info = await loop.run_in_executor(None, _http)
@@ -307,7 +365,7 @@ class NetworkCapability:
             port = int(args.get("port") or 0)
             if not (0 < port < 65536):
                 return _result(request, ok=False, error="valid port required")
-            restricted_error = _check_restricted_host(host)
+            restricted_error, pinned_addresses = _restricted_addresses(host)
             if restricted_error:
                 return _result(request, ok=False, error=restricted_error)
 
@@ -315,7 +373,7 @@ class NetworkCapability:
                 s = socket.socket()
                 s.settimeout(timeout)
                 try:
-                    s.connect((host, port))
+                    s.connect((pinned_addresses[0] if pinned_addresses else host, port))
                     return True
                 except OSError:
                     return False
@@ -329,7 +387,7 @@ class NetworkCapability:
 
         if op == "dns":
             name = str(args.get("name") or "localhost")
-            restricted_error = _check_restricted_host(name)
+            restricted_error, _ = _restricted_addresses(name)
             if restricted_error:
                 return _result(request, ok=False, error=restricted_error)
 
@@ -362,12 +420,13 @@ class NetworkCapability:
             host = str(args.get("host") or "")
             if not host:
                 return _result(request, ok=False, error="host required")
-            restricted_error = _check_restricted_host(host)
+            restricted_error, pinned_addresses = _restricted_addresses(host)
             if restricted_error:
                 return _result(request, ok=False, error=restricted_error)
 
             def _pg():
-                rc, out, err = _run(["ping", "-c", "3", "-W", "2", host])
+                target = pinned_addresses[0] if pinned_addresses else host
+                rc, out, err = _run(["ping", "-c", "3", "-W", "2", target])
                 return rc, out or err
 
             rc, out = await loop.run_in_executor(None, _pg)

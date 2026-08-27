@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from athena.network import pinned_async_transport
 from athena.protocol.artifacts import parse_artifact_uri
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
@@ -265,11 +266,13 @@ class ResearchCapability:
         chunks: list[bytes] = []
         size = 0
         try:
+            transport = pinned_async_transport(host, resolved_addresses)
             async with httpx.AsyncClient(
                 timeout=timeout,
                 follow_redirects=False,
                 trust_env=False,
                 headers={"User-Agent": "Athena-Research/1"},
+                transport=transport,
             ) as client, client.stream("GET", canonical) as response:
                     if response.status_code >= 300:
                         location = response.headers.get("location")
