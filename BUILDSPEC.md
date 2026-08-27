@@ -5623,3 +5623,87 @@ The success condition is:
 > **Athena retains the leverage of those systems without retaining the architectural coupling that made them large.**
 
 That principle governs every implementation decision in this document.
+
+---
+
+# 171. Programmable Affordance Fabric
+
+Athena MUST expose a governed effective affordance surface, not only a static
+global capability registry. The effective surface is the composition of:
+
+```text
+global capabilities
+    + project overlay
+    + task overlay
+    + user overlay
+    + external capabilities
+    + declarative workflows
+    + selected skills and project knowledge
+```
+
+The fabric MUST preserve these boundaries:
+
+```text
+AgentKernel       decides
+Workflow          deterministically composes
+Capability        performs one governed operation
+Skill/Memory      supplies knowledge
+PolicyEngine      authorizes
+ExecutionManager  executes
+State stores      record
+```
+
+Task-local generated machinery MUST disappear at terminal task cleanup unless
+explicitly promoted. Project and user promotion MUST be explicit, versioned,
+provenance-bearing, and policy/approval controlled. SYSTEM promotion is a
+normal Athena release operation and MUST NOT be autonomous.
+
+Scratch programs MAY be cheap and ephemeral, but they MUST use the canonical
+restricted execution path. Generated capabilities MUST carry code/schema
+hashes, scope, dependencies, provenance, validation state, and proof/evidence
+references. Declared effects are requests only: effective authority MUST be
+calculated outside generated code and enforced by policy and the execution
+backend.
+
+Athena MUST expose a task-scoped generated-tool admission route. The route
+MUST require a Task, validate source and schema before registration, return a
+stable capability identity plus validation proof, and install only into that
+Task's capability overlay. Promotion to project/user scope MUST be explicit;
+creation MUST NOT silently replace a native or external capability.
+
+Workflows MUST be declarative, inspectable, persistable, nestable, and
+composed from ordinary capabilities/workflows. They MUST NOT contain a hidden
+reasoning loop or bypass capability policy. Synthesis, validation, observation,
+verification, and recovery MAY themselves be represented as workflows.
+
+The kernel SHOULD use reflection to retrieve relevant capabilities,
+workflows, skills, runtimes, dependencies, permissions, and project
+affordances rather than injecting the complete global inventory into every
+model turn.
+
+The complete target model, lifecycle, validation tiers, promotion scopes, and
+current alignment boundary are documented in `docs/ARCHITECTURE.md`.
+
+# 172. Evidence/Research Fabric
+
+Athena MUST provide a durable Evidence/Research Fabric distinct from ordinary
+Memory, Skills, Capabilities, and Workflows. It MUST persist versioned source
+records, content hashes or immutable snapshot references, bounded evidence
+objects with exact supporting excerpts and locators, evidence-to-claim links,
+corroboration/contradiction relations, and research gaps.
+
+Source authority classification MUST NOT be treated as permission. Any future
+external acquisition route MUST enforce an explicit source policy before
+fetching, including domain allowlisting and private/local-network controls.
+The current `research` capability provides durable record/list/search/verify
+operations over captured sources; it MUST NOT be described as a crawler or
+internet research agent until acquisition, indexing, and citation verification
+are implemented through the canonical capability/policy/execution path.
+
+Research planning MUST be represented by ordinary Tasks and declarative
+Workflows. Archivist-style retrieval or critique MUST NOT create a second
+reasoning authority or bypass Athena's AgentKernel, PolicyEngine,
+ExecutionManager, ArtifactStore, or event ledger. Research evidence MAY guide
+Machinist-style generated machinery, and generated machinery MAY create
+structured observations, but both directions MUST retain provenance and
+inherited authority.

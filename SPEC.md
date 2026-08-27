@@ -154,6 +154,18 @@ Interfaces transport messages.
 
 None of those components gets its own competing agent loop.
 
+Athena's capability surface is a programmable **Affordance Fabric**, not a
+closed list of predefined tools. The fabric combines native and external
+capabilities with task/project overlays, scratch computation, generated
+capabilities, declarative workflows, and reusable skills. When an existing
+affordance is insufficient, the AgentKernel may choose to compose an existing
+workflow, construct deterministic machinery, acquire a dependency through
+policy, or preserve procedural knowledge. These are all strategies inside the
+same Task and event model; none creates a second reasoning authority.
+
+The detailed developer architecture and its explicit implemented-versus-target
+boundary live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ---
 
 # 4. What Athena Takes From Hermes
@@ -3266,4 +3278,38 @@ Open Interpreter Classic provides much of the model for **how Athena should act 
 Athena's contribution is the boundary between those concerns.
 
 That boundary is what makes the smaller system possible.
+
+---
+
+# 92. Evidence and Research Fabric
+
+Athena's durable knowledge model distinguishes:
+
+```text
+Memory       useful remembered conclusion
+Skill        procedural knowledge
+Evidence     why a factual claim is believed
+Capability   governed callable operation
+Workflow     deterministic composition/procedure
+```
+
+The Evidence/Research Fabric MUST store versioned `SourceRecord`s, bounded
+`EvidenceObject`s, evidence-to-claim links, contradiction/corroboration links,
+and open `ResearchGap`s. A source record SHOULD reference an immutable
+ArtifactStore snapshot and content hash. An evidence object MUST retain its
+source identity, extracted claim, exact supporting excerpt, locator, and
+extraction provenance.
+
+Source classification is a ranking signal, not an authorization decision.
+External acquisition MUST pass an explicit pre-fetch source policy, including
+domain and private-network controls. Network acquisition, retrieval, indexing,
+gap analysis, and citation verification MUST use ordinary Athena capabilities
+and workflows under the canonical PolicyEngine and ExecutionManager path.
+
+Archivist-style research planning MUST NOT introduce a second reasoning loop.
+The AgentKernel remains the only component that interprets observations,
+replans, and decides completion. Research MAY inform generated capability or
+workflow construction, and generated machinery MAY produce structured research
+observations, but both remain subject to inherited authority and durable
+provenance.
 :::
