@@ -7,7 +7,7 @@ one task, one budget envelope, one cancellation token.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 __all__ = ["InterpreterContext"]

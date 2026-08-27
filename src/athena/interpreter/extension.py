@@ -28,7 +28,6 @@ from athena.interpreter.context import InterpreterContext
 from athena.interpreter.protocol import (
     InterpreterObservation,
     InterpreterProposal,
-    ProposalStatus,
 )
 
 __all__ = ["InterpreterExtension"]

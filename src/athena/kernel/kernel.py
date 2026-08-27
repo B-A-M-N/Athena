@@ -25,7 +25,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from athena.context.compiler import CompiledContext, ContextCompiler
 from athena.models.registry import ProviderRegistry
@@ -84,6 +84,9 @@ from athena.kernel.lifecycle import TaskLifecycle
 from athena.kernel.termination import TerminationDecision, TerminationEvaluator
 from athena.interpreter.context import InterpreterContext  # noqa: F401 (annotation)
 from athena.interpreter.protocol import InterpreterProposal  # noqa: F401 (annotation)
+
+if TYPE_CHECKING:
+    from athena.models.router import ModelRouter
 
 __all__ = ["AgentKernel"]
 
