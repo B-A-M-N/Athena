@@ -257,7 +257,7 @@ class AthenaService:
         from athena.research import ResearchStore
         self._research_store = ResearchStore(db)
         from athena.state.provider_usage import ProviderUsageStore
-        self._provider_usage = ProviderUsageStore(db)
+        self._provider_usage_store = ProviderUsageStore(db)
 
         # 2. Credentials (SecretManager owns resolution + leases).
         self._secrets = SecretManager(
@@ -1768,9 +1768,9 @@ class AthenaService:
                 )
                 parts: list[str] = []
                 usage_id = None
-                if self._provider_usage is not None:
+                if self._provider_usage_store is not None:
                     try:
-                        usage_id = await self._provider_usage.record_attempt(
+                        usage_id = await self._provider_usage_store.record_attempt(
                             provider=selection.provider,
                             model=selection.model,
                             metadata={"role": "summarizer",
@@ -1790,7 +1790,7 @@ class AthenaService:
                             if usage_id is not None:
                                 try:
                                     usage = getattr(resp, "usage", None)
-                                    await self._provider_usage.record_completion(
+                                    await self._provider_usage_store.record_completion(
                                         usage_id,
                                         input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
                                         output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
