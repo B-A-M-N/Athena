@@ -26,9 +26,9 @@ OpenGL proof compositor, handles keyboard/resize events, and accepts serialized
 projection frames containing terminal text plus structured scene entities and
 alerts. `athena.cli.native_bridge` emits those newline-delimited frames from
 the same `ProjectionState` used by hosted Glass and `oi-stream`. The glyph
-renderer, selection/clipboard integration,
-cross-platform window backends, and live Python service bridge remain in
-development.
+renderer, cross-platform window backends, and live Python service bridge remain
+in development. The Linux/X11 proof path now provides mouse selection and
+Ctrl-Shift-C/Ctrl-Shift-V clipboard integration over the Alacritty grid.
 
 The native frontend must preserve these boundaries:
 

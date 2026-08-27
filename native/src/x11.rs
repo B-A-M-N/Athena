@@ -29,10 +29,19 @@ type Colormap = c_ulong;
 type GLXContext = *mut c_void;
 
 const KEY_PRESS: c_int = 2;
+const BUTTON_PRESS: c_int = 4;
+const BUTTON_RELEASE: c_int = 5;
+const MOTION_NOTIFY: c_int = 6;
+const SELECTION_CLEAR: c_int = 29;
+const SELECTION_REQUEST: c_int = 30;
+const SELECTION_NOTIFY: c_int = 31;
 const DESTROY_NOTIFY: c_int = 17;
 const CONFIGURE_NOTIFY: c_int = 22;
 const CLIENT_MESSAGE: c_int = 33;
 const KEY_PRESS_MASK: c_long = 1;
+const BUTTON_PRESS_MASK: c_long = 1 << 2;
+const BUTTON_RELEASE_MASK: c_long = 1 << 3;
+const POINTER_MOTION_MASK: c_long = 1 << 6;
 const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
 const EXPOSURE_MASK: c_long = 1 << 15;
 const CW_EVENT_MASK: c_ulong = 1 << 11;
@@ -50,6 +59,11 @@ const GL_LINES: u32 = 0x0001;
 const GL_LINE_LOOP: u32 = 0x0002;
 const GL_PROJECTION: u32 = 0x1701;
 const GL_MODELVIEW: u32 = 0x1700;
+const SHIFT_MASK: CUint = 1;
+const CONTROL_MASK: CUint = 1 << 2;
+const BUTTON1_MASK: CUint = 1 << 8;
+const CURRENT_TIME: c_ulong = 0;
+const PROP_MODE_REPLACE: c_int = 0;
 
 #[repr(C)]
 struct XVisualInfo {
@@ -126,6 +140,71 @@ struct XKeyEvent {
     same_screen: c_int,
 }
 
+#[repr(C)]
+struct XButtonEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    window: Window,
+    root: Window,
+    subwindow: Window,
+    time: c_ulong,
+    x: c_int,
+    y: c_int,
+    x_root: c_int,
+    y_root: c_int,
+    state: CUint,
+    button: CUint,
+    same_screen: c_int,
+}
+
+#[repr(C)]
+struct XMotionEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    window: Window,
+    root: Window,
+    subwindow: Window,
+    time: c_ulong,
+    x: c_int,
+    y: c_int,
+    x_root: c_int,
+    y_root: c_int,
+    state: CUint,
+    is_hint: c_char,
+    same_screen: c_int,
+}
+
+#[repr(C)]
+struct XSelectionRequestEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    owner: Window,
+    requestor: Window,
+    selection: Atom,
+    target: Atom,
+    property: Atom,
+    time: c_ulong,
+}
+
+#[repr(C)]
+struct XSelectionEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    requestor: Window,
+    selection: Atom,
+    target: Atom,
+    property: Atom,
+    time: c_ulong,
+}
+
 type CUint = u32;
 
 #[repr(C)]
@@ -168,6 +247,48 @@ unsafe extern "C" {
         count: c_int,
     ) -> c_int;
     fn XMapWindow(display: *mut Display, window: Window) -> c_int;
+    fn XSetSelectionOwner(display: *mut Display, selection: Atom, owner: Window, time: c_ulong);
+    fn XConvertSelection(
+        display: *mut Display,
+        selection: Atom,
+        target: Atom,
+        property: Atom,
+        requestor: Window,
+        time: c_ulong,
+    );
+    fn XChangeProperty(
+        display: *mut Display,
+        window: Window,
+        property: Atom,
+        type_: Atom,
+        format: c_int,
+        mode: c_int,
+        data: *const u8,
+        nelements: c_int,
+    );
+    fn XGetWindowProperty(
+        display: *mut Display,
+        window: Window,
+        property: Atom,
+        long_offset: c_long,
+        long_length: c_long,
+        delete: c_int,
+        req_type: Atom,
+        actual_type: *mut Atom,
+        actual_format: *mut c_int,
+        nitems: *mut c_ulong,
+        bytes_after: *mut c_ulong,
+        prop: *mut *mut u8,
+    ) -> c_int;
+    fn XDeleteProperty(display: *mut Display, window: Window, property: Atom);
+    fn XSendEvent(
+        display: *mut Display,
+        window: Window,
+        propagate: c_int,
+        event_mask: c_long,
+        event: *mut XEvent,
+    ) -> c_int;
+    fn XFree(data: *mut c_void) -> c_int;
     fn XPending(display: *mut Display) -> c_int;
     fn XNextEvent(display: *mut Display, event: *mut XEvent) -> c_int;
     fn XLookupString(
@@ -226,6 +347,180 @@ unsafe extern "C" {
     fn glColor3f(red: f32, green: f32, blue: f32);
     fn glLineWidth(width: f32);
     fn glVertex2f(x: f32, y: f32);
+}
+
+struct Clipboard {
+    clipboard: Atom,
+    primary: Atom,
+    utf8_string: Atom,
+    string: Atom,
+    targets: Atom,
+    atom: Atom,
+    property: Atom,
+    text: String,
+}
+
+impl Clipboard {
+    fn new(display: *mut Display) -> Self {
+        Self {
+            clipboard: intern_atom(display, "CLIPBOARD"),
+            primary: intern_atom(display, "PRIMARY"),
+            utf8_string: intern_atom(display, "UTF8_STRING"),
+            string: intern_atom(display, "STRING"),
+            targets: intern_atom(display, "TARGETS"),
+            atom: intern_atom(display, "ATOM"),
+            property: intern_atom(display, "ATHENA_SELECTION"),
+            text: String::new(),
+        }
+    }
+
+    fn own(&mut self, display: *mut Display, window: Window, text: String) {
+        self.text = text;
+        unsafe {
+            XSetSelectionOwner(display, self.primary, window, CURRENT_TIME);
+            XSetSelectionOwner(display, self.clipboard, window, CURRENT_TIME);
+        }
+    }
+
+    fn request(&self, display: *mut Display, window: Window) {
+        unsafe {
+            XConvertSelection(
+                display,
+                self.clipboard,
+                self.utf8_string,
+                self.property,
+                window,
+                CURRENT_TIME,
+            );
+            XFlush(display);
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        display: *mut Display,
+        window: Window,
+        event: &mut XEvent,
+    ) -> Option<Vec<u8>> {
+        match event.type_ {
+            SELECTION_REQUEST => {
+                let request =
+                    unsafe { &*((&mut *event) as *mut XEvent as *const XSelectionRequestEvent) };
+                self.respond(display, request);
+                None
+            }
+            SELECTION_NOTIFY => {
+                let notification =
+                    unsafe { &*((&mut *event) as *mut XEvent as *const XSelectionEvent) };
+                if notification.requestor != window || notification.property == 0 {
+                    return None;
+                }
+                let mut actual_type = 0;
+                let mut actual_format = 0;
+                let mut nitems = 0;
+                let mut bytes_after = 0;
+                let mut data: *mut u8 = ptr::null_mut();
+                let status = unsafe {
+                    XGetWindowProperty(
+                        display,
+                        window,
+                        notification.property,
+                        0,
+                        1_048_576,
+                        1,
+                        self.utf8_string,
+                        &mut actual_type,
+                        &mut actual_format,
+                        &mut nitems,
+                        &mut bytes_after,
+                        &mut data,
+                    )
+                };
+                if status != 0 || actual_format != 8 || data.is_null() {
+                    if !data.is_null() {
+                        unsafe { XFree(data.cast()) };
+                    }
+                    return None;
+                }
+                let bytes = unsafe { std::slice::from_raw_parts(data, nitems as usize).to_vec() };
+                unsafe {
+                    XFree(data.cast());
+                    XDeleteProperty(display, window, notification.property);
+                }
+                Some(bytes)
+            }
+            SELECTION_CLEAR => {
+                self.text.clear();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn respond(&self, display: *mut Display, request: &XSelectionRequestEvent) {
+        let property = if request.property == 0 {
+            request.target
+        } else {
+            request.property
+        };
+        let mut accepted = property;
+        unsafe {
+            if request.target == self.targets {
+                let targets = [self.utf8_string, self.string, self.targets];
+                XChangeProperty(
+                    display,
+                    request.requestor,
+                    property,
+                    self.atom,
+                    32,
+                    PROP_MODE_REPLACE,
+                    targets.as_ptr().cast(),
+                    targets.len() as c_int,
+                );
+            } else if request.target == self.utf8_string || request.target == self.string {
+                XChangeProperty(
+                    display,
+                    request.requestor,
+                    property,
+                    request.target,
+                    8,
+                    PROP_MODE_REPLACE,
+                    self.text.as_bytes().as_ptr(),
+                    self.text.len().min(c_int::MAX as usize) as c_int,
+                );
+            } else {
+                accepted = 0;
+            }
+            let response = XSelectionEvent {
+                type_: SELECTION_NOTIFY,
+                serial: 0,
+                send_event: 1,
+                display,
+                requestor: request.requestor,
+                selection: request.selection,
+                target: request.target,
+                property: accepted,
+                time: request.time,
+            };
+            let mut event = XEvent {
+                type_: 0,
+                pad: [0; 24],
+            };
+            ptr::write(
+                (&mut event as *mut XEvent).cast::<XSelectionEvent>(),
+                response,
+            );
+            XSendEvent(display, request.requestor, 0, 0, &mut event);
+            XFlush(display);
+        }
+    }
+}
+
+fn intern_atom(display: *mut Display, name: &str) -> Atom {
+    let Ok(value) = CString::new(name) else {
+        return 0;
+    };
+    unsafe { XInternAtom(display, value.as_ptr(), 0) }
 }
 
 pub fn run(
@@ -290,7 +585,12 @@ fn run_window(
         backing_planes: 0,
         backing_pixel: 0,
         save_under: 0,
-        event_mask: KEY_PRESS_MASK | STRUCTURE_NOTIFY_MASK | EXPOSURE_MASK,
+        event_mask: KEY_PRESS_MASK
+            | BUTTON_PRESS_MASK
+            | BUTTON_RELEASE_MASK
+            | POINTER_MOTION_MASK
+            | STRUCTURE_NOTIFY_MASK
+            | EXPOSURE_MASK,
         do_not_propagate_mask: 0,
         override_redirect: 0,
         colormap,
@@ -345,6 +645,8 @@ fn run_window(
         .file()
         .try_clone()
         .map_err(|error| format!("could not clone PTY writer: {error}"))?;
+    let mut clipboard = Clipboard::new(display);
+    let mut selection: Option<((usize, usize), (usize, usize))> = None;
     let mut width = 1000_i32;
     let mut height = 700_i32;
     let mut running = true;
@@ -357,6 +659,11 @@ fn run_window(
                 pad: [0; 24],
             };
             unsafe { XNextEvent(display, &mut event) };
+            if let Some(bytes) = clipboard.handle_event(display, window, &mut event) {
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
+                continue;
+            }
             match event.type_ {
                 KEY_PRESS => {
                     let key_event = unsafe { &mut *(&mut event as *mut XEvent as *mut XKeyEvent) };
@@ -375,7 +682,20 @@ fn run_window(
                             &mut compose,
                         )
                     };
-                    if keysym == 0xff1b {
+                    if key_event.state & (CONTROL_MASK | SHIFT_MASK) == (CONTROL_MASK | SHIFT_MASK)
+                        && keysym == 'c' as c_ulong
+                    {
+                        if let Some((anchor, extent)) = selection {
+                            let (start, end) = selection_bounds(anchor, extent);
+                            let end = (end.0.saturating_add(1), end.1);
+                            clipboard.own(display, window, core.selection_text(start, end));
+                        }
+                    } else if key_event.state & (CONTROL_MASK | SHIFT_MASK)
+                        == (CONTROL_MASK | SHIFT_MASK)
+                        && keysym == 'v' as c_ulong
+                    {
+                        clipboard.request(display, window);
+                    } else if keysym == 0xff1b {
                         running = false;
                     } else if count > 0 {
                         let bytes = unsafe {
@@ -383,6 +703,34 @@ fn run_window(
                         };
                         let _ = writer.write_all(bytes);
                         let _ = writer.flush();
+                    }
+                }
+                BUTTON_PRESS => {
+                    let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
+                    if button.button == 1 {
+                        if let Some(cell) = cell_at(button.x, button.y, width, height) {
+                            selection = Some((cell, cell));
+                        }
+                    }
+                }
+                MOTION_NOTIFY => {
+                    let motion = unsafe { &*((&event as *const XEvent).cast::<XMotionEvent>()) };
+                    if motion.state & BUTTON1_MASK != 0 {
+                        if let (Some((anchor, _)), Some(cell)) =
+                            (selection, cell_at(motion.x, motion.y, width, height))
+                        {
+                            selection = Some((anchor, cell));
+                        }
+                    }
+                }
+                BUTTON_RELEASE => {
+                    let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
+                    if button.button == 1 {
+                        if let (Some((anchor, _)), Some(cell)) =
+                            (selection, cell_at(button.x, button.y, width, height))
+                        {
+                            selection = Some((anchor, cell));
+                        }
                     }
                 }
                 CONFIGURE_NOTIFY => {
@@ -399,7 +747,9 @@ fn run_window(
         if matches!(pty.next_child_event(), Some(ChildEvent::Exited(_))) {
             child_exited = true;
         }
-        draw_frame(display, window, gc, width, height, core, projection);
+        draw_frame(
+            display, window, gc, width, height, core, projection, selection,
+        );
         if child_exited {
             // Keep one final frame visible long enough for a caller or bridge
             // to observe it, then restore/destroy the native surface.
@@ -431,6 +781,28 @@ fn resize_terminal(core: &mut NativeTerminalCore, pty: &mut tty::Pty, width: i32
     });
 }
 
+fn cell_at(x: c_int, y: c_int, width: i32, height: i32) -> Option<(usize, usize)> {
+    let margin = 18;
+    let gap = 18;
+    let header = 48;
+    let rail = 52;
+    let body_y = header + 12;
+    let body_h = (height - body_y - rail).max(80);
+    let aperture_w = ((width - margin * 2 - gap) / 2).max(80);
+    let left_x = margin;
+    let content_x = left_x + 12;
+    let content_y = body_y + 36;
+    let max_x = left_x + aperture_w - 12;
+    let max_y = body_y + body_h - 12;
+    if x < content_x || x >= max_x || y < content_y || y >= max_y {
+        return None;
+    }
+    Some((
+        ((x - content_x) / 9) as usize,
+        ((y - content_y) / 18) as usize,
+    ))
+}
+
 fn draw_frame(
     display: *mut Display,
     window: Window,
@@ -439,6 +811,7 @@ fn draw_frame(
     height: i32,
     core: &NativeTerminalCore,
     projection: &Projection,
+    selection: Option<((usize, usize), (usize, usize))>,
 ) {
     unsafe {
         glViewport(0, 0, width, height);
@@ -483,6 +856,7 @@ fn draw_frame(
         body_h - 16.0,
         (0.025, 0.055, 0.10),
     );
+    draw_selection(left_x + 12.0, body_y + 36.0, selection);
     let oi_inner = (
         right_x + 16.0,
         body_y + 34.0,
@@ -557,6 +931,55 @@ fn draw_frame(
         );
     }
     unsafe { XFlush(display) };
+}
+
+fn draw_selection(x: f32, y: f32, selection: Option<((usize, usize), (usize, usize))>) {
+    let Some((anchor, extent)) = selection else {
+        return;
+    };
+    let (start, end) = selection_bounds(anchor, extent);
+    unsafe {
+        glColor3f(0.42, 0.68, 0.80);
+        glLineWidth(1.0);
+    }
+    for row in start.1..=end.1 {
+        let first = if row == start.1 { start.0 } else { 0 };
+        let last = if row == end.1 {
+            end.0.saturating_add(1).max(first + 1)
+        } else {
+            // A middle row spans the visible terminal content width. The
+            // viewport clips the outline naturally at the aperture edge.
+            end.0.max(first + 1)
+        };
+        draw_outline_rect(
+            x + first as f32 * 9.0,
+            y + row as f32 * 18.0,
+            (last.saturating_sub(first)) as f32 * 9.0,
+            18.0,
+        );
+    }
+}
+
+fn selection_bounds(
+    anchor: (usize, usize),
+    extent: (usize, usize),
+) -> ((usize, usize), (usize, usize)) {
+    if (anchor.1, anchor.0) <= (extent.1, extent.0) {
+        (anchor, extent)
+    } else {
+        (extent, anchor)
+    }
+}
+
+fn draw_outline_rect(x: f32, y: f32, width: f32, height: f32) {
+    unsafe {
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(x, y);
+        glVertex2f(x + width, y);
+        glVertex2f(x + width, y + height);
+        glVertex2f(x, y + height);
+        glEnd();
+    }
 }
 
 fn draw_rect(x: f32, y: f32, width: f32, height: f32, color: (f32, f32, f32)) {

@@ -16,10 +16,11 @@ feeds output through the pinned Alacritty terminal core, accepts keyboard input
 and resize events in its Linux/X11 window path, and consumes JSON projection
 frames without taking authority over Athena state. Projection frames can carry
 structured scene entities and alerts as well as terminal text; the OpenGL
-compositor renders those as a sparse CRT graph with one Buddy. It remains a
-small proof surface, not the finished glyph/shader renderer; selection,
-clipboard, cross-platform window backends, and the Python service bridge are
-still in development.
+compositor renders those as a sparse CRT graph with one Buddy. The Linux/X11
+proof path also supports mouse selection plus Ctrl-Shift-C/Ctrl-Shift-V
+clipboard round-trips. It remains a small proof surface, not the finished
+glyph/shader renderer; cross-platform window backends and the Python service
+bridge are still in development.
 
 For a headless PTY/core/bridge smoke check:
 

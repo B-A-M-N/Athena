@@ -87,6 +87,47 @@ impl NativeTerminalCore {
             .collect()
     }
 
+    /// Extract a normalized inclusive/exclusive cell selection for the
+    /// native clipboard bridge. Selection is a terminal concern: it reads
+    /// the Alacritty grid and never changes Athena projection state.
+    pub fn selection_text(&self, anchor: (usize, usize), extent: (usize, usize)) -> String {
+        let rows = self.snapshot();
+        if rows.is_empty() {
+            return String::new();
+        }
+        // Cells are stored as (column, row), so tuple ordering is not the
+        // visual reading order. Normalize by row first, then column.
+        let (start, end) = if (anchor.1, anchor.0) <= (extent.1, extent.0) {
+            (anchor, extent)
+        } else {
+            (extent, anchor)
+        };
+        let start_row = start.1.min(rows.len() - 1);
+        let end_row = end.1.min(rows.len() - 1);
+        let mut selected = Vec::new();
+        for row in start_row..=end_row {
+            let chars: Vec<char> = rows[row].chars().collect();
+            let first = if row == start_row {
+                start.0.min(chars.len())
+            } else {
+                0
+            };
+            let last = if row == end_row {
+                end.0.min(chars.len())
+            } else {
+                chars.len()
+            };
+            selected.push(
+                chars[first..last]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned(),
+            );
+        }
+        selected.join("\n").trim_end().to_owned()
+    }
+
     pub fn term(&self) -> &Term<VoidListener> {
         &self.term
     }
@@ -245,5 +286,13 @@ mod tests {
         assert_eq!(terminal.size(), super::TerminalSize::new(8, 2));
         assert_eq!(terminal.snapshot().len(), 2);
         assert_eq!(terminal.snapshot()[0].len(), 8);
+    }
+
+    #[test]
+    fn grid_selection_is_normalized_and_clipped() {
+        let mut terminal = super::NativeTerminalCore::new(8, 3);
+        terminal.feed(b"one\r\ntwo\r\nthree");
+
+        assert_eq!(terminal.selection_text((5, 2), (1, 0)), "ne\ntwo\nthree");
     }
 }
