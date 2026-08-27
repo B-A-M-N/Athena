@@ -34,7 +34,6 @@ from athena.models.router import (
     CAP_REASONING,
     CAP_TOOLS,
     CAP_VISION,
-    ModelRouter,
     ModelSelection,
     _candidate_key,
     _OFFLINE_PRIVACY,
@@ -83,6 +82,7 @@ from athena.state.tasks import TaskStore
 from athena.kernel.dispatch import DispatchResult, SuspendedCall
 from athena.kernel.lifecycle import TaskLifecycle
 from athena.kernel.termination import TerminationDecision, TerminationEvaluator
+from athena.interpreter.context import InterpreterContext  # noqa: F401 (annotation)
 
 __all__ = ["AgentKernel"]
 
@@ -298,15 +298,22 @@ class AgentKernel:
         cancellations=None,
         provider_usage_store=None,
         continuation_store=None,
-        router: "ModelRouter | None" = None,
+        router: "ModelRouter",
     ) -> None:
         self._task_store = task_store
         self._events = events
         self._messages = messages
         self._registry = registry
         # ONE routing authority: the service-owned router carries role
-        # policies; the kernel never builds its own (P1-23).
-        self._router = router or ModelRouter(registry)
+        # policies; the kernel never builds its own (P1-23, audit P0.1).
+        # The router is REQUIRED — no implicit fallback construction. A
+        # second construction site would fork the routing authority.
+        if router is None:
+            raise ValueError(
+                "AgentKernel requires an injected ModelRouter "
+                "(exactly one routing authority; construct it in the service)"
+            )
+        self._router = router
         self._compiler = context_compiler
         self._termination = termination
         self._model_sink = model_sink
@@ -576,10 +583,16 @@ class AgentKernel:
         )
         state.request_id = request.request_id
         state.provider = selection.provider
+        # P0.3: every inference subturn must be inspectable — the policy role
+        # that requested this model travels on the event and the usage record
+        # so `athena inspect` can prove which model served each subturn.
+        role = getattr(task.model_policy, "role", None) or "primary"
         await self._emit("ModelRequestStarted", {
             "provider": selection.provider, "model": selection.model,
             "provider_profile_id": metadata.get("provider_profile_id"),
             "prefix_fingerprint": metadata.get("prefix_fingerprint"),
+            "role": role,
+            "request_id": request.request_id,
         }, task)
 
         # Record provider attempt
@@ -591,7 +604,8 @@ class AgentKernel:
                     model=selection.model,
                     task_id=task.id,
                     session_id=task.session_id,
-                    metadata={"inference": dict(self._inference_metadata(selection))},
+                    metadata={"inference": dict(self._inference_metadata(selection)),
+                              "role": role},
                 )
             except Exception:
                 pass
@@ -652,6 +666,77 @@ class AgentKernel:
                 selection_for_attempt = await self._select_model(
                     task, compiled, exclude=frozenset(attempted))
         raise last_err or ModelUnavailable("no model available")
+
+    # ------------------------------------------------------------------ #
+    # Interpreter fusion broker (audit P0.2 / P0.4)
+    # ------------------------------------------------------------------ #
+    async def interpreter_subturn(
+        self,
+        *,
+        context: "InterpreterContext",
+        system_prompt: str,
+        user_prompt: str,
+    ):
+        """Broker ONE interpreter subturn through the single inference path.
+
+        The InterpreterExtension calls this; the kernel remains the only
+        component that selects a model, opens a provider request, or meters
+        usage. The subturn:
+
+        * reuses the SAME RunState (model_calls / tokens / cost / cancel),
+        * routes through the SAME ModelRouter with role "interpreter",
+        * emits its own ModelRequestStarted/Completed events with
+          role="interpreter" so `athena inspect` shows it as its own row,
+        * does NOT append to the durable assistant history — an interpreter
+          subturn is a side read, not a conversational turn (its proposal,
+          if any, is dispatched and its results land in the transcript the
+          normal way).
+        """
+        from dataclasses import replace as _dc_replace
+
+        if context.cancel_requested():
+            raise RequestCancelled("interpreter subturn cancelled")
+        task = context.run_state.task
+        state = context.run_state
+        role_policy = _dc_replace(task.model_policy, role="interpreter")
+        subturn_task = _dc_replace(task, model_policy=role_policy)
+        compiled = await self._compile_for_prompts(
+            subturn_task, system=system_prompt, user_prompt=user_prompt
+        )
+        selection = await self._select_model(subturn_task, compiled)
+        await self._emit("ModelRequestStarted", {
+            "provider": selection.provider,
+            "model": selection.model,
+            "role": "interpreter",
+            "subturn": True,
+        }, task)
+        response = await self._invoke(subturn_task, state, selection, compiled)
+        await self._emit("ModelResponseCompleted", {
+            "provider": selection.provider,
+            "model": selection.model,
+            "role": "interpreter",
+            "subturn": True,
+        }, task)
+        return response
+
+    async def _compile_for_prompts(
+        self, task: TaskSpec, *, system: str, user_prompt: str
+    ) -> CompiledContext:
+        """Compile a one-off prompt pair without touching durable history."""
+        from athena.protocol.messages import Role, TextBlock
+
+        user_message = Message(
+            id=new_id("msg"),
+            role=Role.USER,
+            blocks=(TextBlock(text=user_prompt),),
+            created_at=utcnow(),
+            provenance=Provenance(
+                source_type=SourceType.SYSTEM, trust=TrustClass.CONFIGURED_INSTRUCTION
+            ),
+        )
+        return await self._compiler.compile(
+            task, system=system, recent_messages=[user_message]
+        )
 
     def _inference_metadata(self, selection: ModelSelection) -> dict[str, Any]:
         profile = self._registry.profile_for(selection.provider)

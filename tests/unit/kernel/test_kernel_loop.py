@@ -13,6 +13,7 @@ from athena.kernel.kernel import AgentKernel
 from athena.kernel.termination import TerminationEvaluator
 from athena.models.fake import FakeModelProvider
 from athena.models.registry import ProviderRegistry
+from athena.models.router import ModelRouter
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import ResourceBudget, TaskSpec, TaskStatus
 from athena.state.database import Database
@@ -71,6 +72,7 @@ async def stack():
     )
     registry = ProviderRegistry()
     registry.register("fake", provider)
+    router = ModelRouter(registry)
     compiler = ContextCompiler(message_store=messages)
     kernel = AgentKernel(
         task_store=tasks,
@@ -78,6 +80,7 @@ async def stack():
         task_manager=manager,
         messages=messages,
         registry=registry,
+        router=router,
         context_compiler=compiler,
         termination=TerminationEvaluator(),
     )
