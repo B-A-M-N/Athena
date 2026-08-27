@@ -11,6 +11,7 @@ from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStat
 from athena.protocol.tasks import WorkspaceSpec
 
 
+@pytest.mark.athena_scenario("ENV-003")
 def test_file_watch_detects_same_size_edit_with_preserved_timestamp(tmp_path):
     path = tmp_path / "state.txt"
     path.write_text("true", encoding="utf-8")

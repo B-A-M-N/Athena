@@ -142,6 +142,7 @@ async def test_fabric_rehydrates_only_visible_promoted_records(tmp_path):
     await db.close()
 
 
+@pytest.mark.athena_scenario("AUTH-002")
 def test_restore_executor_rechecks_source_and_output_contract():
     generated = GeneratedCapability(
         id="gen.restore",
@@ -165,6 +166,7 @@ def test_restore_executor_rechecks_source_and_output_contract():
     assert executor.descriptor.output_schema == generated.output_schema
 
 
+@pytest.mark.athena_scenario("AUTH-002")
 def test_restore_executor_rejects_persisted_source_escape():
     generated = GeneratedCapability(
         id="gen.invalid",
@@ -186,6 +188,7 @@ def test_restore_executor_rejects_persisted_source_escape():
         SynthesisEngine().restore_executor(generated)
 
 
+@pytest.mark.athena_scenario("AUTH-002")
 def test_restore_executor_rejects_persisted_authority_outside_profile():
     generated = GeneratedCapability(
         id="gen.authority",

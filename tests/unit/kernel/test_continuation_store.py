@@ -89,6 +89,7 @@ def test_continuations_survive_restart(db_path):
     asyncio.run(restarted_process())
 
 
+@pytest.mark.athena_scenario("CLAIM-003")
 def test_claim_is_not_consumed_until_execution_finishes(db_path):
     async def run():
         db = Database(db_path)

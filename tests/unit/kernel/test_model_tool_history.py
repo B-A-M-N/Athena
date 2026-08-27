@@ -50,6 +50,7 @@ def test_assistant_message_preserves_reasoning_text_and_calls():
     assert message.blocks[-1].call_id == "tool-1"
 
 
+@pytest.mark.athena_scenario("COMPAT-002")
 def test_openai_and_anthropic_replay_preserve_mixed_assistant_turn():
     assistant = _assistant_message(
         TaskSpec(id="task-1", objective="inspect", session_id="session-1"),

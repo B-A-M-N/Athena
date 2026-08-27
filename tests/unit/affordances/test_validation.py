@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
 from athena.capabilities.synthesis import infer_input_schema
 
@@ -17,6 +18,7 @@ def test_task_source_validation_runs_contract_and_available_static_checks():
     assert result.code.startswith("def run(args):")
 
 
+@pytest.mark.athena_scenario("AUTH-003")
 def test_source_validation_rejects_host_escape_primitives_before_execution():
     result = GeneratedSourceValidator().validate(
         "import subprocess\ndef run(args):\n return subprocess.run(args)\n",

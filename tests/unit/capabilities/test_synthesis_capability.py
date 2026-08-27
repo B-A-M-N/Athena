@@ -20,6 +20,7 @@ from athena.synthesis.engine import SynthesisEngine
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("SYNTH-005")
 async def test_model_can_create_task_local_tool(tmp_path):
     fabric = CapabilityFabric(CapabilityRegistry())
     capability = SynthesisCapability(SynthesisEngine(), fabric)
@@ -91,6 +92,7 @@ async def test_model_can_create_task_local_tool(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("AUTH-001")
 async def test_synthesis_promotion_is_policy_checked(tmp_path):
     registry = CapabilityRegistry()
     fabric = CapabilityFabric(registry)
@@ -128,6 +130,7 @@ async def test_synthesis_promotion_is_policy_checked(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("AUTH-001")
 async def test_synthesis_requires_task_scope(tmp_path):
     capability = SynthesisCapability(SynthesisEngine(), CapabilityFabric(CapabilityRegistry()))
     result = await capability.invoke(CapabilityRequest(
@@ -170,6 +173,7 @@ async def test_synthesis_create_uses_canonical_dispatcher(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("SYNTH-005")
 async def test_synthesis_generates_strict_input_schema_from_fixtures():
     fabric = CapabilityFabric(CapabilityRegistry())
     capability = SynthesisCapability(SynthesisEngine(), fabric)
@@ -206,6 +210,7 @@ async def test_synthesis_generates_strict_input_schema_from_fixtures():
     }
 
 
+@pytest.mark.athena_scenario("SYNTH-005")
 def test_synthesis_output_schema_inference_distinguishes_booleans():
     from athena.synthesis.engine import _schema_for_values
 

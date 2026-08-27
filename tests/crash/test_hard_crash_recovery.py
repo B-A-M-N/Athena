@@ -58,6 +58,7 @@ async def _wait_status(svc, task_id, target, tries=300, delay=0.02):
 
 @pytest.mark.athena_claim("BHV-080", "BHV-079")
 @pytest.mark.athena_evidence("test", "e2e")
+@pytest.mark.athena_scenario("RECOVERY-001")
 async def test_running_task_recovered_after_hard_crash():
     """A task left RUNNING by a hard crash is INTERRUPTED on restart."""
     tmpdir = tempfile.mkdtemp(prefix="athena-crash-")

@@ -58,6 +58,7 @@ class _RecordingExecutor:
 
 @pytest.mark.athena_claim("INV-004")
 @pytest.mark.athena_evidence("security", "invariant")
+@pytest.mark.athena_scenario("AUTH-004")
 async def test_task_deny_is_hard_ceiling_even_when_global_allows():
     """execute allowed globally (coding) but task deny -> DENY, no effect."""
     reg = CapabilityRegistry()

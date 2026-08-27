@@ -7,6 +7,7 @@ from athena.protocol.events import make_event
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("PROJECTION-001")
 async def test_oi_viewer_renders_to_configured_output_and_keeps_partials():
     output = StringIO()
     viewer = OIStreamViewer(output=output, interactive=False)
@@ -19,6 +20,7 @@ async def test_oi_viewer_renders_to_configured_output_and_keeps_partials():
 
 
 @pytest.mark.asyncio
+@pytest.mark.athena_scenario("PROJECTION-001")
 async def test_oi_viewer_does_not_write_to_process_stdout(capsys):
     output = StringIO()
     viewer = OIStreamViewer(output=output, interactive=False)

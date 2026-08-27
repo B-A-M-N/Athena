@@ -30,6 +30,7 @@ async def _real_task(service, ws):
     return spec.id
 
 
+@pytest.mark.athena_scenario("TX-001")
 async def test_shadow_commit_applies_proven_changes(service, tmp_path):
     svc, ws = service
     task_id = await _real_task(svc, ws)
@@ -58,6 +59,7 @@ async def test_shadow_commit_applies_proven_changes(service, tmp_path):
     assert os.path.isfile(os.path.join(ws.root, "lib.py"))
 
 
+@pytest.mark.athena_scenario("TX-002")
 async def test_shadow_discard_leaves_reality_untouched(service):
     svc, ws = service
     task_id = await _real_task(svc, ws)
@@ -84,6 +86,7 @@ async def test_commit_requires_verified_branch(service):
         await engine.commit(branch)
 
 
+@pytest.mark.athena_scenario("CLAIM-001")
 async def test_claims_go_stale_after_dependent_mutation(service, tmp_path):
     svc, ws = service
     from athena.worldstate import ClaimStatus
@@ -101,6 +104,7 @@ def svc_world(service):
     return service.world_state("task_ws_test")
 
 
+@pytest.mark.athena_scenario("WORLD-001")
 async def test_world_state_snapshot_shape(service):
     svc, ws = service
     task_id = await _real_task(svc, ws)

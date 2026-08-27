@@ -111,6 +111,7 @@ async def _create(stack, objective, *, budget=None):
 
 @pytest.mark.athena_claim("INV-001")
 @pytest.mark.athena_evidence("test", "invariant")
+@pytest.mark.athena_scenario("FUSE-004")
 async def test_end_to_end_simple_completes(stack):
     stack.provider._scripts = [
         {"match": {"user_contains": "hello"}, "respond": {"text": "hi there!", "done": True}}
@@ -129,6 +130,7 @@ async def test_end_to_end_simple_completes(stack):
 
 @pytest.mark.athena_claim("INV-001")
 @pytest.mark.athena_evidence("test", "invariant")
+@pytest.mark.athena_scenario("FUSE-004")
 async def test_scripted_capability_then_answer_runs_two_iterations(stack):
     # Match ordering: the capability-result-aware script comes first; on the
     # first call there is no result yet so it is skipped, then the capability

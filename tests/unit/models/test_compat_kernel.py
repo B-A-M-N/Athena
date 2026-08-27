@@ -60,6 +60,7 @@ def test_valid_input_unchanged(repairer):
 
 # -- alias rename ------------------------------------------------------------
 
+@pytest.mark.athena_scenario("COMPAT-003")
 def test_alias_repair_builtin(repairer):
     # fs family: file_path -> path
     fs_schema = {"type": "object", "required": ["path"],
@@ -71,6 +72,7 @@ def test_alias_repair_builtin(repairer):
     assert any("file_path->path" in rule for rule in r.rules)
 
 
+@pytest.mark.athena_scenario("COMPAT-003")
 def test_numeric_string_coercion(repairer):
     out, r = _fix(repairer, {"language": "sh", "code": "ls",
                              "timeout": "30"})
@@ -79,6 +81,7 @@ def test_numeric_string_coercion(repairer):
     assert r.outcome == RepairOutcome.REPAIRED
 
 
+@pytest.mark.athena_scenario("COMPAT-003")
 def test_double_encoded_json(repairer):
     import json
     inner = json.dumps({"language": "python", "code": "print(2)"})
@@ -88,6 +91,7 @@ def test_double_encoded_json(repairer):
     assert "json_string_parse" in r.rules or "json_double_decode" in r.rules
 
 
+@pytest.mark.athena_scenario("COMPAT-003")
 def test_repair_is_idempotent(repairer):
     bad = {"file_path": "/tmp/x.py"}
     fs_schema = {"type": "object", "required": ["path"],
@@ -100,6 +104,7 @@ def test_repair_is_idempotent(repairer):
 
 # -- prohibited repairs -------------------------------------------------------
 
+@pytest.mark.athena_scenario("COMPAT-004")
 def test_unknown_required_field_is_invalid_not_invented(repairer):
     out, r = _fix(repairer, {"language": "python"})   # code missing entirely
     assert out is None
@@ -116,6 +121,7 @@ def test_ambiguous_aliases_rejected(repairer):
     assert r.outcome == RepairOutcome.INVALID
 
 
+@pytest.mark.athena_scenario("COMPAT-004")
 def test_interrupted_stream_never_repaired(repairer):
     out, r = _fix(repairer, {"file_path": "foo.py"},
                   completion_state="INTERRUPTED")
@@ -212,6 +218,7 @@ def test_schema_fingerprint_changes_with_schema():
 
 # -- cache coordinator ---------------------------------------------------------
 
+@pytest.mark.athena_scenario("COMPAT-005")
 def test_prefix_tracker_stable_then_boundary():
     tracker = PrefixTracker()
     env = PromptEnvelope(stable_prefix=["system-prompt"], append_history=["t1"])
@@ -243,6 +250,7 @@ def test_prefix_tracker_marks_model_and_profile_changes_as_boundaries():
     assert result["boundary"]["reason"] == "model_changed"
 
 
+@pytest.mark.athena_scenario("COMPAT-005")
 def test_usage_record_openai_cached_tokens():
     u = UsageRecord.from_openai_compat({
         "prompt_tokens": 1000, "completion_tokens": 50,
@@ -263,6 +271,7 @@ def test_usage_record_anthropic_cache_write():
     assert d["prompt_tokens"] == 1050
 
 
+@pytest.mark.athena_scenario("COMPAT-005")
 def test_no_cache_hit_inferred_without_telemetry():
     # Spec: never infer a hit from low cost/latency; unknown stays unknown.
     u = UsageRecord(prompt_tokens=500, completion_tokens=10)

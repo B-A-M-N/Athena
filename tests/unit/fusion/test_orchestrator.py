@@ -30,6 +30,7 @@ async def fused(tmp_path):
         await svc.stop()
 
 
+@pytest.mark.athena_scenario("CLAIM-002")
 async def test_experiment_commit_binds_claim_and_invalidates(fused, tmp_path):
     """The full loop: propose -> shadow -> verify -> invariant gate ->
     commit -> claim bound to evidence -> later mutation makes it STALE."""
@@ -62,6 +63,7 @@ async def test_experiment_commit_binds_claim_and_invalidates(fused, tmp_path):
     assert wstate.claims.get(result.claim_id).status == ClaimStatus.STALE
 
 
+@pytest.mark.athena_scenario("TX-005")
 async def test_failed_criteria_discards_and_auto_forks(fused):
     svc, ws, task_id = fused
     fusion = FusionOrchestrator(svc)
