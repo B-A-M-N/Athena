@@ -14,7 +14,9 @@ small bridge rather than reimplementing task semantics.
 The first native vertical slice now exists as `athena-terminal`. It owns a PTY,
 feeds output through the pinned Alacritty terminal core, accepts keyboard input
 and resize events in its Linux/X11 window path, and consumes JSON projection
-frames without taking authority over Athena state. Its OpenGL compositor is a
+frames without taking authority over Athena state. Projection frames can carry
+structured scene entities and alerts as well as terminal text; the OpenGL
+compositor renders those as a sparse CRT graph with one Buddy. It remains a
 small proof surface, not the finished glyph/shader renderer; selection,
 clipboard, cross-platform window backends, and the Python service bridge are
 still in development.

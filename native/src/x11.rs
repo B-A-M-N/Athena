@@ -20,7 +20,7 @@ use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
 
 use athena_terminal::NativeTerminalCore;
 
-use crate::{Projection, ProjectionFrame, apply_available};
+use crate::{Projection, ProjectionEntity, ProjectionFrame, apply_available};
 
 type Display = c_void;
 type Window = c_ulong;
@@ -46,6 +46,8 @@ const GLX_BLUE_SIZE: c_int = 10;
 const GLX_DEPTH_SIZE: c_int = 12;
 const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
 const GL_QUADS: u32 = 0x0007;
+const GL_LINES: u32 = 0x0001;
+const GL_LINE_LOOP: u32 = 0x0002;
 const GL_PROJECTION: u32 = 0x1701;
 const GL_MODELVIEW: u32 = 0x1700;
 
@@ -222,6 +224,7 @@ unsafe extern "C" {
     fn glBegin(mode: u32);
     fn glEnd();
     fn glColor3f(red: f32, green: f32, blue: f32);
+    fn glLineWidth(width: f32);
     fn glVertex2f(x: f32, y: f32);
 }
 
@@ -480,6 +483,13 @@ fn draw_frame(
         body_h - 16.0,
         (0.025, 0.055, 0.10),
     );
+    let oi_inner = (
+        right_x + 16.0,
+        body_y + 34.0,
+        (aperture_w - 32.0).max(40.0),
+        (body_h - 50.0).max(40.0),
+    );
+    draw_oi_scene(oi_inner.0, oi_inner.1, oi_inner.2, oi_inner.3, projection);
     unsafe { glXSwapBuffers(display, window) };
 
     unsafe { XSetForeground(display, gc, rgb(180, 198, 226)) };
@@ -525,6 +535,27 @@ fn draw_frame(
             line,
         );
     }
+    unsafe { XSetForeground(display, gc, rgb(145, 181, 216)) };
+    for (index, entity) in projection.entities.iter().take(8).enumerate() {
+        let y = body_y as c_int + 60 + index as c_int * 30;
+        let label = if entity.label.is_empty() {
+            &entity.id
+        } else {
+            &entity.label
+        };
+        draw_text(display, window, gc, right_x as c_int + 28, y, label);
+    }
+    if let Some(alert) = projection.alerts.first() {
+        unsafe { XSetForeground(display, gc, rgb(224, 158, 118)) };
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            (body_y + body_h - 18.0) as c_int,
+            alert,
+        );
+    }
     unsafe { XFlush(display) };
 }
 
@@ -536,6 +567,129 @@ fn draw_rect(x: f32, y: f32, width: f32, height: f32, color: (f32, f32, f32)) {
         glVertex2f(x + width, y);
         glVertex2f(x + width, y + height);
         glVertex2f(x, y + height);
+        glEnd();
+    }
+}
+
+fn draw_oi_scene(x: f32, y: f32, width: f32, height: f32, projection: &Projection) {
+    // The native scene is deliberately sparse: a faint CRT grid, runtime
+    // links/nodes, and one Buddy. Python supplies semantic entities; these
+    // primitives are presentation only and cannot invent task progress.
+    unsafe {
+        glColor3f(0.18, 0.34, 0.50);
+        glLineWidth(1.0);
+        glBegin(GL_LINES);
+        for index in 1..7 {
+            let gy = y + height * index as f32 / 7.0;
+            glVertex2f(x, gy);
+            glVertex2f(x + width, gy);
+        }
+        for index in 1..8 {
+            let gx = x + width * index as f32 / 8.0;
+            glVertex2f(gx, y);
+            glVertex2f(gx, y + height);
+        }
+        glEnd();
+    }
+
+    let runtime: Vec<&ProjectionEntity> = projection
+        .entities
+        .iter()
+        .filter(|entity| {
+            matches!(
+                entity.kind.as_str(),
+                "operation" | "workflow" | "verification" | "child_task" | "generated_tool"
+            )
+        })
+        .take(6)
+        .collect();
+    let mut positions: Vec<(String, f32, f32)> = Vec::with_capacity(runtime.len());
+    for (index, entity) in runtime.iter().enumerate() {
+        let column = index % 2;
+        let row = index / 2;
+        let nx = x + width * (0.30 + column as f32 * 0.40);
+        let ny = y + height * (0.22 + row as f32 * 0.28);
+        positions.push((entity.id.clone(), nx, ny));
+    }
+    unsafe {
+        glColor3f(0.29, 0.63, 0.72);
+        glLineWidth(1.5);
+        glBegin(GL_LINES);
+        for entity in runtime.iter() {
+            let Some(parent_id) = entity.parent_id.as_ref() else {
+                continue;
+            };
+            let Some((_, px, py)) = positions.iter().find(|(id, _, _)| id == parent_id) else {
+                continue;
+            };
+            let Some((_, cx, cy)) = positions.iter().find(|(id, _, _)| id == &entity.id) else {
+                continue;
+            };
+            glVertex2f(*px, *py);
+            glVertex2f(*cx, *cy);
+        }
+        glEnd();
+    }
+    for (index, entity) in runtime.iter().enumerate() {
+        let (_, nx, ny) = &positions[index];
+        let color = if entity.status.eq_ignore_ascii_case("failed")
+            || entity.status.eq_ignore_ascii_case("failure")
+        {
+            (0.82, 0.33, 0.36)
+        } else if entity.status.eq_ignore_ascii_case("approval") {
+            (0.82, 0.62, 0.34)
+        } else {
+            (0.35, 0.72, 0.82)
+        };
+        draw_node(*nx, *ny, 18.0, color);
+    }
+
+    let (buddy_x, buddy_y) = match projection.status.to_ascii_uppercase().as_str() {
+        "READING" | "SEARCHING" => (x + width * 0.18, y + height * 0.28),
+        "EXECUTING" | "TOOLS" => (x + width * 0.76, y + height * 0.26),
+        "FAILURE" | "BLOCKED" => (x + width * 0.78, y + height * 0.76),
+        "APPROVAL" => (x + width * 0.72, y + height * 0.84),
+        _ => (x + width * 0.50, y + height * 0.58),
+    };
+    draw_buddy(buddy_x, buddy_y, projection.status.as_str());
+}
+
+fn draw_node(x: f32, y: f32, radius: f32, color: (f32, f32, f32)) {
+    unsafe {
+        glColor3f(color.0, color.1, color.2);
+        glLineWidth(1.5);
+        glBegin(GL_LINE_LOOP);
+        for index in 0..8 {
+            let angle = std::f32::consts::TAU * index as f32 / 8.0;
+            glVertex2f(x + radius * angle.cos(), y + radius * angle.sin());
+        }
+        glEnd();
+    }
+}
+
+fn draw_buddy(x: f32, y: f32, status: &str) {
+    let color = match status.to_ascii_uppercase().as_str() {
+        "FAILURE" | "BLOCKED" => (0.86, 0.36, 0.40),
+        "APPROVAL" => (0.88, 0.67, 0.36),
+        _ => (0.46, 0.78, 0.88),
+    };
+    draw_rect(x - 22.0, y - 14.0, 44.0, 28.0, (0.035, 0.10, 0.18));
+    unsafe {
+        glColor3f(color.0, color.1, color.2);
+        glLineWidth(2.0);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(x - 22.0, y - 14.0);
+        glVertex2f(x + 22.0, y - 14.0);
+        glVertex2f(x + 22.0, y + 14.0);
+        glVertex2f(x - 22.0, y + 14.0);
+        glEnd();
+        glBegin(GL_LINES);
+        glVertex2f(x - 9.0, y - 2.0);
+        glVertex2f(x - 3.0, y - 2.0);
+        glVertex2f(x + 3.0, y - 2.0);
+        glVertex2f(x + 9.0, y - 2.0);
+        glVertex2f(x, y - 14.0);
+        glVertex2f(x + 8.0, y - 28.0);
         glEnd();
     }
 }

@@ -27,6 +27,23 @@ struct ProjectionFrame {
     status: Option<String>,
     #[serde(default)]
     oi: Vec<String>,
+    #[serde(default)]
+    entities: Option<Vec<ProjectionEntity>>,
+    #[serde(default)]
+    alerts: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionEntity {
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -34,6 +51,8 @@ struct Projection {
     title: String,
     status: String,
     oi: Vec<String>,
+    entities: Vec<ProjectionEntity>,
+    alerts: Vec<String>,
 }
 
 impl Projection {
@@ -46,6 +65,12 @@ impl Projection {
         }
         if !frame.oi.is_empty() {
             self.oi = frame.oi;
+        }
+        if let Some(entities) = frame.entities {
+            self.entities = entities;
+        }
+        if let Some(alerts) = frame.alerts {
+            self.alerts = alerts;
         }
     }
 }
@@ -134,6 +159,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "ATHENA OI // GLASS COMPUTE".to_owned(),
             "no projection frame received".to_owned(),
         ],
+        entities: Vec::new(),
+        alerts: Vec::new(),
     };
 
     if args.headless {
@@ -259,4 +286,30 @@ fn run_headless(
         writeln!(stdout, "{line}")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Projection, ProjectionFrame};
+
+    #[test]
+    fn bridge_preserves_structured_scene_state() {
+        let frame: ProjectionFrame = serde_json::from_str(
+            r#"{
+                "status":"EXECUTING",
+                "entities":[
+                    {"id":"call-1","kind":"operation","label":"executor","status":"active"}
+                ],
+                "alerts":["test pulse"]
+            }"#,
+        )
+        .expect("projection JSON should decode");
+        let mut projection = Projection::default();
+        projection.apply(frame);
+
+        assert_eq!(projection.status, "EXECUTING");
+        assert_eq!(projection.entities.len(), 1);
+        assert_eq!(projection.entities[0].label, "executor");
+        assert_eq!(projection.alerts, vec!["test pulse"]);
+    }
 }
