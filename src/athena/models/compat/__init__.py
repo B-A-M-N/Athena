@@ -19,6 +19,7 @@ from athena.models.compat.profiles import (
     CacheMode,
     CompatibilityProfile,
     CompatibilityCandidates,
+    COMPATIBILITY_PRESETS,
     DiscoveryMode,
     ModelProfile,
     PRESETS,
@@ -26,6 +27,7 @@ from athena.models.compat.profiles import (
     ProviderProfile,
     resolve_profile,
     schema_fingerprint,
+    resolve_compatibility_profile,
 )
 from athena.models.compat.toolrepair import (
     BUILTIN_ALIASES,
@@ -37,8 +39,9 @@ from athena.models.compat.toolrepair import (
 __all__ = [
     "AuthMode", "CacheBoundary", "CacheMode", "CompatibilityCandidates",
     "CompatibilityProfile", "DiscoveryMode", "InferenceReceipt",
-    "ModelProfile", "PRESETS", "PrefixTracker", "PromptEnvelope",
+    "COMPATIBILITY_PRESETS", "ModelProfile", "PRESETS", "PrefixTracker",
+    "PromptEnvelope",
     "Protocol", "ProviderProfile", "BUILTIN_ALIASES", "RepairOutcome",
     "RepairReceipt", "ToolInputRepairer", "UsageRecord", "resolve_profile",
-    "schema_fingerprint",
+    "resolve_compatibility_profile", "schema_fingerprint",
 ]

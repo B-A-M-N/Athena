@@ -86,8 +86,11 @@ class PythonRuntime(BaseRuntime):
     name = "python"
     aliases = ("py", "python3")
 
-    def _make_session(self, *, env=None, cwd=None) -> "_PythonSession":
-        sess = _PythonSession(env=env, cwd=cwd)
+    def _make_session(self, *, env=None, cwd=None, sandbox_root=None,
+                      network_policy=None) -> "_PythonSession":
+        sess = _PythonSession(
+            env=env, cwd=cwd, sandbox_root=sandbox_root,
+            network_policy=network_policy)
         sess.start()
         return sess
 
@@ -102,9 +105,12 @@ class PythonRuntime(BaseRuntime):
 
 
 class _PythonSession:
-    def __init__(self, env=None, cwd=None) -> None:
+    def __init__(self, env=None, cwd=None, sandbox_root=None,
+                 network_policy=None) -> None:
         self.env = env or {}
         self.cwd = cwd
+        self.sandbox_root = sandbox_root
+        self.network_policy = network_policy
         self.process: subprocess.Popen | None = None
         self.frames: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
@@ -114,6 +120,8 @@ class _PythonSession:
             [sys.executable, "-u", "-c", _WORKER_SOURCE],
             env=self.env,
             cwd=self.cwd,
+            sandbox_root=self.sandbox_root,
+            network_policy=self.network_policy,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -166,14 +174,22 @@ class _PythonSession:
         self.close()
 
     def run(self, code, timeout, execution_id):
-        if not self.process or self.process.poll() is not None:
+        process = self.process
+        if process is None or process.poll() is not None:
             self.close()
             self.start()
+            process = self.process
+        if process is None:
+            yield ExecutionEvent(type=ExecutionEventType.EXITED, execution_id=execution_id,
+                                 exit_status=ExecutionExitStatus.FAILED, exit_code=1)
+            return
         message = json.dumps({"source": code})
         try:
-            self.process.stdin.write(f"{len(message)}\n")
-            self.process.stdin.write(message)
-            self.process.stdin.flush()
+            if process.stdin is None:
+                raise BrokenPipeError("python worker stdin is unavailable")
+            process.stdin.write(f"{len(message)}\n")
+            process.stdin.write(message)
+            process.stdin.flush()
         except Exception:
             yield ExecutionEvent(type=ExecutionEventType.STDERR, execution_id=execution_id,
                                  data="worker lost; state reset")
@@ -188,7 +204,7 @@ class _PythonSession:
             try:
                 frame = self.frames.get(timeout=0.1)
             except queue.Empty:
-                if self.process.poll() is not None:
+                if process.poll() is not None:
                     self.frames = queue.Queue()
                     yield ExecutionEvent(type=ExecutionEventType.EXITED,
                                          execution_id=execution_id,

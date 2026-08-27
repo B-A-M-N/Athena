@@ -22,11 +22,17 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
-__all__ = ["CacheBoundary", "PromptEnvelope", "PrefixTracker", "UsageRecord",
-           "InferenceReceipt"]
+__all__ = [
+    "CacheBoundary",
+    "InferenceReceipt",
+    "PrefixTracker",
+    "PromptEnvelope",
+    "UsageRecord",
+]
 
 
 class CacheBoundary:
@@ -90,14 +96,23 @@ class PrefixTracker:
         else:
             new_c = None
 
-        if self.last_prefix_fp is not None and self.last_prefix_fp != fps["prefix"]:
-            reason = "unknown"
-            if new_c and self.components_fp:
-                for key, old in self.components_fp.items():
-                    if new_c.get(key) != old:
-                        reason = f"{key}_changed"
-                        break
-            elif not new_c:
+        prefix_changed = (
+            self.last_prefix_fp is not None
+            and self.last_prefix_fp != fps["prefix"]
+        )
+        changed_component = None
+        if new_c and self.components_fp:
+            # Component order is intentional: report the first semantic
+            # boundary, not whichever mapping key happened to be inserted
+            # last. This catches model/profile changes even when the prompt
+            # bytes themselves are unchanged.
+            for key in new_c:
+                if new_c.get(key) != self.components_fp.get(key):
+                    changed_component = key
+                    break
+        if prefix_changed or changed_component is not None:
+            reason = f"{changed_component}_changed" if changed_component else "unknown"
+            if changed_component is None and not new_c:
                 reason = CacheBoundary.TOOL_SCHEMA_CHANGED  # conservative
             boundary = {
                 "reason": reason,
@@ -121,7 +136,7 @@ class UsageRecord:
     """Normalized cache accounting across providers."""
 
     @staticmethod
-    def from_openai_compat(usage: Mapping[str, Any]) -> "UsageRecord":
+    def from_openai_compat(usage: Mapping[str, Any]) -> UsageRecord:
         details = usage.get("prompt_tokens_details") or {}
         cached = int(details.get("cached_tokens") or 0)
         prompt = int(usage.get("prompt_tokens") or 0)
@@ -132,7 +147,7 @@ class UsageRecord:
             uncached_prompt_tokens=max(prompt - cached, 0))
 
     @staticmethod
-    def from_anthropic(usage: Mapping[str, Any]) -> "UsageRecord":
+    def from_anthropic(usage: Mapping[str, Any]) -> UsageRecord:
         read = int((usage.get("cache_read_input_tokens")) or 0)
         write = int((usage.get("cache_creation_input_tokens")) or 0)
         prompt = int(usage.get("input_tokens") or 0)
@@ -189,15 +204,17 @@ class InferenceReceipt:
     tool_ids: tuple[str, ...] = ()
     continuation_token: str | None = None
     provider_metadata: dict = field(default_factory=dict)
+    usage: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        d = {
+        d: dict[str, Any] = {
             "call_id": self.call_id,
             "provider_profile_id": self.provider_profile_id,
             "model_id": self.model_id,
             "response_id": self.response_id,
             "tool_ids": list(self.tool_ids),
             "provider_metadata": self.provider_metadata,
+            "usage": self.usage,
         }
         # Reasoning payloads may be sensitive/large; store presence markers
         # plus the payload itself only when the provider requires it.

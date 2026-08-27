@@ -91,19 +91,21 @@ class CancellationManager:
         the root — a delegated child's task must not be marked cancelled
         while its processes remain alive.
         """
-        self.set_token(task_id, reason)
+        # Resolve the complete tree before changing any status.  This closes
+        # the race where a child remains alive because the root was transitioned
+        # first and a later lookup no longer considered it runnable.
+        task_ids = [task_id, *(await self._descendants_of(task_id))]
+        for current in task_ids:
+            self.set_token(current, reason)
         if self._exec is not None:
-            try:
-                await self._exec.cancel_task(task_id)
-            except Exception as exc:
-                _logger.warning(
-                    "runtime cancel failed for task %s: %s", task_id, exc)
-        await self._transition_status(task_id, TaskStatus.CANCELLED)
-        children = await self._children_of(task_id)
-        for child in children:
-            self.set_token(child, reason)
-        for child in children:
-            await self._cancel_impl(child, reason, root_id=root_id)
+            for current in task_ids:
+                try:
+                    await self._exec.cancel_task(current)
+                except Exception as exc:
+                    _logger.warning(
+                        "runtime cancel failed for task %s: %s", current, exc)
+        for current in task_ids:
+            await self._transition_status(current, TaskStatus.CANCELLED)
 
     async def _transition_status(self, task_id: str, status: TaskStatus) -> None:
         if self._tasks is None:
@@ -138,10 +140,13 @@ class CancellationManager:
     async def _children_of(self, task_id: str) -> list[str]:
         if self._store is None:
             return []
-        try:
-            return [r["id"] for r in await self._store.list_children(task_id)]
-        except Exception:
-            return []
+        # A failed hierarchy lookup must not be interpreted as “no children”.
+        # Doing that would let a database outage mark the parent cancelled
+        # while leaving descendant processes alive.  Let the caller fail
+        # closed so the cancellation request can be retried and the task is
+        # not falsely reported as fully cancelled.
+        rows = await self._store.list_children(task_id)
+        return [r["id"] for r in rows]
 
 
 def _get_status(task) -> TaskStatus:

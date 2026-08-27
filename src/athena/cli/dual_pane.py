@@ -18,9 +18,8 @@ from __future__ import annotations
 
 import os
 import shutil
-import sys
 from collections import deque
-from typing import Any, Callable, TextIO
+from typing import Any
 
 from athena.cli.surface import OperatorSurface
 
@@ -53,7 +52,7 @@ class Mascot:
     # Character registry. Each entry: {"label", "frames": {state: (a, b)}}
     # Two animation frames per state; render() alternates them.
     # ------------------------------------------------------------------
-    CHARACTERS = {}
+    CHARACTERS: dict[str, dict[str, Any]] = {}
 
     FRAMES = {
         "idle": (
@@ -447,10 +446,26 @@ class DualPaneSurface(OperatorSurface):
         except Exception:
             return 120, 30
 
+    def _refresh_terminal_size(self) -> None:
+        """Refresh dimensions before every repaint (SIGWINCH-safe)."""
+        self._term_cols, self._term_rows = self._terminal_size()
+        self.dual = self._term_cols >= 100
+
+    def _left_width(self) -> int:
+        if not self.dual:
+            return self._term_cols
+        return max(40, (self._term_cols - self.PANE_GAP) // 2)
+
+    def _write(self, text: str, *, end: str = "\n", stream=None) -> None:
+        """Keep calm-pane output inside the left pane in wide terminals."""
+        if self.dual and self.interactive:
+            text = text[: self._left_width()]
+        super()._write(text, end=end, stream=stream)
+
     # ------------------------------------------------------------------
     # Routing: mirror raw events into the OI window
     # ------------------------------------------------------------------
-    async def render_event(self, event: Any) -> None:  # type: ignore[name-defined]
+    async def render_event(self, event: Any) -> None:
         etype = str(getattr(event, "type", ""))
         payload = dict(getattr(event, "payload", {}) or {})
         self.mascot.observe(etype)
@@ -503,12 +518,15 @@ class DualPaneSurface(OperatorSurface):
         Uses ANSI save/restore so calm scrollback above is untouched.
         Skipped in non-tty environments (tests use snapshot_oi()).
         """
-        if not (self.interactive and sys.stdout.isatty()):
+        if not (self.interactive and getattr(self.output, "isatty", lambda: False)()):
             return
+        self._refresh_terminal_size()
         cols = self._term_cols
         rows = self._term_rows
-        inner_w = max(cols - 4, 20)
-        stream_w = max(inner_w - 2 - self.MASCOT_WIDTH, 10)
+        left_width = self._left_width()
+        right_x = left_width + self.PANE_GAP + 1 if self.dual else 1
+        right_width = cols - right_x + 1
+        stream_w = max(right_width - 4 - self.MASCOT_WIDTH, 10)
 
         header = "┌─ OI · live ".ljust(stream_w + 2, "─")
         header += "┬" + " ATHENA ".center(self.MASCOT_WIDTH, "─") + "┐"
@@ -521,7 +539,9 @@ class DualPaneSurface(OperatorSurface):
         pad_top = max((self.oi_height - len(mascot)) // 2, 0)
 
         out = ["\x1b7"]          # save cursor
-        out.append(f"\x1b[{rows - self.oi_height - 2};1H\x1b[K" + header)
+        out.append(
+            f"\x1b[{rows - self.oi_height - 2};{right_x}H\x1b[K" + header
+        )
         for i in range(self.oi_height):
             stream_line = body[i] if i < len(body) else ""
             padded = (stream_line + " " * stream_w)[:stream_w]
@@ -532,8 +552,10 @@ class DualPaneSurface(OperatorSurface):
                 row += (mline + " " * self.MASCOT_WIDTH)[: self.MASCOT_WIDTH]
             else:
                 row += " " * self.MASCOT_WIDTH
-            out.append(f"\x1b[{rows - self.oi_height - 1 + i};1H\x1b[K{row}")
-        out.append(f"\x1b[{rows - 1};1H\x1b[K" + footer)
+            out.append(
+                f"\x1b[{rows - self.oi_height - 1 + i};{right_x}H\x1b[K{row}"
+            )
+        out.append(f"\x1b[{rows - 1};{right_x}H\x1b[K" + footer)
         out.append("\x1b8")      # restore cursor
         self.output.write("".join(out))
         self.output.flush()

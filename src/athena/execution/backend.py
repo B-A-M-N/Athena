@@ -29,6 +29,8 @@ class ExecutionBackend(abc.ABC):
         runtime: str,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
+        workspace_root: str | None = None,
+        network_policy: str | None = None,
     ) -> str:
         """Create a persistent runtime session scoped to ``task_id``."""
 

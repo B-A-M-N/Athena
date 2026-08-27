@@ -23,6 +23,13 @@ from athena.capabilities.execute import ExecuteCapability
 from athena.capabilities.memory import MemoryCapability
 from athena.capabilities.skills import SkillsCapability
 from athena.capabilities.delegate import DelegateCapability
+from athena.capabilities.dependency import DependencyCapability
+from athena.capabilities.reflection import CapabilityReflection
+from athena.capabilities.artifacts import ArtifactCapability
+from athena.capabilities.workflow import WorkflowCapability
+from athena.capabilities.synthesis import SynthesisCapability
+from athena.capabilities.scratch import ScratchCapability
+from athena.capabilities.research import ResearchCapability
 
 __all__ = [
     "CapabilityRegistry",
@@ -35,4 +42,11 @@ __all__ = [
     "MemoryCapability",
     "SkillsCapability",
     "DelegateCapability",
+    "DependencyCapability",
+    "CapabilityReflection",
+    "ArtifactCapability",
+    "WorkflowCapability",
+    "SynthesisCapability",
+    "ScratchCapability",
+    "ResearchCapability",
 ]

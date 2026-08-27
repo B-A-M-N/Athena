@@ -13,11 +13,12 @@ operation, so a misclassification is caught as a test failure.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from athena.protocol.capabilities import CapabilityDescriptor, EffectClass
 
-__all__ = ["resolve_operation_effects", "OPERATION_EFFECTS", "CapabilityEffectError"]
+__all__ = ["OPERATION_EFFECTS", "CapabilityEffectError", "resolve_operation_effects"]
 
 
 class CapabilityEffectError(ValueError):
@@ -50,18 +51,31 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
     "machine": {
         op: frozenset({EffectClass.READ_LOCAL})
         for op in ("overview", "cpu", "memory", "disk", "network", "ports",
-                   "toolchain", "services", "gpu")
+                   "toolchain", "services", "gpu", "env")
     },
     "service": {
-        "list": frozenset({EffectClass.READ_LOCAL}),
-        "status": frozenset({EffectClass.READ_LOCAL}),
-        "logs": frozenset({EffectClass.READ_LOCAL}),
-        "start": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE}),
-        "stop": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE}),
-        "restart": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE}),
-        "reload": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE}),
-        "enable": frozenset({EffectClass.PRIVILEGED, EffectClass.WRITE_LOCAL}),
-        "disable": frozenset({EffectClass.PRIVILEGED, EffectClass.WRITE_LOCAL}),
+        "list": frozenset({EffectClass.READ_LOCAL, EffectClass.EXECUTE,
+                            EffectClass.SPAWN_PROCESS}),
+        "status": frozenset({EffectClass.READ_LOCAL, EffectClass.EXECUTE,
+                              EffectClass.SPAWN_PROCESS}),
+        "logs": frozenset({EffectClass.READ_LOCAL, EffectClass.EXECUTE,
+                            EffectClass.SPAWN_PROCESS}),
+        "start": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE,
+                             EffectClass.SPAWN_PROCESS}),
+        "stop": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE,
+                            EffectClass.SPAWN_PROCESS}),
+        "restart": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE,
+                               EffectClass.SPAWN_PROCESS}),
+        "reload": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE,
+                              EffectClass.SPAWN_PROCESS}),
+        "enable": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE,
+                              EffectClass.SPAWN_PROCESS, EffectClass.WRITE_LOCAL}),
+        "disable": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE,
+                               EffectClass.SPAWN_PROCESS, EffectClass.WRITE_LOCAL}),
+        "mask": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE,
+                            EffectClass.SPAWN_PROCESS, EffectClass.WRITE_LOCAL}),
+        "unmask": frozenset({EffectClass.PRIVILEGED, EffectClass.EXECUTE,
+                              EffectClass.SPAWN_PROCESS, EffectClass.WRITE_LOCAL}),
     },
     "database": {
         "tables": frozenset({EffectClass.READ_LOCAL}),
@@ -86,9 +100,119 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "snapshot": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "restore": frozenset({EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
     },
+    "fs": {
+        "read": frozenset({EffectClass.READ_LOCAL}),
+        "list": frozenset({EffectClass.READ_LOCAL}),
+        "stat": frozenset({EffectClass.READ_LOCAL}),
+        "write": frozenset({EffectClass.WRITE_LOCAL}),
+        "patch": frozenset({EffectClass.WRITE_LOCAL}),
+        "mkdir": frozenset({EffectClass.WRITE_LOCAL}),
+        "copy": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        "move": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        "delete": frozenset({EffectClass.DELETE}),
+    },
+    "memory": {
+        "recall": frozenset({EffectClass.READ_LOCAL}),
+        "search": frozenset({EffectClass.READ_LOCAL}),
+        "save": frozenset({EffectClass.WRITE_LOCAL}),
+    },
+    "delegate": {
+        "spawn": frozenset({EffectClass.SPAWN_PROCESS}),
+        "status": frozenset({EffectClass.READ_LOCAL}),
+        "collect": frozenset({EffectClass.READ_LOCAL}),
+        "cancel": frozenset({EffectClass.SPAWN_PROCESS}),
+    },
+    "schedule": {
+        "create": frozenset({EffectClass.WRITE_LOCAL}),
+        "list": frozenset({EffectClass.READ_LOCAL}),
+        "inspect": frozenset({EffectClass.READ_LOCAL}),
+        "enable": frozenset({EffectClass.WRITE_LOCAL}),
+        "disable": frozenset({EffectClass.WRITE_LOCAL}),
+        "delete": frozenset({EffectClass.WRITE_LOCAL}),
+    },
+    "skills": {
+        "search": frozenset({EffectClass.READ_LOCAL}),
+        "trigger": frozenset({EffectClass.EXECUTE}),
+    },
+    "watch": {
+        "file": frozenset({EffectClass.READ_LOCAL}),
+        "process": frozenset({EffectClass.READ_LOCAL}),
+        "list": frozenset({EffectClass.READ_LOCAL}),
+        "stop": frozenset({EffectClass.READ_LOCAL}),
+    },
+    "capabilities": {
+        "search": frozenset({EffectClass.READ_LOCAL}),
+        "describe": frozenset({EffectClass.READ_LOCAL}),
+        "dependencies": frozenset({EffectClass.READ_LOCAL}),
+        "provenance": frozenset({EffectClass.READ_LOCAL}),
+        "history": frozenset({EffectClass.READ_LOCAL}),
+        "created_this_task": frozenset({EffectClass.READ_LOCAL}),
+        "workflows": frozenset({EffectClass.READ_LOCAL}),
+        "skills": frozenset({EffectClass.READ_LOCAL}),
+        "runtimes": frozenset({EffectClass.READ_LOCAL}),
+        "permissions": frozenset({EffectClass.READ_LOCAL}),
+        "devices": frozenset({EffectClass.READ_LOCAL}),
+    },
+    "dependency": {
+        "inspect": frozenset({EffectClass.READ_LOCAL}),
+        "resolve": frozenset({EffectClass.READ_LOCAL}),
+        "install": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS,
+                               EffectClass.WRITE_LOCAL, EffectClass.NETWORK_WRITE}),
+    },
+    "synthesis": {
+        "create": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        "promote": frozenset({EffectClass.WRITE_LOCAL}),
+    },
+    "scratch": {
+        "run": frozenset({EffectClass.READ_LOCAL, EffectClass.EXECUTE,
+                           EffectClass.SPAWN_PROCESS}),
+    },
+    "research": {
+        "record_source": frozenset({EffectClass.WRITE_LOCAL}),
+        "fetch": frozenset({EffectClass.WRITE_LOCAL, EffectClass.NETWORK_READ}),
+        "sources": frozenset({EffectClass.READ_LOCAL}),
+        "search": frozenset({EffectClass.READ_LOCAL}),
+        "record_evidence": frozenset({EffectClass.WRITE_LOCAL}),
+        "evidence": frozenset({EffectClass.READ_LOCAL}),
+        "record_gap": frozenset({EffectClass.WRITE_LOCAL}),
+        "gaps": frozenset({EffectClass.READ_LOCAL}),
+        "close_gap": frozenset({EffectClass.WRITE_LOCAL}),
+        "verify": frozenset({EffectClass.READ_LOCAL}),
+    },
+    "artifacts": {
+        "list": frozenset({EffectClass.READ_LOCAL}),
+        "read": frozenset({EffectClass.READ_LOCAL}),
+        "slice": frozenset({EffectClass.READ_LOCAL}),
+        "search": frozenset({EffectClass.READ_LOCAL}),
+    },
+    "workflow": {
+        "list": frozenset({EffectClass.READ_LOCAL}),
+        "describe": frozenset({EffectClass.READ_LOCAL}),
+        "create": frozenset({EffectClass.WRITE_LOCAL}),
+        "run": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS,
+                           EffectClass.WRITE_LOCAL, EffectClass.DELETE,
+                           EffectClass.NETWORK_WRITE}),
+    },
+    "debugger": {
+        "launch": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        "attach": frozenset({EffectClass.EXECUTE}),
+        "breakpoint": frozenset({EffectClass.EXECUTE}),
+        "continue": frozenset({EffectClass.EXECUTE}),
+        "pause": frozenset({EffectClass.EXECUTE}),
+        "step": frozenset({EffectClass.EXECUTE}),
+        "stack": frozenset({EffectClass.READ_LOCAL}),
+        "variables": frozenset({EffectClass.READ_LOCAL}),
+        "eval": frozenset({EffectClass.EXECUTE}),
+        "detach": frozenset({EffectClass.EXECUTE}),
+        "status": frozenset({EffectClass.READ_LOCAL}),
+    },
+    "execute": {
+        "": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        "execute": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+    },
 }
 
-_UNSAFE_HTTP_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
 def resolve_operation_effects(
@@ -102,27 +226,11 @@ def resolve_operation_effects(
     CapabilityEffectError when an operation cannot be classified — the
     caller must reject the call instead of guessing effects.
     """
-    op_map = OPERATION_EFFECTS.get(descriptor.id)
-    if op_map is None:
+    if descriptor.operation_effects is None and descriptor.effect_resolver is None:
         return ()
-    op = str(arguments.get("operation") or arguments.get("action") or "").lower()
-    if op not in op_map:
+    try:
+        effects = descriptor.resolve_effects(arguments)
+    except ValueError as exc:
         raise CapabilityEffectError(
-            f"capability {descriptor.id}: operation {op!r} has no declared "
-            f"effect classification")
-    effects = set(op_map[op])
-
-    # Contract-level refinements.
-    if descriptor.id == "network" and op == "http":
-        method = str(arguments.get("method") or "GET").upper()
-        if method in _UNSAFE_HTTP_METHODS:
-            effects.add(EffectClass.NETWORK_WRITE)
-
-    # Every resolved effect must be within the descriptor's declared ceiling.
-    outside = effects - set(descriptor.effects)
-    if outside:
-        raise CapabilityEffectError(
-            f"capability {descriptor.id}: operation {op!r} requires effects "
-            f"{sorted(e.value for e in outside)} beyond its declared envelope")
-
-    return tuple(sorted(effects, key=lambda e: e.value))
+            f"capability {descriptor.id}: {exc}") from None
+    return tuple(sorted(effects or (), key=lambda e: e.value))

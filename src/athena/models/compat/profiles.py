@@ -22,14 +22,22 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any
 
 __all__ = [
-    "AuthMode", "CacheMode", "DiscoveryMode", "Protocol",
-    "ProviderProfile", "ModelProfile", "CompatibilityProfile",
-    "profile_fingerprint", "PRESETS",
+    "COMPATIBILITY_PRESETS",
+    "PRESETS",
+    "AuthMode",
+    "CacheMode",
+    "CompatibilityProfile",
+    "DiscoveryMode",
+    "ModelProfile",
+    "Protocol",
+    "ProviderProfile",
+    "profile_fingerprint",
+    "resolve_compatibility_profile",
 ]
 
 
@@ -111,6 +119,24 @@ class CompatibilityProfile:
     strict_mcp_aliases: bool = True          # MCP gets no fuzzy aliases
 
 
+COMPATIBILITY_PRESETS: dict[str, CompatibilityProfile] = {
+    "auto": CompatibilityProfile("auto"),
+    "test": CompatibilityProfile("test"),
+    "local": CompatibilityProfile("local"),
+    "hosted": CompatibilityProfile("hosted"),
+}
+
+
+def resolve_compatibility_profile(profile_id: str) -> CompatibilityProfile:
+    """Resolve a named correction/replay policy without a silent fallback."""
+    try:
+        return COMPATIBILITY_PRESETS[profile_id]
+    except KeyError:
+        known = ", ".join(sorted(COMPATIBILITY_PRESETS))
+        raise ValueError(
+            f"unknown compatibility profile {profile_id!r}; known: {known}") from None
+
+
 # ---------------------------------------------------------------------------
 # Fingerprints (stable serialization -> cache identity + schema hashes)
 # ---------------------------------------------------------------------------
@@ -121,12 +147,20 @@ def _canonical_json(obj: Any) -> str:
 
 def profile_fingerprint(profile: ProviderProfile) -> str:
     data = {
+        # The profile id is part of the replay/cache boundary even when two
+        # routes currently happen to share identical wire settings. A later
+        # profile revision must not silently reuse the old boundary.
+        "id": profile.id,
         "protocol": profile.protocol, "base_url": profile.base_url,
         "model_id": profile.model_id, "auth_mode": profile.auth_mode,
         "roles": sorted(profile.roles),
         "capabilities": sorted(profile.capabilities),
         "cache_mode": profile.cache_mode,
+        "cache_session_key": profile.cache_session_key,
+        "timeouts": dict(sorted(profile.timeouts.items())),
         "compatibility_profile": profile.compatibility_profile,
+        "discovery_mode": profile.discovery_mode,
+        "api_key_ref": profile.api_key_ref,
     }
     return hashlib.sha256(_canonical_json(data).encode()).hexdigest()[:16]
 
@@ -154,6 +188,13 @@ def _preset(pid: str, base_url: str, *, keyless: bool, protocol: str) -> Provide
 
 
 PRESETS: dict[str, ProviderProfile] = {
+    # The deterministic test/local adapter participates in the same
+    # provenance chain as network providers; it simply has no wire endpoint.
+    "fake": ProviderProfile(
+        id="fake", protocol=Protocol.OPENAI_COMPAT, base_url="",
+        auth_mode=AuthMode.KEYLESS, cache_mode=CacheMode.NONE,
+        compatibility_profile="test",
+    ),
     "ollama": _preset("ollama", "http://127.0.0.1:11434/v1",
                       keyless=True, protocol=Protocol.OPENAI_COMPAT),
     "lmstudio": _preset("lmstudio", "http://127.0.0.1:1234/v1",

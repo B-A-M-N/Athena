@@ -8,7 +8,6 @@ into a calm, human-paced terminal view.
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, TextIO
@@ -279,8 +278,11 @@ class OperatorSurface:
             self._write("choose a listed scope or d to deny", stream=self.error)
 
     async def _read_line(self, prompt: str) -> str:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._input_fn, prompt)
+        # ``input_fn`` is an operator interaction boundary, not agent work.
+        # Calling it directly keeps deterministic embedders/test doubles out
+        # of the process-wide executor; real terminal input is already a
+        # deliberate pause in the interactive surface.
+        return self._input_fn(prompt)
 
     # ------------------------------------------------------------------
     # Buffers

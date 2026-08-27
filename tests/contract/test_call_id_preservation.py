@@ -9,7 +9,6 @@ absent so correlations stay lossless.
 
 from __future__ import annotations
 
-import tempfile
 import pytest
 
 from athena.capabilities.dispatcher import CapabilityDispatcher

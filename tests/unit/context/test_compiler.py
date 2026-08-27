@@ -1,9 +1,10 @@
 
 import pytest
+
 from athena.context.compiler import ContextCompiler
 from athena.protocol.capabilities import CapabilityDescriptor
-from athena.protocol.messages import Role
-from athena.protocol.tasks import TaskSpec
+from athena.protocol.messages import AudioBlock, ImageBlock, Role
+from athena.protocol.tasks import ContextRef, ModelPolicy, TaskSpec
 
 
 def _task(objective: str = "do the thing", **kw) -> TaskSpec:
@@ -16,6 +17,11 @@ class _CapRegistry:
 
     async def list_descriptors(self):
         return list(self._descriptors)
+
+
+class _SearchCapRegistry(_CapRegistry):
+    async def search(self, query, **kwargs):
+        return [{"id": "files.read"}]
 
 
 @pytest.mark.athena_claim("BHV-029")
@@ -49,6 +55,23 @@ async def test_to_request_includes_capabilities_when_registered():
     assert req.messages == tuple(ctx.messages)
 
 
+@pytest.mark.asyncio
+async def test_fabric_progressively_discloses_relevant_capabilities():
+    selected = CapabilityDescriptor(
+        id="files.read", description="read files", input_schema={}
+    )
+    unrelated = CapabilityDescriptor(
+        id="database.query", description="query database", input_schema={}
+    )
+    compiler = ContextCompiler(
+        capability_registry=_SearchCapRegistry([selected, unrelated])
+    )
+
+    ctx = await compiler.compile(_task(objective="read files"))
+
+    assert [descriptor.id for descriptor in ctx.capability_definitions] == ["files.read"]
+
+
 @pytest.mark.athena_claim("BHV-029")
 @pytest.mark.athena_evidence("test")
 async def test_bounded_context_within_token_budget():
@@ -61,3 +84,49 @@ async def test_bounded_context_within_token_budget():
     ctx = await compiler.compile(_task(objective="objective " + "z" * 20))
 
     assert ctx.estimated_tokens <= 2000
+
+
+@pytest.mark.asyncio
+async def test_context_refs_preserve_multimodal_blocks_and_requirements():
+    task = _task(
+        model_policy=ModelPolicy(require_tools=False),
+        context_refs=(
+            ContextRef(kind="image", ref="artifact://sha256/image", mime_type="image/png"),
+            ContextRef(kind="audio", ref="artifact://sha256/audio", mime_type="audio/wav"),
+        ),
+    )
+
+    context = await ContextCompiler().compile(task)
+
+    blocks = [block for message in context.messages for block in message.blocks]
+    assert any(isinstance(block, ImageBlock) for block in blocks)
+    assert any(isinstance(block, AudioBlock) for block in blocks)
+    assert context.requirements.vision is True
+    assert context.requirements.audio is True
+
+
+class _ResearchStore:
+    async def search_content(self, query, **kwargs):
+        assert query == "what is the protocol"
+        assert kwargs["task_id"] == "task-1"
+        return [{
+            "source": {
+                "id": "src-1",
+                "title": "Protocol notes",
+                "canonical_uri": "https://example.test/protocol",
+            },
+            "snippet": "The protocol uses framed messages.",
+        }]
+
+
+async def test_compiler_retrieves_scoped_research_as_external_evidence():
+    compiler = ContextCompiler(research_store=_ResearchStore())
+    context = await compiler.compile(_task(objective="what is the protocol"))
+
+    text = "\n".join(message.text() for message in context.messages)
+    assert "The protocol uses framed messages." in text
+    research_messages = [
+        message for message in context.messages
+        if message.provenance and message.provenance.source_id == "src-1"
+    ]
+    assert research_messages

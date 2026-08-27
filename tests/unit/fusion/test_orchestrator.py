@@ -74,6 +74,7 @@ async def test_failed_criteria_discards_and_auto_forks(fused):
             "content": "x=1\n", "create_dirs": True}}],
         criteria_probes=[
             {"id": "impossible", "command": "test -f /nonexistent-target-file"}],
+        profile="autonomous",
         auto_fork_on_failure=True,
     )
     assert result.status == "FAILED"
@@ -87,16 +88,13 @@ async def test_invariant_violation_blocks_commit(fused):
     svc, ws, task_id = fused
     fusion = FusionOrchestrator(svc)
 
-    async def broken():
-        return False  # required invariant violated
-
     result = await fusion.run_experiment(
         task_id=task_id,
         proposal=[{"capability_id": "fs", "arguments": {
             "operation": "write", "path": "v.py", "content": "1\n",
             "create_dirs": True}}],
-        invariants=[{"description": "system must remain healthy",
-                     "probe": broken}],
+        invariants=[{"description": "always fails",
+                     "command": "test -d /nonexistent-dir-xyz"}],
         profile="autonomous",
         auto_fork_on_failure=False,
     )

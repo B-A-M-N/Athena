@@ -6,6 +6,7 @@ import pytest
 
 from athena.capabilities.terminal_session import TerminalSessionCapability
 from athena.protocol.capabilities import CapabilityRequest
+from athena.protocol.tasks import WorkspaceSpec
 
 
 def _req(op: str, task_id=None, **args):
@@ -23,27 +24,36 @@ def term():
     cap.close_all()
 
 
-async def test_create_send_screen_kill(term):
-    r = await term.invoke(_req("create", task_id="t1", command="bash --norc"))
+async def test_create_send_screen_kill(term, tmp_path):
+    context = type("Context", (), {
+        "workspace": WorkspaceSpec(id="w", root=str(tmp_path)),
+    })()
+    r = await term.invoke(
+        _req("create", task_id="t1", command="bash --norc"), context=context)
     assert "created" in (r.output or "")
     sid = next(p for p in (r.output or "").split() if p.startswith("tty_"))
 
     r = await term.invoke(_req("send", task_id="t1", session=sid,
-                               text="echo marker-$((21*2))"))
+                               text="echo marker-$((21*2))"), context=context)
     assert "marker-42" in (r.output or "")
 
     # wait_for on fresh output
-    await term.invoke(_req("send", task_id="t1", session=sid, text="echo done-tag-xyz"))
+    await term.invoke(_req("send", task_id="t1", session=sid,
+                           text="echo done-tag-xyz"), context=context)
     r = await term.invoke(_req("wait_for", task_id="t1", session=sid,
-                               pattern="done-tag-xyz", timeout=5))
+                               pattern="done-tag-xyz", timeout=5), context=context)
     assert r.metadata.get("matched") is True, (r.output or "")[-200:]
 
-    r = await term.invoke(_req("kill", task_id="t1", session=sid))
+    r = await term.invoke(_req("kill", task_id="t1", session=sid), context=context)
     assert "terminated" in (r.output or "")
 
 
-async def test_task_ownership_enforced(term):
-    await term.invoke(_req("create", task_id="t1", command="bash --norc"))
+async def test_task_ownership_enforced(term, tmp_path):
+    context = type("Context", (), {
+        "workspace": WorkspaceSpec(id="w", root=str(tmp_path)),
+    })()
+    await term.invoke(_req("create", task_id="t1", command="bash --norc"),
+                      context=context)
     sid = next(iter(term._sessions))
     # A different task must not touch the session.
     r = await term.invoke(_req("screen", task_id="t2", session=sid))

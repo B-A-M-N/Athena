@@ -9,6 +9,7 @@ processes after cancellation are a release-blocking defect).
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -32,6 +33,9 @@ def spawn_owned(
     *,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
+    sandbox_root: str | None = None,
+    network_policy: str | None = None,
+    sandbox_writable: bool = True,
     **popen_kwargs: object,
 ) -> "subprocess.Popen[str]":
     """Spawn ``argv`` in its own process group so the whole tree can be killed.
@@ -57,13 +61,128 @@ def spawn_owned(
     if env:
         my_env.update({k: str(v) for k, v in env.items()})
     my_env.setdefault("PYTHONIOENCODING", "utf-8")
+    if sandbox_root is not None:
+        argv = sandbox_argv(
+            argv,
+            root=sandbox_root,
+            cwd=cwd,
+            network_policy=network_policy,
+            writable=sandbox_writable,
+        )
+        root_abs = os.path.realpath(os.path.abspath(sandbox_root))
+        my_env["PATH"] = _namespace_path(my_env.get("PATH", ""), root_abs)
+        # The process now starts in the namespace's path.  Passing the host
+        # cwd to Popen would be both redundant and misleading.
+        cwd = None
     kwargs: dict = {"env": my_env}
     if cwd is not None:
         kwargs["cwd"] = cwd
     if os.name != "nt":
         kwargs["start_new_session"] = True
     kwargs.update(popen_kwargs)
-    return subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
+    return subprocess.Popen(argv, **kwargs)
+
+
+def sandbox_argv(
+    argv: list[str],
+    *,
+    root: str,
+    cwd: str | None = None,
+    network_policy: str | None = None,
+    writable: bool = True,
+) -> list[str]:
+    """Build a fail-closed Linux Bubblewrap command line.
+
+    This is deliberately a small, auditable mount policy rather than a
+    best-effort ``cwd`` convention.  The workspace is writable; common
+    interpreter/toolchain directories are read-only; temporary storage is a
+    private tmpfs; and non-ALLOW network policy requests use a private network
+    namespace.  If Bubblewrap is unavailable, the caller gets an error instead
+    of silently falling back to host execution.
+    """
+    if os.name == "nt":
+        raise RuntimeError("workspace sandbox is unavailable on Windows")
+    bwrap = shutil.which("bwrap")
+    if bwrap is None:
+        raise RuntimeError("workspace sandbox requires bubblewrap")
+    root = os.path.realpath(os.path.abspath(root))
+    if not os.path.isdir(root):
+        raise RuntimeError(f"workspace sandbox root is not a directory: {root}")
+    namespace_root = "/workspace"
+    if cwd is None:
+        namespace_cwd = namespace_root
+    else:
+        host_cwd = os.path.realpath(os.path.abspath(cwd))
+        if host_cwd != root and not host_cwd.startswith(root + os.sep):
+            raise RuntimeError("sandbox cwd is outside workspace root")
+        namespace_cwd = namespace_root + host_cwd[len(root):]
+
+    command = [
+        bwrap,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--bind" if writable else "--ro-bind", root, namespace_root,
+        "--tmpfs", "/tmp",
+    ]
+    if network_policy and network_policy != "allow":
+        command.append("--unshare-net")
+
+    # Bind host toolchains read-only.  Never bind the host root, /home, or /etc
+    # wholesale: that would turn a mount namespace into cosmetic cwd fencing.
+    for path in ("/usr", "/bin", "/lib", "/lib64"):
+        if os.path.exists(path):
+            command.extend(("--ro-bind", path, path))
+    # Resolve PATH-based launchers before entering the namespace.  Calling
+    # ``sandbox_argv(["bash", ...])`` must not resolve relative to the
+    # caller's cwd (which would produce ``<project>/bash``); the executable
+    # is already mounted from its canonical system/toolchain path below.
+    executable = ""
+    if argv:
+        resolved = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0])
+        executable = os.path.realpath(resolved or argv[0])
+    if executable and not (executable == root or executable.startswith(root + os.sep)):
+        parent = os.path.dirname(executable)
+        if os.path.basename(parent) == "bin":
+            parent = os.path.dirname(parent)
+        if parent and os.path.exists(parent) and parent not in ("/usr", "/bin", "/lib", "/lib64"):
+            ancestor = parent
+            ancestors: list[str] = []
+            while ancestor not in ("", os.path.dirname(ancestor)):
+                ancestors.append(ancestor)
+                ancestor = os.path.dirname(ancestor)
+            for directory in reversed(ancestors):
+                if directory not in ("/", "/usr", "/bin", "/lib", "/lib64"):
+                    command.extend(("--dir", directory))
+            command.extend(("--ro-bind", parent, parent))
+    namespace_argv = []
+    for index, arg in enumerate(argv):
+        if index == 0 and executable and (
+            arg == argv[0] or os.path.realpath(arg) == executable
+        ):
+            # Virtualenv launchers are often symlinks into /usr.  The
+            # namespace cannot resolve the host-side symlink path, so invoke
+            # the already-mounted canonical executable.
+            namespace_argv.append(executable)
+        elif arg == root or arg.startswith(root + os.sep):
+            namespace_argv.append(namespace_root + arg[len(root):])
+        else:
+            namespace_argv.append(arg)
+    command.extend(("--chdir", namespace_cwd, "--"))
+    return command + namespace_argv
+
+
+def _namespace_path(value: str, root: str) -> str:
+    """Rewrite workspace-local PATH entries for the /workspace mount."""
+    parts = []
+    for item in value.split(os.pathsep):
+        if item == root or item.startswith(root + os.sep):
+            parts.append("/workspace" + item[len(root):])
+        else:
+            parts.append(item)
+    return os.pathsep.join(parts)
 
 
 def process_group_id(process: "subprocess.Popen") -> int | None:
@@ -75,6 +194,30 @@ def process_group_id(process: "subprocess.Popen") -> int | None:
     try:
         return os.getpgid(process.pid)
     except ProcessLookupError:
+        return None
+
+
+def process_start_identity(pid: int) -> str | None:
+    """Return Linux's process-start token for ``pid``.
+
+    A PID is recyclable. The token in ``/proc/<pid>/stat`` field 22 is stable
+    for one process lifetime, so callers can bind a control request to
+    ``(pid, start_identity)`` instead of trusting a bare PID. The parser
+    splits after the command name because that field may contain whitespace
+    or closing parentheses.
+    """
+    if os.name == "nt" or pid <= 0:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            line = handle.read()
+        _pid_and_comm, separator, remainder = line.rpartition(")")
+        if not separator:
+            return None
+        fields = remainder.split()
+        # ``remainder`` starts at stat field 3; field 22 is index 19.
+        return fields[19] if len(fields) > 19 else None
+    except (OSError, UnicodeError):
         return None
 
 
@@ -95,7 +238,7 @@ def child_pids(root_pid: int) -> list[int]:
 def _descendants(proc) -> list:
     try:
         return proc.children(recursive=True)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):  # type: ignore[union-attr]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         return []
 
 
@@ -199,9 +342,10 @@ def interrupt_group(process: "subprocess.Popen") -> None:
 
 
 __all__ = [
-    "spawn_owned",
-    "process_group_id",
     "child_pids",
     "kill_tree",
     "interrupt_group",
+    "process_group_id",
+    "process_start_identity",
+    "spawn_owned",
 ]

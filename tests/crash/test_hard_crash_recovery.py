@@ -6,7 +6,6 @@ They then restart on the same DB file and verify recovery works.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import tempfile
 import pytest

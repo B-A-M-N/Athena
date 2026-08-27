@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Single-writer demo renderer for Athena.
+#
+# Owns the lifecycle for `vhs demos/<name>.tape`:
+#   1. acquire an exclusive flock keyed on the final gif path
+#   2. render to a unique temp path (vhs -q -o <temp>)
+#   3. wait for VHS to exit, bounded by a timeout that exceeds tape duration
+#   4. validate the temp file (GIF89a header, width, height, frame count, duration)
+#   5. atomically rename the validated temp file to the final path
+#   6. on any failure: kill the process group, remove the temp, leave the
+#      previous known-good final gif untouched
+#
+# Required for stable-beta gate:
+#   - no two VHS processes may write the same final output simultaneously
+#   - file existence alone is NEVER accepted as completion
+#   - VHS process exit 0 AND gif decode OK are both required
+#
+# Usage:
+#   scripts/render-demo                                  # default: capability_fabric
+#   scripts/render-demo capability_fabric                # explicit demo name
+#   ATHENA_DEMO_TIMEOUT=90 scripts/render-demo ...      # override timeout (s)
+#
+# Exit codes:
+#   0  success — final gif exists, decoded, and passed checks
+#   2  tool/argument error (vhs missing, unknown demo)
+#   3  timeout — VHS did not exit in time
+#   4  vhs failure — VHS exited non-zero
+#   5  artifact validation failure — vhs exited 0 but gif is bad
+
+set -euo pipefail
+
+# --- locate repo root, regardless of where the script was invoked from ----
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+# --- configuration ---------------------------------------------------------
+DEMO_NAME="${1:-capability_fabric}"
+DEMO_TIMEOUT="${ATHENA_DEMO_TIMEOUT:-60}"   # tape is ~4s; 60s leaves generous headroom
+TAPE_PATH="demos/${DEMO_NAME}.tape"
+FINAL_PATH="demos/${DEMO_NAME}.gif"
+LOCK_PATH="${FINAL_PATH}.lock"
+DEMO_DIR="$(dirname "${TAPE_PATH}")"
+
+# Validate inputs up front.
+[[ -f "${TAPE_PATH}" ]] || { echo "render-demo: tape not found: ${TAPE_PATH}" >&2; exit 2; }
+command -v vhs >/dev/null 2>&1 || { echo "render-demo: vhs not on PATH" >&2; exit 2; }
+
+# --- acquire exclusive single-writer lock ----------------------------------
+# Hold the lock for the whole critical section.  flock auto-releases on
+# process exit (including timeouts and crashes) so we never leak the lock.
+LOCK_FD=200
+exec {LOCK_FD}>"${LOCK_PATH}"
+if ! flock -n "${LOCK_FD}"; then
+    echo "render-demo: another render is in progress for ${FINAL_PATH}" >&2
+    exit 2
+fi
+
+# --- prepare a unique temp path inside the demo dir ------------------------
+# mktemp inside demos/ so the temp is on the same filesystem as the final
+# target — atomic rename is then guaranteed.
+TMP_PATH="$(mktemp "${DEMO_DIR}/.${DEMO_NAME}.XXXXXX.gif")"
+cleanup() {
+    local rc=$?
+    # Remove any temp artifact; the previous known-good final gif is left
+    # untouched on failure (the whole point of atomic rename).
+    rm -f -- "${TMP_PATH}" 2>/dev/null || true
+    # Drop the temp symlink/lockfile if we made one (no-op for flock fd).
+    return "${rc}"
+}
+trap cleanup EXIT INT TERM
+
+# --- bounded render --------------------------------------------------------
+# Kill the entire process group on timeout so a stuck child tty/ffmpeg
+# doesn't keep writing to the temp path after we've given up.
+echo "render-demo: tape=${TAPE_PATH} timeout=${DEMO_TIMEOUT}s temp=${TMP_PATH}"
+START_TS=$(date +%s)
+set +e
+timeout --foreground --kill-after=5 "${DEMO_TIMEOUT}" \
+    vhs -q -o "${TMP_PATH}" "${TAPE_PATH}"
+VHS_RC=$?
+set -e
+END_TS=$(date +%s)
+ELAPSED=$((END_TS - START_TS))
+echo "render-demo: vhs exited rc=${VHS_RC} after ${ELAPSED}s"
+
+if [[ "${VHS_RC}" -eq 124 ]]; then
+    echo "render-demo: TIMEOUT after ${DEMO_TIMEOUT}s (tape designed for far less)" >&2
+    echo "render-demo: previous known-good gif at ${FINAL_PATH} is preserved" >&2
+    exit 3
+fi
+if [[ "${VHS_RC}" -ne 0 ]]; then
+    echo "render-demo: vhs failed (rc=${VHS_RC}); previous ${FINAL_PATH} is preserved" >&2
+    exit 4
+fi
+
+# --- artifact validation ---------------------------------------------------
+# Required checks (P0):
+#   1. file exists, non-empty
+#   2. GIF89a magic header
+#   3. declared width  = 1280
+#   4. declared height = 720
+#   5. decodes via ffmpeg (frame count > 0, duration within bounds)
+if [[ ! -s "${TMP_PATH}" ]]; then
+    echo "render-demo: temp artifact is empty: ${TMP_PATH}" >&2
+    exit 5
+fi
+
+# GIF89a magic + width/height are at fixed byte offsets in the Logical
+# Screen Descriptor (after the 6-byte header).
+MAGIC="$(head -c 6 "${TMP_PATH}")"
+WIDTH_HEX="$(head -c 4 "${TMP_PATH}" | tail -c 2 | od -An -tu2 --endian=little | tr -d ' ')"
+HEIGHT_HEX="$(head -c 5 "${TMP_PATH}" | tail -c 2 | od -An -tu2 --endian=little | tr -d ' ')"
+
+if [[ "${MAGIC}" != "GIF89a" && "${MAGIC}" != "GIF87a" ]]; then
+    echo "render-demo: bad magic ${MAGIC@Q}; expected GIF89a" >&2
+    exit 5
+fi
+EXPECTED_W=1280
+EXPECTED_H=720
+if [[ "${WIDTH_HEX}" != "${EXPECTED_W}" || "${HEIGHT_HEX}" != "${EXPECTED_H}" ]]; then
+    echo "render-demo: bad dimensions ${WIDTH_HEX}x${HEIGHT_HEX}; expected ${EXPECTED_W}x${EXPECTED_H}" >&2
+    exit 5
+fi
+
+# Frame count + duration check via ffmpeg.  ffmpeg is bundled with VHS so
+# this should always be available, but tolerate absence with a clear error
+# rather than a false pass.
+if command -v ffmpeg >/dev/null 2>&1; then
+    PROBE_OUT="$(ffmpeg -v error -i "${TMP_PATH}" -map 0:v:0 -c copy -f null - 2>&1 || true)"
+    META_OUT="$(ffmpeg -hide_banner -i "${TMP_PATH}" 2>&1 || true)"
+    # Duration in seconds, rounded to one decimal, from ffmpeg's "Duration: HH:MM:SS.xx" line.
+    DURATION_S="$(printf '%s\n' "${META_OUT}" | sed -n 's/.*Duration: \([0-9:]*\.[0-9]\+\).*/\1/p' | head -1)"
+    if [[ -z "${DURATION_S}" ]]; then
+        echo "render-demo: ffmpeg could not parse duration for ${TMP_PATH}" >&2
+        echo "render-demo: ffmpeg stderr was: ${META_OUT}" >&2
+        exit 5
+    fi
+    # Convert HH:MM:SS.xx to total seconds using awk (no bc dependency).
+    DURATION_TOTAL="$(printf '%s' "${DURATION_S}" | awk -F: '{
+        if (NF == 3) { printf "%.3f", ($1*3600) + ($2*60) + $3 }
+        else if (NF == 2) { printf "%.3f", ($1*60) + $2 }
+        else { printf "%.3f", $1 }
+    }')"
+    # Frame count from "frame= N" lines in the probe (copy -f null prints these).
+    FRAMES="$(printf '%s\n' "${PROBE_OUT}" | awk '/^frame= *[0-9]+/ { gsub(/^frame= */, "", $0); print $0; exit }')"
+    FRAMES="${FRAMES:-0}"
+
+    # Bounded assertions: tape ~4s, allow 1.5s..DEMO_TIMEOUT/2 (so a 60s
+    # timeout lets through up to 30s, but a 92s tape would not silently
+    # slip through).
+    MIN_DURATION="1.5"
+    MAX_DURATION="$(awk -v t="${DEMO_TIMEOUT}" 'BEGIN { printf "%.3f", t/2 }')"
+    MIN_FRAMES="15"
+
+    DUR_OK="$(awk -v d="${DURATION_TOTAL}" -v lo="${MIN_DURATION}" -v hi="${MAX_DURATION}" 'BEGIN { print (d >= lo && d <= hi) ? 1 : 0 }')"
+    FRAMES_OK="$(awk -v f="${FRAMES}" -v lo="${MIN_FRAMES}" 'BEGIN { print (f >= lo) ? 1 : 0 }')"
+
+    if [[ "${DUR_OK}" != "1" || "${FRAMES_OK}" != "1" ]]; then
+        echo "render-demo: artifact fails content checks: duration=${DURATION_TOTAL}s frames=${FRAMES} (require duration in [${MIN_DURATION},${MAX_DURATION}] and frames >= ${MIN_FRAMES})" >&2
+        exit 5
+    fi
+    echo "render-demo: validated ${TMP_PATH} — ${WIDTH_HEX}x${HEIGHT_HEX}, ${DURATION_TOTAL}s, ${FRAMES} frames"
+else
+    # No ffmpeg available — surface that as a validation failure rather than
+    # silently accepting an unchecked file.  Stable-beta must not accept
+    # file-existence alone as completion.
+    echo "render-demo: ffmpeg not on PATH; cannot verify frame count + duration" >&2
+    exit 5
+fi
+
+# --- atomic publish --------------------------------------------------------
+# rename(2) is atomic on the same filesystem; we used mktemp in the same
+# directory as the final target for exactly this reason.
+mv -f "${TMP_PATH}" "${FINAL_PATH}"
+TMP_PATH=""  # tell the EXIT trap not to delete the now-published artifact
+echo "render-demo: published ${FINAL_PATH}"
+exit 0

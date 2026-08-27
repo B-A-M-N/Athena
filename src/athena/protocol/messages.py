@@ -112,6 +112,10 @@ class CapabilityCallBlock(ContentBlock):
     call_id: str = ""
     capability_id: str = ""
     arguments: Mapping[str, Any] = field(default_factory=dict)
+    # The raw candidate is retained when a provider did not produce a valid
+    # JSON object.  It makes the durable transcript sufficient for repair and
+    # replay after the process-local candidate registry is gone.
+    candidate: Any = None
 
 
 @dataclass(frozen=True)

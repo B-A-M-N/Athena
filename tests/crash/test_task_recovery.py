@@ -9,7 +9,6 @@ import pytest
 
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskStatus
 from athena.state.database import Database
-from athena.state.mutations import PLANNED
 
 
 _SLEEP_SCRIPT = (

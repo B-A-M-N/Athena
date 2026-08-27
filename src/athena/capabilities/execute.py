@@ -20,7 +20,6 @@ from athena.protocol.capabilities import (
     InvocationContext,
 )
 from athena.protocol.execution import (
-    ExecutionEvent,
     ExecutionEventType,
     ExecutionExitStatus,
     ExecutionRequest,
@@ -85,7 +84,15 @@ class ExecuteCapability:
                 CapabilityResultStatus.FAILED,
                 error="no workspace bound",
             )
-        cwd = self._resolve_cwd(ws, args.get("cwd"))
+        execution_task_id = request.task_id or f"direct:{request.call_id}"
+        try:
+            cwd = self._resolve_cwd(ws, args.get("cwd"))
+        except ValueError as exc:
+            return CapabilityResult(
+                request.call_id, request.capability_id,
+                CapabilityResultStatus.FAILED,
+                error=str(exc),
+            )
 
         # Validate + honor timeout (safety/resource-control promise)
         timeout = None
@@ -121,11 +128,14 @@ class ExecuteCapability:
         exec_req = ExecutionRequest(
             runtime=runtime_name,
             source=code,
-            task_id=request.task_id,
+            task_id=execution_task_id,
             workspace_id=ws.id,
+            backend=ws.execution_backend,
             cwd=cwd,
             runtime_session_id=runtime_session_id,
             timeout=timeout,
+            network_policy=ws.network_policy,
+            workspace_root=os.path.realpath(os.path.abspath(ws.root)),
         )
         execution_id = _new_id()
 
@@ -175,6 +185,7 @@ class ExecuteCapability:
         # Artifactize large output: bounded preview inline, full in artifact
         max_inline = 8 * 1024  # 8KB inline preview
         ref_uri = None
+        result_metadata: dict[str, object] = {}
         if len(combined) > max_inline and self._artifact_store is not None:
             try:
                 artifact = await self._artifact_store.save(
@@ -185,20 +196,28 @@ class ExecuteCapability:
                 )
                 ref_uri = artifact.uri
                 combined = combined[:max_inline] + f"\n…[truncated, full output in artifact {ref_uri}]"
-            except Exception:
-                pass
+            except Exception as exc:
+                # Preserve the complete output and make the degraded
+                # observability state explicit.  Silently pretending that a
+                # durable follow-up artifact exists is worse than returning a
+                # large result because it makes later inspection impossible
+                # to diagnose.
+                result_metadata["artifactization_error"] = str(exc)
+        elif len(combined) > max_inline:
+            result_metadata["artifactization"] = "unavailable"
 
         if exit_code not in (0, None):
             return CapabilityResult(
                 request.call_id, request.capability_id, CapabilityResultStatus.FAILED,
                 output=combined, error=stderr or f"exit code {exit_code}",
                 ref_uri=ref_uri,
-                metadata={"exit_code": exit_code},
+                metadata={"exit_code": exit_code, **result_metadata},
             )
         return CapabilityResult(
             request.call_id, request.capability_id, CapabilityResultStatus.OK,
             output=combined,
             ref_uri=ref_uri,
+            metadata=result_metadata,
         )
 
     @staticmethod
@@ -206,8 +225,8 @@ class ExecuteCapability:
         """Resolve the execution cwd against the task workspace (INV-008).
 
         A relative cwd is joined to the workspace root; an absolute cwd is
-        required to stay inside the workspace root, otherwise ``None`` (the
-        runtime's default) is used so execution never escapes the workspace.
+        required to stay inside the workspace root. Invalid paths fail closed
+        rather than falling back to a runtime-dependent host cwd.
         """
         if not cwd:
             return None
@@ -217,7 +236,7 @@ class ExecuteCapability:
         else:
             candidate = os.path.realpath(os.path.abspath(os.path.join(ws.root, cwd)))
         if candidate != root and not candidate.startswith(root + os.sep):
-            return None
+            raise ValueError(f"cwd outside workspace: {cwd}")
         return candidate
 
 

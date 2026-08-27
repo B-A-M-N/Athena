@@ -23,7 +23,7 @@ import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from athena.protocol.tasks import AutonomyLevel
 
@@ -149,6 +149,11 @@ class AthenaConfig:
     # "privacy": "...", "max_cost_usd": "0.01"}. Roles without an entry fall
     # back to the user's global/primary choice.
     model_roles: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    # External research acquisition is deny-by-default until the operator
+    # explicitly allowlists source domains. Artifact snapshots remain local.
+    research_allowed_domains: tuple[str, ...] = ()
+    research_denied_domains: tuple[str, ...] = ()
+    research_allow_private_network: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -290,6 +295,12 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         ]
     if config.model_roles:
         d["model_roles"] = {k: dict(v) for k, v in config.model_roles.items()}
+    if config.research_allowed_domains:
+        d["research_allowed_domains"] = list(config.research_allowed_domains)
+    if config.research_denied_domains:
+        d["research_denied_domains"] = list(config.research_denied_domains)
+    if config.research_allow_private_network:
+        d["research_allow_private_network"] = True
     if config.metadata:
         d["metadata"] = dict(config.metadata)
     return d
@@ -311,6 +322,11 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
     elif isinstance(skills, str):
         skills = (skills,)
 
+    def _domains(value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            return tuple(v.strip() for v in value.split(",") if v.strip())
+        return tuple(str(v).strip() for v in (value or ()) if str(v).strip())
+
     return AthenaConfig(
         db_path=data.get("db_path"),
         workspace_root=data.get("workspace_root"),
@@ -326,6 +342,10 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         scheduler_max_concurrent=int(data.get("scheduler_max_concurrent", 0)),
         profile=data.get("profile"),
         model_roles=dict(data.get("model_roles") or {}),
+        research_allowed_domains=_domains(data.get("research_allowed_domains")),
+        research_denied_domains=_domains(data.get("research_denied_domains")),
+        research_allow_private_network=bool(
+            data.get("research_allow_private_network", False)),
         metadata=data.get("metadata") or {},
     )
 
@@ -346,7 +366,7 @@ def _env_map() -> dict[str, Any]:
         ATHENA_SKILLS_PATHS (comma-separated)
     """
     result: dict[str, Any] = {}
-    env_map = {
+    env_map: dict[str, tuple[str, Callable[[Any], Any]]] = {
         "ATHENA_DB_PATH": ("db_path", str),
         "ATHENA_DB": ("db_path", str),
         "ATHENA_WORKSPACE": ("workspace_root", str),
@@ -364,6 +384,18 @@ def _env_map() -> dict[str, Any]:
             lambda v: json.loads(v) if isinstance(v, str) else v,
         ),
         "ATHENA_SKILLS_PATHS": ("skills_paths", lambda v: tuple(p.strip() for p in v.split(",") if p.strip())),
+        "ATHENA_RESEARCH_ALLOWED_DOMAINS": (
+            "research_allowed_domains",
+            lambda v: tuple(p.strip() for p in v.split(",") if p.strip()),
+        ),
+        "ATHENA_RESEARCH_DENIED_DOMAINS": (
+            "research_denied_domains",
+            lambda v: tuple(p.strip() for p in v.split(",") if p.strip()),
+        ),
+        "ATHENA_RESEARCH_ALLOW_PRIVATE_NETWORK": (
+            "research_allow_private_network",
+            lambda v: str(v).strip().lower() in {"1", "true", "yes"},
+        ),
     }
     for env_name, (key, cast) in env_map.items():
         value = os.environ.get(env_name)

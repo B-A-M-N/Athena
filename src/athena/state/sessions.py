@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
+from athena.protocol.artifacts import ArtifactRef
+from athena.protocol.events import Event
 from athena.protocol.messages import (
-    AudioBlock,
     ArtifactRefBlock,
+    AudioBlock,
     CapabilityCallBlock,
     CapabilityResultBlock,
     ContentBlock,
@@ -21,7 +24,7 @@ from athena.protocol.messages import (
     TextBlock,
     utcnow,
 )
-from athena.protocol.artifacts import ArtifactRef
+from athena.protocol.models import ToolCallCandidate
 from athena.protocol.tasks import (
     CapabilityPolicy,
     Criterion,
@@ -31,7 +34,6 @@ from athena.protocol.tasks import (
     TaskStatus,
     WorkspaceSpec,
 )
-from athena.protocol.events import Event
 from athena.state.database import Database
 
 
@@ -71,12 +73,15 @@ def _serialize_block(block: ContentBlock) -> dict[str, Any]:
             } if ref is not None else None,
         }
     if isinstance(block, CapabilityCallBlock):
-        return {
+        data = {
             "type": "capability_call",
             "call_id": block.call_id,
             "capability_id": block.capability_id,
             "arguments": dict(block.arguments),
         }
+        if block.candidate is not None:
+            data["candidate"] = _serialize_candidate(block.candidate)
+        return data
     if isinstance(block, CapabilityResultBlock):
         return {
             "type": "capability_result",
@@ -127,6 +132,7 @@ def _deserialize_block(data: dict[str, Any]) -> ContentBlock:
             call_id=data.get("call_id", ""),
             capability_id=data.get("capability_id", ""),
             arguments=data.get("arguments") or {},
+            candidate=_deserialize_candidate(data.get("candidate")),
         )
     if btype == "capability_result":
         return CapabilityResultBlock(
@@ -139,6 +145,39 @@ def _deserialize_block(data: dict[str, Any]) -> ContentBlock:
             ref_uri=data.get("ref_uri"),
         )
     raise ValueError(f"Unknown block type: {btype!r}")
+
+
+def _serialize_candidate(candidate: Any) -> dict[str, Any]:
+    if isinstance(candidate, ToolCallCandidate):
+        return {
+            "call_id": candidate.call_id,
+            "capability_id": candidate.capability_id,
+            "raw_arguments": candidate.raw_arguments,
+            "parsed_arguments": candidate.parsed_arguments,
+            "completion_state": candidate.completion_state,
+            "provider_profile_id": candidate.provider_profile_id,
+            "model_id": candidate.model_id,
+            "provider_metadata": dict(candidate.provider_metadata),
+        }
+    if isinstance(candidate, dict):
+        return dict(candidate)
+    raise TypeError(f"unsupported tool-call candidate: {type(candidate)!r}")
+
+
+def _deserialize_candidate(data: Any) -> ToolCallCandidate | None:
+    if not isinstance(data, dict):
+        return None
+    parsed = data.get("parsed_arguments")
+    return ToolCallCandidate(
+        call_id=str(data.get("call_id") or ""),
+        capability_id=str(data.get("capability_id") or ""),
+        raw_arguments=str(data.get("raw_arguments") or ""),
+        parsed_arguments=parsed if isinstance(parsed, dict) else None,
+        completion_state=str(data.get("completion_state") or "CLEAN"),
+        provider_profile_id=data.get("provider_profile_id"),
+        model_id=data.get("model_id"),
+        provider_metadata=dict(data.get("provider_metadata") or {}),
+    )
 
 
 def _serialize_provenance(prov: Provenance) -> dict[str, Any]:
@@ -170,9 +209,8 @@ def _extract_text(blocks: tuple[ContentBlock, ...]) -> str:
         elif isinstance(b, CapabilityResultBlock):
             if b.output:
                 parts.append(b.output)
-        elif isinstance(b, CapabilityCallBlock):
-            if b.capability_id:
-                parts.append(b.capability_id)
+        elif isinstance(b, CapabilityCallBlock) and b.capability_id:
+            parts.append(b.capability_id)
     return "\n".join(parts)
 
 
@@ -213,6 +251,43 @@ class SessionRepository:
             if row.get("metadata"):
                 row["metadata"] = json.loads(row["metadata"])
         return rows
+
+    async def delete_if_orphaned(self, session_id: str) -> bool:
+        """Delete a session created speculatively when it has no owners.
+
+        Causal-fork setup creates a session before the child task can be
+        inserted.  If task creation fails, that intermediate session (and its
+        copied messages) must not survive as durable state.  This narrow
+        operation refuses to delete a session that has acquired any durable
+        owner, so it is safe to use during failure cleanup.
+        """
+        async with self._db.transaction():
+            existing = await self._db.fetch_one_raw(
+                "SELECT id FROM sessions WHERE id = ?", (session_id,)
+            )
+            if existing is None:
+                return False
+
+            references = (
+                ("SELECT 1 FROM sessions WHERE parent_id = ? LIMIT 1",),
+                ("SELECT 1 FROM tasks WHERE session_id = ? LIMIT 1",),
+                ("SELECT 1 FROM events WHERE session_id = ? LIMIT 1",),
+                ("SELECT 1 FROM memories WHERE source_session_id = ? LIMIT 1",),
+                ("SELECT 1 FROM provider_usage WHERE session_id = ? LIMIT 1",),
+            )
+            for (query,) in references:
+                if await self._db.fetch_one_raw(query, (session_id,)) is not None:
+                    return False
+
+            await self._db.execute_raw(
+                "DELETE FROM messages WHERE session_id = ?", (session_id,)
+            )
+            await self._db.execute_raw(
+                "DELETE FROM sessions WHERE id = ?", (session_id,)
+            )
+            if self._current_session_id == session_id:
+                self._current_session_id = None
+            return True
 
     async def append_message(self, message: Message) -> None:
         session_id: str | None = None
@@ -338,7 +413,8 @@ def _serialize_capability_policy(cp: CapabilityPolicy) -> str:
 
 def _serialize_context_refs(refs: tuple) -> str:
     return json.dumps([
-        {"kind": r.kind, "ref": r.ref, "source_id": r.source_id, "summary": r.summary}
+        {"kind": r.kind, "ref": r.ref, "source_id": r.source_id,
+         "summary": r.summary, "mime_type": getattr(r, "mime_type", None)}
         for r in refs
     ])
 
@@ -490,8 +566,8 @@ class EventRepository:
 
 
 __all__ = [
-    "SessionSpec",
-    "SessionRepository",
-    "TaskRepository",
     "EventRepository",
+    "SessionRepository",
+    "SessionSpec",
+    "TaskRepository",
 ]

@@ -35,7 +35,6 @@ durable and auditable through the canonical event log.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -43,10 +42,10 @@ from typing import Any
 
 from athena.causal.checkpoint import CheckpointManager
 from athena.causal.fork import TaskForker
+from athena.protocol.capabilities import CapabilityRequestOrigin
 from athena.protocol.ids import new_id
-from athena.worldstate.core import ClaimStatus
 
-__all__ = ["FusionOrchestrator", "ExperimentResult"]
+__all__ = ["ExperimentResult", "FusionOrchestrator"]
 
 _logger = logging.getLogger("athena.fusion")
 
@@ -71,9 +70,9 @@ class FusionOrchestrator:
     def __init__(self, service: Any) -> None:
         self.service = service
         self.shadow = service.shadow_engine()
-        self.forker = TaskForker(service=service)
         self.checkpoints = CheckpointManager(
             root="/tmp/athena-checkpoints")
+        self.forker = TaskForker(service=service, checkpoint_manager=self.checkpoints)
 
     # ------------------------------------------------------------------
     # 1+3+4: speculative experiment with invariant gate and claims
@@ -90,10 +89,14 @@ class FusionOrchestrator:
     ) -> ExperimentResult:
         """Run one full speculative experiment against reality.
 
-        criteria_probes : [{"id","command"}] executed INSIDE the shadow;
-                          all must pass for the branch to be verified.
-        invariants      : [{"description","probe"}] required-envelope checks
-                          evaluated AFTER execution but BEFORE commit.
+        criteria_probes : [{"id","command"}] executed INSIDE the shadow via
+                          the dispatcher ('execute' capability, same
+                          capability/policy path as proposals); all must pass
+                          for the branch to be verified.
+        invariants      : [{"description","command"|"probe"}] required-envelope
+                          checks evaluated AFTER execution but BEFORE commit;
+                          declarative "command" specs run inside the shadow
+                          through the dispatcher too.
         auto_fork_on_failure: create a causal fork at the parent's latest
                           event so an alternate approach can be tried.
         """
@@ -106,7 +109,7 @@ class FusionOrchestrator:
             timeline = await self.forker.timeline(task_id)
             pre_experiment_sequence = max(
                 (e["sequence"] for e in timeline), default=0)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - timeline lookup is best-effort before experiment
             _logger.warning("pre-experiment timeline failed: %s", exc)
 
         # Pre-experiment checkpoint: the exact restore point if things go wrong.
@@ -117,7 +120,8 @@ class FusionOrchestrator:
         _logger.info("experiment checkpoint %s", ckpt_id)
 
         branch = await self.shadow.open_branch(
-            task_id=task_id, base_workspace=ws, proposal=proposal)
+            task_id=task_id, base_workspace=ws, proposal=proposal,
+            profile=profile)
         result.branch_id = branch.id
 
         branch = await self.shadow.execute_branch(branch, profile=profile)
@@ -128,18 +132,18 @@ class FusionOrchestrator:
                                   pre_experiment_sequence)
             return result
 
-        # Criteria probes run INSIDE the shadow workspace. Commands written
-        # against the real workspace root are transparently rewritten to the
-        # shadow root so "test -f <real>/src/x.py" verifies the shadow copy.
+        # Criteria probes run INSIDE the shadow workspace through the SAME
+        # capability/policy path as proposals (item 16): each probe is an
+        # 'execute' dispatch bound to branch.shadow_workspace. Commands
+        # written against the real workspace root are transparently rewritten
+        # to the shadow root so "test -f <real>/src/x.py" verifies the shadow
+        # copy.
         verification = []
         all_ok = True
-        real_root = os.path.realpath(ws.root)
-        shadow_root = os.path.realpath(branch.shadow_workspace.root)
         for probe in criteria_probes or []:
-            command = probe["command"].replace(real_root, shadow_root) \
-                if real_root != shadow_root else probe["command"]
-            ok, detail = await self._run_probe(command,
-                                               branch.shadow_workspace.root)
+            command = self._rewrite_to_shadow(probe["command"], branch)
+            ok, detail = await self._dispatch_probe(
+                command, branch.shadow_workspace, profile, task_id=task_id)
             passed = ok if not probe.get("negate", False) else not ok
             verification.append({
                 "id": probe.get("id") or new_id("ac"),
@@ -159,7 +163,8 @@ class FusionOrchestrator:
             return result
 
         # Invariant envelope BEFORE touching reality.
-        inv_set = self._build_invariants(invariants)
+        inv_set = self._build_invariants(invariants, branch=branch,
+                                         profile=profile, task_id=task_id)
         report = await inv_set.check_all()
         result.invariant_report = report
         if not report["ok"]:
@@ -180,6 +185,13 @@ class FusionOrchestrator:
         wstate = self.service.world_state(task_id)
         depends = tuple(outcome.get("written", []))
         wstate.claims.invalidate_for_paths(list(depends))
+        event_sequence = 0
+        events = getattr(self.service, "_store_events", None)
+        if events is not None:
+            try:
+                event_sequence = await events.last_sequence(task_id)
+            except Exception as exc:  # noqa: BLE001 - telemetry lookup cannot block commit planning
+                _logger.warning("claim event boundary lookup failed: %s", exc)
         claim = wstate.claims.record(
             text=f"experiment {branch.id} verified "
                  f"({len(verification)} criteria)",
@@ -189,6 +201,14 @@ class FusionOrchestrator:
                 "criteria": verification,
                 "invariants": report["results"],
                 "committed": outcome,
+                "event_sequence": event_sequence,
+                "mutation_sequence": max(
+                    (int(item.get("mutation_sequence"))
+                     for item in outcome.get("mutation_results", [])
+                     if item.get("mutation_sequence") is not None),
+                    default=0,
+                ),
+                "workspace_revision": await self.checkpoints.fingerprint(ws.root),
             },
             task_id=task_id,
             depends_on_paths=depends,
@@ -202,7 +222,8 @@ class FusionOrchestrator:
     # ------------------------------------------------------------------
     async def fork_from_event(self, *, task_id: str,
                               after_event_sequence: int,
-                              capture_checkpoint: bool = False) -> dict:
+                              capture_checkpoint: bool = False,
+                              checkpoint_id: str | None = None) -> dict:
         """Fork a task from a causal point, optionally checkpointing first."""
         ckpt = None
         if capture_checkpoint:
@@ -210,10 +231,14 @@ class FusionOrchestrator:
             ckpt = await self.checkpoints.capture(
                 task_id=task_id, workspace_root=ws.root,
                 label=f"fork-after-{after_event_sequence}")
+            checkpoint_id = ckpt.get("checkpoint_id") or ckpt.get("id")
         outcome = await self.forker.fork(
-            task_id=task_id, after_event_sequence=after_event_sequence)
-        if ckpt:
-            outcome["checkpoint_id"] = ckpt.get("checkpoint_id") or ckpt.get("id")
+            task_id=task_id,
+            after_event_sequence=after_event_sequence,
+            workspace_checkpoint_id=checkpoint_id,
+        )
+        if checkpoint_id:
+            outcome["checkpoint_id"] = checkpoint_id
         return outcome
 
     async def synthesize_from_branch(
@@ -228,10 +253,12 @@ class FusionOrchestrator:
         """
         from athena.synthesis.engine import SynthesisEngine
 
-        engine = getattr(self, "_synthesis", None)
+        engine = getattr(self.service, "_synthesis", None)
         if engine is None:
             engine = SynthesisEngine()
-            self._synthesis = engine
+            # Services create the shared engine during startup. This fallback
+            # keeps the orchestrator usable with lightweight test doubles.
+            self.service._synthesis = engine
 
         cap = engine.synthesize(
             name=name, description=description, code=code,
@@ -239,7 +266,11 @@ class FusionOrchestrator:
             provenance={"origin": "shadow_experiment"},
         )
         cap = await engine.validate(cap, validation_cases)
-        admitted = engine.register_ephemeral(registry, cap)
+        # Generated machinery belongs in the effective task overlay.  Falling
+        # back to the supplied global registry remains supported for older
+        # callers/tests, but the service path never exposes it globally.
+        surface = getattr(self.service, "_fabric", None) or registry
+        admitted = engine.register_ephemeral(surface, cap)
         candidate = engine.to_skill_candidate(cap.id) \
             if cap.validation.get("all_passed") else None
         return {
@@ -264,29 +295,100 @@ class FusionOrchestrator:
                     spec = deserialize_task(dict(row))
                     if spec.workspace is not None:
                         return spec.workspace
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - workspace fallback keeps orchestration available
                 _logger.warning("workspace lookup for %s failed: %s", task_id, exc)
         return base
 
-    def _build_invariants(self, specs: list[dict] | None):
+    async def _dispatch_probe(self, code: str, workspace, profile: str | None,
+                              task_id: str | None = None) -> tuple[bool, str]:
+        """Run one probe through the capability/policy path (item 16).
+
+        Dispatches an ``execute`` request bound to the given (shadow)
+        workspace so probes pass policy like every other operation instead
+        of bypassing via raw subprocess.
+        """
+        from athena.capabilities.dispatcher import SuspendedCall
+        from athena.protocol.capabilities import CapabilityRequest
+
+        dispatcher = getattr(self.service, "_dispatcher", None)
+        if dispatcher is None:
+            raise RuntimeError("service has no capability dispatcher bound")
+        req = CapabilityRequest(
+            capability_id="execute",
+            arguments={"language": "shell", "code": code},
+            task_id=task_id,
+            call_id=new_id("call"),
+            origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+        )
+        result = await dispatcher.dispatch(req, workspace=workspace,
+                                           profile=profile)
+        if isinstance(result, SuspendedCall):
+            return False, "probe requires approval; suspended"
+        if isinstance(result, Exception):
+            return False, str(result)
+        ok = getattr(result.status, "value", str(result.status)) == "ok"
+        detail = (getattr(result, "output", None) or "") \
+            + (getattr(result, "error", None) or "")
+        return ok, detail
+
+    def _rewrite_to_shadow(self, command: str, branch) -> str:
+        """Rewrite real paths to the sandbox-visible shadow mount.
+
+        Shadow verification runs through the ``shadow`` execution backend.
+        Inside its mount namespace the branch root is ``/workspace``; the
+        host-side temporary path is intentionally not visible.  Rewriting
+        only to the host shadow directory makes an absolute probe look right
+        in the parent process but fail inside the actual sandbox.
+        """
+        real_root = os.path.realpath(branch.base_workspace.root)
+        shadow_root = os.path.realpath(branch.shadow_workspace.root)
+        if real_root == shadow_root:
+            return command
+        return command.replace(real_root, "/workspace")
+
+    def _build_invariants(self, specs: list[dict] | None, *,
+                          branch=None, profile: str | None = None,
+                          task_id: str | None = None):
+        """Build an InvariantSet from declarative or callable specs.
+
+        Declarative spec: {"description", "command"} — the probe runs that
+        command inside the shadow workspace via the dispatcher (same
+        capability/policy path as everything else).
+        """
         from athena.worldstate import InvariantSet
 
-        inv = InvariantSet()
+        inv = InvariantSet(
+            task_id=task_id,
+            store=getattr(self.service, "_world_state_store", None),
+        )
         for spec in specs or []:
-            inv.add(spec["description"], spec["probe"])
+            probe = spec.get("probe")
+            if probe is not None:
+                raise ValueError(
+                    "fusion invariants must use declarative command specs; "
+                    "arbitrary Python probes are not durable"
+                )
+            if probe is None and spec.get("command") and branch is not None:
+                code = self._rewrite_to_shadow(spec["command"], branch)
+
+                async def cmd_probe(cmd=code):
+                    ok, _ = await self._dispatch_probe(
+                        cmd, branch.shadow_workspace, profile, task_id=task_id)
+                    return ok
+
+                probe = cmd_probe
+            if probe is None:
+                raise ValueError(
+                    f"invariant spec needs 'command' or 'probe': {spec!r}")
+            inv.add(
+                spec["description"], probe,
+                definition={
+                    "type": "command",
+                    "command": spec.get("command"),
+                    "required": bool(spec.get("required", True)),
+                },
+            )
         return inv
-
-    async def _run_probe(self, command: str, cwd: str) -> tuple[bool, str]:
-        import subprocess
-
-        loop = asyncio.get_running_loop()
-
-        def _run():
-            proc = subprocess.run(command, shell=True, capture_output=True,
-                                  text=True, timeout=120, cwd=cwd)
-            return proc.returncode == 0, proc.stdout + proc.stderr
-
-        return await loop.run_in_executor(None, _run)
 
     async def _fail_path(self, task_id, result: ExperimentResult,
                          auto_fork: bool, ckpt_id: str | None,
@@ -305,10 +407,10 @@ class FusionOrchestrator:
                 seq = max((e["sequence"] for e in timeline), default=0)
             outcome = await self.fork_from_event(
                 task_id=task_id, after_event_sequence=seq,
-                capture_checkpoint=False)
+                capture_checkpoint=False, checkpoint_id=ckpt_id)
             result.fork_id = outcome.get("fork_id")
             result.commit = {"checkpoint_available": ckpt_id}
             _logger.info("experiment failed; forked %s -> %s for alternate approach",
                          task_id, result.fork_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - auto-fork is recovery best-effort
             _logger.warning("auto-fork after failure failed: %s", exc)

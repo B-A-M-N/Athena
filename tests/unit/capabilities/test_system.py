@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
 
 from athena.capabilities.system import MachineCapability, ProcessCapability
 from athena.protocol.capabilities import CapabilityRequest

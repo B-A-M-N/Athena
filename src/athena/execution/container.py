@@ -1,9 +1,8 @@
 """Container execution backend (BUILDSPEC 51, initial backends: local, container).
 
-Requires the optional ``docker`` dependency. Provides a thin ``docker exec``
-wrapper: a stateless container per execution. If ``docker`` is unavailable the
-backend is importable but every operation raises ``NotImplementedError`` so the
-interface always exists (BUILDSPEC 9 structure).
+The type is kept importable while the backend is being completed.  Docker
+reachability alone is not sufficient to advertise availability: the execution,
+interrupt, session teardown, and shutdown contract must all be implemented.
 """
 
 from __future__ import annotations
@@ -16,10 +15,10 @@ from athena.protocol.execution import ExecutionEvent, ExecutionRequest
 __all__ = ["ContainerBackend"]
 
 try:
-    import docker  # type: ignore
+    import docker  # type: ignore[import-untyped]
     _DOCKER_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
-    docker = None  # type: ignore[assignment]
+    docker = None
     _DOCKER_AVAILABLE = False
 
 
@@ -36,7 +35,10 @@ class ContainerBackend(ExecutionBackend):
                 self._client = None
 
     def available(self) -> bool:
-        return self._client is not None
+        # Do not report a reachable daemon as a usable backend while the
+        # execution contract below is incomplete.  A false availability result
+        # is safer than advertising a backend that fails after selection.
+        return False
 
     def _require(self) -> None:
         if not self.available():
@@ -52,6 +54,8 @@ class ContainerBackend(ExecutionBackend):
         runtime: str,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
+        workspace_root: str | None = None,
+        network_policy: str | None = None,
     ) -> str:
         self._require()
         return f"container_{runtime}_{task_id}"

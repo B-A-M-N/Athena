@@ -47,7 +47,7 @@ class Principal:
 @dataclass(frozen=True)
 class PolicyRequest:
     principal: Principal
-    task_id: str
+    task_id: str | None
     capability_id: str
     arguments: Mapping[str, Any]
     workspace: WorkspaceSpec

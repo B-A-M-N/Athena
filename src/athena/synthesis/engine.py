@@ -18,26 +18,41 @@ knows "executed successfully N times under these conditions", not merely
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 
+from athena.affordances.models import AffordanceScope, GeneratedCapability
+from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
+from athena.execution.process_tree import kill_tree, sandbox_argv, spawn_owned
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
-    CapabilityRequest,
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
 )
 from athena.protocol.ids import new_id
 
-__all__ = ["SyntheticCapability", "SynthesisEngine"]
+__all__ = ["SynthesisEngine", "SyntheticCapability"]
 
 _logger = logging.getLogger("athena.synthesis")
+
+# Generated Python is an untrusted implementation, not an authority
+# declaration.  It may compute over the task workspace inside the restricted
+# runtime, but it cannot acquire process-spawn, write, delete, network, or
+# privileged authority merely by naming those effects in its metadata.  A
+# generated implementation that needs those operations must request the
+# corresponding native capability through the normal dispatcher.
+_GENERATED_EFFECTIVE_AUTHORITY = frozenset({
+    "READ_LOCAL", "EXECUTE",
+})
 
 def _child_code(cap_code_repr: str) -> str:
     """Build the sandboxed child-process program for one capability."""
@@ -67,31 +82,162 @@ class SyntheticCapability:
     uses: int = 0
     successes: int = 0
     failures: int = 0
+    validation_cases: list[dict] | None = None
+    # This is calculated by Athena's sandbox contract, not trusted from the
+    # generated source or its declared effects.
+    effective_effects: frozenset[str] = _GENERATED_EFFECTIVE_AUTHORITY
+    output_schema: dict | None = None
 
 
 class SynthesisEngine:
     """Registers temporary capabilities born from execution traces."""
 
-    def __init__(self, *, restricted_env: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        restricted_env: bool = True,
+        source_validator: GeneratedSourceValidator | None = None,
+    ) -> None:
         self._restricted_env = restricted_env
+        self._source_validator = source_validator or GeneratedSourceValidator()
         self._synthetic: dict[str, SyntheticCapability] = {}
+        self._executors: dict[str, object] = {}
 
     def _child_env(self) -> dict:
         if not self._restricted_env:
             return {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        allowed = ("PATH", "PYTHONIOENCODING", "LANG", "LC_ALL", "TMPDIR",
-                   "HOME", "VIRTUAL_ENV")
+        allowed = ("PATH", "PYTHONIOENCODING", "LANG", "LC_ALL", "TMPDIR")
         env = {k: os.environ[k] for k in allowed if k in os.environ}
         env["PYTHONIOENCODING"] = "utf-8"
         return env
 
+    @staticmethod
+    def _effect_values(cap: SyntheticCapability) -> set[str]:
+        return {getattr(effect, "value", str(effect)) for effect in cap.effects}
+
+    @staticmethod
+    def _authority_values(cap: SyntheticCapability) -> set[str]:
+        return set(cap.effective_effects)
+
+    def _run_child(
+        self,
+        child: str,
+        payload: str,
+        *,
+        timeout: float,
+        workspace_root: str | None = None,
+        effects: set[str] | None = None,
+    ) -> tuple[str, str, int]:
+        """Run generated code inside the same namespace boundary as runtimes.
+
+        A subprocess with a sanitized environment is not a sandbox: Python
+        can still open arbitrary host paths.  Bubblewrap is therefore required
+        here as well.  Read-only synthetic capabilities receive a read-only
+        workspace; write/delete effects explicitly receive writable scope.
+        """
+        owned_root = workspace_root is None
+        root = workspace_root or tempfile.mkdtemp(prefix="athena-synth-")
+        values = effects or set()
+        writable = bool({"WRITE_LOCAL", "DELETE"} & values)
+        network = "allow" if {"NETWORK_READ", "NETWORK_WRITE"} & values else "deny"
+        proc = None
+        try:
+            proc = spawn_owned(
+                [sys.executable, "-c", child],
+                env=self._child_env(),
+                sandbox_root=root,
+                network_policy=network,
+                sandbox_writable=writable,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                stdout, stderr = proc.communicate(input=payload, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                kill_tree(proc)
+                stdout, stderr = proc.communicate()
+                return stdout, stderr or "synthetic execution timed out", 124
+            return stdout, stderr, proc.returncode
+        finally:
+            if owned_root:
+                shutil.rmtree(root, ignore_errors=True)
+
+    async def _run_child_async(
+        self,
+        child: str,
+        payload: str,
+        *,
+        timeout: float,
+        workspace_root: str | None = None,
+        effects: set[str] | None = None,
+    ) -> tuple[str, str, int]:
+        """Async equivalent of :meth:`_run_child` for live validation/invocation.
+
+        Validation and generated capability calls are part of the async agent
+        path.  Using ``asyncio.create_subprocess_exec`` keeps the event loop
+        responsive and avoids relying on thread-pool subprocess semantics.
+        The command line is built by the same fail-closed Bubblewrap policy as
+        the synchronous compatibility path.
+        """
+        owned_root = workspace_root is None
+        root = workspace_root or tempfile.mkdtemp(prefix="athena-synth-")
+        values = effects or set()
+        writable = bool({"WRITE_LOCAL", "DELETE"} & values)
+        network = "allow" if {"NETWORK_READ", "NETWORK_WRITE"} & values else "deny"
+        proc = None
+        try:
+            argv = sandbox_argv(
+                [sys.executable, "-c", child],
+                root=root,
+                network_policy=network,
+                writable=writable,
+            )
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                env=self._child_env(),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(payload.encode()), timeout=timeout,
+                )
+            except TimeoutError:
+                proc.kill()
+                stdout, stderr = await proc.communicate()
+                return (
+                    stdout.decode("utf-8", errors="replace"),
+                    stderr.decode("utf-8", errors="replace")
+                    or "synthetic execution timed out",
+                    124,
+                )
+            return (
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
+                proc.returncode if proc.returncode is not None else 1,
+            )
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.communicate()
+            raise
+        finally:
+            if owned_root:
+                shutil.rmtree(root, ignore_errors=True)
+
     def synthesize(
         self,
         *,
+        capability_id: str | None = None,
         name: str,
         description: str,
         code: str,
         input_schema: dict | None = None,
+        output_schema: dict | None = None,
         effects: set | frozenset | None = None,
         task_id: str | None = None,
         provenance: dict | None = None,
@@ -103,48 +249,123 @@ class SynthesisEngine:
         executed in a subprocess sandbox before the capability becomes callable.
         """
         return SyntheticCapability(
-            id=f"synth_{name}",
+            id=capability_id or f"synth_{name}",
             name=name,
             description=description,
             code=code,
-            input_schema=input_schema or {"type": "object", "properties": {}},
+            input_schema=(
+                input_schema
+                if input_schema is not None
+                else {"type": "object", "properties": {}}
+            ),
+            output_schema=output_schema,
             effects=frozenset(effects or {EffectClass.READ_LOCAL}),
             task_id=task_id,
             provenance=provenance or {},
             validation={},
+            validation_cases=[dict(case) for case in validation_cases or []],
+            effective_effects=_GENERATED_EFFECTIVE_AUTHORITY,
         )
 
     async def validate(
         self, cap: SyntheticCapability, cases: list[dict],
         *, timeout: float = 15.0,
+        tier: ValidationTier | str = ValidationTier.TASK,
+        workspace_root: str | None = None,
     ) -> SyntheticCapability:
-        """Run each case in an isolated interpreter; record evidence."""
-        loop = asyncio.get_running_loop()
+        """Run each case in an isolated interpreter; record evidence.
+
+        workspace_root is mounted read-only for validation when supplied.
+        This lets a task-local analyzer inspect the task workspace without
+        turning validation into host execution. Writes/network remain denied
+        by the fixed scratch/read-only authority profile.
+        """
         passed = 0
         details = []
+        observed_values: list[object] = []
+
+        # Static source checks happen before any trial execution.  The source
+        # validator is intentionally separate from tool-input repair: it
+        # validates generated implementation code, while repair validates one
+        # model-produced argument candidate against the capability schema.
+        source_validation = self._source_validator.validate(cap.code, tier=tier)
+        cap.code = source_validation.code
+        source_record = source_validation.to_dict()
+        if not source_validation.passed:
+            cap.validation = {
+                "tier": source_validation.tier.value,
+                "cases_total": len(cases or []),
+                "cases_passed": 0,
+                "all_passed": False,
+                "source": source_record,
+                "details": [
+                    {"case": "source", "passed": False, "error": check.detail}
+                    for check in source_validation.checks
+                    if check.status == "failed"
+                ],
+            }
+            return cap
+
+        # Schema compilation is the second half of the static contract gate.
+        # Registration and dispatch use the same jsonschema implementation.
+        try:
+            from jsonschema.exceptions import (  # type: ignore[import-untyped]
+                SchemaError,
+            )
+
+            from athena.capabilities.registry import _compile_validator
+
+            _compile_validator(cap.input_schema)
+            if cap.output_schema is not None:
+                _compile_validator(cap.output_schema)
+        except (SchemaError, SyntaxError, TypeError, ValueError) as exc:
+            cap.validation = {
+                "tier": source_validation.tier.value,
+                "cases_total": len(cases or []),
+                "cases_passed": 0, "all_passed": False,
+                "source": source_record,
+                "details": [{"case": "static", "passed": False,
+                              "error": f"static validation: {exc}"}],
+            }
+            return cap
 
         child = _child_code(repr(cap.code))
+        from athena.capabilities.registry import validate_schema
 
-        def _run_case(case: dict):
-            proc = subprocess.run(
-                [sys.executable, "-c", child],
-                input=json.dumps(case.get("args") or {}),
-                capture_output=True, text=True, timeout=timeout,
-                env=self._child_env())
-            return proc.stdout, proc.stderr, proc.returncode
+        async def _run_case(case: dict):
+            return await self._run_child_async(
+                child,
+                json.dumps(case.get("args") or {}),
+                timeout=timeout,
+                workspace_root=workspace_root,
+                effects=self._authority_values(cap),
+            )
 
         for i, case in enumerate(cases or []):
             try:
-                out, err, rc = await loop.run_in_executor(None, _run_case, case)
+                case_args = case.get("args") or {}
+                input_errors = validate_schema(cap.input_schema, case_args)
+                if input_errors:
+                    details.append({
+                        "case": i, "passed": False,
+                        "error": "input contract: " + "; ".join(input_errors),
+                    })
+                    continue
+                out, err, rc = await _run_case(case)
                 ok = rc == 0
                 marker = "__RESULT__"
                 value = None
+                output_errors: list[str] = []
                 if ok and marker in out:
                     try:
                         line = out.split(marker, 1)[1].splitlines()[0]
                         value = json.loads(line)
+                        observed_values.append(value)
                     except (IndexError, json.JSONDecodeError):
                         ok = False
+                if ok and cap.output_schema is not None:
+                    output_errors = validate_schema(cap.output_schema, value)
+                    ok = not output_errors
                 expect = case.get("expect_output_contains")
                 if expect is not None:
                     if value is None:
@@ -154,14 +375,28 @@ class SynthesisEngine:
                 passed += 1 if ok else 0
                 details.append({"case": i, "passed": ok,
                                 "value": value, "rc": rc,
+                                **({"error": "output contract: "
+                                   + "; ".join(output_errors)}
+                                   if output_errors else {}),
                                 **({"stderr": err[-300:]} if err else {})})
-            except Exception as exc:
+            except (KeyError, OSError, TypeError, ValueError) as exc:
                 details.append({"case": i, "passed": False, "error": str(exc)})
+
+        output_schema_inferred = False
+        if cap.output_schema is None and observed_values:
+            # A generated capability that omitted an output contract still
+            # gets a concrete model-facing contract from successful fixtures.
+            # Infer it after execution so it describes the actual boundary.
+            cap.output_schema = _schema_for_values(observed_values)
+            output_schema_inferred = True
 
         total = len(details)
         cap.validation = {
+            "tier": source_validation.tier.value,
             "cases_total": total, "cases_passed": passed,
             "all_passed": total > 0 and passed == total,
+            "output_schema_inferred": output_schema_inferred,
+            "source": source_record,
             "details": details,
         }
         return cap
@@ -169,26 +404,27 @@ class SynthesisEngine:
     # ------------------------------------------------------------------
     # Registration into the live registry (ephemeral, task-scoped)
     # ------------------------------------------------------------------
-    def register_ephemeral(self, registry, cap: SyntheticCapability) -> bool:
-        """Admit a VALIDATED synthetic capability through the normal path."""
-        if not cap.validation.get("all_passed"):
-            _logger.warning("refusing unvalidated synthetic %s", cap.name)
-            return False
-
+    def _build_executor(self, cap: SyntheticCapability, *, proof_sink=None):
+        """Build the canonical executor closure for one validated record."""
         child = _child_code(repr(cap.code))
 
         class _Executor:
-            def __init__(self, engine_ref):
+            def __init__(self, engine_ref, proof_sink_ref):
                 self.engine = engine_ref
+                self.proof_sink = proof_sink_ref
 
             descriptor = CapabilityDescriptor(
                 id=cap.id,
                 description=f"[synthetic] {cap.description} "
-                            f"(validated {cap.validation['cases_passed']}/"
-                            f"{cap.validation['cases_total']})",
+                            f"(validated {cap.validation.get('cases_passed', 0)}/"
+                            f"{cap.validation.get('cases_total', 0)})",
                 input_schema=cap.input_schema,
-                effects=frozenset(cap.effects),
-                origin=CapabilityOrigin.NATIVE,
+                output_schema=cap.output_schema,
+                # The executable is sandboxed with this effective authority;
+                # the generated declaration remains audit metadata only.
+                effects=frozenset(EffectClass(effect) for effect in cap.effective_effects),
+                origin=(CapabilityOrigin.PROJECT if cap.task_id is None
+                        else CapabilityOrigin.GENERATED),
                 version="0",
             )
 
@@ -201,37 +437,228 @@ class SynthesisEngine:
                         CapabilityResultStatus.FAILED,
                         error=f"synthetic capability {cap.id} is scoped to "
                               f"task {cap.task_id}")
-                loop = asyncio.get_running_loop()
-
-                def _run():
+                async def _run():
                     payload = json.dumps(dict(request.arguments or {}))
-                    return subprocess.run(
-                        [sys.executable, "-c", child],
-                        input=payload, capture_output=True,
-                        text=True, timeout=30,
-                        env=self.engine._child_env())
+                    workspace_root = (
+                        context.workspace.root if context is not None else None
+                    )
+                    return await self.engine._run_child_async(
+                        child,
+                        payload,
+                        timeout=30,
+                        workspace_root=workspace_root,
+                        effects=self.engine._authority_values(cap),
+                    )
 
-                proc = await loop.run_in_executor(None, _run)
-                ok = proc.returncode == 0 and "__RESULT__" in proc.stdout
+                stdout, stderr, returncode = await _run()
+                ok = returncode == 0 and "__RESULT__" in stdout
                 cap.uses += 1
+
+                async def _persist_proof() -> str | None:
+                    if self.proof_sink is None:
+                        return None
+                    try:
+                        await self.proof_sink(
+                            cap.id, self.engine._proof_record(cap),
+                        )
+                    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                        # The execution result remains truthful, but a
+                        # durable proof failure is surfaced in result metadata
+                        # and logs instead of silently degrading auditability.
+                        _logger.error(
+                            "generated capability proof persistence failed for %s: %s",
+                            cap.id, exc,
+                        )
+                        return str(exc)
+                    return None
+
                 if ok:
+                    try:
+                        value = json.loads(
+                            stdout.split("__RESULT__", 1)[1].splitlines()[0])
+                    except (IndexError, json.JSONDecodeError) as exc:
+                        cap.failures += 1
+                        proof_error = await _persist_proof()
+                        return CapabilityResult(
+                            request.call_id, request.capability_id,
+                            CapabilityResultStatus.FAILED,
+                            error=f"synthetic returned invalid JSON: {exc}",
+                            metadata=(
+                                {"proof_persistence_error": proof_error}
+                                if proof_error else {}
+                            ),
+                        )
+                    if cap.output_schema is not None:
+                        from athena.capabilities.registry import validate_schema
+                        errors = validate_schema(cap.output_schema, value)
+                        if errors:
+                            cap.failures += 1
+                            proof_error = await _persist_proof()
+                            return CapabilityResult(
+                                request.call_id, request.capability_id,
+                                CapabilityResultStatus.FAILED,
+                                error="generated output validation failed: "
+                                      + "; ".join(errors),
+                                metadata=(
+                                    {"proof_persistence_error": proof_error}
+                                    if proof_error else {}
+                                ),
+                            )
                     cap.successes += 1
-                    value = json.loads(
-                        proc.stdout.split("__RESULT__", 1)[1].splitlines()[0])
+                    proof_error = await _persist_proof()
                     return CapabilityResult(
                         request.call_id, request.capability_id,
                         CapabilityResultStatus.OK,
-                        output=json.dumps(value))
+                        output=json.dumps(value),
+                        metadata=(
+                            {"proof_persistence_error": proof_error}
+                            if proof_error else {}
+                        ))
                 cap.failures += 1
+                proof_error = await _persist_proof()
                 return CapabilityResult(
                     request.call_id, request.capability_id,
                     CapabilityResultStatus.FAILED,
-                    error=(proc.stderr or "synthetic failed")[-500:])
+                    error=(stderr or "synthetic failed")[-500:],
+                    metadata=(
+                        {"proof_persistence_error": proof_error}
+                        if proof_error else {}
+                    ))
 
-        registry.register(_Executor(engine_ref=self))
+        return _Executor(engine_ref=self, proof_sink_ref=proof_sink)
+
+    @staticmethod
+    def _proof_record(cap: SyntheticCapability) -> dict:
+        return {
+            **dict(cap.validation),
+            "fixture_count": len(cap.validation_cases or []),
+            "fixture_hashes": [
+                hashlib.sha256(
+                    json.dumps(case, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                for case in (cap.validation_cases or [])
+            ],
+            "usage": {
+                "uses": cap.uses,
+                "successes": cap.successes,
+                "failures": cap.failures,
+            },
+        }
+
+    def _generated_record(
+        self, cap: SyntheticCapability, *, scope: AffordanceScope,
+        project_scope: str | None = None, user_scope: str | None = None,
+    ) -> GeneratedCapability:
+        return GeneratedCapability(
+            id=cap.id,
+            name=cap.name,
+            description=cap.description,
+            implementation=cap.code,
+            input_schema=cap.input_schema,
+            output_schema=cap.output_schema,
+            declared_effects=frozenset(self._effect_values(cap)),
+            effective_authority=frozenset(self._authority_values(cap)),
+            scope=scope,
+            task_scope=cap.task_id if scope is AffordanceScope.TASK else None,
+            project_scope=project_scope,
+            user_scope=user_scope,
+            provenance=cap.provenance,
+            validation_state="VALIDATED",
+            proof_record=self._proof_record(cap),
+        )
+
+    def register_ephemeral(self, registry, cap: SyntheticCapability) -> bool:
+        """Admit a VALIDATED synthetic capability through the normal path."""
+        if not cap.validation.get("all_passed"):
+            _logger.warning("refusing unvalidated synthetic %s", cap.name)
+            return False
+
+        proof_sink = getattr(registry, "update_generated_proof", None)
+        executor = self._build_executor(cap, proof_sink=proof_sink)
+        generated = self._generated_record(
+            cap,
+            scope=AffordanceScope.TASK if cap.task_id
+            else AffordanceScope.PROJECT,
+        )
+        if hasattr(registry, "register_task") and cap.task_id:
+            registry.register_task(cap.task_id, executor, generated=generated)
+        else:
+            registry.register(executor)
         self._synthetic[cap.id] = cap
+        self._executors[cap.id] = executor
         _logger.info("ephemeral capability registered: %s", cap.id)
         return True
+
+    def restore_executor(self, generated: GeneratedCapability, *, proof_sink=None):
+        """Rehydrate an already validated project/user capability.
+
+        The persisted source is syntax/schema checked again before an executor
+        is returned. Runtime execution still goes through the dispatcher and
+        policy engine.
+        """
+        if generated.validation_state not in {"VALIDATED", "PROMOTED"}:
+            raise ValueError("generated capability is not validated")
+        from athena.capabilities.registry import _compile_validator
+
+        tier = (
+            ValidationTier.PROJECT
+            if generated.scope is AffordanceScope.PROJECT
+            else ValidationTier.USER
+        )
+        source_validation = self._source_validator.validate(
+            generated.implementation, tier=tier,
+        )
+        if not source_validation.passed:
+            failed = "; ".join(
+                check.detail for check in source_validation.checks
+                if check.status == "failed"
+            )
+            raise ValueError(
+                f"persisted generated capability failed {tier.value} source checks: "
+                f"{failed or 'unknown validation failure'}"
+            )
+        # The source hash is part of the persisted identity.  A formatter or
+        # validator version change must not silently produce a different
+        # executable from the same record during restart recovery.
+        if source_validation.code != generated.implementation:
+            raise ValueError(
+                "persisted generated capability is not in canonical source format"
+            )
+        persisted_authority = frozenset(generated.effective_authority)
+        if not persisted_authority.issubset(_GENERATED_EFFECTIVE_AUTHORITY):
+            raise ValueError(
+                "persisted generated capability requests authority outside "
+                "the generated sandbox profile"
+            )
+        _compile_validator(generated.input_schema)
+        if generated.output_schema is not None:
+            _compile_validator(generated.output_schema)
+        proof = dict(generated.proof_record)
+        usage = dict(proof.pop("usage", {}))
+        cap = SyntheticCapability(
+            id=generated.id,
+            name=generated.name,
+            description=generated.description,
+            code=generated.implementation,
+            input_schema=dict(generated.input_schema),
+            output_schema=dict(generated.output_schema or {}) or None,
+            effects=frozenset(generated.declared_effects),
+            task_id=generated.task_scope,
+            provenance=dict(generated.provenance),
+            validation=proof,
+            validation_cases=[],
+            uses=int(usage.get("uses", 0)),
+            successes=int(usage.get("successes", 0)),
+            failures=int(usage.get("failures", 0)),
+            # Stored metadata is checked above but is never the source of
+            # runtime authority. Rehydration derives the envelope from the
+            # current Athena profile so old records cannot widen execution.
+            effective_effects=_GENERATED_EFFECTIVE_AUTHORITY,
+        )
+        executor = self._build_executor(cap, proof_sink=proof_sink)
+        self._synthetic[cap.id] = cap
+        self._executors[cap.id] = executor
+        return executor
 
     def proof_for(self, cap_id: str) -> dict | None:
         """Proof-carrying summary for a synthetic capability."""
@@ -246,7 +673,73 @@ class SynthesisEngine:
             "failures": cap.failures,
             "provenance": cap.provenance,
             "effects": sorted(getattr(e, "value", str(e)) for e in cap.effects),
+            "effective_authority": sorted(cap.effective_effects),
+            "code_hash": hashlib.sha256(cap.code.encode()).hexdigest(),
         }
+
+    def promote(self, surface, cap_id: str, *, scope: AffordanceScope,
+                project_id: str | None = None, user_id: str = "athena") -> bool:
+        """Explicitly promote validated task machinery to a wider overlay.
+
+        Promotion is never implicit.  SYSTEM promotion is intentionally
+        rejected: native/system changes belong to the normal release process.
+        """
+        if scope not in {AffordanceScope.PROJECT, AffordanceScope.USER}:
+            raise ValueError("promotion target must be project or user")
+        cap = self._synthetic.get(cap_id)
+        executor = self._executors.get(cap_id)
+        if cap is None or executor is None or not cap.validation.get("all_passed"):
+            return False
+        # Task admission is intentionally lightweight. Widening lifetime and
+        # visibility requires the stricter source gate for the target scope;
+        # promotion must never turn a task-only proof into a project/user
+        # proof merely by changing metadata.
+        promotion_tier = (
+            ValidationTier.PROJECT if scope is AffordanceScope.PROJECT
+            else ValidationTier.USER
+        )
+        if scope is AffordanceScope.PROJECT and not project_id:
+            raise ValueError("project promotion requires project_id")
+        if scope is AffordanceScope.USER and not user_id:
+            raise ValueError("user promotion requires user_id")
+        source_validation = self._source_validator.validate(
+            cap.code, tier=promotion_tier
+        )
+        if not source_validation.passed:
+            _logger.warning(
+                "refusing promotion of %s after %s source checks",
+                cap.id, promotion_tier.value,
+            )
+            return False
+        cap.code = source_validation.code
+        cap.validation["tier"] = promotion_tier.value
+        cap.validation["source"] = source_validation.to_dict()
+        # Formatting is part of the canonical source contract. Rebuild the
+        # executor if promotion normalized the source bytes.
+        proof_sink = getattr(surface, "update_generated_proof", None)
+        executor = self._build_executor(cap, proof_sink=proof_sink)
+        source_task_id = cap.task_id
+        generated = GeneratedCapability(
+            id=cap.id, name=cap.name, description=cap.description,
+            implementation=cap.code, input_schema=cap.input_schema,
+            output_schema=cap.output_schema,
+            declared_effects=frozenset(self._effect_values(cap)),
+            effective_authority=frozenset(self._authority_values(cap)),
+            scope=scope, project_scope=project_id,
+            user_scope=user_id if scope is AffordanceScope.USER else None,
+            provenance={**cap.provenance, "promoted_from": "task"},
+            validation_state="PROMOTED", proof_record=self._proof_record(cap),
+        )
+        if scope is AffordanceScope.PROJECT:
+            surface.register_project(project_id, executor, generated=generated)
+        else:
+            surface.register_user(user_id, executor, generated=generated)
+        # The executor's closure enforced the task owner until the explicit
+        # promotion succeeded. Remove the old overlay before widening it.
+        cap.task_id = None
+        if source_task_id and hasattr(surface, "unregister_task_capability"):
+            surface.unregister_task_capability(source_task_id, cap.id)
+        return True
 
     def to_skill_candidate(self, cap_id: str):
         """Convert a repeatedly-successful synthetic into a SkillCandidate."""
@@ -268,10 +761,61 @@ class SynthesisEngine:
             source_task_id=cap.task_id or "",
             target_skill=None,
             rationale="synthesized capability with proven usage history",
-            evidence=tuple([
-                f"validated {cap.validation.get('cases_passed')}/"
-                f"{cap.validation.get('cases_total')} sandbox cases",
+            evidence=(
+                (
+                    f"validated {cap.validation.get('cases_passed')}/"
+                    f"{cap.validation.get('cases_total')} sandbox cases"
+                ),
                 f"{cap.successes}/{cap.uses} live invocations succeeded",
-            ]),
+            ),
             confidence=min(0.4 + 0.2 * cap.successes, 0.95),
         )
+
+
+def _schema_for_values(values: list[object]) -> dict:
+    """Infer a conservative JSON Schema from observed JSON results."""
+    schemas = [_schema_for_value(value) for value in values]
+    unique = {json.dumps(schema, sort_keys=True) for schema in schemas}
+    if len(unique) == 1:
+        return schemas[0]
+    return {"anyOf": [schemas[index] for index in _first_schema_indexes(schemas)]}
+
+
+def _first_schema_indexes(schemas: list[dict]) -> list[int]:
+    seen: set[str] = set()
+    indexes: list[int] = []
+    for index, schema in enumerate(schemas):
+        encoded = json.dumps(schema, sort_keys=True)
+        if encoded not in seen:
+            seen.add(encoded)
+            indexes.append(index)
+    return indexes
+
+
+def _schema_for_value(value: object) -> dict:
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, int):
+        return {"type": "integer"}
+    if isinstance(value, float):
+        return {"type": "number"}
+    if isinstance(value, str):
+        return {"type": "string"}
+    if isinstance(value, list):
+        return {
+            "type": "array",
+            "items": _schema_for_values(value) if value else {},
+        }
+    if isinstance(value, dict):
+        return {
+            "type": "object",
+            "properties": {
+                str(key): _schema_for_values([item])
+                for key, item in value.items()
+            },
+            "required": [str(key) for key in value],
+            "additionalProperties": False,
+        }
+    return {}

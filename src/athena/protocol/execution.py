@@ -41,6 +41,7 @@ class ExecutionRequest:
     stdin: bytes | None = None
     timeout: timedelta | None = None
     network_policy: NetworkPolicy | None = None
+    workspace_root: str | None = None
     resource_limits: ExecutionLimits | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -92,6 +93,8 @@ class Runtime(Protocol):
         backend: str,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
+        workspace_root: str | None = None,
+        network_policy: NetworkPolicy | str | None = None,
     ) -> str:
         ...
 
@@ -115,7 +118,16 @@ class Runtime(Protocol):
 class ExecutionBackend(Protocol):
     name: str
 
-    async def create_session(self, *, task_id: str, runtime: str, cwd: str | None, env: Mapping[str, str] | None) -> str:
+    async def create_session(
+        self,
+        *,
+        task_id: str,
+        runtime: str,
+        cwd: str | None,
+        env: Mapping[str, str] | None,
+        workspace_root: str | None = None,
+        network_policy: NetworkPolicy | str | None = None,
+    ) -> str:
         ...
 
     def execute(self, request: ExecutionRequest) -> AsyncIterator[ExecutionEvent]:

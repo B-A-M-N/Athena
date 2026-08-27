@@ -10,11 +10,13 @@ Requires the `debugpy` extra (`pip install athena-agent[debug]`).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import socket
 from typing import Any
 
 from athena.protocol.capabilities import (
+    Availability,
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
@@ -24,10 +26,16 @@ from athena.protocol.capabilities import (
 )
 
 try:
-    import debugpy
-    from debugpy.common import json  # noqa: F401  (ensures common present)
+    import debugpy  # noqa: T100 - optional debugger dependency
 except ImportError:
     debugpy = None  # type: ignore[assignment]
+
+# Importability is not usability.  The current implementation has no DAP
+# client and its launch helper would otherwise create a raw host subprocess
+# outside ExecutionManager.  Keep the descriptor out of the model surface
+# until launch/attach/stepping can use a governed runtime session.
+_DEBUGGER_AVAILABILITY = Availability.UNAVAILABLE
+_logger = logging.getLogger("athena.debugger")
 
 
 def _result(request, ok=True, output="", error="", meta=None):
@@ -55,22 +63,17 @@ class DebuggerCapability:
     descriptor = CapabilityDescriptor(
         id="debugger",
         description=(
-            "Debug Python programs with debugpy: launch a script under the "
-            "debugger or attach to a process already listening on a debugpy "
-            "port; set/clear breakpoints by file:line; continue, pause, step "
-            "over/in/out; read stack frames and local variables; evaluate an "
-            "expression inside a frame. Operations: launch/attach/breakpoint/"
-            "continue/pause/step/stack/variables/eval/detach/status. "
-            "(DAP client pending; launch/status/detach only)."
+            "Launch Python scripts under debugpy, record breakpoints for a "
+            "future DAP client, inspect status, and detach. Full interactive "
+            "DAP attach/stepping/stack inspection is not exposed until a DAP "
+            "client is available. Operations: launch/breakpoint/detach/status."
         ),
         input_schema={
             "type": "object",
             "required": ["operation"],
             "properties": {
                 "operation": {"type": "string", "enum": [
-                    "launch", "attach", "breakpoint", "continue", "pause",
-                    "step", "stack", "variables", "eval", "detach",
-                    "status"]},
+                    "launch", "breakpoint", "detach", "status"]},
                 "session": {"type": "string"},
                 "script": {"type": "string"},
                 "pid": {"type": "integer"},
@@ -90,6 +93,7 @@ class DebuggerCapability:
             EffectClass.WRITE_LOCAL,
         }),
         origin=CapabilityOrigin.NATIVE,
+        availability=_DEBUGGER_AVAILABILITY,
     )
 
     def __init__(self) -> None:
@@ -98,6 +102,10 @@ class DebuggerCapability:
                 "debugger capability requires debugpy; "
                 "install athena-agent[debug]")
         self._sessions: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def available() -> bool:
+        return _DEBUGGER_AVAILABILITY is Availability.AVAILABLE
 
     def _own(self, request) -> dict | None:
         sid = str((request.arguments or {}).get("session") or "")
@@ -109,6 +117,12 @@ class DebuggerCapability:
     async def invoke(self, request: CapabilityRequest, **kwargs) -> CapabilityResult:
         args = dict(request.arguments or {})
         op = str(args.get("operation") or "")
+        if not self.available():
+            return _result(
+                request, ok=False,
+                error=("debugger unavailable: DAP client and governed "
+                       "ExecutionManager backend are not implemented"),
+            )
         if debugpy is None:
             return _result(request, ok=False,
                            error="debugpy not installed; install athena-agent[debug]")
@@ -148,7 +162,7 @@ class DebuggerCapability:
         if op == "status":
             alive = sess["proc"].poll() is None if sess.get("proc") else True
             return _result(request, output=(
-                f"session={sess['session_id'] if 'session_id' in sess else ''}"
+                f"session={sess.get('session_id', '')}"
                 f" alive={alive} paused={sess['paused']} "
                 f"breakpoints={list(sess['breakpoints'])}"
             ))
@@ -187,8 +201,8 @@ class DebuggerCapability:
                 proc = sess.get("proc")
                 if proc is not None and proc.poll() is None:
                     proc.terminate()
-            except Exception:
-                pass
+            except OSError as exc:
+                _logger.debug("debugger session cleanup failed: %s", exc)
         self._sessions.clear()
 
 

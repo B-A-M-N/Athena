@@ -37,8 +37,11 @@ class ShellRuntime(BaseRuntime):
     aliases: tuple[str, ...] = ("bash", "sh", "zsh")
     start_cmd: list[str] | None = None
 
-    def _make_session(self, *, env=None, cwd=None) -> "_SubprocessSession":
-        sess = _SubprocessSession(env=env, cwd=cwd, start_cmd=self.start_cmd)
+    def _make_session(self, *, env=None, cwd=None, sandbox_root=None,
+                      network_policy=None) -> "_SubprocessSession":
+        sess = _SubprocessSession(
+            env=env, cwd=cwd, start_cmd=self.start_cmd,
+            sandbox_root=sandbox_root, network_policy=network_policy)
         sess.start()
         return sess
 
@@ -55,10 +58,13 @@ class ShellRuntime(BaseRuntime):
 class _SubprocessSession:
     """One long-lived shell process speaking the OI marker protocol."""
 
-    def __init__(self, env=None, cwd=None, start_cmd=None):
+    def __init__(self, env=None, cwd=None, start_cmd=None, sandbox_root=None,
+                 network_policy=None):
         self.env = env or {}
         self.cwd = cwd
         self.start_cmd = start_cmd
+        self.sandbox_root = sandbox_root
+        self.network_policy = network_policy
         self.process: subprocess.Popen | None = None
         self.output_queue: queue.Queue = queue.Queue()
         self.done = threading.Event()
@@ -77,6 +83,8 @@ class _SubprocessSession:
             start_cmd,
             env=self.env,
             cwd=self.cwd,
+            sandbox_root=self.sandbox_root,
+            network_policy=self.network_policy,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -135,16 +143,28 @@ class _SubprocessSession:
     # -- execution -- ---------------------------------------------------- #
     def run(self, code, timeout, execution_id):
         code_processed = preprocess_shell(code)
-        if not self.process or self.process.poll() is not None:
+        process = self.process
+        if process is None or process.poll() is not None:
             self.close()
             self.start()
+            process = self.process
+        if process is None:
+            yield ExecutionEvent(
+                type=ExecutionEventType.EXITED,
+                execution_id=execution_id,
+                exit_status=ExecutionExitStatus.FAILED,
+                exit_code=1,
+            )
+            return
 
         self.done.clear()
         with self._exit_lock:
             self.exit_code = 0
         try:
-            self.process.stdin.write(code_processed + "\n")
-            self.process.stdin.flush()
+            if process.stdin is None:
+                raise BrokenPipeError("shell stdin is unavailable")
+            process.stdin.write(code_processed + "\n")
+            process.stdin.flush()
         except Exception:
             yield ExecutionEvent(
                 type=ExecutionEventType.STDERR,
@@ -169,8 +189,8 @@ class _SubprocessSession:
             except queue.Empty:
                 if self.done.is_set():
                     break
-                if self.process and self.process.poll() is not None:
-                    rc = self.process.returncode
+                if process.poll() is not None:
+                    rc = process.returncode
                     with self._exit_lock:
                         self.exit_code = rc if rc is not None else 0
                     break
@@ -181,7 +201,7 @@ class _SubprocessSession:
                         exit_status=ExecutionExitStatus.TIMED_OUT,
                         exit_code=None,
                     )
-                    kill_tree(self.process)
+                    kill_tree(process)
                     return
                 continue
             yield ExecutionEvent(

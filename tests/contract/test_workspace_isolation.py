@@ -4,8 +4,7 @@
     ``../`` escape is denied by the executor with a FAILED result (no file
     touched).
   * ExecuteCapability resolves ``cwd`` against the task workspace root — a
-    path outside it must fall back (not escape) even when the policy engine is
-    absent.
+    path outside it fails closed even when the policy engine is absent.
 """
 
 from __future__ import annotations
@@ -132,6 +131,6 @@ class TestExecuteCwd:
         result = await cap.invoke(
             req, context=InvocationContext(workspace=_ws(tmp_path))
         )
-        assert result.status == CapabilityResultStatus.OK
-        # cwd falls back to None (runtime default) rather than escaping.
-        assert mgr.calls[0].cwd is None
+        assert result.status == CapabilityResultStatus.FAILED
+        assert "outside workspace" in (result.error or "")
+        assert not mgr.calls

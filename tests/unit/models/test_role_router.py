@@ -7,11 +7,11 @@ import pytest
 from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
 from athena.protocol.models import (
+    CostInfo,
     ModelEvent,
     ModelEventType,
     ModelInfo,
     PrivacyClass,
-    CostInfo,
 )
 from athena.protocol.tasks import ModelPolicy
 
@@ -85,3 +85,8 @@ async def test_caller_allowlist_wins_over_role(registry):
         policy=ModelPolicy(role="summarizer", allowed=("prov/pricey",))
     )
     assert sel.model == "pricey"
+
+
+def test_router_exposes_selected_provider_without_second_authority(registry):
+    router = ModelRouter(registry)
+    assert router.provider_for("prov") is registry.provider_for("prov")

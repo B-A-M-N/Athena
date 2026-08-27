@@ -329,10 +329,10 @@ class TaskStore:
             if row is None:
                 # No QUEUED/INTERRUPTED; try to reclaim an expired lease
                 row = await self._db.fetch_one_raw(
-                    f"SELECT id, status, claimed_by, lease_expires_at FROM tasks "
-                    f"WHERE status = 'RUNNING' AND lease_expires_at IS NOT NULL "
-                    f"AND lease_expires_at < ? "
-                    f"ORDER BY created_at ASC LIMIT 1",
+                    "SELECT id, status, claimed_by, lease_expires_at FROM tasks "
+                    "WHERE status = 'RUNNING' AND lease_expires_at IS NOT NULL "
+                    "AND lease_expires_at < ? "
+                    "ORDER BY created_at ASC LIMIT 1",
                     (now_iso,),
                 )
             if row is None:

@@ -19,11 +19,16 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
-__all__ = ["RepairOutcome", "RepairReceipt", "ToolInputRepairer",
-           "BUILTIN_ALIASES"]
+__all__ = [
+    "BUILTIN_ALIASES",
+    "RepairOutcome",
+    "RepairReceipt",
+    "ToolInputRepairer",
+]
 
 _REPAIR_POLICY_VERSION = "athena-repair-1"
 
@@ -145,6 +150,7 @@ class ToolInputRepairer:
         completion_state: str = "CLEAN",
         provider_profile_id: str | None = None,
         model_id: str | None = None,
+        mode: str | None = None,
     ) -> tuple[Any, RepairReceipt]:
         """Returns (canonical_arguments, receipt). Never raises."""
         receipt = RepairReceipt(
@@ -162,7 +168,16 @@ class ToolInputRepairer:
             receipt.issue_codes.append("stream_interrupted")
             return None, receipt
 
-        if self.mode == "off":
+        # A provider may emit a tool-call envelope before it emits any
+        # argument bytes. An empty string is incomplete input, not a scalar
+        # that can safely be wrapped into a required field such as ``path``.
+        if isinstance(arguments, str) and not arguments.strip():
+            receipt.outcome = RepairOutcome.INVALID
+            receipt.issue_codes.append("empty_arguments")
+            return None, receipt
+
+        selected_mode = mode or self.mode
+        if selected_mode == "off":
             ok = not validate_fn(input_schema, arguments)
             receipt.outcome = (RepairOutcome.UNCHANGED if ok
                                else RepairOutcome.INVALID)
@@ -219,8 +234,8 @@ def args2_keys(args):
     return args if isinstance(args, Mapping) else {}
 
 
-def _repair_pass(args, schema: Mapping[str, Any], ctx: "_Ctx",
-                 *, mcp_origin: bool) -> tuple[dict, bool]:
+def _repair_pass(args, schema: Mapping[str, Any], ctx: _Ctx,
+                 *, mcp_origin: bool) -> tuple[dict | None, bool]:
     """Apply the ordered safe rules once. Returns (obj, changed)."""
     obj, changed = args, False
 
@@ -238,18 +253,18 @@ def _repair_pass(args, schema: Mapping[str, Any], ctx: "_Ctx",
                 pass
 
     # Rule 1b: raw control characters inside JSON strings (lexical proof).
-    if isinstance(obj, str) and not changed:
-        if '"' in obj and re.search(r'[\n\r\t]', obj):
-            fixed = _escape_controls_in_strings(obj)
-            if fixed != obj:
-                try:
-                    parsed = json.loads(fixed)
-                    if isinstance(parsed, dict):
-                        obj = parsed
-                        changed = True
-                        ctx.rules.append("control_char_escape")
-                except (ValueError, TypeError):
-                    pass
+    if (isinstance(obj, str) and not changed
+            and '"' in obj and re.search(r'[\n\r\t]', obj)):
+        fixed = _escape_controls_in_strings(obj)
+        if fixed != obj:
+            try:
+                parsed = json.loads(fixed)
+                if isinstance(parsed, dict):
+                    obj = parsed
+                    changed = True
+                    ctx.rules.append("control_char_escape")
+            except (ValueError, TypeError):
+                pass
 
     # Rule 1c: direct parse of non-dict (e.g. model sent a JSON array wrapper).
     if isinstance(obj, str):
@@ -274,7 +289,7 @@ def _repair_pass(args, schema: Mapping[str, Any], ctx: "_Ctx",
     # Rule 4: explicit alias rename (canonical absent, exactly one alias).
     aliases = BUILTIN_ALIASES.get(ctx.tool_name, {})
     declared = schema.get("x-athena-aliases") or {}
-    for canonical, spec_props in props.items():
+    for canonical in props:
         if canonical in obj:
             continue
         sources: list[str] = []
@@ -327,11 +342,11 @@ def _repair_pass(args, schema: Mapping[str, Any], ctx: "_Ctx",
                 obj[prop] = low == "true"
                 changed = True
                 ctx.rules.append(f"bool_string:{prop}")
-        elif expected == "array" and not isinstance(value, list):
-            if isinstance(value, (str, int, float, bool)):
-                obj[prop] = [value]
-                changed = True
-                ctx.rules.append(f"scalar_to_array:{prop}")
+        elif (expected == "array" and not isinstance(value, list)
+              and isinstance(value, (str, int, float, bool))):
+            obj[prop] = [value]
+            changed = True
+            ctx.rules.append(f"scalar_to_array:{prop}")
 
     # Rule 5/6: optional null / placeholder removal.
     for prop, spec in props.items():
@@ -345,7 +360,7 @@ def _repair_pass(args, schema: Mapping[str, Any], ctx: "_Ctx",
     return obj, changed
 
 
-def _root_wrap(value, schema: Mapping[str, Any], ctx: "_Ctx") -> dict | None:
+def _root_wrap(value, schema: Mapping[str, Any], ctx: _Ctx) -> dict | None:
     """Wrap a bare scalar only for one unambiguous primary field."""
     props = schema.get("properties") or {}
     required = [r for r in (schema.get("required") or []) if r in props]

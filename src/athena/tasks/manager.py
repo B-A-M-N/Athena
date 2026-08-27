@@ -462,7 +462,8 @@ def _decode_context_refs(raw: Any) -> tuple[ContextRef, ...]:
         return ()
     return tuple(
         ContextRef(kind=i.get("kind", "session"), ref=i.get("ref", ""),
-                   source_id=i.get("source_id"), summary=i.get("summary"))
+                   source_id=i.get("source_id"), summary=i.get("summary"),
+                   mime_type=i.get("mime_type"))
         for i in items
     )
 

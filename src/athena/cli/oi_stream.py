@@ -13,10 +13,9 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from typing import Any
+from typing import Any, Callable, TextIO
 
 from athena.cli.dual_pane import Mascot, _OIWindow
-from athena.protocol.events import Event
 
 _CLEAR = "\x1b[2J\x1b[H"
 _DIM = "\x1b[2m"
@@ -36,11 +35,17 @@ class OIStreamViewer:
         task_id: str | None = None,
         max_lines: int = 400,
         interactive: bool | None = None,
+        output: TextIO | None = None,
+        error: TextIO | None = None,
+        input_fn: Callable[[str], str] | None = None,
     ) -> None:
         self.service = service
         self.task_id = task_id
         self.max_lines = max_lines
         self.interactive = sys.stdin.isatty() if interactive is None else interactive
+        self.output = output or sys.stdout
+        self.error = error or sys.stderr
+        self._input_fn = input_fn or input
         self.mascot = Mascot()
         self.window = _OIWindow(max_lines=max_lines)
         self._pending_approval: dict | None = None
@@ -126,14 +131,12 @@ class OIStreamViewer:
         scopes = [str(s) for s in payload.get("scopes") or ()] or ["call"]
         aid = payload.get("approval_id")
         cap = payload.get("capability_id") or "capability"
-        print(f"\n{_BOLD}APPROVAL REQUIRED{_RESET}  capability={cap}  id={aid}")
+        self._write(f"\n{_BOLD}APPROVAL REQUIRED{_RESET}  capability={cap}  id={aid}")
         for i, s in enumerate(scopes, 1):
-            print(f"  {i}) {s}")
-        print("  d) deny")
+            self._write(f"  {i}) {s}")
+        self._write("  d) deny")
         try:
-            raw = await asyncio.get_running_loop().run_in_executor(
-                None, input, f"approve [{1}-{len(scopes)}/d]> "
-            )
+            raw = self._input_fn(f"approve [{1}-{len(scopes)}/d]> ")
         except (EOFError, KeyboardInterrupt):
             raw = "d"
         choice = raw.strip().lower()
@@ -152,8 +155,8 @@ class OIStreamViewer:
     def render(self, height: int = 24) -> None:
         m = self.mascot.render(max_width=30)
         state = self.mascot.state.upper()
-        print(_CLEAR)
-        print(f"{_BOLD}╭─ OI LIVE ─ state: {state} ─ {'─' * 20}{_RESET}")
+        self._write(_CLEAR)
+        self._write(f"{_BOLD}╭─ OI LIVE ─ state: {state} ─ {'─' * 20}{_RESET}")
         mascot_lines = m[:3]
         body_height = max(height - len(mascot_lines) - 2, 1)
         body = self.window.snapshot(body_height, width=58)
@@ -162,17 +165,35 @@ class OIStreamViewer:
             is_err = text.startswith(_ERR_PREFIX) or text.startswith("[err]")
             color = "\x1b[31m" if is_err else ""
             side = mascot_lines[i] if i < len(mascot_lines) else ""
-            print(f"{color}{text:<58}{_RESET}{side}")
+            self._write(f"{color}{text:<58}{_RESET}{side}")
         for ln in mascot_lines[len(body):]:
-            print(ln)
+            self._write(ln)
         tail = f"{_DIM}{self._status}{_RESET}"
-        print(f"╰─ {tail} " + "─" * 30)
+        self._write(f"╰─ {tail} " + "─" * 30)
+
+    def _write(self, text: str, *, end: str = "\n", stream: TextIO | None = None) -> None:
+        target = stream or self.output
+        target.write(text + end)
+        target.flush()
 
 
-async def run_viewer(service: Any, task_id: str | None = None) -> int:
-    viewer = OIStreamViewer(service=service, task_id=task_id)
+async def run_viewer(
+    service: Any,
+    task_id: str | None = None,
+    *,
+    output: TextIO | None = None,
+    error: TextIO | None = None,
+    input_fn: Callable[[str], str] | None = None,
+) -> int:
+    viewer = OIStreamViewer(
+        service=service,
+        task_id=task_id,
+        output=output,
+        error=error,
+        input_fn=input_fn,
+    )
     cursor = 0  # rowid for global tail
-    print(_CLEAR)
+    viewer._write(_CLEAR)
     if viewer.task_id:
         # Task-scoped: stream_events yields incrementally while the task runs;
         # handle+render each event as it arrives, track highest sequence seen,

@@ -14,10 +14,18 @@ class Database:
         self._path = path
         self._conn: aiosqlite.Connection | None = None
         self._migrated = False
+        self._ensure_lock = asyncio.Lock()
         self._lock = asyncio.Lock()
         self._txn_owner: asyncio.Task | None = None
 
     async def _ensure_ready(self) -> None:
+        # P0: concurrency-safe initialization. Multiple concurrent callers
+        # (e.g. background world-state writes) must not race to run
+        # migrations twice — that causes "table sessions already exists".
+        async with self._ensure_lock:
+            await self._ensure_ready_unlocked()
+
+    async def _ensure_ready_unlocked(self) -> None:
         if self._conn is None:
             self._conn = await aiosqlite.connect(self._path)
             self._conn.row_factory = aiosqlite.Row

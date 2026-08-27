@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
 
-from athena.protocol.errors import RequestCancelled
+from athena.protocol.errors import PersistenceError, RequestCancelled
 from athena.protocol.tasks import TERMINAL_STATUSES, TaskResult, TaskStatus
 
 __all__ = [
     "TaskWorker",
     "WorkerConfig",
 ]
+
+_logger = logging.getLogger("athena.tasks.worker")
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,12 @@ class TaskWorker:
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._worker_tasks: list[asyncio.Task] | None = None
+        self._consecutive_store_failures = 0
+        self._last_store_error: str | None = None
+        self._last_store_error_kind: str | None = None
+        self._last_store_error_at: float | None = None
+        self._claimed_count = 0
+        self._completed_count = 0
 
     async def stop(self) -> None:
         """Signal the background loop to stop and await its graceful exit."""
@@ -62,7 +71,7 @@ class TaskWorker:
         for t in tasks:
             try:
                 await asyncio.wait_for(t, timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 t.cancel()
         self._task = None
         self._worker_tasks = None
@@ -88,10 +97,7 @@ class TaskWorker:
         store = getattr(self._tasks, "_store", None)
         worker_id = f"manual-{os.getpid()}"
         if store is not None:
-            try:
-                await store.acquire_with_ownership(task_id, worker_id=worker_id)
-            except Exception:
-                raise  # Let IllegalStateTransition propagate
+            await store.acquire_with_ownership(task_id, worker_id=worker_id)
         else:
             await self._tasks.acquire(task_id)
         result = await self._run_claimed(task_id)
@@ -126,9 +132,17 @@ class TaskWorker:
             if task_id is None:
                 await asyncio.sleep(self._config.poll_wait_s)
                 continue
-            result = await self._run_claimed(task_id)
-            if await self._maybe_retry(task_id, result):
-                await self._tasks.enqueue(task_id)
+            try:
+                result = await self._run_claimed(task_id)
+                if await self._maybe_retry(task_id, result):
+                    await self._tasks.enqueue(task_id)
+                self._completed_count += 1
+            except PersistenceError as exc:
+                # A task whose terminal result could not be persisted is not
+                # truthfully complete. Keep the worker alive and expose a
+                # degraded health signal so operators/recovery can retry it.
+                self._record_store_error("finalization", exc)
+                await asyncio.sleep(self._failure_backoff())
 
     async def _maybe_retry(self, task_id: str, result: TaskResult) -> bool:
         if self._config.max_retries <= 0:
@@ -166,7 +180,7 @@ class TaskWorker:
             return await self._mark_failed(
                 task_id, TaskStatus.CANCELLED, f"task cancelled: {exc}"
             )
-        except Exception as exc:  # the kernel never crashes; classify truthfully.
+        except Exception as exc:  # noqa: BLE001 - classify every kernel failure truthfully
             return await self._mark_failed(
                 task_id, TaskStatus.FAILED, f"worker kernel failure: {exc}"
             )
@@ -176,21 +190,66 @@ class TaskWorker:
             return await self._tasks.finalize(
                 task_id, status=status, reason=reason, summary=reason,
             )
-        except Exception:
-            pass
-        return TaskResult(task_id=task_id, status=status, summary=reason)
+        except Exception as exc:
+            self._record_store_error("finalization", exc)
+            raise PersistenceError(
+                f"could not persist terminal result for task {task_id}: {exc}",
+                cause=exc,
+                task_id=task_id,
+                intended_status=status.value,
+            ) from exc
 
     async def _claim(self, *, worker_id: str) -> str | None:
         store = getattr(self._tasks, "_store", None)
         if store is None:
+            self._record_store_error(
+                "claim", RuntimeError("task store is unavailable")
+            )
             return None
         try:
             row = await store.claim_with_lease(self._claim_statuses, worker_id=worker_id)
-        except Exception:
+        except Exception as exc:
+            self._record_store_error("claim", exc)
+            _logger.exception("task claim failed; queue health is degraded")
             return None
         if not row:
+            self._record_store_recovered()
             return None
-        return row.get("id")
+        task_id = row.get("id")
+        if not task_id:
+            self._record_store_error("claim", RuntimeError("claim returned no task id"))
+            return None
+        self._record_store_recovered()
+        self._claimed_count += 1
+        return task_id
+
+    def health(self) -> dict[str, Any]:
+        """Return queue persistence health for readiness/forensics surfaces."""
+        degraded = self._consecutive_store_failures > 0
+        return {
+            "status": "degraded" if degraded else "ok",
+            "consecutive_store_failures": self._consecutive_store_failures,
+            "last_store_error": self._last_store_error,
+            "last_store_error_kind": self._last_store_error_kind,
+            "claimed": self._claimed_count,
+            "completed": self._completed_count,
+        }
+
+    def _record_store_error(self, kind: str, error: BaseException) -> None:
+        self._consecutive_store_failures += 1
+        self._last_store_error_kind = kind
+        self._last_store_error = str(error)
+        self._last_store_error_at = asyncio.get_running_loop().time()
+
+    def _record_store_recovered(self) -> None:
+        self._consecutive_store_failures = 0
+
+    def _failure_backoff(self) -> float:
+        return min(
+            max(self._config.poll_wait_s, 0.1)
+            * (2 ** min(self._consecutive_store_failures - 1, 5)),
+            30.0,
+        )
 
     @property
     def _max_parallel(self) -> int:

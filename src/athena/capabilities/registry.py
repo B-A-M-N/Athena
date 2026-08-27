@@ -24,9 +24,11 @@ class CapabilityRegistry:
 
     def __init__(self) -> None:
         self._by_id: dict[str, CapabilityExecutor] = {}
+        self._validators: dict[str, Any] = {}
+        self._registration_audit: list[dict[str, Any]] = []
 
     def register(self, executor: CapabilityExecutor, *,
-                 authority: str = "native", replace: bool = False) -> None:
+                 authority: str = "native", replace: bool = False) -> dict[str, Any]:
         """Register an executor by its descriptor id.
 
         Duplicate ids are a HARD error: later extensions (MCP, plugins,
@@ -37,10 +39,13 @@ class CapabilityRegistry:
         descriptor = getattr(executor, "descriptor", None)
         if descriptor is None or not isinstance(descriptor, CapabilityDescriptor):
             raise TypeError("executor must define a CapabilityDescriptor")
+        validator = _compile_validator(descriptor.input_schema)
         if descriptor.id in self._by_id and not replace:
             raise ValueError(
                 f"capability '{descriptor.id}' already registered "
                 f"(authority={authority}); use replace=True to override")
+        if descriptor.id in self._by_id and replace and not authority:
+            raise ValueError("explicit capability replacement requires authority")
         audit = {
             "capability_id": descriptor.id,
             "replaced": self._by_id.get(descriptor.id).__class__.__name__
@@ -49,11 +54,20 @@ class CapabilityRegistry:
             "authority": authority,
         }
         self._by_id[descriptor.id] = executor
+        self._validators[descriptor.id] = validator
+        self._registration_audit.append(audit)
         return audit
+
+    def replace(self, executor: CapabilityExecutor, *, authority: str) -> dict[str, Any]:
+        """Explicitly replace an executor and return an audit record."""
+        if not authority:
+            raise ValueError("capability replacement requires authority")
+        return self.register(executor, authority=authority, replace=True)
 
     def unregister(self, capability_id: str) -> None:
         if capability_id in self._by_id:
             del self._by_id[capability_id]
+            self._validators.pop(capability_id, None)
 
     def resolve(self, capability_id: str) -> CapabilityDescriptor:
         """Return the descriptor for a registered capability id."""
@@ -66,6 +80,11 @@ class CapabilityRegistry:
         executor = self._by_id.get(capability_id)
         if executor is None:
             raise CapabilityUnavailable(f"unknown capability: {capability_id}")
+        if executor.descriptor.availability is not Availability.AVAILABLE:
+            raise CapabilityUnavailable(
+                f"capability '{capability_id}' is "
+                f"{executor.descriptor.availability.value}"
+            )
         return executor
 
     def validate(
@@ -78,7 +97,7 @@ class CapabilityRegistry:
         if executor is None:
             raise CapabilityUnavailable(f"unknown capability: {capability_id}")
         descriptor = executor.descriptor
-        for error in validate_schema(descriptor.input_schema, arguments):
+        for error in self._validate_descriptor(descriptor, arguments):
             raise CapabilityValidationError(
                 f"invalid arguments for {capability_id}: {error}"
             )
@@ -98,11 +117,26 @@ class CapabilityRegistry:
         return sorted(out, key=lambda d: d.id)
 
     def list_descriptors(self) -> list[CapabilityDescriptor]:
-        """Alias for :meth:`list_available` (returns ``list[CapabilityDescriptor]``)."""
-        return self.list_available()
+        """Return only descriptors that can actually be invoked.
+
+        ``list_available()`` keeps its historical unfiltered behavior for
+        callers that need an inventory, while prompt/API consumers use this
+        canonical usable-capability view.
+        """
+        return self.list_available(availability=Availability.AVAILABLE)
+
+    def _validate_descriptor(
+        self, descriptor: CapabilityDescriptor, arguments: Mapping[str, Any]
+    ) -> list[str]:
+        validator = self._validators.get(descriptor.id)
+        if validator is None:
+            validator = _compile_validator(descriptor.input_schema)
+            self._validators[descriptor.id] = validator
+        instance = arguments if isinstance(arguments, dict) else arguments
+        return _format_schema_errors(validator.iter_errors(instance))
 
 
-def validate_schema(schema: dict[str, Any], arguments: Mapping[str, Any]) -> list[str]:
+def validate_schema(schema: dict[str, Any], arguments: Any) -> list[str]:
     """Exact JSON Schema validation used before policy evaluation (BHV-040).
 
     Uses the version-pinned `jsonschema` library so integers/booleans,
@@ -113,31 +147,38 @@ def validate_schema(schema: dict[str, Any], arguments: Mapping[str, Any]) -> lis
     Falls back to the lightweight subset validator only if jsonschema is
     unavailable (it is a hard dependency; fallback exists for resilience).
     """
-    try:
-        import jsonschema
-        from jsonschema.validators import validator_for as _validator_for
-    except ImportError:
-        return _validate_schema_subset(schema, arguments)
+    validator = _compile_validator(schema)
+    return _format_schema_errors(validator.iter_errors(arguments))
 
-    # Athena's legacy 'allow_extra: False' == JSON Schema's
-    # 'additionalProperties: false'. Translate so existing descriptors keep
-    # their strictness under real validation.
+
+def _effective_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Translate Athena's legacy alias without weakening JSON Schema."""
     effective = dict(schema)
     if effective.pop("allow_extra", True) is False \
             and "additionalProperties" not in effective:
         effective["additionalProperties"] = False
+    if "$schema" not in effective:
+        effective["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    return effective
 
-    validator_cls = _validator_for(
-        effective if effective.get("$schema") else
-        {**effective, "$schema": "https://json-schema.org/draft/2020-12/schema"})
-    validator = validator_cls(effective)
-    errors = []
-    instance = arguments if isinstance(arguments, dict) else (arguments,)
-    for err in sorted(validator.iter_errors(instance),
-                      key=lambda e: list(e.absolute_path)):
+
+def _compile_validator(schema: Mapping[str, Any]):
+    try:
+        from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+    except ImportError as exc:  # pragma: no cover - dependency is mandatory
+        raise RuntimeError("jsonschema is required for capability schemas") from exc
+    effective = _effective_schema(schema)
+    validator_cls = validator_for(effective)
+    validator_cls.check_schema(effective)
+    return validator_cls(effective)
+
+
+def _format_schema_errors(errors) -> list[str]:
+    formatted: list[str] = []
+    for err in sorted(errors, key=lambda e: list(e.absolute_path)):
         path = "/".join(str(p) for p in err.absolute_path) or "(root)"
-        errors.append(f"{path}: {err.message}")
-    return errors
+        formatted.append(f"{path}: {err.message}")
+    return formatted
 
 
 def _validate_schema_subset(schema: dict[str, Any], arguments: Mapping[str, Any]) -> list[str]:

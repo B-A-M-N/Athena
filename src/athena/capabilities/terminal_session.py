@@ -19,12 +19,16 @@ Operations:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
+import shutil
 import time
 from typing import Any
 
+from athena.execution.process_tree import sandbox_argv
 from athena.protocol.capabilities import (
+    Availability,
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
@@ -34,9 +38,9 @@ from athena.protocol.capabilities import (
 )
 
 try:
-    import pexpect
+    import pexpect  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover
-    pexpect = None  # type: ignore[assignment]
+    pexpect = None
 
 try:
     import pyte
@@ -46,6 +50,13 @@ except ImportError:  # pragma: no cover
 _MAX_SESSIONS_PER_TASK = 8
 _DEFAULT_WAIT_TIMEOUT = 15.0
 _MAX_WAIT_TIMEOUT = 60.0
+_logger = logging.getLogger("athena.terminal_session")
+_TERMINAL_AVAILABILITY = (
+    Availability.AVAILABLE
+    if pexpect is not None and pyte is not None
+    and (os.name != "posix" or shutil.which("bwrap") is not None)
+    else Availability.UNAVAILABLE
+)
 
 
 def _result(request, ok=True, output="", error="", meta=None):
@@ -75,6 +86,21 @@ def _tail_text(data, limit: int = 4000) -> str:
     return text[-limit:]
 
 
+def _terminal_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a non-secret environment for the PTY namespace."""
+    allowed = (
+        "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM",
+    )
+    env = {key: os.environ[key] for key in allowed if key in os.environ}
+    env.setdefault("TERM", "xterm-256color")
+    # The host home directory is not mounted in the namespace. Use the private
+    # tmpfs home rather than advertising a path that cannot be accessed.
+    env["HOME"] = "/tmp"
+    if overrides:
+        env.update({str(key): str(value) for key, value in overrides.items()})
+    return env
+
+
 class _Session:
     """PTY session with a raw transcript buffer and a real screen framebuffer.
 
@@ -94,13 +120,25 @@ class _Session:
     _BUF_CAP = 200_000  # chars
 
     def __init__(self, session_id: str, task_id: str | None, cmd: str,
-                 rows: int, cols: int, env=None, cwd=None):
+                 rows: int, cols: int, env=None, cwd=None,
+                 workspace_root: str | None = None,
+                 network_policy: str | None = None):
         assert pexpect is not None, "pexpect required"
+        if workspace_root is None:
+            raise ValueError("terminal sessions require a workspace root")
+        command = sandbox_argv(
+            ["bash", "--norc", "--noprofile", "-c", cmd],
+            root=workspace_root,
+            cwd=cwd or workspace_root,
+            network_policy=network_policy,
+            writable=True,
+        )
         self.id = session_id
         self.task_id = task_id
+        self.workspace_root = workspace_root
         child = pexpect.spawn(
-            cmd, encoding="utf-8", codec_errors="replace",
-            dimensions=(rows, cols), env=env, cwd=cwd, timeout=None,
+            command[0], command[1:], encoding="utf-8", codec_errors="replace",
+            dimensions=(rows, cols), env=_terminal_env(env), cwd=None, timeout=None,
         )
         self.child = child
         self.cmd_text = cmd
@@ -112,7 +150,7 @@ class _Session:
         else:  # pragma: no cover - pyte is a hard dep of this capability
             self.screen_obj = None
 
-    def drain(self, quiet_seconds: float = 0.3) -> str:
+    def drain(self, quiet_seconds: float = 0.3) -> str | list[str]:
         """Read all pending output into the buffers until quiet."""
         deadline = time.time() + quiet_seconds
         while time.time() < deadline:
@@ -125,14 +163,14 @@ class _Session:
                     if self.screen_obj is not None:
                         try:
                             feed_screen(self.screen_obj, chunk)
-                        except Exception:
-                            pass
+                        except Exception as exc:  # noqa: BLE001 - screen must not kill PTY
+                            _logger.debug("terminal screen feed failed: %s", exc)
                     deadline = time.time() + quiet_seconds
-            except Exception:
+            except (OSError, pexpect.exceptions.ExceptionPexpect):
                 break
         return self.screen()
 
-    def screen(self) -> "str | list[str]":
+    def screen(self) -> str | list[str]:
         if self.screen_obj is not None:
             return self.screen_obj.display
         return self._ANSI_RE.sub("", self.buffer)
@@ -182,10 +220,16 @@ class TerminalSessionCapability:
             EffectClass.WRITE_LOCAL, EffectClass.READ_LOCAL,
         }),
         origin=CapabilityOrigin.NATIVE,
+        availability=_TERMINAL_AVAILABILITY,
     )
 
     def __init__(self) -> None:
         self._sessions: dict[str, _Session] = {}
+
+    @staticmethod
+    def available() -> bool:
+        """Whether the PTY and framebuffer dependencies are installed."""
+        return _TERMINAL_AVAILABILITY is Availability.AVAILABLE
 
     # -- helpers ---------------------------------------------------------
     def _own(self, request: CapabilityRequest) -> _Session | None:
@@ -210,10 +254,10 @@ class TerminalSessionCapability:
         args = dict(request.arguments or {})
         op = str(args.get("operation") or "")
         call_id = request.call_id
-        if pexpect is None:
+        if not self.available():
             return CapabilityResult(
                 call_id, request.capability_id, CapabilityResultStatus.FAILED,
-                error="pexpect not installed",
+                error="terminal_session unavailable: install pexpect and pyte",
             )
         loop = asyncio.get_running_loop()
 
@@ -221,81 +265,100 @@ class TerminalSessionCapability:
             cmd = str(args.get("command") or "").strip()
             if not cmd:
                 return _result(request, ok=False, error="command required")
-            owned = [s for s in self._sessions.values() if s.task_id == request.task_id]
-            if len(owned) >= _MAX_SESSIONS_PER_TASK:
+            existing_sessions = [
+                s for s in self._sessions.values() if s.task_id == request.task_id
+            ]
+            if len(existing_sessions) >= _MAX_SESSIONS_PER_TASK:
                 return _result(request, ok=False,
                                error=f"session limit reached ({_MAX_SESSIONS_PER_TASK})")
             sid = f"tty_{len(self._sessions) + 1}_{os.getpid()}"
             rows = int(args.get("rows") or 24)
             cols = int(args.get("cols") or 80)
             cwd = args.get("cwd")
+            ctx = kwargs.get("context")
+            workspace = getattr(ctx, "workspace", None) if ctx is not None else None
+            if workspace is None and isinstance(ctx, dict):
+                workspace = ctx.get("workspace")
+            if workspace is None or not getattr(workspace, "root", None):
+                return _result(
+                    request, ok=False,
+                    error="terminal sessions require workspace context",
+                )
+            workspace_root = os.path.realpath(str(workspace.root))
             if cwd:
-                workspace = None
-                ctx = kwargs.get("context")
-                if ctx is not None:
-                    workspace = getattr(ctx, "workspace", None) or (
-                        ctx.get("workspace") if isinstance(ctx, dict) else None)
-                if workspace:
-                    ws_root = os.path.realpath(str(workspace))
-                    real = os.path.realpath(str(cwd))
-                    if not (real == ws_root or real.startswith(ws_root + os.sep)):
-                        return _result(
-                            request, ok=False,
-                            error=f"cwd outside workspace: {cwd}")
-                cwd = str(cwd)
-            sess = await loop.run_in_executor(
-                None, lambda: _Session(sid, request.task_id, cmd, rows, cols, cwd=cwd))
-            self._sessions[sid] = sess
+                real = os.path.realpath(
+                    str(cwd) if os.path.isabs(str(cwd))
+                    else os.path.join(workspace_root, str(cwd))
+                )
+                if real != workspace_root and not real.startswith(workspace_root + os.sep):
+                    return _result(
+                        request, ok=False,
+                        error=f"cwd outside workspace: {cwd}")
+                cwd = real
+            else:
+                cwd = workspace_root
+            network_policy = getattr(
+                getattr(workspace, "network_policy", None),
+                "value",
+                getattr(workspace, "network_policy", None),
+            )
+            created_session = await loop.run_in_executor(
+                None, lambda: _Session(
+                    sid, request.task_id, cmd, rows, cols, cwd=cwd,
+                    workspace_root=workspace_root,
+                    network_policy=network_policy,
+                ))
+            self._sessions[sid] = created_session
             return _result(request, output=f"created {sid} ({cmd})",
                            meta={"session": sid})
 
         if op == "list":
-            owned = [
+            listed: list[dict[str, Any]] = [
                 {"session": s.id, "command": s.cmd_text,
                  "alive": s.alive(), "rows": s.rows, "cols": s.cols}
                 for s in self._sessions.values()
                 if s.task_id == request.task_id
             ]
-            return _result(request, output=f"{len(owned)} session(s)",
-                           meta={"sessions": owned})
+            return _result(request, output=f"{len(listed)} session(s)",
+                           meta={"sessions": listed})
 
-        sess = self._own(request)
-        if sess is None:
+        session: _Session | None = self._own(request)
+        if session is None:
             return _result(request, ok=False, error="unknown or unowned session")
 
         if op == "screen":
-            data = await loop.run_in_executor(None, sess.drain)
-            row, col = sess.cursor()
+            data = await loop.run_in_executor(None, session.drain)
+            row, col = session.cursor()
             return _result(request, output=_tail_text(data), meta={
-                "session": sess.id, "alive": sess.alive(),
+                "session": session.id, "alive": session.alive(),
                 "cursor_row": row, "cursor_col": col,
-                "rows": sess.rows, "cols": sess.cols})
+                "rows": session.rows, "cols": session.cols})
 
         if op == "write":
-            await loop.run_in_executor(None, sess.child.write, str(args.get("text") or ""))
-            return _result(request, output="ok", meta={"session": sess.id})
+            await loop.run_in_executor(None, session.child.write, str(args.get("text") or ""))
+            return _result(request, output="ok", meta={"session": session.id})
 
         if op == "send":
             await loop.run_in_executor(
-                None, sess.child.sendline, str(args.get("text") or ""))
+                None, session.child.sendline, str(args.get("text") or ""))
 
             def _drain_send():
                 time.sleep(0.15)
-                return sess.drain()
+                return session.drain()
 
             data = await loop.run_in_executor(None, _drain_send)
-            return _result(request, output=_tail_text(data), meta={"session": sess.id})
+            return _result(request, output=_tail_text(data), meta={"session": session.id})
 
         if op == "keys":
             raw = self._escape_keys(str(args.get("keys") or ""))
-            await loop.run_in_executor(None, sess.child.send, raw)
+            await loop.run_in_executor(None, session.child.send, raw)
 
             def _drain_keys():
                 time.sleep(0.15)
-                return sess.drain()
+                return session.drain()
 
             data = await loop.run_in_executor(None, _drain_keys)
-            return _result(request, output=_tail_text(data), meta={"session": sess.id})
+            return _result(request, output=_tail_text(data), meta={"session": session.id})
 
         if op == "wait_for":
             pattern = str(args.get("pattern") or "")
@@ -314,41 +377,41 @@ class TerminalSessionCapability:
 
                 deadline = _time.monotonic() + timeout
                 while _time.monotonic() < deadline:
-                    sess.drain(quiet_seconds=0.1)
-                    if pattern in "\n".join(sess.screen()):
+                    session.drain(quiet_seconds=0.1)
+                    if pattern in "\n".join(session.screen()):
                         return True
-                    if not sess.alive():
+                    if not session.alive():
                         return False
                     _time.sleep(0.05)
                 return False
 
             matched = await loop.run_in_executor(None, _wait)
-            data = _tail_text(sess.screen())
+            data = _tail_text(session.screen())
             if matched:
                 return _result(request, output=data, meta={
-                    "session": sess.id, "matched": True})
-            reason = "eof" if not sess.alive() else "timeout"
+                    "session": session.id, "matched": True})
+            reason = "eof" if not session.alive() else "timeout"
             return _result(request, ok=False, output=data,
                            error=f"wait_for: {reason}",
-                           meta={"session": sess.id, "matched": False})
+                           meta={"session": session.id, "matched": False})
 
         if op == "resize":
             rows = max(int(args.get("rows") or 24), 2)
             cols = max(int(args.get("cols") or 80), 10)
             await loop.run_in_executor(
-                None, sess.child.setwinsize, rows, cols)
-            sess.rows, sess.cols = rows, cols
-            if getattr(sess, "screen_obj", None) is not None:
+                None, session.child.setwinsize, rows, cols)
+            session.rows, session.cols = rows, cols
+            if getattr(session, "screen_obj", None) is not None:
                 try:
-                    sess.screen_obj.resize(lines=rows, columns=cols)
-                except Exception:
-                    pass
-            return _result(request, output="ok", meta={"session": sess.id})
+                    session.screen_obj.resize(lines=rows, columns=cols)
+                except (OSError, TypeError, ValueError) as exc:
+                    _logger.debug("terminal resize failed: %s", exc)
+            return _result(request, output="ok", meta={"session": session.id})
 
         if op == "kill":
-            await loop.run_in_executor(None, sess.child.terminate, True)
-            self._sessions.pop(sess.id, None)
-            return _result(request, output=f"terminated {sess.id}")
+            await loop.run_in_executor(None, session.child.terminate, True)
+            self._sessions.pop(session.id, None)
+            return _result(request, output=f"terminated {session.id}")
 
         return _result(request, ok=False, error=f"unknown operation: {op}")
 
@@ -356,6 +419,6 @@ class TerminalSessionCapability:
         for s in self._sessions.values():
             try:
                 s.child.terminate(force=True)
-            except Exception:
-                pass
+            except (OSError, pexpect.exceptions.ExceptionPexpect) as exc:
+                _logger.debug("terminal session cleanup failed: %s", exc)
         self._sessions.clear()

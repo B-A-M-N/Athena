@@ -11,11 +11,19 @@ import pytest
 
 from athena.capabilities.registry import validate_schema
 from athena.models.compat.caching import (
-    CacheBoundary, InferenceReceipt, PrefixTracker, PromptEnvelope, UsageRecord)
+    InferenceReceipt,
+    PrefixTracker,
+    PromptEnvelope,
+    UsageRecord,
+)
 from athena.models.compat.profiles import (
-    CompatibilityCandidates, PRESETS, resolve_profile, schema_fingerprint)
-from athena.models.compat.toolrepair import (
-    RepairOutcome, ToolInputRepairer)
+    PRESETS,
+    CompatibilityCandidates,
+    ModelProfile,
+    resolve_profile,
+    schema_fingerprint,
+)
+from athena.models.compat.toolrepair import RepairOutcome, ToolInputRepairer
 
 EXEC_SCHEMA = {
     "type": "object",
@@ -84,7 +92,7 @@ def test_repair_is_idempotent(repairer):
     bad = {"file_path": "/tmp/x.py"}
     fs_schema = {"type": "object", "required": ["path"],
                  "properties": {"path": {"type": "string"}}}
-    once, r1 = _fix(repairer, dict(bad), schema=fs_schema, tool="fs")
+    once, _r1 = _fix(repairer, dict(bad), schema=fs_schema, tool="fs")
     twice, r2 = _fix(repairer, dict(once), schema=fs_schema, tool="fs")
     assert twice == once
     assert r2.outcome == RepairOutcome.UNCHANGED
@@ -169,6 +177,32 @@ def test_profile_fingerprint_stable_and_sensitive():
     assert a.fingerprint() == b.fingerprint()
     assert a.fingerprint() != c.fingerprint()
 
+    # Route identity is a replay/cache boundary even when the wire settings
+    # are otherwise equal.
+    from dataclasses import replace
+    assert a.fingerprint() != replace(a, id="ollama-reviewed").fingerprint()
+
+
+def test_provider_registry_keeps_route_and_model_profiles_together():
+    from athena.models.registry import ProviderRegistry
+
+    class Provider:
+        async def list_models(self):
+            return []
+
+        async def complete(self, request):
+            if False:
+                yield request
+
+    registry = ProviderRegistry()
+    registry.register("ollama", Provider())
+    route = resolve_profile("ollama", model_id="qwen3:8b")
+    model = ModelProfile(model_pattern="qwen3:8b", malformed_json_tendency=True)
+    registry.set_profile("ollama", route)
+    registry.set_model_profile("ollama", "qwen3:8b", model)
+    assert registry.profile_for("ollama") is route
+    assert registry.model_profile_for("ollama", "qwen3:8b") is model
+
 
 def test_schema_fingerprint_changes_with_schema():
     s1 = {"type": "object", "properties": {"a": {"type": "string"}}}
@@ -194,6 +228,19 @@ def test_prefix_tracker_stable_then_boundary():
     r3 = tracker.observe(env, components={"system_prompt": "NEW system prompt"})
     assert r3["stable"] is False
     assert r3["boundary"]["reason"] == "system_prompt_changed"
+
+
+def test_prefix_tracker_marks_model_and_profile_changes_as_boundaries():
+    tracker = PrefixTracker()
+    env = PromptEnvelope(stable_prefix=["system"], append_history=[])
+    tracker.observe(env, components={
+        "model": "m1", "provider_profile": "profile-fingerprint-1",
+    })
+    result = tracker.observe(env, components={
+        "model": "m2", "provider_profile": "profile-fingerprint-2",
+    })
+    assert result["stable"] is False
+    assert result["boundary"]["reason"] == "model_changed"
 
 
 def test_usage_record_openai_cached_tokens():

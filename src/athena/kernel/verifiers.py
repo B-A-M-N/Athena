@@ -19,6 +19,7 @@ from athena.protocol.messages import (
     TrustClass,
     utcnow,
 )
+from athena.protocol.capabilities import CapabilityRequest, CapabilityRequestOrigin
 from athena.protocol.models import ModelRequest
 from athena.protocol.tasks import (
     Criterion,
@@ -39,27 +40,47 @@ class _TypeVerifier(Protocol):
 
 
 class _CommandVerifier:
-    """Verify by running a read-only probe command through ExecutionManager."""
+    """Verify a command through the canonical restricted execution route.
 
-    def __init__(self, execution: Any = None) -> None:
-        self._execution = execution
+    Verification commands are untrusted input.  Sending them directly to the
+    execution manager would make an acceptance criterion an execution-policy
+    bypass, so this verifier deliberately depends on the capability
+    dispatcher.  The ``execute`` capability applies the task workspace and
+    sandbox policy before starting the probe.
+    """
+
+    def __init__(self, dispatcher: Any = None) -> None:
+        self._dispatcher = dispatcher
 
     async def verify_one(self, task: TaskSpec, spec: VerificationSpec) -> bool:
         if not spec.command:
             return False
-        if self._execution is None:
-            _logger.warning("command verifier: no ExecutionManager bound")
+        if self._dispatcher is None:
+            _logger.warning("command verifier: no CapabilityDispatcher bound")
             return False
         try:
-            from athena.protocol.execution import ExecutionRequest
-            exec_req = ExecutionRequest(
-                runtime="shell",
-                source=spec.command,
-                task_id=f"verify_{task.id}",
-                workspace_id=task.workspace.id if task.workspace else "verify",
+            if task.workspace is None:
+                _logger.warning("command verifier: task has no workspace")
+                return False
+            request = CapabilityRequest(
+                capability_id="execute",
+                arguments={"language": "shell", "code": spec.command},
+                task_id=task.id,
+                session_id=task.session_id,
+                call_id=f"verify_{task.id}_{id(spec)}",
+                origin=CapabilityRequestOrigin.SYSTEM,
             )
-            result = await self._execution.execute(exec_req, f"verify_{id(spec)}")
-            return result.exit_code == 0
+            result = await self._dispatcher.dispatch(
+                request,
+                workspace=task.workspace,
+                profile=(task.metadata or {}).get("autonomy"),
+                task_policy=task.capability_policy,
+            )
+            # An approval request cannot be resolved by a verifier.  Treat it
+            # as unresolved instead of turning it into an implicit grant.
+            if not hasattr(result, "status"):
+                return False
+            return result.status.value == "ok"
         except Exception as exc:
             _logger.warning("command verifier failed: %s", exc)
             return False
@@ -75,9 +96,9 @@ class _FileVerifier:
         target = spec.path
         if task.workspace and not os.path.isabs(target):
             target = os.path.join(task.workspace.root, target)
-        target = os.path.abspath(target)
+        target = os.path.realpath(os.path.abspath(target))
         if task.workspace:
-            root = os.path.abspath(task.workspace.root)
+            root = os.path.realpath(os.path.abspath(task.workspace.root))
             if target != root and not target.startswith(root + os.sep):
                 _logger.warning("file verifier: path escapes workspace: %s", spec.path)
                 return False
@@ -144,9 +165,13 @@ class _CapabilityCheckVerifier:
 class _ModelJudgmentVerifier:
     """Ask the model to judge satisfaction (lower-trust, configurable)."""
 
-    def __init__(self, registry: Any = None, *, trusted: bool = False) -> None:
+    def __init__(
+        self, registry: Any = None, *, trusted: bool = False,
+        evidence_provider: Any = None,
+    ) -> None:
         self._registry = registry
         self._trusted = trusted
+        self._evidence_provider = evidence_provider
 
     async def verify_one(self, task: TaskSpec, spec: VerificationSpec) -> bool:
         if self._registry is None:
@@ -161,10 +186,31 @@ class _ModelJudgmentVerifier:
         except Exception as exc:
             _logger.warning("model judgment: selection failed: %s", exc)
             return False
+        metadata = dict(task.metadata or {})
+        evidence = metadata.get("verification_evidence", metadata.get("evidence", {}))
+        artifacts = metadata.get("artifacts", ())
+        unresolved = metadata.get("unresolved_failures", ())
+        world_state = metadata.get("world_state")
+        if self._evidence_provider is not None:
+            try:
+                provided = self._evidence_provider(task)
+                if hasattr(provided, "__await__"):
+                    provided = await provided
+                if isinstance(provided, dict):
+                    evidence = provided.get("evidence", evidence)
+                    artifacts = provided.get("artifacts", artifacts)
+                    unresolved = provided.get("unresolved_failures", unresolved)
+                    world_state = provided.get("world_state", world_state)
+            except Exception as exc:
+                _logger.warning("model judgment: evidence collection failed: %s", exc)
         prompt = (
             f"Task objective: {task.objective}\n\n"
-            f"Criterion: {spec.path or spec.predicate or spec.command or 'check'}\n\n"
-            f"Based on the task's evidence, is this criterion satisfied?\n"
+            f"Criterion: {spec.predicate or spec.path or spec.command or 'check'}\n\n"
+            f"Evidence: {evidence!r}\n"
+            f"Artifacts: {artifacts!r}\n"
+            f"Unresolved failures: {unresolved!r}\n"
+            f"Current world state: {world_state!r}\n\n"
+            f"Based only on this task evidence, is this criterion satisfied?\n"
             f"Reply with ONLY: YES or NO."
         )
         try:
@@ -210,19 +256,28 @@ class CompositeVerifier:
         self,
         *,
         execution: Any = None,
+        dispatcher: Any = None,
         artifact_store: Any = None,
         capability_registry: Any = None,
         model_registry: Any = None,
+        evidence_provider: Any = None,
         model_judgment_trusted: bool = False,
     ) -> None:
-        self._command = _CommandVerifier(execution)
+        # ``execution`` is retained in the signature for source compatibility,
+        # but command verification never uses it: the dispatcher is the only
+        # route that can establish the task's policy/sandbox boundary.
+        self._command = _CommandVerifier(dispatcher)
         self._file = _FileVerifier()
         self._artifact = _ArtifactPredicateVerifier(artifact_store)
         self._capability = _CapabilityCheckVerifier(capability_registry)
         # P1-22: the judge verifier needs the ModelRouter (which owns
         # select()); a bare ProviderRegistry has no select(). Both are
         # accepted; the router path is used when available.
-        self._model = _ModelJudgmentVerifier(model_registry, trusted=model_judgment_trusted)
+        self._model = _ModelJudgmentVerifier(
+            model_registry,
+            trusted=model_judgment_trusted,
+            evidence_provider=evidence_provider,
+        )
         self._manual = _ManualVerifier()
 
     async def verify(self, task: TaskSpec, criteria: tuple[Criterion, ...]) -> list[bool]:

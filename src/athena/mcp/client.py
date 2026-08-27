@@ -12,6 +12,7 @@ methods that need it; if it is absent, use raises a clear :class:`MCPError`.
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -21,7 +22,7 @@ from athena.protocol.errors import MCPError
 def _require_sdk() -> Any:
     """Import the ``mcp`` SDK lazily; raise a clear error if it is absent."""
     try:
-        import mcp  # noqa: PLC0415
+        mcp = importlib.import_module("mcp")
     except Exception as exc:  # pragma: no cover - only hit when dep missing
         raise MCPError(
             "the 'mcp' package is not installed; add the 'mcp' extra, e.g. "
@@ -134,16 +135,20 @@ class MCPClient:
                 if self.connected:
                     return self
                 if self.url is not None:
-                    from mcp.client.streamable_http import (
-                        streamablehttp_client,
-                    )
+                    streamablehttp_client = importlib.import_module(
+                        "mcp.client.streamable_http"
+                    ).streamablehttp_client
                     http_ctx = streamablehttp_client(
                         self.url, timeout=float(self.connect_timeout)
                     )
                     read, write, _ = await stack.enter_async_context(http_ctx)
                 else:
-                    from mcp.client.stdio import stdio_client
-                    from mcp import StdioServerParameters
+                    stdio_client = importlib.import_module(
+                        "mcp.client.stdio"
+                    ).stdio_client
+                    StdioServerParameters = importlib.import_module(
+                        "mcp"
+                    ).StdioServerParameters
                     server_params = StdioServerParameters(
                         command=_require_str(self.command),
                         args=self.args,

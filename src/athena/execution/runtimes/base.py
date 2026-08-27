@@ -27,8 +27,10 @@ from __future__ import annotations
 import abc
 import asyncio
 import inspect
+import os
+import queue as thread_queue
 import threading
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Mapping, cast
 
 from athena.protocol.execution import (
     ExecutionEvent,
@@ -83,7 +85,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             # the old one and spawn a fresh session under the same id.
             self._close_session(session)
             self._sessions.pop(sid, None)
-            self._register_session(sid, self._make_session(env=request.env or None, cwd=request.cwd))
+            self._register_session(sid, self._make_session_for_request(request))
             return sid, self._sessions[sid]
         existing_sid = f"{self.name}_{request.task_id}"
         if existing_sid in self._sessions:
@@ -91,11 +93,30 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             if self._request_matches_session(request, existing):
                 return existing_sid, existing
             runtime_session_id = f"{self.name}_{request.task_id}_{len(self._sessions) + 1}"
-            self._register_session(runtime_session_id, self._make_session(env=request.env or None, cwd=request.cwd))
+            self._register_session(runtime_session_id, self._make_session_for_request(request))
             return runtime_session_id, self._sessions[runtime_session_id]
         runtime_session_id = existing_sid
-        self._register_session(runtime_session_id, self._make_session(env=request.env or None, cwd=request.cwd))
+        self._register_session(runtime_session_id, self._make_session_for_request(request))
         return runtime_session_id, self._sessions[runtime_session_id]
+
+    def _make_session_for_request(self, request: ExecutionRequest) -> Any:
+        """Create a session while remaining compatible with small test runtimes."""
+        kwargs: dict[str, Any] = {
+            "env": request.env or None,
+            "cwd": request.cwd,
+            "sandbox_root": request.workspace_root,
+            "network_policy": (
+                request.network_policy.value
+                if request.network_policy is not None
+                else None
+            ),
+        }
+        try:
+            params = inspect.signature(self._make_session).parameters
+            kwargs = {key: value for key, value in kwargs.items() if key in params}
+        except (TypeError, ValueError):
+            pass
+        return self._make_session(**kwargs)
 
     def _request_matches_session(self, request: ExecutionRequest, session: Any) -> bool:
         if request.cwd is not None and getattr(session, "cwd", None) != request.cwd:
@@ -105,6 +126,19 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             merged = dict(session_env)
             merged.update(request.env)
             if merged != session_env:
+                return False
+        if request.workspace_root is not None:
+            requested_root = os.path.realpath(os.path.abspath(request.workspace_root))
+            session_root = getattr(session, "sandbox_root", None)
+            if session_root is None or os.path.realpath(
+                os.path.abspath(session_root)
+            ) != requested_root:
+                return False
+        if request.network_policy is not None:
+            requested_network = getattr(
+                request.network_policy, "value", request.network_policy
+            )
+            if getattr(session, "network_policy", None) != requested_network:
                 return False
         return True
 
@@ -118,9 +152,19 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         backend: str = "local",
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,  # noqa: N802
+        workspace_root: str | None = None,
+        network_policy: str | None = None,
     ) -> str:
         runtime_session_id = f"{self.name}_{task_id}"
-        self._register_session(runtime_session_id, self._make_session(env=env, cwd=cwd))
+        self._register_session(
+            runtime_session_id,
+            self._make_session(
+                env=env,
+                cwd=cwd,
+                sandbox_root=workspace_root,
+                network_policy=network_policy,
+            ),
+        )
         return runtime_session_id
 
     async def execute(
@@ -155,7 +199,8 @@ class BaseRuntime(metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def _make_session(self, *, env: Mapping[str, str] | None = None,
-                      cwd: str | None = None) -> Any:
+                      cwd: str | None = None, sandbox_root: str | None = None,
+                      network_policy: str | None = None) -> Any:
         ...
 
     @abc.abstractmethod
@@ -207,31 +252,43 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         running it in a worker thread and bridging over an asyncio.Queue."""
         if inspect.isasyncgen(gen):
             async for event in gen:
-                yield event
+                # ``gen`` is intentionally accepted as ``Any`` because runtime
+                # implementations expose different generator types.  Keep the
+                # public bridge typed at the protocol boundary.
+                yield cast(ExecutionEvent, event)
             return
 
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: thread_queue.Queue = thread_queue.Queue()
         done = threading.Event()
 
         def _runner() -> None:
             try:
                 for item in gen:
-                    loop.call_soon_threadsafe(queue.put_nowait, ("item", item))
+                    queue.put(("item", item))
             except BaseException as exc:  # surface to async side
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+                queue.put(("error", exc))
             finally:
                 done.set()
-                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+                queue.put(("done", None))
 
-        task = loop.run_in_executor(None, _runner)
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
         while True:
-            kind, value = await queue.get()
+            try:
+                kind, value = queue.get_nowait()
+            except thread_queue.Empty:
+                if done.is_set():
+                    break
+                await asyncio.sleep(0.01)
+                continue
             if kind == "item":
                 yield value
             elif kind == "error":
-                await asyncio.shield(task)
                 raise value
             else:
                 break
-        await asyncio.shield(task)
+        # The generator has signalled completion. A short join makes thread
+        # ownership explicit without ever blocking the event loop on runtime
+        # I/O. The thread is daemonized as a final safety net for a broken
+        # third-party runtime.
+        thread.join(timeout=0)

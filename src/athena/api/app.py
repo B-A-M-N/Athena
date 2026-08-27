@@ -15,9 +15,10 @@ from __future__ import annotations
 import enum
 import json
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any
 
 from athena.api.decoders import DecodeError, decode_model_policy, decode_workspace
 from athena.protocol.tasks import AgentRequest, AutonomyLevel
@@ -27,7 +28,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids forced runtime dep
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["create_app", "build_agent_request", "json_response", "HTTPError"]
+__all__ = ["HTTPError", "build_agent_request", "create_app", "json_response"]
 
 
 # --------------------------------------------------------------------------- #
@@ -127,6 +128,38 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
     if not isinstance(metadata, Mapping):
         metadata = {}
 
+    task_id = body.get("task_id")
+    if task_id is not None and not isinstance(task_id, str):
+        raise HTTPError(400, "validation_error", "field 'task_id' must be a string or null")
+
+    requested = body.get("requested_capabilities")
+    if requested is not None and (
+        not isinstance(requested, (list, tuple)) or not all(
+            isinstance(item, str) and item.strip() for item in requested
+        )
+    ):
+            raise HTTPError(
+                400,
+                "validation_error",
+                "field 'requested_capabilities' must be an array of non-empty strings",
+            )
+
+    raw_attachments = body.get("attachments", body.get("context_refs", ()))
+    if raw_attachments is None:
+        raw_attachments = ()
+    if not isinstance(raw_attachments, (list, tuple)):
+        raise HTTPError(400, "validation_error", "attachments must be an array")
+    attachments: list[Any] = []
+    for item in raw_attachments:
+        if isinstance(item, str):
+            attachments.append({"kind": "file", "ref": item})
+        elif isinstance(item, Mapping):
+            if not item.get("ref") and not item.get("uri"):
+                raise HTTPError(400, "validation_error", "each attachment needs ref or uri")
+            attachments.append(dict(item))
+        else:
+            raise HTTPError(400, "validation_error", "each attachment must be an object or string")
+
     try:
         workspace = decode_workspace(body.get("workspace"))
         model_policy = decode_model_policy(body.get("model_policy"))
@@ -136,9 +169,14 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
     return AgentRequest(
         prompt=prompt,
         session_id=body.get("session_id"),
+        task_id=task_id,
         autonomy=autonomy_value,
         workspace=workspace,
         model_policy=model_policy,
+        attachments=tuple(attachments),
+        requested_capabilities=(
+            frozenset(requested) if requested is not None else None
+        ),
         metadata=dict(metadata),
     )
 
@@ -241,7 +279,7 @@ def _get_result_handler(service: Any) -> Any:
         if result is None:
             try:
                 task_status = await _task_status(service, task_id)
-            except Exception:
+            except Exception:  # noqa: BLE001 - status polling is best effort
                 task_status = None
             if task_status is None:
                 raise _task_not_found(task_id)
@@ -279,8 +317,17 @@ def _approve_handler(service: Any) -> Any:
     async def handler(request: Any) -> Any:
         approval_id = request.path_params["approval_id"]
         body = await request.json()
-        granted = bool(body.get("granted", False))
+        # P1-57: approval is security-sensitive. Require an actual JSON
+        # boolean; string "false" must never coerce to True.
+        granted = body.get("granted")
+        if not isinstance(granted, bool):
+            return json_response(
+                {"error": "'granted' must be a JSON boolean"},
+                status=400)
         scope = body.get("scope")
+        if scope is not None and not isinstance(scope, str):
+            return json_response(
+                {"error": "'scope' must be a string or null"}, status=400)
         try:
             await service.approve(approval_id, granted=granted, scope=scope)
         except Exception as exc:  # noqa: BLE001
@@ -315,11 +362,128 @@ def _resume_handler(service: Any) -> Any:
     return handler
 
 
-def _health_handler(service: Any) -> Any:
+def _input_handler(service: Any) -> Any:
     async def handler(request: Any) -> Any:
-        return json_response({"status": "ok"}, status=200)
+        task_id = request.path_params["task_id"]
+        body = await request.json()
+        if not isinstance(body, Mapping) or "input" not in body:
+            raise HTTPError(400, "validation_error", "field 'input' is required")
+        value = body["input"]
+        try:
+            provider = getattr(service, "provide_input", None)
+            if callable(provider):
+                outcome = await provider(task_id, value)
+            else:
+                task = await service.get_task(task_id)
+                if task is None:
+                    raise KeyError(task_id)
+                outcome = await service.resume(
+                    getattr(task, "session_id", None), prompt=str(value)
+                )
+        except KeyError:
+            raise _task_not_found(task_id)
+        except Exception as exc:  # noqa: BLE001
+            raise _status_for_error(exc)
+        return json_response({"task_id": _get_task_id(outcome), "accepted": True})
 
     return handler
+
+
+def _get_session_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        session_id = request.path_params["session_id"]
+        try:
+            sessions = await service.list_sessions()
+        except Exception as exc:  # noqa: BLE001
+            raise _status_for_error(exc)
+        match = next((item for item in sessions if str(
+            item.get("id") if isinstance(item, Mapping) else getattr(item, "id", "")
+        ) == session_id), None)
+        if match is None:
+            raise HTTPError(404, "session_not_found", f"session {session_id!r} not found")
+        return json_response({"session": _serializable(match)})
+
+    return handler
+
+
+def _models_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        registry = getattr(service, "_model_registry", None)
+        if registry is None:
+            return json_response({"models": []})
+        try:
+            models = await registry.list_models()
+        except Exception as exc:  # noqa: BLE001
+            raise _status_for_error(exc)
+        return json_response({"models": _serializable(models)})
+
+    return handler
+
+
+def _capabilities_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        registry = getattr(service, "_registry", None)
+        try:
+            descriptors = registry.list_descriptors() if registry is not None else []
+        except Exception as exc:  # noqa: BLE001
+            raise _status_for_error(exc)
+        return json_response({"capabilities": _serializable(descriptors)})
+
+    return handler
+
+
+def _health_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        started = bool(getattr(service, "_started", False))
+        database_ok = getattr(service, "_db", None) is not None
+        database_error = None
+        db = getattr(service, "_db", None)
+        if database_ok and db is not None:
+            try:
+                await db.fetch_one("SELECT 1")
+            except Exception as exc:  # noqa: BLE001 - readiness must expose DB failure
+                database_ok = False
+                database_error = str(exc)
+        worker = getattr(service, "_worker", None)
+        worker_health = (
+            worker.health() if worker is not None and hasattr(worker, "health") else {}
+        )
+        checks = {
+            "service": started,
+            "database": database_ok,
+            "worker": (
+                getattr(service, "_worker_task", None) is not None
+                and not getattr(service._worker_task, "done", lambda: True)()
+            ),
+            "scheduler": (
+                getattr(service, "_scheduler", None) is not None
+                and getattr(service._scheduler, "_task", None) is not None
+                and not getattr(service._scheduler._task, "done", lambda: True)()
+            ),
+            "providers": bool(getattr(service, "_model_registry", None)),
+            "worker_persistence": worker_health.get("status", "ok") == "ok",
+        }
+        ready = all(checks.values())
+        details = {"checks": checks, "worker": worker_health}
+        if database_error is not None:
+            details["database_error"] = database_error
+        return json_response(
+            {"status": "ok" if ready else "degraded", **details},
+            status=200 if ready else 503,
+        )
+
+    return handler
+
+
+def _live_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        return json_response({"status": "alive"}, status=200)
+
+    return handler
+
+
+def _ready_handler(service: Any) -> Any:
+    return _health_handler(service)
 
 
 # ------------------------------------------------------------------------ #
@@ -362,10 +526,16 @@ def create_app(service: Any = None) -> Any:
         Route("/v1/tasks/{task_id}/cancel", _cancel_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}/interrupt", _interrupt_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}/events", _events_handler(service), methods=["GET"]),
+        Route("/v1/tasks/{task_id}/input", _input_handler(service), methods=["POST"]),
         Route("/v1/approvals/{approval_id}", _approve_handler(service), methods=["POST"]),
         Route("/v1/sessions", _list_sessions_handler(service), methods=["GET"]),
+        Route("/v1/sessions/{session_id}", _get_session_handler(service), methods=["GET"]),
         Route("/v1/sessions/{session_id}/resume", _resume_handler(service), methods=["POST"]),
+        Route("/v1/models", _models_handler(service), methods=["GET"]),
+        Route("/v1/capabilities", _capabilities_handler(service), methods=["GET"]),
         Route("/v1/health", _health_handler(service), methods=["GET"]),
+        Route("/v1/live", _live_handler(service), methods=["GET"]),
+        Route("/v1/ready", _ready_handler(service), methods=["GET"]),
     ]
 
     app = Starlette(routes=routes, lifespan=_lifespan(service))
@@ -383,8 +553,8 @@ def _lifespan(service: Any) -> Any:
     so a minimal duck-type service can still be served.
     """
 
-    from contextlib import asynccontextmanager
     from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def _manager(_app: Any = None) -> AsyncIterator[None]:
@@ -398,7 +568,7 @@ def _lifespan(service: Any) -> Any:
             if callable(stop):
                 try:
                     await stop()
-                except Exception:  # noqa: BLE001 - shutdown must not raise out
+                except Exception:
                     logger.exception("error stopping AthenaService during shutdown")
 
     return _manager
@@ -500,7 +670,10 @@ def _serializable(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, Decimal):
         return float(value)
+    record_method = getattr(value, "to_record", None)
+    if callable(record_method):
+        return _serializable(record_method())
     try:
         return _serializable(getattr(value, "__dict__", value))
-    except Exception:
+    except Exception:  # noqa: BLE001 - serialization fallback must not mask output
         return str(value)

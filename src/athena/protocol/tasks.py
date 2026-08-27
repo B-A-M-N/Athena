@@ -115,6 +115,7 @@ class ContextRef:
     ref: str
     source_id: str | None = None
     summary: str | None = None
+    mime_type: str | None = None
 
 
 @dataclass(frozen=True)

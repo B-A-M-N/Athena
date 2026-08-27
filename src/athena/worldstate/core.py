@@ -21,11 +21,17 @@ All three read and write canonical durable stores; none execute anything.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from athena.protocol.ids import new_id
+
+if TYPE_CHECKING:  # pragma: no cover
+    from athena.worldstate.store import WorldStateStore
 
 __all__ = ["ClaimRegistry", "InvariantSet", "TaskWorldState"]
 
@@ -50,10 +56,36 @@ class Claim:
 
 
 class ClaimRegistry:
-    """Claims bound to evidence, invalidated by later mutations."""
+    """Claims bound to evidence, invalidated by later mutations.
 
-    def __init__(self) -> None:
+    With ``store=None`` (default) the registry is purely in-memory exactly as
+    before. With a ``WorldStateStore``, every record/flip is also persisted
+    (best-effort background writes; call :meth:`flush` to await them).
+    """
+
+    def __init__(self, *, store: WorldStateStore | None = None) -> None:
         self._claims: dict[str, Claim] = {}
+        self._store = store
+        self._pending: set[asyncio.Task] = set()
+
+    # -- persistence helpers -------------------------------------------------
+
+    def _persist(self, coro) -> None:
+        """Schedule a durable write without blocking the sync API."""
+        if self._store is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no running loop: in-memory only (matches legacy behavior)
+        task = loop.create_task(coro)
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def flush(self) -> None:
+        """Await any outstanding persistence writes."""
+        if self._pending:
+            await asyncio.gather(*list(self._pending))
 
     def record(
         self,
@@ -72,6 +104,15 @@ class ClaimRegistry:
             depends_on_paths=tuple(depends_on_paths or ()),
         )
         self._claims[claim.id] = claim
+        if self._store is not None:
+            self._persist(self._store.save_claim({
+                "id": claim.id,
+                "task_id": claim.task_id,
+                "text": claim.text,
+                "status": claim.status,
+                "evidence": claim.evidence,
+                "depends_on_paths": list(claim.depends_on_paths),
+            }))
         return claim
 
     def get(self, claim_id: str) -> Claim | None:
@@ -80,7 +121,35 @@ class ClaimRegistry:
     def for_task(self, task_id: str | None) -> list[Claim]:
         return [c for c in self._claims.values() if c.task_id == task_id]
 
-    def invalidate_for_paths(self, changed_paths: list[str]) -> list[Claim]:
+    async def load_from_store(self, task_id: str | None = None) -> int:
+        """Hydrate in-memory claims from the durable store (restart path)."""
+        from athena.worldstate.store import WorldStateStore
+
+        if not isinstance(self._store, WorldStateStore):
+            return 0
+        await self.flush()
+        records = await self._store.claims_for_task(task_id)
+        for rec in records:
+            claim = Claim(
+                id=rec["id"],
+                task_id=rec.get("task_id"),
+                text=rec.get("text") or "",
+                status=rec.get("status") or ClaimStatus.VERIFIED,
+                evidence=rec.get("evidence") or {},
+                depends_on_paths=tuple(rec.get("depends_on_paths") or ()),
+                invalidated_by=list(rec.get("invalidated_by") or []),
+            )
+            self._claims[claim.id] = claim
+        return len(records)
+
+    def invalidate_for_paths(
+        self,
+        changed_paths: list[str],
+        *,
+        mutation_id: str | None = None,
+        mutation_sequence: int | None = None,
+        mutation_event_sequence: int | None = None,
+    ) -> list[Claim]:
         """Mark claims STALE when a path they depend on has been mutated.
 
         Returns the claims whose status changed so callers can surface it.
@@ -92,8 +161,21 @@ class ClaimRegistry:
                 continue
             if any(_paths_overlap(claim.depends_on_paths, p) for p in changed):
                 claim.status = ClaimStatus.STALE
-                claim.invalidated_by.append({"paths": sorted(changed)})
+                reason: dict[str, Any] = {"paths": sorted(changed)}
+                if mutation_id is not None:
+                    reason["mutation_id"] = mutation_id
+                if mutation_sequence is not None:
+                    reason["mutation_sequence"] = mutation_sequence
+                if mutation_event_sequence is not None:
+                    reason["mutation_event_sequence"] = mutation_event_sequence
+                claim.invalidated_by.append(reason)
                 flipped.append(claim)
+                if self._store is not None and claim.task_id is not None:
+                    self._persist(self._store.invalidate_for_paths(
+                        claim.task_id, sorted(changed),
+                        mutation_id=mutation_id,
+                        mutation_sequence=mutation_sequence,
+                        mutation_event_sequence=mutation_event_sequence))
                 _logger.info("claim %s STALE (%s)", claim.id, claim.text[:60])
         return flipped
 
@@ -103,6 +185,8 @@ class ClaimRegistry:
             return None
         claim.status = ClaimStatus.CONTRADICTED
         claim.invalidated_by.append({"because": because})
+        if self._store is not None:
+            self._persist(self._store.mark_contradicted(claim.id, because))
         return claim
 
 
@@ -125,34 +209,72 @@ def _paths_overlap(patterns: tuple[str, ...], path: str) -> bool:
 class Invariant:
     id: str
     description: str
-    probe: Callable[..., Any]      # async callable -> bool
+    probe: Callable[..., Any] | None  # async callable -> bool
     required: bool = True
 
 
 class InvariantSet:
     """Runtime safety envelope: probes run after each mutation batch."""
 
-    def __init__(self, *, task_id: str | None = None) -> None:
+    def __init__(self, *, task_id: str | None = None,
+                 store: WorldStateStore | None = None) -> None:
         self.task_id = task_id
+        self._store = store
         self.invariants: dict[str, Invariant] = {}
         self.violations: list[dict] = []
+        self._pending: set[asyncio.Task] = set()
 
-    def add(self, description: str, probe: Callable[..., Any],
-            *, invariant_id: str | None = None, required: bool = True) -> str:
+    def add(self, description: str, probe: Callable[..., Any] | None = None,
+            *, invariant_id: str | None = None, required: bool = True,
+            definition: dict[str, Any] | None = None) -> str:
         iid = invariant_id or new_id("inv")
         self.invariants[iid] = Invariant(
             id=iid, description=description, probe=probe, required=required)
+        if self._store is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                task = loop.create_task(self._store.save_invariant({
+                    "id": iid,
+                    "task_id": self.task_id,
+                    "description": description,
+                    "definition": definition or {"type": "callable"},
+                    "required": required,
+                }))
+                self._pending.add(task)
+                task.add_done_callback(self._pending.discard)
         return iid
+
+    async def flush(self) -> None:
+        if self._pending:
+            await asyncio.gather(*list(self._pending))
 
     async def check_all(self) -> dict:
         """Run every probe; return a summary and record violations."""
         results: list[dict] = []
         ok_all = True
         for inv in list(self.invariants.values()):
+            if inv.probe is None:
+                passed = False
+                detail = {
+                    "invariant": inv.id, "description": inv.description,
+                    "passed": False, "error": "invariant has no executable probe",
+                    "required": inv.required,
+                }
+                results.append(detail)
+                if inv.required:
+                    ok_all = False
+                    self.violations.append({
+                        "invariant": inv.id, "description": inv.description,
+                    })
+                continue
             try:
                 passed = bool(await inv.probe())
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - invariant probes are user-defined
                 passed = False
+                _logger.warning("invariant %s probe failed: %s", inv.id, exc)
                 results.append({
                     "invariant": inv.id, "description": inv.description,
                     "passed": False, "error": str(exc),
@@ -171,6 +293,17 @@ class InvariantSet:
                 self.violations.append({
                     "invariant": inv.id, "description": inv.description,
                 })
+        if self._store is not None and self.task_id is not None:
+            for result in results:
+                await self._store.record_invariant_result({
+                    "id": new_id("inv-result"),
+                    "invariant_id": result["invariant"],
+                    "task_id": self.task_id,
+                    "passed": result["passed"],
+                    "error": result.get("error"),
+                    "details": result,
+                })
+            await self.flush()
         return {"ok": ok_all, "results": results,
                 "violations": list(self.violations)}
 
@@ -185,10 +318,17 @@ class TaskWorldState:
     def __init__(self, *, service=None, task_id: str | None = None) -> None:
         self.service = service
         self.task_id = task_id
-        self.claims = ClaimRegistry()
+        self.claims = ClaimRegistry(
+            store=getattr(service, "_world_state_store", None)
+        )
+        self._claims_loaded = False
 
     async def snapshot(self, *, workspace_root: str | None = None) -> dict:
         state: dict[str, Any] = {"task_id": self.task_id}
+
+        if not self._claims_loaded:
+            await self.claims.load_from_store(self.task_id)
+            self._claims_loaded = True
 
         # Runtime sessions alive?
         sessions = []
@@ -200,9 +340,20 @@ class TaskWorldState:
                     sessions = [
                         {"id": r.get("id"), "runtime": r.get("runtime"),
                          "alive": bool(r.get("alive"))} for r in rows or []]
-                except Exception as exc:
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
                     _logger.warning("world-state session query failed: %s", exc)
         state["runtime_sessions"] = sessions
+
+        if self.service is not None and getattr(
+            self.service, "_world_state_store", None
+        ) is not None and self.task_id:
+            try:
+                state["invariants"] = await self.service._world_state_store.invariants_for_task(
+                    self.task_id)
+                state["invariant_results"] = await self.service._world_state_store.invariant_results_for_task(
+                    self.task_id)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                _logger.warning("world-state invariant query failed: %s", exc)
 
         # Mutation pressure since last verification.
         if self.service is not None and getattr(self.service, "_store_mutations", None) is not None \
@@ -213,16 +364,34 @@ class TaskWorldState:
                 state["recent_mutations"] = [
                     {"resource": r.get("resource"), "operation": r.get("operation"),
                      "status": r.get("status")} for r in recent]
-                # P1-37: c is a Claim dataclass — attribute access, not indexing.
-                # (The old c["status"] raised TypeError, was silently swallowed,
-                #  and the snapshot lost mutation-state information.)
                 verified_claims = [
                     c for c in self.claims.for_task(self.task_id)
                     if c.status == ClaimStatus.VERIFIED]
-                state["mutations_since_verified_claim"] = (
-                    len(rows) if not verified_claims else
-                    sum(1 for r in rows if r.get("status") == "COMPLETED"))
-            except Exception as exc:
+                # Claims pin the event sequence at which their evidence was
+                # established. Counting every mutation after *any* verified
+                # claim makes a fresh claim look stale immediately and was
+                # especially misleading when several claims existed. Use the
+                # latest durable verification boundary; legacy claims without
+                # a boundary conservatively report all completed mutations.
+                boundaries = [
+                    int(c.evidence["mutation_sequence"])
+                    for c in verified_claims
+                    if isinstance(c.evidence, dict)
+                    and str(c.evidence.get("mutation_sequence", "")).isdigit()
+                ]
+                completed = [r for r in rows if r.get("status") == "COMPLETED"]
+                baseline = max(boundaries, default=0)
+                state["mutations_since_verified_claim"] = sum(
+                    1 for mutation in completed
+                    if mutation.get("sequence") is None
+                    or int(mutation["sequence"]) > baseline
+                )
+                state["last_mutation_sequence"] = max(
+                    (int(mutation["sequence"]) for mutation in completed
+                     if mutation.get("sequence") is not None),
+                    default=0,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 _logger.warning("world-state mutation query failed: %s", exc)
 
         # Dirty files (workspace vs HEAD when git present) — best effort.
@@ -251,17 +420,14 @@ class TaskWorldState:
             try:
                 proc = subprocess.run(
                     ["git", "-C", root, "status", "--porcelain"],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, check=False)
                 if proc.returncode == 0:
                     return [ln[3:].strip() for ln in proc.stdout.splitlines()
                             if ln.strip()]
-            except Exception:
-                pass
+            except (OSError, subprocess.SubprocessError):
+                return []
             return []
 
         import asyncio
 
         return await asyncio.get_running_loop().run_in_executor(None, _git)
-
-
-import os  # noqa: E402  (used by snapshot; kept at bottom to avoid shadowing)

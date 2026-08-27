@@ -87,3 +87,58 @@ def test_continuations_survive_restart(db_path):
 
     asyncio.run(first_process())
     asyncio.run(restarted_process())
+
+
+def test_claim_is_not_consumed_until_execution_finishes(db_path):
+    async def run():
+        db = Database(db_path)
+        store = ContinuationStore(db)
+        await store.record(
+            task_id="task-1",
+            call_id="call-claim",
+            capability_id="fs.write_file",
+            canonical_arguments={"path": "a.txt", "content": "ok"},
+            approval_id="apr-claim",
+        )
+        pending = await store.pending(task_id="task-1")
+        await store.mark_resolved(pending[0]["id"], "granted")
+
+        claimed = await store.claim_resolved("task-1")
+        assert claimed is not None
+        assert claimed["claimed_at"] is not None
+        assert claimed["consumed_at"] is None
+        assert await store.claim_resolved("task-1") is None
+
+        await store.release_claim("call-claim")
+        reclaimed = await store.claim_resolved("task-1")
+        assert reclaimed is not None
+        await store.mark_consumed_for_call("call-claim")
+        assert await store.claim_resolved("task-1") is None
+        await db.close()
+
+    asyncio.run(run())
+
+
+def test_restart_releases_claims_and_lists_recoverable_tasks(db_path):
+    async def run():
+        db = Database(db_path)
+        store = ContinuationStore(db)
+        await store.record(
+            task_id="task-restart",
+            call_id="call-restart",
+            capability_id="fs.write_file",
+            canonical_arguments={"path": "a.txt", "content": "ok"},
+            approval_id="apr-restart",
+        )
+        row = (await store.pending(task_id="task-restart"))[0]
+        await store.mark_resolved(row["id"], "granted")
+        assert await store.claim_resolved("task-restart") is not None
+
+        # A fresh service owner makes a crashed claim available immediately;
+        # it does not wait for the five-minute stale-claim timeout.
+        await store.release_claims_for_restart()
+        assert await store.recoverable_task_ids() == ["task-restart"]
+        assert await store.claim_resolved("task-restart") is not None
+        await db.close()
+
+    asyncio.run(run())

@@ -99,6 +99,8 @@ class ArtifactStore:
         sidecar = self._sidecar(ref)
         if sidecar is None:
             return
+        if not ref.hash:
+            return
         occurrence = _ref_to_meta(ref, include_provenance=True)
 
         # Lock on digest to serialize concurrent sidecar updates
@@ -121,7 +123,7 @@ class ArtifactStore:
             else:
                 previous = {"digest": ref.hash or uri_digest(ref.uri), "provenances": [occurrence]}
             # Atomic write: temp file + os.replace (atomic on same filesystem)
-            await _atomic_write_bytes(sidecar, json.dumps(previous).encode("utf-8"))
+            _atomic_write_bytes(sidecar, json.dumps(previous).encode("utf-8"))
 
     # -- reads ------------------------------------------------------------
 
@@ -129,7 +131,7 @@ class ArtifactStore:
         path = self._path_for(ref)
         if path is None or not path.exists():
             raise FileNotFoundError(f"artifact blob not found: {ref}")
-        return await _to_thread(path.read_bytes)
+        return path.read_bytes()
 
     @asynccontextmanager
     async def open_stream(
@@ -138,25 +140,24 @@ class ArtifactStore:
         path = self._path_for(ref)
         if path is None or not path.exists():
             raise FileNotFoundError(f"artifact blob not found: {ref}")
-        loop = asyncio.get_running_loop()
-        fh = await loop.run_in_executor(None, path.open, "rb")
+        fh = path.open("rb")
 
         async def _gen() -> AsyncIterator[bytes]:
             try:
                 while True:
-                    chunk = await loop.run_in_executor(None, fh.read, chunk_size)
+                    chunk = fh.read(chunk_size)
                     if not chunk:
                         break
                     yield chunk
             finally:
-                await loop.run_in_executor(None, fh.close)
+                fh.close()
 
         try:
             async for chunk in _gen():
                 yield chunk
         finally:
             if not fh.closed:
-                await loop.run_in_executor(None, fh.close)
+                fh.close()
 
     async def list(
         self,
@@ -213,7 +214,7 @@ class ArtifactStore:
                         removed = True
                     if new_provenances:
                         meta["provenances"] = new_provenances
-                        await _atomic_write_bytes(sidecar, json.dumps(meta).encode("utf-8"))
+                        _atomic_write_bytes(sidecar, json.dumps(meta).encode("utf-8"))
                     else:
                         # No occurrences left — remove entire sidecar
                         sidecar.unlink()
@@ -375,10 +376,8 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
-async def _atomic_write_bytes(path: Path, data: bytes) -> None:
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """Atomically write bytes to path using temp file + os.replace."""
-    loop = asyncio.get_running_loop()
-
     def _write():
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".athena-", suffix=".tmp")
         try:
@@ -394,11 +393,7 @@ async def _atomic_write_bytes(path: Path, data: bytes) -> None:
                 pass
             raise
 
-    await loop.run_in_executor(None, _write)
-
-
-async def _to_thread(func: Any) -> Any:
-    return await asyncio.to_thread(func)
+    _write()
 
 
 def _read_meta_sync(path: Path) -> dict[str, Any] | None:

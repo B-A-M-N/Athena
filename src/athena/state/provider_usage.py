@@ -61,13 +61,22 @@ class ProviderUsageStore:
         input_tokens: int,
         output_tokens: int,
         cost_usd: str | None = None,
+        metadata: dict | None = None,
     ) -> None:
         """Update a recorded attempt with final token/cost counts."""
         now = utcnow().isoformat()
+        if metadata is None:
+            await self._db.execute(
+                "UPDATE provider_usage SET input_tokens = ?, output_tokens = ?, "
+                "cost_usd = ?, ended_at = ? WHERE id = ?",
+                (input_tokens, output_tokens, cost_usd, now, usage_id),
+            )
+            return
         await self._db.execute(
             "UPDATE provider_usage SET input_tokens = ?, output_tokens = ?, "
-            "cost_usd = ?, ended_at = ? WHERE id = ?",
-            (input_tokens, output_tokens, cost_usd, now, usage_id),
+            "cost_usd = ?, ended_at = ?, metadata = ? WHERE id = ?",
+            (input_tokens, output_tokens, cost_usd, now,
+             json.dumps(dict(metadata)), usage_id),
         )
 
     async def list_for_task(self, task_id: str) -> list[dict]:

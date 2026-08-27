@@ -1,6 +1,6 @@
 """Causal capabilities: task forks and workspace checkpoints."""
 
-from athena.causal.checkpoint import CheckpointManager
+from athena.causal.checkpoint import CheckpointConflict, CheckpointManager
 from athena.causal.fork import TaskForker
 
-__all__ = ["TaskForker", "CheckpointManager"]
+__all__ = ["CheckpointConflict", "CheckpointManager", "TaskForker"]

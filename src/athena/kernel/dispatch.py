@@ -116,6 +116,8 @@ def _to_request(task: TaskSpec, call: CapabilityCallBlock) -> CapabilityRequest:
         arguments=dict(call.arguments or {}),
         task_id=task.id,
         session_id=task.session_id,
+        call_id=call.call_id,
+        candidate=call.candidate,
     )
 
 

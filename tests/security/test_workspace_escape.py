@@ -90,14 +90,16 @@ async def test_directory_traversal_via_dotdot_denied(tmp_path):
 def test_execute_relative_cwd_escape_is_rejected(tmp_path):
     cap = ExecuteCapability(None, workspace=_ws(str(tmp_path)))
     # "../../.." resolves above the workspace -> must not escape.
-    assert cap._resolve_cwd(_ws(str(tmp_path)), "../../../") is None
+    with pytest.raises(ValueError, match="outside workspace"):
+        cap._resolve_cwd(_ws(str(tmp_path)), "../../../")
 
 
 @pytest.mark.athena_claim("BHV-149")
 @pytest.mark.athena_evidence("test", "security")
 def test_execute_absolute_cwd_outside_workspace_is_rejected(tmp_path):
     cap = ExecuteCapability(None, workspace=_ws(str(tmp_path)))
-    assert cap._resolve_cwd(_ws(str(tmp_path)), "/etc") is None
+    with pytest.raises(ValueError, match="outside workspace"):
+        cap._resolve_cwd(_ws(str(tmp_path)), "/etc")
 
 
 @pytest.mark.athena_claim("BHV-149")

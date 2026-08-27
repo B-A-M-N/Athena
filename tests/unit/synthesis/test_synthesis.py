@@ -10,7 +10,9 @@ from athena.capabilities.registry import CapabilityRegistry
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResultStatus,
+    EffectClass,
 )
+from athena.protocol.errors import CapabilityUnavailable
 from athena.synthesis.engine import SynthesisEngine
 
 GOOD_CODE = "def run(args):\n    return {'echo': args.get('msg', '')}\n"
@@ -47,14 +49,45 @@ async def test_validate_catches_failing_case():
     assert result.validation["cases_passed"] == 0
 
 
+@pytest.mark.asyncio
+async def test_validate_reports_invalid_generated_schema_as_admission_failure():
+    engine = SynthesisEngine()
+    cap = _make_cap(engine)
+    cap.input_schema = {"type": "not-a-json-schema-type"}
+
+    result = await engine.validate(cap, [{"args": {}}])
+
+    assert result.validation["all_passed"] is False
+    assert result.validation["details"][0]["case"] == "static"
+    assert "static validation" in result.validation["details"][0]["error"]
+
+
 def test_register_ephemeral_refuses_unvalidated():
     engine = SynthesisEngine()
     registry = CapabilityRegistry()
     cap = _make_cap(engine)  # never validated
     assert cap.validation.get("all_passed") is not True
     assert engine.register_ephemeral(registry, cap) is False
-    with pytest.raises(Exception):
+    with pytest.raises(CapabilityUnavailable):
         registry.resolve("synth_greeter")
+
+
+def test_generated_authority_is_sandbox_profile_not_declared_effects():
+    engine = SynthesisEngine()
+    cap = engine.synthesize(
+        name="restricted_helper",
+        description="computes a value",
+        code=GOOD_CODE,
+        input_schema={"type": "object"},
+        effects={"READ_LOCAL", "WRITE_LOCAL", "NETWORK_WRITE", "PRIVILEGED"},
+    )
+
+    assert cap.effects == frozenset({
+        "READ_LOCAL", "WRITE_LOCAL", "NETWORK_WRITE", "PRIVILEGED",
+    })
+    assert cap.effective_effects == frozenset({
+        EffectClass.READ_LOCAL.value, EffectClass.EXECUTE.value,
+    })
 
 
 @pytest.mark.asyncio

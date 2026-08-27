@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from athena.causal import CheckpointManager, TaskForker
+from athena.causal import CheckpointConflict, CheckpointManager, TaskForker
 from athena.protocol.tasks import AgentRequest
 from athena.service.service import AthenaService
 
@@ -47,6 +47,31 @@ async def test_fork_unknown_task_raises(svc):
     forker = TaskForker(service=svc)
     with pytest.raises(KeyError):
         await forker.fork(task_id="task_does_not_exist", after_event_sequence=0)
+
+
+async def test_fork_task_creation_failure_removes_speculative_session(svc):
+    task = await svc.submit(AgentRequest(prompt="x"), wait=True)
+    sessions = svc._sessions
+    assert sessions is not None
+    before = {row["id"] for row in await sessions.list_all()}
+
+    async def fail_create(_spec):
+        raise RuntimeError("simulated task insert failure")
+
+    task_manager = svc._task_manager
+    assert task_manager is not None
+    original_create = task_manager.create
+    task_manager.create = fail_create
+    try:
+        with pytest.raises(RuntimeError, match="simulated task insert failure"):
+            await TaskForker(service=svc).fork(
+                task_id=task.id, after_event_sequence=1,
+            )
+    finally:
+        task_manager.create = original_create
+
+    after = {row["id"] for row in await sessions.list_all()}
+    assert after == before
 
 
 async def test_timeline_lists_task_events(svc):
@@ -91,3 +116,39 @@ async def test_restore_unknown_checkpoint(tmp_path: Path):
     mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
     with pytest.raises(KeyError):
         await mgr.restore("ckpt_missing", str(tmp_path / "ws"))
+
+
+async def test_checkpoint_restore_rejects_concurrent_workspace_change(tmp_path: Path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "value.txt").write_text("before")
+    mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
+    manifest = await mgr.capture(
+        task_id="task_1", workspace_root=str(ws), label="before-change"
+    )
+    expected = await mgr.fingerprint(str(ws))
+    (ws / "value.txt").write_text("concurrent")
+
+    with pytest.raises(CheckpointConflict):
+        await mgr.restore(
+            manifest["id"], str(ws), expected_fingerprint=expected,
+        )
+    assert (ws / "value.txt").read_text() == "concurrent"
+
+
+async def test_checkpoint_materialize_creates_independent_workspace(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value.txt").write_text("captured")
+    mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
+    manifest = await mgr.capture(
+        task_id="task_1", workspace_root=str(source), label="fork-base"
+    )
+
+    destination = tmp_path / "fork"
+    await mgr.materialize(manifest["id"], str(destination))
+    (source / "value.txt").write_text("parent-changed")
+    (destination / "value.txt").write_text("fork-changed")
+
+    assert (source / "value.txt").read_text() == "parent-changed"
+    assert (destination / "value.txt").read_text() == "fork-changed"

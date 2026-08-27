@@ -126,6 +126,17 @@ class ApprovalStore:
         )
         return [_decode_approval(r) for r in rows]
 
+    async def list_granted(self) -> list[dict]:
+        """Return granted approvals with their persisted effective scope."""
+        rows = await self._db.fetch_all(
+            "SELECT a.*, g.scope AS grant_scope, g.expires_at AS grant_expires_at "
+            "FROM approvals AS a LEFT JOIN approval_grants AS g "
+            "ON g.approval_id = a.id "
+            "WHERE a.status = ? ORDER BY a.resolved_at ASC, g.created_at ASC",
+            (self.GRANTED,),
+        )
+        return [_decode_approval(r) for r in rows]
+
     async def _capability_of(self, approval_id: str) -> str:
         row = await self._db.fetch_one(
             "SELECT capability_id FROM approvals WHERE id = ?",

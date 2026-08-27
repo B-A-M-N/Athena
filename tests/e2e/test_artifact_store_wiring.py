@@ -8,7 +8,6 @@ import tempfile
 import pytest
 
 from athena.artifacts.store import ArtifactStore
-from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.service.service import AthenaService
 from athena.service.config import AthenaConfig, ProviderConfig
 

@@ -8,8 +8,9 @@ Arguments MUST be schema-validated before policy evaluation.
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
 from athena.protocol.tasks import WorkspaceSpec
 
@@ -32,10 +33,21 @@ class EffectClass(str, enum.Enum):
 
 class CapabilityOrigin(str, enum.Enum):
     NATIVE = "native"
+    GENERATED = "generated"
     MCP = "MCP"
     PLUGIN = "plugin"
     PROJECT = "project"
     REMOTE = "remote"
+
+
+class CapabilityRequestOrigin(str, enum.Enum):
+    """Trust/provenance of a capability request."""
+
+    MODEL = "model"
+    USER_DIRECT = "user_direct"
+    TRUSTED_ORCHESTRATION = "trusted_orchestration"
+    SYSTEM = "system"
+    MCP = "mcp"
 
 
 class Availability(str, enum.Enum):
@@ -55,15 +67,96 @@ class CapabilityDescriptor:
     origin: CapabilityOrigin = CapabilityOrigin.NATIVE
     version: str = "1"
     availability: Availability = Availability.AVAILABLE
+    operation_effects: Mapping[str, frozenset[EffectClass]] | None = None
+    effect_resolver: Callable[[Mapping[str, Any]], frozenset[EffectClass]] | None = None
+
+    def __post_init__(self) -> None:
+        """Attach the native operation contract at descriptor creation.
+
+        The compatibility map is only a migration source for the existing
+        native descriptors; dispatch consumes the immutable contract stored on
+        this descriptor. Third-party descriptors must provide their own map or
+        remain simple, non-operation capabilities.
+        """
+        if self.operation_effects is not None or self.effect_resolver is not None:
+            return
+        try:
+            from athena.capabilities.operations import OPERATION_EFFECTS
+
+            mapping = OPERATION_EFFECTS.get(self.id)
+        except ImportError:
+            mapping = None
+        if mapping is not None:
+            object.__setattr__(self, "operation_effects", dict(mapping))
+
+    def resolve_effects(self, arguments: Mapping[str, Any]) -> frozenset[EffectClass] | None:
+        """Resolve exact operation effects, or ``None`` for simple contracts."""
+        if self.effect_resolver is not None:
+            effects = set(self.effect_resolver(arguments))
+            outside = set(effects) - set(self.effects)
+            if outside:
+                raise ValueError(
+                    "resolved effects exceed the descriptor envelope: "
+                    + ", ".join(sorted(effect.value for effect in outside))
+                )
+            return frozenset(effects)
+        if self.operation_effects is None:
+            return None
+        op = str(arguments.get("operation") or arguments.get("action") or "").lower()
+        if op not in self.operation_effects:
+            raise ValueError(f"operation {op!r} has no declared effect classification")
+        effects = set(self.operation_effects[op])
+        if self.id == "network" and op == "http":
+            method = str(arguments.get("method") or "GET").upper()
+            if method not in {"GET", "HEAD", "OPTIONS"}:
+                effects.add(EffectClass.NETWORK_WRITE)
+        outside = effects - set(self.effects)
+        if outside:
+            raise ValueError(
+                f"operation {op!r} requires effects beyond the descriptor envelope: "
+                + ", ".join(sorted(effect.value for effect in outside))
+            )
+        return frozenset(effects)
+
+    def to_record(self) -> dict[str, Any]:
+        """Return the model/API-safe descriptor representation.
+
+        ``effect_resolver`` is executable policy, not serializable model
+        metadata.  Generic ``__dict__`` serialization used to expose it as
+        an empty object, which made a dynamic descriptor look like it had a
+        broken operation contract.  Publish the static envelope and whether
+        operation effects are resolved dynamically instead.
+        """
+        record: dict[str, Any] = {
+            "id": self.id,
+            "description": self.description,
+            "input_schema": self.input_schema,
+            "output_schema": self.output_schema,
+            "effects": sorted(effect.value for effect in self.effects),
+            "tags": sorted(self.tags),
+            "origin": self.origin.value,
+            "version": self.version,
+            "availability": self.availability.value,
+        }
+        if self.operation_effects is not None:
+            record["operation_effects"] = {
+                operation: sorted(effect.value for effect in effects)
+                for operation, effects in self.operation_effects.items()
+            }
+        if self.effect_resolver is not None:
+            record["dynamic_effects"] = True
+        return record
 
 
 @dataclass(frozen=True)
 class CapabilityRequest:
     capability_id: str
     arguments: Mapping[str, Any]
-    task_id: str
+    task_id: str | None
     session_id: str | None = None
     call_id: str = ""
+    origin: CapabilityRequestOrigin = CapabilityRequestOrigin.MODEL
+    candidate: Any = None
 
 
 @dataclass(frozen=True)
@@ -105,8 +198,8 @@ class CapabilityExecutor(Protocol):
         self,
         request: CapabilityRequest,
         *,
-        output_accumulator: "CapabilityOutputSink | None" = None,
-        context: "InvocationContext | None" = None,
+        output_accumulator: CapabilityOutputSink | None = None,
+        context: InvocationContext | None = None,
     ) -> CapabilityResult:
         ...
 
@@ -130,7 +223,8 @@ class Capability(Protocol):
 
 
 __all__ = [
-    "EffectClass", "CapabilityOrigin", "Availability", "CapabilityDescriptor",
-    "Capability", "CapabilityRequest", "InvocationContext", "CapabilityResult",
-    "CapabilityResultStatus", "CapabilityExecutor", "CapabilityOutputSink",
+    "Availability", "Capability", "CapabilityDescriptor", "CapabilityExecutor",
+    "CapabilityOrigin", "CapabilityOutputSink", "CapabilityRequest",
+    "CapabilityRequestOrigin", "CapabilityResult", "CapabilityResultStatus",
+    "EffectClass", "InvocationContext",
 ]

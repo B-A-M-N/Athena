@@ -89,3 +89,17 @@ def test_list_available_returns_registered_descriptors():
     # Unfiltered returns everything; filtered on availability excludes "gone".
     assert any(d.id == "gone" for d in reg.list_available())
     assert reg.list_available(availability=unavailable.availability) == [unavailable]
+
+
+def test_unavailable_capability_cannot_be_invoked():
+    descriptor = CapabilityDescriptor(
+        id="missing.runtime",
+        description="dependency is absent",
+        input_schema={},
+        availability=Availability.UNAVAILABLE,
+    )
+    registry = CapabilityRegistry()
+    registry.register(_Executor(descriptor))
+
+    with pytest.raises(CapabilityUnavailable, match="unavailable"):
+        registry.executor_for(descriptor.id)

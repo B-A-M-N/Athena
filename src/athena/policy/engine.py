@@ -34,6 +34,9 @@ from athena.protocol.tasks import AutonomyLevel, NetworkPolicy, WorkspaceSpec
 _WRITE_OPS = frozenset({"write", "patch", "mkdir", "copy", "move", "create", "update"})
 _DELETE_OPS = frozenset({"delete", "remove", "rmtree", "unlink"})
 _READ_OPS = frozenset({"read", "list", "stat", "read_text", "get", "exists", "open"})
+_PATHLESS_WRITE_CAPABILITIES = frozenset({
+    "memory", "schedule", "synthesis", "workflow", "research",
+})
 _BUILD_CMDS = frozenset({"build", "test", "pytest", "make", "go", "cargo", "npm"})
 _SEP = os.sep
 
@@ -79,9 +82,16 @@ class PolicyEngine:
                     or _has(EffectClass.SPAWN_PROCESS, request.effects)):
                 # Database writes target DB files by path; they are workspace-
                 # scoped like file writes but resolved against the DB path.
-                out = (self._eval_database_write(request, rules)
-                       if request.capability_id == "database"
-                       else self._eval_write(request, rules))
+                if (not request.arguments.get("path")
+                        and request.capability_id in _PATHLESS_WRITE_CAPABILITIES):
+                    out = self._eval_rule(
+                        request, rules, EffectClass.WRITE_LOCAL,
+                        f"{request.capability_id}.write",
+                    )
+                else:
+                    out = (self._eval_database_write(request, rules)
+                           if request.capability_id == "database"
+                           else self._eval_write(request, rules))
             else:
                 out = self._eval_execute(request, rules, level)
         elif _has(EffectClass.DELETE, request.effects) or self._is_files_op(request, _DELETE_OPS):
@@ -145,13 +155,13 @@ class PolicyEngine:
         return self._eval_rule(req, rules, EffectClass.READ_LOCAL, "files.read")
 
     def _eval_execute(self, req, rules, level):
-        # HIGH-6: a network-policy DENY workspace must not reach the network.
-        # Denying unrestricted execute is the conservative v1 guard: shell/python
-        # execution can trivially reach the network, so treat DENY as denying
-        # execute entirely. Documented limitation: this is a coarse guard; a
-        # true network sandbox (no_new_privileges / seccomp / egress rules) is
-        # deferred to the execution runtimes.
-        if req.workspace is not None and req.workspace.network_policy == NetworkPolicy.DENY:
+        # A normal local backend remains conservative: it cannot prove that
+        # arbitrary code is network-confined.  The shadow backend is allowed
+        # through only because its runtime contract invokes the fail-closed
+        # namespace sandbox with a private network namespace.
+        if (req.workspace is not None
+                and req.workspace.network_policy == NetworkPolicy.DENY
+                and req.execution_backend not in {"shadow", "sandbox"}):
             return _deny("execute denied: workspace network_policy is DENY")
         if self._out_of_workspace(req) and not _execute_granted(level, req):
             return _deny(

@@ -1,8 +1,9 @@
 """`process` + `machine` — rich process control and machine introspection (P0).
 
-`process`: inspect, signal, write stdin, list tree, resource usage for
-OS processes. Task ownership is NOT required (system processes are the
-point) but every mutation is policy-gated via effect classes.
+`process`: inspect, list tree, and resource usage for OS processes. Mutating
+operations are restricted to live Athena-owned runtime processes. Arbitrary
+host-process control, when enabled in a deployment, must use a separately
+authorized host-process capability.
 
 `machine`: read-only introspection of the machine Athena runs on —
 CPU/memory/disk/network/ports/environment/toolchain. No mutation ops.
@@ -16,8 +17,9 @@ import os
 import platform
 import shutil
 import subprocess
-from typing import Any
+from typing import Any, ClassVar
 
+from athena.execution.process_tree import process_start_identity
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
@@ -42,7 +44,7 @@ def _result(request, ok=True, output="", error="", meta=None):
 def _run(cmd: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout)
+            cmd, capture_output=True, text=True, timeout=timeout, check=False)
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
@@ -55,7 +57,7 @@ def _run(cmd: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
 # ---------------------------------------------------------------------------
 
 class ProcessCapability:
-    """Inspect / signal / feed arbitrary OS processes."""
+    """Inspect host processes; mutate only Athena-owned runtime processes."""
 
     descriptor = CapabilityDescriptor(
         id="process",
@@ -74,6 +76,7 @@ class ProcessCapability:
                     "list", "inspect", "tree", "usage", "write_stdin",
                     "signal", "wait"]},
                 "pid": {"type": "integer"},
+                "start_identity": {"type": "string", "minLength": 1},
                 "pattern": {"type": "string"},
                 "limit": {"type": "integer"},
                 "signal": {"type": "string"},
@@ -85,14 +88,42 @@ class ProcessCapability:
             EffectClass.READ_LOCAL,
             EffectClass.EXECUTE,
             EffectClass.SPAWN_PROCESS,
+            EffectClass.PRIVILEGED,
         }),
         origin=CapabilityOrigin.NATIVE,
     )
 
-    _SIGNALS = {
+    _SIGNALS: ClassVar[dict[str, int]] = {
         "TERM": 15, "KILL": 9, "INT": 2, "HUP": 1, "QUIT": 3,
         "USR1": 10, "USR2": 12, "CONT": 18, "STOP": 19,
     }
+
+    def __init__(self, execution_manager=None) -> None:
+        self.execution_manager = execution_manager
+
+    def _owns(
+        self, request: CapabilityRequest, pid: int,
+        start_identity: str | None = None,
+    ) -> bool:
+        return bool(
+            self.execution_manager is not None
+            and self.execution_manager.owns_process(
+                request.task_id, pid, start_identity)
+        )
+
+    def _require_owned(
+        self, request: CapabilityRequest, pid: int,
+        start_identity: str | None = None,
+    ) -> CapabilityResult | None:
+        if not os.path.exists(f"/proc/{pid}"):
+            return _result(request, ok=False, error=f"no such pid {pid}")
+        if not self._owns(request, pid, start_identity):
+            return _result(
+                request,
+                ok=False,
+                error="process is not a live Athena-owned runtime process",
+            )
+        return None
 
     async def invoke(self, request: CapabilityRequest, **kwargs) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -103,7 +134,7 @@ class ProcessCapability:
             limit = max(int(args.get("limit") or 40), 1)
 
             def _ps():
-                rc, out, err = _run(
+                _rc, out, _err = _run(
                     ["ps", "-eo", "pid,ppid,pcpu,pmem,etime,comm", "--no-headers",
                      "--sort=-pcpu"])
                 lines = out.splitlines()[:limit]
@@ -137,6 +168,10 @@ class ProcessCapability:
                         info["exe"] = os.readlink(f"/proc/{pid}/exe")
                     except OSError:
                         pass
+                    try:
+                        info["start_identity"] = process_start_identity(pid)
+                    except OSError:
+                        pass
                 except FileNotFoundError:
                     return None
                 except PermissionError as exc:
@@ -150,7 +185,7 @@ class ProcessCapability:
 
         if op == "tree":
             def _tree():
-                rc, out, _ = _run(
+                _rc, out, _ = _run(
                     ["ps", "-eo", "pid,ppid,pgid,comm", "--no-headers"])
                 rows = []
                 for ln in out.splitlines():
@@ -178,7 +213,7 @@ class ProcessCapability:
 
         if op == "usage":
             def _usage():
-                rc, out, _ = _run(["ps", "-p", str(pid),
+                _rc, out, _ = _run(["ps", "-p", str(pid),
                                    "-o", "pid,pcpu,pmem,rss,vsz,etime,comm"])
                 return out.strip()
 
@@ -186,8 +221,10 @@ class ProcessCapability:
             return _result(request, output=out)
 
         if op == "write_stdin":
-            # Only possible for processes spawned through Athena's runtimes;
-            # we match on runtime session ownership via the execution manager.
+            owned_error = self._require_owned(
+                request, pid, str(args.get("start_identity") or "") or None)
+            if owned_error is not None:
+                return owned_error
             text = str(args.get("text") or "")
             fd = f"/proc/{pid}/fd/0"
             if not os.access(fd, os.W_OK):
@@ -205,6 +242,10 @@ class ProcessCapability:
             return _result(request, output="written")
 
         if op == "signal":
+            owned_error = self._require_owned(
+                request, pid, str(args.get("start_identity") or "") or None)
+            if owned_error is not None:
+                return owned_error
             sig_name = str(args.get("signal") or "TERM").upper()
             sig = self._SIGNALS.get(sig_name)
             if sig is None and sig_name.isdigit():
@@ -213,7 +254,6 @@ class ProcessCapability:
                 return _result(request, ok=False,
                                error=f"unknown signal {sig_name}")
 
-            import signal as _signal
 
             def _kill():
                 os.kill(pid, sig)
@@ -231,7 +271,6 @@ class ProcessCapability:
             timeout = min(float(args.get("timeout") or 10.0), 60.0)
 
             def _wait():
-                deadline = asyncio.get_event_loop().time() if False else None
                 import time
                 end = time.monotonic() + timeout
                 while time.monotonic() < end:
@@ -286,7 +325,7 @@ class MachineCapability:
         loop = asyncio.get_running_loop()
 
         def _out(cmd: list[str]) -> str:
-            rc, out, err = _run(cmd)
+            _rc, out, err = _run(cmd)
             return (out or err).strip()
 
         if op == "overview":
@@ -333,8 +372,10 @@ class MachineCapability:
 
         if op == "disk":
             out = await loop.run_in_executor(
-                None, lambda: _out(["df", "-h", "--output="
-                                    "source,fstype,size,used,avail,pcent,target"]))
+                None, lambda: _out([
+                    "df", "-h",
+                    "--output=source,fstype,size,used,avail,pcent,target",
+                ]))
             return _result(request, output=out)
 
         if op == "network":
@@ -378,14 +419,16 @@ class MachineCapability:
         if op == "gpu":
 
             def _gpu():
-                nvidia = _out(["nvidia-smi", "--query-gpu=name,memory.total,"
-                               "utilization.gpu,memory.used",
-                               "--format=csv,noheader"])
+                nvidia = _out([
+                    "nvidia-smi",
+                    "--query-gpu=name,memory.total,utilization.gpu,memory.used",
+                    "--format=csv,noheader",
+                ])
                 if nvidia and "not found" not in nvidia.lower():
                     return nvidia
                 lspci = _out(["lspci"])
-                gpu_lines = [l for l in lspci.splitlines()
-                             if "vga" in l.lower() or "3d" in l.lower()]
+                gpu_lines = [line for line in lspci.splitlines()
+                             if "vga" in line.lower() or "3d" in line.lower()]
                 return "\n".join(gpu_lines) or "(no gpu info)"
 
             text = await loop.run_in_executor(None, _gpu)

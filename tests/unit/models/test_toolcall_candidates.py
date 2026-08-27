@@ -2,8 +2,6 @@
 
 import json
 
-import pytest
-
 from athena.models.compat.candidates import (
     ToolCallCandidate,
     clear_raw_candidates,
@@ -135,3 +133,21 @@ def test_repair_control_char_string_via_candidate_path():
     )
     assert receipt.outcome == RepairOutcome.REPAIRED
     assert args == {"command": "echo a\nb"}
+
+
+def test_empty_candidate_is_not_rewritten_as_an_empty_object():
+    candidate = ToolCallCandidate.parse("call-empty", "fs.read", "")
+    repairer = ToolInputRepairer(mode="safe")
+    args, receipt = repairer.repair(
+        call_id=candidate.call_id,
+        tool_name=candidate.capability_id,
+        arguments=candidate.raw_arguments,
+        input_schema={
+            "type": "object",
+            "required": ["path"],
+            "properties": {"path": {"type": "string"}},
+        },
+        validate_fn=_validate,
+    )
+    assert args is None
+    assert receipt.outcome == RepairOutcome.INVALID

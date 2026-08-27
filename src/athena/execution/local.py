@@ -36,9 +36,14 @@ class LocalBackend(ExecutionBackend):
         runtime: str,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
+        workspace_root: str | None = None,
+        network_policy: str | None = None,
     ) -> str:
         return await self.manager.create_session(
-            task_id=task_id, runtime=runtime, cwd=cwd, env=dict(env) if env else None
+            task_id=task_id, runtime=runtime, cwd=cwd,
+            env=dict(env) if env else None,
+            workspace_root=workspace_root,
+            network_policy=network_policy,
         )
 
     async def execute(self, request: ExecutionRequest) -> AsyncIterator[ExecutionEvent]:

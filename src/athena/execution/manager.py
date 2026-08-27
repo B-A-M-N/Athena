@@ -84,6 +84,8 @@ class ExecutionManager:
         runtime: str,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        workspace_root: str | None = None,
+        network_policy: str | None = None,
     ) -> str:
         rt = self._resolve(runtime)
         kwargs: dict[str, Any] = {"task_id": task_id}
@@ -91,6 +93,10 @@ class ExecutionManager:
             kwargs["env"] = env
         if cwd is not None:
             kwargs["cwd"] = cwd
+        if workspace_root is not None:
+            kwargs["workspace_root"] = workspace_root
+        if network_policy is not None:
+            kwargs["network_policy"] = network_policy
         try:
             sig = inspect.signature(rt.create_session)
             kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -360,12 +366,49 @@ class ExecutionManager:
         session by guessing its ID.
         """
         # Direct task_sessions lookup
-        for rt, sid in self._task_sessions.get(task_id, ()):
-            if sid == runtime_session_id:
+        for rt, known_sid in self._task_sessions.get(task_id, ()):
+            if known_sid == runtime_session_id:
                 return True
         # Check adopted sessions from executions of this task
-        for _exec_id, (rt, sid) in self._exec_runtimes.items():
-            if sid == runtime_session_id and self._executions.get(_exec_id) == task_id:
+        for _exec_id, (rt, adopted_sid) in self._exec_runtimes.items():
+            if adopted_sid == runtime_session_id and self._executions.get(_exec_id) == task_id:
+                return True
+        return False
+
+    def owns_process(
+        self, task_id: str | None, pid: int,
+        start_identity: str | None = None,
+    ) -> bool:
+        """Return whether *pid* is a currently live Athena runtime process.
+
+        Process control is keyed to the live ``Popen`` object, rather than a
+        bare PID. That makes a recycled PID fail closed after the original
+        runtime exits and keeps host-process control out of the normal
+        ``process`` capability. When supplied, ``start_identity`` is checked
+        against Linux's process-start token as an additional PID-reuse guard.
+        """
+        if not task_id or pid <= 0:
+            return False
+        from athena.execution.process_tree import process_start_identity
+
+        current_identity = process_start_identity(pid)
+        if current_identity is None:
+            return False
+        if start_identity is not None and current_identity != str(start_identity):
+            return False
+        for runtime, known_sid in self._task_sessions.get(task_id, ()):
+            session = getattr(runtime, "_sessions", {}).get(known_sid)
+            process = getattr(session, "process", None)
+            if (process is not None and process.pid == pid
+                    and process.poll() is None):
+                return True
+        for execution_id, (runtime, adopted_sid) in self._exec_runtimes.items():
+            if self._executions.get(execution_id) != task_id or not adopted_sid:
+                continue
+            session = getattr(runtime, "_sessions", {}).get(adopted_sid)
+            process = getattr(session, "process", None)
+            if (process is not None and process.pid == pid
+                    and process.poll() is None):
                 return True
         return False
 

@@ -21,17 +21,25 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass, field
-from typing import Any
 
 from athena.capabilities.dispatcher import SuspendedCall
-from athena.protocol.capabilities import CapabilityRequest, CapabilityResult
+from athena.protocol.capabilities import (
+    CapabilityRequest,
+    CapabilityRequestOrigin,
+    CapabilityResult,
+)
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
-from athena.protocol.tasks import WorkspaceSpec
+from athena.protocol.tasks import NetworkPolicy, WorkspaceSpec
 
-__all__ = ["ShadowBranch", "ShadowEngine", "BranchStatus"]
+__all__ = ["BranchStatus", "ShadowBranch", "ShadowEngine"]
 
 _logger = logging.getLogger("athena.shadow")
+
+
+def _read_utf8(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
 
 
 class BranchStatus:
@@ -57,8 +65,13 @@ class ShadowBranch:
     rejected_requests: list[CapabilityRequest] = field(default_factory=list)
     mutations: list[dict] = field(default_factory=list)
     verification: list[dict] = field(default_factory=list)
+    # Immutable snapshot of the real workspace at branch creation. Commit
+    # conflict checks must compare reality with this, never with a manifest
+    # freshly captured after the branch has already run.
+    base_manifest: dict[str, str] = field(default_factory=dict)
     error: str | None = None
     commit_mutation_id: str | None = None
+    policy_profile: str | None = None
     created_at: str = field(default_factory=lambda: utcnow().isoformat())
 
 
@@ -86,7 +99,9 @@ class ShadowEngine:
     # ------------------------------------------------------------------
     # Branch lifecycle
     # ------------------------------------------------------------------
-    def _make_shadow_workspace(self, base: WorkspaceSpec, branch_id: str) -> WorkspaceSpec:
+    def _make_shadow_workspace(
+        self, base: WorkspaceSpec, branch_id: str,
+    ) -> tuple[WorkspaceSpec, dict[str, str]]:
         """Clone-on-create: copy the real workspace tree into a shadow root.
 
         Bounded copy: skip VCS internals and caches that don't affect
@@ -96,6 +111,11 @@ class ShadowEngine:
         root = os.path.join(self._roots_parent, branch_id)
         os.makedirs(root, exist_ok=True)
         src = base.root
+        # Capture the base at the same lifecycle boundary as branch creation.
+        # Capturing after copytree would leave a race window in which a real
+        # workspace edit could be mistaken for the branch's own starting
+        # state.
+        base_manifest = self._manifest(src)
         if os.path.isdir(src):
             shutil.copytree(
                 src, root, dirs_exist_ok=True,
@@ -108,9 +128,13 @@ class ShadowEngine:
             root=root,
             readable=base.readable,
             writable=base.writable,
-            network_policy=base.network_policy,
-            execution_backend=base.execution_backend,
-        )
+            # A copied directory is not an isolation boundary.  The branch
+            # therefore requests the sandbox backend and denies outbound
+            # networking; execution must fail closed if that backend is not
+            # available.
+            network_policy=NetworkPolicy.DENY,
+                execution_backend="shadow",
+        ), base_manifest
 
     async def open_branch(
         self,
@@ -118,6 +142,7 @@ class ShadowEngine:
         task_id: str | None,
         base_workspace: WorkspaceSpec,
         proposal: list[dict],
+        profile: str | None = None,
     ) -> ShadowBranch:
         """Create a shadow clone for a proposed operation batch.
 
@@ -126,13 +151,15 @@ class ShadowEngine:
         if self._dispatcher is None:
             raise RuntimeError("ShadowEngine not bound to a dispatcher")
         bid = new_id("branch")
-        shadow_ws = await asyncio.get_running_loop().run_in_executor(
+        shadow_ws, base_manifest = await asyncio.get_running_loop().run_in_executor(
             None, self._make_shadow_workspace, base_workspace, bid)
         branch = ShadowBranch(
             id=bid,
             task_id=task_id,
             base_workspace=base_workspace,
             shadow_workspace=shadow_ws,
+            policy_profile=profile,
+            base_manifest=base_manifest,
         )
         branch.proposal = proposal
         self._branches[bid] = branch
@@ -151,6 +178,14 @@ class ShadowEngine:
         Uses the SAME dispatcher -> registry -> policy path as real work;
         the only difference is the workspace bound into each request.
         """
+        # The commit phase must evaluate the exact same requested policy
+        # profile as the speculative execution phase.  Without persisting
+        # this, callers that supply the profile here would silently fall back
+        # to the service default during commit (usually supervised), turning a
+        # proven branch into an approval suspension at the final mutation
+        # boundary.
+        if profile is not None:
+            branch.policy_profile = profile
         branch.status = BranchStatus.EXECUTING
         try:
             for i, op in enumerate(branch.proposal):
@@ -160,6 +195,7 @@ class ShadowEngine:
                     arguments=args,
                     task_id=branch.task_id,
                     call_id=new_id("call"),
+                    origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
                 )
                 result = await self._dispatcher.dispatch(
                     req, workspace=branch.shadow_workspace, profile=profile)
@@ -177,7 +213,7 @@ class ShadowEngine:
                     branch.status = BranchStatus.FAILED
                     return branch
                 if isinstance(result, Exception):
-                    raise RuntimeError(str(result))
+                    raise result
                 if result.status.value != "ok":
                     branch.error = (
                         f"op {i} ({op['capability_id']}) failed: {result.error}")
@@ -185,7 +221,7 @@ class ShadowEngine:
                     branch.status = BranchStatus.FAILED
                     return branch
                 branch.results.append(result)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - branch must become FAILED
             branch.error = f"branch execution error: {exc}"
             branch.status = BranchStatus.FAILED
         return branch
@@ -206,13 +242,13 @@ class ShadowEngine:
     # Commit / discard
     # ------------------------------------------------------------------
     async def commit(self, branch: ShadowBranch) -> dict:
-        """Apply the shadow's file effects onto the real workspace.
+        """Apply a verified branch through the canonical mutation capability.
 
-        Strategy: diff shadow vs base by walking the trees, then copy
-        changed/new files forward and delete files removed in the shadow.
-        Each applied change is recorded in the caller's mutation ledger via
-        the returned summary (the dispatcher already logged the shadow-side
-        mutations; this records the commit itself as one reversible unit).
+        The shadow diff is a *plan*, not permission to mutate the real tree.
+        Every write/delete is converted to an ``fs`` capability request and
+        dispatched against the base workspace.  Consequently the ordinary
+        policy, approval, before-state/WAL, and mutation event boundaries are
+        used for the commit itself too.
         """
         if branch.status != BranchStatus.VERIFIED:
             raise RuntimeError(
@@ -224,76 +260,95 @@ class ShadowEngine:
         # Conflict detection (P0-15): every modified/deleted file must still
         # match the base hash captured at branch open. If reality drifted,
         # refuse to overwrite — return CONFLICT instead.
-        import hashlib
-
-        def _current_hash(path: str) -> str:
-            h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-            return h.hexdigest()[:16]
-
         base_root = branch.base_workspace.root
-        conflicts = []
-        for rel, expected in changes.get("base_hashes", {}).items():
-            current_path = os.path.join(base_root, rel)
-            if not os.path.isfile(current_path):
-                conflicts.append({"resource": rel, "reason": "deleted_elsewhere"})
-                continue
-            if _current_hash(current_path) != expected:
-                conflicts.append({"resource": rel, "reason": "modified_elsewhere"})
+        conflicts = self._conflicts(
+            base_root, changes.get("base_hashes", {}),
+        )
         if conflicts:
             branch.status = BranchStatus.FAILED
             branch.error = f"commit CONFLICT: {len(conflicts)} resource(s) changed outside the branch"
-            await loop.run_in_executor(None, self._cleanup, branch)
+            await self._cleanup(branch)
             return {"status": "CONFLICT", "branch": branch.id,
                     "conflicts": conflicts}
 
-        def _apply():
-            applied = {"written": [], "deleted": []}
-            base_root = branch.base_workspace.root
-            shadow_root = branch.shadow_workspace.root
-            for rel in changes["modified"] + changes["added"]:
-                src = os.path.join(shadow_root, rel)
-                dst = os.path.join(base_root, rel)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                applied["written"].append(rel)
-            for rel in changes["deleted"]:
-                target = os.path.join(base_root, rel)
-                if os.path.isfile(target):
-                    os.remove(target)
-                    applied["deleted"].append(rel)
-            return applied
+        requests: list[CapabilityRequest] = []
+        outcomes: list[CapabilityResult | SuspendedCall] = []
+        shadow_root = branch.shadow_workspace.root
+        for rel in changes["modified"] + changes["added"]:
+            source = os.path.join(shadow_root, rel)
+            try:
+                content = await asyncio.to_thread(_read_utf8, source)
+            except (OSError, UnicodeDecodeError) as exc:
+                branch.status = BranchStatus.FAILED
+                branch.error = f"cannot create canonical commit plan for {rel}: {exc}"
+                await self._cleanup(branch)
+                return {"status": "FAILED", "branch": branch.id,
+                        "error": branch.error}
+            requests.append(CapabilityRequest(
+                capability_id="fs",
+                arguments={"operation": "write", "path": rel,
+                           "content": content, "create_dirs": True},
+                task_id=branch.task_id,
+                call_id=new_id("commit"),
+                origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+            ))
+        for rel in changes["deleted"]:
+            requests.append(CapabilityRequest(
+                capability_id="fs",
+                arguments={"operation": "delete", "path": rel},
+                task_id=branch.task_id,
+                call_id=new_id("commit"),
+                origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+            ))
 
-        applied = await loop.run_in_executor(None, _apply)
+        if requests:
+            if self._dispatcher is None:
+                raise RuntimeError("ShadowEngine not bound to a dispatcher")
+            outcomes = await self._dispatcher.dispatch_many(
+                requests,
+                workspace=branch.base_workspace,
+                profile=branch.policy_profile,
+                preflight=True,
+            )
+            failed = [item for item in outcomes
+                      if isinstance(item, CapabilityResult)
+                      and item.status.value != "ok"]
+            suspended = [item for item in outcomes if isinstance(item, SuspendedCall)]
+            if failed or suspended or len(outcomes) != len(requests):
+                branch.status = BranchStatus.FAILED
+                if failed:
+                    reason = failed[0].error or "capability request failed"
+                elif suspended:
+                    reason = "commit requires approval"
+                else:
+                    reason = "commit dispatch returned incomplete results"
+                branch.error = f"commit not applied: {reason}"
+                await self._cleanup(branch)
+                return {"status": "FAILED", "branch": branch.id,
+                        "error": branch.error}
+
+        applied = {
+            "written": list(changes["modified"] + changes["added"]),
+            "deleted": list(changes["deleted"]),
+            "mutation_results": [
+                {
+                    "mutation_id": (item.metadata or {}).get("mutation", {}).get(
+                        "mutation_id"),
+                    "mutation_sequence": (item.metadata or {}).get(
+                        "mutation_sequence"),
+                    "mutation_event_sequence": (item.metadata or {}).get(
+                        "mutation_event_sequence"),
+                }
+                for item in outcomes
+                if isinstance(item, CapabilityResult)
+            ],
+        }
         branch.mutations = [
             {"resource": w, "operation": "commit_write"} for w in applied["written"]
         ] + [{"resource": d, "operation": "commit_delete"} for d in applied["deleted"]]
 
-        # Record the commit as a durable mutation intent (P0-13): the most
-        # important step of a speculative transaction must be in the WAL.
-        if getattr(self, "_service", None) is not None:
-            store = getattr(self._service, "_store_mutations", None)
-            if store is not None:
-                try:
-                    mid = await store.record_intent(
-                        task_id=branch.task_id,
-                        resource=f"shadow-branch:{branch.id}",
-                        operation="commit",
-                        metadata={"written": applied["written"],
-                                  "deleted": applied["deleted"]},
-                    )
-                    await store.complete(mid,
-                                         after_hash=branch.id[-8:],
-                                         reversible=False)
-                    branch.commit_mutation_id = mid
-                except Exception as exc:
-                    _logger.warning("commit WAL record failed (branch %s): %s",
-                                    branch.id, exc)
-
         branch.status = BranchStatus.COMMITTED
-        self._cleanup(branch)
+        await self._cleanup(branch)
         _logger.info("shadow branch %s committed: +%d/-%d files",
                      branch.id, len(applied["written"]), len(applied["deleted"]))
         return {"status": "committed", "branch": branch.id, **applied}
@@ -301,7 +356,7 @@ class ShadowEngine:
     async def discard(self, branch: ShadowBranch, reason: str = "") -> dict:
         branch.status = BranchStatus.DISCARDED
         branch.error = branch.error or reason or None
-        self._cleanup(branch)
+        await self._cleanup(branch)
         return {"status": "discarded", "branch": branch.id, "reason": reason}
 
     # ------------------------------------------------------------------
@@ -309,34 +364,9 @@ class ShadowEngine:
         """Content-hash tree diff (size comparison misses same-size edits)."""
         base_root = branch.base_workspace.root
         shadow_root = branch.shadow_workspace.root
-        ignore = {".git", "__pycache__", "node_modules", ".venv"}
 
-        def _hash_file(path: str) -> str:
-            import hashlib
-            h = hashlib.sha256()
-            try:
-                if os.path.islink(path):
-                    return hashlib.sha256(
-                        ("link:" + os.readlink(path)).encode()).hexdigest()[:16]
-                with open(path, "rb") as f:
-                    for chunk in iter(lambda: f.read(65536), b""):
-                        h.update(chunk)
-                return h.hexdigest()[:16]
-            except OSError:
-                return "<unreadable>"
-
-        def walk(root: str) -> dict[str, str]:
-            out: dict[str, str] = {}
-            for dirpath, dirnames, filenames in os.walk(root):
-                dirnames[:] = [d for d in dirnames if d not in ignore]
-                for name in filenames:
-                    full = os.path.join(dirpath, name)
-                    rel = os.path.relpath(full, root)
-                    out[rel] = _hash_file(full)
-            return out
-
-        base_files = walk(base_root)
-        shadow_files = walk(shadow_root)
+        base_files = branch.base_manifest or self._manifest(base_root)
+        shadow_files = self._manifest(shadow_root)
         modified, added, deleted = [], [], []
         for rel, digest in shadow_files.items():
             if rel not in base_files:
@@ -348,10 +378,72 @@ class ShadowEngine:
                 deleted.append(rel)
         # Base content hashes recorded for conflict detection at commit.
         return {"modified": modified, "added": added, "deleted": deleted,
-                "base_hashes": {**{r: base_files[r] for r in modified},
-                                **{r: base_files[r] for r in deleted}}}
+                "base_hashes": {
+                    **{r: base_files[r] for r in modified},
+                    **{r: base_files[r] for r in deleted},
+                **{r: "<missing>" for r in added},
+            }}
 
-    def _cleanup(self, branch: ShadowBranch) -> None:
+    def _conflicts(
+        self, base_root: str, base_hashes: dict[str, str],
+    ) -> list[dict[str, str]]:
+        """Report real-workspace edits since a branch's captured base."""
+        current_manifest = self._manifest(base_root)
+        conflicts: list[dict[str, str]] = []
+        for rel, expected in base_hashes.items():
+            current = current_manifest.get(rel, "<missing>")
+            if expected == "<missing>" and current != "<missing>":
+                conflicts.append({"resource": rel, "reason": "created_elsewhere"})
+            elif expected != "<missing>" and current != expected:
+                reason = "deleted_elsewhere" if current == "<missing>" else "modified_elsewhere"
+                conflicts.append({"resource": rel, "reason": reason})
+        return conflicts
+
+    @staticmethod
+    def _manifest(root: str) -> dict[str, str]:
+        """Return content/type hashes for a workspace tree.
+
+        Symlink targets and file contents are represented differently, so a
+        same-size replacement or symlink retarget cannot disappear from a
+        speculative diff. Directory symlinks are recorded but never followed.
+        """
+        import hashlib
+
+        ignore = {".git", "__pycache__", "node_modules", ".venv"}
+
+        def resource_hash(path: str) -> str:
+            try:
+                if os.path.islink(path):
+                    value = "link:" + os.readlink(path)
+                    return hashlib.sha256(value.encode()).hexdigest()[:16]
+                if os.path.isdir(path):
+                    return hashlib.sha256(b"directory").hexdigest()[:16]
+                digest = hashlib.sha256()
+                with open(path, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(65536), b""):
+                        digest.update(chunk)
+                return digest.hexdigest()[:16]
+            except OSError:
+                return "<unreadable>"
+
+        manifest: dict[str, str] = {}
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            kept_dirs: list[str] = []
+            for name in dirnames:
+                if name in ignore:
+                    continue
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full):
+                    manifest[os.path.relpath(full, root)] = resource_hash(full)
+                else:
+                    kept_dirs.append(name)
+            dirnames[:] = kept_dirs
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                manifest[os.path.relpath(full, root)] = resource_hash(full)
+        return manifest
+
+    async def _cleanup(self, branch: ShadowBranch) -> None:
         def _rm():
             shutil.rmtree(branch.shadow_workspace.root, ignore_errors=True)
-        asyncio.get_running_loop().run_in_executor(None, _rm)
+        await asyncio.get_running_loop().run_in_executor(None, _rm)

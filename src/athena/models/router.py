@@ -9,8 +9,9 @@ crosses a privacy, locality, or cost boundary that policy has not authorized.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Protocol
 
 from athena.protocol.errors import ModelUnavailable, ProviderUnavailable
 from athena.protocol.models import ModelInfo, PrivacyClass
@@ -115,6 +116,16 @@ class ModelRouter:
         """Assign (or replace) the default policy for a role."""
         self._role_policies[role] = policy
 
+    def provider_for(self, provider_name: str) -> object:
+        """Expose the selected provider through the single routing authority.
+
+        Callers that need to stream the selected model (for example the
+        acceptance-judge verifier) must not reach around the router and keep
+        a second provider registry.  Delegating here preserves the configured
+        role-selection authority while retaining the registry's adapter lookup.
+        """
+        return self._registry.provider_for(provider_name)
+
     def _resolve_policy(self, policy: ModelPolicy) -> ModelPolicy:
         """Merge role defaults into a caller-supplied policy.
 
@@ -175,7 +186,7 @@ class ModelRouter:
                 f"offline={offline})"
             )
 
-        best = sorted(candidates, key=_candidate_key)[0]
+        best = min(candidates, key=_candidate_key)
         return ModelSelection(
             provider=best.provider,
             model=best.id,
@@ -198,9 +209,7 @@ class ModelRouter:
             attr = _CAPABILITY_FIELD.get(cap)
             if attr is not None and not getattr(info, attr, False):
                 return False
-        if policy.require_tools and not info.tool_calling:
-            return False
-        return True
+        return not (policy.require_tools and not info.tool_calling)
 
     def _meets_capacity(self, info: ModelInfo, requirements: ModelRequirements) -> bool:
         if requirements.minimum_context_tokens is not None:
@@ -240,15 +249,15 @@ class ModelRouter:
 
 
 __all__ = [
-    "ModelRequirements",
-    "ModelSelection",
-    "ModelSource",
-    "ModelRouter",
-    "CAP_TOOLS",
-    "CAP_VISION",
     "CAP_AUDIO_INPUT",
     "CAP_AUDIO_OUTPUT",
     "CAP_REASONING",
-    "CAP_STRUCTURED",
     "CAP_STREAMING",
+    "CAP_STRUCTURED",
+    "CAP_TOOLS",
+    "CAP_VISION",
+    "ModelRequirements",
+    "ModelRouter",
+    "ModelSelection",
+    "ModelSource",
 ]

@@ -22,10 +22,6 @@ from pathlib import Path
 
 from athena.state.mutations import (
     COMPLETED,
-    FAILED,
-    RECOVERY_REQUIRED,
-    ROLLED_BACK,
-    STARTED,
     MutationStore,
 )
 
@@ -154,7 +150,6 @@ class RollbackExecutor:
         source = inverse.get("source")  # where the file is now
         target = inverse.get("target")  # where the file was originally
         dest_before_ref = inverse.get("overwritten_destination_ref")
-        source_before_ref = inverse.get("source_before_ref")
 
         # If the destination was overwritten, restore it first
         if dest_before_ref and source and target:

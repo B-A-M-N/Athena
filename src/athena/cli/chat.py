@@ -42,6 +42,15 @@ _META_HELP = """\
 """
 
 
+def bold(text: str) -> str:
+    """ANSI style helper used by the inspect projection."""
+    return f"\033[1m{text}\033[0m"
+
+
+def dim(text: str) -> str:
+    return f"\033[2m{text}\033[0m"
+
+
 def _autonomy(value: str | None) -> AutonomyLevel:
     if not value:
         return AutonomyLevel.SUPERVISED
@@ -293,7 +302,8 @@ class ChatREPL:
             result = await _stream(self.service, spec.id, autonomy=self.autonomy, surface=self.surface)
             if result is not None:
                 status = getattr(result, "status", None)
-                s = status.value if hasattr(status, "value") else str(status)
+                value = getattr(status, "value", None)
+                s = str(value if value is not None else status)
                 summary = getattr(result, "summary", "") or ""
                 if summary:
                     print(summary)

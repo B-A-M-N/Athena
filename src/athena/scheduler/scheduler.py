@@ -22,7 +22,6 @@ from typing import Any, Mapping
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
 
-_logger = logging.getLogger("athena.scheduler")
 from athena.protocol.tasks import (
     CapabilityPolicy,
     DeliverySpec,
@@ -34,6 +33,8 @@ from athena.protocol.tasks import (
 from athena.scheduler.claims import claim_next
 from athena.scheduler.triggers import TriggerType, TriggerSpec, next_fire
 from athena.state.schedules import ScheduleStore
+
+_logger = logging.getLogger("athena.scheduler")
 
 
 @dataclass(frozen=True)

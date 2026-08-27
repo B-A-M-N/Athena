@@ -6,5 +6,12 @@ from athena.worldstate.core import (
     InvariantSet,
     TaskWorldState,
 )
+from athena.worldstate.store import WorldStateStore
 
-__all__ = ["ClaimRegistry", "ClaimStatus", "InvariantSet", "TaskWorldState"]
+__all__ = [
+    "ClaimRegistry",
+    "ClaimStatus",
+    "InvariantSet",
+    "TaskWorldState",
+    "WorldStateStore",
+]

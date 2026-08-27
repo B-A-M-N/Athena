@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
 from typing import Any
 
 from athena.protocol.ids import new_id

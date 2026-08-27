@@ -11,10 +11,14 @@ in/out remain canonical provider-neutral ModelRequest/ModelEvent types.
 from __future__ import annotations
 
 import json
-from typing import Any, AsyncIterator
+import logging
+from collections.abc import AsyncIterator
+from dataclasses import replace
+from typing import Any
 
 import httpx
 
+from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
 from athena.protocol.errors import (
     ContextOverflow,
     ModelUnavailable,
@@ -26,11 +30,14 @@ from athena.protocol.errors import (
     ProviderUnavailable,
 )
 from athena.protocol.ids import new_id
-from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
 from athena.protocol.messages import (
+    ArtifactRefBlock,
+    AudioBlock,
     CapabilityCallBlock,
     CapabilityResultBlock,
     ContentBlock,
+    FileRefBlock,
+    ImageBlock,
     ReasoningBlock,
     Role,
     TextBlock,
@@ -47,6 +54,7 @@ from athena.protocol.models import (
 )
 
 _PATH = "/v1/messages"
+_logger = logging.getLogger("athena.provider.anthropic")
 
 
 def _load_anthropic():
@@ -54,7 +62,7 @@ def _load_anthropic():
         import anthropic  # type: ignore
 
         return anthropic
-    except Exception:
+    except ImportError:
         return None
 
 
@@ -75,8 +83,23 @@ def _done_event(
     *,
     blocks: list[ContentBlock] | tuple[ContentBlock, ...] = (),
     finish: str = "end_turn",
-    usage: UsageInfo = UsageInfo(),
+    usage: UsageInfo | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> ModelEvent:
+    request_keys = (
+        "task_id", "session_id", "provider_profile_id",
+        "provider_profile_fingerprint", "profile_id", "model_id",
+        "compatibility_profile", "model_profile", "protocol",
+        "tool_repair_mode", "max_tool_correction_cycles", "cache_mode",
+        "cache_session_key", "prefix_fingerprint", "full_fingerprint",
+        "components_fp",
+    )
+    response_metadata = {
+        key: request.metadata[key]
+        for key in request_keys if key in request.metadata
+    }
+    response_metadata.update(metadata or {})
+    usage = usage or UsageInfo()
     return ModelEvent(
         type=ModelEventType.DONE,
         request_id=request.request_id,
@@ -87,6 +110,7 @@ def _done_event(
             blocks=tuple(blocks),
             finish_reason=finish,
             usage=usage,
+            metadata=response_metadata,
         ),
     )
 
@@ -140,6 +164,8 @@ class AnthropicProvider:
                 provider=self.provider,
                 streaming=True,
                 tool_calling=True,
+                vision=True,
+                reasoning=True,
                 privacy_class=self._privacy_class,
             )
         ]
@@ -156,8 +182,8 @@ class AnthropicProvider:
         if resp is not None:
             try:
                 await resp.aclose()
-            except Exception:
-                pass
+            except (OSError, RuntimeError) as exc:
+                _logger.debug("%s stream close failed: %s", self.provider, exc)
 
     async def _complete_sdk(self, request: ModelRequest) -> ModelEvent:
         assert self._anthropic is not None  # guarded by `complete` before dispatch
@@ -168,13 +194,35 @@ class AnthropicProvider:
         for content in response.content:
             if content.type == "text" and getattr(content, "text", None):
                 blocks.append(TextBlock(type="text", text=content.text))
+            elif content.type == "thinking" and getattr(content, "thinking", None):
+                blocks.append(
+                    ReasoningBlock(type="reasoning", text=content.thinking)
+                )
             elif content.type == "tool_use":
+                call_id = content.id or new_id("call")
+                raw_input = json.dumps(
+                    content.input if isinstance(content.input, dict) else {},
+                    ensure_ascii=False,
+                )
+                if isinstance(content.input, str):
+                    raw_input = content.input
+                elif content.input is None:
+                    raw_input = ""
+                candidate = ToolCallCandidate.parse(
+                    call_id,
+                    content.name,
+                    raw_input,
+                    provider_profile_id=request.metadata.get("provider_profile_id"),
+                    model_id=request.model,
+                    protocol="anthropic",
+                )
                 blocks.append(
                     CapabilityCallBlock(
                         type="capability_call",
-                        call_id=content.id,
+                        call_id=call_id,
                         capability_id=content.name,
-                        arguments=content.input,
+                        arguments=candidate.parsed_arguments or {},
+                        candidate=candidate,
                     )
                 )
         usage = response.usage
@@ -185,6 +233,24 @@ class AnthropicProvider:
             usage=UsageInfo(
                 input_tokens=getattr(usage, "input_tokens", 0) or 0,
                 output_tokens=getattr(usage, "output_tokens", 0) or 0,
+                cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+                cache_write_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                provider_metadata={
+                    "raw_usage": {
+                        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+                        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+                        "cache_read_input_tokens": (
+                            getattr(usage, "cache_read_input_tokens", 0) or 0
+                        ),
+                        "cache_creation_input_tokens": (
+                            getattr(usage, "cache_creation_input_tokens", 0) or 0
+                        ),
+                    }
+                },
+            ),
+            metadata=(
+                {"response_id": response.id}
+                if getattr(response, "id", None) else None
             ),
         )
 
@@ -219,7 +285,16 @@ class AnthropicProvider:
             "stream": stream,
         }
         if system:
-            kwargs["system"] = system
+            if request.metadata.get("cache_mode") in {
+                "session-key", "explicit-cache-api"
+            }:
+                kwargs["system"] = [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                kwargs["system"] = system
         if request.max_tokens is not None:
             kwargs["max_tokens"] = request.max_tokens
         if request.temperature is not None:
@@ -246,6 +321,35 @@ class AnthropicProvider:
             for block in msg.blocks:
                 if isinstance(block, (TextBlock, ReasoningBlock)) and block.text:
                     content.append({"type": "text", "text": block.text})
+                elif isinstance(block, ImageBlock) and block.data_path:
+                    content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "url", "url": block.data_path,
+                        },
+                    })
+                elif isinstance(block, ArtifactRefBlock) and block.uri:
+                    # Anthropic has no portable artifact-ref block. Keep the
+                    # reference visible to the model instead of silently
+                    # dropping durable context; callers that need native
+                    # media should resolve it to an image/data URL first.
+                    content.append({
+                        "type": "text",
+                        "text": f"[artifact attachment: {block.uri}]",
+                    })
+                elif isinstance(block, FileRefBlock) and block.uri:
+                    content.append({
+                        "type": "text",
+                        "text": f"[file attachment: {block.uri}]",
+                    })
+                elif isinstance(block, AudioBlock) and block.data_path:
+                    # Anthropic Messages currently has no canonical audio
+                    # input block. Preserve the attachment explicitly so an
+                    # unsupported request is observable rather than omitted.
+                    content.append({
+                        "type": "text",
+                        "text": f"[audio attachment: {block.data_path}]",
+                    })
                 elif isinstance(block, CapabilityResultBlock):
                     result: dict[str, Any] = {
                         "type": "tool_result",
@@ -282,8 +386,10 @@ class AnthropicProvider:
         self, request: ModelRequest, resp: httpx.Response
     ) -> AsyncIterator[ModelEvent]:
         tool_uses: dict[int, dict[str, Any]] = {}
+        pending_tool_blocks: list[CapabilityCallBlock] = []
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
+        stream_complete = False
         async for line in resp.aiter_lines():
             line = line.strip()
             if not line.startswith("data:"):
@@ -304,6 +410,16 @@ class AnthropicProvider:
                         "input_tokens": [],
                         "input": {},
                     }
+                elif block.get("type") == "thinking" and block.get("thinking"):
+                    reasoning_parts.append(block["thinking"])
+                    yield ModelEvent(
+                        type=ModelEventType.REASONING,
+                        request_id=request.request_id,
+                        delta=ModelDelta(
+                            request_id=request.request_id,
+                            reasoning=block["thinking"],
+                        ),
+                    )
             elif ptype == "content_block_delta":
                 delta = payload.get("delta") or {}
                 if delta.get("type") == "text_delta" and delta.get("text"):
@@ -315,6 +431,16 @@ class AnthropicProvider:
                             request_id=request.request_id, text=delta["text"]
                         ),
                     )
+                elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                    reasoning_parts.append(delta["thinking"])
+                    yield ModelEvent(
+                        type=ModelEventType.REASONING,
+                        request_id=request.request_id,
+                        delta=ModelDelta(
+                            request_id=request.request_id,
+                            reasoning=delta["thinking"],
+                        ),
+                    )
                 elif delta.get("type") == "input_json_delta":
                     index = payload.get("index", 0)
                     slot = tool_uses.get(index)
@@ -324,34 +450,46 @@ class AnthropicProvider:
                 index = payload.get("index", 0)
                 slot = tool_uses.get(index)
                 if slot is not None:
-                    raw_input = "".join(slot["input_tokens"]) or "{}"
-                    try:
-                        arguments = json.loads(raw_input)
-                    except ValueError:
-                        arguments = {}
-                    if not isinstance(arguments, dict):
-                        arguments = {}
-                    if arguments == {} and raw_input.strip() not in ("", "{}"):
-                        candidate = ToolCallCandidate.parse(
-                            slot["call_id"] or new_id("call"),
-                            slot["name"],
-                            raw_input,
-                        )
-                        if candidate.parsed_arguments is None:
-                            record_raw_candidate(candidate)
+                    call_id = slot["call_id"] or new_id("call")
+                    # An empty/incomplete stream is still a candidate.  Keep
+                    # the original empty payload so the compatibility layer
+                    # can reject or repair it; manufacturing ``{}`` turns a
+                    # malformed model call into a valid one silently.
+                    raw_input = "".join(slot["input_tokens"])
+                    candidate = ToolCallCandidate.parse(
+                        call_id, slot["name"], raw_input,
+                        completion_state="CLEAN" if stream_complete else "INTERRUPTED",
+                        provider_profile_id=request.metadata.get("provider_profile_id"),
+                        model_id=request.model,
+                        stream="anthropic",
+                    )
                     block = CapabilityCallBlock(
                         type="capability_call",
-                        call_id=slot["call_id"] or new_id("call"),
+                        call_id=call_id,
                         capability_id=slot["name"],
-                        arguments=arguments,
+                        arguments=candidate.parsed_arguments or {},
+                        candidate=candidate,
                     )
-                    yield ModelEvent(
-                        type=ModelEventType.DELTA,
-                        request_id=request.request_id,
-                        delta=ModelDelta(request_id=request.request_id, text="", block=block),
-                    )
+                    pending_tool_blocks.append(block)
             elif ptype == "error":
                 raise ProviderProtocolError(f"{self.provider} stream error: {payload}")
+            elif ptype == "message_stop":
+                stream_complete = True
+        for block in pending_tool_blocks:
+            candidate = block.candidate
+            if candidate is not None:
+                candidate = replace(
+                    candidate,
+                    completion_state="CLEAN" if stream_complete else "INTERRUPTED",
+                )
+                if candidate.parsed_arguments is None:
+                    record_raw_candidate(candidate)
+                block = replace(block, candidate=candidate)
+            yield ModelEvent(
+                type=ModelEventType.DELTA,
+                request_id=request.request_id,
+                delta=ModelDelta(request_id=request.request_id, text="", block=block),
+            )
         blocks: list[ContentBlock] = []
         if reasoning_parts:
             blocks.append(ReasoningBlock(type="reasoning", text="".join(reasoning_parts)))
@@ -364,13 +502,39 @@ class AnthropicProvider:
         for content in data.get("content") or []:
             if content.get("type") == "text" and content.get("text"):
                 blocks.append(TextBlock(type="text", text=content["text"]))
+            elif content.get("type") == "thinking" and content.get("thinking"):
+                blocks.append(ReasoningBlock(
+                    type="reasoning", text=content["thinking"]
+                ))
             elif content.get("type") == "tool_use":
+                call_id = content.get("id") or new_id("call")
+                raw_input = content.get("input")
+                if isinstance(raw_input, dict):
+                    raw_arguments = json.dumps(raw_input, ensure_ascii=False)
+                elif isinstance(raw_input, str):
+                    raw_arguments = raw_input
+                else:
+                    # Preserve a missing/non-object payload as invalid raw
+                    # input.  ``{}`` is a real empty-object argument and is
+                    # not an acceptable parse-failure sentinel.
+                    raw_arguments = ""
+                candidate = ToolCallCandidate.parse(
+                    call_id,
+                    content.get("name", ""),
+                    raw_arguments,
+                    provider_profile_id=request.metadata.get("provider_profile_id"),
+                    model_id=request.model,
+                    protocol="anthropic",
+                )
+                if candidate.parsed_arguments is None:
+                    record_raw_candidate(candidate)
                 blocks.append(
                     CapabilityCallBlock(
                         type="capability_call",
-                        call_id=content.get("id") or new_id("call"),
+                        call_id=call_id,
                         capability_id=content.get("name", ""),
-                        arguments=content.get("input") or {},
+                        arguments=candidate.parsed_arguments or {},
+                        candidate=candidate,
                     )
                 )
         usage_raw = data.get("usage") or {}
@@ -381,7 +545,11 @@ class AnthropicProvider:
             usage=UsageInfo(
                 input_tokens=int(usage_raw.get("input_tokens") or 0),
                 output_tokens=int(usage_raw.get("output_tokens") or 0),
+                cache_read_tokens=int(usage_raw.get("cache_read_input_tokens") or 0),
+                cache_write_tokens=int(usage_raw.get("cache_creation_input_tokens") or 0),
+                provider_metadata={"raw_usage": usage_raw},
             ),
+            metadata={"response_id": data.get("id")} if data.get("id") else {},
         )
 
     async def _map_err(self, resp: httpx.Response):

@@ -68,6 +68,29 @@ async def test_cancel_propagates_to_children(env):
         assert row.metadata["status"] == TaskStatus.CANCELLED.value
 
 
+@pytest.mark.athena_claim("BHV-076")
+@pytest.mark.athena_evidence("test", "invariant")
+async def test_cancel_propagates_to_execution_manager_for_every_descendant(env):
+    manager, cancellations, sessions = env
+
+    class ExecutionSpy:
+        def __init__(self):
+            self.cancelled = []
+
+        async def cancel_task(self, task_id):
+            self.cancelled.append(task_id)
+
+    spy = ExecutionSpy()
+    cancellations._exec = spy
+    parent = await _create(manager, sessions, "parent")
+    child = await _create(manager, sessions, "child", parent=parent.id)
+    grandchild = await _create(manager, sessions, "grandchild", parent=child.id)
+
+    await cancellations.cancel(parent.id)
+
+    assert spy.cancelled == [parent.id, child.id, grandchild.id]
+
+
 @pytest.mark.athena_claim("BHV-023")
 @pytest.mark.athena_evidence("test", "invariant")
 async def test_interrupt_sets_interrupted_recoverable(env):
