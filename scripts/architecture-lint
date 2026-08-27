@@ -128,6 +128,7 @@ RULES: tuple[Rule, ...] = (
             "synthesis/engine.py",        # sandboxed generated-code validation
             "worldstate/core.py",         # read-only `git status` projection
             "fusion/orchestrator.py",     # comment-only mention (no call)
+            "cli/native.py",              # owned native terminal frontend
         ),
     ),
     Rule(

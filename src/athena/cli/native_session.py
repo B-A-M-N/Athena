@@ -78,8 +78,8 @@ class NativeSession:
         await self._writer.drain()
 
     async def run(self) -> int:
-        await self.start()
         try:
+            await self.start()
             print("ATHENA // NATIVE TERMINAL")
             print("Type a request. /help for commands; /exit to close.")
             while True:
