@@ -40,4 +40,6 @@ athena --display plain   # line-oriented fallback
 The native work remains separate from hosted Glass. Kitty and WezTerm are
 compatible hosts for the Python renderer, while this frontend owns its window
 and compositor instead of asking another terminal to interpret graphics
-escapes.
+escapes. `athena native` launches a Python service session as the PTY child and
+connects its canonical event projection through a Unix socket; set
+`ATHENA_NATIVE_BIN` when the binary lives outside the development tree.

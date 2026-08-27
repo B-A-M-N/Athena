@@ -12,6 +12,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
 use serde::Deserialize;
@@ -79,6 +82,7 @@ impl Projection {
 struct Args {
     headless: bool,
     bridge_stdin: bool,
+    bridge_socket: Option<String>,
     command: Option<String>,
     columns: usize,
     rows: usize,
@@ -95,6 +99,9 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--headless" => args.headless = true,
             "--bridge-stdin" => args.bridge_stdin = true,
+            "--bridge-socket" => {
+                args.bridge_socket = Some(values.next().ok_or("--bridge-socket needs a path")?);
+            }
             "--command" => {
                 args.command = Some(values.next().ok_or("--command needs a value")?);
             }
@@ -113,7 +120,9 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "--rows must be an integer")?;
             }
             "--help" | "-h" => {
-                println!("athena-terminal [--headless] [--bridge-stdin] [--command SHELL_CODE]");
+                println!(
+                    "athena-terminal [--headless] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE]"
+                );
                 println!("  --headless       run the PTY/core slice without opening a window");
                 println!("  --bridge-stdin   read JSON projection frames from stdin");
                 return Err(String::new());
@@ -133,8 +142,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(error.into()),
     };
 
+    #[cfg(unix)]
+    let bridge_socket = args
+        .bridge_socket
+        .as_deref()
+        .map(spawn_projection_socket)
+        .transpose()?;
+    #[cfg(not(unix))]
+    let bridge_socket: Option<Receiver<ProjectionFrame>> = None;
+    if args.bridge_socket.is_some() && !cfg!(unix) {
+        return Err("--bridge-socket is only supported on Unix targets".into());
+    }
+
     let window_size = window_size(args.columns, args.rows);
     let mut pty_options = tty::Options::default();
+    if let Some(path) = args.bridge_socket.as_ref() {
+        pty_options
+            .env
+            .insert("ATHENA_NATIVE_BRIDGE_SOCKET".to_owned(), path.clone());
+    }
     if let Some(command) = args.command {
         pty_options.shell = Some(tty::Shell::new(
             "/bin/sh".to_owned(),
@@ -145,7 +171,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reader = pty.file().try_clone()?;
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
     spawn_pty_reader(reader, output_tx);
-    let bridge_rx = if args.bridge_stdin {
+    let bridge_rx = if bridge_socket.is_some() {
+        bridge_socket
+    } else if args.bridge_stdin {
         Some(spawn_projection_reader())
     } else {
         None
@@ -163,20 +191,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         alerts: Vec::new(),
     };
 
-    if args.headless {
-        return run_headless(core, pty, output_rx, bridge_rx, projection);
-    }
+    let result = if args.headless {
+        run_headless(core, pty, output_rx, bridge_rx, projection)
+    } else {
+        #[cfg(unix)]
+        {
+            x11::run(core, pty, output_rx, bridge_rx, projection).map_err(|error| error.into())
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (core, pty, output_rx, bridge_rx, projection);
+            Err("native window frontend is not implemented on this target yet".into())
+        }
+    };
 
     #[cfg(unix)]
-    {
-        return x11::run(core, pty, output_rx, bridge_rx, projection).map_err(|error| error.into());
+    if let Some(path) = args.bridge_socket {
+        let _ = std::fs::remove_file(path);
     }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (core, pty, output_rx, bridge_rx, projection);
-        Err("native window frontend is not implemented on this target yet".into())
-    }
+    result
 }
 
 fn window_size(columns: usize, rows: usize) -> WindowSize {
@@ -224,6 +258,26 @@ fn spawn_projection_reader() -> Receiver<ProjectionFrame> {
     rx
 }
 
+#[cfg(unix)]
+fn spawn_projection_socket(path: &str) -> Result<Receiver<ProjectionFrame>, io::Error> {
+    let listener = UnixListener::bind(path)?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for connection in listener.incoming() {
+            let Ok(stream) = connection else { break };
+            for line in io::BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(frame) = serde_json::from_str::<ProjectionFrame>(&line) {
+                    if tx.send(frame).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    Ok(rx)
+}
+
 fn apply_available(
     core: &mut NativeTerminalCore,
     output_rx: &Receiver<Vec<u8>>,
@@ -265,9 +319,14 @@ fn run_headless(
     loop {
         apply_available(&mut core, &output_rx, bridge_rx.as_ref(), &mut projection);
         if matches!(pty.next_child_event(), Some(ChildEvent::Exited(_))) {
-            // Give the reader a short drain window before taking the snapshot.
-            thread::sleep(Duration::from_millis(20));
-            apply_available(&mut core, &output_rx, bridge_rx.as_ref(), &mut projection);
+            // Give both the PTY reader and a socket bridge client a bounded
+            // drain window before taking the snapshot. The child can close
+            // its bridge connection just before the reader thread delivers
+            // the final frame.
+            for _ in 0..5 {
+                thread::sleep(Duration::from_millis(20));
+                apply_available(&mut core, &output_rx, bridge_rx.as_ref(), &mut projection);
+            }
             break;
         }
         if Instant::now() >= deadline {

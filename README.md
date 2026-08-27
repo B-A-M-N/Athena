@@ -69,6 +69,9 @@ athena --display glass chat
 # universal terminal fallback
 athena --display ansi chat
 
+# development native Athena terminal (Alacritty core + Athena compositor)
+athena native
+
 # inspect the host terminal and renderer decision
 athena doctor display
 ```
@@ -411,6 +414,9 @@ is unavailable. ANSI is the safe default/fallback and keeps the same scene
 semantics in cell text. The native Athena terminal development slice is documented in
 [`docs/NATIVE_TERMINAL_FRONTEND.md`](docs/NATIVE_TERMINAL_FRONTEND.md); it is
 separate from the Python package and is not yet the default shipped frontend.
+`athena native` launches that frontend with a Python service session inside
+its PTY and a Unix-socket projection bridge; build the native binary first with
+`cargo build --manifest-path native/Cargo.toml --offline`.
 Noisy deltas are coalesced, animation is presentation-only, and reduced motion
 is available with `ATHENA_REDUCED_MOTION=1` or `--reduced-motion`.
 

@@ -14,6 +14,7 @@ Each subcommand maps onto a documented ``AthenaService`` method:
     resume    -> resume(session_id), then interactive chat
     approve   -> approve(approval_id, grant)
     cancel    -> cancel(task_id)
+    native    -> native Athena terminal frontend
 
 Argument parsing prefers ``click`` (optional extra ``cli``) and falls back to
 ``argparse`` so the CLI works without it. Click is imported lazily.
@@ -266,6 +267,10 @@ def dispatch(o: Options) -> int:
             print("athena doctor: supported target is 'display'", file=sys.stderr)
             return 2
         return _doctor_display(o, config)
+    if o.command == "native":
+        from athena.cli.native import launch
+
+        return launch(o)
     try:
         service = build_service(config)
     except ServiceUnavailable as exc:
@@ -602,6 +607,12 @@ def _click_cli(click: Any):
         o.mascot = oi_mascot or o.mascot
         sys.exit(dispatch(o))
 
+    @cli.command("native")
+    @click.pass_context
+    def native(ctx):
+        """Launch the development native Athena terminal frontend."""
+        sys.exit(dispatch(base_options(ctx, "native")))
+
     return cli
 
 
@@ -654,6 +665,8 @@ def _arg_parse(argv: list[str]) -> Options:
     sp = sub.add_parser("oi-stream", help="Stream the live OI projection.")
     globals_(sp)
     sp.add_argument("--task", dest="task_id", default=None)
+    sp = sub.add_parser("native", help="Launch the native Athena terminal frontend.")
+    globals_(sp)
 
     ns = p.parse_args(argv)
     command = ns.command or "chat"

@@ -30,6 +30,16 @@ renderer, cross-platform window backends, and live Python service bridge remain
 in development. The Linux/X11 proof path now provides mouse selection and
 Ctrl-Shift-C/Ctrl-Shift-V clipboard integration over the Alacritty grid.
 
+During development, `athena native` launches the native executable with a
+Python Athena service session as its PTY child. The child publishes the same
+projection state over `ATHENA_NATIVE_BRIDGE_SOCKET`; the bridge is local to the
+native process and carries no credentials. Build the binary with:
+
+```bash
+cargo build --manifest-path native/Cargo.toml --offline
+athena native
+```
+
 The native frontend must preserve these boundaries:
 
 - terminal/parser, PTY, selection, clipboard, and input remain terminal-engine
