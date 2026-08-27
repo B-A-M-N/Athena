@@ -56,3 +56,5 @@ f-wal
 # Demo render single-writer locks (runtime artifacts of scripts/render-demo)
 demos/*.gif.lock
 .claude/
+# Demo render output (published by scripts/render-demo; reproducible from tape)
+demos/*.gif
