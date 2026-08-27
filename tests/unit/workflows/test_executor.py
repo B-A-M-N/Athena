@@ -63,6 +63,25 @@ async def test_workflow_supports_conditions_and_bounded_foreach(tmp_path):
     assert result.outputs["echoes"] == [
         '{"value": "a"}', '{"value": "b"}',
     ]
+    assert {call.session_id for call in dispatcher.requests} == {None}
+
+
+async def test_workflow_propagates_session_scope_to_capability_calls(tmp_path):
+    dispatcher = _Dispatcher()
+    workflow = Workflow.create(
+        name="session-aware", description="session-aware",
+        steps=(WorkflowStep(id="echo", capability_id="echo"),),
+    )
+
+    result = await WorkflowExecutor(dispatcher, resolver=_resolver).run(
+        workflow,
+        task_id="task-1",
+        session_id="session-1",
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
+    )
+
+    assert result.status == "completed"
+    assert dispatcher.requests[0].session_id == "session-1"
 
 
 async def test_workflow_rejects_unbounded_foreach(tmp_path):

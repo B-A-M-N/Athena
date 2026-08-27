@@ -38,6 +38,7 @@ class WorkflowExecutor:
     async def run(
         self, workflow: Workflow, *, task_id: str | None,
         workspace: WorkspaceSpec, profile: str | None = None,
+        session_id: str | None = None,
         inputs: Mapping[str, Any] | None = None,
     ) -> WorkflowResult:
         validation = WorkflowValidator(self._resolver).validate(workflow)
@@ -89,7 +90,8 @@ class WorkflowExecutor:
                             dict(step.arguments), inputs, outputs, item)
                         nested_result = await self.run(
                             nested, task_id=task_id, workspace=workspace,
-                            profile=profile, inputs=nested_inputs,
+                            profile=profile, session_id=session_id,
+                            inputs=nested_inputs,
                         )
                         step_results.append(dict(nested_result.outputs))
                         if nested_result.status == "suspended":
@@ -108,6 +110,7 @@ class WorkflowExecutor:
                         capability_id=step.capability_id or "",
                         arguments=arguments,
                         task_id=task_id,
+                        session_id=session_id,
                         call_id=new_id("workflow-call"),
                         origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
                     )

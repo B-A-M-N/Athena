@@ -27,17 +27,28 @@ class WorkflowCapability:
         ),
         input_schema={
             "type": "object", "required": ["operation"],
+            "additionalProperties": False,
             "properties": {
                 "operation": {"type": "string", "enum": [
                     "list", "describe", "create", "run"]},
-                "workflow_id": {"type": "string"},
-                "name": {"type": "string", "minLength": 1},
-                "description": {"type": "string"},
-                "steps": {"type": "array", "items": {"type": "object"}},
-                "inputs": {"type": "object"},
+                "workflow_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "name": {"type": "string", "minLength": 1, "maxLength": 256},
+                "description": {"type": "string", "maxLength": 4000},
+                "steps": {"type": "array", "minItems": 1, "maxItems": 1000,
+                          "items": {"type": "object"}},
+                "inputs": {"type": "object", "maxProperties": 128},
                 "input_schema": {"type": "object"},
                 "output_schema": {"type": "object"},
             },
+            "oneOf": [
+                {"properties": {"operation": {"enum": ["list"]}}},
+                {"properties": {"operation": {"const": "describe"}},
+                 "required": ["workflow_id"]},
+                {"properties": {"operation": {"const": "create"}},
+                 "required": ["name", "steps"]},
+                {"properties": {"operation": {"const": "run"}},
+                 "required": ["workflow_id"]},
+            ],
         },
         effects=frozenset({
             EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL,
@@ -132,6 +143,7 @@ class WorkflowCapability:
         outcome = await WorkflowExecutor(self._dispatcher, resolver=resolver).run(
             graph[workflow.id], task_id=request.task_id,
             workspace=context.workspace, inputs=args.get("inputs"),
+            session_id=request.session_id,
         )
         ok = outcome.status == "completed"
         return _result(request, ok=ok, output=json.dumps({
