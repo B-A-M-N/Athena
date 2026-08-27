@@ -6,6 +6,7 @@ from athena.acp.adapter import EV_TASK_MESSAGE, _event_from_athena_event
 from athena.api.sse import encode_frame
 from athena.cli.dual_pane import DualPaneSurface
 from athena.cli.oi_stream import OIStreamViewer
+from athena.cli.native_bridge import native_projection_frame
 from athena.cli.projection import ProjectionState
 from athena.cli.scene import build_oi_scene
 from athena.protocol.events import make_event
@@ -138,3 +139,28 @@ def test_restart_loss_is_a_warning_in_the_shared_projection():
 
     assert state.status == "WARNING"
     assert "runtime-1" in state.recent[-1][1]
+
+
+def test_native_bridge_uses_the_same_scene_projection_as_hosted_surfaces():
+    state = ProjectionState()
+    state.reduce(
+        "CapabilityRequested",
+        {
+            "call_id": "call-native",
+            "capability_id": "execute",
+            "arguments": {"command": "pytest -q"},
+        },
+    )
+    state.reduce(
+        "CapabilityStarted",
+        {"call_id": "call-native", "capability_id": "execute"},
+    )
+
+    frame = native_projection_frame(state, width=60, height=16)
+
+    assert frame["title"] == "ATHENA OI // GLASS COMPUTE"
+    assert frame["status"] == "EXECUTING"
+    assert len(frame["oi"]) == 16
+    entity = next(item for item in frame["entities"] if item["id"] == "call-native")
+    assert entity["kind"] == "operation"
+    assert entity["label"] == "execute"

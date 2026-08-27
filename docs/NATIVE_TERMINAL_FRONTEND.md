@@ -24,7 +24,9 @@ renderer. The Rust crate in `native/` now includes the first native executable:
 it owns a PTY, feeds the pinned Alacritty terminal core, has a Linux/X11
 OpenGL proof compositor, handles keyboard/resize events, and accepts serialized
 projection frames containing terminal text plus structured scene entities and
-alerts. The glyph renderer, selection/clipboard integration,
+alerts. `athena.cli.native_bridge` emits those newline-delimited frames from
+the same `ProjectionState` used by hosted Glass and `oi-stream`. The glyph
+renderer, selection/clipboard integration,
 cross-platform window backends, and live Python service bridge remain in
 development.
 
