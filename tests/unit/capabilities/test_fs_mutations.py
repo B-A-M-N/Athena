@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+
 import pytest
 
 from athena.artifacts.store import ArtifactStore
@@ -217,3 +220,48 @@ async def test_copy_captures_destination_before_state(env):
     assert row["resource"] == str(dest)
     assert row["before_ref"] is not None
     assert row["reversible"] == 1
+
+
+async def test_binary_content_round_trips_without_hash_corruption(env):
+    tmp_path, db = env
+    target = tmp_path / "binary.dat"
+    original = bytes(range(256)) + b"\x00\xff\xfe"
+    fs, _ = await _fs(tmp_path, db)
+
+    written = await fs.invoke(_req(
+        operation="write",
+        path=str(target),
+        content_base64=base64.b64encode(original).decode("ascii"),
+    ))
+    assert written.status is CapabilityResultStatus.OK
+    assert target.read_bytes() == original
+    assert written.metadata["mutation"]["after_hash"] == hashlib.sha256(original).hexdigest()
+
+    read = await fs.invoke(_req(
+        operation="read", path=str(target), encoding="base64",
+    ))
+    assert read.status is CapabilityResultStatus.OK
+    assert read.output == base64.b64encode(original).decode("ascii")
+    assert read.metadata == {"encoding": "base64", "bytes": len(original)}
+
+    patched = b"\x80\x81\x82"
+    patch = await fs.invoke(_req(
+        operation="patch",
+        path=str(target),
+        expected_sha256=hashlib.sha256(original).hexdigest(),
+        new_content_base64=base64.b64encode(patched).decode("ascii"),
+    ))
+    assert patch.status is CapabilityResultStatus.OK
+    assert target.read_bytes() == patched
+
+
+async def test_binary_read_without_explicit_encoding_fails_closed(env):
+    tmp_path, db = env
+    target = tmp_path / "binary.dat"
+    target.write_bytes(b"\xff\x00\xfe")
+    fs, _ = await _fs(tmp_path, db)
+
+    result = await fs.invoke(_req(operation="read", path=str(target)))
+
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "base64" in (result.error or "")

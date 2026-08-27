@@ -15,11 +15,12 @@ single MutationRef through the MutationStore without double-counting
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import os
-import shutil
-import tempfile
+import secrets
 import threading
 
 from athena.protocol.capabilities import (
@@ -58,18 +59,80 @@ def _path_lock(path: str) -> asyncio.Lock:
     with _LOCK:
         return _PATH_LOCKS.setdefault(real, asyncio.Lock())
 
+_PATH = {"type": "string", "minLength": 1}
+
+
+def _operation_schema(operation: str, properties: dict, required: tuple[str, ...]) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "operation": {"const": operation},
+            "path": _PATH,
+            **properties,
+        },
+        "required": list(required),
+        "additionalProperties": False,
+    }
+
+
 _INPUT_SCHEMA = {
-    "type": "object",
-    "required": ["operation", "path"],
-    "properties": {
-        "operation": {"type": "string", "enum": list(_OPERATIONS)},
-        "path": {"type": "string"},
-        "content": {"type": "string"},
-        "new_content": {"type": "string"},
-        "expected_sha256": {"type": "string"},
-        "destination": {"type": "string"},
-        "create_dirs": {"type": "boolean"},
-    },
+    "oneOf": [
+        _operation_schema(
+            "read",
+            {"encoding": {"type": "string", "enum": ["text", "base64"]}},
+            ("operation", "path"),
+        ),
+        {
+            "oneOf": [
+                _operation_schema(
+                    "write",
+                    {
+                        "content": {"type": "string"},
+                        "create_dirs": {"type": "boolean"},
+                    },
+                    ("operation", "path", "content"),
+                ),
+                _operation_schema(
+                    "write",
+                    {
+                        "content_base64": {"type": "string", "minLength": 1},
+                        "create_dirs": {"type": "boolean"},
+                    },
+                    ("operation", "path", "content_base64"),
+                ),
+            ],
+        },
+        {
+            "oneOf": [
+                _operation_schema(
+                    "patch",
+                    {
+                        "new_content": {"type": "string"},
+                        "expected_sha256": {"type": "string", "minLength": 64, "maxLength": 64},
+                    },
+                    ("operation", "path", "new_content"),
+                ),
+                _operation_schema(
+                    "patch",
+                    {
+                        "new_content_base64": {"type": "string", "minLength": 1},
+                        "expected_sha256": {"type": "string", "minLength": 64, "maxLength": 64},
+                    },
+                    ("operation", "path", "new_content_base64"),
+                ),
+            ],
+        },
+        _operation_schema("list", {}, ("operation", "path")),
+        _operation_schema("stat", {}, ("operation", "path")),
+        _operation_schema("mkdir", {}, ("operation", "path")),
+        _operation_schema(
+            "copy", {"destination": _PATH}, ("operation", "path", "destination")
+        ),
+        _operation_schema(
+            "move", {"destination": _PATH}, ("operation", "path", "destination")
+        ),
+        _operation_schema("delete", {}, ("operation", "path")),
+    ],
 }
 
 
@@ -145,6 +208,8 @@ class FilesystemCapability:
             return await handler(request, args, abs_path, ws)
         except FilesystemConflict as e:
             return _fail(request, str(e))
+        except (PolicyDenied, OSError) as e:
+            return _fail(request, str(e))
 
     # ------------------------------------------------------------------ #
     # Operations
@@ -161,10 +226,26 @@ class FilesystemCapability:
             return _fail(request, f"is a directory: {path}")
         except PermissionError:
             return _fail(request, f"permission denied: {path}")
-        return _ok(request, data)
+        encoding = args.get("encoding", "text")
+        if encoding == "base64":
+            return _ok(
+                request,
+                base64.b64encode(data).decode("ascii"),
+                metadata={"encoding": "base64", "bytes": len(data)},
+            )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return _fail(request, "file is not valid UTF-8; read it with encoding=base64")
+        return _ok(request, text, metadata={"encoding": "utf-8", "bytes": len(data)})
 
     async def _write(self, request, args, path, ws):
-        content = args.get("content", "")
+        try:
+            content = _decode_content(args, "content", "content_base64")
+        except ValueError as e:
+            return _fail(request, str(e))
+        if content is None:
+            return _fail(request, "write requires content or content_base64")
         create_dirs = args.get("create_dirs", False)
         lock = _path_lock(path)
         async with lock:
@@ -176,10 +257,13 @@ class FilesystemCapability:
             # Mark STARTED after PLANNED but before the side effect
             if self.mutation_store is not None and intent_id is not None:
                 await self.mutation_store.mark_started(intent_id)
-            if create_dirs:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-            _atomic_write(path, content)
-            after = _sha256(path)
+            try:
+                if create_dirs:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                after = _atomic_write(path, content, ws)
+            except OSError as e:
+                await self._abort(intent_id, str(e))
+                return _fail(request, str(e))
             reversible = before is None or before_ref is not None
             await self._complete(intent_id, after, reversible,
                                  _inverse("write", path, before_ref))
@@ -189,7 +273,10 @@ class FilesystemCapability:
 
     async def _patch(self, request, args, path, ws):
         expected = args.get("expected_sha256")
-        new_content = args.get("new_content")
+        try:
+            new_content = _decode_content(args, "new_content", "new_content_base64")
+        except ValueError as e:
+            return _fail(request, str(e))
         if new_content is None:
             return _fail(request, "patch requires new_content")
         lock = _path_lock(path)
@@ -205,8 +292,11 @@ class FilesystemCapability:
             )
             if self.mutation_store is not None and intent_id is not None:
                 await self.mutation_store.mark_started(intent_id)
-            _atomic_write(path, new_content)
-            after = _sha256(path)
+            try:
+                after = _atomic_write(path, new_content, ws)
+            except OSError as e:
+                await self._abort(intent_id, str(e))
+                return _fail(request, str(e))
             reversible = before is None or before_ref is not None
             await self._complete(intent_id, after, reversible,
                                  _inverse("patch", path, before_ref))
@@ -216,7 +306,11 @@ class FilesystemCapability:
 
     async def _list(self, request, args, path, ws):
         try:
-            entries = sorted(os.listdir(path))
+            fd = self._safe_open_directory(path, ws)
+            try:
+                entries = sorted(os.listdir(fd))
+            finally:
+                os.close(fd)
         except FileNotFoundError:
             return _fail(request, f"no such dir: {path}")
         except NotADirectoryError:
@@ -225,7 +319,11 @@ class FilesystemCapability:
 
     async def _stat(self, request, args, path, ws):
         try:
-            st = os.stat(path)
+            fd = self._safe_open_stat(path, ws)
+            try:
+                st = os.fstat(fd)
+            finally:
+                os.close(fd)
         except OSError as e:
             return _fail(request, str(e))
         import stat as statmod
@@ -269,11 +367,12 @@ class FilesystemCapability:
         if self.mutation_store is not None and intent_id is not None:
             await self.mutation_store.mark_started(intent_id)
         try:
-            shutil.copy2(path, dest)
+            with self._safe_open_read(path, ws) as source:
+                content = source.read()
+            after = _atomic_write(dest, content, ws)
         except OSError as e:
             await self._abort(intent_id, str(e))
             return _fail(request, str(e))
-        after = _sha256(dest)
         await self._complete(intent_id, after, True, _inverse("copy", dest, dest_before_ref))
         return _ok(request, f"copied to {dest}",
                    mutation=_mutation("copy", dest, dest_before, after,
@@ -290,12 +389,26 @@ class FilesystemCapability:
         )
         if self.mutation_store is not None and intent_id is not None:
             await self.mutation_store.mark_started(intent_id)
+        source_directory = None
+        destination_directory = None
         try:
-            shutil.move(path, dest)
-        except OSError as e:
+            source_directory = self._safe_open_directory(os.path.dirname(path), ws)
+            destination_directory = self._safe_open_directory(os.path.dirname(dest), ws)
+            os.replace(
+                os.path.basename(path),
+                os.path.basename(dest),
+                src_dir_fd=source_directory,
+                dst_dir_fd=destination_directory,
+            )
+        except (OSError, PolicyDenied) as e:
             await self._abort(intent_id, str(e))
             return _fail(request, str(e))
-        after = _sha256(dest)
+        finally:
+            if source_directory is not None:
+                os.close(source_directory)
+            if destination_directory is not None:
+                os.close(destination_directory)
+        after = src_before
         # Reversible only if we can restore both source and destination
         reversible = (src_before is None or src_ref is not None) and (dest_before is None or dest_ref is not None)
         await self._complete(intent_id, after, reversible,
@@ -314,11 +427,16 @@ class FilesystemCapability:
         )
         if self.mutation_store is not None and intent_id is not None:
             await self.mutation_store.mark_started(intent_id)
+        directory = None
         try:
-            os.remove(path)
-        except OSError as e:
+            directory = self._safe_open_directory(os.path.dirname(path), ws)
+            os.unlink(os.path.basename(path), dir_fd=directory)
+        except (OSError, PolicyDenied) as e:
             await self._abort(intent_id, str(e))
             return _fail(request, str(e))
+        finally:
+            if directory is not None:
+                os.close(directory)
         reversible = before_ref is not None
         await self._complete(intent_id, None, reversible, _inverse("delete", path, before_ref))
         return _ok(request, "deleted",
@@ -365,7 +483,31 @@ class FilesystemCapability:
             real = self._real(f"/proc/self/fd/{fd}")
             if not self._within_root(real, ws):
                 raise PolicyDenied(f"path escapes workspace: {path}")
-            return os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+            return os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _safe_open_directory(self, path: str, ws: WorkspaceSpec) -> int:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            real = self._real(f"/proc/self/fd/{fd}")
+            if not self._within_root(real, ws):
+                raise PolicyDenied(f"path escapes workspace: {path}")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _safe_open_stat(self, path: str, ws: WorkspaceSpec) -> int:
+        flags = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            real = self._real(f"/proc/self/fd/{fd}")
+            if not self._within_root(real, ws):
+                raise PolicyDenied(f"path escapes workspace: {path}")
+            return fd
         except BaseException:
             os.close(fd)
             raise
@@ -392,8 +534,7 @@ class FilesystemCapability:
             return None, None
         if ws is not None:
             with self._safe_open_read(path, ws) as f:
-                fb = f.read()
-            data = fb.encode("utf-8", errors="replace")
+                data = f.read()
         else:
             with open(path, "rb") as f:
                 data = f.read()
@@ -491,7 +632,7 @@ def _inverse(op: str, path: str, before_ref: str | None, dest: str | None = None
     return {"op": "none", "target": target}
 
 
-def _atomic_write(path: str, content: str) -> None:
+def _atomic_write(path: str, content: bytes, ws: WorkspaceSpec) -> str:
     """Write ``content`` to ``path`` atomically (temp file + fsync + rename).
 
     The temp file lives in the same directory so ``os.replace`` stays on one
@@ -499,19 +640,45 @@ def _atomic_write(path: str, content: str) -> None:
     state.
     """
     directory = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".athena-", suffix=".tmp")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(directory, flags)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        directory_real = os.path.realpath(f"/proc/self/fd/{directory_fd}")
+        root_real = os.path.realpath(os.path.abspath(ws.root))
+        if directory_real != root_real and not directory_real.startswith(root_real + os.sep):
+            raise PolicyDenied(f"path escapes workspace: {path}")
+        temp_name = f".athena-{secrets.token_hex(12)}.tmp"
+        temp_fd = -1
+        temp_fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        with os.fdopen(temp_fd, "wb") as f:
+            temp_fd = -1
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        os.replace(
+            temp_name,
+            os.path.basename(path),
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+        return hashlib.sha256(content).hexdigest()
     except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if "temp_fd" in locals() and temp_fd >= 0:
+            os.close(temp_fd)
+        if "temp_name" in locals():
+            try:
+                os.unlink(temp_name, dir_fd=directory_fd)
+            except OSError:
+                pass
         raise
+    finally:
+        os.close(directory_fd)
 
 
 def _match_path(real_path: str, pattern: str) -> bool:
@@ -545,8 +712,32 @@ def _exists(path: str) -> bool:
     return os.path.lexists(path)
 
 
-def _ok(request: CapabilityRequest, output: str, mutation: dict | None = None) -> CapabilityResult:
-    meta = {"mutation": mutation} if mutation else {}
+def _decode_content(args: dict, text_key: str, base64_key: str) -> bytes | None:
+    if base64_key in args:
+        encoded = args[base64_key]
+        if not isinstance(encoded, str):
+            raise ValueError(f"{base64_key} must be a base64 string")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise ValueError(f"{base64_key} is not valid base64") from None
+    if text_key in args:
+        content = args[text_key]
+        if not isinstance(content, str):
+            raise ValueError(f"{text_key} must be a string")
+        return content.encode("utf-8")
+    return b"" if text_key == "content" else None
+
+
+def _ok(
+    request: CapabilityRequest,
+    output: str,
+    mutation: dict | None = None,
+    metadata: dict | None = None,
+) -> CapabilityResult:
+    meta = dict(metadata or {})
+    if mutation:
+        meta["mutation"] = mutation
     return CapabilityResult(
         request.call_id, request.capability_id, CapabilityResultStatus.OK,
         output=output, metadata=meta,

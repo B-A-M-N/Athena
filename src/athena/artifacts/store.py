@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -132,6 +133,17 @@ class ArtifactStore:
         if path is None or not path.exists():
             raise FileNotFoundError(f"artifact blob not found: {ref}")
         return path.read_bytes()
+
+    async def read_range(self, ref: ArtifactRef | str, offset: int, limit: int) -> bytes:
+        """Read a bounded byte range without materialising the complete blob."""
+        if offset < 0 or limit < 0:
+            raise ValueError("offset and limit must be non-negative")
+        path = self._path_for(ref)
+        if path is None or not path.exists():
+            raise FileNotFoundError(f"artifact blob not found: {ref}")
+        with path.open("rb") as fh:
+            fh.seek(offset)
+            return fh.read(limit)
 
     @asynccontextmanager
     async def open_stream(
@@ -308,10 +320,11 @@ def _ref_digest(ref: ArtifactRef | str) -> str | None:
 def uri_digest(uri: str) -> str | None:
     """Extract the digest from an ``artifact://sha256/<digest>`` uri, if any."""
     parsed = parse_artifact_uri(uri)
-    if parsed:
-        return parsed[1] or None
+    if parsed and parsed[0] == SHA256_ALGO and re.fullmatch(r"[0-9a-f]{64}", parsed[1]):
+        return parsed[1]
     stripped = uri[len("artifact://") :] if uri.startswith("artifact://") else uri
-    return None if not stripped else (stripped.rsplit("/", 1)[-1] or None)
+    digest = None if not stripped else stripped.rsplit("/", 1)[-1]
+    return digest if digest and re.fullmatch(r"[0-9a-f]{64}", digest) else None
 
 
 def _producer_str(producer: Provenance | str | None) -> str | None:
