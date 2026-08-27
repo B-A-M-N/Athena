@@ -586,7 +586,11 @@ class ContextCompiler:
             pass
         try:
             out.extend(
-                await store.search(task.objective, scope=MemoryScope.PROJECT)
+                await store.search(
+                    task.objective,
+                    scope=MemoryScope.PROJECT,
+                    scope_id=task.workspace.id if task.workspace else None,
+                )
             )
         except Exception:
             pass

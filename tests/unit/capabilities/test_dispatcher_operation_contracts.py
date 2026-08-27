@@ -43,8 +43,11 @@ async def _dispatch(dispatcher, request, workspace):
 
 
 class _MemoryStore:
-    async def recall(self, *, query, tags):
+    async def recall(self, *, query, tags, **kwargs):
         return [{"query": query, "tags": tags, "content": "remembered"}]
+
+    async def search(self, *, query, limit, **kwargs):
+        return [{"query": query, "limit": limit, "content": "remembered"}]
 
 
 class _SkillsStore:
