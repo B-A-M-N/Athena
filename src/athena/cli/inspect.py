@@ -1,12 +1,13 @@
 """``athena inspect`` — deep task observability (BUILDSPEC §99).
 
 Renders every facet of a task that survives in the system so a human can
-reconstruct *why Athena did this*: status, parent/children, budget/usage, the
-result object, and a chronological event timeline.
+reconstruct *why Athena did this*: status, parent/children, budget/usage,
+which provider/model served each inference subturn, the result object, and a
+chronological event timeline.
 
 This is a pure read-only renderer. All data comes from the documented
-``AthenaService`` accessors (get_task / get_result / inspect / stream_events) —
-the inspection never mutates anything.
+``AthenaService`` accessors (get_task / get_result / inspect / stream_events)
+plus the durable provider-usage store — the inspection never mutates anything.
 """
 
 from __future__ import annotations
@@ -56,6 +57,122 @@ async def _get_events(service: Any, task_id: Any) -> list[Event]:
     except Exception:  # pragma: no cover
         return events
     return events
+
+
+async def _get_provider_usage(service: Any, task_id: Any) -> list[dict]:
+    """Read durable provider/model usage rows for ``task_id``, if available.
+
+    Rows come from the service's ``ProviderUsageStore`` (one row per model
+    attempt, including failed/fallback attempts). Purely defensive: services
+    without a usage store simply yield no rows.
+    """
+    store = getattr(service, "_provider_usage_store", None)
+    if store is None or not hasattr(store, "list_for_task"):
+        return []
+    try:
+        return list(await store.list_for_task(task_id))
+    except (NotImplementedError, AttributeError):
+        return []
+    except Exception:  # pragma: no cover - inspection must not crash on I/O
+        return []
+
+
+def _inference_role(record: dict) -> str:
+    """Best-effort role for an inference record.
+
+    The kernel does not currently stamp the policy role onto inference events
+    or usage rows (audit P0.3 gap); the router's default role is "primary", so
+    records without a role are rendered as that default — honestly derivable,
+    never invented.
+    """
+    for holder in (record.get("metadata") or {}, record):
+        role = holder.get("role")
+        if isinstance(role, str) and role:
+            return role
+    return "primary"
+
+
+def _usage_from_record(record: dict) -> str:
+    """Render token/cost usage for an inference row, or a dash when absent."""
+    metadata = record.get("metadata") or {}
+    usage = metadata.get("usage") if isinstance(metadata, dict) else None
+    if not isinstance(usage, dict):
+        usage = {}
+    in_tok = usage.get("input_tokens", record.get("input_tokens"))
+    out_tok = usage.get("output_tokens", record.get("output_tokens"))
+    cost = usage.get("cost_usd", record.get("cost_usd"))
+    if in_tok is None and out_tok is None and cost is None:
+        return "—"
+    return f"in={in_tok if in_tok is not None else 0} out={out_tok if out_tok is not None else 0} cost={cost if cost is not None else '—'}"
+
+
+def _render_inference(events: list[Event], usage_records: list[dict]) -> None:
+    """Render the INFERENCE section: which provider/model served each turn.
+
+    Sources (durable only, no new event types):
+      - ``ModelRequestStarted`` / ``ModelResponseCompleted`` / ``ModelRequestFailed``
+        events carrying provider/model per inference subturn;
+      - ``provider_usage`` rows (one per attempt, with tokens/cost when the
+        attempt completed).
+    A record is emitted for each event; usage rows that had no matching event
+    (e.g. failed attempts recorded only in the usage store) are appended.
+    """
+    print()
+    print(chat.bold("Inference"))
+    print(_SECTIONS)
+    _INFERENCE_EVENT_TYPES = (
+        "ModelRequestStarted",
+        "ModelResponseCompleted",
+        "ModelRequestFailed",
+    )
+    lines: list[str] = []
+    seen_event_attempts: set[str] = set()
+    for ev in events:
+        etype = getattr(ev, "type", None)
+        if etype not in _INFERENCE_EVENT_TYPES:
+            continue
+        payload = getattr(ev, "payload", None) or {}
+        provider = payload.get("provider")
+        model = payload.get("model")
+        if not provider and not model:
+            continue  # not an inference subturn record
+        call_id = getattr(ev, "id", None) or f"seq:{getattr(ev, 'sequence', '?')}"
+        state = {
+            "ModelRequestStarted": "start",
+            "ModelResponseCompleted": "completed",
+            "ModelRequestFailed": "failed",
+        }[etype]
+        profile = payload.get("provider_profile_id")
+        profile_str = f" profile={profile}" if profile else ""
+        lines.append(
+            f"  {call_id}  role={_inference_role(dict(payload))}  "
+            f"{provider or '?'}/{model or '?'}  {state}{profile_str}"
+        )
+        if provider and model:
+            seen_event_attempts.add(f"{provider}|{model}")
+    # Usage-store rows: attempt-level records (they can include attempts whose
+    # events were not retained). Skip the primary (provider, model) pairs the
+    # events already covered so the section is not doubled.
+    usage_extra: list[str] = []
+    for row in usage_records:
+        provider = row.get("provider")
+        model = row.get("model")
+        if provider and model and f"{provider}|{model}" in seen_event_attempts:
+            continue
+        uid = row.get("id") or "?"
+        started = row.get("started_at")
+        usage_extra.append(
+            f"  {uid}  role={_inference_role(row)}  "
+            f"{provider or '?'}/{model or '?'}  recorded  usage={_usage_from_record(row)}"
+            + (f"  at={started}" if started else "")
+        )
+    if not lines and not usage_extra:
+        print("  <no inference records>")
+        return
+    for line in lines:
+        print(line)
+    for line in usage_extra:
+        print(line)
 
 
 async def _render_budget(task: Any, result: Any = None) -> None:
@@ -212,6 +329,9 @@ async def run_inspect(service: Any, task_id: str, *, verbose: bool = False) -> i
 
     await _render_budget(task, result)
     _render_result(result, task_id)
+
+    usage_records = await _get_provider_usage(service, task_id)
+    _render_inference(events, usage_records)
 
     _render_events(events)
 

@@ -457,8 +457,7 @@ def _health_handler(service: Any) -> Any:
             ),
             "scheduler": (
                 getattr(service, "_scheduler", None) is not None
-                and getattr(service._scheduler, "_task", None) is not None
-                and not getattr(service._scheduler._task, "done", lambda: True)()
+                and bool(getattr(service._scheduler, "is_running", lambda: False)())
             ),
             "providers": bool(getattr(service, "_model_registry", None)),
             "worker_persistence": worker_health.get("status", "ok") == "ok",
