@@ -38,7 +38,12 @@ class SecretSource:
 
 
 class EnvSource(SecretSource):
-    """Resolve ``ATHENA_SECRET_<NAME>`` from process environment."""
+    """Resolve managed and explicitly named environment credentials.
+
+    The managed ``ATHENA_SECRET_<NAME>`` form remains the namespaced default.
+    The direct ``<NAME>`` fallback supports provider-standard names such as
+    ``OPENROUTER_API_KEY`` without copying the secret into application config.
+    """
 
     name = "env"
 
@@ -47,7 +52,10 @@ class EnvSource(SecretSource):
 
     def resolve(self, name: str) -> str | None:
         key = self._prefix + name.upper().replace("/", "_").replace("-", "_")
-        return os.environ.get(key)
+        value = os.environ.get(key)
+        if value is None and self._prefix == "ATHENA_SECRET_":
+            value = os.environ.get(name)
+        return value
 
 
 class FileSource(SecretSource):

@@ -77,17 +77,42 @@ def build_config(o: "Options"):
     the service understands. The CLI only forwards the knobs a user set on the
     command line (INV-007); it never interprets execution.
     """
-    from athena.service.config import AthenaConfig
+    from athena.service.config import ProviderConfig, load_config
 
     root = o.workspace or _env("ATHENA_WORKSPACE", "ATHENA_WORKSPACE_PATH")
     pcs = getattr(o, "_providers", None)
-    return AthenaConfig(
-        db_path=o.db_path or _env("ATHENA_DB", "ATHENA_DB_PATH"),
-        workspace_root=os.path.abspath(os.path.expanduser(root)) if root else os.getcwd(),
-        autonomy=_autonomy(o.autonomy),
-        artifact_root=o.artifact_root,
-        providers=pcs or (),
+    config = load_config(
+        explicit_path=o.config_path,
+        cli_overrides={
+            "db_path": o.db_path,
+            "workspace_root": (
+                os.path.abspath(os.path.expanduser(root)) if root else None
+            ),
+            "autonomy": _autonomy(o.autonomy).value if o.autonomy else None,
+            "artifact_root": o.artifact_root,
+        },
     )
+    if config.workspace_root is None:
+        config.workspace_root = os.getcwd()
+    if pcs:
+        config.providers = tuple(pcs)
+    elif not config.providers and os.environ.get("OPENROUTER_API_KEY"):
+        # OpenRouter speaks the OpenAI-compatible protocol. Keep the key in
+        # the environment/SecretManager; never copy it into config or task
+        # state. The free router selects an eligible free model at request time.
+        config.providers = (
+            ProviderConfig(
+                kind="openai-compat",
+                name="openrouter",
+                model=os.environ.get(
+                    "OPENROUTER_MODEL", "poolside/laguna-s-2.1:free"
+                ),
+                credential_id="OPENROUTER_API_KEY",
+                base_url="https://openrouter.ai/api/v1",
+                extra={"headers": {"X-Title": "Athena"}},
+            ),
+        )
+    return config
 
 
 def build_service(config) -> Any:

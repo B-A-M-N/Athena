@@ -202,7 +202,7 @@ def execute_scenario(sc: Scenario) -> dict:
         entry["status"] = "passed" if record["exit_code"] == 0 else "failed"
     elif sc.probe:
         record = _run(list(sc.probe), timeout=float(
-            os.environ.get("ATHENA_DEMO_TIMEOUT", 60)) + 30.0)
+            os.environ.get("ATHENA_DEMO_TIMEOUT", 120)) + 30.0)
         record["probe_exit"] = RENDER_DEMO_EXIT_NAMES.get(
             record["exit_code"], f"exit-{record['exit_code']}")
         entry["evidence"].append(record)

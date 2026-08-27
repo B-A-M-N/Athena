@@ -1,10 +1,16 @@
 import pytest
 
-from athena.policy.credentials import SecretError, SecretManager
+from athena.policy.credentials import EnvSource, SecretError, SecretManager
 
 
 def _manager() -> SecretManager:
     return SecretManager(sources=[])
+
+
+def test_env_source_supports_provider_standard_name(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
+
+    assert EnvSource().resolve("OPENROUTER_API_KEY") == "test-only-secret"
 
 
 def test_can_use_returns_false_with_no_context():

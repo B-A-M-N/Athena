@@ -18,7 +18,7 @@
 # Usage:
 #   scripts/render-demo                                  # default: capability_fabric
 #   scripts/render-demo capability_fabric                # explicit demo name
-#   ATHENA_DEMO_TIMEOUT=90 scripts/render-demo ...      # override timeout (s)
+#   ATHENA_DEMO_TIMEOUT=150 scripts/render-demo ...     # override timeout (s)
 #
 # Exit codes:
 #   0  success — final gif exists, decoded, and passed checks
@@ -36,7 +36,7 @@ cd "${REPO_ROOT}"
 
 # --- configuration ---------------------------------------------------------
 DEMO_NAME="${1:-capability_fabric}"
-DEMO_TIMEOUT="${ATHENA_DEMO_TIMEOUT:-60}"   # tape is ~4s; 60s leaves generous headroom
+DEMO_TIMEOUT="${ATHENA_DEMO_TIMEOUT:-120}"  # readable recording is ~90s
 TAPE_PATH="demos/${DEMO_NAME}.tape"
 FINAL_PATH="demos/${DEMO_NAME}.gif"
 LOCK_PATH="${FINAL_PATH}.lock"
@@ -151,11 +151,11 @@ if command -v ffmpeg >/dev/null 2>&1; then
     # value (the final count, not an early progress sample).
     FRAMES="$(printf '%s' "${PROBE_OUT}" | tr '\r' '\n' | awk '/frame= *[0-9]+/ { match($0, /frame= *[0-9]+/); s=substr($0, RSTART, RLENGTH); gsub(/frame= *|[^0-9]/, "", s); last=s } END { print last+0 }')"
 
-    # Bounded assertions: tape ~4s, allow 1.5s..DEMO_TIMEOUT/2 (so a 60s
-    # timeout lets through up to 30s, but a 92s tape would not silently
-    # slip through).
-    MIN_DURATION="1.5"
-    MAX_DURATION="$(awk -v t="${DEMO_TIMEOUT}" 'BEGIN { printf "%.3f", t/2 }')"
+    # Bounded assertions: the demo is intentionally ~90s and the default
+    # timeout is 120s. Leave a ten-second margin so an unexpectedly long tape
+    # cannot silently pass just because the renderer eventually finished.
+    MIN_DURATION="10.0"
+    MAX_DURATION="$(awk -v t="${DEMO_TIMEOUT}" 'BEGIN { printf "%.3f", t-10 }')"
     MIN_FRAMES="15"
 
     DUR_OK="$(awk -v d="${DURATION_TOTAL}" -v lo="${MIN_DURATION}" -v hi="${MAX_DURATION}" 'BEGIN { print (d >= lo && d <= hi) ? 1 : 0 }')"

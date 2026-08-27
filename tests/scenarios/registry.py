@@ -648,7 +648,8 @@ VHS = (
             "Screen Descriptor (bytes 6-9), and the frame count used `-c copy` "
             "which never decodes frames. Both repaired: dimensions read from "
             "offsets 6-7/8-9, frames decoded with the LAST frame=N progress "
-            "value. Probe validates end-to-end: 1280x720, ~4.5s, 112 frames."
+            "value. Probe validates end-to-end: 1280x720, a readable ~90s "
+            "recording, and a non-zero decoded frame count."
         ),
     ),
     Scenario(

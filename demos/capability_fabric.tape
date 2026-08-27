@@ -9,16 +9,13 @@ Set Padding 18
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 25ms
 
+# Clear the shell line before revealing the app.  The fixture is committed;
+# the recording only replays it through the production DualPaneSurface.
 Hide
-Type ".venv/bin/python demos/capability_fabric_demo.py --emit-fixture demos/fixtures/capability_fabric.jsonl"
+Type "clear && stty cols 120 rows 40 && exec .venv/bin/python demos/capability_fabric_demo.py --replay demos/fixtures/capability_fabric.jsonl --speed 1"
 Enter
 Sleep 2s
 Show
-
-# Replay the canonical fixture at 8x speed: 9 scenes x 0.2s ~= 1.8s of motion,
-# then a 2s tail.  Total well under the 60s render timeout.  The Output above
-# is authoritative; scripts/render-demo overrides it with -o <temp> for
-# race-free single-writer rendering.
-Type ".venv/bin/python demos/capability_fabric_demo.py --replay demos/fixtures/capability_fabric.jsonl --speed 8"
-Enter
-Sleep 2s
+# Nine chapters with deliberate reading pauses; the resulting recording is
+# approximately 90 seconds and ends at the real REPL prompt.
+Sleep 5s

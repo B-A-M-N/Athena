@@ -538,7 +538,11 @@ class DualPaneSurface(OperatorSurface):
         # Vertically center the mascot beside the stream.
         pad_top = max((self.oi_height - len(mascot)) // 2, 0)
 
-        out = ["\x1b7"]          # save cursor
+        # Use the ANSI CSI save/restore sequences rather than the older DEC
+        # aliases (ESC 7 / ESC 8).  Both work in most terminals, but the CSI
+        # form is also understood by pyte/VHS and keeps repeated OI repaints
+        # from leaving stale borders in recordings and terminal emulators.
+        out = ["\x1b[s"]          # save cursor
         out.append(
             f"\x1b[{rows - self.oi_height - 2};{right_x}H\x1b[K" + header
         )
@@ -556,7 +560,7 @@ class DualPaneSurface(OperatorSurface):
                 f"\x1b[{rows - self.oi_height - 1 + i};{right_x}H\x1b[K{row}"
             )
         out.append(f"\x1b[{rows - 1};{right_x}H\x1b[K" + footer)
-        out.append("\x1b8")      # restore cursor
+        out.append("\x1b[u")      # restore cursor
         self.output.write("".join(out))
         self.output.flush()
 
