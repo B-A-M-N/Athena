@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-27T04:43:38.654514+00:00",
+  "generated_at": "2026-08-27T05:15:21.196526+00:00",
   "repo_root": "/home/bamn/Athena",
   "scenarios": [
     {
@@ -25,11 +25,11 @@
             "tests/unit/models/test_role_router.py::test_router_exposes_selected_provider_without_second_authority"
           ],
           "exit_code": 0,
-          "duration_s": 0.542,
+          "duration_s": 0.61,
           "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.542,
+      "duration_s": 0.61,
       "notes": "RoleRouter exposes the selected provider without building a second authority. The single sanctioned ModelRouter construction site is src/athena/service/service.py; see FUSE-002 and scripts/architecture-lint."
     },
     {
@@ -57,11 +57,11 @@
             "tests/unit/models/test_router_authority.py::test_kernel_holds_the_injected_router_instance"
           ],
           "exit_code": 0,
-          "duration_s": 0.61,
-          "tail": "..                                                                       [100%]\n2 passed in 0.06s\n"
+          "duration_s": 0.576,
+          "tail": "..                                                                       [100%]\n2 passed in 0.05s\n"
         }
       ],
-      "duration_s": 0.61,
+      "duration_s": 0.576,
       "notes": "FIXED (was P1-23 residual): the kernel REQUIRES an injected ModelRouter \u2014 no `router or ModelRouter(registry)` fallback exists. scripts/architecture-lint rule kernel-router-construction is green; these tests pin the contract."
     },
     {
@@ -87,11 +87,11 @@
             "tests/unit/service/test_direct_execution.py::test_direct_execution_routes_through_dispatcher_and_records_audit"
           ],
           "exit_code": 0,
-          "duration_s": 0.597,
-          "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
+          "duration_s": 0.484,
+          "tail": ".                                                                        [100%]\n1 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.597,
+      "duration_s": 0.484,
       "notes": "Direct shell path uses the same dispatch/audit authority as the kernel loop."
     },
     {
@@ -119,11 +119,11 @@
             "tests/unit/kernel/test_kernel_loop.py::test_scripted_capability_then_answer_runs_two_iterations"
           ],
           "exit_code": 0,
-          "duration_s": 0.625,
+          "duration_s": 0.604,
           "tail": "..                                                                       [100%]\n2 passed in 0.08s\n"
         }
       ],
-      "duration_s": 0.625
+      "duration_s": 0.604
     },
     {
       "scenario": "SYNTH-001",
@@ -152,11 +152,11 @@
             "tests/unit/synthesis/test_synthesis.py::test_validate_reports_invalid_generated_schema_as_admission_failure"
           ],
           "exit_code": 0,
-          "duration_s": 0.761,
-          "tail": "...                                                                      [100%]\n3 passed in 0.24s\n"
+          "duration_s": 0.705,
+          "tail": "...                                                                      [100%]\n3 passed in 0.21s\n"
         }
       ],
-      "duration_s": 0.761
+      "duration_s": 0.705
     },
     {
       "scenario": "SYNTH-002",
@@ -183,11 +183,11 @@
             "tests/unit/synthesis/test_synthesis.py::test_register_ephemeral_registers_validated_and_invokes"
           ],
           "exit_code": 0,
-          "duration_s": 0.718,
-          "tail": "..                                                                       [100%]\n2 passed in 0.19s\n"
+          "duration_s": 0.645,
+          "tail": "..                                                                       [100%]\n2 passed in 0.17s\n"
         }
       ],
-      "duration_s": 0.718
+      "duration_s": 0.645
     },
     {
       "scenario": "SYNTH-003",
@@ -212,11 +212,11 @@
             "tests/unit/synthesis/test_synthesis.py::test_generated_authority_is_sandbox_profile_not_declared_effects"
           ],
           "exit_code": 0,
-          "duration_s": 0.524,
-          "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
+          "duration_s": 0.461,
+          "tail": ".                                                                        [100%]\n1 passed in 0.01s\n"
         }
       ],
-      "duration_s": 0.524
+      "duration_s": 0.461
     },
     {
       "scenario": "SYNTH-004",
@@ -243,11 +243,11 @@
             "tests/unit/synthesis/test_synthesis.py::test_to_skill_candidate_requires_two_uses"
           ],
           "exit_code": 0,
-          "duration_s": 0.886,
-          "tail": "..                                                                       [100%]\n2 passed in 0.37s\n"
+          "duration_s": 0.798,
+          "tail": "..                                                                       [100%]\n2 passed in 0.34s\n"
         }
       ],
-      "duration_s": 0.886
+      "duration_s": 0.798
     },
     {
       "scenario": "SYNTH-005",
@@ -276,11 +276,11 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_output_schema_inference_distinguishes_booleans"
           ],
           "exit_code": 0,
-          "duration_s": 1.781,
-          "tail": "...                                                                      [100%]\n3 passed in 1.23s\n"
+          "duration_s": 1.593,
+          "tail": "...                                                                      [100%]\n3 passed in 1.11s\n"
         }
       ],
-      "duration_s": 1.781
+      "duration_s": 1.593
     },
     {
       "scenario": "AUTH-001",
@@ -307,11 +307,11 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_requires_task_scope"
           ],
           "exit_code": 0,
-          "duration_s": 2.101,
-          "tail": "..                                                                       [100%]\n2 passed in 1.49s\n"
+          "duration_s": 1.45,
+          "tail": "..                                                                       [100%]\n2 passed in 0.97s\n"
         }
       ],
-      "duration_s": 2.101
+      "duration_s": 1.45
     },
     {
       "scenario": "AUTH-002",
@@ -340,11 +340,11 @@
             "tests/unit/affordances/test_fabric.py::test_restore_executor_rejects_persisted_authority_outside_profile"
           ],
           "exit_code": 0,
-          "duration_s": 3.153,
-          "tail": "...                                                                      [100%]\n3 passed in 2.35s\n"
+          "duration_s": 2.176,
+          "tail": "...                                                                      [100%]\n3 passed in 1.70s\n"
         }
       ],
-      "duration_s": 3.153
+      "duration_s": 2.176
     },
     {
       "scenario": "AUTH-003",
@@ -371,11 +371,11 @@
             "tests/unit/affordances/test_validation.py::test_source_validation_rejects_host_escape_primitives_before_execution"
           ],
           "exit_code": 0,
-          "duration_s": 0.636,
+          "duration_s": 0.525,
           "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.636
+      "duration_s": 0.525
     },
     {
       "scenario": "AUTH-004",
@@ -402,11 +402,11 @@
             "tests/contract/test_capability_policy_enforcement.py::TestPolicyEnforcement::test_task_deny_never_calls_executor"
           ],
           "exit_code": 0,
-          "duration_s": 0.644,
-          "tail": "..                                                                       [100%]\n2 passed in 0.08s\n"
+          "duration_s": 0.539,
+          "tail": "..                                                                       [100%]\n2 passed in 0.07s\n"
         }
       ],
-      "duration_s": 0.644
+      "duration_s": 0.539
     },
     {
       "scenario": "COMPAT-001",
@@ -437,11 +437,11 @@
             "tests/unit/models/test_response_accumulator.py::test_registry_invoke_uses_the_same_accumulator"
           ],
           "exit_code": 0,
-          "duration_s": 0.638,
-          "tail": "....                                                                     [100%]\n4 passed in 0.11s\n"
+          "duration_s": 0.555,
+          "tail": "....                                                                     [100%]\n4 passed in 0.09s\n"
         }
       ],
-      "duration_s": 0.638
+      "duration_s": 0.555
     },
     {
       "scenario": "COMPAT-002",
@@ -468,11 +468,11 @@
             "tests/unit/kernel/test_model_tool_history.py::test_kernel_stream_assembly_keeps_text_and_tool_delta"
           ],
           "exit_code": 0,
-          "duration_s": 0.572,
-          "tail": "..                                                                       [100%]\n2 passed in 0.09s\n"
+          "duration_s": 0.533,
+          "tail": "..                                                                       [100%]\n2 passed in 0.08s\n"
         }
       ],
-      "duration_s": 0.573
+      "duration_s": 0.534
     },
     {
       "scenario": "COMPAT-003",
@@ -503,11 +503,11 @@
             "tests/unit/models/test_compat_kernel.py::test_repair_is_idempotent"
           ],
           "exit_code": 0,
-          "duration_s": 0.624,
-          "tail": "....                                                                     [100%]\n4 passed in 0.10s\n"
+          "duration_s": 0.55,
+          "tail": "....                                                                     [100%]\n4 passed in 0.08s\n"
         }
       ],
-      "duration_s": 0.624
+      "duration_s": 0.55
     },
     {
       "scenario": "COMPAT-004",
@@ -538,11 +538,11 @@
             "tests/unit/models/test_toolcall_candidates.py::test_empty_candidate_is_not_rewritten_as_an_empty_object"
           ],
           "exit_code": 0,
-          "duration_s": 2.077,
-          "tail": "....                                                                     [100%]\n4 passed in 0.19s\n"
+          "duration_s": 0.562,
+          "tail": "....                                                                     [100%]\n4 passed in 0.09s\n"
         }
       ],
-      "duration_s": 2.077
+      "duration_s": 0.562
     },
     {
       "scenario": "COMPAT-005",
@@ -575,11 +575,11 @@
             "tests/unit/models/test_compat_kernel.py::test_no_cache_hit_inferred_without_telemetry"
           ],
           "exit_code": 0,
-          "duration_s": 0.926,
-          "tail": ".....                                                                    [100%]\n5 passed in 0.03s\n"
+          "duration_s": 0.47,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.926
+      "duration_s": 0.47
     },
     {
       "scenario": "COMPAT-006",
@@ -606,11 +606,11 @@
             "tests/unit/capabilities/test_tool_repair_store.py::test_parallel_repair_receipt_is_durable_and_replayable"
           ],
           "exit_code": 0,
-          "duration_s": 0.886,
-          "tail": "..                                                                       [100%]\n2 passed in 0.15s\n"
+          "duration_s": 0.557,
+          "tail": "..                                                                       [100%]\n2 passed in 0.10s\n"
         }
       ],
-      "duration_s": 0.886
+      "duration_s": 0.557
     },
     {
       "scenario": "BODY-001",
@@ -637,11 +637,11 @@
             "tests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced"
           ],
           "exit_code": 0,
-          "duration_s": 2.036,
-          "tail": "..                                                                       [100%]\n=============================== warnings summary ===============================\ntests/unit/capabilities/test_terminal_session.py::test_create_send_screen_kill\ntests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced\n  /usr/lib/python3.12/pty.py:95: DeprecationWarning: This process (pid=2653293) is multi-threaded, use of forkpty() may lead to deadlocks in the child.\n    pid, fd = os.forkpty()\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n2 passed, 2 warnings in 1.43s\n"
+          "duration_s": 1.855,
+          "tail": "..                                                                       [100%]\n=============================== warnings summary ===============================\ntests/unit/capabilities/test_terminal_session.py::test_create_send_screen_kill\ntests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced\n  /usr/lib/python3.12/pty.py:95: DeprecationWarning: This process (pid=2762112) is multi-threaded, use of forkpty() may lead to deadlocks in the child.\n    pid, fd = os.forkpty()\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n2 passed, 2 warnings in 1.40s\n"
         }
       ],
-      "duration_s": 2.036
+      "duration_s": 1.855
     },
     {
       "scenario": "BODY-002",
@@ -670,11 +670,11 @@
             "tests/unit/capabilities/test_screen_emulator.py::test_alternate_screen_overwrite_via_cursor_reposition"
           ],
           "exit_code": 0,
-          "duration_s": 0.579,
-          "tail": "...                                                                      [100%]\n3 passed in 0.06s\n"
+          "duration_s": 0.419,
+          "tail": "...                                                                      [100%]\n3 passed in 0.05s\n"
         }
       ],
-      "duration_s": 0.579
+      "duration_s": 0.419
     },
     {
       "scenario": "BODY-003",
@@ -703,11 +703,11 @@
             "tests/e2e/test_real_execution.py::test_persistent_python_session_keeps_state"
           ],
           "exit_code": 0,
-          "duration_s": 4.542,
-          "tail": "...                                                                      [100%]\n3 passed in 4.01s\n"
+          "duration_s": 4.233,
+          "tail": "...                                                                      [100%]\n3 passed in 3.83s\n"
         }
       ],
-      "duration_s": 4.542
+      "duration_s": 4.233
     },
     {
       "scenario": "BODY-004",
@@ -736,11 +736,11 @@
             "tests/unit/capabilities/test_system.py::test_process_tree_and_usage"
           ],
           "exit_code": 0,
-          "duration_s": 0.498,
-          "tail": "...                                                                      [100%]\n3 passed in 0.07s\n"
+          "duration_s": 0.373,
+          "tail": "...                                                                      [100%]\n3 passed in 0.06s\n"
         }
       ],
-      "duration_s": 0.498
+      "duration_s": 0.373
     },
     {
       "scenario": "BODY-005",
@@ -773,11 +773,11 @@
             "tests/unit/capabilities/test_debugger.py::test_session_ownership_is_enforced"
           ],
           "exit_code": 0,
-          "duration_s": 0.524,
-          "tail": ".....                                                                    [100%]\n5 passed in 0.03s\n"
+          "duration_s": 0.365,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.524,
+      "duration_s": 0.365,
       "notes": "FIXED (was declared gap): debugger.py deliberately keeps itself off the model surface (Availability.UNAVAILABLE) because its launch helper would create a raw host subprocess outside ExecutionManager and it has no DAP client. These tests pin the honesty contract: every op refuses with the documented reason, no session is created, no process spawns, and cleanup is safe. Full DAP attach/stepping remains future work (documented in the descriptor)."
     },
     {
@@ -805,11 +805,11 @@
             "tests/unit/capabilities/test_system.py::test_machine_env_redacts_secrets"
           ],
           "exit_code": 0,
-          "duration_s": 0.552,
+          "duration_s": 0.375,
           "tail": "..                                                                       [100%]\n2 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.552
+      "duration_s": 0.375
     },
     {
       "scenario": "WORLD-001",
@@ -836,11 +836,11 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_invariant_envelope_detects_violation"
           ],
           "exit_code": 0,
-          "duration_s": 1.795,
-          "tail": "..                                                                       [100%]\n2 passed in 1.23s\n"
+          "duration_s": 1.564,
+          "tail": "..                                                                       [100%]\n2 passed in 1.18s\n"
         }
       ],
-      "duration_s": 1.795
+      "duration_s": 1.564
     },
     {
       "scenario": "WORLD-002",
@@ -869,11 +869,11 @@
             "tests/unit/worldstate/test_store.py::test_mutations_get_durable_task_sequences"
           ],
           "exit_code": 0,
-          "duration_s": 0.756,
-          "tail": "...                                                                      [100%]\n3 passed in 0.25s\n"
+          "duration_s": 0.575,
+          "tail": "...                                                                      [100%]\n3 passed in 0.23s\n"
         }
       ],
-      "duration_s": 0.756
+      "duration_s": 0.575
     },
     {
       "scenario": "WORLD-003",
@@ -900,11 +900,11 @@
             "tests/unit/worldstate/test_store.py::test_mark_contradicted"
           ],
           "exit_code": 0,
-          "duration_s": 0.752,
-          "tail": "..                                                                       [100%]\n2 passed in 0.25s\n"
+          "duration_s": 0.65,
+          "tail": "..                                                                       [100%]\n2 passed in 0.24s\n"
         }
       ],
-      "duration_s": 0.752
+      "duration_s": 0.65
     },
     {
       "scenario": "CLAIM-001",
@@ -929,11 +929,11 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_claims_go_stale_after_dependent_mutation"
           ],
           "exit_code": 0,
-          "duration_s": 1.365,
-          "tail": ".                                                                        [100%]\n1 passed in 0.73s\n"
+          "duration_s": 1.134,
+          "tail": ".                                                                        [100%]\n1 passed in 0.68s\n"
         }
       ],
-      "duration_s": 1.365
+      "duration_s": 1.134
     },
     {
       "scenario": "CLAIM-002",
@@ -958,11 +958,11 @@
             "tests/unit/fusion/test_orchestrator.py::test_experiment_commit_binds_claim_and_invalidates"
           ],
           "exit_code": 0,
-          "duration_s": 2.443,
-          "tail": ".                                                                        [100%]\n1 passed in 1.79s\n"
+          "duration_s": 2.155,
+          "tail": ".                                                                        [100%]\n1 passed in 1.75s\n"
         }
       ],
-      "duration_s": 2.443
+      "duration_s": 2.155
     },
     {
       "scenario": "CLAIM-003",
@@ -989,11 +989,11 @@
             "tests/unit/kernel/test_continuation_store.py::test_restart_releases_claims_and_lists_recoverable_tasks"
           ],
           "exit_code": 0,
-          "duration_s": 0.699,
-          "tail": "..                                                                       [100%]\n2 passed in 0.23s\n"
+          "duration_s": 0.554,
+          "tail": "..                                                                       [100%]\n2 passed in 0.21s\n"
         }
       ],
-      "duration_s": 0.699
+      "duration_s": 0.554
     },
     {
       "scenario": "TX-001",
@@ -1018,11 +1018,11 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_shadow_commit_applies_proven_changes"
           ],
           "exit_code": 0,
-          "duration_s": 1.825,
-          "tail": ".                                                                        [100%]\n1 passed in 1.25s\n"
+          "duration_s": 1.576,
+          "tail": ".                                                                        [100%]\n1 passed in 1.18s\n"
         }
       ],
-      "duration_s": 1.825
+      "duration_s": 1.576
     },
     {
       "scenario": "TX-002",
@@ -1049,11 +1049,11 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_commit_requires_verified_branch"
           ],
           "exit_code": 0,
-          "duration_s": 2.838,
-          "tail": "..                                                                       [100%]\n2 passed in 2.32s\n"
+          "duration_s": 2.632,
+          "tail": "..                                                                       [100%]\n2 passed in 2.25s\n"
         }
       ],
-      "duration_s": 2.838
+      "duration_s": 2.632
     },
     {
       "scenario": "TX-003",
@@ -1080,11 +1080,11 @@
             "tests/unit/shadow/test_shadow_manifest.py::test_shadow_conflict_rejects_same_size_concurrent_edit"
           ],
           "exit_code": 0,
-          "duration_s": 0.406,
-          "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
+          "duration_s": 0.362,
+          "tail": "..                                                                       [100%]\n2 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.406
+      "duration_s": 0.362
     },
     {
       "scenario": "TX-004",
@@ -1115,11 +1115,11 @@
             "tests/unit/capabilities/test_fs_mutations.py::test_delete_snapshot_failure_is_not_reversible"
           ],
           "exit_code": 0,
-          "duration_s": 0.484,
-          "tail": "....                                                                     [100%]\n4 passed in 0.08s\n"
+          "duration_s": 0.379,
+          "tail": "....                                                                     [100%]\n4 passed in 0.06s\n"
         }
       ],
-      "duration_s": 0.485
+      "duration_s": 0.379
     },
     {
       "scenario": "TX-005",
@@ -1146,11 +1146,11 @@
             "tests/unit/fusion/test_orchestrator.py::test_invariant_violation_blocks_commit"
           ],
           "exit_code": 0,
-          "duration_s": 3.411,
-          "tail": "..                                                                       [100%]\n2 passed in 2.93s\n"
+          "duration_s": 3.24,
+          "tail": "..                                                                       [100%]\n2 passed in 2.87s\n"
         }
       ],
-      "duration_s": 3.411
+      "duration_s": 3.24
     },
     {
       "scenario": "FORK-001",
@@ -1177,11 +1177,11 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_fork_unknown_task_raises"
           ],
           "exit_code": 0,
-          "duration_s": 2.253,
-          "tail": "..                                                                       [100%]\n2 passed in 1.78s\n"
+          "duration_s": 2.091,
+          "tail": "..                                                                       [100%]\n2 passed in 1.74s\n"
         }
       ],
-      "duration_s": 2.253
+      "duration_s": 2.092
     },
     {
       "scenario": "FORK-002",
@@ -1210,11 +1210,11 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_materialize_creates_independent_workspace"
           ],
           "exit_code": 0,
-          "duration_s": 1.403,
-          "tail": "...                                                                      [100%]\n3 passed in 0.87s\n"
+          "duration_s": 0.926,
+          "tail": "...                                                                      [100%]\n3 passed in 0.58s\n"
         }
       ],
-      "duration_s": 1.403
+      "duration_s": 0.926
     },
     {
       "scenario": "FORK-003",
@@ -1241,11 +1241,11 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_fork_task_creation_failure_removes_speculative_session"
           ],
           "exit_code": 0,
-          "duration_s": 2.797,
-          "tail": "..                                                                       [100%]\n2 passed in 2.27s\n"
+          "duration_s": 2.674,
+          "tail": "..                                                                       [100%]\n2 passed in 2.26s\n"
         }
       ],
-      "duration_s": 2.797
+      "duration_s": 2.674
     },
     {
       "scenario": "ENV-001",
@@ -1272,11 +1272,11 @@
             "tests/unit/capabilities/test_environment.py::test_database_read_connection_cannot_attach_or_mutate"
           ],
           "exit_code": 0,
-          "duration_s": 0.446,
+          "duration_s": 0.352,
           "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.446
+      "duration_s": 0.352
     },
     {
       "scenario": "ENV-002",
@@ -1301,11 +1301,11 @@
             "tests/integration/test_skill_injection.py::test_skill_injected_when_trigger_in_objective"
           ],
           "exit_code": 0,
-          "duration_s": 1.189,
-          "tail": ".                                                                        [100%]\n1 passed in 0.67s\n"
+          "duration_s": 1.053,
+          "tail": ".                                                                        [100%]\n1 passed in 0.64s\n"
         }
       ],
-      "duration_s": 1.189
+      "duration_s": 1.053
     },
     {
       "scenario": "ENV-003",
@@ -1332,11 +1332,11 @@
             "tests/unit/capabilities/test_watch.py::test_process_exit_observation_is_one_shot_and_truthful"
           ],
           "exit_code": 0,
-          "duration_s": 0.505,
+          "duration_s": 0.41,
           "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.505
+      "duration_s": 0.41
     },
     {
       "scenario": "RECOVERY-001",
@@ -1363,11 +1363,11 @@
             "tests/crash/test_hard_crash_recovery.py::test_worker_parallelism_real"
           ],
           "exit_code": 0,
-          "duration_s": 4.282,
-          "tail": "..                                                                       [100%]\n2 passed in 3.80s\n"
+          "duration_s": 4.141,
+          "tail": "..                                                                       [100%]\n2 passed in 3.74s\n"
         }
       ],
-      "duration_s": 4.282
+      "duration_s": 4.141
     },
     {
       "scenario": "RECOVERY-002",
@@ -1396,11 +1396,11 @@
             "tests/crash/test_task_recovery.py::test_mutation_intent_wal_survives_crash"
           ],
           "exit_code": 0,
-          "duration_s": 29.449,
-          "tail": "...                                                                      [100%]\n3 passed in 28.92s\n"
+          "duration_s": 29.191,
+          "tail": "...                                                                      [100%]\n3 passed in 28.84s\n"
         }
       ],
-      "duration_s": 29.45
+      "duration_s": 29.191
     },
     {
       "scenario": "RECOVERY-003",
@@ -1427,11 +1427,11 @@
             "tests/crash/test_scheduler_recovery.py::test_job_not_fired_before_stop_fires_after_restart"
           ],
           "exit_code": 0,
-          "duration_s": 3.63,
-          "tail": "..                                                                       [100%]\n2 passed in 3.18s\n"
+          "duration_s": 3.382,
+          "tail": "..                                                                       [100%]\n2 passed in 2.99s\n"
         }
       ],
-      "duration_s": 3.63
+      "duration_s": 3.382
     },
     {
       "scenario": "PROJECTION-001",
@@ -1458,11 +1458,11 @@
             "tests/unit/cli/test_oi_stream.py::test_oi_viewer_does_not_write_to_process_stdout"
           ],
           "exit_code": 0,
-          "duration_s": 0.532,
+          "duration_s": 0.429,
           "tail": "..                                                                       [100%]\n2 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.532
+      "duration_s": 0.429
     },
     {
       "scenario": "PROJECTION-002",
@@ -1489,11 +1489,11 @@
             "tests/unit/cli/test_surface.py::test_direct_shell_escape_uses_the_same_execution_surface"
           ],
           "exit_code": 0,
-          "duration_s": 0.71,
-          "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
+          "duration_s": 0.435,
+          "tail": "..                                                                       [100%]\n2 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.71
+      "duration_s": 0.435
     },
     {
       "scenario": "PROJECTION-003",
@@ -1522,11 +1522,11 @@
             "tests/unit/service/test_operator_views.py::test_operator_artifacts_empty"
           ],
           "exit_code": 0,
-          "duration_s": 2.747,
-          "tail": "...                                                                      [100%]\n3 passed in 1.94s\n"
+          "duration_s": 2.249,
+          "tail": "...                                                                      [100%]\n3 passed in 1.74s\n"
         }
       ],
-      "duration_s": 2.747
+      "duration_s": 2.249
     },
     {
       "scenario": "VHS-001",
@@ -1542,12 +1542,12 @@
             "capability_fabric"
           ],
           "exit_code": 0,
-          "duration_s": 20.963,
-          "tail": "render-demo: tape=demos/capability_fabric.tape timeout=60s temp=demos/.capability_fabric.6CpOWf.gif\nrender-demo: vhs exited rc=0 after 21s\nrender-demo: validated demos/.capability_fabric.6CpOWf.gif \u2014 1280x720, 4.480s, 112 frames\nrender-demo: published demos/capability_fabric.gif\n",
+          "duration_s": 17.432,
+          "tail": "render-demo: tape=demos/capability_fabric.tape timeout=60s temp=demos/.capability_fabric.bclKNx.gif\nrender-demo: vhs exited rc=0 after 17s\nrender-demo: validated demos/.capability_fabric.bclKNx.gif \u2014 1280x720, 4.640s, 116 frames\nrender-demo: published demos/capability_fabric.gif\n",
           "probe_exit": "success"
         }
       ],
-      "duration_s": 20.963,
+      "duration_s": 17.432,
       "notes": "Probe contract (scripts/render-demo header): 0 success; 2 tool/argument error (e.g. vhs missing \u2014 treated as 'skipped', not a failure); 3 timeout; 4 vhs failure; 5 artifact validation failure. Artifact-existence alone is never accepted as completion. FIXED (2026-08-26): the width/height check previously read inside the ASCII 'GIF89a' header (bytes 2-3/3-4) instead of the Logical Screen Descriptor (bytes 6-9), and the frame count used `-c copy` which never decodes frames. Both repaired: dimensions read from offsets 6-7/8-9, frames decoded with the LAST frame=N progress value. Probe validates end-to-end: 1280x720, ~4.5s, 112 frames."
     },
     {
@@ -1573,11 +1573,11 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_create_uses_canonical_dispatcher"
           ],
           "exit_code": 0,
-          "duration_s": 0.913,
-          "tail": ".                                                                        [100%]\n1 passed in 0.22s\n"
+          "duration_s": 0.581,
+          "tail": ".                                                                        [100%]\n1 passed in 0.13s\n"
         }
       ],
-      "duration_s": 0.913,
+      "duration_s": 0.581,
       "notes": "demos/capability_fabric_demo.py drives the same capability-fabric path (fixtures in demos/fixtures/capability_fabric.jsonl) that this bound test pins; the tape renders that driver."
     },
     {
@@ -1609,11 +1609,11 @@
             "tests/unit/scripts/test_render_demo_validation.py::test_published_demo_gif_has_correct_header"
           ],
           "exit_code": 0,
-          "duration_s": 0.929,
-          "tail": "....                                                                     [100%]\n4 passed in 0.06s\n"
+          "duration_s": 0.455,
+          "tail": "....                                                                     [100%]\n4 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.929,
+      "duration_s": 0.455,
       "notes": "FIXED (was declared gap): render-demo's header parsing is pinned at the byte level \u2014 Logical Screen Descriptor offsets 6-9 are the dimensions, the ASCII-header read that caused VHS-001's 14406x14648 failure is asserted to be wrong, and the exact od pipeline the script runs is executed against synthetic bytes."
     }
   ],
