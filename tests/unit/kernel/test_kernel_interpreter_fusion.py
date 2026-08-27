@@ -112,9 +112,10 @@ async def _persisted_task(stack: Stack) -> TaskSpec:
 class _RecordingShim:
     """Dispatch stand-in: first call fails a capability, later calls succeed."""
 
-    def __init__(self, sink: list, fail_first: bool = True):
+    def __init__(self, sink: list, fail_first: bool = True, fail_count: int = 1):
         self._sink = sink
         self._fail_first = fail_first
+        self._fail_count = fail_count
         self._calls = 0
 
     async def dispatch(self, task, calls):
@@ -125,7 +126,7 @@ class _RecordingShim:
         results = []
         for c in calls:
             ok = True
-            if self._fail_first and self._calls == 1:
+            if self._fail_first and self._calls <= self._fail_count:
                 ok = False
             results.append(CapabilityResultBlock(
                 call_id=c.call_id, capability_id=c.capability_id,
@@ -135,12 +136,12 @@ class _RecordingShim:
         return DispatchResult(results=tuple(results))
 
 
-async def _run_one_turn(stack: Stack, task: TaskSpec, shim) -> None:
+async def _run_one_turn(stack: Stack, task: TaskSpec, shim, calls=None) -> None:
     """Drive one primary-loop dispatch cycle manually (no full run_task)."""
     state = stack.kernel._runs.get(task.id) or RunState(task=task)
     stack.kernel._runs[task.id] = state
     response = _FakeResponse()
-    calls = [_Call()]
+    calls = calls if calls is not None else [_Call()]
     stack.kernel._dispatch_factory = lambda t: shim
     await stack.kernel._dispatch(task, state, response, calls)
 
@@ -251,4 +252,57 @@ async def test_cancellation_skips_fusion():
     # no proposal dispatch, primary loop unharmed.
     assert state.model_calls == 0
     assert len(dispatched) == 1
+    await stack.db.close()
+
+
+async def test_many_failed_results_still_one_subturn():
+    """Cost-amplification bound: N failed calls in one dispatch → ONE subturn.
+
+    Without the bound, a turn whose model emitted many failing tool calls
+    would trigger one metered model subturn per failure — budget checks are
+    only applied at the next loop iteration, so a task at its cost cap could
+    overshoot inside a single dispatch.
+    """
+    stack = await _make_stack(interpreter="wired-marker")
+    task = await _persisted_task(stack)
+    ext = _extension_for(stack.kernel)
+    stack.kernel._interpreter = ext
+    dispatched: list = []
+    shim = _RecordingShim(dispatched)
+    calls = [_Call(call_id=f"c-{i}") for i in range(5)]
+    await _run_one_turn(stack, task, shim, calls=calls)
+    state = stack.kernel._runs[task.id]
+    assert state.model_calls == 1  # exactly one subturn for five failures
+    # primary dispatch (5 calls) + one proposal dispatch
+    assert len(dispatched) == 6
+    await stack.db.close()
+
+
+async def test_budget_exhausted_skips_fusion():
+    """A task already at its budget cap must not fund another subturn."""
+    from athena.protocol.tasks import ResourceBudget
+
+    stack = await _make_stack(interpreter="wired-marker")
+    task = TaskSpec(
+        id=new_id("task"), objective="budget cap", session_id="s-fusion",
+        resource_budget=ResourceBudget(max_input_tokens=100),
+    )
+    await stack.db.execute(
+        "INSERT OR IGNORE INTO sessions(id, parent_id, created_at, updated_at, metadata) "
+        "VALUES (?, NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '{}')",
+        (task.session_id,),
+    )
+    await stack.tasks.insert_task(task.id, task.session_id, None, task.objective)
+    ext = _extension_for(stack.kernel)
+    stack.kernel._interpreter = ext
+    state = stack.kernel._runs.get(task.id) or RunState(task=task)
+    stack.kernel._runs[task.id] = state
+    state.input_tokens = 100  # at the cap already
+    dispatched: list = []
+    shim = _RecordingShim(dispatched)
+    await _run_one_turn(stack, task, shim)
+    # _budget_exhausted sees input_tokens >= max → no observation offered
+    assert len(dispatched) == 1  # primary dispatch only
+    assert state.model_calls == 0
+    await stack.db.close()
     await stack.db.close()

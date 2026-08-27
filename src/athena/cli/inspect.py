@@ -80,10 +80,9 @@ async def _get_provider_usage(service: Any, task_id: Any) -> list[dict]:
 def _inference_role(record: dict) -> str:
     """Best-effort role for an inference record.
 
-    The kernel does not currently stamp the policy role onto inference events
-    or usage rows (audit P0.3 gap); the router's default role is "primary", so
-    records without a role are rendered as that default — honestly derivable,
-    never invented.
+    The kernel stamps the policy role onto inference events and usage rows;
+    records lacking one (older rows, task-less utility attempts) render as
+    the router's default "primary" — honestly derivable, never invented.
     """
     for holder in (record.get("metadata") or {}, record):
         role = holder.get("role")

@@ -66,9 +66,10 @@ class InterpreterExtension:
 
         Returns None when the observation does not warrant a subturn (e.g.
         truncated payload, cancellation already requested, or the model
-        proposes nothing). Never raises past the broker contract: a broker
-        failure is logged and yields None (no proposal) rather than killing
-        the primary loop.
+        proposes nothing). Broker failures (provider errors, cancellation
+        races) PROPAGATE to the caller — the kernel's observation-producer
+        loop catches them so fusion can never kill the primary loop; this
+        method does not swallow them itself.
         """
         if context.cancel_requested():
             return None

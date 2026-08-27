@@ -782,6 +782,17 @@ class AgentKernel:
             "rationale": proposal.rationale,
             "role": "interpreter",
         }, task)
+        # Bind the producing subturn's identity for repair receipts, exactly
+        # as the primary dispatch path does (kernel._dispatch). RunState.provider
+        # is set by _invoke for the most recent inference — which, at this
+        # point, is the interpreter subturn that produced the proposal.
+        dispatcher = getattr(shim, "_dispatcher", None)
+        if dispatcher is not None and hasattr(dispatcher, "set_inference_provenance"):
+            dispatcher.set_inference_provenance(
+                provider_profile_id=context.run_state.provider,
+                model_id=None,
+                repair_mode=None,
+            )
         return await shim.dispatch(task, [call])
 
     async def _offer_observation(self, task, state, observation) -> None:
@@ -825,6 +836,7 @@ class AgentKernel:
         """
         if self._provider_usage_store is None or self._registry is None:
             return None
+        usage_id: str | None = None
         try:
             from athena.protocol.messages import Role, TextBlock
             from athena.protocol.tasks import ModelPolicy
@@ -889,16 +901,29 @@ class AgentKernel:
                     except Exception:
                         pass
             if usage_id is not None:
-                # started but never completed (stream ended without done)
+                # started but never completed (stream ended without done);
+                # keep role metadata — record_completion REPLACES it
                 try:
                     await self._provider_usage_store.record_completion(
                         usage_id, input_tokens=0, output_tokens=0,
-                        metadata={"state": "no_done_event"},
+                        metadata={"role": role, "purpose": "utility_inference",
+                                  "state": "no_done_event"},
                     )
                 except Exception:
                     pass
             return " ".join(parts).strip() or None
         except Exception:
+            if usage_id is not None:
+                # started but never completed (exception mid-stream): close
+                # the row honestly rather than leaving it in-flight forever
+                try:
+                    await self._provider_usage_store.record_completion(
+                        usage_id, input_tokens=0, output_tokens=0,
+                        metadata={"role": role, "purpose": "utility_inference",
+                                  "state": "error"},
+                    )
+                except Exception:
+                    pass
             _logger.debug("utility_inference failed; deterministic fallback",
                           exc_info=True)
             return None
@@ -1160,12 +1185,15 @@ class AgentKernel:
 
         await self._append_results(task, outcome.results)
         # Loop-side observation producer (audit P0.2 completion): a FAILED
-        # capability result is an execution-grounded observation. Offer it
-        # to the interpreter extension (when the service wired one in) so
-        # the kernel can reason about body failures without piping raw
-        # runtime output into the primary context. The extension's subturn
-        # and its proposal's dispatch both meter through this kernel.
+        # capability result is an execution-grounded observation. Offer at
+        # most ONE per dispatch (cost-amplification bound: a turn with N
+        # failed calls must not trigger N unbounded model subturns, and the
+        # budget is re-checked immediately so a task at its cost/token cap
+        # cannot overshoot inside this loop) to the interpreter extension
+        # (when the service wired one in). The extension's subturn and its
+        # proposal's dispatch both meter through this kernel.
         if self._interpreter is not None:
+            budget = getattr(task, "resource_budget", None)
             for result in outcome.results:
                 if not isinstance(result, CapabilityResultBlock):
                     continue
@@ -1174,6 +1202,8 @@ class AgentKernel:
                 observation = _observation_from_result(task, result)
                 if observation is None:
                     continue
+                if budget is not None and _budget_exhausted(state, budget):
+                    break
                 try:
                     await self._offer_observation(task, state, observation)
                 except Exception:  # noqa: BLE001 — fusion must not kill the loop
@@ -1181,6 +1211,7 @@ class AgentKernel:
                         "interpreter fusion failed for %s observation",
                         observation.kind, exc_info=True,
                     )
+                break  # one observation per dispatch, however many failures
         exhausted: list[str] = []
         max_cycles = int(response.metadata.get("max_tool_correction_cycles", 2))
         for result in outcome.results:
