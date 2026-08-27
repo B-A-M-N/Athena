@@ -321,7 +321,9 @@ class SkillLifecycle:
         scored.sort(key=lambda t: t[0], reverse=True)
         return [s for _, s in scored[:limit]]
 
-    async def trigger(self, skill_id: str, arguments: Mapping[str, Any]) -> Skill:
+    async def trigger(
+        self, skill_id: str, arguments: Mapping[str, Any], *, task_id: str | None = None
+    ) -> Skill:
         skill = await self.get(skill_id)
         if skill is None:
             raise KeyError(f"no such skill: {skill_id}")
@@ -330,6 +332,7 @@ class SkillLifecycle:
         await self._emit(
             EventCategory.SKILL_ACTIVATED.value,
             {"skill_id": skill_id, "op": "trigger", "version": skill.version},
+            task_id=task_id,
         )
         return skill
 
@@ -388,9 +391,11 @@ class SkillStore:
             if q in f"{s.name} {s.description} {s.body}".lower()
         ][:limit]
 
-    async def trigger(self, skill_id: str, arguments: Mapping[str, Any]) -> Skill:
+    async def trigger(
+        self, skill_id: str, arguments: Mapping[str, Any], *, task_id: str | None = None
+    ) -> Skill:
         if self._lifecycle is not None:
-            return await self._lifecycle.trigger(skill_id, arguments)
+            return await self._lifecycle.trigger(skill_id, arguments, task_id=task_id)
         raise KeyError(f"no such skill: {skill_id}")
 
     async def load_active(self) -> list[Skill]:

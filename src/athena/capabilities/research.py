@@ -200,7 +200,7 @@ class ResearchCapability:
             if operation == "gaps":
                 return await self._gaps(request, args)
             if operation == "close_gap":
-                return await self._close_gap(request, args)
+                return await self._close_gap(request, args, context)
             if operation == "verify":
                 return await self._verify(request, args, context)
             if operation == "plan":
@@ -365,6 +365,8 @@ class ResearchCapability:
                 return _result(request, ok=False, error="artifact store not available")
             if parse_artifact_uri(str(artifact_uri)) is None:
                 return _result(request, ok=False, error="artifact_uri is not an artifact URI")
+            if not await _artifact_visible(self._artifacts, str(artifact_uri), request.task_id):
+                return _result(request, ok=False, error="artifact snapshot is not visible to this task")
             loaded_snapshot = await self._artifacts.load(str(artifact_uri))
             if not isinstance(loaded_snapshot, bytes):
                 return _result(request, ok=False, error="artifact snapshot is not bytes")
@@ -521,12 +523,21 @@ class ResearchCapability:
         )
         return _result(request, output=_json({"gaps": [g.to_record() for g in gaps]}))
 
-    async def _close_gap(self, request, args) -> CapabilityResult:
+    async def _close_gap(self, request, args, context) -> CapabilityResult:
         if not request.task_id:
             return _result(request, ok=False, error="close_gap requires a task")
         gap_id = str(args.get("gap_id") or "")
         if not gap_id:
             return _result(request, ok=False, error="close_gap requires gap_id")
+        for evidence_id in tuple(args.get("evidence_ids") or ()):
+            evidence = await self._store.get_evidence(str(evidence_id))
+            if evidence is None or not await _evidence_visible(
+                evidence, request, context, self._store.get_source
+            ):
+                return _result(
+                    request, ok=False,
+                    error=f"evidence is not visible: {evidence_id}",
+                )
         gap = await self._store.close_gap(
             gap_id, evidence_ids=tuple(args.get("evidence_ids") or ()),
             task_id=request.task_id)
@@ -1047,6 +1058,12 @@ async def _evidence_visible(
         return False
     source = await source_lookup(evidence.source_id)
     return source is not None and _source_visible(source, request, context)
+
+
+async def _artifact_visible(artifacts: Any, uri: str, task_id: str) -> bool:
+    """Artifact URIs are references, not bearer credentials."""
+    refs = await artifacts.list(task_id=task_id, limit=1000)
+    return any(getattr(ref, "uri", None) == uri for ref in refs)
 
 
 __all__ = ["ResearchCapability"]

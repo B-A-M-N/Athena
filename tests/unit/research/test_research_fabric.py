@@ -120,6 +120,7 @@ class _MemoryResearchStore:
 class _MemoryArtifacts:
     def __init__(self):
         self.data = {}
+        self.refs = []
 
     async def save(self, **kwargs):
         content = kwargs["content"]
@@ -127,10 +128,45 @@ class _MemoryArtifacts:
             content = content.encode()
         uri = "artifact://sha256/source"
         self.data[uri] = content
-        return ArtifactRef(id=uri, uri=uri, hash="source")
+        ref = ArtifactRef(
+            id=uri, uri=uri, hash="source", task_id=kwargs.get("task_id")
+        )
+        self.refs.append(ref)
+        return ref
+
+    async def list(self, *, task_id=None, limit=100):
+        return [ref for ref in self.refs if ref.task_id == task_id][:limit]
 
     async def load(self, ref):
         return self.data[ref]
+
+
+@pytest.mark.asyncio
+async def test_record_source_cannot_import_another_tasks_artifact():
+    store = _MemoryResearchStore()
+    artifacts = _MemoryArtifacts()
+    foreign_uri = "artifact://sha256/foreign"
+    artifacts.data[foreign_uri] = b"private snapshot"
+    artifacts.refs.append(ArtifactRef(
+        id=foreign_uri, uri=foreign_uri, hash="foreign", task_id="task-other"
+    ))
+    capability = ResearchCapability(
+        store,
+        artifact_store=artifacts,
+        source_policy=SourcePolicy(allowed_domains=("example.test",)),
+    )
+
+    result = await capability.invoke(CapabilityRequest(
+        capability_id="research", task_id="task-a", call_id="foreign-artifact",
+        arguments={
+            "operation": "record_source",
+            "uri": "https://example.test/private",
+            "artifact_uri": foreign_uri,
+        },
+    ))
+
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "not visible" in (result.error or "")
 
 
 @pytest.mark.asyncio

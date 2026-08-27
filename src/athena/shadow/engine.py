@@ -377,8 +377,16 @@ class ShadowEngine:
                     reason = "commit requires approval"
                 else:
                     reason = "commit dispatch returned incomplete results"
+                rollback = await self._rollback_partial_commit(outcomes)
                 branch.error = f"commit not applied: {reason}"
-                branch.commit_outcome = {"status": "failed", "reason": reason}
+                if rollback["errors"]:
+                    branch.error += "; recovery required: " + "; ".join(
+                        rollback["errors"]
+                    )
+                branch.commit_outcome = {
+                    "status": "failed", "reason": reason,
+                    "rollback": rollback,
+                }
                 branch.commit_completed_at = utcnow().isoformat()
                 self._persist_branches()
                 await self._cleanup(branch)
@@ -414,6 +422,41 @@ class ShadowEngine:
         _logger.info("shadow branch %s committed: +%d/-%d files",
                      branch.id, len(applied["written"]), len(applied["deleted"]))
         return {"status": "committed", "branch": branch.id, **applied}
+
+    async def _rollback_partial_commit(self, outcomes) -> dict[str, list[str]]:
+        """Compensate mutations that completed before a batch failure.
+
+        ``dispatch_many`` is preflight-atomic, not mutation-transactional:
+        individual filesystem calls can finish before another call fails.
+        Every successful call must therefore be undone through the service's
+        auditable rollback path before the branch is reported as failed.
+        """
+        rolled_back: list[str] = []
+        errors: list[str] = []
+        undo = getattr(getattr(self, "_service", None), "undo_mutation", None)
+        for item in reversed(outcomes):
+            if not isinstance(item, CapabilityResult):
+                continue
+            if item.status.value != "ok":
+                continue
+            mutation = (item.metadata or {}).get("mutation")
+            mutation_id = mutation.get("mutation_id") if isinstance(mutation, dict) else None
+            if not mutation_id:
+                errors.append("successful mutation had no durable mutation id")
+                continue
+            if undo is None:
+                errors.append(f"no rollback authority for {mutation_id}")
+                continue
+            try:
+                outcome = await undo(mutation_id)
+            except Exception as exc:  # noqa: BLE001 - preserve recovery state
+                errors.append(f"{mutation_id}: {exc}")
+                continue
+            if outcome.get("status") != "ok":
+                errors.append(f"{mutation_id}: {outcome.get('error', 'rollback failed')}")
+            else:
+                rolled_back.append(mutation_id)
+        return {"rolled_back": rolled_back, "errors": errors}
 
     async def discard(self, branch: ShadowBranch, reason: str = "") -> dict:
         branch.status = BranchStatus.DISCARDED

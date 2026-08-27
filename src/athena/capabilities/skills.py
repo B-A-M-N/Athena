@@ -7,6 +7,8 @@ EXECUTE for trigger.
 
 from __future__ import annotations
 
+import json
+
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
@@ -20,12 +22,18 @@ from athena.protocol.ids import new_id
 _INPUT_SCHEMA = {
     "type": "object",
     "required": ["operation"],
+    "additionalProperties": False,
     "properties": {
         "operation": {"type": "string", "enum": ["search", "trigger"]},
-        "query": {"type": "string"},
-        "skill_id": {"type": "string"},
-        "arguments": {"type": "object"},
+        "query": {"type": "string", "maxLength": 2000},
+        "skill_id": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "arguments": {"type": "object", "maxProperties": 64},
     },
+    "oneOf": [
+        {"properties": {"operation": {"const": "search"}}},
+        {"properties": {"operation": {"const": "trigger"}},
+         "required": ["skill_id"]},
+    ],
 }
 
 
@@ -60,24 +68,42 @@ class SkillsCapability:
                 error="skills store not available",
             )
         if op in ("search", "select"):
-            query = args.get("query") or args.get("objective") or ""
-            matches = await self.skills_store.search(query=query)
+            query = str(args.get("query") or "")
+            matches = await self.skills_store.search(query=query, limit=10)
             return CapabilityResult(
                 call_id, request.capability_id, CapabilityResultStatus.OK,
-                output=str(matches),
+                output=json.dumps([_skill_record(item) for item in matches], sort_keys=True),
             )
         if op == "trigger":
             outcome = await self.skills_store.trigger(
-                skill_id=args.get("skill_id"), arguments=args.get("arguments") or {}
+                skill_id=args.get("skill_id"), arguments=args.get("arguments") or {},
+                task_id=request.task_id,
             )
             return CapabilityResult(
                 call_id, request.capability_id, CapabilityResultStatus.OK,
-                output=str(outcome),
+                output=json.dumps(_skill_record(outcome), sort_keys=True),
             )
         return CapabilityResult(
             call_id, request.capability_id, CapabilityResultStatus.FAILED,
             error=f"unknown operation: {op}",
         )
+
+
+def _skill_record(skill) -> dict:
+    if isinstance(skill, dict):
+        return dict(skill)
+    return {
+        "id": getattr(skill, "id", ""),
+        "name": getattr(skill, "name", ""),
+        "description": getattr(skill, "description", ""),
+        "body": getattr(skill, "body", ""),
+        "triggers": list(getattr(skill, "triggers", ()) or ()),
+        "scope": getattr(skill, "scope", ""),
+        "trust": getattr(getattr(skill, "trust", None), "value", getattr(skill, "trust", "")),
+        "version": getattr(skill, "version", 1),
+        "enabled": bool(getattr(skill, "enabled", True)),
+        "metadata": dict(getattr(skill, "metadata", {}) or {}),
+    }
 
 
 __all__ = ["SkillsCapability"]

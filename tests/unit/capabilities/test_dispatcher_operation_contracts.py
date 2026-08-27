@@ -51,8 +51,11 @@ class _MemoryStore:
 
 
 class _SkillsStore:
-    async def search(self, *, query):
+    async def search(self, *, query, limit=10):
         return [{"id": "skill-1", "query": query}]
+
+    async def trigger(self, *, skill_id, arguments, task_id=None):
+        return {"id": skill_id, "arguments": arguments, "task_id": task_id}
 
 
 class _ScheduleAPI:

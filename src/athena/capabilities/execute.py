@@ -30,12 +30,13 @@ _LANGUAGES = ("python", "shell", "bash", "sh", "zsh", "node", "powershell", "py"
 _INPUT_SCHEMA = {
     "type": "object",
     "required": ["language", "code"],
+    "additionalProperties": False,
     "properties": {
         "language": {"type": "string", "enum": list(_LANGUAGES)},
-        "code": {"type": "string"},
-        "session": {"type": "string"},
-        "cwd": {"type": "string"},
-        "timeout": {"type": "number"},
+        "code": {"type": "string", "maxLength": 10_000_000},
+        "session": {"type": "string", "minLength": 1, "maxLength": 128},
+        "cwd": {"type": "string", "maxLength": 4096},
+        "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
     },
 }
 
@@ -68,6 +69,12 @@ class ExecuteCapability:
     ) -> CapabilityResult:
         args = request.arguments or {}
         language = (args.get("language") or "sh").lower()
+        if language not in _LANGUAGES:
+            return CapabilityResult(
+                request.call_id, request.capability_id,
+                CapabilityResultStatus.FAILED,
+                error=f"unsupported language: {language}",
+            )
         code = args.get("code", "")
         runtime_name = _map_runtime(language)
         if runtime_name not in self.execution_manager.available_runtimes():
@@ -153,11 +160,15 @@ class ExecuteCapability:
                 stdout_parts.append(data)
                 if self._event_sink:
                     await self._event_sink("stdout", data)
+                if output_accumulator is not None:
+                    await output_accumulator.chunk(data, stream="stdout")
             elif event.type == ExecutionEventType.STDERR:
                 data = event.data or ""
                 stderr_parts.append(data)
                 if self._event_sink:
                     await self._event_sink("stderr", data)
+                if output_accumulator is not None:
+                    await output_accumulator.chunk(data, stream="stderr")
             elif event.type == ExecutionEventType.EXITED:
                 exit_status = event.exit_status
                 exit_code = event.exit_code

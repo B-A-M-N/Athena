@@ -37,11 +37,27 @@ class FusionCapability:
                 "operation": {"type": "string", "enum": [
                     "run", "status", "commit", "discard", "fork", "checkpoint",
                 ]},
-                "branch_id": {"type": "string"},
-                "proposal": {"type": "array", "items": {"type": "object"}},
-                "criteria_probes": {"type": "array", "items": {"type": "object"}},
-                "invariants": {"type": "array", "items": {"type": "object"}},
-                "profile": {"type": "string"},
+                "branch_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "proposal": {
+                    "type": "array", "minItems": 1, "maxItems": 100,
+                    "items": {
+                        "type": "object", "required": ["capability_id", "arguments"],
+                        "properties": {
+                            "capability_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                            "arguments": {"type": "object"},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "criteria_probes": {
+                    "type": "array", "maxItems": 100,
+                    "items": {"type": "object", "additionalProperties": True},
+                },
+                "invariants": {
+                    "type": "array", "maxItems": 100,
+                    "items": {"type": "object", "additionalProperties": True},
+                },
+                "profile": {"type": "string", "maxLength": 128},
                 "auto_fork_on_failure": {"type": "boolean"},
                 "after_event_sequence": {"type": "integer", "minimum": 0},
                 "capture_checkpoint": {"type": "boolean"},
@@ -49,6 +65,15 @@ class FusionCapability:
                 "label": {"type": "string"},
                 "reason": {"type": "string"},
             },
+            "oneOf": [
+                {"properties": {"operation": {"const": "run"}},
+                 "required": ["proposal"]},
+                {"properties": {"operation": {"enum": ["status", "commit", "discard"]}},
+                 "required": ["branch_id"]},
+                {"properties": {"operation": {"const": "fork"}},
+                 "required": ["after_event_sequence"]},
+                {"properties": {"operation": {"const": "checkpoint"}}},
+            ],
             "additionalProperties": False,
         },
         effects=frozenset({
@@ -85,12 +110,12 @@ class FusionCapability:
 
             branch_id = str(args.get("branch_id") or "")
             if operation == "status":
-                branch = orchestrator.shadow.get_branch(branch_id)
+                branch = _owned_branch(orchestrator, branch_id, task_id)
                 if branch is None:
                     return _result(request, ok=False, error="branch not found")
                 return _result(request, output=json.dumps(_branch_record(branch)))
             if operation == "discard":
-                branch = orchestrator.shadow.get_branch(branch_id)
+                branch = _owned_branch(orchestrator, branch_id, task_id)
                 if branch is None:
                     return _result(request, ok=False, error="branch not found")
                 outcome = await orchestrator.shadow.discard(
@@ -98,7 +123,7 @@ class FusionCapability:
                 )
                 return _result(request, output=json.dumps(outcome))
             if operation == "commit":
-                branch = orchestrator.shadow.get_branch(branch_id)
+                branch = _owned_branch(orchestrator, branch_id, task_id)
                 if branch is None:
                     return _result(request, ok=False, error="branch not found")
                 outcome = await orchestrator.shadow.commit(branch)
@@ -148,6 +173,13 @@ def _branch_record(branch: Any) -> dict[str, Any]:
         "policy_profile": branch.policy_profile,
         "created_at": branch.created_at,
     }
+
+
+def _owned_branch(orchestrator: Any, branch_id: str, task_id: str) -> Any | None:
+    branch = orchestrator.shadow.get_branch(branch_id)
+    if branch is None or branch.task_id != task_id:
+        return None
+    return branch
 
 
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):

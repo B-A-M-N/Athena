@@ -187,6 +187,18 @@ class FusionOrchestrator:
         #    claim for this experiment.
         outcome = await self.shadow.commit(branch)
         result.commit = outcome
+        if outcome.get("status") != "committed":
+            result.status = "FAILED"
+            result.error = str(
+                outcome.get("error")
+                or outcome.get("reason")
+                or f"shadow commit did not complete: {outcome.get('status', 'unknown')}"
+            )
+            await self._fail_path(
+                task_id, result, auto_fork_on_failure, ckpt_id,
+                pre_experiment_sequence,
+            )
+            return result
         wstate = self.service.world_state(task_id)
         depends = tuple(outcome.get("written", []))
         wstate.claims.invalidate_for_paths(list(depends))
