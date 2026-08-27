@@ -808,7 +808,7 @@ class AgentKernel:
 
     async def utility_inference(
         self, *, system_prompt: str, user_prompt: str, role: str = "summarizer",
-    ) -> "ModelResponse | None":
+    ) -> str | None:
         """Route ONE task-less auxiliary inference through this kernel.
 
         For auxiliary model work that is not a reasoning turn of any task
@@ -838,7 +838,19 @@ class AgentKernel:
                 model=selection.model,
                 metadata={"role": role, "purpose": "utility_inference"},
             )
-            message = Message(
+            messages: list[Message] = []
+            if system_prompt:
+                messages.append(Message(
+                    id=new_id("msg"),
+                    role=Role.SYSTEM,
+                    blocks=(TextBlock(text=system_prompt),),
+                    created_at=utcnow(),
+                    provenance=Provenance(
+                        source_type=SourceType.SYSTEM,
+                        trust=TrustClass.CONFIGURED_INSTRUCTION,
+                    ),
+                ))
+            messages.append(Message(
                 id=new_id("msg"),
                 role=Role.USER,
                 blocks=(TextBlock(text=user_prompt),),
@@ -847,9 +859,9 @@ class AgentKernel:
                     source_type=SourceType.SYSTEM,
                     trust=TrustClass.CONFIGURED_INSTRUCTION,
                 ),
-            )
+            ))
             request = ModelRequest(
-                messages=(message,),
+                messages=tuple(messages),
                 model=selection.model,
                 provider=selection.provider,
                 request_id=new_id("sum"),
