@@ -675,6 +675,8 @@ class DualPaneSurface(OperatorSurface):
         self.oi_framebuffer = OIFrameBuffer()
         self.kitty = KittyGraphicsProtocol()
         self._glass_frame_id = 40
+        self._glass_overlay_id = 41
+        self._glass_base_key: tuple[Any, ...] | None = None
         self._prompt_text = ""
         self.prompt = PromptController(
             input_fn=self._input_fn if self._input_supplied else None,
@@ -1261,33 +1263,50 @@ class DualPaneSurface(OperatorSurface):
             self._present_glass()
 
     def _present_glass(self) -> None:
-        """Present the OI framebuffer inside the already-painted right CRT."""
+        """Present a retained CRT base plus a clipped animated overlay."""
         viewport = self.layout.oi
-        frame = self.oi_framebuffer.render(
-            self.scene,
-            self.animator.visual,
-            max(viewport.width * 10, 80),
-            max((viewport.height - 2) * 20, 60),
+        pixel_width = max(viewport.width * 10, 80)
+        pixel_height = max((viewport.height - 2) * 20, 60)
+        base = self.oi_framebuffer.render_base(
+            self.scene, pixel_width, pixel_height
         )
-        if frame is None:
+        overlay = self.oi_framebuffer.render_overlay(
+            self.scene, self.animator.visual, pixel_width, pixel_height
+        )
+        if base is None or overlay is None:
             return
-        # Reuse one Kitty image identity for the fixed CRT placement.  The
-        # transmit action replaces that image's data, so an animation tick
-        # does not accumulate placements or emit a delete for the previous
-        # frame.  The protocol object owns the single identity until close().
-        asset = KittyAsset(self._glass_frame_id, frame.png)
-        command = self.kitty.present(
-            asset,
-            x=viewport.x + 1,
-            y=viewport.y + 1,
-            columns=max(viewport.width - 2, 1),
-            rows=max(viewport.height - 2, 1),
-        )
+        command = ""
+        if base.base_key != self._glass_base_key:
+            # The opaque scene changes only when canonical projection content
+            # changes. It stays resident while animation updates Buddy.
+            command += self.kitty.present(
+                KittyAsset(self._glass_frame_id, base.png),
+                x=viewport.x + 1,
+                y=viewport.y + 1,
+                columns=max(viewport.width - 2, 1),
+                rows=max(viewport.height - 2, 1),
+            )
+            self._glass_base_key = base.base_key
+
+        if overlay.png and overlay.dirty_region:
+            left, top, region_width, region_height = overlay.dirty_region
+            command += self.kitty.present(
+                KittyAsset(self._glass_overlay_id, overlay.png),
+                x=viewport.x + 1 + left // 10,
+                y=viewport.y + 1 + top // 20,
+                columns=max((region_width + 9) // 10, 1),
+                rows=max((region_height + 19) // 20, 1),
+            )
+        else:
+            # A hidden Buddy must not leave its previous placement above the
+            # retained base scene.
+            command += self.kitty.delete(self._glass_overlay_id)
         # Kitty placements with C=1 leave the cursor at the placement origin.
         # Put it back on the integrated prompt before line input resumes.
-        command += f"\x1b[{self.layout.prompt.y + 2};1H"
-        self.output.write(command)
-        self.output.flush()
+        if command:
+            command += f"\x1b[{self.layout.prompt.y + 2};1H"
+            self.output.write(command)
+            self.output.flush()
 
     def snapshot_oi(self, height: int | None = None) -> list[str]:
         return self.window.snapshot(height or self.oi_height, self._term_cols)

@@ -45,6 +45,9 @@ class FrameBuffer:
     png: bytes
     width: int
     height: int
+    dirty_region: tuple[int, int, int, int] | None = None
+    layer: str = "full"
+    base_key: tuple[Any, ...] | None = None
 
 
 class OIFrameBuffer:
@@ -60,6 +63,7 @@ class OIFrameBuffer:
         self.font_path = font_path
         self._fonts: dict[int, Any] = {}
         self._base_frames: dict[tuple[int, int, tuple[Any, ...]], Any] = {}
+        self._base_png: dict[tuple[int, int, tuple[Any, ...]], bytes] = {}
 
     def _font(self, size: int):
         if ImageFont is None:
@@ -101,6 +105,36 @@ class OIFrameBuffer:
             tuple(scene.alerts),
             tuple(scene.stream),
         )
+
+    def _base_image(self, scene: OIScene, width: int, height: int) -> tuple[Any, tuple[Any, ...]]:
+        """Return a cached opaque scene layer and its stable content key."""
+        key = (width, height, self._scene_key(scene))
+        base = self._base_frames.get(key)
+        if base is None:
+            base = self._render_base(scene, width, height)
+            self._base_frames[key] = base
+            # Live traces can produce many distinct scene keys. Retain only a
+            # small working set so an active session cannot grow without bound.
+            if len(self._base_frames) > 8:
+                oldest = next(iter(self._base_frames))
+                if oldest != key:
+                    del self._base_frames[oldest]
+        return base, key
+
+    @staticmethod
+    def _buddy_position(scene: OIScene, visual: OIVisualState, width: int, height: int) -> tuple[int, int, int]:
+        start_fx, start_fy = scene.anchors.get(
+            visual.previous_anchor, scene.anchors["center"]
+        )
+        end_fx, end_fy = scene.anchors.get(
+            scene.buddy_anchor, scene.anchors["center"]
+        )
+        progress = min(max(visual.transition, 0.0), 1.0)
+        eased = progress * progress * (3.0 - 2.0 * progress)
+        fx = start_fx + (end_fx - start_fx) * eased
+        fy = start_fy + (end_fy - start_fy) * eased
+        scale = max(18, width // 28)
+        return int(width * fx), int(height * fy) + (0 if progress >= 1 else int((1 - progress) * 10)), scale
 
     @staticmethod
     def _entity_color(entity: Any, ink: Color, accent: Color, warn: Color, bad: Color) -> Color:
@@ -214,17 +248,7 @@ class OIFrameBuffer:
         if Image is None:
             return None
         width, height = max(int(width), 80), max(int(height), 60)
-        key = (width, height, self._scene_key(scene))
-        base = self._base_frames.get(key)
-        if base is None:
-            base = self._render_base(scene, width, height)
-            self._base_frames[key] = base
-            # Live traces can produce many distinct scene keys. Retain only a
-            # small working set so an active session cannot grow without bound.
-            if len(self._base_frames) > 8:
-                oldest = next(iter(self._base_frames))
-                if oldest != key:
-                    del self._base_frames[oldest]
+        base, key = self._base_image(scene, width, height)
         image = base.copy()
         draw = ImageDraw.Draw(image, "RGBA")
         ink = (177, 196, 225, 228)
@@ -233,22 +257,8 @@ class OIFrameBuffer:
         bad = (224, 119, 126, 235)
         # One buddy, one bounded anchor.  It is a scene entity, never a pane.
         if visual.semantic_state != "hidden":
-            start_fx, start_fy = scene.anchors.get(
-                visual.previous_anchor, scene.anchors["center"]
-            )
-            end_fx, end_fy = scene.anchors.get(
-                scene.buddy_anchor, scene.anchors["center"]
-            )
-            # Ease between semantic anchors.  The event chooses the target;
-            # the clock only supplies presentation time.
-            progress = min(max(visual.transition, 0.0), 1.0)
-            eased = progress * progress * (3.0 - 2.0 * progress)
-            fx = start_fx + (end_fx - start_fx) * eased
-            fy = start_fy + (end_fy - start_fy) * eased
-            bx, by = int(width * fx), int(height * fy)
-            bob = 0 if progress >= 1 else int((1 - progress) * 10)
-            by += bob
-            self._draw_buddy(draw, bx, by, max(18, width // 28), scene.status, visual.phase, ink, accent, warn, bad)
+            bx, by, scale = self._buddy_position(scene, visual, width, height)
+            self._draw_buddy(draw, bx, by, scale, scene.status, visual.phase, ink, accent, warn, bad)
 
         encoded = io.BytesIO()
         # Animation ticks reuse the cached scene layer and use a low-latency
@@ -256,7 +266,66 @@ class OIFrameBuffer:
         # costly palette/scan optimisation that should happen only for a
         # deliberate asset export, not for a live frame transport.
         image.convert("RGB").save(encoded, format="PNG", optimize=False, compress_level=1)
-        return FrameBuffer(encoded.getvalue(), width, height)
+        return FrameBuffer(encoded.getvalue(), width, height, base_key=key)
+
+    def render_base(self, scene: OIScene, width: int, height: int) -> FrameBuffer | None:
+        """Encode only the opaque CRT layer for a stable Kitty placement."""
+        if Image is None:
+            return None
+        width, height = max(int(width), 80), max(int(height), 60)
+        base, key = self._base_image(scene, width, height)
+        png = self._base_png.get(key)
+        if png is None:
+            encoded = io.BytesIO()
+            base.convert("RGB").save(encoded, format="PNG", optimize=False, compress_level=1)
+            png = encoded.getvalue()
+            self._base_png[key] = png
+            if len(self._base_png) > 8:
+                oldest = next(iter(self._base_png))
+                if oldest != key:
+                    del self._base_png[oldest]
+        return FrameBuffer(png, width, height, layer="base", base_key=key)
+
+    def render_overlay(self, scene: OIScene, visual: OIVisualState, width: int, height: int) -> FrameBuffer | None:
+        """Encode a clipped transparent Buddy layer for partial presentation.
+
+        The static CRT remains resident in the host terminal. A stable overlay
+        image id lets Kitty discard the previous Buddy placement before the new
+        clipped rectangle is placed, so movement cannot leave stale pixels.
+        """
+        if Image is None:
+            return None
+        width, height = max(int(width), 80), max(int(height), 60)
+        if visual.semantic_state == "hidden":
+            return FrameBuffer(b"", width, height, layer="overlay", base_key=(width, height, self._scene_key(scene)))
+        bx, by, scale = self._buddy_position(scene, visual, width, height)
+        margin = max(scale * 2, 8)
+        left = max(0, bx - scale * 5 - margin)
+        top = max(0, by - scale * 5 - margin)
+        right = min(width, bx + scale * 7 + margin)
+        bottom = min(height, by + scale * 5 + margin)
+        # Align to the approximate terminal cell grid used by the caller so a
+        # clipped image scales predictably in a cell placement.
+        cell_width, cell_height = 10, 20
+        left = (left // cell_width) * cell_width
+        top = (top // cell_height) * cell_height
+        right = min(width, max(right, left + cell_width))
+        bottom = min(height, max(bottom, top + cell_height))
+        image = Image.new("RGBA", (right - left, bottom - top), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image, "RGBA")
+        ink = (177, 196, 225, 228)
+        accent = (101, 183, 206, 220)
+        warn = (222, 176, 108, 235)
+        bad = (224, 119, 126, 235)
+        self._draw_buddy(draw, bx - left, by - top, scale, scene.status, visual.phase, ink, accent, warn, bad)
+        encoded = io.BytesIO()
+        image.save(encoded, format="PNG", optimize=False, compress_level=1)
+        return FrameBuffer(
+            encoded.getvalue(), width, height,
+            dirty_region=(left, top, right - left, bottom - top),
+            layer="overlay",
+            base_key=(width, height, self._scene_key(scene)),
+        )
 
     def _draw_buddy(self, draw: Any, x: int, y: int, scale: int, status: str, phase: float, ink: Color, accent: Color, warn: Color, bad: Color) -> None:
         """Draw one small scene character with restrained state cues.

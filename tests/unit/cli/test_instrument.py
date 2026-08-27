@@ -114,6 +114,33 @@ def test_glass_framebuffer_caches_static_scene_layer() -> None:
     assert len(framebuffer._base_frames) == 1
 
 
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_glass_framebuffer_exposes_small_dynamic_overlay() -> None:
+    layout = compute_layout(120, 40)
+    state = ProjectionState(status="EXECUTING")
+    scene = build_oi_scene(state, layout.oi)
+    animator = OIAnimator()
+    animator.set_state("EXECUTING", "graph")
+    framebuffer = OIFrameBuffer()
+
+    base = framebuffer.render_base(scene, 640, 360)
+    overlay = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+    assert base is not None and overlay is not None
+    assert base.layer == "base"
+    assert overlay.layer == "overlay"
+    assert overlay.dirty_region is not None
+    _left, _top, region_width, region_height = overlay.dirty_region
+    assert region_width < overlay.width
+    assert region_height < overlay.height
+    assert base.base_key == overlay.base_key
+
+    animator.tick(0.1)
+    moved = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+    assert moved is not None
+    assert moved.png != overlay.png
+    assert len(moved.png) < len(framebuffer.render(scene, animator.visual, 640, 360).png)
+
+
 def test_animation_clock_only_repaints_the_glass_layer() -> None:
     surface = DualPaneSurface(output=StringIO(), error=StringIO(), interactive=False)
     surface._full_screen = True
