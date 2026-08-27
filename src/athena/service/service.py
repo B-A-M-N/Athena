@@ -407,6 +407,7 @@ class AthenaService:
             ),
             dispatch_factory=self._dispatch_factory,
             continuation_store=continuations,
+            provider_usage_store=self._provider_usage_store,
             interpreter=self._make_interpreter(),
         )
         self._kernel = kernel
