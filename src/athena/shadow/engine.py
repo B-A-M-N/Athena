@@ -365,7 +365,14 @@ class ShadowEngine:
         base_root = branch.base_workspace.root
         shadow_root = branch.shadow_workspace.root
 
-        base_files = branch.base_manifest or self._manifest(base_root)
+        # ``base_manifest`` is the immutable snapshot captured at branch
+        # open (commit conflict checks MUST compare against it, never a
+        # manifest freshly captured after the branch has run). An empty
+        # workspace yields an empty-but-valid manifest, so only ``None``
+        # (legacy branches without a snapshot) may take the fallback.
+        base_files = (branch.base_manifest
+                      if branch.base_manifest is not None
+                      else self._manifest(base_root))
         shadow_files = self._manifest(shadow_root)
         modified, added, deleted = [], [], []
         for rel, digest in shadow_files.items():

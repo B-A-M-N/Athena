@@ -22,6 +22,7 @@ from athena.protocol.messages import (
     Role,
     SourceType,
     TextBlock,
+    TrustClass,
     utcnow,
 )
 from athena.protocol.models import ToolCallCandidate
@@ -191,10 +192,15 @@ def _serialize_provenance(prov: Provenance) -> dict[str, Any]:
 
 
 def _deserialize_provenance(data: dict[str, Any]) -> Provenance:
+    # ``trust`` must come back as a TrustClass member: JSON round-trips lose
+    # the enum, and the serializer calls ``.value`` on it. Fork transcript
+    # cloning re-appends deserialized messages, so a plain str here made any
+    # fork of a session with persisted messages crash on append.
+    trust = data.get("trust", "agent_curated")
     return Provenance(
         source_type=SourceType(data.get("source_type", "runtime")),
         source_id=data.get("source_id"),
-        trust=data.get("trust", "agent_curated"),
+        trust=TrustClass(trust),
         scope=data.get("scope"),
         created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None,
     )
