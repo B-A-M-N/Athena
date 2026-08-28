@@ -213,6 +213,16 @@ async def test_capability_records_and_verifies_evidence():
     assert search_payload["sources"][0]["id"] == source_id
     assert search_payload["evidence"][0]["id"] == evidence_id
 
+    discovered = await capability.invoke(CapabilityRequest(
+        capability_id="research", task_id="task-1", call_id="discover-1",
+        arguments={"operation": "discover", "query": "status"},
+    ), context=context)
+    assert discovered.status is CapabilityResultStatus.OK
+    discover_payload = json.loads(discovered.output)
+    assert discover_payload["provider"] == "local_corpus"
+    assert discover_payload["candidates"][0]["source_id"] == source_id
+    assert discover_payload["network_used"] is False
+
 
 @pytest.mark.asyncio
 async def test_task_cannot_cite_or_verify_another_tasks_private_evidence():

@@ -51,7 +51,7 @@ class ResearchCapability:
         id="research",
         description=(
             "Durable evidence-backed research records: record and list source "
-            "snapshots, extract exact evidence, link evidence to Athena claims, "
+            "snapshots, discover bounded candidates, extract exact evidence, link evidence to Athena claims, "
             "track research gaps, search the local corpus, verify excerpts, and "
             "plan/assess/bundle explicit research requirements. Planning is "
             "deterministic and local; external fetching is a separate "
@@ -62,7 +62,7 @@ class ResearchCapability:
             "required": ["operation"],
             "properties": {
                 "operation": {"type": "string", "enum": [
-                    "fetch", "record_source", "sources", "search", "record_evidence", "evidence",
+                    "fetch", "discover", "record_source", "sources", "search", "record_evidence", "evidence",
                     "record_gap", "gaps", "close_gap", "verify", "plan", "assess", "bundle",
                     "run",
                 ]},
@@ -108,6 +108,10 @@ class ResearchCapability:
                 "queries": {
                     "type": "array", "maxItems": 10,
                     "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+                },
+                "uris": {
+                    "type": "array", "maxItems": 50,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 4096},
                 },
                 "source_specs": {
                     "type": "array", "maxItems": 10,
@@ -171,11 +175,12 @@ class ResearchCapability:
 
     def __init__(self, store, *, artifact_store=None,
                  source_policy: SourcePolicy | None = None,
-                 host_resolver=None) -> None:
+                 host_resolver=None, discovery_provider=None) -> None:
         self._store = store
         self._artifacts = artifact_store
         self._source_policy = source_policy or SourcePolicy()
         self._host_resolver = host_resolver or socket.getaddrinfo
+        self._discovery_provider = discovery_provider
 
     async def invoke(self, request: CapabilityRequest, **kw) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -186,6 +191,8 @@ class ResearchCapability:
         try:
             if operation == "fetch":
                 return await self._fetch(request, args, context)
+            if operation == "discover":
+                return await self._discover(request, args, context)
             if operation == "record_source":
                 return await self._record_source(request, args, context)
             if operation == "sources":
@@ -219,6 +226,116 @@ class ResearchCapability:
             # Capability failures are model-visible, but unexpected storage
             # errors remain explicit rather than becoming false evidence.
             return _result(request, ok=False, error=f"research operation failed: {exc}")
+
+    async def _discover(self, request, args, context) -> CapabilityResult:
+        """Discover bounded, policy-valid source candidates.
+
+        The default provider is the durable task/project corpus. Deployments
+        may inject a provider for external indexes, but its results still
+        pass SourcePolicy before they become model-visible candidates. This
+        operation never fetches a candidate; acquisition remains ``fetch``.
+        """
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return _result(request, ok=False, error="discover requires query")
+        limit = min(int(args.get("limit") or 20), 50)
+        workspace = getattr(context, "workspace", None)
+        project_id = getattr(workspace, "id", None)
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for hit in await self._search_content(
+            query, task_id=request.task_id, project_id=project_id, limit=limit,
+        ):
+            source = hit.get("source") if isinstance(hit, Mapping) else None
+            if not isinstance(source, Mapping):
+                continue
+            source_id = str(source.get("id") or "")
+            uri = str(source.get("canonical_uri") or "")
+            key = source_id or uri
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                "uri": uri,
+                "source_id": source_id or None,
+                "title": str(source.get("title") or ""),
+                "source_type": str(source.get("source_type") or ""),
+                "snippet": str(hit.get("snippet") or "")[:2000],
+                "origin": "local_corpus",
+            })
+
+        list_sources = getattr(self._store, "list_sources", None)
+        if callable(list_sources) and len(candidates) < limit:
+            sources = await list_sources(
+                task_id=request.task_id, project_id=project_id,
+                query=query, limit=limit,
+            )
+            for source in sources:
+                record = source.to_record() if hasattr(source, "to_record") else source
+                if not isinstance(record, Mapping):
+                    continue
+                source_id = str(record.get("id") or "")
+                uri = str(record.get("canonical_uri") or "")
+                key = source_id or uri
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                candidates.append({
+                    "uri": uri,
+                    "source_id": source_id or None,
+                    "title": str(record.get("title") or ""),
+                    "source_type": str(record.get("source_type") or ""),
+                    "snippet": "",
+                    "origin": "local_catalog",
+                })
+                if len(candidates) >= limit:
+                    break
+
+        provider = self._discovery_provider
+        rejected: list[dict[str, str]] = []
+        if provider is not None and len(candidates) < limit:
+            network_policy = getattr(workspace, "network_policy", None)
+            if getattr(network_policy, "value", network_policy) == "deny":
+                return _result(request, ok=False, error="network denied by workspace policy")
+            provided = provider(
+                query=query, limit=limit, task_id=request.task_id,
+                project_id=project_id, context=context,
+            )
+            if asyncio.iscoroutine(provided):
+                provided = await provided
+            if not isinstance(provided, list):
+                return _result(request, ok=False, error="discovery provider returned a non-list")
+            for item in provided[:limit]:
+                if not isinstance(item, Mapping):
+                    rejected.append({"reason": "candidate is not an object"})
+                    continue
+                uri = str(item.get("uri") or item.get("url") or "")
+                try:
+                    canonical = self._source_policy.check(uri)
+                except SourcePolicyError as exc:
+                    rejected.append({"uri": uri[:4096], "reason": str(exc)})
+                    continue
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+                candidates.append({
+                    "uri": canonical,
+                    "title": str(item.get("title") or "")[:1000],
+                    "source_type": str(item.get("source_type") or "web"),
+                    "snippet": str(item.get("snippet") or "")[:2000],
+                    "origin": "configured_provider",
+                })
+                if len(candidates) >= limit:
+                    break
+
+        return _result(request, output=_json({
+            "query": query,
+            "candidates": candidates[:limit],
+            "provider": "configured" if provider is not None else "local_corpus",
+            "network_used": provider is not None,
+            "rejected": rejected[:limit],
+        }))
 
     async def _fetch(self, request, args, context) -> CapabilityResult:
         """Fetch one allowlisted source and persist its immutable snapshot.

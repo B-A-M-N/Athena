@@ -171,6 +171,7 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
     "research": {
         "record_source": frozenset({EffectClass.WRITE_LOCAL}),
         "fetch": frozenset({EffectClass.WRITE_LOCAL, EffectClass.NETWORK_READ}),
+        "discover": frozenset({EffectClass.READ_LOCAL, EffectClass.NETWORK_READ}),
         "sources": frozenset({EffectClass.READ_LOCAL}),
         "search": frozenset({EffectClass.READ_LOCAL}),
         "record_evidence": frozenset({EffectClass.WRITE_LOCAL}),

@@ -90,6 +90,14 @@ def test_reflection_workflow_and_skill_operations_have_effect_contracts():
         ) == (EffectClass.READ_LOCAL,)
 
 
+def test_research_discover_has_conservative_network_contract():
+    from athena.capabilities.research import ResearchCapability
+
+    assert set(CapabilityDispatcher._resolve_effects_for(
+        ResearchCapability.descriptor, {"operation": "discover"}
+    )) == {EffectClass.READ_LOCAL, EffectClass.NETWORK_READ}
+
+
 def test_reflection_runtime_permission_and_device_operations_have_contracts():
     from athena.capabilities.reflection import CapabilityReflection
 
