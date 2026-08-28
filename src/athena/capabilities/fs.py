@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from contextlib import asynccontextmanager
 import hashlib
 import json
 import os
@@ -29,6 +30,7 @@ from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResult,
     CapabilityResultStatus,
+    CachePolicy,
     EffectClass,
     InvocationContext,
 )
@@ -58,6 +60,69 @@ def _path_lock(path: str) -> asyncio.Lock:
     real = os.path.realpath(os.path.abspath(path))
     with _LOCK:
         return _PATH_LOCKS.setdefault(real, asyncio.Lock())
+
+
+def _fs_cache_key(arguments, workspace: WorkspaceSpec) -> str | None:
+    """Return a target-local identity for explicitly cacheable fs reads."""
+    operation = str(arguments.get("operation") or "").lower()
+    raw_path = arguments.get("path")
+    if operation not in {"read", "stat", "list"} or not isinstance(raw_path, str):
+        return None
+    root = os.path.realpath(os.path.abspath(workspace.root))
+    target = os.path.realpath(
+        os.path.abspath(raw_path if os.path.isabs(raw_path) else os.path.join(root, raw_path))
+    )
+    if target != root and not target.startswith(root + os.sep):
+        return None
+    digest = hashlib.sha256()
+    digest.update(operation.encode())
+    digest.update(b"\0")
+    digest.update(target.encode("utf-8", errors="replace"))
+    try:
+        if operation == "read":
+            with open(target, "rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+        elif operation == "stat":
+            stat = os.stat(target)
+            digest.update(
+                repr((stat.st_mode, stat.st_size, stat.st_mtime_ns, stat.st_ino)).encode()
+            )
+        else:
+            entries: list[tuple[object, ...]] = []
+            with os.scandir(target) as directory:
+                for entry in directory:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        entries.append(
+                            (
+                                entry.name,
+                                info.st_mode,
+                                info.st_size,
+                                info.st_mtime_ns,
+                                entry.is_symlink(),
+                            )
+                        )
+                    except OSError:
+                        entries.append((entry.name, "unreadable"))
+            digest.update(repr(sorted(entries)).encode("utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    return digest.hexdigest()
+
+
+@asynccontextmanager
+async def _resource_locks(*paths: str):
+    """Serialize a mutation's compare-and-swap window for every resource."""
+    locks = [_path_lock(path) for path in sorted(set(paths))]
+    for lock in locks:
+        await lock.acquire()
+    try:
+        yield
+    finally:
+        for lock in reversed(locks):
+            lock.release()
+
 
 _PATH = {"type": "string", "minLength": 1}
 
@@ -125,12 +190,8 @@ _INPUT_SCHEMA = {
         _operation_schema("list", {}, ("operation", "path")),
         _operation_schema("stat", {}, ("operation", "path")),
         _operation_schema("mkdir", {}, ("operation", "path")),
-        _operation_schema(
-            "copy", {"destination": _PATH}, ("operation", "path", "destination")
-        ),
-        _operation_schema(
-            "move", {"destination": _PATH}, ("operation", "path", "destination")
-        ),
+        _operation_schema("copy", {"destination": _PATH}, ("operation", "path", "destination")),
+        _operation_schema("move", {"destination": _PATH}, ("operation", "path", "destination")),
         _operation_schema("delete", {}, ("operation", "path")),
     ],
 }
@@ -148,6 +209,12 @@ class FilesystemCapability:
         ),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
+        operation_cache_policies={
+            "read": CachePolicy.CONTENT_ADDRESS,
+            "stat": CachePolicy.CONTENT_ADDRESS,
+            "list": CachePolicy.CONTENT_ADDRESS,
+        },
+        cache_key_resolver=_fs_cache_key,
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -205,7 +272,7 @@ class FilesystemCapability:
         }[op]
 
         try:
-            return await handler(request, args, abs_path, ws)
+            return await handler(request, args, abs_path, ws, context)
         except FilesystemConflict as e:
             return _fail(request, str(e))
         except (PolicyDenied, OSError) as e:
@@ -214,7 +281,7 @@ class FilesystemCapability:
     # ------------------------------------------------------------------ #
     # Operations
     # ------------------------------------------------------------------ #
-    async def _read(self, request, args, path, ws):
+    async def _read(self, request, args, path, ws, context=None):
         try:
             with self._safe_open_read(path, ws) as f:
                 data = f.read()
@@ -239,7 +306,7 @@ class FilesystemCapability:
             return _fail(request, "file is not valid UTF-8; read it with encoding=base64")
         return _ok(request, text, metadata={"encoding": "utf-8", "bytes": len(data)})
 
-    async def _write(self, request, args, path, ws):
+    async def _write(self, request, args, path, ws, context=None):
         try:
             content = _decode_content(args, "content", "content_base64")
         except ValueError as e:
@@ -247,11 +314,14 @@ class FilesystemCapability:
         if content is None:
             return _fail(request, "write requires content or content_base64")
         create_dirs = args.get("create_dirs", False)
-        lock = _path_lock(path)
-        async with lock:
+        async with _resource_locks(path):
             before_ref, before = await self._capture_before(request.task_id, path, ws)
+            self._check_expected_preimage(path, before, context)
             intent_id = await self._intent(
-                request.task_id, path, "write", before_ref,
+                request.task_id,
+                path,
+                "write",
+                before_ref,
                 _inverse("write", path, before_ref),
             )
             # Mark STARTED after PLANNED but before the side effect
@@ -261,17 +331,19 @@ class FilesystemCapability:
                 if create_dirs:
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                 after = _atomic_write(path, content, ws)
+                self._apply_expected_mode(path, context)
             except OSError as e:
                 await self._abort(intent_id, str(e))
                 return _fail(request, str(e))
             reversible = before is None or before_ref is not None
-            await self._complete(intent_id, after, reversible,
-                                 _inverse("write", path, before_ref))
-        return _ok(request, f"wrote {len(content)} bytes",
-                   mutation=_mutation("write", path, before, after,
-                                      before_ref, reversible, intent_id))
+            await self._complete(intent_id, after, reversible, _inverse("write", path, before_ref))
+        return _ok(
+            request,
+            f"wrote {len(content)} bytes",
+            mutation=_mutation("write", path, before, after, before_ref, reversible, intent_id),
+        )
 
-    async def _patch(self, request, args, path, ws):
+    async def _patch(self, request, args, path, ws, context=None):
         expected = args.get("expected_sha256")
         try:
             new_content = _decode_content(args, "new_content", "new_content_base64")
@@ -279,32 +351,35 @@ class FilesystemCapability:
             return _fail(request, str(e))
         if new_content is None:
             return _fail(request, "patch requires new_content")
-        lock = _path_lock(path)
-        async with lock:
+        async with _resource_locks(path):
             before_ref, before = await self._capture_before(request.task_id, path, ws)
+            self._check_expected_preimage(path, before, context)
             if expected and (before is None or before != expected):
-                raise FilesystemConflict(
-                    f"expected sha256 {expected} but file has changed"
-                )
+                raise FilesystemConflict(f"expected sha256 {expected} but file has changed")
             intent_id = await self._intent(
-                request.task_id, path, "patch", before_ref,
+                request.task_id,
+                path,
+                "patch",
+                before_ref,
                 _inverse("patch", path, before_ref),
             )
             if self.mutation_store is not None and intent_id is not None:
                 await self.mutation_store.mark_started(intent_id)
             try:
                 after = _atomic_write(path, new_content, ws)
+                self._apply_expected_mode(path, context)
             except OSError as e:
                 await self._abort(intent_id, str(e))
                 return _fail(request, str(e))
             reversible = before is None or before_ref is not None
-            await self._complete(intent_id, after, reversible,
-                                 _inverse("patch", path, before_ref))
-        return _ok(request, "patched",
-                   mutation=_mutation("patch", path, before, after,
-                                      before_ref, reversible, intent_id))
+            await self._complete(intent_id, after, reversible, _inverse("patch", path, before_ref))
+        return _ok(
+            request,
+            "patched",
+            mutation=_mutation("patch", path, before, after, before_ref, reversible, intent_id),
+        )
 
-    async def _list(self, request, args, path, ws):
+    async def _list(self, request, args, path, ws, context=None):
         try:
             fd = self._safe_open_directory(path, ws)
             try:
@@ -317,7 +392,7 @@ class FilesystemCapability:
             return _fail(request, f"not a directory: {path}")
         return _ok(request, "\n".join(entries))
 
-    async def _stat(self, request, args, path, ws):
+    async def _stat(self, request, args, path, ws, context=None):
         try:
             fd = self._safe_open_stat(path, ws)
             try:
@@ -327,6 +402,7 @@ class FilesystemCapability:
         except OSError as e:
             return _fail(request, str(e))
         import stat as statmod
+
         info = {
             "size": st.st_size,
             "is_dir": statmod.S_ISDIR(st.st_mode),
@@ -335,13 +411,18 @@ class FilesystemCapability:
         }
         return _ok(request, json.dumps(info))
 
-    async def _mkdir(self, request, args, path, ws):
+    async def _mkdir(self, request, args, path, ws, context=None):
         # Check existence BEFORE recording intent (write-ahead)
         existed_before = os.path.isdir(path)
         # If the directory already existed, this is a no-op mutation
         reversible = not existed_before
-        intent_id = await self._intent(request.task_id, path, "mkdir", None,
-                                       _inverse("mkdir", path, None, existed_before=existed_before))
+        intent_id = await self._intent(
+            request.task_id,
+            path,
+            "mkdir",
+            None,
+            _inverse("mkdir", path, None, existed_before=existed_before),
+        )
         if self.mutation_store is not None and intent_id is not None:
             await self.mutation_store.mark_started(intent_id)
         try:
@@ -349,103 +430,171 @@ class FilesystemCapability:
         except OSError as e:
             await self._abort(intent_id, str(e))
             return _fail(request, str(e))
-        await self._complete(intent_id, None, reversible,
-                             _inverse("mkdir", path, None, existed_before=existed_before))
+        await self._complete(
+            intent_id,
+            None,
+            reversible,
+            _inverse("mkdir", path, None, existed_before=existed_before),
+        )
         if existed_before:
             return _ok(request, "mkdir ok (already existed)")
-        return _ok(request, "mkdir ok",
-                   mutation=_mutation("mkdir", path, None, None, None, reversible, intent_id))
+        return _ok(
+            request,
+            "mkdir ok",
+            mutation=_mutation("mkdir", path, None, None, None, reversible, intent_id),
+        )
 
-    async def _copy(self, request, args, path, ws):
+    async def _copy(self, request, args, path, ws, context=None):
         dest = self._resolve(args.get("destination"), ws)
         self._check_writable(dest, ws)
-        dest_before_ref, dest_before = await self._capture_before(request.task_id, dest, ws)
-        intent_id = await self._intent(
-            request.task_id, dest, "copy", dest_before_ref,
-            _inverse("copy", dest, dest_before_ref),
-        )
-        if self.mutation_store is not None and intent_id is not None:
-            await self.mutation_store.mark_started(intent_id)
-        try:
-            with self._safe_open_read(path, ws) as source:
-                content = source.read()
-            after = _atomic_write(dest, content, ws)
-        except OSError as e:
-            await self._abort(intent_id, str(e))
-            return _fail(request, str(e))
-        await self._complete(intent_id, after, True, _inverse("copy", dest, dest_before_ref))
-        return _ok(request, f"copied to {dest}",
-                   mutation=_mutation("copy", dest, dest_before, after,
-                                      dest_before_ref, True, intent_id))
-
-    async def _move(self, request, args, path, ws):
-        dest = self._resolve(args.get("destination"), ws)
-        self._check_writable(dest, ws)
-        src_ref, src_before = await self._capture_before(request.task_id, path, ws)
-        dest_ref, dest_before = await self._capture_before(request.task_id, dest, ws)
-        intent_id = await self._intent(
-            request.task_id, path, "move", src_ref,
-            _inverse("move", path, src_ref, dest=dest, dest_before_ref=dest_ref),
-        )
-        if self.mutation_store is not None and intent_id is not None:
-            await self.mutation_store.mark_started(intent_id)
-        source_directory = None
-        destination_directory = None
-        try:
-            source_directory = self._safe_open_directory(os.path.dirname(path), ws)
-            destination_directory = self._safe_open_directory(os.path.dirname(dest), ws)
-            os.replace(
-                os.path.basename(path),
-                os.path.basename(dest),
-                src_dir_fd=source_directory,
-                dst_dir_fd=destination_directory,
+        async with _resource_locks(path, dest):
+            dest_before_ref, dest_before = await self._capture_before(request.task_id, dest, ws)
+            self._check_expected_preimage(dest, dest_before, context)
+            intent_id = await self._intent(
+                request.task_id,
+                dest,
+                "copy",
+                dest_before_ref,
+                _inverse("copy", dest, dest_before_ref),
             )
-        except (OSError, PolicyDenied) as e:
-            await self._abort(intent_id, str(e))
-            return _fail(request, str(e))
-        finally:
-            if source_directory is not None:
-                os.close(source_directory)
-            if destination_directory is not None:
-                os.close(destination_directory)
-        after = src_before
-        # Reversible only if we can restore both source and destination
-        reversible = (src_before is None or src_ref is not None) and (dest_before is None or dest_ref is not None)
-        await self._complete(intent_id, after, reversible,
-                             _inverse("move", path, src_ref, dest=dest, dest_before_ref=dest_ref))
-        return _ok(request, f"moved to {dest}",
-                   mutation=_mutation("move", path, src_before, after,
-                                      src_ref, reversible, intent_id, dest=dest))
+            if self.mutation_store is not None and intent_id is not None:
+                await self.mutation_store.mark_started(intent_id)
+            try:
+                with self._safe_open_read(path, ws) as source:
+                    content = source.read()
+                after = _atomic_write(dest, content, ws)
+                self._apply_expected_mode(dest, context)
+            except OSError as e:
+                await self._abort(intent_id, str(e))
+                return _fail(request, str(e))
+            await self._complete(intent_id, after, True, _inverse("copy", dest, dest_before_ref))
+            return _ok(
+                request,
+                f"copied to {dest}",
+                mutation=_mutation(
+                    "copy", dest, dest_before, after, dest_before_ref, True, intent_id
+                ),
+            )
 
-    async def _delete(self, request, args, path, ws):
-        if os.path.isdir(path) and not os.path.islink(path):
-            return _fail(request, "refusing recursive directory delete")
-        before_ref, before = await self._capture_before(request.task_id, path, ws)
-        intent_id = await self._intent(
-            request.task_id, path, "delete", before_ref,
-            _inverse("delete", path, before_ref),
-        )
-        if self.mutation_store is not None and intent_id is not None:
-            await self.mutation_store.mark_started(intent_id)
-        directory = None
-        try:
-            directory = self._safe_open_directory(os.path.dirname(path), ws)
-            os.unlink(os.path.basename(path), dir_fd=directory)
-        except (OSError, PolicyDenied) as e:
-            await self._abort(intent_id, str(e))
-            return _fail(request, str(e))
-        finally:
-            if directory is not None:
-                os.close(directory)
-        reversible = before_ref is not None
-        await self._complete(intent_id, None, reversible, _inverse("delete", path, before_ref))
-        return _ok(request, "deleted",
-                   mutation=_mutation("delete", path, before, None,
-                                      before_ref, reversible, intent_id))
+    async def _move(self, request, args, path, ws, context=None):
+        dest = self._resolve(args.get("destination"), ws)
+        self._check_writable(dest, ws)
+        async with _resource_locks(path, dest):
+            src_ref, src_before = await self._capture_before(request.task_id, path, ws)
+            dest_ref, dest_before = await self._capture_before(request.task_id, dest, ws)
+            self._check_expected_preimage(path, src_before, context)
+            self._check_expected_preimage(dest, dest_before, context)
+            intent_id = await self._intent(
+                request.task_id,
+                path,
+                "move",
+                src_ref,
+                _inverse("move", path, src_ref, dest=dest, dest_before_ref=dest_ref),
+            )
+            if self.mutation_store is not None and intent_id is not None:
+                await self.mutation_store.mark_started(intent_id)
+            source_directory = None
+            destination_directory = None
+            try:
+                source_directory = self._safe_open_directory(os.path.dirname(path), ws)
+                destination_directory = self._safe_open_directory(os.path.dirname(dest), ws)
+                os.replace(
+                    os.path.basename(path),
+                    os.path.basename(dest),
+                    src_dir_fd=source_directory,
+                    dst_dir_fd=destination_directory,
+                )
+            except (OSError, PolicyDenied) as e:
+                await self._abort(intent_id, str(e))
+                return _fail(request, str(e))
+            finally:
+                if source_directory is not None:
+                    os.close(source_directory)
+                if destination_directory is not None:
+                    os.close(destination_directory)
+            after = src_before
+            # Reversible only if we can restore both source and destination
+            reversible = (src_before is None or src_ref is not None) and (
+                dest_before is None or dest_ref is not None
+            )
+            await self._complete(
+                intent_id,
+                after,
+                reversible,
+                _inverse("move", path, src_ref, dest=dest, dest_before_ref=dest_ref),
+            )
+            return _ok(
+                request,
+                f"moved to {dest}",
+                mutation=_mutation(
+                    "move", path, src_before, after, src_ref, reversible, intent_id, dest=dest
+                ),
+            )
+
+    async def _delete(self, request, args, path, ws, context=None):
+        async with _resource_locks(path):
+            if os.path.isdir(path) and not os.path.islink(path):
+                return _fail(request, "refusing recursive directory delete")
+            before_ref, before = await self._capture_before(request.task_id, path, ws)
+            self._check_expected_preimage(path, before, context)
+            intent_id = await self._intent(
+                request.task_id,
+                path,
+                "delete",
+                before_ref,
+                _inverse("delete", path, before_ref),
+            )
+            if self.mutation_store is not None and intent_id is not None:
+                await self.mutation_store.mark_started(intent_id)
+            directory = None
+            try:
+                directory = self._safe_open_directory(os.path.dirname(path), ws)
+                os.unlink(os.path.basename(path), dir_fd=directory)
+            except (OSError, PolicyDenied) as e:
+                await self._abort(intent_id, str(e))
+                return _fail(request, str(e))
+            finally:
+                if directory is not None:
+                    os.close(directory)
+            reversible = before_ref is not None
+            await self._complete(intent_id, None, reversible, _inverse("delete", path, before_ref))
+            return _ok(
+                request,
+                "deleted",
+                mutation=_mutation("delete", path, before, None, before_ref, reversible, intent_id),
+            )
 
     # ------------------------------------------------------------------ #
     # Scope enforcement
     # ------------------------------------------------------------------ #
+    def _check_expected_preimage(self, path: str, current: str | None, context) -> None:
+        """Enforce a trusted resource-level compare-and-swap precondition.
+
+        The expected hash is carried by ``InvocationContext.directives`` and
+        therefore cannot be supplied by model-visible capability arguments.
+        The caller has already acquired the resource lock before this method
+        runs, so the check covers the complete read/intent/write window.
+        """
+        directives = getattr(context, "directives", None)
+        expected_preimages = getattr(directives, "expected_preimages", {})
+        expected = expected_preimages.get(self._real(path))
+        if expected is None:
+            return
+        if expected == "<missing>":
+            if current is not None:
+                raise FilesystemConflict(f"expected resource to be absent but it exists: {path}")
+            return
+        if current != expected:
+            raise FilesystemConflict(f"expected sha256 {expected} but resource has changed: {path}")
+
+    def _apply_expected_mode(self, path: str, context) -> None:
+        """Apply a trusted candidate mode during canonical commit."""
+        directives = getattr(context, "directives", None)
+        expected_modes = getattr(directives, "expected_modes", {})
+        mode = expected_modes.get(self._real(path))
+        if mode is not None:
+            os.chmod(path, int(mode))
+
     def _real(self, p: str) -> str:
         return os.path.realpath(os.path.abspath(p))
 
@@ -587,9 +736,16 @@ class FilesystemCapability:
                 pass
 
 
-def _mutation(op: str, path: str, before: str | None, after: str | None,
-              before_ref: str | None, reversible: bool,
-              intent_id: str | None, dest: str | None = None) -> dict:
+def _mutation(
+    op: str,
+    path: str,
+    before: str | None,
+    after: str | None,
+    before_ref: str | None,
+    reversible: bool,
+    intent_id: str | None,
+    dest: str | None = None,
+) -> dict:
     return {
         "resource": path,
         "operation": op,
@@ -603,7 +759,14 @@ def _mutation(op: str, path: str, before: str | None, after: str | None,
     }
 
 
-def _inverse(op: str, path: str, before_ref: str | None, dest: str | None = None, existed_before: bool = False, dest_before_ref: str | None = None) -> dict:
+def _inverse(
+    op: str,
+    path: str,
+    before_ref: str | None,
+    dest: str | None = None,
+    existed_before: bool = False,
+    dest_before_ref: str | None = None,
+) -> dict:
     target = dest if dest is not None else path
     if op in ("write", "patch"):
         if before_ref:
@@ -689,6 +852,7 @@ def _match_path(real_path: str, pattern: str) -> bool:
         return real_path.startswith(base + os.sep)
     if "*" in pattern:
         import fnmatch
+
         return fnmatch.fnmatch(real_path, _real_path(pattern))
     base = _real_path(pattern)
     return real_path == base or real_path.startswith(base + os.sep)
@@ -739,14 +903,20 @@ def _ok(
     if mutation:
         meta["mutation"] = mutation
     return CapabilityResult(
-        request.call_id, request.capability_id, CapabilityResultStatus.OK,
-        output=output, metadata=meta,
+        request.call_id,
+        request.capability_id,
+        CapabilityResultStatus.OK,
+        output=output,
+        metadata=meta,
     )
 
 
 def _fail(request: CapabilityRequest, msg: str) -> CapabilityResult:
     return CapabilityResult(
-        request.call_id, request.capability_id, CapabilityResultStatus.FAILED, error=msg,
+        request.call_id,
+        request.capability_id,
+        CapabilityResultStatus.FAILED,
+        error=msg,
     )
 
 

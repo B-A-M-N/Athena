@@ -19,6 +19,7 @@ Operations:
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import re
@@ -45,9 +46,9 @@ except ImportError:  # pragma: no cover
     pexpect = None
 
 try:
-    import pyte
+    pyte: Any = importlib.import_module("pyte")
 except ImportError:  # pragma: no cover
-    pyte = None  # type: ignore[assignment]
+    pyte = None
 
 _MAX_SESSIONS_PER_TASK = 8
 _DEFAULT_WAIT_TIMEOUT = 15.0
@@ -55,7 +56,8 @@ _MAX_WAIT_TIMEOUT = 60.0
 _logger = logging.getLogger("athena.terminal_session")
 _TERMINAL_AVAILABILITY = (
     Availability.AVAILABLE
-    if pexpect is not None and pyte is not None
+    if pexpect is not None
+    and pyte is not None
     and (os.name != "posix" or shutil.which("bwrap") is not None)
     else Availability.UNAVAILABLE
 )
@@ -95,7 +97,13 @@ def _screen_text(data: str | list[str]) -> str:
 def _terminal_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     """Build a non-secret environment for the PTY namespace."""
     allowed = (
-        "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_ALL",
+        "TERM",
     )
     env = {key: os.environ[key] for key in allowed if key in os.environ}
     env.setdefault("TERM", "xterm-256color")
@@ -119,16 +127,24 @@ class _Session:
     """
 
     _ANSI_RE = re.compile(
-        r"\x1b\[[?0-9;]*[A-Za-z]"      # CSI sequences
-        r"|\x1b\][^\x07]*\x07"          # OSC (title) sequences
+        r"\x1b\[[?0-9;]*[A-Za-z]"  # CSI sequences
+        r"|\x1b\][^\x07]*\x07"  # OSC (title) sequences
         r"|[\x00-\x08\x0b\x0c\x0e-\x1f]"  # other control chars
     )
     _BUF_CAP = 200_000  # chars
 
-    def __init__(self, session_id: str, task_id: str | None, cmd: str,
-                 rows: int, cols: int, env=None, cwd=None,
-                 workspace_root: str | None = None,
-                 network_policy: str | None = None):
+    def __init__(
+        self,
+        session_id: str,
+        task_id: str | None,
+        cmd: str,
+        rows: int,
+        cols: int,
+        env=None,
+        cwd=None,
+        workspace_root: str | None = None,
+        network_policy: str | None = None,
+    ):
         assert pexpect is not None, "pexpect required"
         if workspace_root is None:
             raise ValueError("terminal sessions require a workspace root")
@@ -143,8 +159,14 @@ class _Session:
         self.task_id = task_id
         self.workspace_root = workspace_root
         child = pexpect.spawn(
-            command[0], command[1:], encoding="utf-8", codec_errors="replace",
-            dimensions=(rows, cols), env=_terminal_env(env), cwd=None, timeout=None,
+            command[0],
+            command[1:],
+            encoding="utf-8",
+            codec_errors="replace",
+            dimensions=(rows, cols),
+            env=_terminal_env(env),
+            cwd=None,
+            timeout=None,
         )
         self.child = child
         self.cmd_text = cmd
@@ -165,7 +187,7 @@ class _Session:
                 if chunk:
                     self.buffer += chunk
                     if len(self.buffer) > self._BUF_CAP:
-                        self.buffer = self.buffer[-self._BUF_CAP:]
+                        self.buffer = self.buffer[-self._BUF_CAP :]
                     if self.screen_obj is not None:
                         try:
                             feed_screen(self.screen_obj, chunk)
@@ -207,16 +229,26 @@ class TerminalSessionCapability:
             "type": "object",
             "required": ["operation"],
             "properties": {
-                "operation": {"type": "string", "enum": [
-                    "create", "screen", "write", "send", "keys",
-                    "wait_for", "list", "resize", "kill"]},
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "create",
+                        "screen",
+                        "write",
+                        "send",
+                        "keys",
+                        "wait_for",
+                        "list",
+                        "resize",
+                        "kill",
+                    ],
+                },
                 "session": {"type": "string"},
                 "command": {"type": "string"},
                 "text": {"type": "string"},
                 "keys": {"type": "string"},
                 "pattern": {"type": "string", "maxLength": 512},
-                "timeout": {"type": "number", "exclusiveMinimum": 0,
-                             "maximum": 60},
+                "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 60},
                 "match": {"type": "string", "enum": ["literal", "regex"]},
                 "rows": {"type": "integer", "minimum": 2, "maximum": 200},
                 "cols": {"type": "integer", "minimum": 10, "maximum": 300},
@@ -224,10 +256,14 @@ class TerminalSessionCapability:
             },
             "additionalProperties": False,
         },
-        effects=frozenset({
-            EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS,
-            EffectClass.WRITE_LOCAL, EffectClass.READ_LOCAL,
-        }),
+        effects=frozenset(
+            {
+                EffectClass.EXECUTE,
+                EffectClass.SPAWN_PROCESS,
+                EffectClass.WRITE_LOCAL,
+                EffectClass.READ_LOCAL,
+            }
+        ),
         origin=CapabilityOrigin.NATIVE,
         availability=_TERMINAL_AVAILABILITY,
     )
@@ -239,11 +275,13 @@ class TerminalSessionCapability:
     async def _emit_runtime(self, event_type: str, session: _Session, **payload) -> None:
         if self._event_sink is None:
             return
-        await self._event_sink(make_event(
-            event_type,
-            {"session": session.id, **payload},
-            task_id=session.task_id,
-        ))
+        await self._event_sink(
+            make_event(
+                event_type,
+                {"session": session.id, **payload},
+                task_id=session.task_id,
+            )
+        )
 
     @staticmethod
     def available() -> bool:
@@ -260,18 +298,39 @@ class TerminalSessionCapability:
     def _escape_keys(self, keys: str):
         """Map friendly names to pexpect escapes; pass through unknown."""
         named = {
-            "enter": "\n", "return": "\n", "esc": "\x1b", "tab": "\t",
-            "C-c": "\x03", "C-d": "\x04", "C-z": "\x1a",
-            "C-l": "\x0c", "backspace": "\x7f",
-            "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C",
-            "left": "\x1b[D", "home": "\x1b[H", "end": "\x1b[F",
-            "pgup": "\x1b[5~", "pageup": "\x1b[5~",
-            "pgdn": "\x1b[6~", "pagedown": "\x1b[6~",
-            "delete": "\x1b[3~", "insert": "\x1b[2~",
-            "f1": "\x1bOP", "f2": "\x1bOQ", "f3": "\x1bOR", "f4": "\x1bOS",
-            "f5": "\x1b[15~", "f6": "\x1b[17~", "f7": "\x1b[18~",
-            "f8": "\x1b[19~", "f9": "\x1b[20~", "f10": "\x1b[21~",
-            "f11": "\x1b[23~", "f12": "\x1b[24~",
+            "enter": "\n",
+            "return": "\n",
+            "esc": "\x1b",
+            "tab": "\t",
+            "C-c": "\x03",
+            "C-d": "\x04",
+            "C-z": "\x1a",
+            "C-l": "\x0c",
+            "backspace": "\x7f",
+            "up": "\x1b[A",
+            "down": "\x1b[B",
+            "right": "\x1b[C",
+            "left": "\x1b[D",
+            "home": "\x1b[H",
+            "end": "\x1b[F",
+            "pgup": "\x1b[5~",
+            "pageup": "\x1b[5~",
+            "pgdn": "\x1b[6~",
+            "pagedown": "\x1b[6~",
+            "delete": "\x1b[3~",
+            "insert": "\x1b[2~",
+            "f1": "\x1bOP",
+            "f2": "\x1bOQ",
+            "f3": "\x1bOR",
+            "f4": "\x1bOS",
+            "f5": "\x1b[15~",
+            "f6": "\x1b[17~",
+            "f7": "\x1b[18~",
+            "f8": "\x1b[19~",
+            "f9": "\x1b[20~",
+            "f10": "\x1b[21~",
+            "f11": "\x1b[23~",
+            "f12": "\x1b[24~",
         }
         low = keys.strip()
         for key, value in named.items():
@@ -285,7 +344,9 @@ class TerminalSessionCapability:
         call_id = request.call_id
         if not self.available():
             return CapabilityResult(
-                call_id, request.capability_id, CapabilityResultStatus.FAILED,
+                call_id,
+                request.capability_id,
+                CapabilityResultStatus.FAILED,
                 error="terminal_session unavailable: install pexpect and pyte",
             )
         loop = asyncio.get_running_loop()
@@ -294,12 +355,11 @@ class TerminalSessionCapability:
             cmd = str(args.get("command") or "").strip()
             if not cmd:
                 return _result(request, ok=False, error="command required")
-            existing_sessions = [
-                s for s in self._sessions.values() if s.task_id == request.task_id
-            ]
+            existing_sessions = [s for s in self._sessions.values() if s.task_id == request.task_id]
             if len(existing_sessions) >= _MAX_SESSIONS_PER_TASK:
-                return _result(request, ok=False,
-                               error=f"session limit reached ({_MAX_SESSIONS_PER_TASK})")
+                return _result(
+                    request, ok=False, error=f"session limit reached ({_MAX_SESSIONS_PER_TASK})"
+                )
             sid = new_id("tty")
             rows = int(args.get("rows") or 24)
             cols = int(args.get("cols") or 80)
@@ -312,19 +372,17 @@ class TerminalSessionCapability:
                 workspace = ctx.get("workspace")
             if workspace is None or not getattr(workspace, "root", None):
                 return _result(
-                    request, ok=False,
+                    request,
+                    ok=False,
                     error="terminal sessions require workspace context",
                 )
             workspace_root = os.path.realpath(str(workspace.root))
             if cwd:
                 real = os.path.realpath(
-                    str(cwd) if os.path.isabs(str(cwd))
-                    else os.path.join(workspace_root, str(cwd))
+                    str(cwd) if os.path.isabs(str(cwd)) else os.path.join(workspace_root, str(cwd))
                 )
                 if real != workspace_root and not real.startswith(workspace_root + os.sep):
-                    return _result(
-                        request, ok=False,
-                        error=f"cwd outside workspace: {cwd}")
+                    return _result(request, ok=False, error=f"cwd outside workspace: {cwd}")
                 cwd = real
             else:
                 cwd = workspace_root
@@ -335,28 +393,39 @@ class TerminalSessionCapability:
             )
             try:
                 created_session = await loop.run_in_executor(
-                    None, lambda: _Session(
-                        sid, request.task_id, cmd, rows, cols, cwd=cwd,
+                    None,
+                    lambda: _Session(
+                        sid,
+                        request.task_id,
+                        cmd,
+                        rows,
+                        cols,
+                        cwd=cwd,
                         workspace_root=workspace_root,
                         network_policy=network_policy,
-                    ))
+                    ),
+                )
             except (OSError, ValueError, pexpect.exceptions.ExceptionPexpect) as exc:
                 return _result(request, ok=False, error=f"session create failed: {exc}")
             self._sessions[sid] = created_session
-            await self._emit_runtime(EV["RUNTIME_SESSION_CREATED"], created_session,
-                                     command=cmd, rows=rows, cols=cols)
-            return _result(request, output=f"created {sid} ({cmd})",
-                           meta={"session": sid})
+            await self._emit_runtime(
+                EV["RUNTIME_SESSION_CREATED"], created_session, command=cmd, rows=rows, cols=cols
+            )
+            return _result(request, output=f"created {sid} ({cmd})", meta={"session": sid})
 
         if op == "list":
             listed: list[dict[str, Any]] = [
-                {"session": s.id, "command": s.cmd_text,
-                 "alive": s.alive(), "rows": s.rows, "cols": s.cols}
+                {
+                    "session": s.id,
+                    "command": s.cmd_text,
+                    "alive": s.alive(),
+                    "rows": s.rows,
+                    "cols": s.cols,
+                }
                 for s in self._sessions.values()
                 if s.task_id == request.task_id
             ]
-            return _result(request, output=f"{len(listed)} session(s)",
-                           meta={"sessions": listed})
+            return _result(request, output=f"{len(listed)} session(s)", meta={"sessions": listed})
 
         session: _Session | None = self._own(request)
         if session is None:
@@ -365,18 +434,25 @@ class TerminalSessionCapability:
         if op == "screen":
             data = await loop.run_in_executor(None, session.drain)
             row, col = session.cursor()
-            return _result(request, output=_tail_text(data), meta={
-                "session": session.id, "alive": session.alive(),
-                "cursor_row": row, "cursor_col": col,
-                "rows": session.rows, "cols": session.cols})
+            return _result(
+                request,
+                output=_tail_text(data),
+                meta={
+                    "session": session.id,
+                    "alive": session.alive(),
+                    "cursor_row": row,
+                    "cursor_col": col,
+                    "rows": session.rows,
+                    "cols": session.cols,
+                },
+            )
 
         if op == "write":
             await loop.run_in_executor(None, session.child.write, str(args.get("text") or ""))
             return _result(request, output="ok", meta={"session": session.id})
 
         if op == "send":
-            await loop.run_in_executor(
-                None, session.child.sendline, str(args.get("text") or ""))
+            await loop.run_in_executor(None, session.child.sendline, str(args.get("text") or ""))
 
             def _drain_send():
                 time.sleep(0.15)
@@ -400,8 +476,7 @@ class TerminalSessionCapability:
             pattern = str(args.get("pattern") or "")
             if not pattern:
                 return _result(request, ok=False, error="pattern required")
-            timeout = min(float(args.get("timeout") or _DEFAULT_WAIT_TIMEOUT),
-                          _MAX_WAIT_TIMEOUT)
+            timeout = min(float(args.get("timeout") or _DEFAULT_WAIT_TIMEOUT), _MAX_WAIT_TIMEOUT)
             match_mode = str(args.get("match") or "literal")
             matcher = None
             if match_mode == "regex":
@@ -432,20 +507,22 @@ class TerminalSessionCapability:
             matched = await loop.run_in_executor(None, _wait)
             data = _tail_text(session.screen())
             if matched:
-                return _result(request, output=data, meta={
-                    "session": session.id, "matched": True})
+                return _result(request, output=data, meta={"session": session.id, "matched": True})
             reason = "eof" if not session.alive() else "timeout"
-            return _result(request, ok=False, output=data,
-                           error=f"wait_for: {reason}",
-                           meta={"session": session.id, "matched": False})
+            return _result(
+                request,
+                ok=False,
+                output=data,
+                error=f"wait_for: {reason}",
+                meta={"session": session.id, "matched": False},
+            )
 
         if op == "resize":
             rows = max(int(args.get("rows") or 24), 2)
             cols = max(int(args.get("cols") or 80), 10)
             if rows > 200 or cols > 300:
                 return _result(request, ok=False, error="rows/cols outside safe bounds")
-            await loop.run_in_executor(
-                None, session.child.setwinsize, rows, cols)
+            await loop.run_in_executor(None, session.child.setwinsize, rows, cols)
             session.rows, session.cols = rows, cols
             if getattr(session, "screen_obj", None) is not None:
                 try:
@@ -477,6 +554,8 @@ class TerminalSessionCapability:
                 loop = None
             if loop is not None:
                 for session in sessions:
-                    loop.create_task(self._emit_runtime(
-                        EV["RUNTIME_STATE_LOST"], session, reason="service_shutdown"
-                    ))
+                    loop.create_task(
+                        self._emit_runtime(
+                            EV["RUNTIME_STATE_LOST"], session, reason="service_shutdown"
+                        )
+                    )

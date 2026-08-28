@@ -67,11 +67,17 @@ def _serialize_block(block: ContentBlock) -> dict[str, Any]:
             "type": "artifact_ref",
             "uri": block.uri,
             "ref": {
-                "id": ref.id, "uri": ref.uri, "hash": ref.hash,
-                "mime_type": ref.mime_type, "size": ref.size,
-                "producer": ref.producer, "task_id": ref.task_id,
+                "id": ref.id,
+                "uri": ref.uri,
+                "hash": ref.hash,
+                "mime_type": ref.mime_type,
+                "size": ref.size,
+                "producer": ref.producer,
+                "task_id": ref.task_id,
                 "metadata": dict(ref.metadata),
-            } if ref is not None else None,
+            }
+            if ref is not None
+            else None,
         }
     if isinstance(block, CapabilityCallBlock):
         data = {
@@ -250,9 +256,7 @@ class SessionRepository:
 
     async def list_all(self) -> list[dict]:
         """Return every persisted session in creation order."""
-        rows = await self._db.fetch_all(
-            "SELECT * FROM sessions ORDER BY created_at ASC, rowid ASC"
-        )
+        rows = await self._db.fetch_all("SELECT * FROM sessions ORDER BY created_at ASC, rowid ASC")
         for row in rows:
             if row.get("metadata"):
                 row["metadata"] = json.loads(row["metadata"])
@@ -285,12 +289,8 @@ class SessionRepository:
                 if await self._db.fetch_one_raw(query, (session_id,)) is not None:
                     return False
 
-            await self._db.execute_raw(
-                "DELETE FROM messages WHERE session_id = ?", (session_id,)
-            )
-            await self._db.execute_raw(
-                "DELETE FROM sessions WHERE id = ?", (session_id,)
-            )
+            await self._db.execute_raw("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            await self._db.execute_raw("DELETE FROM sessions WHERE id = ?", (session_id,))
             if self._current_session_id == session_id:
                 self._current_session_id = None
             return True
@@ -304,7 +304,9 @@ class SessionRepository:
         if session_id is None:
             session_id = self._current_session_id
         if session_id is None:
-            raise ValueError("append_message requires a session_id in metadata or a current session")
+            raise ValueError(
+                "append_message requires a session_id in metadata or a current session"
+            )
         self._current_session_id = session_id
         blocks_json = json.dumps([_serialize_block(b) for b in message.blocks])
         prov_json = json.dumps(_serialize_provenance(message.provenance))
@@ -335,7 +337,11 @@ class SessionRepository:
             blocks_data = json.loads(row["blocks"]) if row.get("blocks") else []
             blocks = tuple(_deserialize_block(b) for b in blocks_data)
             prov_data = json.loads(row["provenance"]) if row.get("provenance") else None
-            prov = _deserialize_provenance(prov_data) if prov_data else Provenance(source_type=SourceType.RUNTIME)
+            prov = (
+                _deserialize_provenance(prov_data)
+                if prov_data
+                else Provenance(source_type=SourceType.RUNTIME)
+            )
             meta = json.loads(row["metadata"]) if row.get("metadata") else {}
             result.append(
                 Message(
@@ -353,77 +359,98 @@ class SessionRepository:
 def _serialize_workspace(ws: WorkspaceSpec | None) -> str | None:
     if ws is None:
         return None
-    return json.dumps({
-        "id": ws.id,
-        "root": ws.root,
-        "readable": [{"path": r.path, "allow": r.allow} for r in ws.readable],
-        "writable": [{"path": r.path, "allow": r.allow} for r in ws.writable],
-        "temp_root": ws.temp_root,
-        "execution_backend": ws.execution_backend,
-        "network_policy": ws.network_policy.value,
-        "mutation_mode": ws.mutation_mode.value,
-    })
+    return json.dumps(
+        {
+            "id": ws.id,
+            "root": ws.root,
+            "readable": [{"path": r.path, "allow": r.allow} for r in ws.readable],
+            "writable": [{"path": r.path, "allow": r.allow} for r in ws.writable],
+            "temp_root": ws.temp_root,
+            "execution_backend": ws.execution_backend,
+            "network_policy": ws.network_policy.value,
+            "mutation_mode": ws.mutation_mode.value,
+        }
+    )
 
 
 def _serialize_criteria(crits: tuple[Criterion, ...]) -> str:
     out = []
     for c in crits:
         v = c.verification
-        out.append({
-            "id": c.id,
-            "description": c.description,
-            "required": c.required,
-            "verification": {
-                "type": v.type.value,
-                "command": v.command,
-                "path": v.path,
-                "predicate": v.predicate,
-                "capability": v.capability,
-            } if v else None,
-        })
+        out.append(
+            {
+                "id": c.id,
+                "description": c.description,
+                "required": c.required,
+                "verification": {
+                    "type": v.type.value,
+                    "command": v.command,
+                    "path": v.path,
+                    "predicate": v.predicate,
+                    "capability": v.capability,
+                }
+                if v
+                else None,
+            }
+        )
     return json.dumps(out)
 
 
 def _serialize_resource_budget(rb: ResourceBudget) -> str:
-    return json.dumps({
-        "max_agent_iterations": rb.max_agent_iterations,
-        "max_input_tokens": rb.max_input_tokens,
-        "max_output_tokens": rb.max_output_tokens,
-        "max_cost_usd": str(rb.max_cost_usd) if rb.max_cost_usd is not None else None,
-        "max_wall_time": rb.max_wall_time.total_seconds() if rb.max_wall_time is not None else None,
-        "max_children": rb.max_children,
-        "max_child_depth": rb.max_child_depth,
-        "max_parallel_model_calls": rb.max_parallel_model_calls,
-        "max_parallel_executions": rb.max_parallel_executions,
-        "max_artifact_bytes": rb.max_artifact_bytes,
-    })
+    return json.dumps(
+        {
+            "max_agent_iterations": rb.max_agent_iterations,
+            "max_input_tokens": rb.max_input_tokens,
+            "max_output_tokens": rb.max_output_tokens,
+            "max_cost_usd": str(rb.max_cost_usd) if rb.max_cost_usd is not None else None,
+            "max_wall_time": rb.max_wall_time.total_seconds()
+            if rb.max_wall_time is not None
+            else None,
+            "max_children": rb.max_children,
+            "max_child_depth": rb.max_child_depth,
+            "max_parallel_model_calls": rb.max_parallel_model_calls,
+            "max_parallel_executions": rb.max_parallel_executions,
+            "max_artifact_bytes": rb.max_artifact_bytes,
+        }
+    )
 
 
 def _serialize_model_policy(mp: ModelPolicy) -> str:
-    return json.dumps({
-        "role": mp.role,
-        "allowed": list(mp.allowed),
-        "require_tools": mp.require_tools,
-        "privacy": mp.privacy,
-        "max_cost_usd": str(mp.max_cost_usd) if mp.max_cost_usd is not None else None,
-    })
+    return json.dumps(
+        {
+            "role": mp.role,
+            "allowed": list(mp.allowed),
+            "require_tools": mp.require_tools,
+            "privacy": mp.privacy,
+            "max_cost_usd": str(mp.max_cost_usd) if mp.max_cost_usd is not None else None,
+        }
+    )
 
 
 def _serialize_capability_policy(cp: CapabilityPolicy) -> str:
-    return json.dumps({
-        "effects": sorted(cp.effects),
-        "allow": list(cp.allow),
-        "ask": list(cp.ask),
-        "deny": list(cp.deny),
-    })
+    return json.dumps(
+        {
+            "effects": sorted(cp.effects),
+            "allow": list(cp.allow),
+            "ask": list(cp.ask),
+            "deny": list(cp.deny),
+        }
+    )
 
 
 def _serialize_context_refs(refs: tuple) -> str:
-    return json.dumps([
-        {"kind": r.kind, "ref": r.ref, "source_id": r.source_id,
-         "summary": r.summary, "mime_type": getattr(r, "mime_type", None)}
-        for r in refs
-    ])
+    return json.dumps(
+        [
+            {
+                "kind": r.kind,
+                "ref": r.ref,
+                "source_id": r.source_id,
+                "summary": r.summary,
+                "mime_type": getattr(r, "mime_type", None),
+            }
+            for r in refs
+        ]
+    )
 
 
 def _serialize_delivery(d) -> str | None:
@@ -485,9 +512,7 @@ class TaskRepository:
 
     async def transition(self, task_id: str, new_status: TaskStatus) -> None:
         async with self._db.transaction():
-            row = await self._db.fetch_one_raw(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,)
-            )
+            row = await self._db.fetch_one_raw("SELECT status FROM tasks WHERE id = ?", (task_id,))
             if row is None:
                 raise KeyError(f"Task not found: {task_id}")
             current = TaskStatus(row["status"])

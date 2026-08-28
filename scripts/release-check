@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Run the release gate against one frozen, clean commit.
+
+The developer checkout may be dirty while work is in progress.  This command
+does not pretend that such a checkout is a release candidate: it extracts one
+resolved commit into a temporary clean tree and runs every release lane there.
+Pass ``--evidence-dir`` when the lane records must survive the temporary tree.
+
+Usage::
+
+    scripts/release-check                 # check HEAD as a clean commit
+    scripts/release-check --sha <commit>  # check an exact release candidate
+    scripts/release-check --skip-e2e      # local fast gate; not the full gate
+    scripts/release-check --sha <commit> --evidence-dir .release-evidence
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import tarfile
+import time
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _git(*args: str, cwd: Path = REPO_ROOT) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=cwd, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _run(
+    command: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
+) -> dict[str, object]:
+    print(f"[release] {' '.join(command)}", flush=True)
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            command, cwd=cwd, env=env, timeout=timeout, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        output = result.stdout
+        exit_code = result.returncode
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        exit_code = 124
+        output += f"\ncommand timed out after {timeout:g}s"
+    except OSError as exc:
+        output = f"{type(exc).__name__}: {exc}"
+        exit_code = 127
+    print(output, end="" if output.endswith("\n") else "\n", flush=True)
+    return {
+        "command": command,
+        "exit_code": exit_code,
+        "duration_s": round(time.monotonic() - started, 3),
+        "output": output,
+    }
+
+
+def _extract_commit(commit: str, checkout: Path, *, timeout: float) -> None:
+    """Extract one commit without writing repository metadata.
+
+    The release check must also work in read-only CI/agent environments where
+    ``.git/worktrees`` cannot be created.  ``git archive`` gives us the same
+    committed bytes while keeping the source checkout untouched.
+    """
+    try:
+        archive = subprocess.run(
+            ["git", "archive", "--format=tar", commit], cwd=REPO_ROOT,
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout,
+        ).stdout
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("timed out while extracting the frozen commit") from exc
+    checkout.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+        root = checkout.resolve()
+        members = []
+        for member in tar.getmembers():
+            target = (checkout / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"frozen archive contains unsafe path: {member.name}")
+            members.append(member)
+        tar.extractall(checkout, members=members)
+
+
+def _commands(uv: str, *, skip_e2e: bool) -> list[tuple[str, list[str]]]:
+    # The clean archive has no editable development environment. Select the
+    # locked dev extra explicitly so pytest/mypy/ruff/build never fall through
+    # to an unrelated host interpreter on PATH.
+    prefix = [uv, "run", "--frozen", "--extra", "dev"]
+    commands: list[tuple[str, list[str]]] = [
+        ("ruff-format", [*prefix, "ruff", "format", "--check", "src", "tests"]),
+        ("ruff-check", [*prefix, "ruff", "check", "src", "tests"]),
+        ("mypy", [*prefix, "mypy", "src/athena"]),
+        ("compileall", [*prefix, "python", "-m", "compileall", "-q", "src", "tests"]),
+        ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider",
+                     "--ignore=tests/e2e"]),
+        ("release-scenarios", [*prefix, "python", "scripts/scenarios",
+                                "--require-clean", "--output", "release-scenarios.json"]),
+        ("architecture-lint", [*prefix, "python", "scripts/architecture-lint"]),
+        ("native-check", ["cargo", "check", "--manifest-path", "native/Cargo.toml", "--offline"]),
+        ("native-test", ["cargo", "test", "--manifest-path", "native/Cargo.toml", "--offline"]),
+        ("native-smoke", ["scripts/native-smoke"]),
+    ]
+    if not skip_e2e:
+        commands.append(("e2e", [
+            *prefix, "pytest", "-q", "-p", "no:cacheprovider",
+            "tests/e2e/test_release_black_box.py",
+        ]))
+    return commands
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
+def _write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(value)
+    os.replace(temporary, path)
+
+
+def _evidence_record(record: dict[str, object]) -> dict[str, object]:
+    return {
+        key: value for key, value in record.items() if key != "output"
+    } | {"output_tail": str(record.get("output") or "")[-4000:]}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="scripts/release-check",
+        description="Run the complete release gate against a frozen commit.",
+    )
+    parser.add_argument(
+        "--sha", default=None,
+        help="commit-ish to check (resolved once before creating the worktree)",
+    )
+    parser.add_argument(
+        "--uv", default=os.environ.get("ATHENA_RELEASE_UV", "uv"),
+        help="uv executable used for Python lanes",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=1800.0,
+        help="per-command timeout in seconds (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--skip-e2e", action="store_true",
+        help="skip installed-artifact acceptance; not a full release check",
+    )
+    parser.add_argument(
+        "--evidence-dir", default=None,
+        help="directory outside the temporary checkout for durable release evidence",
+    )
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+
+    explicit_sha = args.sha is not None
+    requested_sha = args.sha or "HEAD"
+    if not explicit_sha:
+        try:
+            dirty = _git("status", "--porcelain", "--untracked-files=all")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"release-check: cannot inspect checkout state: {exc}", file=sys.stderr)
+            return 2
+        if dirty:
+            print(
+                "release-check: FAIL working tree contains changes not represented "
+                "by HEAD; commit the candidate or pass --sha explicitly",
+                file=sys.stderr,
+            )
+            return 1
+
+    try:
+        resolved = _git("rev-parse", "--verify", f"{requested_sha}^{{commit}}")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"release-check: cannot resolve --sha {requested_sha!r}: {exc}", file=sys.stderr)
+        return 2
+
+    temp_root = Path(tempfile.mkdtemp(prefix="athena-release-check-"))
+    checkout = temp_root / "checkout"
+    evidence_dir = (
+        Path(args.evidence_dir).expanduser().resolve()
+        if args.evidence_dir else None
+    )
+    lanes: list[dict[str, object]] = []
+    final_status = "FAIL"
+    error: str | None = None
+    try:
+        if evidence_dir is not None:
+            _write_json(evidence_dir / "release-identity.json", {
+                "commit_sha": resolved,
+                "requested_sha": requested_sha,
+                "explicit_sha": explicit_sha,
+                "skip_e2e": bool(args.skip_e2e),
+            })
+        _extract_commit(resolved, checkout, timeout=args.timeout)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src") + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        )
+        env.pop("PYTHONHOME", None)
+        env["ATHENA_RELEASE_SHA"] = resolved
+        env["ATHENA_FROZEN_SOURCE"] = "1"
+        # Keep uv's environment outside the checkout. Otherwise the first
+        # ``uv run`` can create an untracked .venv and make the later
+        # scenarios --require-clean assertion fail for the wrong reason.
+        env["UV_PROJECT_ENVIRONMENT"] = str(temp_root / "venv")
+        env["UV_CACHE_DIR"] = str(temp_root / "uv-cache")
+        for name, command in _commands(args.uv, skip_e2e=args.skip_e2e):
+            record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
+            record["name"] = name
+            lanes.append(record)
+            if evidence_dir is not None:
+                _write_text(
+                    evidence_dir / {
+                        "architecture-lint": "architecture-lint.txt",
+                        "native-check": "native-check.txt",
+                        "native-test": "native-test.txt",
+                        "native-smoke": "native-smoke.txt",
+                        "e2e": "e2e.txt",
+                    }.get(name, f"{name}.txt"),
+                    str(record.get("output") or ""),
+                )
+            if int(record.get("exit_code") or 0) != 0:
+                raise RuntimeError(
+                    f"command failed with exit {record['exit_code']}: {' '.join(command)}"
+                )
+        if evidence_dir is not None:
+            static_names = {"ruff-format", "ruff-check", "mypy", "compileall"}
+            _write_json(evidence_dir / "static-checks.json", {
+                "commit_sha": resolved,
+                "lanes": [_evidence_record(item) for item in lanes
+                          if item.get("name") in static_names],
+            })
+            pytest_lane = next(
+                (item for item in lanes if item.get("name") == "pytest"), None,
+            )
+            _write_json(evidence_dir / "pytest-summary.json", {
+                "commit_sha": resolved,
+                "lane": _evidence_record(pytest_lane) if pytest_lane else None,
+            })
+            scenario_path = checkout / "release-scenarios.json"
+            if scenario_path.exists():
+                _write_text(
+                    evidence_dir / "release-scenarios.json",
+                    scenario_path.read_text(encoding="utf-8"),
+                )
+            else:
+                scenario_lane = next(
+                    (item for item in lanes if item.get("name") == "release-scenarios"),
+                    None,
+                )
+                _write_json(evidence_dir / "release-scenarios.json", {
+                    "commit_sha": resolved,
+                    "lane": _evidence_record(scenario_lane) if scenario_lane else None,
+                })
+            if args.skip_e2e:
+                _write_text(
+                    evidence_dir / "e2e.txt",
+                    "SKIPPED: installed-artifact acceptance was explicitly omitted\n",
+                )
+        final_status = "PARTIAL_PASS" if args.skip_e2e else "PASS"
+        if args.skip_e2e:
+            print(
+                "release-check: PARTIAL PASS — e2e omitted, not releasable",
+                flush=True,
+            )
+        else:
+            print(f"release-check: PASS {resolved}", flush=True)
+        return 0
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+        error = str(exc)
+        print(f"release-check: FAIL {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if evidence_dir is not None:
+            _write_json(evidence_dir / "final-release-result.json", {
+                "commit_sha": resolved,
+                "status": final_status,
+                "releasable": final_status == "PASS",
+                "error": error,
+                "lanes": [_evidence_record(item) for item in lanes],
+            })
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

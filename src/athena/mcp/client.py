@@ -138,17 +138,11 @@ class MCPClient:
                     streamablehttp_client = importlib.import_module(
                         "mcp.client.streamable_http"
                     ).streamablehttp_client
-                    http_ctx = streamablehttp_client(
-                        self.url, timeout=float(self.connect_timeout)
-                    )
+                    http_ctx = streamablehttp_client(self.url, timeout=float(self.connect_timeout))
                     read, write, _ = await stack.enter_async_context(http_ctx)
                 else:
-                    stdio_client = importlib.import_module(
-                        "mcp.client.stdio"
-                    ).stdio_client
-                    StdioServerParameters = importlib.import_module(
-                        "mcp"
-                    ).StdioServerParameters
+                    stdio_client = importlib.import_module("mcp.client.stdio").stdio_client
+                    StdioServerParameters = importlib.import_module("mcp").StdioServerParameters
                     server_params = StdioServerParameters(
                         command=_require_str(self.command),
                         args=self.args,
@@ -157,9 +151,7 @@ class MCPClient:
                     )
                     stdio_ctx = stdio_client(server_params)
                     read, write = await stack.enter_async_context(stdio_ctx)
-                session = await stack.enter_async_context(
-                    mcp.ClientSession(read, write)
-                )
+                session = await stack.enter_async_context(mcp.ClientSession(read, write))
                 await session.initialize()
                 self._session = session
                 self._exit_stack = stack
@@ -198,8 +190,7 @@ class MCPClient:
     def _require(self) -> Any:
         if not self.connected:
             raise MCPError(
-                f"MCP server {self.connection_id!r} is not connected; "
-                "call connect() first"
+                f"MCP server {self.connection_id!r} is not connected; call connect() first"
             )
         return self._session
 
@@ -213,9 +204,7 @@ class MCPClient:
             async with self._lock:
                 result = await session.list_tools()
         except Exception as exc:
-            raise MCPError(
-                f"MCP list_tools failed on {self.connection_id!r}: {exc}"
-            ) from exc
+            raise MCPError(f"MCP list_tools failed on {self.connection_id!r}: {exc}") from exc
         out: list[MCPToolRef] = []
         for t in result.tools:
             out.append(
@@ -223,9 +212,7 @@ class MCPClient:
                     name=t.name,
                     description=getattr(t, "description", "") or "",
                     input_schema=(getattr(t, "inputSchema", None) or {}) or {},
-                    annotations=_normalize_annotations(
-                        getattr(t, "annotations", None)
-                    ),
+                    annotations=_normalize_annotations(getattr(t, "annotations", None)),
                     server=self.connection_id,
                 )
             )
@@ -237,9 +224,7 @@ class MCPClient:
             async with self._lock:
                 result = await session.list_resources()
         except Exception as exc:
-            raise MCPError(
-                f"MCP list_resources failed on {self.connection_id!r}: {exc}"
-            ) from exc
+            raise MCPError(f"MCP list_resources failed on {self.connection_id!r}: {exc}") from exc
         refs = [
             MCPResourceRef(
                 uri=r.uri,
@@ -258,9 +243,7 @@ class MCPClient:
             async with self._lock:
                 result = await session.list_prompts()
         except Exception as exc:
-            raise MCPError(
-                f"MCP list_prompts failed on {self.connection_id!r}: {exc}"
-            ) from exc
+            raise MCPError(f"MCP list_prompts failed on {self.connection_id!r}: {exc}") from exc
         return [
             MCPPromptRef(
                 name=p.name,
@@ -359,7 +342,7 @@ def _render_mcp_content(blocks: list) -> str:
                     if text is not None:
                         parts.append(str(text))
                     else:
-                        parts.append(f"[resource:{res.get('uri','')}]")
+                        parts.append(f"[resource:{res.get('uri', '')}]")
                 else:
                     parts.append(str(res))
             else:

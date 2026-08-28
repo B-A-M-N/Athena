@@ -170,12 +170,14 @@ class BudgetTracker:
         if summary is not None:
             self.consume(
                 task_id,
-                dict(input_tokens=summary.input_tokens,
-                     output_tokens=summary.output_tokens,
-                     model_calls=summary.model_calls,
-                     cost=summary.cost_usd,
-                     executions=summary.executions,
-                     mutations=summary.mutations),
+                dict(
+                    input_tokens=summary.input_tokens,
+                    output_tokens=summary.output_tokens,
+                    model_calls=summary.model_calls,
+                    cost=summary.cost_usd,
+                    executions=summary.executions,
+                    mutations=summary.mutations,
+                ),
             )
 
     def record_child(self, parent_id: str) -> None:
@@ -193,11 +195,17 @@ class BudgetTracker:
             if entry is None:
                 return Usage()
             return Usage(
-                iterations=entry.iterations, model_calls=entry.model_calls,
-                input_tokens=entry.input_tokens, output_tokens=entry.output_tokens,
-                cost=entry.cost, executions=entry.executions, mutations=entry.mutations,
-                children=entry.children, artifact_bytes=entry.artifact_bytes,
-                started=entry.started, wall_time_s=entry.wall_time_s,
+                iterations=entry.iterations,
+                model_calls=entry.model_calls,
+                input_tokens=entry.input_tokens,
+                output_tokens=entry.output_tokens,
+                cost=entry.cost,
+                executions=entry.executions,
+                mutations=entry.mutations,
+                children=entry.children,
+                artifact_bytes=entry.artifact_bytes,
+                started=entry.started,
+                wall_time_s=entry.wall_time_s,
             )
 
     # ------------------------------------------------------------------ #
@@ -244,7 +252,11 @@ class BudgetTracker:
             return False
         if not row:
             return False
-        rb = _deserialize_budget(row.get("resource_budget")) if row.get("resource_budget") else ResourceBudget()
+        rb = (
+            _deserialize_budget(row.get("resource_budget"))
+            if row.get("resource_budget")
+            else ResourceBudget()
+        )
         with self._lock:
             self._budgets[task_id] = rb
             self._parent[task_id] = row.get("parent_task_id")
@@ -282,8 +294,8 @@ class BudgetTracker:
         budget = await self.budget_of_async(task_id)
         total = await self.total(task_id)
         cost_remaining = _cap_remaining_dec(
-            budget.max_cost_usd if budget.max_cost_usd is not None else None,
-            total.cost)
+            budget.max_cost_usd if budget.max_cost_usd is not None else None, total.cost
+        )
         return {
             "iterations": _cap_remaining(budget.max_agent_iterations, total.iterations),
             "input_tokens": _cap_remaining(budget.max_input_tokens, total.input_tokens),
@@ -386,7 +398,13 @@ def _cap_remaining_dec(cap: Decimal | None, used: Decimal) -> Decimal | None:
 
 def _all_zero(u: Usage) -> bool:
     return (
-        u.iterations == 0 and u.model_calls == 0 and u.input_tokens == 0
-        and u.output_tokens == 0 and u.cost == 0 and u.executions == 0
-        and u.mutations == 0 and u.children == 0 and u.artifact_bytes == 0
+        u.iterations == 0
+        and u.model_calls == 0
+        and u.input_tokens == 0
+        and u.output_tokens == 0
+        and u.cost == 0
+        and u.executions == 0
+        and u.mutations == 0
+        and u.children == 0
+        and u.artifact_bytes == 0
     )

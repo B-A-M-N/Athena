@@ -13,6 +13,7 @@ import pytest
 from athena.protocol.tasks import FINAL_STATUSES, TaskStatus
 from athena.state.tasks import TaskStore
 
+
 async def _wait_for(store: TaskStore, task_id: str, *, polls: int = 5, step: float = 0.01):
     """Poll until the task is terminal; returns final status (or None if still waiting)."""
     seen = None
@@ -23,6 +24,7 @@ async def _wait_for(store: TaskStore, task_id: str, *, polls: int = 5, step: flo
             return seen
         await asyncio.sleep(step)
     return None
+
 
 @pytest.mark.athena_claim("BHV-023", "BHV-024", "BHV-022")
 @pytest.mark.athena_evidence("test", "invariant")

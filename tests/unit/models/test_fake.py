@@ -49,9 +49,7 @@ async def test_fake_returns_canned_response():
     assert any(e.type == ModelEventType.DONE for e in events)
     done = next(e for e in events if e.type == ModelEventType.DONE)
     assert done.response is not None
-    assert any(
-        isinstance(b, TextBlock) and b.text == "pong" for b in done.response.blocks
-    )
+    assert any(isinstance(b, TextBlock) and b.text == "pong" for b in done.response.blocks)
     assert done.response.usage is not None
 
 

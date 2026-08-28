@@ -18,6 +18,7 @@ from athena.state.database import Database
 
 __all__ = ["WorldStateStore"]
 
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -34,10 +35,12 @@ class WorldStateStore:
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS claims ("
                 "id TEXT PRIMARY KEY, task_id TEXT, text TEXT, status TEXT,"
-                " evidence TEXT, depends_on_paths TEXT, created_at TEXT)")
+                " evidence TEXT, depends_on_paths TEXT, created_at TEXT)"
+            )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS claim_invalidations ("
-                "claim_id TEXT, reason TEXT, ts TEXT)")
+                "claim_id TEXT, reason TEXT, ts TEXT)"
+            )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS invariants ("
                 "id TEXT PRIMARY KEY, task_id TEXT, description TEXT NOT NULL,"
@@ -107,30 +110,29 @@ class WorldStateStore:
                 reason["mutation_sequence"] = mutation_sequence
             if mutation_event_sequence is not None:
                 reason["mutation_event_sequence"] = mutation_event_sequence
+            await self._db.execute("UPDATE claims SET status = 'STALE' WHERE id = ?", (row["id"],))
             await self._db.execute(
-                "UPDATE claims SET status = 'STALE' WHERE id = ?", (row["id"],))
-            await self._db.execute(
-                "INSERT INTO claim_invalidations(claim_id, reason, ts)"
-                " VALUES (?, ?, ?)",
-                (row["id"], json.dumps(reason), _now()))
+                "INSERT INTO claim_invalidations(claim_id, reason, ts) VALUES (?, ?, ?)",
+                (row["id"], json.dumps(reason), _now()),
+            )
             flipped.append(row["id"])
         return flipped
 
     async def mark_contradicted(self, claim_id: str, because: str) -> bool:
         """Mark one claim CONTRADICTED; returns False if unknown/not verified."""
         await self._ensure_schema()
-        row = await self._db.fetch_one(
-            "SELECT status FROM claims WHERE id = ?", (claim_id,))
+        row = await self._db.fetch_one("SELECT status FROM claims WHERE id = ?", (claim_id,))
         if row is None:
             return False
         if row["status"] == "CONTRADICTED":
             return True
         await self._db.execute(
-            "UPDATE claims SET status = 'CONTRADICTED' WHERE id = ?", (claim_id,))
+            "UPDATE claims SET status = 'CONTRADICTED' WHERE id = ?", (claim_id,)
+        )
         await self._db.execute(
-            "INSERT INTO claim_invalidations(claim_id, reason, ts)"
-            " VALUES (?, ?, ?)",
-            (claim_id, json.dumps({"because": because}), _now()))
+            "INSERT INTO claim_invalidations(claim_id, reason, ts) VALUES (?, ?, ?)",
+            (claim_id, json.dumps({"because": because}), _now()),
+        )
         return True
 
     async def save_invariant(self, record: dict) -> str:
@@ -218,10 +220,12 @@ class WorldStateStore:
             rec["evidence"] = json.loads(rec.get("evidence") or "{}")
             rec["depends_on_paths"] = tuple(json.loads(rec.get("depends_on_paths") or "[]"))
             invalidations = await self._db.fetch_all(
-                "SELECT reason, ts FROM claim_invalidations WHERE claim_id = ?"
-                " ORDER BY ts ASC", (rec["id"],))
+                "SELECT reason, ts FROM claim_invalidations WHERE claim_id = ? ORDER BY ts ASC",
+                (rec["id"],),
+            )
             rec["invalidated_by"] = [
-                {**json.loads(i["reason"]), "ts": i["ts"]} for i in invalidations]
+                {**json.loads(i["reason"]), "ts": i["ts"]} for i in invalidations
+            ]
             out.append(rec)
         return out
 

@@ -105,18 +105,25 @@ async def test_acceptance_evidence_includes_task_scoped_research(service):
     task = await service.submit(_req("verify a captured research claim"), wait=True)
     content = b"status=ready"
     artifact = await service._artifacts.save(
-        task_id=task.id, content=content, mime_type="text/plain",
+        task_id=task.id,
+        content=content,
+        mime_type="text/plain",
         producer="test.research",
     )
     source = SourceRecord.for_uri(
-        artifact.uri, title="captured release", content_hash=artifact.hash,
-        artifact_uri=artifact.uri, task_id=task.id,
+        artifact.uri,
+        title="captured release",
+        content_hash=artifact.hash,
+        artifact_uri=artifact.uri,
+        task_id=task.id,
     )
     await service._research_store.save_source(source)
     evidence = EvidenceObject.for_content(
-        source_id=source.id, claim_id="release-status",
+        source_id=source.id,
+        claim_id="release-status",
         extracted_claim="The release is ready.",
-        exact_supporting_excerpt="status=ready", task_id=task.id,
+        exact_supporting_excerpt="status=ready",
+        task_id=task.id,
     )
     await service._research_store.save_evidence(evidence)
 
@@ -124,3 +131,5 @@ async def test_acceptance_evidence_includes_task_scoped_research(service):
     research = collected["evidence"]["research"]
     assert research["sources"][0]["id"] == source.id
     assert research["evidence"][0]["id"] == evidence.id
+    assert collected["world_state"]["task_id"] == task.id
+    assert collected["evidence"]["world_state"]["task_id"] == task.id

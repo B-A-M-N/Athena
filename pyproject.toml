@@ -20,6 +20,7 @@ dependencies = [
     "pyte>=0.8,<1",
     "jsonschema>=4.23,<5",
     "tomli-w>=1.0",
+    "tomli>=2.0",
     "wcwidth>=0.2",
 ]
 
@@ -70,7 +71,7 @@ warn_redundant_casts = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["PIL"]
+module = ["PIL", "anthropic"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

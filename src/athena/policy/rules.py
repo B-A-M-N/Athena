@@ -109,7 +109,11 @@ def rule(
 ) -> Rule:
     return Rule(
         capability_id=capability_id,
-        effect=effect if isinstance(effect, EffectClass) else EffectClass(effect) if effect else None,
+        effect=effect
+        if isinstance(effect, EffectClass)
+        else EffectClass(effect)
+        if effect
+        else None,
         path=path,
         resource=resource,
         priority=priority,

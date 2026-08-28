@@ -16,8 +16,26 @@ from athena.skills.models import Skill
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{1,}")
 _SKIPWORDS = frozenset(
     {
-        "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "at",
-        "with", "using", "please", "help", "that", "this", "is", "are", "be",
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "of",
+        "to",
+        "for",
+        "in",
+        "on",
+        "at",
+        "with",
+        "using",
+        "please",
+        "help",
+        "that",
+        "this",
+        "is",
+        "are",
+        "be",
     }
 )
 
@@ -69,11 +87,7 @@ class SkillSelector:
 
     @staticmethod
     def _tokens(text: str) -> list[str]:
-        return [
-            w.lower()
-            for w in _TOKEN_RE.findall(text or "")
-            if w.lower() not in _SKIPWORDS
-        ]
+        return [w.lower() for w in _TOKEN_RE.findall(text or "") if w.lower() not in _SKIPWORDS]
 
 
 __all__ = ["SkillSelector"]

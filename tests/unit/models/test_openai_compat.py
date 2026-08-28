@@ -86,8 +86,8 @@ def _user_request(text: str = "hello") -> ModelRequest:
 async def test_stream_events_delta_and_done_with_usage(monkeypatch):
     provider = _provider()
     sse = [
-        'data: ' + json.dumps({"choices": [{"delta": {"content": "Hello"}}]}),
-        'data: ' + json.dumps({"usage": {"prompt_tokens": 10, "completion_tokens": 3}}),
+        "data: " + json.dumps({"choices": [{"delta": {"content": "Hello"}}]}),
+        "data: " + json.dumps({"usage": {"prompt_tokens": 10, "completion_tokens": 3}}),
         "data: [DONE]",
     ]
     fake_resp = _FakeSSEResponse(sse)
@@ -96,8 +96,7 @@ async def test_stream_events_delta_and_done_with_usage(monkeypatch):
     events = [e async for e in provider.complete(_user_request())]
 
     text_deltas = [
-        e for e in events
-        if e.type == ModelEventType.DELTA and (e.delta.text or "") == "Hello"
+        e for e in events if e.type == ModelEventType.DELTA and (e.delta.text or "") == "Hello"
     ]
     done = next(e for e in events if e.type == ModelEventType.DONE)
     assert len(text_deltas) == 1
@@ -111,8 +110,11 @@ async def test_provider_response_keeps_profile_and_cache_metadata(monkeypatch):
     provider = _provider()
     base = _user_request()
     request = ModelRequest(
-        messages=base.messages, model=base.model, provider=base.provider,
-        request_id=base.request_id, system=base.system,
+        messages=base.messages,
+        model=base.model,
+        provider=base.provider,
+        request_id=base.request_id,
+        system=base.system,
         metadata={
             "provider_profile_id": "openai-local",
             "provider_profile_fingerprint": "fp-1",
@@ -121,15 +123,20 @@ async def test_provider_response_keeps_profile_and_cache_metadata(monkeypatch):
         },
     )
     sse = [
-        'data: ' + json.dumps({"choices": [{"delta": {"content": "ok"}}]}),
-        'data: ' + json.dumps({
-            "usage": {"prompt_tokens": 10, "completion_tokens": 3,
-                       "prompt_tokens_details": {"cached_tokens": 7}},
-        }),
+        "data: " + json.dumps({"choices": [{"delta": {"content": "ok"}}]}),
+        "data: "
+        + json.dumps(
+            {
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 3,
+                    "prompt_tokens_details": {"cached_tokens": 7},
+                },
+            }
+        ),
         "data: [DONE]",
     ]
-    monkeypatch.setattr(
-        provider._client, "stream", _StreamCtx(_FakeSSEResponse(sse)))
+    monkeypatch.setattr(provider._client, "stream", _StreamCtx(_FakeSSEResponse(sse)))
     events = [e async for e in provider.complete(request)]
     response = next(e.response for e in events if e.response is not None)
     assert response.metadata["provider_profile_id"] == "openai-local"
@@ -196,10 +203,16 @@ def test_nonstream_response_keeps_reasoning_content():
     provider = _provider()
     event = provider._parse_complete(
         _user_request(),
-        {"choices": [{"message": {
-            "reasoning_content": "inspect first",
-            "content": "I will inspect it.",
-        }}]},
+        {
+            "choices": [
+                {
+                    "message": {
+                        "reasoning_content": "inspect first",
+                        "content": "I will inspect it.",
+                    }
+                }
+            ]
+        },
     )
 
     assert isinstance(event.response.blocks[0], ReasoningBlock)
@@ -210,13 +223,15 @@ def test_nonstream_response_keeps_reasoning_content():
 def test_translate_multimodal_blocks_without_dropping_them():
     provider = _provider()
     message = Message(
-        id="m-media", role=Role.USER,
+        id="m-media",
+        role=Role.USER,
         blocks=(
             TextBlock(text="inspect these"),
             ImageBlock(data_path="https://example.test/image.png", mime_type="image/png"),
             AudioBlock(data_path="BASE64", mime_type="audio/wav"),
         ),
-        created_at=None, provenance=None,
+        created_at=None,
+        provenance=None,
     )
 
     translated = provider._translate_message(message)

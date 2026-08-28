@@ -121,7 +121,8 @@ class InterpreterExtension:
             # truncate silently (a truncated tool payload invites guessing).
             _logger.warning(
                 "interpreter observation %s exceeds %d chars; artifactize it",
-                observation.kind, _MAX_OBSERVATION_CHARS,
+                observation.kind,
+                _MAX_OBSERVATION_CHARS,
             )
             return None
         return text

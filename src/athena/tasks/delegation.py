@@ -69,10 +69,14 @@ class DelegationManager:
         self._tasks = task_manager
         self._kernel = kernel
         self._budgets = budgets
-        self._sessions = sessions if sessions is not None else getattr(
-            task_manager, "_sessions", None)
-        self._cancellations = cancellations if cancellations is not None else getattr(
-            task_manager, "_cancellations", None)
+        self._sessions = (
+            sessions if sessions is not None else getattr(task_manager, "_sessions", None)
+        )
+        self._cancellations = (
+            cancellations
+            if cancellations is not None
+            else getattr(task_manager, "_cancellations", None)
+        )
         self._default_max_depth = default_max_depth
         self._default_max_children = default_max_children
 
@@ -96,11 +100,15 @@ class DelegationManager:
         await self._ensure_session(child_session, parent_id=parent.session_id)
         context_refs = (
             ContextRef(
-                kind="task", ref=parent.id, source_id=parent.id,
+                kind="task",
+                ref=parent.id,
+                source_id=parent.id,
                 summary=parent.objective,
             ),
             ContextRef(
-                kind="task", ref=objective, source_id=objective,
+                kind="task",
+                ref=objective,
+                source_id=objective,
                 summary=objective,
             ),
         ) + tuple(context or ())
@@ -219,9 +227,7 @@ class DelegationManager:
         result = await self.run_child(child_task_id)
         return result
 
-    async def _ensure_session(
-        self, session_id: str, parent_id: str | None = None
-    ) -> None:
+    async def _ensure_session(self, session_id: str, parent_id: str | None = None) -> None:
         if self._sessions is None:
             return
         existing = await self._sessions.get(session_id)
@@ -234,13 +240,15 @@ class DelegationManager:
         if status == TaskStatus.CANCELLED:
             raise DelegationError("parent task is cancelled")
         if status in TERMINAL_STATUSES:
-            raise DelegationError(
-                f"cannot delegate from a terminal parent (status={status.value})")
-        if status not in (TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL,
-                          TaskStatus.WAITING_INPUT, TaskStatus.CREATED,
-                          TaskStatus.QUEUED):
-            raise DelegationError(
-                f"parent task not delegable (status={status.value})")
+            raise DelegationError(f"cannot delegate from a terminal parent (status={status.value})")
+        if status not in (
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_APPROVAL,
+            TaskStatus.WAITING_INPUT,
+            TaskStatus.CREATED,
+            TaskStatus.QUEUED,
+        ):
+            raise DelegationError(f"parent task not delegable (status={status.value})")
 
     async def _enforce_limits(self, parent: TaskSpec) -> None:
         depth = await self._depth_of(parent.id)
@@ -248,7 +256,9 @@ class DelegationManager:
         if depth >= max_depth:
             raise DepthExceeded(f"delegation depth {depth} >= limit {max_depth}")
         budget = parent.resource_budget or ResourceBudget()
-        max_children = budget.max_children if budget.max_children is not None else self._default_max_children
+        max_children = (
+            budget.max_children if budget.max_children is not None else self._default_max_children
+        )
         if await self._count_children(parent.id) >= max_children:
             raise ChildLimitExceeded(f"parent reached max_children={max_children}")
 
@@ -316,9 +326,12 @@ class DelegationManager:
     # ------------------------------------------------------------------ #
     def _scope_child(self, parent: TaskSpec, child_spec: TaskSpec) -> TaskSpec:
         limited_policy = _scope_policy(parent, child_spec.capability_policy)
-        budget = _merged_budget(parent, child_spec.resource_budget,
-                                default_depth=self._default_max_depth,
-                                default_children=self._default_max_children)
+        budget = _merged_budget(
+            parent,
+            child_spec.resource_budget,
+            default_depth=self._default_max_depth,
+            default_children=self._default_max_children,
+        )
         return replace(
             child_spec,
             parent_task_id=parent.id,
@@ -352,10 +365,7 @@ def _scope_policy(parent: TaskSpec, child: CapabilityPolicy | None = None) -> Ca
 def _scope_model_policy(parent: TaskSpec, child):
     base = _as_model_policy(parent.model_policy)
     child_v = _as_model_policy(child or base)
-    allowed = tuple(
-        a for a in child_v.allowed
-        if not base.allowed or a in base.allowed
-    )
+    allowed = tuple(a for a in child_v.allowed if not base.allowed or a in base.allowed)
     return replace(
         base,
         require_tools=bool(base.require_tools),
@@ -416,8 +426,12 @@ def _scope_workspace(parent: TaskSpec, child):
         root = str(parent_root_canonical / "tasks" / (child_ws.id or "child"))
         child_root_canonical = Path(root).resolve()
 
-    readable = _restrict_paths(parent_ws.readable, child_ws.readable, parent_root_canonical, child_root_canonical)
-    writable = _restrict_paths(parent_ws.writable, child_ws.writable, parent_root_canonical, child_root_canonical)
+    readable = _restrict_paths(
+        parent_ws.readable, child_ws.readable, parent_root_canonical, child_root_canonical
+    )
+    writable = _restrict_paths(
+        parent_ws.writable, child_ws.writable, parent_root_canonical, child_root_canonical
+    )
     network = _restrict_network(parent_ws.network_policy, child_ws.network_policy)
 
     return WorkspaceSpec(
@@ -458,14 +472,14 @@ def _restrict_paths(parent_rules, child_rules, parent_root: Path, child_root: Pa
     out = []
     # Build canonical set of parent-allowed paths for intersection
     parent_allowed = set()
-    for pr in (parent_rules or ()):
+    for pr in parent_rules or ():
         try:
             canon = Path(pr.path).resolve()
             parent_allowed.add(str(canon))
         except (OSError, ValueError):
             continue
 
-    for rule in (child_rules or ()):
+    for rule in child_rules or ():
         allow = bool(rule.allow)
         if not rule.path:
             continue
@@ -506,8 +520,9 @@ def _restrict_network(parent, child):
     return NetworkPolicy.ALLOW
 
 
-def _merged_budget(parent: TaskSpec, child: ResourceBudget | None, *,
-                   default_depth: int, default_children: int) -> ResourceBudget:
+def _merged_budget(
+    parent: TaskSpec, child: ResourceBudget | None, *, default_depth: int, default_children: int
+) -> ResourceBudget:
     base = parent.resource_budget or ResourceBudget()
     desired = child or ResourceBudget()
     merged = base.merged_with(desired)

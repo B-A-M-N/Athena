@@ -24,10 +24,15 @@ from athena.protocol.messages import utcnow
 
 from athena.protocol.tasks import (
     CapabilityPolicy,
+    Criterion,
     DeliverySpec,
+    MutationMode,
     ModelPolicy,
+    NetworkPolicy,
     ResourceBudget,
     TaskSpec,
+    VerificationSpec,
+    VerificationType,
     WorkspaceSpec,
 )
 from athena.scheduler.claims import Claim, _to_claim, claim_next
@@ -44,21 +49,28 @@ class TaskTemplate:
     parent_task_id: str | None = None
     workspace_id: str | None = None
     workspace_root: str | None = None
+    network_policy: str | None = None
+    mutation_mode: str | None = None
     capability_allow: tuple[str, ...] = ()
     model_role: str = "primary"
     max_agent_iterations: int | None = None
     deadline: datetime | None = None
     delivery_channel: str | None = None
+    acceptance_criteria: tuple[Criterion, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
-    def build_task_spec(
-        self, job_id: str, occurrence_key: str | None = None
-    ) -> TaskSpec:
+    def build_task_spec(self, job_id: str, occurrence_key: str | None = None) -> TaskSpec:
         workspace = None
         if self.workspace_id or self.workspace_root:
+            workspace_kwargs: dict[str, Any] = {}
+            if self.network_policy:
+                workspace_kwargs["network_policy"] = NetworkPolicy(self.network_policy)
+            if self.mutation_mode:
+                workspace_kwargs["mutation_mode"] = MutationMode(self.mutation_mode)
             workspace = WorkspaceSpec(
                 id=self.workspace_id or job_id,
                 root=self.workspace_root or ".",
+                **workspace_kwargs,
             )
         budget = ResourceBudget()
         if self.max_agent_iterations is not None:
@@ -69,6 +81,7 @@ class TaskTemplate:
         return TaskSpec(
             id=new_id("task"),
             objective=self.objective,
+            acceptance_criteria=self.acceptance_criteria,
             session_id=self.session_id,
             parent_task_id=self.parent_task_id,
             workspace=workspace,
@@ -77,9 +90,7 @@ class TaskTemplate:
             resource_budget=budget,
             deadline=self.deadline,
             delivery=(
-                None
-                if not self.delivery_channel
-                else DeliverySpec(channel=self.delivery_channel)
+                None if not self.delivery_channel else DeliverySpec(channel=self.delivery_channel)
             ),
             metadata=metadata,
         )
@@ -156,11 +167,7 @@ def _trigger_from_job(job: dict) -> TriggerSpec | None:
 def _template_from_job(job: dict) -> TaskTemplate:
     payload = job.get("payload")
     meta = job.get("metadata")
-    src = (
-        payload
-        if isinstance(payload, dict)
-        else (meta if isinstance(meta, dict) else {})
-    )
+    src = payload if isinstance(payload, dict) else (meta if isinstance(meta, dict) else {})
     raw_template = src.get("template")
     template = raw_template if isinstance(raw_template, dict) else src
     itinerary = template.get("task_template")
@@ -172,13 +179,47 @@ def _template_from_job(job: dict) -> TaskTemplate:
         parent_task_id=active.get("parent_task_id"),
         workspace_id=active.get("workspace_id"),
         workspace_root=active.get("workspace_root"),
+        network_policy=active.get("network_policy"),
+        mutation_mode=active.get("mutation_mode"),
         capability_allow=tuple(active.get("capability_allow") or ()),
         model_role=active.get("model_role", "primary"),
         max_agent_iterations=active.get("max_agent_iterations"),
         deadline=deadline,
         delivery_channel=active.get("delivery_channel"),
+        acceptance_criteria=_criteria_from_records(active.get("acceptance_criteria")),
         metadata=dict(active.get("metadata") or {}),
     )
+
+
+def _criteria_from_records(value: Any) -> tuple[Criterion, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    criteria: list[Criterion] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        raw = item.get("verification")
+        verification = None
+        if isinstance(raw, Mapping):
+            try:
+                verification = VerificationSpec(
+                    type=VerificationType(str(raw.get("type") or "manual")),
+                    command=raw.get("command"),
+                    path=raw.get("path"),
+                    predicate=raw.get("predicate"),
+                    capability=raw.get("capability"),
+                )
+            except ValueError:
+                continue
+        criteria.append(
+            Criterion(
+                id=str(item.get("id") or ""),
+                description=str(item.get("description") or ""),
+                verification=verification,
+                required=bool(item.get("required", True)),
+            )
+        )
+    return tuple(criteria)
 
 
 class Scheduler:
@@ -273,9 +314,7 @@ class Scheduler:
         try:
             created = await self._tm.create(spec)
         except Exception:
-            await self._store.release_claim(
-                claim.claim_id, job["id"], claim.scheduled_for
-            )
+            await self._store.release_claim(claim.claim_id, job["id"], claim.scheduled_for)
             raise
         task_id = created.id if created is not None else None
         if task_id is not None:
@@ -288,8 +327,11 @@ class Scheduler:
         )
         next_run, time_disable = self._next_run(job, claim)
         await self._store.complete_claim(
-            claim.claim_id, job["id"], task_id,
-            next_run=next_run, disable=disable or time_disable,
+            claim.claim_id,
+            job["id"],
+            task_id,
+            next_run=next_run,
+            disable=disable or time_disable,
         )
 
     def _next_run(self, job: dict, claim) -> tuple[str | None, bool]:
@@ -355,6 +397,13 @@ class Scheduler:
         )
 
     async def _run(self) -> None:
+        # Give callers one scheduling turn after startup to finish durable
+        # setup or perform an explicit tick.  Immediate first-pass polling
+        # makes a due occurrence race with recovery/bootstrap code.
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
+        except asyncio.TimeoutError:
+            pass
         while not self._stop.is_set():
             try:
                 await self.tick()
@@ -377,8 +426,6 @@ def _filters_match(filters: Mapping[str, Any], payload: Mapping[str, Any]) -> bo
         if payload.get(key) != expected:
             return False
     return True
-
-
 
 
 __all__ = ["ScheduledJob", "Scheduler", "TaskTemplate", "TriggerSpec"]

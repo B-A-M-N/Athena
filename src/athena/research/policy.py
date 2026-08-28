@@ -58,18 +58,15 @@ class SourcePolicy:
         call this after DNS resolution and before opening the HTTP connection.
         The resolved set is returned in stable order for provenance.
         """
-        normalized = tuple(
-            sorted({str(address).strip() for address in addresses if address})
-        )
+        normalized = tuple(sorted({str(address).strip() for address in addresses if address}))
         if not normalized:
             raise SourcePolicyError(f"source hostname did not resolve: {host}")
         if not self.allow_private_network:
-            private = [
-                address for address in normalized if _is_private_host(address)
-            ]
+            private = [address for address in normalized if _is_private_host(address)]
             if private:
                 raise SourcePolicyError(
-                    f"source hostname resolves to private/local address: {host}")
+                    f"source hostname resolves to private/local address: {host}"
+                )
         return normalized
 
 
@@ -95,9 +92,7 @@ def canonicalize_uri(uri: str) -> str:
         port = parsed.port
     except ValueError as exc:
         raise SourcePolicyError("invalid source URI port") from exc
-    default_port = (scheme == "http" and port == 80) or (
-        scheme == "https" and port == 443
-    )
+    default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
     netloc = host if port is None or default_port else f"{host}:{port}"
     path = parsed.path or "/"
     return urlunsplit((scheme, netloc, path, parsed.query, ""))
@@ -107,8 +102,17 @@ def classify_source(uri: str) -> str:
     """Conservative authority class used for ranking, never authorization."""
     host = (urlsplit(uri).hostname or "").lower().rstrip(".")
     primary = (
-        ".gov", ".edu", "arxiv.org", "nature.com", "science.org", "aps.org",
-        "nih.gov", "cern.ch", "iop.org", "acm.org", "ieee.org",
+        ".gov",
+        ".edu",
+        "arxiv.org",
+        "nature.com",
+        "science.org",
+        "aps.org",
+        "nih.gov",
+        "cern.ch",
+        "iop.org",
+        "acm.org",
+        "ieee.org",
     )
     secondary = ("reuters.com", "bbc.com", "nytimes.com", "economist.com")
     if any(host == suffix.lstrip(".") or host.endswith(suffix) for suffix in primary):

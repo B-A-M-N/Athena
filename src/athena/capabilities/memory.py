@@ -50,14 +50,16 @@ _INPUT_SCHEMA = {
         "query": {"type": "string", "maxLength": 2000},
         "content": {"type": "string", "maxLength": 10000},
         "tags": {
-            "type": "array", "maxItems": 32,
+            "type": "array",
+            "maxItems": 32,
             "items": {"type": "string", "maxLength": 128},
         },
         "kind": {"type": "string", "enum": list(_KIND_ALIASES)},
         "scope": {"type": "string", "enum": list(_SCOPE_ALIASES)},
         "scope_id": {"type": "string", "minLength": 1, "maxLength": 256},
         "retrieval_mode": {
-            "type": "string", "enum": [mode.value for mode in RetrievalMode],
+            "type": "string",
+            "enum": [mode.value for mode in RetrievalMode],
         },
         "limit": {"type": "integer", "minimum": 1, "maximum": 50},
         "source_id": {"type": "string"},
@@ -65,11 +67,13 @@ _INPUT_SCHEMA = {
 }
 
 _MAX_OUTPUT_CHARS = 48_000
-_GLOBAL_AUTHORITY = frozenset({
-    CapabilityRequestOrigin.USER_DIRECT,
-    CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
-    CapabilityRequestOrigin.SYSTEM,
-})
+_GLOBAL_AUTHORITY = frozenset(
+    {
+        CapabilityRequestOrigin.USER_DIRECT,
+        CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+        CapabilityRequestOrigin.SYSTEM,
+    }
+)
 
 
 class MemoryCapability:
@@ -99,15 +103,14 @@ class MemoryCapability:
         call_id = request.call_id or new_id("call")
         if self.memory_store is None:
             return CapabilityResult(
-                call_id, request.capability_id,
+                call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error="memory store not available",
             )
         if op in ("recall", "search"):
             limit = int(args.get("limit") or 10)
-            mode = RetrievalMode(str(
-                args.get("retrieval_mode") or RetrievalMode.SEMANTIC.value
-            ))
+            mode = RetrievalMode(str(args.get("retrieval_mode") or RetrievalMode.SEMANTIC.value))
             scopes, error = _visible_scopes(request, context, args, for_write=False)
             if error:
                 return _failed(call_id, request, error)
@@ -134,7 +137,9 @@ class MemoryCapability:
                 items.extend(found)
             items = _dedupe_and_bound(items, limit)
             return CapabilityResult(
-                call_id, request.capability_id, CapabilityResultStatus.OK,
+                call_id,
+                request.capability_id,
+                CapabilityResultStatus.OK,
                 output=_bounded_json(items, limit),
             )
         if op == "save":
@@ -142,9 +147,7 @@ class MemoryCapability:
             if error:
                 return _failed(call_id, request, error)
             scope, scope_id = scopes[0]
-            kind = _KIND_ALIASES.get(
-                str(args.get("kind") or "working"), MemoryKind.WORKING
-            )
+            kind = _KIND_ALIASES.get(str(args.get("kind") or "working"), MemoryKind.WORKING)
             source = Provenance(
                 source_type=SourceType.CAPABILITY,
                 source_id=call_id,
@@ -159,28 +162,29 @@ class MemoryCapability:
                 source=source,
                 trust=TrustClass.AGENT_CURATED,
                 metadata={"scope_id": scope_id},
-                retrieval_mode=RetrievalMode(str(
-                    args.get("retrieval_mode") or RetrievalMode.SEMANTIC.value
-                )),
+                retrieval_mode=RetrievalMode(
+                    str(args.get("retrieval_mode") or RetrievalMode.SEMANTIC.value)
+                ),
                 tags=tuple(args.get("tags") or ()),
-                source_refs=((str(args["source_id"]),)
-                             if args.get("source_id") else ()),
+                source_refs=((str(args["source_id"]),) if args.get("source_id") else ()),
             )
             await self.memory_store.save(record)
             return CapabilityResult(
-                call_id, request.capability_id, CapabilityResultStatus.OK,
+                call_id,
+                request.capability_id,
+                CapabilityResultStatus.OK,
                 output="saved",
                 ref_uri=f"memory:{record.id}",
             )
         return CapabilityResult(
-            call_id, request.capability_id, CapabilityResultStatus.FAILED,
+            call_id,
+            request.capability_id,
+            CapabilityResultStatus.FAILED,
             error=f"unknown operation: {op}",
         )
 
 
-def _failed(
-    call_id: str, request: CapabilityRequest, error: str
-) -> CapabilityResult:
+def _failed(call_id: str, request: CapabilityRequest, error: str) -> CapabilityResult:
     return CapabilityResult(
         call_id, request.capability_id, CapabilityResultStatus.FAILED, error=error
     )
@@ -216,9 +220,7 @@ def _visible_scopes(
         if for_write:
             requested_scope = MemoryScope.SESSION
         else:
-            visible = [
-                (scope, owner) for scope, owner in owners.items() if owner
-            ]
+            visible = [(scope, owner) for scope, owner in owners.items() if owner]
             return [(scope, str(owner)) for scope, owner in visible], None
     else:
         requested_scope = _SCOPE_ALIASES[str(requested)]
@@ -253,8 +255,7 @@ def _dedupe_and_bound(items: list[Any], limit: int) -> list[Any]:
         by_id.values(),
         key=lambda item: (
             _record_datetime(item),
-            str(item.get("id")) if isinstance(item, dict)
-            else str(getattr(item, "id", "")),
+            str(item.get("id")) if isinstance(item, dict) else str(getattr(item, "id", "")),
         ),
         reverse=True,
     )[:limit]

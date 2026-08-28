@@ -75,8 +75,7 @@ class ProviderUsageStore:
         await self._db.execute(
             "UPDATE provider_usage SET input_tokens = ?, output_tokens = ?, "
             "cost_usd = ?, ended_at = ?, metadata = ? WHERE id = ?",
-            (input_tokens, output_tokens, cost_usd, now,
-             json.dumps(dict(metadata)), usage_id),
+            (input_tokens, output_tokens, cost_usd, now, json.dumps(dict(metadata)), usage_id),
         )
 
     async def list_for_task(self, task_id: str) -> list[dict]:

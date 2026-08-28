@@ -167,8 +167,7 @@ class ResearchStore:
             "SELECT s.*, c.content, c.content_hash AS indexed_content_hash, "
             "c.mime_type FROM research_source_content c "
             "JOIN research_sources s ON s.id = c.source_id "
-            "WHERE " + " AND ".join(clauses)
-            + " ORDER BY s.retrieved_at DESC, s.id DESC LIMIT ?",
+            "WHERE " + " AND ".join(clauses) + " ORDER BY s.retrieved_at DESC, s.id DESC LIMIT ?",
             (*params, max(1, min(int(limit), 200))),
         )
         bounded = max(80, min(int(snippet_chars), 2000))
@@ -185,7 +184,7 @@ class ResearchStore:
     async def save_source(self, source: SourceRecord) -> SourceRecord:
         await self._ensure()
         await self._db.execute(
-            "INSERT INTO research_sources(" 
+            "INSERT INTO research_sources("
             "id, canonical_uri, title, source_type, authority_class, retrieved_at, "
             "published_at, content_hash, artifact_uri, task_id, project_id, metadata) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -195,18 +194,35 @@ class ResearchStore:
             "task_id=excluded.task_id, project_id=excluded.project_id, "
             "metadata=excluded.metadata",
             (
-                source.id, source.canonical_uri, source.title, source.source_type,
-                source.authority_class, source.retrieved_at, source.published_at,
-                source.content_hash, source.artifact_uri, source.task_id,
-                source.project_id, json.dumps(dict(source.metadata), sort_keys=True),
+                source.id,
+                source.canonical_uri,
+                source.title,
+                source.source_type,
+                source.authority_class,
+                source.retrieved_at,
+                source.published_at,
+                source.content_hash,
+                source.artifact_uri,
+                source.task_id,
+                source.project_id,
+                json.dumps(dict(source.metadata), sort_keys=True),
             ),
         )
         return source
 
     async def get_source(self, source_id: str) -> SourceRecord | None:
         await self._ensure()
+        row = await self._db.fetch_one("SELECT * FROM research_sources WHERE id = ?", (source_id,))
+        return SourceRecord.from_record(_decode_row(row)) if row else None
+
+    async def latest_source_for_uri(self, canonical_uri: str) -> SourceRecord | None:
+        """Return the newest captured version of one canonical source."""
+        await self._ensure()
         row = await self._db.fetch_one(
-            "SELECT * FROM research_sources WHERE id = ?", (source_id,))
+            "SELECT * FROM research_sources WHERE canonical_uri = ? "
+            "ORDER BY retrieved_at DESC, id DESC LIMIT 1",
+            (canonical_uri,),
+        )
         return SourceRecord.from_record(_decode_row(row)) if row else None
 
     async def list_sources(
@@ -237,7 +253,8 @@ class ResearchStore:
             params.extend((pattern, pattern))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = await self._db.fetch_all(
-            "SELECT * FROM research_sources" + where
+            "SELECT * FROM research_sources"
+            + where
             + " ORDER BY retrieved_at DESC, id DESC LIMIT ?",
             (*params, max(1, min(int(limit), 200))),
         )
@@ -248,7 +265,7 @@ class ResearchStore:
         if await self.get_source(evidence.source_id) is None:
             raise KeyError(f"unknown source: {evidence.source_id}")
         await self._db.execute(
-            "INSERT INTO research_evidence(" 
+            "INSERT INTO research_evidence("
             "id, source_id, claim_id, extracted_claim, exact_supporting_excerpt, "
             "locator, evidence_type, authority_class, extraction_method, "
             "extraction_model, confidence, task_id, created_at, metadata) "
@@ -261,12 +278,20 @@ class ResearchStore:
             "extraction_model=excluded.extraction_model, confidence=excluded.confidence, "
             "task_id=excluded.task_id, metadata=excluded.metadata",
             (
-                evidence.id, evidence.source_id, evidence.claim_id,
-                evidence.extracted_claim, evidence.exact_supporting_excerpt,
-                json.dumps(dict(evidence.locator), sort_keys=True), evidence.evidence_type,
-                evidence.authority_class, evidence.extraction_method,
-                evidence.extraction_model, evidence.confidence, evidence.task_id,
-                evidence.created_at, json.dumps(dict(evidence.metadata), sort_keys=True),
+                evidence.id,
+                evidence.source_id,
+                evidence.claim_id,
+                evidence.extracted_claim,
+                evidence.exact_supporting_excerpt,
+                json.dumps(dict(evidence.locator), sort_keys=True),
+                evidence.evidence_type,
+                evidence.authority_class,
+                evidence.extraction_method,
+                evidence.extraction_model,
+                evidence.confidence,
+                evidence.task_id,
+                evidence.created_at,
+                json.dumps(dict(evidence.metadata), sort_keys=True),
             ),
         )
         for related_id in evidence.corroborates:
@@ -275,7 +300,7 @@ class ResearchStore:
             await self._link(evidence.id, related_id, "contradicts")
         if evidence.claim_id:
             await self._db.execute(
-                "INSERT OR IGNORE INTO research_claim_evidence(" 
+                "INSERT OR IGNORE INTO research_claim_evidence("
                 "claim_id, evidence_id, task_id, created_at) VALUES (?, ?, ?, ?)",
                 (evidence.claim_id, evidence.id, evidence.task_id, evidence.created_at),
             )
@@ -283,7 +308,7 @@ class ResearchStore:
 
     async def _link(self, evidence_id: str, related_id: str, relation: str) -> None:
         await self._db.execute(
-            "INSERT OR IGNORE INTO research_evidence_links(" 
+            "INSERT OR IGNORE INTO research_evidence_links("
             "evidence_id, related_evidence_id, relation) VALUES (?, ?, ?)",
             (evidence_id, related_id, relation),
         )
@@ -291,7 +316,8 @@ class ResearchStore:
     async def get_evidence(self, evidence_id: str) -> EvidenceObject | None:
         await self._ensure()
         row = await self._db.fetch_one(
-            "SELECT * FROM research_evidence WHERE id = ?", (evidence_id,))
+            "SELECT * FROM research_evidence WHERE id = ?", (evidence_id,)
+        )
         if row is None:
             return None
         return EvidenceObject.from_record(await self._evidence_record(row))
@@ -310,9 +336,7 @@ class ResearchStore:
         clauses: list[str] = []
         params: list[Any] = []
         if task_id is not None and project_id is not None:
-            clauses.append(
-                "(e.task_id = ? OR (e.task_id IS NULL AND s.project_id = ?))"
-            )
+            clauses.append("(e.task_id = ? OR (e.task_id IS NULL AND s.project_id = ?))")
             params.extend((task_id, project_id))
         elif task_id is not None:
             clauses.append("e.task_id = ?")
@@ -320,21 +344,19 @@ class ResearchStore:
         elif project_id is not None:
             clauses.append("s.project_id = ?")
             params.append(project_id)
-        for column, value in (("e.source_id", source_id),
-                              ("e.claim_id", claim_id)):
+        for column, value in (("e.source_id", source_id), ("e.claim_id", claim_id)):
             if value is not None:
                 clauses.append(f"{column} = ?")
                 params.append(value)
         if query:
-            clauses.append(
-                "(e.extracted_claim LIKE ? OR e.exact_supporting_excerpt LIKE ?)"
-            )
+            clauses.append("(e.extracted_claim LIKE ? OR e.exact_supporting_excerpt LIKE ?)")
             pattern = f"%{query}%"
             params.extend((pattern, pattern))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = await self._db.fetch_all(
             "SELECT e.* FROM research_evidence e "
-            "JOIN research_sources s ON s.id = e.source_id" + where
+            "JOIN research_sources s ON s.id = e.source_id"
+            + where
             + " ORDER BY e.created_at DESC, e.id DESC LIMIT ?",
             (*params, max(1, min(int(limit), 200))),
         )
@@ -344,35 +366,47 @@ class ResearchStore:
         record = _decode_row(row)
         links = await self._db.fetch_all(
             "SELECT related_evidence_id, relation FROM research_evidence_links "
-            "WHERE evidence_id = ?", (record["id"],))
+            "WHERE evidence_id = ?",
+            (record["id"],),
+        )
         record["corroborates"] = [
-            link["related_evidence_id"] for link in links
-            if link["relation"] == "corroborates"]
+            link["related_evidence_id"] for link in links if link["relation"] == "corroborates"
+        ]
         record["contradicts"] = [
-            link["related_evidence_id"] for link in links
-            if link["relation"] == "contradicts"]
+            link["related_evidence_id"] for link in links if link["relation"] == "contradicts"
+        ]
         return record
 
     async def save_gap(self, gap: ResearchGap) -> ResearchGap:
         await self._ensure()
         await self._db.execute(
-            "INSERT INTO research_gaps(" 
+            "INSERT INTO research_gaps("
             "id, objective, question, kind, required, status, task_id, evidence_ids, "
             "created_at, resolved_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
             "evidence_ids=excluded.evidence_ids, resolved_at=excluded.resolved_at, "
             "metadata=excluded.metadata",
             (
-                gap.id, gap.objective, gap.question, gap.kind, int(gap.required),
-                gap.status, gap.task_id, json.dumps(list(gap.evidence_ids)),
-                gap.created_at, gap.resolved_at,
+                gap.id,
+                gap.objective,
+                gap.question,
+                gap.kind,
+                int(gap.required),
+                gap.status,
+                gap.task_id,
+                json.dumps(list(gap.evidence_ids)),
+                gap.created_at,
+                gap.resolved_at,
                 json.dumps(dict(gap.metadata), sort_keys=True),
             ),
         )
         return gap
 
     async def list_gaps(
-        self, *, task_id: str | None = None, status: str | None = None,
+        self,
+        *,
+        task_id: str | None = None,
+        status: str | None = None,
         limit: int = 100,
     ) -> list[ResearchGap]:
         await self._ensure()
@@ -386,14 +420,16 @@ class ResearchStore:
             params.append(status)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = await self._db.fetch_all(
-            "SELECT * FROM research_gaps" + where
-            + " ORDER BY created_at ASC, id ASC LIMIT ?",
+            "SELECT * FROM research_gaps" + where + " ORDER BY created_at ASC, id ASC LIMIT ?",
             (*params, max(1, min(int(limit), 200))),
         )
         return [ResearchGap.from_record(_decode_row(row)) for row in rows]
 
     async def close_gap(
-        self, gap_id: str, *, evidence_ids: tuple[str, ...] = (),
+        self,
+        gap_id: str,
+        *,
+        evidence_ids: tuple[str, ...] = (),
         task_id: str | None = None,
     ) -> ResearchGap | None:
         gap = await self._get_gap(gap_id)
@@ -402,10 +438,16 @@ class ResearchStore:
         if task_id is not None and gap.task_id != task_id:
             raise PermissionError("research gap belongs to another task")
         updated = ResearchGap(
-            id=gap.id, objective=gap.objective, question=gap.question,
-            kind=gap.kind, required=gap.required, status="CLOSED",
-            task_id=gap.task_id, evidence_ids=tuple(evidence_ids),
-            created_at=gap.created_at, resolved_at=gap.resolved_at or _now(),
+            id=gap.id,
+            objective=gap.objective,
+            question=gap.question,
+            kind=gap.kind,
+            required=gap.required,
+            status="CLOSED",
+            task_id=gap.task_id,
+            evidence_ids=tuple(evidence_ids),
+            created_at=gap.created_at,
+            resolved_at=gap.resolved_at or _now(),
             metadata=gap.metadata,
         )
         await self.save_gap(updated)
@@ -413,8 +455,7 @@ class ResearchStore:
 
     async def _get_gap(self, gap_id: str) -> ResearchGap | None:
         await self._ensure()
-        row = await self._db.fetch_one(
-            "SELECT * FROM research_gaps WHERE id = ?", (gap_id,))
+        row = await self._db.fetch_one("SELECT * FROM research_gaps WHERE id = ?", (gap_id,))
         return ResearchGap.from_record(_decode_row(row)) if row else None
 
 
@@ -455,6 +496,7 @@ def _snippet(content: str, terms: list[str], width: int) -> str:
 
 def _now() -> str:
     from datetime import datetime
+
     return datetime.now(timezone.utc).isoformat()
 
 

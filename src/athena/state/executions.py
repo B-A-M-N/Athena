@@ -71,18 +71,14 @@ class ExecutionStore:
             ),
         )
 
-    async def update_runtime_session(
-        self, execution_id: str, runtime_session_id: str
-    ) -> None:
+    async def update_runtime_session(self, execution_id: str, runtime_session_id: str) -> None:
         await self._db.execute(
             "UPDATE executions SET runtime_session_id = ? WHERE id = ?",
             (runtime_session_id, execution_id),
         )
 
     async def get(self, execution_id: str) -> dict | None:
-        row = await self._db.fetch_one(
-            "SELECT * FROM executions WHERE id = ?", (execution_id,)
-        )
+        row = await self._db.fetch_one("SELECT * FROM executions WHERE id = ?", (execution_id,))
         if row is None:
             return None
         return _decode(row)

@@ -48,8 +48,8 @@ class CacheBoundary:
 
 
 def _fp(obj: Any) -> str:
-    return hashlib.sha256(json.dumps(
-        obj, sort_keys=True, ensure_ascii=False, default=str).encode()
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str).encode()
     ).hexdigest()[:16]
 
 
@@ -57,9 +57,9 @@ def _fp(obj: Any) -> str:
 class PromptEnvelope:
     """Three-zone partition of one compiled request."""
 
-    stable_prefix: list[Any] = field(default_factory=list)     # system/identity/schemas/policies
-    append_history: list[Any] = field(default_factory=list)    # assistant/tool-result turns
-    dynamic_suffix: list[Any] = field(default_factory=list)    # latest observations/current request
+    stable_prefix: list[Any] = field(default_factory=list)  # system/identity/schemas/policies
+    append_history: list[Any] = field(default_factory=list)  # assistant/tool-result turns
+    dynamic_suffix: list[Any] = field(default_factory=list)  # latest observations/current request
 
     def fingerprint(self) -> dict:
         return {
@@ -78,8 +78,7 @@ class PrefixTracker:
         self.boundaries: list[dict] = []
         self.components_fp: dict[str, str] = {}
 
-    def observe(self, envelope: PromptEnvelope,
-                components: dict[str, Any] | None = None) -> dict:
+    def observe(self, envelope: PromptEnvelope, components: dict[str, Any] | None = None) -> dict:
         """Observe one request. Returns {stable, boundary?, first_change?}.
 
         ``components`` maps prefix-defining component names (system_prompt,
@@ -87,8 +86,7 @@ class PrefixTracker:
         attributed to the first changed component.
         """
         fps = envelope.fingerprint()
-        outcome: dict[str, Any] = {"prefix_fp": fps["prefix"],
-                                   "stable": False}
+        outcome: dict[str, Any] = {"prefix_fp": fps["prefix"], "stable": False}
         if components:
             # Always track component fingerprints so any later drift is
             # attributable, even if this observation was already stable.
@@ -96,10 +94,7 @@ class PrefixTracker:
         else:
             new_c = None
 
-        prefix_changed = (
-            self.last_prefix_fp is not None
-            and self.last_prefix_fp != fps["prefix"]
-        )
+        prefix_changed = self.last_prefix_fp is not None and self.last_prefix_fp != fps["prefix"]
         changed_component = None
         if new_c and self.components_fp:
             # Component order is intentional: report the first semantic
@@ -142,9 +137,11 @@ class UsageRecord:
         prompt = int(usage.get("prompt_tokens") or 0)
         completion = int(usage.get("completion_tokens") or 0)
         return UsageRecord(
-            prompt_tokens=prompt, completion_tokens=completion,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
             cache_read_tokens=cached,
-            uncached_prompt_tokens=max(prompt - cached, 0))
+            uncached_prompt_tokens=max(prompt - cached, 0),
+        )
 
     @staticmethod
     def from_anthropic(usage: Mapping[str, Any]) -> UsageRecord:
@@ -155,19 +152,29 @@ class UsageRecord:
         return UsageRecord(
             prompt_tokens=prompt + read + write,
             completion_tokens=completion,
-            cache_read_tokens=read, cache_write_tokens=write,
-            uncached_prompt_tokens=prompt)
+            cache_read_tokens=read,
+            cache_write_tokens=write,
+            uncached_prompt_tokens=prompt,
+        )
 
-    def __init__(self, *, prompt_tokens: int = 0, completion_tokens: int = 0,
-                 cache_read_tokens: int = 0, cache_write_tokens: int = 0,
-                 uncached_prompt_tokens: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        uncached_prompt_tokens: int | None = None,
+    ) -> None:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.cache_read_tokens = cache_read_tokens
         self.cache_write_tokens = cache_write_tokens
         self.uncached_prompt_tokens = (
-            uncached_prompt_tokens if uncached_prompt_tokens is not None
-            else max(prompt_tokens - cache_read_tokens - cache_write_tokens, 0))
+            uncached_prompt_tokens
+            if uncached_prompt_tokens is not None
+            else max(prompt_tokens - cache_read_tokens - cache_write_tokens, 0)
+        )
 
     @property
     def cache_rate(self) -> float | None:
@@ -199,7 +206,7 @@ class InferenceReceipt:
     provider_profile_id: str
     model_id: str
     response_id: str | None = None
-    reasoning_signature: str | None = None       # anthropic thought signature
+    reasoning_signature: str | None = None  # anthropic thought signature
     encrypted_reasoning: bytes | str | None = None
     tool_ids: tuple[str, ...] = ()
     continuation_token: str | None = None

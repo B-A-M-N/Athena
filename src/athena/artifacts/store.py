@@ -6,6 +6,7 @@ therefore a different artifact identity. Metadata is mirrored to sidecar JSON
 records under ``<root>/_meta/<hash>.json`` so the filesystem, not a database,
 is the source of truth for listing and retention.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -113,10 +114,9 @@ class ArtifactStore:
                 existing = previous["provenances"]
                 # Remove duplicate entry (same task_id + created_at)
                 for entry in existing:
-                    if (
-                        entry.get("task_id") == occurrence.get("task_id")
-                        and entry.get("created_at") == occurrence.get("created_at")
-                    ):
+                    if entry.get("task_id") == occurrence.get("task_id") and entry.get(
+                        "created_at"
+                    ) == occurrence.get("created_at"):
                         existing.remove(entry)
                         break
                 existing.append(occurrence)
@@ -219,8 +219,10 @@ class ArtifactStore:
                     provenances = meta.get("provenances", [])
                     occurrence_id = getattr(ref, "id", None)
                     new_provenances = [
-                        p for p in provenances
-                        if p.get("id") != occurrence_id and p.get("uri") != getattr(ref, "uri", None)
+                        p
+                        for p in provenances
+                        if p.get("id") != occurrence_id
+                        and p.get("uri") != getattr(ref, "uri", None)
                     ]
                     if len(new_provenances) < len(provenances):
                         removed = True
@@ -391,6 +393,7 @@ def _parse_dt(value: str | None) -> datetime | None:
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """Atomically write bytes to path using temp file + os.replace."""
+
     def _write():
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".athena-", suffix=".tmp")
         try:

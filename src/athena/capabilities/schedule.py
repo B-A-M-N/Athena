@@ -8,9 +8,11 @@ Operations:
     disable -> disable a job
     delete  -> delete a job
 """
+
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -54,9 +56,7 @@ def _trigger_from_metadata(job: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _owner_visible(
-    job: Mapping[str, Any], owner: Mapping[str, str | None] | None
-) -> bool:
+def _owner_visible(job: Mapping[str, Any], owner: Mapping[str, str | None] | None) -> bool:
     """Check task/session/project ownership, while preserving legacy jobs."""
     metadata = job.get("metadata")
     stored = metadata.get("_owner") if isinstance(metadata, dict) else None
@@ -71,6 +71,28 @@ def _owner_visible(
     )
 
 
+def _criterion_record(criterion: Any) -> dict[str, Any]:
+    verification = getattr(criterion, "verification", None)
+    return {
+        "id": str(getattr(criterion, "id", "")),
+        "description": str(getattr(criterion, "description", "")),
+        "required": bool(getattr(criterion, "required", True)),
+        "verification": None
+        if verification is None
+        else {
+            "type": getattr(
+                getattr(verification, "type", None),
+                "value",
+                getattr(verification, "type", "manual"),
+            ),
+            "command": getattr(verification, "command", None),
+            "path": getattr(verification, "path", None),
+            "predicate": getattr(verification, "predicate", None),
+            "capability": getattr(verification, "capability", None),
+        },
+    }
+
+
 class ScheduleAPI:
     """Thin interface the capability wraps."""
 
@@ -78,14 +100,22 @@ class ScheduleAPI:
         self._scheduler = scheduler
         self._task_manager = task_manager
 
-    async def create(self, *, name: str, objective: str, trigger: dict,
-                     session_id: str | None = None,
-                     owner: Mapping[str, str | None] | None = None) -> dict:
+    async def create(
+        self,
+        *,
+        name: str,
+        objective: str,
+        trigger: dict,
+        session_id: str | None = None,
+        workspace_root: str | None = None,
+        workspace=None,
+        acceptance_criteria: tuple[Any, ...] = (),
+        owner: Mapping[str, str | None] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict:
         job_id = new_id("job")
         trigger_spec = self._parse_trigger(trigger)
-        owner_data = {
-            key: value for key, value in dict(owner or {}).items() if value
-        }
+        owner_data = {key: value for key, value in dict(owner or {}).items() if value}
         now = utcnow()
         if trigger_spec.type is TriggerType.INTERVAL and trigger_spec.at is None:
             trigger_spec = replace(trigger_spec, at=now)
@@ -93,12 +123,30 @@ class ScheduleAPI:
         if first_run is None and trigger_spec.type is not TriggerType.EVENT:
             first_run = next_fire(trigger_spec, now - _small_delta())
         await self._scheduler._store.upsert_job(
-            job_id, name,
-            payload={"template": {
-                "objective": objective,
-                "session_id": session_id,
-                "workspace_id": owner_data.get("project_id"),
-            }},
+            job_id,
+            name,
+            payload={
+                "template": {
+                    "objective": objective,
+                    "session_id": session_id,
+                    "workspace_id": owner_data.get("project_id"),
+                    "workspace_root": workspace_root,
+                    "network_policy": getattr(
+                        getattr(workspace, "network_policy", None),
+                        "value",
+                        getattr(workspace, "network_policy", None),
+                    ),
+                    "mutation_mode": getattr(
+                        getattr(workspace, "mutation_mode", None),
+                        "value",
+                        getattr(workspace, "mutation_mode", None),
+                    ),
+                    "acceptance_criteria": [
+                        _criterion_record(criterion) for criterion in acceptance_criteria
+                    ],
+                    "metadata": dict(metadata or {}),
+                }
+            },
             trigger_spec=self._scheduler_trigger_spec(trigger_spec),
             enabled=True,
             next_run=first_run.isoformat() if first_run else None,
@@ -110,7 +158,9 @@ class ScheduleAPI:
         jobs = await self._scheduler._store.list_jobs(enabled_only=False)
         return [self._public_job(job) for job in jobs if _owner_visible(job, owner)]
 
-    async def inspect(self, job_id: str, *, owner: Mapping[str, str | None] | None = None) -> dict | None:
+    async def inspect(
+        self, job_id: str, *, owner: Mapping[str, str | None] | None = None
+    ) -> dict | None:
         job = await self._scheduler._store.get_job_id(job_id)
         if job is None or not _owner_visible(job, owner):
             return None
@@ -155,8 +205,16 @@ class ScheduleAPI:
         if not isinstance(trigger, dict):
             raise ValueError("trigger must be an object")
         allowed = {
-            "type", "at", "interval_seconds", "cron", "event_name",
-            "event_filters", "timezone", "end_at", "times", "metadata",
+            "type",
+            "at",
+            "interval_seconds",
+            "cron",
+            "event_name",
+            "event_filters",
+            "timezone",
+            "end_at",
+            "times",
+            "metadata",
         }
         unknown = set(trigger) - allowed
         if unknown:
@@ -187,14 +245,18 @@ class ScheduleAPI:
         if trigger_type is TriggerType.ONCE and at is None:
             raise ValueError("once trigger requires at")
         times = trigger.get("times")
-        if times is not None and (not isinstance(times, int) or isinstance(times, bool) or times < 1):
+        if times is not None and (
+            not isinstance(times, int) or isinstance(times, bool) or times < 1
+        ):
             raise ValueError("trigger.times must be a positive integer")
         timezone_name = trigger.get("timezone", "UTC")
         try:
             ZoneInfo(str(timezone_name))
         except Exception as exc:
             raise ValueError(f"invalid trigger timezone: {timezone_name}") from exc
-        end_at = _parse_datetime(trigger["end_at"], "trigger.end_at") if trigger.get("end_at") else None
+        end_at = (
+            _parse_datetime(trigger["end_at"], "trigger.end_at") if trigger.get("end_at") else None
+        )
         if end_at is not None and end_at.tzinfo is None:
             end_at = end_at.replace(tzinfo=timezone.utc)
         return TriggerSpec(
@@ -236,18 +298,28 @@ class ScheduleCapability:
             "required": ["operation"],
             "additionalProperties": False,
             "properties": {
-                "operation": {"type": "string", "enum": ["create", "list", "inspect", "enable", "disable", "delete"]},
+                "operation": {
+                    "type": "string",
+                    "enum": ["create", "list", "inspect", "enable", "disable", "delete"],
+                },
                 "job_id": {"type": "string", "minLength": 1, "maxLength": 128},
                 "name": {"type": "string", "minLength": 1, "maxLength": 256},
                 "objective": {"type": "string", "minLength": 1, "maxLength": 10000},
                 "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "workspace_root": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "trigger": {"type": "object", "maxProperties": 16},
             },
             "oneOf": [
-                {"properties": {"operation": {"const": "create"}},
-                 "required": ["name", "objective", "trigger"]},
-                {"properties": {"operation": {"enum": ["inspect", "enable", "disable", "delete"]}},
-                 "required": ["job_id"]},
+                {
+                    "properties": {"operation": {"const": "create"}},
+                    "required": ["name", "objective", "trigger"],
+                },
+                {
+                    "properties": {
+                        "operation": {"enum": ["inspect", "enable", "disable", "delete"]}
+                    },
+                    "required": ["job_id"],
+                },
                 {"properties": {"operation": {"const": "list"}}},
             ],
         },
@@ -258,7 +330,9 @@ class ScheduleCapability:
     def __init__(self, api: ScheduleAPI) -> None:
         self._api = api
 
-    async def invoke(self, request: CapabilityRequest, *, output_accumulator=None, context=None) -> CapabilityResult:
+    async def invoke(
+        self, request: CapabilityRequest, *, output_accumulator=None, context=None
+    ) -> CapabilityResult:
         args = dict(request.arguments or {})
         op = args.get("operation", "")
         call_id = request.call_id or new_id("call")
@@ -277,55 +351,132 @@ class ScheduleCapability:
                     and request.origin.value == "model"
                 ):
                     return CapabilityResult(
-                        call_id, self.descriptor.id, CapabilityResultStatus.FAILED,
+                        call_id,
+                        self.descriptor.id,
+                        CapabilityResultStatus.FAILED,
                         error="model cannot schedule work for another session",
                     )
+                workspace = getattr(context, "workspace", None)
+                requested_root = args.get("workspace_root")
+                if workspace is None and requested_root:
+                    return CapabilityResult(
+                        call_id,
+                        self.descriptor.id,
+                        CapabilityResultStatus.FAILED,
+                        error="workspace context is required for workspace_root",
+                    )
+                workspace_root = (
+                    str(requested_root) if requested_root else getattr(workspace, "root", None)
+                )
+                if workspace is not None and workspace_root:
+                    base = os.path.realpath(str(workspace.root))
+                    resolved = os.path.realpath(workspace_root)
+                    if resolved != base and not resolved.startswith(base + os.sep):
+                        return CapabilityResult(
+                            call_id,
+                            self.descriptor.id,
+                            CapabilityResultStatus.FAILED,
+                            error="scheduled workspace must remain within current workspace",
+                        )
                 result = await self._api.create(
                     name=args.get("name", "scheduled task"),
                     objective=args.get("objective", ""),
                     trigger=args.get("trigger", {}),
                     session_id=requested_session or request.session_id,
+                    workspace_root=workspace_root,
+                    workspace=workspace,
                     owner=owner,
                 )
-                return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.OK,
-                                       output=json.dumps(result), metadata={"operation": "create"})
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.OK,
+                    output=json.dumps(result),
+                    metadata={"operation": "create"},
+                )
             elif op == "list":
                 jobs = await self._api.list_jobs(owner=owner)
-                return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.OK,
-                                       output=json.dumps(jobs), metadata={"operation": "list"})
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.OK,
+                    output=json.dumps(jobs),
+                    metadata={"operation": "list"},
+                )
             elif op == "inspect":
                 job = await self._api.inspect(args.get("job_id", ""), owner=owner)
                 if job is None:
-                    return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.FAILED,
-                                           error="job not found")
-                return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.OK,
-                                       output=json.dumps(job), metadata={"operation": "inspect"})
+                    return CapabilityResult(
+                        call_id,
+                        self.descriptor.id,
+                        CapabilityResultStatus.FAILED,
+                        error="job not found",
+                    )
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.OK,
+                    output=json.dumps(job),
+                    metadata={"operation": "inspect"},
+                )
             elif op == "enable":
                 ok = await self._api.enable(args.get("job_id", ""), owner=owner)
                 if not ok:
-                    return CapabilityResult(call_id, self.descriptor.id,
-                                            CapabilityResultStatus.FAILED,
-                                            error="job not found or not owned")
-                return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.OK,
-                                       output=json.dumps({"enabled": ok}), metadata={"operation": "enable"})
+                    return CapabilityResult(
+                        call_id,
+                        self.descriptor.id,
+                        CapabilityResultStatus.FAILED,
+                        error="job not found or not owned",
+                    )
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.OK,
+                    output=json.dumps({"enabled": ok}),
+                    metadata={"operation": "enable"},
+                )
             elif op == "disable":
                 ok = await self._api.disable(args.get("job_id", ""), owner=owner)
                 if not ok:
-                    return CapabilityResult(call_id, self.descriptor.id,
-                                            CapabilityResultStatus.FAILED,
-                                            error="job not found or not owned")
-                return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.OK,
-                                       output=json.dumps({"enabled": ok}), metadata={"operation": "disable"})
+                    return CapabilityResult(
+                        call_id,
+                        self.descriptor.id,
+                        CapabilityResultStatus.FAILED,
+                        error="job not found or not owned",
+                    )
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.OK,
+                    output=json.dumps({"enabled": ok}),
+                    metadata={"operation": "disable"},
+                )
             elif op == "delete":
                 ok = await self._api.delete(args.get("job_id", ""), owner=owner)
                 if not ok:
-                    return CapabilityResult(call_id, self.descriptor.id,
-                                            CapabilityResultStatus.FAILED,
-                                            error="job not found or not owned")
-                return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.OK,
-                                       output=json.dumps({"deleted": ok}), metadata={"operation": "delete"})
-            return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.FAILED,
-                                   error=f"unknown operation: {op}")
+                    return CapabilityResult(
+                        call_id,
+                        self.descriptor.id,
+                        CapabilityResultStatus.FAILED,
+                        error="job not found or not owned",
+                    )
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.OK,
+                    output=json.dumps({"deleted": ok}),
+                    metadata={"operation": "delete"},
+                )
+            return CapabilityResult(
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
+                error=f"unknown operation: {op}",
+            )
         except Exception as exc:
-            return CapabilityResult(call_id, self.descriptor.id, CapabilityResultStatus.FAILED,
-                                   error=f"schedule.{op} failed: {exc}")
+            return CapabilityResult(
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
+                error=f"schedule.{op} failed: {exc}",
+            )

@@ -13,6 +13,7 @@ evidence for.  It never selects or skips tests — ``scripts/scenarios`` binds
 scenarios to concrete node IDs and runs them by ID; the marker exists so a
 reader of a test file can trace it back to its release-gate scenario.
 """
+
 from __future__ import annotations
 
 import os
@@ -76,7 +77,8 @@ async def make_durable_service():
             artifact_root=os.path.join(workspace, "artifacts"),
             providers=(
                 ProviderConfig(
-                    kind="fake", name="fake",
+                    kind="fake",
+                    name="fake",
                     extra={"scripts": list(scripts or ())},
                 ),
             ),

@@ -40,7 +40,9 @@ class LocalBackend(ExecutionBackend):
         network_policy: str | None = None,
     ) -> str:
         return await self.manager.create_session(
-            task_id=task_id, runtime=runtime, cwd=cwd,
+            task_id=task_id,
+            runtime=runtime,
+            cwd=cwd,
             env=dict(env) if env else None,
             workspace_root=workspace_root,
             network_policy=network_policy,

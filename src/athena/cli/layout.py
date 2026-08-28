@@ -63,10 +63,7 @@ class AthenaLayout:
 
     @property
     def apertures_equal(self) -> bool:
-        return (
-            self.operator.width == self.oi.width
-            and self.operator.height == self.oi.height
-        )
+        return self.operator.width == self.oi.width and self.operator.height == self.oi.height
 
 
 def _mode(columns: int, rows: int, requested: str | DisplayMode) -> LayoutMode:
@@ -81,11 +78,7 @@ def _mode(columns: int, rows: int, requested: str | DisplayMode) -> LayoutMode:
     if requested is DisplayMode.ANSI:
         return LayoutMode.ANSI_INSTRUMENT
     if requested is DisplayMode.GLASS:
-        return (
-            LayoutMode.GLASS_FULL
-            if columns >= 140 and rows >= 36
-            else LayoutMode.GLASS_COMPACT
-        )
+        return LayoutMode.GLASS_FULL if columns >= 140 and rows >= 36 else LayoutMode.GLASS_COMPACT
     if columns >= 140 and rows >= 36:
         return LayoutMode.GLASS_FULL
     if columns >= 110 and rows >= 30:

@@ -28,10 +28,7 @@ class EventStore:
     stable event id on append (section 81).
     """
 
-    _COLS = (
-        "id, task_id, session_id, type, sequence, timestamp, schema_version, "
-        "payload, causal_id"
-    )
+    _COLS = "id, task_id, session_id, type, sequence, timestamp, schema_version, payload, causal_id"
 
     def __init__(self, db: Database) -> None:
         self._db = db
@@ -78,8 +75,7 @@ class EventStore:
                         causal_id=causal_id,
                     )
                     await db.execute_raw(
-                        f"INSERT INTO events({self._COLS}) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        f"INSERT INTO events({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         self._values(event),
                     )
                 for callback in tuple(self._subscribers):
@@ -92,7 +88,8 @@ class EventStore:
                         # never turn a committed canonical event into a failed
                         # write or cause a producer to retry it.
                         _logger.warning(
-                            "event subscriber failed for %s", event.type,
+                            "event subscriber failed for %s",
+                            event.type,
                             exc_info=True,
                         )
                 return event
@@ -104,9 +101,7 @@ class EventStore:
                 continue
 
     async def append(self, event: Event) -> None:
-        if event.id and await self._db.fetch_one(
-            "SELECT id FROM events WHERE id = ?", (event.id,)
-        ):
+        if event.id and await self._db.fetch_one("SELECT id FROM events WHERE id = ?", (event.id,)):
             return
         await self.append_event(
             event.type,
@@ -137,8 +132,7 @@ class EventStore:
         after_sequence: int = 0,
     ) -> list[Event]:
         rows = await self._db.fetch_all(
-            "SELECT * FROM events WHERE task_id = ? AND sequence > ? "
-            "ORDER BY sequence ASC",
+            "SELECT * FROM events WHERE task_id = ? AND sequence > ? ORDER BY sequence ASC",
             (task_id, after_sequence),
         )
         return [_row_to_event(r) for r in rows]
@@ -156,8 +150,7 @@ class EventStore:
         ``sequence``, which resets per task.
         """
         rows = await self._db.fetch_all(
-            "SELECT *, rowid AS _rid FROM events WHERE rowid > ? "
-            "ORDER BY rowid ASC LIMIT ?",
+            "SELECT *, rowid AS _rid FROM events WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
             (after_rowid, int(limit)),
         )
         out = []
@@ -173,8 +166,7 @@ class EventStore:
 
     async def list_for_session(self, session_id: str) -> list[Event]:
         rows = await self._db.fetch_all(
-            "SELECT * FROM events WHERE session_id = ? "
-            "ORDER BY timestamp ASC, sequence ASC",
+            "SELECT * FROM events WHERE session_id = ? ORDER BY timestamp ASC, sequence ASC",
             (session_id,),
         )
         return [_row_to_event(r) for r in rows]

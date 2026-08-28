@@ -25,12 +25,17 @@ from athena.capabilities.skills import SkillsCapability
 from athena.capabilities.delegate import DelegateCapability
 from athena.capabilities.dependency import DependencyCapability
 from athena.capabilities.reflection import CapabilityReflection
+from athena.capabilities.truth import TruthCapability
 from athena.capabilities.artifacts import ArtifactCapability
 from athena.capabilities.workflow import WorkflowCapability
 from athena.capabilities.synthesis import SynthesisCapability
 from athena.capabilities.scratch import ScratchCapability
 from athena.capabilities.research import ResearchCapability
+from athena.capabilities.maintain import MaintenanceCapability
 from athena.capabilities.git import GitCapability
+from athena.capabilities.observer import ObserverCapability
+from athena.capabilities.capsule import ProcedureCapsuleCapability
+from athena.capabilities.diagnostics import DiagnosticsCapability
 
 __all__ = [
     "CapabilityRegistry",
@@ -45,10 +50,15 @@ __all__ = [
     "DelegateCapability",
     "DependencyCapability",
     "CapabilityReflection",
+    "TruthCapability",
     "ArtifactCapability",
     "WorkflowCapability",
     "SynthesisCapability",
     "ScratchCapability",
     "ResearchCapability",
+    "MaintenanceCapability",
     "GitCapability",
+    "ObserverCapability",
+    "ProcedureCapsuleCapability",
+    "DiagnosticsCapability",
 ]

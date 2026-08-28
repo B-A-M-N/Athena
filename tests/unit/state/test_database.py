@@ -18,6 +18,7 @@ async def test_in_memory_connect_and_migrations_run(db):
     assert "tasks" in names
     assert "messages" in names
     assert "schema_migrations" in names
+    assert "workflow_step_item_runs" in names
 
 
 async def test_transaction_commits_on_success(db):

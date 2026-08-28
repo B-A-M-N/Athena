@@ -101,6 +101,7 @@ class TaskLifecycle:
 # Row -> TaskSpec deserialization (durable reconstruction, BHV-026).
 # ---------------------------------------------------------------------------
 
+
 def deserialize_task(row: dict[str, Any]) -> TaskSpec:
     """Rebuild a ``TaskSpec`` from a ``TaskStore.get`` row."""
     deadline = _ds(row.get("deadline"))
@@ -128,6 +129,7 @@ def deserialize_task(row: dict[str, Any]) -> TaskSpec:
 
 def _ds(value: Any) -> datetime | None:
     from datetime import datetime as _dt
+
     if isinstance(value, _dt):
         return value
     if isinstance(value, str):
@@ -154,12 +156,14 @@ def _decode_criteria(raw: Any) -> tuple[Criterion, ...]:
                 predicate=v.get("predicate"),
                 capability=v.get("capability"),
             )
-        out.append(Criterion(
-            id=item.get("id", ""),
-            description=item.get("description", ""),
-            verification=verification,
-            required=bool(item.get("required", True)),
-        ))
+        out.append(
+            Criterion(
+                id=item.get("id", ""),
+                description=item.get("description", ""),
+                verification=verification,
+                required=bool(item.get("required", True)),
+            )
+        )
     return tuple(out)
 
 
@@ -169,13 +173,15 @@ def _decode_context_refs(raw: Any) -> tuple[ContextRef, ...]:
     items = raw if isinstance(raw, list) else json.loads(raw)
     out = []
     for item in items:
-        out.append(ContextRef(
-            kind=item.get("kind", "session"),
-            ref=item.get("ref", ""),
-            source_id=item.get("source_id"),
-            summary=item.get("summary"),
-            mime_type=item.get("mime_type"),
-        ))
+        out.append(
+            ContextRef(
+                kind=item.get("kind", "session"),
+                ref=item.get("ref", ""),
+                source_id=item.get("source_id"),
+                summary=item.get("summary"),
+                mime_type=item.get("mime_type"),
+            )
+        )
     return tuple(out)
 
 
@@ -197,9 +203,7 @@ def _decode_workspace(raw: Any) -> WorkspaceSpec | None:
         temp_root=data.get("temp_root"),
         execution_backend=data.get("execution_backend", "local"),
         network_policy=NetworkPolicy(data.get("network_policy", "allow")),
-        mutation_mode=MutationMode(
-            data.get("mutation_mode", MutationMode.DIRECT.value)
-        ),
+        mutation_mode=MutationMode(data.get("mutation_mode", MutationMode.DIRECT.value)),
     )
 
 
@@ -236,16 +240,16 @@ def _decode_budget(raw: Any) -> ResourceBudget:
     wall = data.get("max_wall_time")
     cost = data.get("max_cost_usd")
     return ResourceBudget(
-        max_agent_iterations=int(data.get("max_agent_iterations", 100)),
+        max_agent_iterations=int(data.get("max_agent_iterations", 500)),
         max_input_tokens=_opt_int(data.get("max_input_tokens")),
         max_output_tokens=_opt_int(data.get("max_output_tokens")),
         max_cost_usd=Decimal(str(cost)) if cost else None,
         max_wall_time=timedelta(seconds=float(wall)) if wall else None,
-        max_children=int(data.get("max_children", 4)),
+        max_children=int(data.get("max_children", 16)),
         max_child_depth=int(data.get("max_child_depth", 1)),
         max_parallel_model_calls=int(data.get("max_parallel_model_calls", 4)),
-        max_parallel_executions=int(data.get("max_parallel_executions", 4)),
-        max_artifact_bytes=int(data.get("max_artifact_bytes", 10 * 1024 * 1024)),
+        max_parallel_executions=int(data.get("max_parallel_executions", 16)),
+        max_artifact_bytes=int(data.get("max_artifact_bytes", 100 * 1024 * 1024)),
     )
 
 

@@ -130,8 +130,7 @@ class SkillLifecycle:
         result = self._validator.validate(skill)
         if not result.ok:
             raise ValueError(
-                f"cannot install invalid skill: {skill.name or '?'} "
-                f"({'; '.join(result.errors)})"
+                f"cannot install invalid skill: {skill.name or '?'} ({'; '.join(result.errors)})"
             )
         skill_id = skill.id or new_id("skill")
         now = utcnow().isoformat()
@@ -174,8 +173,7 @@ class SkillLifecycle:
         result = self._validator.validate(base)
         if not result.ok:
             raise ValueError(
-                f"cannot update invalid skill: {skill.name or '?'} "
-                f"({'; '.join(result.errors)})"
+                f"cannot update invalid skill: {skill.name or '?'} ({'; '.join(result.errors)})"
             )
         new_version = int(current.version or 1) + 1
         updated = _with_fixed(skill, version=new_version, id=current.id)
@@ -276,9 +274,7 @@ class SkillLifecycle:
         """
         if not authorized:
             await self._emit_candidate(candidate, accepted=False, task_id=task_id)
-            logger.warning(
-                "skill promotion blocked by policy for %s", candidate.propose_name
-            )
+            logger.warning("skill promotion blocked by policy for %s", candidate.propose_name)
             return None
 
         result = self._validator.validate_candidate(candidate)
@@ -298,9 +294,7 @@ class SkillLifecycle:
             )
             return candidate.target_skill
         skill_id = await self.install(draft, task_id=task_id)
-        await self._emit_candidate(
-            candidate, accepted=True, skill_id=skill_id, task_id=task_id
-        )
+        await self._emit_candidate(candidate, accepted=True, skill_id=skill_id, task_id=task_id)
         return skill_id
 
     async def search(self, query: str = "", *, limit: int = 10) -> List[Skill]:
@@ -344,9 +338,7 @@ class SkillLifecycle:
             logger.info("skill lifecycle event: %s %s", type_name, dict(payload))
             return
         try:
-            await self._events.append(
-                make_event(type_name, payload, task_id=task_id)
-            )
+            await self._events.append(make_event(type_name, payload, task_id=task_id))
         except Exception as exc:
             logger.warning("failed to append skill event: %s", exc)
 
@@ -386,10 +378,7 @@ class SkillStore:
         if not query:
             return loaded[:limit]
         q = query.lower()
-        return [
-            s for s in loaded
-            if q in f"{s.name} {s.description} {s.body}".lower()
-        ][:limit]
+        return [s for s in loaded if q in f"{s.name} {s.description} {s.body}".lower()][:limit]
 
     async def trigger(
         self, skill_id: str, arguments: Mapping[str, Any], *, task_id: str | None = None

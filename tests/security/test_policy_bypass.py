@@ -64,9 +64,7 @@ async def test_task_deny_is_hard_ceiling_even_when_global_allows():
     reg = CapabilityRegistry()
     exec_ = _RecordingExecutor("execute", (EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS))
     reg.register(exec_)
-    dispatcher = CapabilityDispatcher(
-        reg, PolicyEngine(profile=AutonomyLevel.CODING)
-    )
+    dispatcher = CapabilityDispatcher(reg, PolicyEngine(profile=AutonomyLevel.CODING))
 
     result = await dispatcher.dispatch(
         CapabilityRequest(
@@ -112,6 +110,7 @@ def test_autonomous_grant_allows_build_cmd_outside_workspace():
     """INV-008: autonomous profile grants build/test commands outside ws."""
     engine = PolicyEngine(profile=AutonomyLevel.AUTONOMOUS)
     from athena.protocol.policy import PolicyVerdict as PV
+
     decision = engine.evaluate(
         PolicyRequest(
             principal=Principal("agent", "athena"),

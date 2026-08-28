@@ -34,9 +34,15 @@ from athena.protocol.tasks import AutonomyLevel, NetworkPolicy, WorkspaceSpec
 _WRITE_OPS = frozenset({"write", "patch", "mkdir", "copy", "move", "create", "update"})
 _DELETE_OPS = frozenset({"delete", "remove", "rmtree", "unlink"})
 _READ_OPS = frozenset({"read", "list", "stat", "read_text", "get", "exists", "open"})
-_PATHLESS_WRITE_CAPABILITIES = frozenset({
-    "memory", "schedule", "synthesis", "workflow", "research",
-})
+_PATHLESS_WRITE_CAPABILITIES = frozenset(
+    {
+        "memory",
+        "schedule",
+        "synthesis",
+        "workflow",
+        "research",
+    }
+)
 _BUILD_CMDS = frozenset({"build", "test", "pytest", "make", "go", "cargo", "npm"})
 _SEP = os.sep
 
@@ -69,8 +75,10 @@ class PolicyEngine:
         hit = self.approvals.covers_request(request)
         if hit is not None:
             return _decision(
-                "allow", f"approved grant {hit.id} covers request",
-                f"approval:{hit.id}", request,
+                "allow",
+                f"approved grant {hit.id} covers request",
+                f"approval:{hit.id}",
+                request,
             )
 
         if _has(EffectClass.WRITE_LOCAL, request.effects) or self._is_files_op(request, _WRITE_OPS):
@@ -78,27 +86,37 @@ class PolicyEngine:
             # effect but must be evaluated as EXECUTE (they run code, not
             # write files). Only route to _eval_write when there is no
             # execute/spawn effect present.
-            if not (_has(EffectClass.EXECUTE, request.effects)
-                    or _has(EffectClass.SPAWN_PROCESS, request.effects)):
+            if not (
+                _has(EffectClass.EXECUTE, request.effects)
+                or _has(EffectClass.SPAWN_PROCESS, request.effects)
+            ):
                 # Database writes target DB files by path; they are workspace-
                 # scoped like file writes but resolved against the DB path.
-                if (not request.arguments.get("path")
-                        and request.capability_id in _PATHLESS_WRITE_CAPABILITIES):
+                if (
+                    not request.arguments.get("path")
+                    and request.capability_id in _PATHLESS_WRITE_CAPABILITIES
+                ):
                     out = self._eval_rule(
-                        request, rules, EffectClass.WRITE_LOCAL,
+                        request,
+                        rules,
+                        EffectClass.WRITE_LOCAL,
                         f"{request.capability_id}.write",
                     )
                 else:
-                    out = (self._eval_database_write(request, rules)
-                           if request.capability_id == "database"
-                           else self._eval_write(request, rules))
+                    out = (
+                        self._eval_database_write(request, rules)
+                        if request.capability_id == "database"
+                        else self._eval_write(request, rules)
+                    )
             else:
                 out = self._eval_execute(request, rules, level)
         elif _has(EffectClass.DELETE, request.effects) or self._is_files_op(request, _DELETE_OPS):
             out = self._eval_delete(request, rules)
-        elif (_has(EffectClass.EXECUTE, request.effects)
-              or _has(EffectClass.SPAWN_PROCESS, request.effects)
-              or self._is_exec(request)):
+        elif (
+            _has(EffectClass.EXECUTE, request.effects)
+            or _has(EffectClass.SPAWN_PROCESS, request.effects)
+            or self._is_exec(request)
+        ):
             out = self._eval_execute(request, rules, level)
         elif _has(EffectClass.READ_LOCAL, request.effects) or self._is_files_op(request, _READ_OPS):
             out = self._eval_read(request, rules)
@@ -125,16 +143,14 @@ class PolicyEngine:
         explicit approval grant (same rule as out-of-workspace execute).
         """
         path = str(req.arguments.get("path") or "")
-        if self._out_of_workspace(req) and os.path.realpath(
-                os.path.abspath(path)).startswith("/tmp/"):
+        if self._out_of_workspace(req) and os.path.realpath(os.path.abspath(path)).startswith(
+            "/tmp/"
+        ):
             # /tmp databases are scratch; allow under profile rules.
-            return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL,
-                                   "database.write")
-        if not self._within(self._abs(path, req.workspace), req.workspace,
-                            writable_only=True):
+            return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL, "database.write")
+        if not self._within(self._abs(path, req.workspace), req.workspace, writable_only=True):
             return _deny(f"database outside writable scope: {path}")
-        return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL,
-                               "database.write")
+        return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL, "database.write")
 
     def _eval_delete(self, req, rules):
         path = req.arguments.get("path") or req.arguments.get("resource")
@@ -159,9 +175,11 @@ class PolicyEngine:
         # arbitrary code is network-confined.  The shadow backend is allowed
         # through only because its runtime contract invokes the fail-closed
         # namespace sandbox with a private network namespace.
-        if (req.workspace is not None
-                and req.workspace.network_policy == NetworkPolicy.DENY
-                and req.execution_backend not in {"shadow", "sandbox"}):
+        if (
+            req.workspace is not None
+            and req.workspace.network_policy == NetworkPolicy.DENY
+            and req.execution_backend not in {"shadow", "sandbox"}
+        ):
             return _deny("execute denied: workspace network_policy is DENY")
         if self._out_of_workspace(req) and not _execute_granted(level, req):
             return _deny(
@@ -222,7 +240,9 @@ def _to_level(value) -> AutonomyLevel:
     return value if isinstance(value, AutonomyLevel) else AutonomyLevel(value)
 
 
-def _decision(verdict: str, reason: str, matched: Optional[str], req: PolicyRequest) -> PolicyDecision:
+def _decision(
+    verdict: str, reason: str, matched: Optional[str], req: PolicyRequest
+) -> PolicyDecision:
     if verdict in (PolicyVerdict.DENY.value, "deny"):
         return PolicyDecision(PolicyVerdict.DENY, reason, matched, ())
     if verdict in (PolicyVerdict.ASK.value, "ask"):
@@ -245,11 +265,19 @@ def _has(cls, effects) -> bool:
 
 def _primary(effects) -> Optional[EffectClass]:
     for eff in (
-        EffectClass.PRIVILEGED, EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS,
-        EffectClass.FINANCIAL, EffectClass.SECRET_READ, EffectClass.NETWORK_WRITE,
-        EffectClass.NETWORK_READ, EffectClass.EXTERNAL_PUBLISH,
-        EffectClass.EXTERNAL_MESSAGE, EffectClass.DELETE, EffectClass.WRITE_LOCAL,
-        EffectClass.READ_LOCAL, EffectClass.COMPUTER_INPUT,
+        EffectClass.PRIVILEGED,
+        EffectClass.EXECUTE,
+        EffectClass.SPAWN_PROCESS,
+        EffectClass.FINANCIAL,
+        EffectClass.SECRET_READ,
+        EffectClass.NETWORK_WRITE,
+        EffectClass.NETWORK_READ,
+        EffectClass.EXTERNAL_PUBLISH,
+        EffectClass.EXTERNAL_MESSAGE,
+        EffectClass.DELETE,
+        EffectClass.WRITE_LOCAL,
+        EffectClass.READ_LOCAL,
+        EffectClass.COMPUTER_INPUT,
     ):
         if eff in effects:
             return eff
@@ -257,10 +285,20 @@ def _primary(effects) -> Optional[EffectClass]:
 
 
 def _path_match(target: str, pattern: str) -> bool:
-    if pattern.endswith("/**"):
-        base = pattern[:-3].rstrip("/")
-        return target == base or target.startswith(base + "/")
-    return fnmatch.fnmatch(target, pattern)
+    """Match a canonical target against a workspace path rule.
+
+    A rule naming a directory grants that directory's descendants, just like
+    the filesystem capability's writable/readable scope check.  Policy sees
+    canonical targets, so canonicalize the rule before comparing it; this also
+    makes relative and ``~``-prefixed rules behave consistently at both
+    authority boundaries.
+    """
+    target_real = os.path.realpath(os.path.abspath(target))
+    pattern_text = os.path.expanduser(str(pattern))
+    if "*" in pattern_text or "?" in pattern_text or "[" in pattern_text:
+        return fnmatch.fnmatch(target_real, os.path.realpath(os.path.abspath(pattern_text)))
+    pattern_real = os.path.realpath(os.path.abspath(pattern_text))
+    return target_real == pattern_real or target_real.startswith(pattern_real + _SEP)
 
 
 def _execute_granted(level: AutonomyLevel, req) -> bool:

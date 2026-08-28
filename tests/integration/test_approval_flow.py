@@ -4,6 +4,7 @@ Under the default SUPERVISED profile an ``execute`` capability call is an ASK
 (policy profile), so the kernel parks the task in WAITING_APPROVAL. Resolving
 the approval grants an exact scoped grant and resumes the task.
 """
+
 from __future__ import annotations
 import pytest
 
@@ -17,31 +18,40 @@ async def _collect_up_to(svc, task_id, target: str, tries=150, delay=0.02) -> st
         if st == target:
             return st
         from asyncio import sleep
+
         await sleep(delay)
     return await svc.get_task_status(task_id)
 
 
 async def _request_execution(svc, prompt: str):
-    return await svc.submit(
-        AgentRequest(prompt=prompt, session_id=new_id("session")), wait=False
-    )
+    return await svc.submit(AgentRequest(prompt=prompt, session_id=new_id("session")), wait=False)
 
 
 @pytest.mark.athena_claim("BHV-044")
 @pytest.mark.athena_evidence("test", "e2e")
 async def test_approve_granted_resumes_and_completes(make_service):
-    svc = await make_service(scripts=[
-        {"match": {"capability_result_ok": True},
-         "respond": {"text": "EXECUTED_OK", "done": True}},
-        {"match": {"user_contains": "APPROVE_EXEC"},
-         "respond": {"capability_call": {
-             "capability_id": "execute",
-             "arguments": {"language": "sh", "code": "echo ok"},
-         }}},
-    ])
+    svc = await make_service(
+        scripts=[
+            {
+                "match": {"capability_result_ok": True},
+                "respond": {"text": "EXECUTED_OK", "done": True},
+            },
+            {
+                "match": {"user_contains": "APPROVE_EXEC"},
+                "respond": {
+                    "capability_call": {
+                        "capability_id": "execute",
+                        "arguments": {"language": "sh", "code": "echo ok"},
+                    }
+                },
+            },
+        ]
+    )
     task = await _request_execution(svc, "APPROVE_EXEC do it")
-    assert await _collect_up_to(svc, task.id, TaskStatus.WAITING_APPROVAL.value) \
+    assert (
+        await _collect_up_to(svc, task.id, TaskStatus.WAITING_APPROVAL.value)
         == TaskStatus.WAITING_APPROVAL.value
+    )
 
     approval_id = await svc.pending_approval_id(task.id)
     assert approval_id is not None
@@ -56,18 +66,28 @@ async def test_approve_granted_resumes_and_completes(make_service):
 @pytest.mark.athena_claim("BHV-043")
 @pytest.mark.athena_evidence("test", "e2e")
 async def test_approve_denied_has_no_effect(make_service):
-    svc = await make_service(scripts=[
-        {"match": {"capability_result_ok": False},
-         "respond": {"text": "AFTER_DENY", "done": True}},
-        {"match": {"user_contains": "DENY_EXEC"},
-         "respond": {"capability_call": {
-             "capability_id": "execute",
-             "arguments": {"language": "sh", "code": "echo should_not_run"},
-         }}},
-    ])
+    svc = await make_service(
+        scripts=[
+            {
+                "match": {"capability_result_ok": False},
+                "respond": {"text": "AFTER_DENY", "done": True},
+            },
+            {
+                "match": {"user_contains": "DENY_EXEC"},
+                "respond": {
+                    "capability_call": {
+                        "capability_id": "execute",
+                        "arguments": {"language": "sh", "code": "echo should_not_run"},
+                    }
+                },
+            },
+        ]
+    )
     task = await _request_execution(svc, "DENY_EXEC do it")
-    assert await _collect_up_to(svc, task.id, TaskStatus.WAITING_APPROVAL.value) \
+    assert (
+        await _collect_up_to(svc, task.id, TaskStatus.WAITING_APPROVAL.value)
         == TaskStatus.WAITING_APPROVAL.value
+    )
 
     approval_id = await svc.pending_approval_id(task.id)
     assert approval_id is not None

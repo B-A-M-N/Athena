@@ -77,9 +77,7 @@ class RuntimeSessionStore:
         )
 
     async def get(self, session_id: str) -> dict | None:
-        row = await self._db.fetch_one(
-            "SELECT * FROM runtime_sessions WHERE id = ?", (session_id,)
-        )
+        row = await self._db.fetch_one("SELECT * FROM runtime_sessions WHERE id = ?", (session_id,))
         if row is None:
             return None
         return _decode(row)

@@ -43,7 +43,7 @@ __all__ = ["BaseRuntime"]
 class BaseRuntime(metaclass=abc.ABCMeta):
     """Abstract base for persistent, process-backed runtimes."""
 
-    name: str = ""            # required: unique runtime name
+    name: str = ""  # required: unique runtime name
     aliases: tuple[str, ...] = ()
     persistence: str = "persistent"
 
@@ -64,9 +64,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
     def _session_for(self, runtime_session_id: str) -> Any:
         return self._sessions[runtime_session_id]
 
-    def _adopt_or_create(
-        self, request: ExecutionRequest
-    ) -> tuple[str, Any]:
+    def _adopt_or_create(self, request: ExecutionRequest) -> tuple[str, Any]:
         """Return (session_id, session) for ``request``, creating a task-scoped
         session synchronously if none exists (BHV-058 persistent default).
 
@@ -106,9 +104,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             "cwd": request.cwd,
             "sandbox_root": request.workspace_root,
             "network_policy": (
-                request.network_policy.value
-                if request.network_policy is not None
-                else None
+                request.network_policy.value if request.network_policy is not None else None
             ),
         }
         try:
@@ -130,14 +126,13 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         if request.workspace_root is not None:
             requested_root = os.path.realpath(os.path.abspath(request.workspace_root))
             session_root = getattr(session, "sandbox_root", None)
-            if session_root is None or os.path.realpath(
-                os.path.abspath(session_root)
-            ) != requested_root:
+            if (
+                session_root is None
+                or os.path.realpath(os.path.abspath(session_root)) != requested_root
+            ):
                 return False
         if request.network_policy is not None:
-            requested_network = getattr(
-                request.network_policy, "value", request.network_policy
-            )
+            requested_network = getattr(request.network_policy, "value", request.network_policy)
             if getattr(session, "network_policy", None) != requested_network:
                 return False
         return True
@@ -198,15 +193,17 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             self._exec_owner.pop(execution_id, None)
 
     @abc.abstractmethod
-    def _make_session(self, *, env: Mapping[str, str] | None = None,
-                      cwd: str | None = None, sandbox_root: str | None = None,
-                      network_policy: str | None = None) -> Any:
-        ...
+    def _make_session(
+        self,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: str | None = None,
+        sandbox_root: str | None = None,
+        network_policy: str | None = None,
+    ) -> Any: ...
 
     @abc.abstractmethod
-    def _run(self, session: Any, request: ExecutionRequest,
-             execution_id: str) -> Any:
-        ...
+    def _run(self, session: Any, request: ExecutionRequest, execution_id: str) -> Any: ...
 
     # -- interrupt / close -------------------------------------------------- #
     async def interrupt(self, execution_id: str) -> None:

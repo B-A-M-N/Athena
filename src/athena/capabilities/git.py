@@ -59,10 +59,19 @@ class GitCapability:
             "type": "object",
             "required": ["operation"],
             "properties": {
-                "operation": {"type": "string", "enum": [
-                    "status", "diff", "log", "show", "blame", "branch",
-                    "merge_base", "baseline",
-                ]},
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "status",
+                        "diff",
+                        "log",
+                        "show",
+                        "blame",
+                        "branch",
+                        "merge_base",
+                        "baseline",
+                    ],
+                },
                 "path": {"type": "string", "maxLength": 4096},
                 "ref": {"type": "string", "maxLength": 256},
                 "other_ref": {"type": "string", "maxLength": 256},
@@ -90,9 +99,7 @@ class GitCapability:
         except ValueError as exc:
             return _result(request, ok=False, error=str(exc))
         loop = asyncio.get_running_loop()
-        rc, stdout, stderr = await loop.run_in_executor(
-            None, lambda: _run_git(command, root)
-        )
+        rc, stdout, stderr = await loop.run_in_executor(None, lambda: _run_git(command, root))
         metadata = {
             "operation": operation,
             "returncode": rc,
@@ -128,8 +135,11 @@ class GitCapability:
             return command
         if operation == "log":
             command = [
-                "git", "log", f"-n{int(args.get('limit') or 20)}",
-                "--date=iso-strict", "--format=%H%n%aI%n%an%n%s",
+                "git",
+                "log",
+                f"-n{int(args.get('limit') or 20)}",
+                "--date=iso-strict",
+                "--format=%H%n%aI%n%an%n%s",
             ]
             if path_arg is not None:
                 command.extend(["--", path_arg])
@@ -156,8 +166,12 @@ class GitCapability:
             return ["git", "merge-base", first, second]
         if operation == "baseline":
             return [
-                "git", "rev-parse", "--show-toplevel", "HEAD",
-                "--abbrev-ref", "HEAD",
+                "git",
+                "rev-parse",
+                "--show-toplevel",
+                "HEAD",
+                "--abbrev-ref",
+                "HEAD",
             ]
         raise ValueError(f"unknown git operation: {operation}")
 

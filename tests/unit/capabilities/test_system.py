@@ -39,8 +39,7 @@ async def test_machine_env_redacts_secrets():
     cap = MachineCapability()
     os.environ["ATHENA_TEST_SECRET_KEY_XYZ"] = "supersecret"
     try:
-        r = await cap.invoke(_req("machine", "env",
-                                  name="ATHENA_TEST_SECRET_KEY_XYZ"))
+        r = await cap.invoke(_req("machine", "env", name="ATHENA_TEST_SECRET_KEY_XYZ"))
         assert "redacted" in (r.output or "") and "supersecret" not in (r.output or "")
     finally:
         del os.environ["ATHENA_TEST_SECRET_KEY_XYZ"]

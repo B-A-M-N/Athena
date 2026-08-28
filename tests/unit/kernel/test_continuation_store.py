@@ -1,4 +1,5 @@
 """Durable approval continuation store (review item 19)."""
+
 from __future__ import annotations
 
 import asyncio

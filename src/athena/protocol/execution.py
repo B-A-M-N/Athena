@@ -95,24 +95,19 @@ class Runtime(Protocol):
         env: Mapping[str, str] | None = None,
         workspace_root: str | None = None,
         network_policy: NetworkPolicy | str | None = None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     def execute(
         self,
         request: ExecutionRequest,
         execution_id: str,
-    ) -> AsyncIterator[ExecutionEvent]:
-        ...
+    ) -> AsyncIterator[ExecutionEvent]: ...
 
-    async def interrupt(self, execution_id: str) -> None:
-        ...
+    async def interrupt(self, execution_id: str) -> None: ...
 
-    async def reset(self, runtime_session_id: str) -> None:
-        ...
+    async def reset(self, runtime_session_id: str) -> None: ...
 
-    async def close(self, runtime_session_id: str) -> None:
-        ...
+    async def close(self, runtime_session_id: str) -> None: ...
 
 
 class ExecutionBackend(Protocol):
@@ -127,21 +122,23 @@ class ExecutionBackend(Protocol):
         env: Mapping[str, str] | None,
         workspace_root: str | None = None,
         network_policy: NetworkPolicy | str | None = None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
-    def execute(self, request: ExecutionRequest) -> AsyncIterator[ExecutionEvent]:
-        ...
+    def execute(self, request: ExecutionRequest) -> AsyncIterator[ExecutionEvent]: ...
 
-    async def interrupt(self, execution_id: str) -> None:
-        ...
+    async def interrupt(self, execution_id: str) -> None: ...
 
-    async def destroy_session(self, runtime_session_id: str) -> None:
-        ...
+    async def destroy_session(self, runtime_session_id: str) -> None: ...
 
 
 __all__ = [
-    "RuntimePersistence", "ExecutionLimits", "ExecutionRequest",
-    "ExecutionExitStatus", "ExecutionEventType", "ExecutionEvent",
-    "ExecutionResult", "Runtime", "ExecutionBackend",
+    "RuntimePersistence",
+    "ExecutionLimits",
+    "ExecutionRequest",
+    "ExecutionExitStatus",
+    "ExecutionEventType",
+    "ExecutionEvent",
+    "ExecutionResult",
+    "Runtime",
+    "ExecutionBackend",
 ]

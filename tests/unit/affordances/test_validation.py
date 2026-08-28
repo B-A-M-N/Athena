@@ -13,7 +13,12 @@ def test_task_source_validation_runs_contract_and_available_static_checks():
 
     assert result.passed
     assert {check.name for check in result.checks} >= {
-        "parse", "interface", "security", "format", "lint", "typecheck",
+        "parse",
+        "interface",
+        "security",
+        "format",
+        "lint",
+        "typecheck",
     }
     assert result.code.startswith("def run(args):")
 
@@ -25,10 +30,7 @@ def test_source_validation_rejects_host_escape_primitives_before_execution():
     )
 
     assert not result.passed
-    assert any(
-        check.name == "security" and check.status == "failed"
-        for check in result.checks
-    )
+    assert any(check.name == "security" and check.status == "failed" for check in result.checks)
 
 
 def test_candidate_validation_requires_type_and_lint_tools_when_present():
@@ -43,10 +45,12 @@ def test_candidate_validation_requires_type_and_lint_tools_when_present():
 
 
 def test_input_schema_is_generated_from_validation_fixtures_when_omitted():
-    schema = infer_input_schema([
-        {"args": {"path": "a.txt", "limit": 10}},
-        {"args": {"path": "b.txt", "limit": 20}},
-    ])
+    schema = infer_input_schema(
+        [
+            {"args": {"path": "a.txt", "limit": 10}},
+            {"args": {"path": "b.txt", "limit": 20}},
+        ]
+    )
 
     assert schema == {
         "type": "object",

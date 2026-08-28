@@ -7,6 +7,7 @@ output remain the canonical provider-neutral ModelRequest/ModelEvent shapes.
 Streaming is native via ``complete``; a consumer accumulates events when it
 wants a whole response.
 """
+
 from __future__ import annotations
 
 import json
@@ -109,11 +110,11 @@ def _emit_candidate(
             parsed_arguments=dict(raw),
             provider_profile_id=metadata.get("provider_profile_id"),
             model_id=metadata.get("model_id"),
-            provider_metadata={k: v for k, v in metadata.items()
-                               if k not in {"provider_profile_id", "model_id"}},
+            provider_metadata={
+                k: v for k, v in metadata.items() if k not in {"provider_profile_id", "model_id"}
+            },
         )
-    candidate = ToolCallCandidate.parse(
-        call_id, capability_id, raw, **metadata)
+    candidate = ToolCallCandidate.parse(call_id, capability_id, raw, **metadata)
     if candidate.parsed_arguments is None:
         record_raw_candidate(candidate)
     return candidate
@@ -134,15 +135,27 @@ def serialize_tool_result(output: str | None) -> str:
 
 
 def _response_metadata(
-    request: ModelRequest, *, extra: Mapping[str, Any] | None = None,
+    request: ModelRequest,
+    *,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Carry request provenance/cache identity onto every provider response."""
     keys = (
-        "task_id", "session_id", "provider_profile_id",
-        "provider_profile_fingerprint", "profile_id", "model_id",
-        "compatibility_profile", "model_profile", "protocol",
-        "tool_repair_mode", "max_tool_correction_cycles", "cache_mode",
-        "cache_session_key", "prefix_fingerprint", "full_fingerprint",
+        "task_id",
+        "session_id",
+        "provider_profile_id",
+        "provider_profile_fingerprint",
+        "profile_id",
+        "model_id",
+        "compatibility_profile",
+        "model_profile",
+        "protocol",
+        "tool_repair_mode",
+        "max_tool_correction_cycles",
+        "cache_mode",
+        "cache_session_key",
+        "prefix_fingerprint",
+        "full_fingerprint",
         "components_fp",
     )
     result = {key: request.metadata[key] for key in keys if key in request.metadata}
@@ -254,8 +267,7 @@ class OpenAICompatProvider:
         if (
             request.metadata.get("protocol") == "openai"
             and request.metadata.get("cache_session_key")
-            and request.metadata.get("cache_mode")
-            in {"automatic-prefix", "explicit-cache-api"}
+            and request.metadata.get("cache_mode") in {"automatic-prefix", "explicit-cache-api"}
         ):
             payload["prompt_cache_key"] = request.metadata["cache_session_key"]
         return payload
@@ -263,51 +275,52 @@ class OpenAICompatProvider:
     def _translate_message(self, msg: Message) -> list[dict[str, Any]] | dict[str, Any]:
         role = _ROLE_MAP.get(msg.role, "user")
         if role == "tool":
-            results = [
-                b for b in msg.blocks if isinstance(b, CapabilityResultBlock)
-            ]
+            results = [b for b in msg.blocks if isinstance(b, CapabilityResultBlock)]
             if results:
                 return [
                     {
                         "role": "tool",
-                        "content": serialize_tool_result(
-                            b.output if b.output else b.error
-                        ),
+                        "content": serialize_tool_result(b.output if b.output else b.error),
                         "tool_call_id": b.call_id,
                     }
                     for b in results
                 ]
             return {"role": "tool", "content": msg.text()}
         text = "\n".join(
-            b.text for b in msg.blocks
-            if isinstance(b, (TextBlock, ReasoningBlock)) and b.text
+            b.text for b in msg.blocks if isinstance(b, (TextBlock, ReasoningBlock)) and b.text
         )
         content_parts: list[dict[str, Any]] = []
         if text:
             content_parts.append({"type": "text", "text": text})
         for block in msg.blocks:
             if isinstance(block, ImageBlock) and block.data_path:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": block.data_path},
-                })
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": block.data_path},
+                    }
+                )
             elif isinstance(block, AudioBlock) and block.data_path:
                 audio_format = (block.mime_type or "audio/wav").split("/", 1)[-1]
-                content_parts.append({
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": block.data_path,
-                        "format": audio_format,
-                    },
-                })
+                content_parts.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": block.data_path,
+                            "format": audio_format,
+                        },
+                    }
+                )
             elif isinstance(block, (ArtifactRefBlock, FileRefBlock)) and block.uri:
                 # The generic chat-completions protocol has no portable
                 # artifact part. Preserve the reference as an explicit file
                 # part rather than silently dropping the attachment.
-                content_parts.append({
-                    "type": "text",
-                    "text": f"[artifact attachment: {block.uri}]",
-                })
+                content_parts.append(
+                    {
+                        "type": "text",
+                        "text": f"[artifact attachment: {block.uri}]",
+                    }
+                )
         content: str | list[dict[str, Any]] = text
         if content_parts and not (
             len(content_parts) == 1
@@ -398,15 +411,15 @@ class OpenAICompatProvider:
                 yield ModelEvent(
                     type=ModelEventType.DELTA,
                     request_id=request.request_id,
-                    delta=ModelDelta(
-                        request_id=request.request_id, text=delta["content"]
-                    ),
+                    delta=ModelDelta(request_id=request.request_id, text=delta["content"]),
                 )
             for tc in delta.get("tool_calls") or []:
                 self._accumulate_tool_call(tc, tool_calls)
         for call in tool_calls.values():
             candidate = _emit_candidate(
-                call["call_id"], call["name"], call["arguments"],
+                call["call_id"],
+                call["name"],
+                call["arguments"],
                 completion_state="CLEAN" if stream_complete else "INTERRUPTED",
                 provider_profile_id=request.metadata.get("provider_profile_id"),
                 model_id=request.model,
@@ -539,5 +552,4 @@ class OpenAICompatProvider:
         return ProviderProtocolError(message)
 
 
-__all__ = ["OpenAICompatProvider", "parse_tool_arguments",
-           "serialize_tool_result"]
+__all__ = ["OpenAICompatProvider", "parse_tool_arguments", "serialize_tool_result"]

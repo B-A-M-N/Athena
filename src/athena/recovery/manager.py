@@ -15,7 +15,7 @@ _logger = logging.getLogger("athena.recovery")
 
 class RecoveryManager:
     """Startup crash recovery: reconcile in-flight state after a hard crash.
-    
+
     Called BEFORE the worker and scheduler start claiming work. This ensures
     that orphaned RUNNING tasks, stale executions, and incomplete mutations are
     resolved to a consistent state before any new work begins.
@@ -134,9 +134,7 @@ class RecoveryManager:
                     except Exception as exc:
                         # Session truth still wins if observability is
                         # temporarily unavailable during startup recovery.
-                        _logger.warning(
-                            "failed to emit runtime state loss for %s: %s", sid, exc
-                        )
+                        _logger.warning("failed to emit runtime state loss for %s: %s", sid, exc)
             except Exception as exc:
                 _logger.warning("failed to mark runtime session %s dead: %s", sid, exc)
         return count

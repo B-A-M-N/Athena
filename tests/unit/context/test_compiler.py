@@ -1,10 +1,10 @@
-
 import pytest
 
 from athena.context.compiler import ContextCompiler
+from athena.context.blocks import ContextBlock
 from athena.protocol.capabilities import CapabilityDescriptor
-from athena.protocol.messages import AudioBlock, ImageBlock, Role
-from athena.protocol.tasks import ContextRef, ModelPolicy, TaskSpec
+from athena.protocol.messages import AudioBlock, ImageBlock, Role, TrustClass
+from athena.protocol.tasks import ContextRef, ModelPolicy, TaskSpec, WorkspaceSpec
 
 
 def _task(objective: str = "do the thing", **kw) -> TaskSpec:
@@ -24,6 +24,22 @@ class _SearchCapRegistry(_CapRegistry):
         return [{"id": "files.read"}]
 
 
+class _ContextBlockStore:
+    async def list(self, *, scopes, attached_only, limit):
+        assert attached_only is True
+        assert ("task", "task-1") in scopes
+        return [
+            ContextBlock(
+                id="ctx-project-contract",
+                label="project-contract",
+                content="Always preserve the public API.",
+                scope="project",
+                scope_id="repo",
+                trust=TrustClass.CONFIGURED_INSTRUCTION,
+            )
+        ]
+
+
 @pytest.mark.athena_claim("BHV-029")
 @pytest.mark.athena_evidence("test")
 async def test_compile_minimal_context():
@@ -39,6 +55,19 @@ async def test_compile_minimal_context():
     user_texts = " ".join(m.text() for m in ctx.messages if m.role == Role.USER)
     assert "do the thing" in user_texts
     assert ctx.requirements is not None
+
+
+@pytest.mark.asyncio
+async def test_attached_context_blocks_are_mandatory_and_provenanced():
+    task = _task(workspace=WorkspaceSpec(id="repo", root="/tmp/repo"))
+    context = await ContextCompiler(
+        context_block_store=_ContextBlockStore(),
+    ).compile(task)
+
+    messages = [message for message in context.messages if "project-contract" in message.text()]
+    assert len(messages) == 1
+    assert messages[0].provenance.source_id == "ctx-project-contract"
+    assert messages[0].provenance.trust is TrustClass.CONFIGURED_INSTRUCTION
 
 
 @pytest.mark.athena_claim("BHV-029")
@@ -57,15 +86,11 @@ async def test_to_request_includes_capabilities_when_registered():
 
 @pytest.mark.asyncio
 async def test_fabric_progressively_discloses_relevant_capabilities():
-    selected = CapabilityDescriptor(
-        id="files.read", description="read files", input_schema={}
-    )
+    selected = CapabilityDescriptor(id="files.read", description="read files", input_schema={})
     unrelated = CapabilityDescriptor(
         id="database.query", description="query database", input_schema={}
     )
-    compiler = ContextCompiler(
-        capability_registry=_SearchCapRegistry([selected, unrelated])
-    )
+    compiler = ContextCompiler(capability_registry=_SearchCapRegistry([selected, unrelated]))
 
     ctx = await compiler.compile(_task(objective="read files"))
 
@@ -109,14 +134,16 @@ class _ResearchStore:
     async def search_content(self, query, **kwargs):
         assert query == "what is the protocol"
         assert kwargs["task_id"] == "task-1"
-        return [{
-            "source": {
-                "id": "src-1",
-                "title": "Protocol notes",
-                "canonical_uri": "https://example.test/protocol",
-            },
-            "snippet": "The protocol uses framed messages.",
-        }]
+        return [
+            {
+                "source": {
+                    "id": "src-1",
+                    "title": "Protocol notes",
+                    "canonical_uri": "https://example.test/protocol",
+                },
+                "snippet": "The protocol uses framed messages.",
+            }
+        ]
 
 
 async def test_compiler_retrieves_scoped_research_as_external_evidence():
@@ -126,7 +153,8 @@ async def test_compiler_retrieves_scoped_research_as_external_evidence():
     text = "\n".join(message.text() for message in context.messages)
     assert "The protocol uses framed messages." in text
     research_messages = [
-        message for message in context.messages
+        message
+        for message in context.messages
         if message.provenance and message.provenance.source_id == "src-1"
     ]
     assert research_messages

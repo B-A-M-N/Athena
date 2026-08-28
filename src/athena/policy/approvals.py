@@ -76,6 +76,7 @@ class ApprovalManager:
         call_id: Optional[str] = None,
     ) -> str:
         from athena.protocol.ids import new_id
+
         aid = approval_id or new_id("apr")
         sc = scope if isinstance(scope, ApprovalScope) else ApprovalScope(scope)
         self._records[aid] = {
@@ -143,7 +144,8 @@ class ApprovalManager:
     def get(self, approval_id: str) -> Optional[ApprovalGrant]:
         rec = self._records.get(approval_id)
         if rec is None or rec["state"] not in (
-            ApprovalState.APPROVED, ApprovalState.REQUESTED,
+            ApprovalState.APPROVED,
+            ApprovalState.REQUESTED,
         ):
             return None
         return self._to_grant(rec)
@@ -284,6 +286,7 @@ class ApprovalManager:
 
 def _effect_from(name: str):
     from athena.protocol.capabilities import EffectClass
+
     if name in EffectClass._value2member_map_:
         return EffectClass(name)
     try:
@@ -294,6 +297,7 @@ def _effect_from(name: str):
 
 def _fnmatch(pattern: str, value: str) -> bool:
     import fnmatch
+
     if pattern.endswith("/**"):
         base = pattern[:-3].rstrip("/")
         return value == base or value.startswith(base + "/")

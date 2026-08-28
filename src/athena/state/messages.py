@@ -86,7 +86,11 @@ def _row_to_message(row: dict | Any) -> Message:
     blocks_data = json.loads(row["blocks"]) if row.get("blocks") else []
     blocks = tuple(_deserialize_block(b) for b in blocks_data)
     prov_data = json.loads(row["provenance"]) if row.get("provenance") else None
-    prov = _deserialize_provenance(prov_data) if prov_data else Provenance(source_type=SourceType.RUNTIME)
+    prov = (
+        _deserialize_provenance(prov_data)
+        if prov_data
+        else Provenance(source_type=SourceType.RUNTIME)
+    )
     meta = json.loads(row["metadata"]) if row.get("metadata") else {}
     return Message(
         id=row["id"],

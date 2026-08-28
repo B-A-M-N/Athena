@@ -29,6 +29,7 @@ def term():
 
 # -- pyte framebuffer feeding logic (pure, no PTY) -------------------------
 
+
 @pytest.mark.athena_scenario("BODY-002")
 def test_overwrite_moves_cursor_and_replaces():
     s = new_screen(4, 10)
@@ -72,6 +73,7 @@ def test_scrolling_keeps_last_rows():
 
 
 # -- capability-level: list op works without a session arg -----------------
+
 
 async def test_list_empty_sessions_ok_without_session_arg(term):
     r = await term.invoke(_req("list", task_id="t9"))

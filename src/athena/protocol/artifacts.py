@@ -15,7 +15,7 @@ from typing import Any, Mapping
 @dataclass(frozen=True)
 class ArtifactRef:
     id: str
-    uri: str            # artifact://sha256/<digest>
+    uri: str  # artifact://sha256/<digest>
     hash: str | None = None
     mime_type: str | None = None
     size: int | None = None
@@ -29,7 +29,7 @@ class ArtifactRef:
 def parse_artifact_uri(uri: str) -> tuple[str, str] | None:
     """Parse an artifact uri into (scheme-tail, digest/path)."""
     if uri.startswith("artifact://"):
-        rest = uri[len("artifact://"):]
+        rest = uri[len("artifact://") :]
         if "/" in rest:
             scheme, key = rest.split("/", 1)
             return scheme, key

@@ -17,11 +17,13 @@ pseudocode (BUILDSPEC §§17-18):
                    -> terminal? -> finalize
                    -> else -> loop
 """
+
 from __future__ import annotations
 
 import asyncio
 import inspect
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
@@ -48,6 +50,7 @@ from athena.protocol.errors import (
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityRequestOrigin,
+    DispatchDirectives,
 )
 from athena.protocol.ids import new_id
 from athena.protocol.messages import (
@@ -129,26 +132,41 @@ def _textable_messages(messages) -> list[Message]:
         changed = False
         for b in msg.blocks:
             if isinstance(b, CapabilityResultBlock) and not isinstance(b, _ResultTextBlock):
-                blocks.append(_ResultTextBlock(
-                    call_id=b.call_id, capability_id=b.capability_id, ok=b.ok,
-                    output=b.output, error=b.error, metadata=b.metadata,
-                    ref_uri=b.ref_uri,
-                ))
+                blocks.append(
+                    _ResultTextBlock(
+                        call_id=b.call_id,
+                        capability_id=b.capability_id,
+                        ok=b.ok,
+                        output=b.output,
+                        error=b.error,
+                        metadata=b.metadata,
+                        ref_uri=b.ref_uri,
+                    )
+                )
                 changed = True
             elif isinstance(b, CapabilityCallBlock) and not isinstance(b, _CallTextBlock):
-                blocks.append(_CallTextBlock(
-                    call_id=b.call_id, capability_id=b.capability_id,
-                    arguments=dict(b.arguments or {}), candidate=b.candidate,
-                ))
+                blocks.append(
+                    _CallTextBlock(
+                        call_id=b.call_id,
+                        capability_id=b.capability_id,
+                        arguments=dict(b.arguments or {}),
+                        candidate=b.candidate,
+                    )
+                )
                 changed = True
             else:
                 blocks.append(b)
         if changed:
-            out.append(Message(
-                id=msg.id, role=msg.role, blocks=tuple(blocks),
-                created_at=msg.created_at, provenance=msg.provenance,
-                metadata=dict(msg.metadata or {}),
-            ))
+            out.append(
+                Message(
+                    id=msg.id,
+                    role=msg.role,
+                    blocks=tuple(blocks),
+                    created_at=msg.created_at,
+                    provenance=msg.provenance,
+                    metadata=dict(msg.metadata or {}),
+                )
+            )
         else:
             out.append(msg)
     return out
@@ -188,9 +206,7 @@ def _assistant_message(task: TaskSpec, response: ModelResponse) -> Message:
     breaks provider replay (BHV provider-history invariant).
     """
     blocks = tuple(response.blocks or ())
-    metadata: dict[str, Any] = (
-        {"session_id": task.session_id} if task.session_id else {}
-    )
+    metadata: dict[str, Any] = {"session_id": task.session_id} if task.session_id else {}
     try:
         from athena.models.compat.caching import InferenceReceipt
 
@@ -202,7 +218,8 @@ def _assistant_message(task: TaskSpec, response: ModelResponse) -> Message:
             model_id=response.model,
             response_id=response.metadata.get("response_id"),
             tool_ids=tuple(
-                b.call_id for b in response.blocks
+                b.call_id
+                for b in response.blocks
                 if isinstance(b, CapabilityCallBlock) and b.call_id
             ),
             provider_metadata=dict(response.metadata),
@@ -255,6 +272,7 @@ def _deny_result_for_request(request: CapabilityRequest) -> CapabilityResultBloc
 
 def _to_result_block(result) -> CapabilityResultBlock:
     from athena.protocol.capabilities import CapabilityResultStatus
+
     if isinstance(result, CapabilityResultBlock):
         return result
     return CapabilityResultBlock(
@@ -298,6 +316,7 @@ def _observation_from_result(task, result: CapabilityResultBlock):
             "capability_id": result.capability_id,
             "error": error_text,
             "output": output_text,
+            "generated_failure": dict((result.metadata or {}).get("generated_failure") or {}),
         },
         task_id=task.id,
         session_id=task.session_id,
@@ -327,8 +346,10 @@ class AgentKernel:
         cancellations=None,
         provider_usage_store=None,
         continuation_store=None,
+        workflow_run_store=None,
         router: "ModelRouter",
         interpreter=None,
+        reality_coordinator: Any = None,
     ) -> None:
         self._task_store = task_store
         self._events = events
@@ -351,6 +372,11 @@ class AgentKernel:
         self._dispatch_factory = dispatch_factory
         self._provider_usage_store = provider_usage_store
         self._continuation_store = continuation_store
+        self._workflow_run_store = workflow_run_store
+        # Reality completion authority: intercepts terminal decisions to bind
+        # acceptance evidence to an active candidate branch and promote only
+        # proven reality.
+        self._reality_coordinator = reality_coordinator
         # Kernel-owned interpreter fusion hook (audit P0.2). The extension
         # itself carries no authority — it receives observations and returns
         # proposals; every subturn and every dispatch routes through the
@@ -444,26 +470,34 @@ class AgentKernel:
             try:
                 await self._lifecycle.assert_runnable(task)
             except RequestCancelled:
-                return await self._finalize(task, state, TaskStatus.CANCELLED,
-                                            "task cancelled")
+                return await self._finalize(task, state, TaskStatus.CANCELLED, "task cancelled")
             except TaskBudgetExceeded:
-                return await self._finalize(task, state, TaskStatus.PARTIAL,
-                                            "resource budget exhausted")
+                return await self._finalize(
+                    task, state, TaskStatus.PARTIAL, "resource budget exhausted"
+                )
             state.iterations += 1
             await self._emit("TaskIterationStarted", {"iteration": state.iterations}, task)
 
             if self._deadline_passed(task):
                 return await self._finalize(task, state, TaskStatus.PARTIAL, "deadline exceeded")
             if _budget_exhausted(state, budget):
-                return await self._finalize(task, state, TaskStatus.PARTIAL,
-                                            "resource budget exhausted")
+                return await self._finalize(
+                    task, state, TaskStatus.PARTIAL, "resource budget exhausted"
+                )
 
             # If approval was resolved while this process was down, the
             # service requeues the same task. Consume the durable canonical
             # call before asking the model for another turn; otherwise the
             # assistant tool call would be replayed as a new request and could
             # be repaired/executed twice.
-            await self._resume_durable_continuation(task)
+            resumed = await self._resume_durable_continuation(task)
+            if isinstance(resumed, SuspendedCall):
+                approval_result = await self._approval_path(
+                    task, state, DispatchResult(suspended=(resumed,))
+                )
+                if approval_result is not None:
+                    return approval_result
+                continue
 
             compiled = await self._compile(task)
             selection = await self._select_model(task, compiled)
@@ -477,8 +511,9 @@ class AgentKernel:
             except ProviderError:
                 return await self._finalize(task, state, TaskStatus.FAILED, "model unavailable")
             except Exception as exc:  # kernel never crashes; truthful terminal.
-                return await self._finalize(task, state, TaskStatus.FAILED,
-                                            f"kernel failure: {exc}")
+                return await self._finalize(
+                    task, state, TaskStatus.FAILED, f"kernel failure: {exc}"
+                )
 
             calls = [b for b in response.blocks if isinstance(b, CapabilityCallBlock)]
 
@@ -494,7 +529,8 @@ class AgentKernel:
                 continue
 
             decision = await self._termination.evaluate(
-                task, response,
+                task,
+                response,
                 iterations=state.iterations,
                 max_iterations=budget.max_agent_iterations,
                 budget_exhausted=_budget_exhausted(state, budget),
@@ -516,9 +552,9 @@ class AgentKernel:
                 recent = await self._messages.list_session_messages(task.session_id)
             except Exception as exc:
                 _logger.warning(
-                    "context compilation fallback: could not load session messages "
-                    "for %s: %s",
-                    task.session_id, exc,
+                    "context compilation fallback: could not load session messages for %s: %s",
+                    task.session_id,
+                    exc,
                 )
                 recent = []
         compiled = await self._compiler.compile(
@@ -529,10 +565,14 @@ class AgentKernel:
         strategy = compiled.strategy
         await self._emit("StrategySelected", strategy.to_dict(), task)
         if strategy.missing_affordance:
-            await self._emit("AffordanceGapDetected", {
-                "missing_affordance": strategy.missing_affordance,
-                "route": strategy.route,
-            }, task)
+            await self._emit(
+                "AffordanceGapDetected",
+                {
+                    "missing_affordance": strategy.missing_affordance,
+                    "route": strategy.route,
+                },
+                task,
+            )
         return compiled
 
     async def _select_model(
@@ -585,11 +625,17 @@ class AgentKernel:
                 if attr is not None and not getattr(info, attr, False):
                     break
             else:
-                if info.context_limit is not None and requirements.minimum_context_tokens is not None \
-                        and info.context_limit < requirements.minimum_context_tokens:
+                if (
+                    info.context_limit is not None
+                    and requirements.minimum_context_tokens is not None
+                    and info.context_limit < requirements.minimum_context_tokens
+                ):
                     continue
-                if info.max_output_tokens is not None and requirements.max_output_tokens is not None \
-                        and info.max_output_tokens < requirements.max_output_tokens:
+                if (
+                    info.max_output_tokens is not None
+                    and requirements.max_output_tokens is not None
+                    and info.max_output_tokens < requirements.max_output_tokens
+                ):
                     continue
                 if policy.require_tools and not info.tool_calling:
                     continue
@@ -599,7 +645,8 @@ class AgentKernel:
 
         if not candidates:
             raise ModelUnavailable(
-                f"no candidate model excludes failed providers {sorted(exclude)}")
+                f"no candidate model excludes failed providers {sorted(exclude)}"
+            )
         best = min(candidates, key=_candidate_key)
         return ModelSelection(provider=best.provider, model=best.id, info=best)
 
@@ -613,47 +660,17 @@ class AgentKernel:
         metadata.update(cache_metadata)
         replay_metadata = self._replay_metadata(compiled, selection)
         if replay_metadata.get("boundary") is not None:
-            await self._emit("InferenceReplayBoundary", {
-                "boundary": replay_metadata["boundary"],
-                "provider": selection.provider,
-                "model": selection.model,
-            }, task)
+            await self._emit(
+                "InferenceReplayBoundary",
+                {
+                    "boundary": replay_metadata["boundary"],
+                    "provider": selection.provider,
+                    "model": selection.model,
+                },
+                task,
+            )
         metadata.update(replay_metadata)
-        request = compiled.to_request(
-            provider=selection.provider,
-            model=selection.model,
-            request_id=new_id("call"),
-            metadata={"task_id": task.id, "session_id": task.session_id, **metadata},
-        )
-        state.request_id = request.request_id
-        state.provider = selection.provider
-        # P0.3: every inference subturn must be inspectable — the policy role
-        # that requested this model travels on the event and the usage record
-        # so `athena inspect` can prove which model served each subturn.
         role = getattr(task.model_policy, "role", None) or "primary"
-        await self._emit("ModelRequestStarted", {
-            "provider": selection.provider, "model": selection.model,
-            "provider_profile_id": metadata.get("provider_profile_id"),
-            "prefix_fingerprint": metadata.get("prefix_fingerprint"),
-            "role": role,
-            "request_id": request.request_id,
-        }, task)
-
-        # Record provider attempt
-        usage_id = None
-        if self._provider_usage_store is not None:
-            try:
-                usage_id = await self._provider_usage_store.record_attempt(
-                    provider=selection.provider,
-                    model=selection.model,
-                    task_id=task.id,
-                    session_id=task.session_id,
-                    metadata={"inference": dict(self._inference_metadata(selection)),
-                              "role": role},
-                )
-            except Exception:
-                pass
-
         last_err: ProviderError | None = None
         attempted: set[str] = set()
         selection_for_attempt = selection
@@ -662,38 +679,86 @@ class AgentKernel:
                 raise RequestCancelled("task cancelled")
             if selection_for_attempt.provider in attempted:
                 raise last_err or ModelUnavailable(
-                    f"no candidate model excludes failed providers {sorted(attempted)}")
+                    f"no candidate model excludes failed providers {sorted(attempted)}"
+                )
             provider = self._registry.provider_for(selection_for_attempt.provider)
             request = compiled.to_request(
                 provider=selection_for_attempt.provider,
                 model=selection_for_attempt.model,
                 request_id=new_id("call"),
-                metadata={"task_id": task.id, "session_id": task.session_id,
-                          **self._inference_metadata(selection_for_attempt),
-                          **(await self._observe_prefix(
-                              task, compiled, selection_for_attempt)),
-                          **self._replay_metadata(compiled, selection_for_attempt)},
+                metadata={
+                    "task_id": task.id,
+                    "session_id": task.session_id,
+                    **self._inference_metadata(selection_for_attempt),
+                    **(await self._observe_prefix(task, compiled, selection_for_attempt)),
+                    **self._replay_metadata(compiled, selection_for_attempt),
+                },
             )
             state.request_id = request.request_id
             state.provider = selection_for_attempt.provider
-            try:
-                response = await self._consume(task, state, provider, request)
-                await self._emit("ModelResponseCompleted", {
+            # One durable row and one inspectable event per actual provider /
+            # model attempt. Fallbacks must never overwrite the first row.
+            attempt_usage_id: str | None = None
+            attempt_started = time.monotonic()
+            await self._emit(
+                "ModelRequestStarted",
+                {
                     "provider": selection_for_attempt.provider,
                     "model": selection_for_attempt.model,
-                }, task)
+                    "provider_profile_id": request.metadata.get("provider_profile_id"),
+                    "prefix_fingerprint": request.metadata.get("prefix_fingerprint"),
+                    "role": role,
+                    "attempt_index": attempt,
+                    "request_id": request.request_id,
+                },
+                task,
+            )
+            if self._provider_usage_store is not None:
+                try:
+                    attempt_usage_id = await self._provider_usage_store.record_attempt(
+                        provider=selection_for_attempt.provider,
+                        model=selection_for_attempt.model,
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        metadata={
+                            "inference": dict(self._inference_metadata(selection_for_attempt)),
+                            "role": role,
+                            "attempt_index": attempt,
+                            "state": "started",
+                        },
+                    )
+                except Exception:
+                    pass
+            try:
+                response = await self._consume(task, state, provider, request)
+                await self._emit(
+                    "ModelResponseCompleted",
+                    {
+                        "provider": selection_for_attempt.provider,
+                        "model": selection_for_attempt.model,
+                        "role": role,
+                        "attempt_index": attempt,
+                    },
+                    task,
+                )
                 state.model_calls += 1
                 # Record final usage
-                if self._provider_usage_store is not None and usage_id is not None:
+                if self._provider_usage_store is not None and attempt_usage_id is not None:
                     try:
                         usage = response.usage if response else None
                         await self._provider_usage_store.record_completion(
-                            usage_id,
+                            attempt_usage_id,
                             input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
                             output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
                             metadata={
                                 "inference": dict(self._inference_metadata(selection_for_attempt)),
                                 "usage": dict(vars(usage)) if usage is not None else {},
+                                "role": role,
+                                "attempt_index": attempt,
+                                "state": "success",
+                                "duration_ms": round(
+                                    (time.monotonic() - attempt_started) * 1000, 2
+                                ),
                             },
                         )
                     except Exception:
@@ -702,13 +767,35 @@ class AgentKernel:
             except ProviderError as exc:
                 last_err = exc
                 state.request_id = None
+                if self._provider_usage_store is not None and attempt_usage_id is not None:
+                    try:
+                        await self._provider_usage_store.record_completion(
+                            attempt_usage_id,
+                            input_tokens=0,
+                            output_tokens=0,
+                            metadata={
+                                "inference": dict(self._inference_metadata(selection_for_attempt)),
+                                "role": role,
+                                "attempt_index": attempt,
+                                "state": "failed",
+                                "failure_category": type(exc).__name__,
+                                "error_type": type(exc).__name__,
+                                "error": str(exc)[:1000],
+                                "duration_ms": round(
+                                    (time.monotonic() - attempt_started) * 1000, 2
+                                ),
+                            },
+                        )
+                    except Exception:
+                        pass
                 if not _is_retryable(exc):
                     raise
                 if attempt >= _FALLBACK_ATTEMPTS - 1:
                     break
                 attempted.add(selection_for_attempt.provider)
                 selection_for_attempt = await self._select_model(
-                    task, compiled, exclude=frozenset(attempted))
+                    task, compiled, exclude=frozenset(attempted)
+                )
         raise last_err or ModelUnavailable("no model available")
 
     # ------------------------------------------------------------------ #
@@ -748,19 +835,27 @@ class AgentKernel:
             subturn_task, system=system_prompt, user_prompt=user_prompt
         )
         selection = await self._select_model(subturn_task, compiled)
-        await self._emit("ModelRequestStarted", {
-            "provider": selection.provider,
-            "model": selection.model,
-            "role": "interpreter",
-            "subturn": True,
-        }, task)
+        await self._emit(
+            "ModelRequestStarted",
+            {
+                "provider": selection.provider,
+                "model": selection.model,
+                "role": "interpreter",
+                "subturn": True,
+            },
+            task,
+        )
         response = await self._invoke(subturn_task, state, selection, compiled)
-        await self._emit("ModelResponseCompleted", {
-            "provider": selection.provider,
-            "model": selection.model,
-            "role": "interpreter",
-            "subturn": True,
-        }, task)
+        await self._emit(
+            "ModelResponseCompleted",
+            {
+                "provider": selection.provider,
+                "model": selection.model,
+                "role": "interpreter",
+                "subturn": True,
+            },
+            task,
+        )
         return response
 
     async def judge_subturn(
@@ -812,12 +907,16 @@ class AgentKernel:
             arguments=dict(proposal.arguments or {}),
         )
         shim = self._dispatch_factory(task)
-        await self._emit("InterpreterProposalDispatched", {
-            "capability_id": proposal.capability_id,
-            "call_id": call.call_id,
-            "rationale": proposal.rationale,
-            "role": "interpreter",
-        }, task)
+        await self._emit(
+            "InterpreterProposalDispatched",
+            {
+                "capability_id": proposal.capability_id,
+                "call_id": call.call_id,
+                "rationale": proposal.rationale,
+                "role": "interpreter",
+            },
+            task,
+        )
         # Bind the producing subturn's identity for repair receipts, exactly
         # as the primary dispatch path does (kernel._dispatch). RunState.provider
         # is set by _invoke for the most recent inference — which, at this
@@ -854,7 +953,11 @@ class AgentKernel:
         await self.dispatch_interpreter_proposal(proposal, context)
 
     async def utility_inference(
-        self, *, system_prompt: str, user_prompt: str, role: str = "summarizer",
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        role: str = "summarizer",
     ) -> str | None:
         """Route ONE task-less auxiliary inference through this kernel.
 
@@ -888,26 +991,30 @@ class AgentKernel:
             )
             messages: list[Message] = []
             if system_prompt:
-                messages.append(Message(
+                messages.append(
+                    Message(
+                        id=new_id("msg"),
+                        role=Role.SYSTEM,
+                        blocks=(TextBlock(text=system_prompt),),
+                        created_at=utcnow(),
+                        provenance=Provenance(
+                            source_type=SourceType.SYSTEM,
+                            trust=TrustClass.CONFIGURED_INSTRUCTION,
+                        ),
+                    )
+                )
+            messages.append(
+                Message(
                     id=new_id("msg"),
-                    role=Role.SYSTEM,
-                    blocks=(TextBlock(text=system_prompt),),
+                    role=Role.USER,
+                    blocks=(TextBlock(text=user_prompt),),
                     created_at=utcnow(),
                     provenance=Provenance(
                         source_type=SourceType.SYSTEM,
                         trust=TrustClass.CONFIGURED_INSTRUCTION,
                     ),
-                ))
-            messages.append(Message(
-                id=new_id("msg"),
-                role=Role.USER,
-                blocks=(TextBlock(text=user_prompt),),
-                created_at=utcnow(),
-                provenance=Provenance(
-                    source_type=SourceType.SYSTEM,
-                    trust=TrustClass.CONFIGURED_INSTRUCTION,
-                ),
-            ))
+                )
+            )
             request = ModelRequest(
                 messages=tuple(messages),
                 model=selection.model,
@@ -916,8 +1023,7 @@ class AgentKernel:
             )
             parts: list[str] = []
             async for event in provider.complete(request):
-                if getattr(event, "type", None) is not None and \
-                        event.type.value == "done":
+                if getattr(event, "type", None) is not None and event.type.value == "done":
                     resp = event.response
                     if resp is None:
                         continue
@@ -928,10 +1034,8 @@ class AgentKernel:
                     try:
                         await self._provider_usage_store.record_completion(
                             usage_id,
-                            input_tokens=getattr(usage, "input_tokens", 0)
-                            if usage else 0,
-                            output_tokens=getattr(usage, "output_tokens", 0)
-                            if usage else 0,
+                            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+                            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
                         )
                         usage_id = None
                     except Exception:
@@ -941,9 +1045,14 @@ class AgentKernel:
                 # keep role metadata — record_completion REPLACES it
                 try:
                     await self._provider_usage_store.record_completion(
-                        usage_id, input_tokens=0, output_tokens=0,
-                        metadata={"role": role, "purpose": "utility_inference",
-                                  "state": "no_done_event"},
+                        usage_id,
+                        input_tokens=0,
+                        output_tokens=0,
+                        metadata={
+                            "role": role,
+                            "purpose": "utility_inference",
+                            "state": "no_done_event",
+                        },
                     )
                 except Exception:
                     pass
@@ -954,14 +1063,14 @@ class AgentKernel:
                 # the row honestly rather than leaving it in-flight forever
                 try:
                     await self._provider_usage_store.record_completion(
-                        usage_id, input_tokens=0, output_tokens=0,
-                        metadata={"role": role, "purpose": "utility_inference",
-                                  "state": "error"},
+                        usage_id,
+                        input_tokens=0,
+                        output_tokens=0,
+                        metadata={"role": role, "purpose": "utility_inference", "state": "error"},
                     )
                 except Exception:
                     pass
-            _logger.debug("utility_inference failed; deterministic fallback",
-                          exc_info=True)
+            _logger.debug("utility_inference failed; deterministic fallback", exc_info=True)
             return None
 
     async def _compile_for_prompts(
@@ -979,21 +1088,20 @@ class AgentKernel:
                 source_type=SourceType.SYSTEM, trust=TrustClass.CONFIGURED_INSTRUCTION
             ),
         )
-        return await self._compiler.compile(
-            task, system=system, recent_messages=[user_message]
-        )
+        return await self._compiler.compile(task, system=system, recent_messages=[user_message])
 
     def _inference_metadata(self, selection: ModelSelection) -> dict[str, Any]:
         profile = self._registry.profile_for(selection.provider)
         if profile is None:
             return {"provider_profile_id": selection.provider}
         fingerprint = getattr(profile, "fingerprint", None)
-        profile_fingerprint = fingerprint() if callable(fingerprint) else str(
-            getattr(profile, "id", selection.provider)
+        profile_fingerprint = (
+            fingerprint()
+            if callable(fingerprint)
+            else str(getattr(profile, "id", selection.provider))
         )
         profile_id = str(getattr(profile, "id", selection.provider))
-        model_profile = self._registry.model_profile_for(
-            selection.provider, selection.model)
+        model_profile = self._registry.model_profile_for(selection.provider, selection.model)
         from athena.models.compat.profiles import resolve_compatibility_profile
 
         compatibility = resolve_compatibility_profile(
@@ -1012,15 +1120,11 @@ class AgentKernel:
                 if getattr(profile, "cache_session_key", False)
                 else None
             ),
-            "compatibility_profile": getattr(
-                profile, "compatibility_profile", "auto"
-            ),
+            "compatibility_profile": getattr(profile, "compatibility_profile", "auto"),
             "tool_repair_mode": compatibility.tool_repair,
             "max_tool_correction_cycles": compatibility.max_tool_correction_cycles,
             "protocol": getattr(profile, "protocol", "openai-compat"),
-            "model_profile": (
-                dict(vars(model_profile)) if model_profile is not None else None
-            ),
+            "model_profile": (dict(vars(model_profile)) if model_profile is not None else None),
         }
 
     async def _observe_prefix(
@@ -1050,7 +1154,10 @@ class AgentKernel:
                 _logger.debug("prefix tracker restore failed for %s: %s", session_key, exc)
         system_blocks = [m.text() for m in compiled.messages if m.role.value == "system"]
         envelope = PromptEnvelope(
-            stable_prefix=[system_blocks, [d.input_schema for d in compiled.capability_definitions]],
+            stable_prefix=[
+                system_blocks,
+                [d.input_schema for d in compiled.capability_definitions],
+            ],
             append_history=[m.id for m in compiled.messages],
             dynamic_suffix=[task.objective],
         )
@@ -1061,8 +1168,7 @@ class AgentKernel:
                 "tools": [d.id for d in compiled.capability_definitions],
                 "tool_schemas": [d.input_schema for d in compiled.capability_definitions],
                 "model": selection.model,
-                "provider_profile": metadata.get(
-                    "provider_profile_fingerprint", profile_id),
+                "provider_profile": metadata.get("provider_profile_fingerprint", profile_id),
             },
         )
         output = {
@@ -1077,7 +1183,9 @@ class AgentKernel:
         return output
 
     def _replay_metadata(
-        self, compiled: CompiledContext, selection: ModelSelection,
+        self,
+        compiled: CompiledContext,
+        selection: ModelSelection,
     ) -> dict[str, Any]:
         """Reload durable assistant-turn receipts for a resumed request.
 
@@ -1094,8 +1202,9 @@ class AgentKernel:
         if not receipts:
             return {"replay_receipts": (), "replay_compatible": True}
         last = receipts[-1]
-        current_profile = str(self._inference_metadata(selection).get(
-            "provider_profile_id", selection.provider))
+        current_profile = str(
+            self._inference_metadata(selection).get("provider_profile_id", selection.provider)
+        )
         last_profile = str(last.get("provider_profile_id") or "")
         last_model = str(last.get("model_id") or "")
         boundary = None
@@ -1144,12 +1253,22 @@ class AgentKernel:
         # provider name.
         response_metadata = dict(final.metadata)
         for key in (
-            "task_id", "session_id", "provider_profile_id",
-            "provider_profile_fingerprint", "profile_id", "model_id",
-            "compatibility_profile", "model_profile", "protocol",
-            "tool_repair_mode", "max_tool_correction_cycles",
-            "cache_mode", "cache_session_key", "prefix_fingerprint",
-            "full_fingerprint", "components_fp",
+            "task_id",
+            "session_id",
+            "provider_profile_id",
+            "provider_profile_fingerprint",
+            "profile_id",
+            "model_id",
+            "compatibility_profile",
+            "model_profile",
+            "protocol",
+            "tool_repair_mode",
+            "max_tool_correction_cycles",
+            "cache_mode",
+            "cache_session_key",
+            "prefix_fingerprint",
+            "full_fingerprint",
+            "components_fp",
         ):
             if key in request.metadata and key not in response_metadata:
                 response_metadata[key] = request.metadata[key]
@@ -1196,8 +1315,12 @@ class AgentKernel:
     async def _dispatch(self, task, state, response, calls):
         if self._dispatch_factory is None:
             not_executed = [
-                CapabilityResultBlock(call_id=c.call_id, capability_id=c.capability_id,
-                                      ok=False, error="capability path disabled")
+                CapabilityResultBlock(
+                    call_id=c.call_id,
+                    capability_id=c.capability_id,
+                    ok=False,
+                    error="capability path disabled",
+                )
                 for c in calls
             ]
             await self._append_results(task, not_executed)
@@ -1209,8 +1332,7 @@ class AgentKernel:
         dispatcher = getattr(shim, "_dispatcher", None)
         if dispatcher is not None and hasattr(dispatcher, "set_inference_provenance"):
             dispatcher.set_inference_provenance(
-                provider_profile_id=response.metadata.get(
-                    "provider_profile_id", response.provider),
+                provider_profile_id=response.metadata.get("provider_profile_id", response.provider),
                 model_id=response.metadata.get("model_id", response.model),
                 repair_mode=response.metadata.get("tool_repair_mode"),
             )
@@ -1245,7 +1367,8 @@ class AgentKernel:
                 except Exception:  # noqa: BLE001 — fusion must not kill the loop
                     _logger.warning(
                         "interpreter fusion failed for %s observation",
-                        observation.kind, exc_info=True,
+                        observation.kind,
+                        exc_info=True,
                     )
                 break  # one observation per dispatch, however many failures
         exhausted: list[str] = []
@@ -1260,12 +1383,18 @@ class AgentKernel:
             if count > max_cycles:
                 exhausted.append(result.capability_id)
         if exhausted:
-            await self._emit("ToolInputCorrectionExhausted", {
-                "capabilities": sorted(set(exhausted)),
-                "max_cycles": max_cycles,
-            }, task)
+            await self._emit(
+                "ToolInputCorrectionExhausted",
+                {
+                    "capabilities": sorted(set(exhausted)),
+                    "max_cycles": max_cycles,
+                },
+                task,
+            )
             return await self._finalize(
-                task, state, TaskStatus.FAILED,
+                task,
+                state,
+                TaskStatus.FAILED,
                 "tool_input_invalid: correction budget exhausted",
             )
         return None
@@ -1282,28 +1411,48 @@ class AgentKernel:
         resume_task = asyncio.create_task(ev.wait())
         cancel_task = asyncio.create_task(state.cancel.wait())
         try:
-            await asyncio.wait(
-                {resume_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait({resume_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for pending in (resume_task, cancel_task):
                 if not pending.done():
                     pending.cancel()
         if not resume_task.done() or state.cancel.is_set():
-            return await self._finalize(task, state, TaskStatus.CANCELLED,
-                                        "task cancelled during approval")
+            return await self._finalize(
+                task, state, TaskStatus.CANCELLED, "task cancelled during approval"
+            )
         decision = self._resume_decision.get(task.id, "denied")
 
         try:
             await self._transition(task, TaskStatus.RUNNING)
         except Exception:
             return await self._finalize_decision(
-                task, state, TerminationDecision(True, "approval wait could not resume",
-                                                 TaskStatus.BLOCKED))
+                task,
+                state,
+                TerminationDecision(True, "approval wait could not resume", TaskStatus.BLOCKED),
+            )
 
         if decision in ("denied", "cancelled"):
             denied = [_deny_result(s) for s in outcome.suspended]
-            await self._append_results(task, denied)
+            parent_results: list[CapabilityResultBlock] = []
+            parent_suspended: list[SuspendedCall] = []
+            for suspended_call, result in zip(outcome.suspended, denied):
+                await self._reconcile_workflow_suspended(suspended_call, result)
+                resume_parent = getattr(self, "_resume_workflow_parent", None)
+                parent = (
+                    await resume_parent(task, suspended_call) if resume_parent is not None else None
+                )
+                if isinstance(parent, SuspendedCall):
+                    parent_suspended.append(parent)
+                elif parent is not None:
+                    parent_results.append(_to_result_block(parent))
+            await self._append_results(task, [*denied, *parent_results])
             await self._mark_continuations_consumed(outcome.suspended)
+            if parent_suspended:
+                return await self._approval_path(
+                    task,
+                    state,
+                    DispatchResult(suspended=tuple(parent_suspended)),
+                )
             return None
 
         if self._dispatch_factory is None:
@@ -1324,32 +1473,195 @@ class AgentKernel:
                 # The model boundary already produced and validated these
                 # canonical arguments. Approval replay must not run a future
                 # repair-policy version over them.
-                object.__setattr__(
-                    request, "origin", CapabilityRequestOrigin.TRUSTED_ORCHESTRATION
-                )
+                object.__setattr__(request, "origin", CapabilityRequestOrigin.TRUSTED_ORCHESTRATION)
             items = await dispatcher.dispatch_many(
                 requests,
                 workspace=shim._workspace,
                 profile=shim._profile,
                 task_policy=task.capability_policy,
+                _directives_by_call_id={
+                    suspended_call.call_id: suspended_call.directives
+                    for suspended_call in suspended
+                    if suspended_call.directives is not None
+                },
             )
             results = []
+            raw_results = []
             re_ask: list = []
             for it in items:
                 if isinstance(it, SuspendedCall):
                     re_ask.append(it)
                 else:
+                    raw_results.append(it)
                     results.append(_to_result_block(it))
+            by_call_id = {item.call_id: item for item in suspended}
+            for item in raw_results:
+                matched_suspended = by_call_id.get(getattr(item, "call_id", ""))
+                if matched_suspended is not None:
+                    reconcile_kwargs = {"workspace_root": shim._workspace.root}
+                    if (
+                        "workspace"
+                        in inspect.signature(self._reconcile_workflow_suspended).parameters
+                    ):
+                        reconcile_kwargs["workspace"] = shim._workspace
+                    await self._reconcile_workflow_suspended(
+                        matched_suspended,
+                        item,
+                        **reconcile_kwargs,
+                    )
+                    resume_parent = getattr(self, "_resume_workflow_parent", None)
+                    parent_result = (
+                        await resume_parent(
+                            task,
+                            matched_suspended,
+                            dispatcher=dispatcher,
+                            workspace=shim._workspace,
+                            profile=shim._profile,
+                        )
+                        if resume_parent is not None
+                        else None
+                    )
+                    if isinstance(parent_result, SuspendedCall):
+                        re_ask.append(parent_result)
+                    elif parent_result is not None:
+                        results.append(_to_result_block(parent_result))
             if re_ask:
                 await self._append_results(task, results)
                 return await self._approval_path(
-                    task, state,
+                    task,
+                    state,
                     DispatchResult(results=(), suspended=tuple(re_ask)),
                 )
             await self._append_results(task, results)
             await self._mark_continuations_consumed(suspended)
             return None
         return None
+
+    async def _resume_workflow_parent(
+        self,
+        task: TaskSpec,
+        suspended: SuspendedCall | None = None,
+        *,
+        record: dict | None = None,
+        dispatcher=None,
+        workspace=None,
+        profile=None,
+    ):
+        """Finish the outer workflow call after one child approval resolves.
+
+        A workflow step is dispatched as its own canonical capability call, so
+        the approval belongs to that child.  Without this small bridge the
+        kernel would append the child's result but leave the model's original
+        ``workflow`` call unresolved.  The resumed workflow run owns the
+        continuation and decides whether to execute the next step or return a
+        final workflow result.
+        """
+        directives = getattr(suspended, "directives", None)
+        policy_context = dict((record or {}).get("policy_context") or {})
+        parent_request = getattr(suspended, "workflow_parent_request", None)
+        run_id = (
+            getattr(suspended, "workflow_run_id", None)
+            or getattr(directives, "workflow_run_id", None)
+            or policy_context.get("workflow_run_id")
+        )
+        workflow_id = (
+            getattr(suspended, "workflow_id", None)
+            or getattr(directives, "workflow_id", None)
+            or policy_context.get("workflow_id")
+        )
+        parent_call_id = (
+            getattr(directives, "workflow_parent_call_id", None)
+            or policy_context.get("workflow_parent_call_id")
+            or getattr(parent_request, "call_id", None)
+        )
+        parent_capability_id = (
+            getattr(directives, "workflow_parent_capability_id", None)
+            or policy_context.get("workflow_parent_capability_id")
+            or "workflow"
+        )
+        if not run_id or not workflow_id or not parent_call_id:
+            return None
+        if dispatcher is None:
+            dispatcher = (
+                getattr(self._dispatch_factory(task), "_dispatcher", None)
+                if self._dispatch_factory is not None
+                else None
+            )
+        if workspace is None:
+            shim = self._dispatch_factory(task) if self._dispatch_factory is not None else None
+            workspace = getattr(shim, "_workspace", None)
+            profile = getattr(shim, "_profile", profile)
+        if dispatcher is None or workspace is None:
+            return CapabilityResultBlock(
+                call_id=str(parent_call_id),
+                capability_id=str(parent_capability_id),
+                ok=False,
+                error="workflow approval continuation has no dispatch context",
+            )
+
+        if parent_request is None:
+            parent_request = CapabilityRequest(
+                capability_id=str(parent_capability_id),
+                arguments={
+                    "operation": "run",
+                    "workflow_id": str(workflow_id),
+                    "run_id": str(run_id),
+                },
+                task_id=task.id,
+                session_id=task.session_id,
+                call_id=str(parent_call_id),
+                origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+            )
+        else:
+            arguments = dict(parent_request.arguments or {})
+            arguments["run_id"] = str(run_id)
+            parent_request = replace(
+                parent_request,
+                arguments=arguments,
+                origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+            )
+        try:
+            return await dispatcher.dispatch(
+                parent_request,
+                workspace=workspace,
+                profile=profile,
+                task_policy=task.capability_policy,
+                task_budget=task.resource_budget,
+            )
+        except Exception as exc:  # the outer result must remain truthful
+            return CapabilityResultBlock(
+                call_id=parent_request.call_id,
+                capability_id=parent_request.capability_id,
+                ok=False,
+                error=f"workflow approval continuation failed: {exc}",
+            )
+
+    async def _reconcile_workflow_suspended(
+        self,
+        suspended,
+        result,
+        *,
+        workspace_root: str | None = None,
+        workspace=None,
+    ) -> None:
+        """Record same-process approval completion for a durable workflow step."""
+        if self._workflow_run_store is None:
+            return
+        directives = getattr(suspended, "directives", None)
+        if directives is None or not directives.workflow_run_id:
+            return
+        status = getattr(result, "status", None)
+        status = getattr(status, "value", status)
+        ok = status == "ok" if status is not None else bool(getattr(result, "ok", False))
+        failures = () if ok else (getattr(result, "error", None) or "approved call failed",)
+        completion = {
+            "output": getattr(result, "output", None),
+            "failures": failures,
+            "workspace_root": workspace_root,
+        }
+        if workspace is not None:
+            completion["workspace"] = workspace
+        await self._workflow_run_store.complete_call(suspended.call_id, **completion)
 
     async def _mark_continuations_consumed(self, suspended) -> None:
         if self._continuation_store is None:
@@ -1363,18 +1675,20 @@ class AgentKernel:
             except Exception as exc:
                 _logger.warning("continuation consume failed for %s: %s", call_id, exc)
 
-    async def _resume_durable_continuation(self, task: TaskSpec) -> None:
+    async def _resume_durable_continuation(self, task: TaskSpec) -> SuspendedCall | None:
         if self._continuation_store is None or self._dispatch_factory is None:
-            return
+            return None
         try:
             record = await self._continuation_store.claim_resolved(task.id)
         except Exception as exc:
             _logger.warning("durable continuation lookup failed for %s: %s", task.id, exc)
-            return
+            return None
         if record is None:
-            return
+            return None
 
         call_id = str(record.get("call_id") or new_id("call"))
+        shim = self._dispatch_factory(task)
+        policy_context = record.get("policy_context") or {}
         request = CapabilityRequest(
             capability_id=str(record.get("capability_id") or ""),
             arguments=dict(record.get("canonical_arguments") or {}),
@@ -1387,41 +1701,153 @@ class AgentKernel:
             origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
         )
         if record.get("decision") not in (None, "granted"):
-            await self._append_results(task, [_deny_result_for_request(request)])
+            denied = _deny_result_for_request(request)
+            await self._reconcile_workflow_continuation(record, denied)
+            parent = await self._resume_workflow_parent(
+                task,
+                record=record,
+                dispatcher=shim._dispatcher,
+                workspace=shim._workspace,
+                profile=shim._profile,
+            )
+            blocks = [denied]
+            if isinstance(parent, SuspendedCall):
+                await self._append_results(task, blocks)
+                await self._consume_durable_call(call_id)
+                return parent
+            if parent is not None:
+                blocks.append(_to_result_block(parent))
+            await self._append_results(task, blocks)
             await self._consume_durable_call(call_id)
-            return
+            return None
 
         try:
-            shim = self._dispatch_factory(task)
+            directives = None
+            workflow_run_id = policy_context.get("workflow_run_id")
+            if workflow_run_id:
+                directives = DispatchDirectives(
+                    workflow_run_id=str(workflow_run_id),
+                    workflow_step_id=(
+                        str(policy_context["workflow_step_id"])
+                        if policy_context.get("workflow_step_id") is not None
+                        else None
+                    ),
+                    workflow_item_index=(
+                        int(policy_context["workflow_item_index"])
+                        if policy_context.get("workflow_item_index") is not None
+                        else None
+                    ),
+                    workflow_execution_id=(
+                        str(policy_context["workflow_execution_id"])
+                        if policy_context.get("workflow_execution_id") is not None
+                        else None
+                    ),
+                    workflow_parent_call_id=(
+                        str(policy_context["workflow_parent_call_id"])
+                        if policy_context.get("workflow_parent_call_id") is not None
+                        else None
+                    ),
+                    workflow_parent_capability_id=(
+                        str(policy_context["workflow_parent_capability_id"])
+                        if policy_context.get("workflow_parent_capability_id") is not None
+                        else None
+                    ),
+                    workflow_id=(
+                        str(policy_context["workflow_id"])
+                        if policy_context.get("workflow_id") is not None
+                        else None
+                    ),
+                )
             result = await shim._dispatcher.dispatch(
                 request,
                 workspace=shim._workspace,
                 profile=shim._profile,
                 task_policy=task.capability_policy,
+                _directives=directives,
             )
             if isinstance(result, SuspendedCall):
-                await self._append_results(task, [
+                await self._append_results(
+                    task,
+                    [
+                        CapabilityResultBlock(
+                            call_id=call_id,
+                            capability_id=request.capability_id,
+                            ok=False,
+                            error="approval continuation could not be resumed",
+                        )
+                    ],
+                )
+                await self._release_durable_call(call_id)
+            else:
+                await self._reconcile_workflow_continuation(
+                    record,
+                    result,
+                    workspace_root=shim._workspace.root,
+                    workspace=shim._workspace,
+                )
+                parent = await self._resume_workflow_parent(
+                    task,
+                    record=record,
+                    dispatcher=shim._dispatcher,
+                    workspace=shim._workspace,
+                    profile=shim._profile,
+                )
+                blocks = [_to_result_block(result)]
+                if isinstance(parent, SuspendedCall):
+                    await self._append_results(task, blocks)
+                    await self._consume_durable_call(call_id)
+                    return parent
+                if parent is not None:
+                    blocks.append(_to_result_block(parent))
+                await self._append_results(task, blocks)
+                await self._consume_durable_call(call_id)
+        except Exception as exc:
+            await self._release_durable_call(call_id)
+            await self._append_results(
+                task,
+                [
                     CapabilityResultBlock(
                         call_id=call_id,
                         capability_id=request.capability_id,
                         ok=False,
-                        error="approval continuation could not be resumed",
+                        error=f"approval continuation failed: {exc}",
                     )
-                ])
-                await self._release_durable_call(call_id)
-            else:
-                await self._append_results(task, [_to_result_block(result)])
-                await self._consume_durable_call(call_id)
-        except Exception as exc:
-            await self._release_durable_call(call_id)
-            await self._append_results(task, [
-                CapabilityResultBlock(
-                    call_id=call_id,
-                    capability_id=request.capability_id,
-                    ok=False,
-                    error=f"approval continuation failed: {exc}",
-                )
-            ])
+                ],
+            )
+        return None
+
+    async def _reconcile_workflow_continuation(
+        self,
+        record,
+        result,
+        *,
+        workspace_root: str | None = None,
+        workspace=None,
+    ) -> None:
+        """Advance a workflow step when its canonical approval call completes."""
+        if self._workflow_run_store is None:
+            return
+        policy_context = record.get("policy_context") or {}
+        if not policy_context.get("workflow_run_id"):
+            return
+        failures: tuple[str, ...] = ()
+        result_status = getattr(result, "status", None)
+        result_status = getattr(result_status, "value", result_status)
+        if result_status is None:
+            result_status = "ok" if getattr(result, "ok", False) else "failed"
+        if result_status != "ok":
+            failures = (getattr(result, "error", None) or "approved call failed",)
+        completion = {
+            "output": getattr(result, "output", None),
+            "failures": failures,
+            "workspace_root": workspace_root,
+        }
+        if workspace is not None:
+            completion["workspace"] = workspace
+        await self._workflow_run_store.complete_call(
+            str(record.get("call_id") or ""),
+            **completion,
+        )
 
     async def _consume_durable_call(self, call_id: str) -> None:
         if self._continuation_store is None:
@@ -1446,6 +1872,11 @@ class AgentKernel:
     # Finalization
     # ------------------------------------------------------------------ #
     async def _finalize(self, task, state, status: TaskStatus, reason: str) -> TaskResult:
+        if self._reality_coordinator is not None:
+            cleanup_status = await self._reality_coordinator.discard_incomplete(task.id, status)
+            if cleanup_status is TaskStatus.RECOVERY_REQUIRED:
+                status = TaskStatus.RECOVERY_REQUIRED
+                reason = f"{reason}; reality compensation requires recovery"
         return await self._lifecycle.finalize(
             task,
             status=status,
@@ -1460,7 +1891,11 @@ class AgentKernel:
         )
 
     async def _finalize_decision(self, task, state, decision: TerminationDecision) -> TaskResult:
-        return await self._lifecycle.finalize(
+        completion = None
+        if self._reality_coordinator is not None:
+            completion = await self._reality_coordinator.prepare_completion(task, decision)
+            decision = completion.decision
+        result = await self._lifecycle.finalize(
             task,
             decision=decision,
             usage=UsageSummary(
@@ -1471,6 +1906,20 @@ class AgentKernel:
                 duration_ms=state.elapsed_ms,
             ),
         )
+        if completion is not None and completion.committed:
+            try:
+                await self._reality_coordinator.mark_finalized(task.id)
+            except Exception as exc:  # noqa: BLE001 - task result is already durable
+                # The completion journal is deliberately replayable.  Do not
+                # turn an already persisted COMPLETE task into an exception
+                # merely because the final journal tombstone was interrupted;
+                # startup reconciliation will close it on the next run.
+                _logger.warning(
+                    "could not finalize reality completion journal for %s: %s",
+                    task.id,
+                    exc,
+                )
+        return result
 
     # ------------------------------------------------------------------ #
     # Persistence / event / misc helpers
@@ -1591,6 +2040,8 @@ def _is_retryable(exc: ProviderError) -> bool:
 
 def _denied_result_withcall(call_id, capability_id) -> CapabilityResultBlock:
     return CapabilityResultBlock(
-        call_id=call_id, capability_id=capability_id, ok=False,
+        call_id=call_id,
+        capability_id=capability_id,
+        ok=False,
         error="denied: approval not granted",
     )

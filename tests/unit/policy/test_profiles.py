@@ -36,6 +36,18 @@ def test_supervised_network_write_is_ask():
     assert decision.decision is PolicyVerdict.ASK
 
 
+def test_autonomous_network_write_still_requires_approval():
+    engine = PolicyEngine(AutonomyLevel.AUTONOMOUS)
+    decision = engine.evaluate(
+        _req(
+            "network",
+            {EffectClass.NETWORK_WRITE},
+            arguments={"operation": "http", "method": "POST", "url": "https://example.com"},
+        )
+    )
+    assert decision.decision is PolicyVerdict.ASK
+
+
 def test_coding_in_workspace_write_allowed():
     engine = PolicyEngine(AutonomyLevel.CODING)
     ws = WorkspaceSpec(

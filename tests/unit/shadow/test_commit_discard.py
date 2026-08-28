@@ -45,15 +45,15 @@ async def service(tmp_path):
 
 async def _real_task(service, ws) -> str:
     svc = service
-    spec = await svc.submit(AgentRequest(prompt="commit-discard", workspace=ws),
-                            wait=True)
+    spec = await svc.submit(AgentRequest(prompt="commit-discard", workspace=ws), wait=True)
     return spec.id
 
 
 def _write_prop(path: str, content: str) -> dict:
-    return {"capability_id": "fs", "arguments": {
-        "operation": "write", "path": path, "content": content,
-        "create_dirs": True}}
+    return {
+        "capability_id": "fs",
+        "arguments": {"operation": "write", "path": path, "content": content, "create_dirs": True},
+    }
 
 
 async def test_commit_refuses_branches_not_in_verified_status(service):
@@ -62,8 +62,8 @@ async def test_commit_refuses_branches_not_in_verified_status(service):
     engine = svc.shadow_engine()
 
     branch = await engine.open_branch(
-        task_id=task_id, base_workspace=ws,
-        proposal=[_write_prop("junk.py", "bad\n")])
+        task_id=task_id, base_workspace=ws, proposal=[_write_prop("junk.py", "bad\n")]
+    )
     assert branch.status == BranchStatus.PROPOSED
     with pytest.raises(RuntimeError, match=r"cannot commit branch .* PROPOSED"):
         await engine.commit(branch)
@@ -81,15 +81,14 @@ async def test_commit_refuses_branches_not_in_verified_status(service):
     assert not os.path.exists(os.path.join(ws.root, "junk.py"))
 
 
-async def test_shadow_op_requiring_approval_fails_branch_without_auto_grant(
-        service):
+async def test_shadow_op_requiring_approval_fails_branch_without_auto_grant(service):
     svc, ws = service
     task_id = await _real_task(svc, ws)
     engine = svc.shadow_engine()
 
     branch = await engine.open_branch(
-        task_id=task_id, base_workspace=ws,
-        proposal=[_write_prop("needs_approval.py", "x\n")])
+        task_id=task_id, base_workspace=ws, proposal=[_write_prop("needs_approval.py", "x\n")]
+    )
     # Supervised profile: an fs write is an ASK decision.
     branch = await engine.execute_branch(branch, profile="supervised")
 
@@ -102,8 +101,7 @@ async def test_shadow_op_requiring_approval_fails_branch_without_auto_grant(
     assert svc._policy.approvals.list_active() == []
     # Nothing was written: neither reality nor the shadow clone.
     assert not os.path.exists(os.path.join(ws.root, "needs_approval.py"))
-    assert not os.path.exists(
-        os.path.join(branch.shadow_workspace.root, "needs_approval.py"))
+    assert not os.path.exists(os.path.join(branch.shadow_workspace.root, "needs_approval.py"))
 
 
 async def test_commit_returns_conflict_when_reality_drifted(service):
@@ -112,8 +110,8 @@ async def test_commit_returns_conflict_when_reality_drifted(service):
     engine = svc.shadow_engine()
 
     branch = await engine.open_branch(
-        task_id=task_id, base_workspace=ws,
-        proposal=[_write_prop("drift.txt", "shadow\n")])
+        task_id=task_id, base_workspace=ws, proposal=[_write_prop("drift.txt", "shadow\n")]
+    )
     branch = await engine.execute_branch(branch, profile="autonomous")
     await engine.record_verification(branch, [{"id": "ac", "passed": True}])
 
@@ -124,22 +122,46 @@ async def test_commit_returns_conflict_when_reality_drifted(service):
     assert outcome["status"] == "CONFLICT"
     assert outcome["conflicts"][0]["resource"] == "drift.txt"
     assert outcome["conflicts"][0]["reason"] == "created_elsewhere"
-    assert branch.status == BranchStatus.FAILED
+    # A conflict is retained as an explicit recoverable candidate rather than
+    # being collapsed into an ordinary execution failure.
+    assert branch.status == BranchStatus.CONFLICTED
+    assert os.path.isdir(branch.shadow_workspace.root)
     assert branch.error and "CONFLICT" in branch.error
     # The concurrent edit is preserved, not overwritten by the branch.
-    assert (Path(ws.root) / "drift.txt").read_text() == \
-        "changed-by-someone-else\n"
+    assert (Path(ws.root) / "drift.txt").read_text() == "changed-by-someone-else\n"
 
 
-async def test_commit_through_ask_profile_suspends_instead_of_auto_approving(
-        service):
+async def test_commit_retains_and_reports_unsupported_symlink(service):
+    svc, ws = service
+    task_id = await _real_task(svc, ws)
+    engine = svc.shadow_engine()
+    branch = await engine.open_branch(
+        task_id=task_id,
+        base_workspace=ws,
+        proposal=[_write_prop("link.txt", "unused\n")],
+    )
+    link = Path(branch.shadow_workspace.root) / "link.txt"
+    link.symlink_to("README.txt")
+    await engine.record_verification(branch, [{"id": "ac", "passed": True}])
+
+    outcome = await engine.commit(branch)
+
+    assert outcome["status"] == "UNSUPPORTED_RESOURCE"
+    assert outcome["resources"] == [{"resource": "link.txt", "kind": "symlink"}]
+    assert branch.status == BranchStatus.FAILED
+    assert branch.commit_state == "UNSUPPORTED_RESOURCE"
+    assert link.is_symlink()
+    assert not (Path(ws.root) / "link.txt").exists()
+
+
+async def test_commit_through_ask_profile_suspends_instead_of_auto_approving(service):
     svc, ws = service
     task_id = await _real_task(svc, ws)
     engine = svc.shadow_engine()
 
     branch = await engine.open_branch(
-        task_id=task_id, base_workspace=ws,
-        proposal=[_write_prop("gated.py", "proven\n")])
+        task_id=task_id, base_workspace=ws, proposal=[_write_prop("gated.py", "proven\n")]
+    )
     branch = await engine.execute_branch(branch, profile="autonomous")
     # The execute-time profile is remembered so commit evaluates the same
     # policy the branch was proven under.
@@ -149,16 +171,24 @@ async def test_commit_through_ask_profile_suspends_instead_of_auto_approving(
     branch.policy_profile = "supervised"
 
     outcome = await engine.commit(branch)
+    assert outcome["status"] == "STALE_CERTIFICATE"
+    assert "verification certificate stale" in outcome["error"]
+    assert not os.path.exists(os.path.join(ws.root, "gated.py"))
+    # The candidate remains available for re-verification under the new
+    # policy; stale proof never reaches the mutation dispatcher.
+    assert svc._policy.approvals.list_active() == []
+    rows = await svc._store_approvals.list_for_task(task_id)
+    assert rows == []
+
+    await engine.record_verification(branch, [{"id": "ac", "passed": True}])
+    outcome = await engine.commit(branch)
     assert outcome["status"] == "FAILED"
     assert outcome["error"] == "commit not applied: commit requires approval"
     assert not os.path.exists(os.path.join(ws.root, "gated.py"))
-    # The aborted commit cleans up the shadow clone.
-    assert not os.path.exists(branch.shadow_workspace.root)
-    # The approval parks for a human; nothing is auto-granted.
-    assert svc._policy.approvals.list_active() == []
+    # Re-verification under supervised policy reaches the approval boundary;
+    # it is still never auto-granted.
     rows = await svc._store_approvals.list_for_task(task_id)
-    assert all(r["status"] == "PENDING" for r in rows), (
-        "any parked approval must remain PENDING, never GRANTED")
+    assert all(r["status"] == "PENDING" for r in rows)
 
 
 async def test_discard_and_commit_remove_shadow_workspace(service):
@@ -167,8 +197,8 @@ async def test_discard_and_commit_remove_shadow_workspace(service):
     engine = svc.shadow_engine()
 
     discarded = await engine.open_branch(
-        task_id=task_id, base_workspace=ws,
-        proposal=[_write_prop("thrown.py", "away\n")])
+        task_id=task_id, base_workspace=ws, proposal=[_write_prop("thrown.py", "away\n")]
+    )
     discarded = await engine.execute_branch(discarded, profile="autonomous")
     shadow_root = discarded.shadow_workspace.root
     assert os.path.isdir(shadow_root)
@@ -177,8 +207,8 @@ async def test_discard_and_commit_remove_shadow_workspace(service):
     assert not os.path.exists(shadow_root)
 
     committed = await engine.open_branch(
-        task_id=task_id, base_workspace=ws,
-        proposal=[_write_prop("kept.py", "value\n")])
+        task_id=task_id, base_workspace=ws, proposal=[_write_prop("kept.py", "value\n")]
+    )
     committed = await engine.execute_branch(committed, profile="autonomous")
     await engine.record_verification(committed, [{"id": "ac", "passed": True}])
     shadow_root = committed.shadow_workspace.root
@@ -190,12 +220,10 @@ async def test_discard_and_commit_remove_shadow_workspace(service):
     assert outcome["mutation_results"], "commit must record mutations"
     assert all(m["mutation_id"] for m in outcome["mutation_results"])
     rows = await svc._store_mutations.list_for_task(task_id)
-    assert any(r["operation"] == "write" and r["resource"].endswith("kept.py")
-               for r in rows)
+    assert any(r["operation"] == "write" and r["resource"].endswith("kept.py") for r in rows)
 
 
-async def test_commit_deletion_requires_approval_and_never_lands_unapproved(
-        service):
+async def test_commit_deletion_requires_approval_and_never_lands_unapproved(service):
     """Deletions are ASK under every autonomy profile: a shadow branch that
     removed a file can never silently delete it from reality at commit.
     Effect truthfulness -- no irreversible effect hides behind a
@@ -208,8 +236,7 @@ async def test_commit_deletion_requires_approval_and_never_lands_unapproved(
     # base manifest includes it).
     (Path(ws.root) / "stale.txt").write_text("to be removed\n")
 
-    branch = await engine.open_branch(task_id=task_id, base_workspace=ws,
-                                      proposal=[])
+    branch = await engine.open_branch(task_id=task_id, base_workspace=ws, proposal=[])
     branch = await engine.execute_branch(branch, profile="autonomous")
     await engine.record_verification(branch, [{"id": "ac", "passed": True}])
 

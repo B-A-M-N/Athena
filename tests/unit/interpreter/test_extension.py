@@ -65,8 +65,7 @@ PROPOSAL_TEXT = (
 
 
 def _scripts(*texts: str) -> list[dict]:
-    return [{"match": {"user_contains": "Observation kind"}, "respond": {"text": t}}
-            for t in texts]
+    return [{"match": {"user_contains": "Observation kind"}, "respond": {"text": t}} for t in texts]
 
 
 @pytest.fixture
@@ -79,7 +78,9 @@ async def stack():
     messages = MessageStore(db)
     manager = TaskManager(task_store=tasks, events=events, sessions=sessions)
     provider = FakeModelProvider(
-        scripts=_scripts(PROPOSAL_TEXT), model="fake-1", provider="fake",
+        scripts=_scripts(PROPOSAL_TEXT),
+        model="fake-1",
+        provider="fake",
         tool_calling=True,
     )
     registry = ProviderRegistry()
@@ -97,8 +98,14 @@ async def stack():
         termination=TerminationEvaluator(),
     )
     yield Stack(
-        db=db, tasks=tasks, events=events, messages=messages,
-        registry=registry, provider=provider, kernel=kernel, manager=manager,
+        db=db,
+        tasks=tasks,
+        events=events,
+        messages=messages,
+        registry=registry,
+        provider=provider,
+        kernel=kernel,
+        manager=manager,
     )
     await db.close()
 
@@ -115,9 +122,7 @@ async def _persisted_task(stack) -> TaskSpec:
         "VALUES (?, NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '{}')",
         (task.session_id,),
     )
-    await stack.tasks.insert_task(
-        task.id, task.session_id, None, task.objective
-    )
+    await stack.tasks.insert_task(task.id, task.session_id, None, task.objective)
     return task
 
 
@@ -143,6 +148,7 @@ def _extension(stack) -> InterpreterExtension:
         return await stack.kernel.interpreter_subturn(
             context=context, system_prompt=system_prompt, user_prompt=user_prompt
         )
+
     return InterpreterExtension(inference_broker=broker)
 
 
@@ -151,7 +157,9 @@ def _extension(stack) -> InterpreterExtension:
 # --------------------------------------------------------------------- #
 async def test_extension_parses_proposal_from_broker_response(stack):
     ext = _extension(stack)
-    proposal = await ext.interpret(_observation(), _context(stack.kernel, await _persisted_task(stack)))
+    proposal = await ext.interpret(
+        _observation(), _context(stack.kernel, await _persisted_task(stack))
+    )
     assert proposal is not None
     assert proposal.capability_id == "runtime.evaluate"
     assert proposal.arguments == {"code": "repr(obj)"}
@@ -160,7 +168,10 @@ async def test_extension_parses_proposal_from_broker_response(stack):
 async def test_extension_returns_none_on_empty_proposal(stack):
     stack.provider._scripts = _scripts("{}")
     ext = _extension(stack)
-    assert await ext.interpret(_observation(), _context(stack.kernel, await _persisted_task(stack))) is None
+    assert (
+        await ext.interpret(_observation(), _context(stack.kernel, await _persisted_task(stack)))
+        is None
+    )
 
 
 async def test_extension_refuses_oversized_observation_without_broker_call(stack):
@@ -172,7 +183,10 @@ async def test_extension_refuses_oversized_observation_without_broker_call(stack
 async def test_extension_refuses_malformed_json_without_guessing(stack):
     stack.provider._scripts = _scripts("<not json at all>")
     ext = _extension(stack)
-    assert await ext.interpret(_observation(), _context(stack.kernel, await _persisted_task(stack))) is None
+    assert (
+        await ext.interpret(_observation(), _context(stack.kernel, await _persisted_task(stack)))
+        is None
+    )
 
 
 async def test_extension_honours_cancellation(stack):
@@ -213,9 +227,7 @@ async def test_interpreter_subturn_cancel_raises(stack):
     ctx = _context(stack.kernel, task)
     ctx.run_state.cancel.set()
     with pytest.raises(RequestCancelled):
-        await stack.kernel.interpreter_subturn(
-            context=ctx, system_prompt="s", user_prompt="u"
-        )
+        await stack.kernel.interpreter_subturn(context=ctx, system_prompt="s", user_prompt="u")
 
 
 async def test_interpreter_subturn_does_not_touch_durable_history(stack):
@@ -242,12 +254,15 @@ class _RecordingShim:
     async def dispatch(self, task, calls):
         from athena.kernel.dispatch import DispatchResult
         from athena.protocol.messages import CapabilityResultBlock
+
         calls = list(calls or ())
         self._sink.extend(calls)
         results = tuple(
             CapabilityResultBlock(
-                call_id=c.call_id, capability_id=c.capability_id,
-                ok=True, output="ok",
+                call_id=c.call_id,
+                capability_id=c.capability_id,
+                ok=True,
+                output="ok",
             )
             for c in calls
         )

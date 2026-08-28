@@ -211,6 +211,9 @@ Typical integrated workflows:
   verify, record a claim bound to the evidence, check invariants before commit,
   and commit only when the envelope holds. If the experiment fails, fork the
   parent task from the pre-experiment event for an alternate approach.
+- **Comparative experiments** — run bounded alternatives from the same
+  unchanged workspace, verify each independently, and return comparable proof
+  without mutating reality; the kernel chooses what to commit.
 - **Invariant-gated commits** — no shadow branch commits while a required
   invariant is violated; violations are recorded as world-state facts.
 - **Claim invalidation on commit** — committing a branch staleness-invalidates
@@ -221,6 +224,9 @@ Typical integrated workflows:
 - **Fork-with-checkpoint** — forking can first capture a parent-workspace
   checkpoint so the fork restores to the exact causal state rather than merely
   replaying events.
+- **Checkpoint lifecycle** — task-owned checkpoints can be inspected and
+  released through `fusion`; branch, claim, and recovery owners keep evidence
+  alive until their lifecycle is complete.
 
 Durably scheduled work is the same idea applied to time. `athena.scheduler` is
 a trigger + claim engine that fires due occurrences and enqueues Tasks; it
@@ -272,6 +278,17 @@ the generated code and enforced by the canonical capability/policy/execution
 path. Source validation, JSON Schema contract checks, bounded tests, and
 restricted execution are independent admission requirements; a repaired tool
 call is not evidence that the implementation is safe.
+
+Generated code may compose governed native capabilities through the mediated
+`athena.call(capability_id, arguments)` host API. The generated process never
+receives a dispatcher or filesystem handle; each host request returns through
+the canonical schema, policy, approval, RealityGate, budget, and mutation
+path. If a generated tool later encounters stale provenance, environment
+drift, or an output-contract mismatch, the result carries a bounded repair
+signal. A synthesis request may declare `required_capabilities` when a
+host-call branch is not exercised by its fixtures; observed host calls are
+added to that same bounded set during validation. It never auto-rewrites or
+auto-promotes itself.
 
 ### Generated-code quality and dynamic contracts
 

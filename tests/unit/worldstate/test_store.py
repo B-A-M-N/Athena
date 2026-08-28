@@ -22,14 +22,16 @@ async def _open(path):
 async def test_persistence_across_restart(db_path):
     db1 = await _open(db_path)
     store1 = WorldStateStore(db1)
-    cid = await store1.save_claim({
-        "id": "claim-1",
-        "task_id": "t1",
-        "text": "all tests pass",
-        "status": "VERIFIED",
-        "evidence": {"exit_code": 0, "command": "pytest -q"},
-        "depends_on_paths": ["src/"],
-    })
+    cid = await store1.save_claim(
+        {
+            "id": "claim-1",
+            "task_id": "t1",
+            "text": "all tests pass",
+            "status": "VERIFIED",
+            "evidence": {"exit_code": 0, "command": "pytest -q"},
+            "depends_on_paths": ["src/"],
+        }
+    )
     assert cid == "claim-1"
     rows = await store1.claims_for_task("t1")
     assert len(rows) == 1
@@ -51,25 +53,44 @@ async def test_persistence_across_restart(db_path):
 async def test_invalidation_flip_persisted_and_scoped(db_path):
     db = await _open(db_path)
     store = WorldStateStore(db)
-    scoped = await store.save_claim({
-        "id": "c-scoped", "task_id": "t1", "text": "scoped claim",
-        "status": "VERIFIED", "evidence": {},
-        "depends_on_paths": ["src/athena"],
-    })
-    unscoped = await store.save_claim({
-        "id": "c-unscoped", "task_id": "t1", "text": "unscoped claim",
-        "status": "VERIFIED", "evidence": {}, "depends_on_paths": [],
-    })
-    other = await store.save_claim({
-        "id": "c-other", "task_id": "t2", "text": "other task",
-        "status": "VERIFIED", "evidence": {},
-        "depends_on_paths": ["src/athena"],
-    })
+    scoped = await store.save_claim(
+        {
+            "id": "c-scoped",
+            "task_id": "t1",
+            "text": "scoped claim",
+            "status": "VERIFIED",
+            "evidence": {},
+            "depends_on_paths": ["src/athena"],
+        }
+    )
+    unscoped = await store.save_claim(
+        {
+            "id": "c-unscoped",
+            "task_id": "t1",
+            "text": "unscoped claim",
+            "status": "VERIFIED",
+            "evidence": {},
+            "depends_on_paths": [],
+        }
+    )
+    other = await store.save_claim(
+        {
+            "id": "c-other",
+            "task_id": "t2",
+            "text": "other task",
+            "status": "VERIFIED",
+            "evidence": {},
+            "depends_on_paths": ["src/athena"],
+        }
+    )
 
     flipped = await store.invalidate_for_paths(
-        "t1", ["src/athena/store.py"],
-        mutation_id="mut-1", mutation_sequence=4,
-        mutation_event_sequence=11)
+        "t1",
+        ["src/athena/store.py"],
+        mutation_id="mut-1",
+        mutation_sequence=4,
+        mutation_event_sequence=11,
+    )
     # prefix semantics match core._paths_overlap; unscoped claims depend on all
     assert set(flipped) == {scoped, unscoped}
     assert other not in flipped
@@ -80,8 +101,7 @@ async def test_invalidation_flip_persisted_and_scoped(db_path):
     assert rows[other]["status"] == "VERIFIED"
     assert rows[scoped]["invalidated_by"], "invalidation reason recorded"
 
-    inv = await db.fetch_all(
-        "SELECT * FROM claim_invalidations WHERE claim_id = ?", (scoped,))
+    inv = await db.fetch_all("SELECT * FROM claim_invalidations WHERE claim_id = ?", (scoped,))
     reason = json.loads(inv[0]["reason"])
     assert reason["paths"] == ["src/athena/store.py"]
     assert reason["mutation_id"] == "mut-1"
@@ -96,10 +116,16 @@ async def test_invalidation_flip_persisted_and_scoped(db_path):
 async def test_mark_contradicted(db_path):
     db = await _open(db_path)
     store = WorldStateStore(db)
-    cid = await store.save_claim({
-        "id": "c-1", "task_id": "t1", "text": "x", "status": "VERIFIED",
-        "evidence": {}, "depends_on_paths": [],
-    })
+    cid = await store.save_claim(
+        {
+            "id": "c-1",
+            "task_id": "t1",
+            "text": "x",
+            "status": "VERIFIED",
+            "evidence": {},
+            "depends_on_paths": [],
+        }
+    )
     assert await store.mark_contradicted(cid, "test failed on rerun") is True
     rows = await store.claims_for_task("t1")
     assert rows[0]["status"] == "CONTRADICTED"
@@ -110,10 +136,12 @@ async def test_mark_contradicted(db_path):
 async def test_registry_with_store_records_and_reloads(db_path):
     db1 = await _open(db_path)
     reg1 = ClaimRegistry(store=WorldStateStore(db1))
-    a = reg1.record(text="tests pass", evidence={"exit_code": 0},
-                    task_id="t9", depends_on_paths=("tests/",))
-    b = reg1.record(text="lint clean", evidence={"rc": 0}, task_id="t9",
-                    depends_on_paths=("docs/",))
+    a = reg1.record(
+        text="tests pass", evidence={"exit_code": 0}, task_id="t9", depends_on_paths=("tests/",)
+    )
+    b = reg1.record(
+        text="lint clean", evidence={"rc": 0}, task_id="t9", depends_on_paths=("docs/",)
+    )
     flipped = reg1.invalidate_for_paths(["tests/test_x.py"])
     assert [c.id for c in flipped] == [a.id]
     reg1.contradict(b.id, "contradicted later")
@@ -159,10 +187,8 @@ async def test_mutations_get_durable_task_sequences(db_path):
         "'2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"
     )
     mutations = MutationStore(db)
-    first = await mutations.record(
-        "t-seq", "src/a.py", "write", after_state="a")
-    second = await mutations.record(
-        "t-seq", "src/b.py", "write", after_state="b")
+    first = await mutations.record("t-seq", "src/a.py", "write", after_state="a")
+    second = await mutations.record("t-seq", "src/b.py", "write", after_state="b")
     assert await mutations.sequence_for(first) == 1
     assert await mutations.sequence_for(second) == 2
     rows = await mutations.list_for_task("t-seq")
@@ -182,7 +208,8 @@ async def test_invariant_definitions_and_results_survive_store_reload(db_path):
         return True
 
     invariant_id = invariants.add(
-        "workspace remains valid", probe,
+        "workspace remains valid",
+        probe,
         definition={"type": "command", "command": "test -d /workspace"},
     )
     report = await invariants.check_all()

@@ -25,8 +25,7 @@ async def service(tmp_path):
 
 
 async def _real_task(service, ws):
-    spec = await service.submit(AgentRequest(prompt="shadow demo",
-                                             workspace=ws), wait=True)
+    spec = await service.submit(AgentRequest(prompt="shadow demo", workspace=ws), wait=True)
     return spec.id
 
 
@@ -37,10 +36,20 @@ async def test_shadow_commit_applies_proven_changes(service, tmp_path):
     engine = svc.shadow_engine()
 
     branch = await engine.open_branch(
-        task_id=task_id, base_workspace=ws,
-        proposal=[{"capability_id": "fs", "arguments": {
-            "operation": "write", "path": "lib.py",
-            "content": "x = 1\n", "create_dirs": True}}])
+        task_id=task_id,
+        base_workspace=ws,
+        proposal=[
+            {
+                "capability_id": "fs",
+                "arguments": {
+                    "operation": "write",
+                    "path": "lib.py",
+                    "content": "x = 1\n",
+                    "create_dirs": True,
+                },
+            }
+        ],
+    )
 
     # Reality untouched before commit.
     assert not os.path.exists(os.path.join(ws.root, "lib.py"))
@@ -55,9 +64,7 @@ async def test_shadow_commit_applies_proven_changes(service, tmp_path):
     await engine.record_verification(branch, [{"id": "ac_1", "passed": True}])
     assert branch.verification_certificate["candidate_fingerprint"]
     assert branch.verification_certificate["environment_fingerprint"]
-    assert branch.verification_certificate["criteria"] == [
-        {"id": "ac_1", "passed": True}
-    ]
+    assert branch.verification_certificate["criteria"] == [{"id": "ac_1", "passed": True}]
     outcome = await engine.commit(branch)
     assert outcome["status"] == "committed"
     assert "lib.py" in outcome["written"]
@@ -71,10 +78,20 @@ async def test_shadow_discard_leaves_reality_untouched(service):
     engine = svc.shadow_engine()
 
     branch = await engine.open_branch(
-        task_id=task_id, base_workspace=ws,
-        proposal=[{"capability_id": "fs", "arguments": {
-            "operation": "write", "path": "junk.py",
-            "content": "bad\n", "create_dirs": True}}])
+        task_id=task_id,
+        base_workspace=ws,
+        proposal=[
+            {
+                "capability_id": "fs",
+                "arguments": {
+                    "operation": "write",
+                    "path": "junk.py",
+                    "content": "bad\n",
+                    "create_dirs": True,
+                },
+            }
+        ],
+    )
     branch = await engine.execute_branch(branch, profile="autonomous")
     outcome = await engine.discard(branch, reason="verification failed")
     assert outcome["status"] == "discarded"
@@ -85,8 +102,7 @@ async def test_commit_requires_verified_branch(service):
     svc, ws = service
     task_id = await _real_task(svc, ws)
     engine = svc.shadow_engine()
-    branch = await engine.open_branch(task_id=task_id, base_workspace=ws,
-                                      proposal=[])
+    branch = await engine.open_branch(task_id=task_id, base_workspace=ws, proposal=[])
     with pytest.raises(RuntimeError, match="cannot commit"):
         await engine.commit(branch)
 
@@ -98,8 +114,8 @@ async def test_claims_go_stale_after_dependent_mutation(service, tmp_path):
 
     wstate = svc.world_state("task_ws_test")
     claim = wstate.claims.record(
-        text="tests pass", evidence={"exit_code": 0},
-        depends_on_paths=("src/auth.py",))
+        text="tests pass", evidence={"exit_code": 0}, depends_on_paths=("src/auth.py",)
+    )
     assert claim.status == ClaimStatus.VERIFIED
     flipped = wstate.claims.invalidate_for_paths(["src/auth.py"])
     assert claim in flipped and claim.status == ClaimStatus.STALE
@@ -114,8 +130,7 @@ async def test_world_state_snapshot_shape(service):
     svc, ws = service
     task_id = await _real_task(svc, ws)
     snap = await svc.world_state(task_id).snapshot(workspace_root=ws.root)
-    for key in ("task_id", "claims", "runtime_sessions",
-                "mutations_since_verified_claim"):
+    for key in ("task_id", "claims", "runtime_sessions", "mutations_since_verified_claim"):
         assert key in snap
 
 

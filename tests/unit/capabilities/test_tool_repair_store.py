@@ -1,4 +1,5 @@
 """Durable compatibility receipts cover single and parallel dispatch paths."""
+
 from __future__ import annotations
 
 import pytest
@@ -16,6 +17,24 @@ from athena.protocol.capabilities import (
 from athena.protocol.tasks import AutonomyLevel, WorkspaceSpec
 from athena.state.database import Database
 from athena.state.tool_repairs import ToolRepairStore
+from athena.state.tool_repairs import sanitize_repair_arguments
+
+
+def test_repair_argument_sanitizer_preserves_shape_without_secrets():
+    safe, sensitive = sanitize_repair_arguments(
+        {
+            "path": "src/app.py",
+            "authorization": "Bearer short-lived-token",
+            "nested": [{"api_key": "abc"}, {"value": 3}],
+        }
+    )
+
+    assert sensitive is True
+    assert safe == {
+        "path": "src/app.py",
+        "authorization": "[REDACTED]",
+        "nested": [{"api_key": "[REDACTED]"}, {"value": 3}],
+    }
 
 
 class _Executor:
@@ -34,8 +53,10 @@ class _Executor:
 
     async def invoke(self, request, *, output_accumulator=None, context=None):
         return CapabilityResult(
-            request.call_id, request.capability_id,
-            CapabilityResultStatus.OK, output=request.arguments["path"],
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
+            output=request.arguments["path"],
         )
 
 
@@ -66,10 +87,6 @@ async def test_parallel_repair_receipt_is_durable_and_replayable(tmp_path):
     record = await store.get("call-repair")
     assert record is not None
     assert record["outcome"] == "REPAIRED"
-    assert record["original_arguments"] == {
-        "file_path": str(tmp_path / "a.txt")
-    }
-    assert record["canonical_arguments"] == {
-        "path": str(tmp_path / "a.txt")
-    }
+    assert record["original_arguments"] == {"file_path": str(tmp_path / "a.txt")}
+    assert record["canonical_arguments"] == {"path": str(tmp_path / "a.txt")}
     await db.close()

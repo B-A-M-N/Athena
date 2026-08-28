@@ -118,54 +118,101 @@ class GeneratedSourceValidator:
 
             ruff = shutil.which("ruff")
             if ruff is None:
-                checks.append(ValidationCheck(
-                    "format", "failed" if "ruff" in self._REQUIRED_TOOLS[selected]
-                    else "skipped", "ruff is not installed", tool="ruff"))
-                checks.append(ValidationCheck(
-                    "lint", "failed" if "ruff" in self._REQUIRED_TOOLS[selected]
-                    else "skipped", "ruff is not installed", tool="ruff"))
+                checks.append(
+                    ValidationCheck(
+                        "format",
+                        "failed" if "ruff" in self._REQUIRED_TOOLS[selected] else "skipped",
+                        "ruff is not installed",
+                        tool="ruff",
+                    )
+                )
+                checks.append(
+                    ValidationCheck(
+                        "lint",
+                        "failed" if "ruff" in self._REQUIRED_TOOLS[selected] else "skipped",
+                        "ruff is not installed",
+                        tool="ruff",
+                    )
+                )
             else:
                 format_result = _run_tool(
-                    [ruff, "format", path], cwd=root, timeout=self._timeout,
+                    [ruff, "format", path],
+                    cwd=root,
+                    timeout=self._timeout,
                 )
                 if format_result.returncode == 0:
                     # Formatter output is canonical input to subsequent checks
                     # and to the eventual code hash.
                     with open(path, encoding="utf-8") as handle:
                         source = handle.read()
-                    checks.append(ValidationCheck(
-                        "format", "passed", format_result.stdout.strip(), tool="ruff"))
+                    checks.append(
+                        ValidationCheck(
+                            "format", "passed", format_result.stdout.strip(), tool="ruff"
+                        )
+                    )
                 else:
-                    checks.append(ValidationCheck(
-                        "format", "failed", _tool_detail(format_result), tool="ruff"))
+                    checks.append(
+                        ValidationCheck(
+                            "format", "failed", _tool_detail(format_result), tool="ruff"
+                        )
+                    )
+
+                # ``athena`` is injected by the generated runtime, so it is
+                # intentionally absent from the submitted source. Give Ruff
+                # and Mypy a local type/name stub without changing the
+                # canonical source that will be executed or hashed.
+                if _uses_generated_host(source):
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write(_GENERATED_HOST_STUB + source)
 
                 lint_result = _run_tool(
                     [ruff, "check", "--select", "E4,E7,E9,F,B,I,UP", path],
-                    cwd=root, timeout=self._timeout,
+                    cwd=root,
+                    timeout=self._timeout,
                 )
-                checks.append(ValidationCheck(
-                    "lint", "passed" if lint_result.returncode == 0 else "failed",
-                    _tool_detail(lint_result), tool="ruff"))
+                checks.append(
+                    ValidationCheck(
+                        "lint",
+                        "passed" if lint_result.returncode == 0 else "failed",
+                        _tool_detail(lint_result),
+                        tool="ruff",
+                    )
+                )
 
             mypy = shutil.which("mypy")
             if mypy is None:
-                checks.append(ValidationCheck(
-                    "typecheck", "failed" if "mypy" in self._REQUIRED_TOOLS[selected]
-                    else "skipped", "mypy is not installed", tool="mypy"))
+                checks.append(
+                    ValidationCheck(
+                        "typecheck",
+                        "failed" if "mypy" in self._REQUIRED_TOOLS[selected] else "skipped",
+                        "mypy is not installed",
+                        tool="mypy",
+                    )
+                )
             elif selected in {
-                ValidationTier.CANDIDATE, ValidationTier.PROJECT, ValidationTier.USER,
+                ValidationTier.CANDIDATE,
+                ValidationTier.PROJECT,
+                ValidationTier.USER,
             }:
                 type_result = _run_tool(
                     [mypy, "--ignore-missing-imports", "--follow-imports=skip", path],
-                    cwd=root, timeout=self._timeout,
+                    cwd=root,
+                    timeout=self._timeout,
                 )
-                checks.append(ValidationCheck(
-                    "typecheck", "passed" if type_result.returncode == 0 else "failed",
-                    _tool_detail(type_result), tool="mypy"))
+                checks.append(
+                    ValidationCheck(
+                        "typecheck",
+                        "passed" if type_result.returncode == 0 else "failed",
+                        _tool_detail(type_result),
+                        tool="mypy",
+                    )
+                )
             else:
-                checks.append(ValidationCheck(
-                    "typecheck", "skipped", "not required for task-local machinery",
-                    tool="mypy"))
+                checks.append(
+                    ValidationCheck(
+                        "typecheck", "skipped", "not required for task-local machinery", tool="mypy"
+                    )
+                )
 
         return SourceValidation(
             selected,
@@ -173,9 +220,7 @@ class GeneratedSourceValidator:
             tuple(checks),
             metadata={
                 "required_tools": list(self._REQUIRED_TOOLS[selected]),
-                "available_tools": [
-                    tool for tool in ("ruff", "mypy") if shutil.which(tool)
-                ],
+                "available_tools": [tool for tool in ("ruff", "mypy") if shutil.which(tool)],
             },
         )
 
@@ -184,31 +229,39 @@ def _contract_checks(tree: ast.AST) -> list[ValidationCheck]:
     if not isinstance(tree, ast.Module):
         return [ValidationCheck("interface", "failed", "source must be a module")]
     definitions = [
-        node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "run"
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run"
     ]
     if len(definitions) != 1:
-        return [ValidationCheck(
-            "interface", "failed", "source must define exactly one run(args) function"
-        )]
+        return [
+            ValidationCheck(
+                "interface", "failed", "source must define exactly one run(args) function"
+            )
+        ]
     function = definitions[0]
     if isinstance(function, ast.AsyncFunctionDef):
-        return [ValidationCheck(
-            "interface", "failed", "run must be a synchronous function"
-        )]
+        return [ValidationCheck("interface", "failed", "run must be a synchronous function")]
     if len(function.args.posonlyargs) + len(function.args.args) != 1:
-        return [ValidationCheck(
-            "interface", "failed", "run must accept exactly one args parameter"
-        )]
+        return [
+            ValidationCheck("interface", "failed", "run must accept exactly one args parameter")
+        ]
     return [ValidationCheck("interface", "passed")]
 
 
 def _security_checks(tree: ast.AST) -> list[ValidationCheck]:
     """Reject unambiguous host-escape primitives before sandbox execution."""
     forbidden_calls = {
-        "eval", "exec", "compile", "__import__",
-        "system", "popen", "Popen", "call", "check_call", "check_output",
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+        "system",
+        "popen",
+        "Popen",
+        "call",
+        "check_call",
+        "check_output",
         "CDLL",
     }
     findings: list[str] = []
@@ -222,13 +275,21 @@ def _security_checks(tree: ast.AST) -> list[ValidationCheck]:
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id in {"os", "subprocess"}
             )
-            if node.func.attr in forbidden_calls or is_process_run:
+            is_generated_host_call = (
+                node.func.attr == "call"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "athena"
+            )
+            if (node.func.attr in forbidden_calls and not is_generated_host_call) or is_process_run:
                 findings.append(f".{node.func.attr}()")
     if findings:
-        return [ValidationCheck(
-            "security", "failed",
-            "host/process escape primitive is not allowed: " + ", ".join(sorted(set(findings))),
-        )]
+        return [
+            ValidationCheck(
+                "security",
+                "failed",
+                "host/process escape primitive is not allowed: " + ", ".join(sorted(set(findings))),
+            )
+        ]
     return [ValidationCheck("security", "passed")]
 
 
@@ -244,9 +305,7 @@ def _run_tool(command: list[str], *, cwd: str, timeout: float) -> subprocess.Com
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(
-            command, 124, "", f"timed out after {exc.timeout}s"
-        )
+        return subprocess.CompletedProcess(command, 124, "", f"timed out after {exc.timeout}s")
     except OSError as exc:
         return subprocess.CompletedProcess(command, 127, "", str(exc))
 
@@ -266,6 +325,28 @@ def _tool_detail(result: subprocess.CompletedProcess[str]) -> str:
     return output.strip()[-2000:]
 
 
+_GENERATED_HOST_STUB = (
+    "class _GeneratedHost:\n"
+    "    def call(self, capability_id, arguments): ...\n"
+    "\n"
+    "athena = _GeneratedHost()\n\n"
+)
+
+
+def _uses_generated_host(source: str) -> bool:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Name) and node.id == "athena" and isinstance(node.ctx, ast.Load)
+        for node in ast.walk(tree)
+    )
+
+
 __all__ = [
-    "GeneratedSourceValidator", "SourceValidation", "ValidationCheck", "ValidationTier",
+    "GeneratedSourceValidator",
+    "SourceValidation",
+    "ValidationCheck",
+    "ValidationTier",
 ]

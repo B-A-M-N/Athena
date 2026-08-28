@@ -86,11 +86,12 @@ class PythonRuntime(BaseRuntime):
     name = "python"
     aliases = ("py", "python3")
 
-    def _make_session(self, *, env=None, cwd=None, sandbox_root=None,
-                      network_policy=None) -> "_PythonSession":
+    def _make_session(
+        self, *, env=None, cwd=None, sandbox_root=None, network_policy=None
+    ) -> "_PythonSession":
         sess = _PythonSession(
-            env=env, cwd=cwd, sandbox_root=sandbox_root,
-            network_policy=network_policy)
+            env=env, cwd=cwd, sandbox_root=sandbox_root, network_policy=network_policy
+        )
         sess.start()
         return sess
 
@@ -105,8 +106,7 @@ class PythonRuntime(BaseRuntime):
 
 
 class _PythonSession:
-    def __init__(self, env=None, cwd=None, sandbox_root=None,
-                 network_policy=None) -> None:
+    def __init__(self, env=None, cwd=None, sandbox_root=None, network_policy=None) -> None:
         self.env = env or {}
         self.cwd = cwd
         self.sandbox_root = sandbox_root
@@ -129,9 +129,7 @@ class _PythonSession:
             encoding="utf-8",
             errors="replace",
         )
-        threading.Thread(
-            target=self._read_loop, args=(self.process.stdout,), daemon=True
-        ).start()
+        threading.Thread(target=self._read_loop, args=(self.process.stdout,), daemon=True).start()
 
     def _read_loop(self, stream) -> None:
         try:
@@ -180,8 +178,12 @@ class _PythonSession:
             self.start()
             process = self.process
         if process is None:
-            yield ExecutionEvent(type=ExecutionEventType.EXITED, execution_id=execution_id,
-                                 exit_status=ExecutionExitStatus.FAILED, exit_code=1)
+            yield ExecutionEvent(
+                type=ExecutionEventType.EXITED,
+                execution_id=execution_id,
+                exit_status=ExecutionExitStatus.FAILED,
+                exit_code=1,
+            )
             return
         message = json.dumps({"source": code})
         try:
@@ -191,12 +193,19 @@ class _PythonSession:
             process.stdin.write(message)
             process.stdin.flush()
         except Exception:
-            yield ExecutionEvent(type=ExecutionEventType.STDERR, execution_id=execution_id,
-                                 data="worker lost; state reset")
+            yield ExecutionEvent(
+                type=ExecutionEventType.STDERR,
+                execution_id=execution_id,
+                data="worker lost; state reset",
+            )
             self.close()
             self.start()
-            yield ExecutionEvent(type=ExecutionEventType.EXITED, execution_id=execution_id,
-                                 exit_status=ExecutionExitStatus.FAILED, exit_code=1)
+            yield ExecutionEvent(
+                type=ExecutionEventType.EXITED,
+                execution_id=execution_id,
+                exit_status=ExecutionExitStatus.FAILED,
+                exit_code=1,
+            )
             return
 
         deadline = time.monotonic() + timeout.total_seconds() if timeout else None
@@ -206,18 +215,22 @@ class _PythonSession:
             except queue.Empty:
                 if process.poll() is not None:
                     self.frames = queue.Queue()
-                    yield ExecutionEvent(type=ExecutionEventType.EXITED,
-                                         execution_id=execution_id,
-                                         exit_status=ExecutionExitStatus.FAILED,
-                                         exit_code=1)
+                    yield ExecutionEvent(
+                        type=ExecutionEventType.EXITED,
+                        execution_id=execution_id,
+                        exit_status=ExecutionExitStatus.FAILED,
+                        exit_code=1,
+                    )
                     return
                 if deadline and time.monotonic() > deadline:
                     self.timeout_kill()
                     yield from self._drain(timeout=0.5, execution_id=execution_id)
-                    yield ExecutionEvent(type=ExecutionEventType.EXITED,
-                                         execution_id=execution_id,
-                                         exit_status=ExecutionExitStatus.TIMED_OUT,
-                                         exit_code=None)
+                    yield ExecutionEvent(
+                        type=ExecutionEventType.EXITED,
+                        execution_id=execution_id,
+                        exit_status=ExecutionExitStatus.TIMED_OUT,
+                        exit_code=None,
+                    )
                     return
                 continue
             ftype = frame.get("type")
@@ -225,27 +238,43 @@ class _PythonSession:
                 # Check explicit success/failure from worker
                 ok = frame.get("ok", True)
                 if not ok:
-                    yield ExecutionEvent(type=ExecutionEventType.EXITED,
-                                         execution_id=execution_id,
-                                         exit_status=ExecutionExitStatus.FAILED,
-                                         exit_code=1)
+                    yield ExecutionEvent(
+                        type=ExecutionEventType.EXITED,
+                        execution_id=execution_id,
+                        exit_status=ExecutionExitStatus.FAILED,
+                        exit_code=1,
+                    )
                     return
                 break
             if ftype == "out":
                 if frame.get("data"):
-                    yield ExecutionEvent(type=ExecutionEventType.STDOUT, execution_id=execution_id,
-                                         data=frame["data"])
+                    yield ExecutionEvent(
+                        type=ExecutionEventType.STDOUT,
+                        execution_id=execution_id,
+                        data=frame["data"],
+                    )
             elif ftype == "err":
-                yield ExecutionEvent(type=ExecutionEventType.STDERR, execution_id=execution_id,
-                                     data=frame.get("data", ""))
+                yield ExecutionEvent(
+                    type=ExecutionEventType.STDERR,
+                    execution_id=execution_id,
+                    data=frame.get("data", ""),
+                )
             if deadline and time.monotonic() > deadline:
                 self.timeout_kill()
                 yield from self._drain(timeout=0.5, execution_id=execution_id)
-                yield ExecutionEvent(type=ExecutionEventType.EXITED, execution_id=execution_id,
-                                     exit_status=ExecutionExitStatus.TIMED_OUT, exit_code=None)
+                yield ExecutionEvent(
+                    type=ExecutionEventType.EXITED,
+                    execution_id=execution_id,
+                    exit_status=ExecutionExitStatus.TIMED_OUT,
+                    exit_code=None,
+                )
                 return
-        yield ExecutionEvent(type=ExecutionEventType.EXITED, execution_id=execution_id,
-                             exit_status=ExecutionExitStatus.EXITED, exit_code=0)
+        yield ExecutionEvent(
+            type=ExecutionEventType.EXITED,
+            execution_id=execution_id,
+            exit_status=ExecutionExitStatus.EXITED,
+            exit_code=0,
+        )
 
     def _drain(self, timeout, execution_id):
         end = time.monotonic() + timeout
@@ -255,11 +284,15 @@ class _PythonSession:
             except queue.Empty:
                 continue
             if frame.get("type") == "out" and frame.get("data"):
-                yield ExecutionEvent(type=ExecutionEventType.STDOUT, execution_id=execution_id,
-                                     data=frame["data"])
+                yield ExecutionEvent(
+                    type=ExecutionEventType.STDOUT, execution_id=execution_id, data=frame["data"]
+                )
             elif frame.get("type") == "err":
-                yield ExecutionEvent(type=ExecutionEventType.STDERR, execution_id=execution_id,
-                                     data=frame.get("data", ""))
+                yield ExecutionEvent(
+                    type=ExecutionEventType.STDERR,
+                    execution_id=execution_id,
+                    data=frame.get("data", ""),
+                )
 
 
 __all__ = ["PythonRuntime"]

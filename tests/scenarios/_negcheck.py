@@ -4,6 +4,7 @@ Loads scripts/scenarios as a module, injects a REQUIRED scenario that will
 fail (nonexistent pytest node id), and asserts the runner exits 1 and lists
 it in required_not_passed.  Not part of the test suite.
 """
+
 import importlib.machinery
 import importlib.util
 import json
@@ -13,9 +14,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location(
-    "scenarios_runner", str(ROOT / "scripts" / "scenarios"),
-    loader=importlib.machinery.SourceFileLoader("scenarios_runner",
-                                                str(ROOT / "scripts" / "scenarios")))
+    "scenarios_runner",
+    str(ROOT / "scripts" / "scenarios"),
+    loader=importlib.machinery.SourceFileLoader(
+        "scenarios_runner", str(ROOT / "scripts" / "scenarios")
+    ),
+)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
@@ -24,10 +28,15 @@ import dataclasses  # noqa: E402 — must load the runner module first
 import tests.scenarios.registry as reg  # noqa: E402
 
 fake = dataclasses.replace(
-    reg.SCENARIOS[0], id="ZZZ-999", family="FUSE",
+    reg.SCENARIOS[0],
+    id="ZZZ-999",
+    family="FUSE",
     title="gate negative check (must fail)",
     nodeids=("tests/unit/kernel/test_kernel_loop.py::test_does_not_exist_xyz",),
-    probe=(), required=True, notes="")
+    probe=(),
+    required=True,
+    notes="",
+)
 
 reg.SCENARIOS = (fake,) + reg.SCENARIOS
 mod.SCENARIOS = reg.SCENARIOS

@@ -9,6 +9,7 @@ temp workspace, fake model). Usage:
     finally:
         await svc.stop()
 """
+
 from __future__ import annotations
 
 import pytest

@@ -39,16 +39,20 @@ class TaskStatus(str, enum.Enum):
 # states is finished: event streams close, wait_for returns, the worker stops,
 # and completed_at is written.
 FINAL_STATUSES = frozenset(
-    {TaskStatus.COMPLETE, TaskStatus.PARTIAL, TaskStatus.FAILED,
-     TaskStatus.CANCELLED}
+    {TaskStatus.COMPLETE, TaskStatus.PARTIAL, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
 
 # Paused — not currently executing, but may resume. NOT terminal. A paused task
 # is still alive: its event stream stays open, wait_for keeps polling, the
 # worker may claim it again, and completed_at must NOT be written.
 PAUSED_STATUSES = frozenset(
-    {TaskStatus.WAITING_APPROVAL, TaskStatus.WAITING_INPUT,
-     TaskStatus.INTERRUPTED, TaskStatus.RECOVERY_REQUIRED, TaskStatus.BLOCKED}
+    {
+        TaskStatus.WAITING_APPROVAL,
+        TaskStatus.WAITING_INPUT,
+        TaskStatus.INTERRUPTED,
+        TaskStatus.RECOVERY_REQUIRED,
+        TaskStatus.BLOCKED,
+    }
 )
 
 # Backward-compatible alias for code written against the old "terminal" notion;
@@ -59,20 +63,36 @@ TERMINAL_STATUSES = FINAL_STATUSES
 LEGAL_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.CREATED: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
     TaskStatus.QUEUED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
-    TaskStatus.RUNNING: frozenset({
-        TaskStatus.WAITING_APPROVAL, TaskStatus.WAITING_INPUT, TaskStatus.BLOCKED,
-        TaskStatus.PARTIAL, TaskStatus.FAILED, TaskStatus.CANCELLED,
-        TaskStatus.INTERRUPTED, TaskStatus.COMPLETE, TaskStatus.RECOVERY_REQUIRED,
-    }),
+    TaskStatus.RUNNING: frozenset(
+        {
+            TaskStatus.WAITING_APPROVAL,
+            TaskStatus.WAITING_INPUT,
+            TaskStatus.BLOCKED,
+            TaskStatus.PARTIAL,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.INTERRUPTED,
+            TaskStatus.COMPLETE,
+            TaskStatus.RECOVERY_REQUIRED,
+        }
+    ),
     TaskStatus.WAITING_APPROVAL: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
     TaskStatus.WAITING_INPUT: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
     TaskStatus.BLOCKED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
-    TaskStatus.INTERRUPTED: frozenset({
-        TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED,
-    }),
-    TaskStatus.RECOVERY_REQUIRED: frozenset({
-        TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED,
-    }),
+    TaskStatus.INTERRUPTED: frozenset(
+        {
+            TaskStatus.RUNNING,
+            TaskStatus.CANCELLED,
+            TaskStatus.RECOVERY_REQUIRED,
+        }
+    ),
+    TaskStatus.RECOVERY_REQUIRED: frozenset(
+        {
+            TaskStatus.RUNNING,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }
+    ),
 }
 
 
@@ -111,7 +131,7 @@ class Criterion:
 
 @dataclass(frozen=True)
 class ContextRef:
-    kind: str          # session | memory | skill | artifact | file | task | web
+    kind: str  # session | memory | skill | artifact | context_block | file | task | web
     ref: str
     source_id: str | None = None
     summary: str | None = None
@@ -155,20 +175,24 @@ class WorkspaceSpec:
     execution_backend: str = "local"
     network_policy: NetworkPolicy = NetworkPolicy.ALLOW
     mutation_mode: MutationMode = MutationMode.DIRECT
+    # Optional revision supplied by a persisted project/workspace index.  A
+    # cache policy may use it, but the dispatcher never invents one by hashing
+    # the entire workspace synchronously.
+    revision: str | None = None
 
 
 @dataclass(frozen=True)
 class ResourceBudget:
-    max_agent_iterations: int = 100
+    max_agent_iterations: int = 500
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     max_cost_usd: Decimal | None = None
     max_wall_time: timedelta | None = None
-    max_children: int = 4
+    max_children: int = 16
     max_child_depth: int = 1
     max_parallel_model_calls: int = 4
-    max_parallel_executions: int = 4
-    max_artifact_bytes: int = 10 * 1024 * 1024
+    max_parallel_executions: int = 16
+    max_artifact_bytes: int = 100 * 1024 * 1024
 
     def merged_with(self, other: "ResourceBudget | None") -> "ResourceBudget":
         if other is None:
@@ -181,8 +205,12 @@ class ResourceBudget:
             max_wall_time=_min_opt(self.max_wall_time, other.max_wall_time),
             max_children=min(self.max_children, other.max_children),
             max_child_depth=min(self.max_child_depth, other.max_child_depth),
-            max_parallel_model_calls=min(self.max_parallel_model_calls, other.max_parallel_model_calls),
-            max_parallel_executions=min(self.max_parallel_executions, other.max_parallel_executions),
+            max_parallel_model_calls=min(
+                self.max_parallel_model_calls, other.max_parallel_model_calls
+            ),
+            max_parallel_executions=min(
+                self.max_parallel_executions, other.max_parallel_executions
+            ),
             max_artifact_bytes=min(self.max_artifact_bytes, other.max_artifact_bytes),
         )
 
@@ -281,10 +309,26 @@ class AgentRequest:
 
 
 __all__ = [
-    "TaskStatus", "TERMINAL_STATUSES", "FINAL_STATUSES", "PAUSED_STATUSES",
-    "AutonomyLevel", "VerificationType",
-    "VerificationSpec", "Criterion", "ContextRef", "PathRule", "NetworkPolicy",
-    "WorkspaceSpec", "MutationMode", "ResourceBudget", "ModelPolicy", "CapabilityPolicy",
-    "DeliverySpec", "TaskSpec", "UsageSummary", "MutationRef", "TaskResult",
+    "TaskStatus",
+    "TERMINAL_STATUSES",
+    "FINAL_STATUSES",
+    "PAUSED_STATUSES",
+    "AutonomyLevel",
+    "VerificationType",
+    "VerificationSpec",
+    "Criterion",
+    "ContextRef",
+    "PathRule",
+    "NetworkPolicy",
+    "WorkspaceSpec",
+    "MutationMode",
+    "ResourceBudget",
+    "ModelPolicy",
+    "CapabilityPolicy",
+    "DeliverySpec",
+    "TaskSpec",
+    "UsageSummary",
+    "MutationRef",
+    "TaskResult",
     "AgentRequest",
 ]

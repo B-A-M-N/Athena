@@ -100,11 +100,13 @@ def test_dispatch_many_survives_one_raising_call():
 
     assert len(results) == 2
     failures = [
-        r for r in results
+        r
+        for r in results
         if isinstance(r, CapabilityResult) and r.status == CapabilityResultStatus.FAILED
     ]
     ok = [
-        r for r in results
+        r
+        for r in results
         if isinstance(r, CapabilityResult) and r.status == CapabilityResultStatus.OK
     ]
     assert len(failures) == 1
@@ -122,3 +124,39 @@ def test_resolve_effects_copy_returns_read_and_write():
     dispatcher = _dispatcher(_Executor(desc))
     effects = dispatcher._resolve_effects(desc, {"operation": "copy"})
     assert set(effects) == {EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}
+
+
+def test_dispatcher_emits_capability_progress_and_diagnostics():
+    class ObservableExecutor(_Executor):
+        async def invoke(self, request, *, output_accumulator=None, context=None):
+            if output_accumulator is not None:
+                await output_accumulator.chunk("observed", stream="stdout")
+            return CapabilityResult(
+                request.call_id,
+                request.capability_id,
+                CapabilityResultStatus.OK,
+                metadata={"diagnostics": [{"message": "one warning"}]},
+            )
+
+    async def run() -> list[str]:
+        executor = ObservableExecutor(_read_exec().descriptor)
+        events = []
+
+        async def sink(event):
+            events.append(event)
+
+        registry = CapabilityRegistry()
+        registry.register(executor)
+        dispatcher = CapabilityDispatcher(
+            registry, PolicyEngine(AutonomyLevel.SUPERVISED), event_sink=sink
+        )
+        result = await dispatcher.dispatch(
+            _req("files.read", path="/tmp/ws/a.txt"), workspace=_workspace()
+        )
+        assert result.status is CapabilityResultStatus.OK
+        return [event.type for event in events]
+
+    event_types = asyncio.run(run())
+    assert "CapabilityProgress" in event_types
+    assert "DiagnosticsProduced" in event_types
+    assert event_types[-1] == "CapabilityCompleted"

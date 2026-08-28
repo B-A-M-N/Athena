@@ -17,9 +17,7 @@ NOT_READ_LOCAL = frozenset({EffectClass.READ_LOCAL})
 @pytest.mark.athena_claim("BHV-111")
 @pytest.mark.athena_evidence("test", "security")
 def test_remote_readonly_hint_yields_network_read_not_local():
-    effects = infer_effects(
-        "fetch_page", {"readOnlyHint": True}, {}, remote=True
-    )
+    effects = infer_effects("fetch_page", {"readOnlyHint": True}, {}, remote=True)
     assert EffectClass.NETWORK_READ in effects
     assert EffectClass.READ_LOCAL not in effects
     assert effects != NOT_READ_LOCAL

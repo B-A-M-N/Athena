@@ -26,12 +26,25 @@ _VALID_UNTIL_KEY = f"{_NSP}:valid_until"
 _SUPERSEDES_KEY = f"{_NSP}:supersedes"
 _CONTRADICTED_BY_KEY = f"{_NSP}:contradicted_by"
 
-_NS_KEYS = frozenset({
-    _TRUST_KEY, _SCOPE_ID_KEY, _SUMMARY_KEY, _PROVENANCE_KEY, _KIND_KEY,
-    _UPDATED_AT_KEY, _RETRIEVAL_MODE_KEY, _SUBJECT_KEY, _TAGS_KEY,
-    _SOURCE_REFS_KEY, _CONFIDENCE_KEY, _VALID_FROM_KEY, _VALID_UNTIL_KEY,
-    _SUPERSEDES_KEY, _CONTRADICTED_BY_KEY,
-})
+_NS_KEYS = frozenset(
+    {
+        _TRUST_KEY,
+        _SCOPE_ID_KEY,
+        _SUMMARY_KEY,
+        _PROVENANCE_KEY,
+        _KIND_KEY,
+        _UPDATED_AT_KEY,
+        _RETRIEVAL_MODE_KEY,
+        _SUBJECT_KEY,
+        _TAGS_KEY,
+        _SOURCE_REFS_KEY,
+        _CONFIDENCE_KEY,
+        _VALID_FROM_KEY,
+        _VALID_UNTIL_KEY,
+        _SUPERSEDES_KEY,
+        _CONTRADICTED_BY_KEY,
+    }
+)
 
 
 def new_memory_id(kind: MemoryKind | str = MemoryKind.SEMANTIC) -> str:
@@ -82,20 +95,32 @@ def _row_to_record(row: Mapping[str, Any]) -> MemoryRecord:
     except Exception:
         md = {}
     trust_value = md.get(_TRUST_KEY, TrustClass.AGENT_CURATED.value)
-    trust = TrustClass(trust_value) if trust_value and trust_value in TrustClass._value2member_map_ else TrustClass.AGENT_CURATED
+    trust = (
+        TrustClass(trust_value)
+        if trust_value and trust_value in TrustClass._value2member_map_
+        else TrustClass.AGENT_CURATED
+    )
     prov_raw = md.get(_PROVENANCE_KEY)
     if isinstance(prov_raw, dict):
         prov = _prov_from_dict(prov_raw)
     else:
-        prov = Provenance(source_type=SourceType.RUNTIME, source_id=row.get("source_task_id"), trust=trust)
+        prov = Provenance(
+            source_type=SourceType.RUNTIME, source_id=row.get("source_task_id"), trust=trust
+        )
     kind_raw = md.get(_KIND_KEY, row.get("kind"))
-    kind = MemoryKind(kind_raw) if kind_raw and kind_raw in MemoryKind._value2member_map_ else MemoryKind.WORKING
+    kind = (
+        MemoryKind(kind_raw)
+        if kind_raw and kind_raw in MemoryKind._value2member_map_
+        else MemoryKind.WORKING
+    )
     created = _parse_dt(row.get("created_at")) or utcnow()
     updated = _parse_dt(md.get(_UPDATED_AT_KEY)) or _parse_dt(row.get("updated_at"))
     retrieval_raw = md.get(_RETRIEVAL_MODE_KEY)
-    retrieval_mode = (RetrievalMode(retrieval_raw)
-                      if retrieval_raw and retrieval_raw in RetrievalMode._value2member_map_
-                      else None)
+    retrieval_mode = (
+        RetrievalMode(retrieval_raw)
+        if retrieval_raw and retrieval_raw in RetrievalMode._value2member_map_
+        else None
+    )
     valid_from = _parse_dt(md.get(_VALID_FROM_KEY))
     valid_until = _parse_dt(md.get(_VALID_UNTIL_KEY))
     conf = md.get(_CONFIDENCE_KEY)
@@ -146,9 +171,7 @@ def _trust_rank(t: TrustClass | None) -> int:
     return _TRUST_RANK.get(t or TrustClass.AGENT_CURATED, 0)
 
 
-def _merge_links(
-    current: Sequence[str], additional: Sequence[str]
-) -> tuple[str, ...]:
+def _merge_links(current: Sequence[str], additional: Sequence[str]) -> tuple[str, ...]:
     seen: list[str] = []
     for v in (*current, *additional):
         if v and v not in seen:
@@ -185,7 +208,11 @@ class MemoryStore:
         self._db = db
 
     def _record_metadata(
-        self, record: MemoryRecord, prov: Provenance, now: str, *,
+        self,
+        record: MemoryRecord,
+        prov: Provenance,
+        now: str,
+        *,
         extra: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         trust = record.trust if record.source is None else prov.trust
@@ -245,7 +272,8 @@ class MemoryStore:
                     record,
                     id=new_memory_id(record.kind),
                     contradicted_by=_merge_links(
-                        record.contradicted_by, (existing_same.id,),
+                        record.contradicted_by,
+                        (existing_same.id,),
                     ),
                 )
 
@@ -275,7 +303,8 @@ class MemoryStore:
                 ),
             )
             await self._merge_superseded(
-                tuple(t.id for t in result.superseded), record.id,
+                tuple(t.id for t in result.superseded),
+                record.id,
             )
 
         source_task = None
@@ -297,28 +326,33 @@ class MemoryStore:
             "ON CONFLICT(id) DO NOTHING"
         )
         params = (
-            record.id, record.scope.value, record.content, text_content,
-            record.kind.value, source_task, source_session, now, now,
+            record.id,
+            record.scope.value,
+            record.content,
+            text_content,
+            record.kind.value,
+            source_task,
+            source_session,
+            now,
+            now,
             json.dumps(md, default=str),
         )
         await self._db.execute(sql, params)
         return record
 
-    async def _merge_superseded(
-        self, superseded_ids: Sequence[str], by_id: str
-    ) -> None:
+    async def _merge_superseded(self, superseded_ids: Sequence[str], by_id: str) -> None:
         for old_id in superseded_ids:
             old = await self.get(old_id)
             if old is None:
                 continue
             md = self._record_metadata(
                 old,
-                old.source or Provenance(
-                    source_type=SourceType.RUNTIME, trust=old.trust
-                ),
-                utcnow().isoformat(), extra={
+                old.source or Provenance(source_type=SourceType.RUNTIME, trust=old.trust),
+                utcnow().isoformat(),
+                extra={
                     _CONTRADICTED_BY_KEY: _merge_links(
-                        old.contradicted_by, (by_id,),
+                        old.contradicted_by,
+                        (by_id,),
                     ),
                 },
             )
@@ -337,16 +371,13 @@ class MemoryStore:
         cursor = await self._db.execute("DELETE FROM memories WHERE id = ?", (id,))
         return cursor.rowcount is not None and cursor.rowcount > 0
 
-    async def list_by_scope(
-        self, scope: MemoryScope, scope_id: str | None
-    ) -> list[MemoryRecord]:
+    async def list_by_scope(self, scope: MemoryScope, scope_id: str | None) -> list[MemoryRecord]:
         conditions = ["scope = ?"]
         params: list[Any] = [scope.value]
         if scope_id:
             conditions.append(f"json_extract(metadata, '$.{_SCOPE_ID_KEY}') = ?")
             params.append(scope_id)
-        sql = (f"SELECT * FROM memories WHERE {' AND '.join(conditions)} "
-               "ORDER BY created_at DESC")
+        sql = f"SELECT * FROM memories WHERE {' AND '.join(conditions)} ORDER BY created_at DESC"
         rows = await self._db.fetch_all(sql, params)
         return [_row_to_record(r) for r in rows]
 
@@ -382,6 +413,7 @@ class MemoryStore:
         limit: int = 10,
     ) -> list[MemoryRecord]:
         from athena.memory.retrieval import MemoryRetriever
+
         return await MemoryRetriever(self).retrieve(
             query=query,
             scope=scope or MemoryScope.SESSION,
@@ -402,6 +434,7 @@ class MemoryStore:
         tags: Sequence[str] | None = None,
     ) -> list[MemoryRecord]:
         from athena.memory.retrieval import MemoryRetriever
+
         return await MemoryRetriever(self).retrieve(
             query=query,
             scope=scope,
@@ -429,9 +462,7 @@ class MemoryStore:
             params.append(scope_id)
         for tag in tags or ():
             if tag:
-                conds.append(
-                    "json_extract(m.metadata, '$._athena:tags') LIKE ?"
-                )
+                conds.append("json_extract(m.metadata, '$._athena:tags') LIKE ?")
                 params.append(f'%"{tag}"%')
         return (" AND ".join(conds), params)
 
@@ -448,8 +479,7 @@ class MemoryStore:
     ) -> list[MemoryRecord]:
         scope_w, params = await self._scope_where(scope, scope_id, tags)
         where = f"WHERE {scope_w}" if scope_w else ""
-        sql = (f"SELECT m.* FROM memories m {where} "
-               "ORDER BY m.created_at DESC LIMIT ?")
+        sql = f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ?"
         params.append(limit)
         return await self._fetch_records(sql, params)
 

@@ -181,7 +181,8 @@ class MutationStore:
         else:
             row = await db.fetch_one_raw(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
-                "FROM mutations WHERE task_id = ?", (task_id,)
+                "FROM mutations WHERE task_id = ?",
+                (task_id,),
             )
         return int((row or {}).get("sequence") or 1)
 
@@ -192,9 +193,7 @@ class MutationStore:
         )
 
     async def get(self, mutation_id: str) -> dict | None:
-        row = await self._db.fetch_one(
-            "SELECT * FROM mutations WHERE id = ?", (mutation_id,)
-        )
+        row = await self._db.fetch_one("SELECT * FROM mutations WHERE id = ?", (mutation_id,))
         if row is None:
             return None
         return _decode_mutation(row)
@@ -242,5 +241,4 @@ def _decode_mutation(row: dict) -> dict:
     return row
 
 
-__all__ = ["MutationStore", "PLANNED", "STARTED", "COMPLETED", "FAILED",
-           "RECOVERY_REQUIRED"]
+__all__ = ["MutationStore", "PLANNED", "STARTED", "COMPLETED", "FAILED", "RECOVERY_REQUIRED"]

@@ -9,7 +9,13 @@ from typing import Callable, TextIO
 class PromptController:
     """Keep prompt ownership with the surface, while remaining test-injectable."""
 
-    def __init__(self, *, input_fn: Callable[[str], str] | None = None, stdin=None, output: TextIO | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        input_fn: Callable[[str], str] | None = None,
+        stdin=None,
+        output: TextIO | None = None,
+    ) -> None:
         self.input_fn = input_fn
         self.stdin = stdin or sys.stdin
         self.output = output or sys.stdout

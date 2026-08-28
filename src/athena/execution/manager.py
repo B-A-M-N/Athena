@@ -20,8 +20,10 @@ import asyncio
 import inspect
 import logging
 import time
-from typing import Any, AsyncIterator, cast
+from dataclasses import replace
+from typing import Any, AsyncIterator, Mapping, cast
 
+from athena.execution.backend import ExecutionBackend
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionEventType,
@@ -40,8 +42,7 @@ _logger = logging.getLogger("athena.execution")
 class Sink:
     """Async output sink. Subclasses override ``chunk``."""
 
-    async def chunk(self, text: str, *, stream: str = "stdout") -> None:
-        ...
+    async def chunk(self, text: str, *, stream: str = "stdout") -> None: ...
 
 
 class ExecutionManager:
@@ -54,10 +55,13 @@ class ExecutionManager:
         durability_mandatory: bool = True,
     ) -> None:
         self._runtimes: dict[str, Runtime] = {}
-        self._executions: dict[str, str] = {}                 # execution_id -> task_id
-        self._exec_runtimes: dict[str, tuple[Runtime, str | None]] = {}  # execution_id -> (runtime, runtime_session_id)
-        self._task_sessions: dict[str, list[tuple[Runtime, str]]] = {}
-        self._runtime_by_session: dict[str, Runtime] = {}
+        self._backends: dict[str, ExecutionBackend] = {}
+        self._executions: dict[str, str] = {}  # execution_id -> task_id
+        self._exec_runtimes: dict[
+            str, tuple[Any, str | None]
+        ] = {}  # execution_id -> (runtime/backend, session)
+        self._task_sessions: dict[str, list[tuple[Any, str]]] = {}
+        self._runtime_by_session: dict[str, Any] = {}
         self._rt_sessions = runtime_session_store
         self._exec_store = execution_store
         self._event_sink = event_sink
@@ -71,6 +75,51 @@ class ExecutionManager:
         for alias in getattr(runtime, "aliases", ()) or ():
             self._runtimes.setdefault(alias, runtime)
 
+    def register_backend(self, backend: ExecutionBackend) -> None:
+        """Register a non-local execution backend.
+
+        Local, shadow, sandbox, and verification requests intentionally remain
+        on the manager's existing runtime path.  Additional backends are
+        selected by ``ExecutionRequest.backend`` and still inherit this
+        manager's persistence, event, ownership, and cancellation handling.
+        """
+        name = getattr(backend, "name", None)
+        if not name:
+            raise ValueError("backend must define a non-empty 'name'")
+        if name == "local":
+            raise ValueError("local is the manager's built-in backend")
+        self._backends[name] = backend
+
+    def available_backends(self) -> list[str]:
+        return ["local", *sorted(self._backends)]
+
+    def backend_status(self) -> list[dict[str, Any]]:
+        """Return availability for registered non-local backends."""
+        result = [{"id": "local", "available": True, "healthy": True}]
+        for name, backend in sorted(self._backends.items()):
+            available = True
+            probe = getattr(backend, "available", None)
+            if callable(probe):
+                try:
+                    available = bool(probe())
+                except Exception:  # noqa: BLE001 - reflection must not crash
+                    available = False
+            result.append(
+                {
+                    "id": name,
+                    "available": available,
+                    "healthy": available,
+                    "implementation": type(backend).__name__,
+                }
+            )
+            identity = getattr(backend, "environment_identity", None)
+            if available and callable(identity):
+                try:
+                    result[-1].update(dict(identity()))
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    result[-1]["environment_identity_error"] = str(exc)
+        return result
+
     def available_runtimes(self) -> list[str]:
         return sorted(self._runtimes.keys())
 
@@ -79,16 +128,19 @@ class ExecutionManager:
         canonical: dict[int, dict[str, Any]] = {}
         for alias, runtime in self._runtimes.items():
             identity = id(runtime)
-            entry = canonical.setdefault(identity, {
-                "id": getattr(runtime, "name", alias),
-                "aliases": [],
-                "available": True,
-                "healthy": True,
-                "persistence": getattr(runtime, "persistence", "unknown"),
-                "active_sessions": 0,
-                "active_executions": 0,
-                "implementation": type(runtime).__name__,
-            })
+            entry = canonical.setdefault(
+                identity,
+                {
+                    "id": getattr(runtime, "name", alias),
+                    "aliases": [],
+                    "available": True,
+                    "healthy": True,
+                    "persistence": getattr(runtime, "persistence", "unknown"),
+                    "active_sessions": 0,
+                    "active_executions": 0,
+                    "implementation": type(runtime).__name__,
+                },
+            )
             if alias != entry["id"]:
                 entry["aliases"].append(alias)
             availability = getattr(runtime, "available", None)
@@ -119,11 +171,26 @@ class ExecutionManager:
         *,
         task_id: str,
         runtime: str,
+        backend: str = "local",
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         workspace_root: str | None = None,
         network_policy: str | None = None,
     ) -> str:
+        selected_backend = self._selected_backend(backend)
+        if selected_backend is not None:
+            sid = await selected_backend.create_session(
+                task_id=task_id,
+                runtime=runtime,
+                cwd=cwd,
+                env=env,
+                workspace_root=workspace_root,
+                network_policy=network_policy,
+            )
+            self._task_sessions.setdefault(task_id, []).append((selected_backend, sid))
+            self._runtime_by_session[sid] = selected_backend
+            await self._persist_session_start(sid, task_id, backend, cwd=cwd)
+            return sid
         rt = self._resolve(runtime)
         kwargs: dict[str, Any] = {"task_id": task_id}
         if env is not None:
@@ -175,7 +242,9 @@ class ExecutionManager:
             if etype == ExecutionEventType.STDOUT:
                 data = event.data or ""
                 if stdout_bytes < cap:
-                    take = data if stdout_bytes + len(data) <= cap else data[: int(cap - stdout_bytes)]
+                    take = (
+                        data if stdout_bytes + len(data) <= cap else data[: int(cap - stdout_bytes)]
+                    )
                     stdout_parts.append(take)
                     stdout_bytes += len(take)
                     if stdout_bytes >= cap:
@@ -185,7 +254,9 @@ class ExecutionManager:
             elif etype == ExecutionEventType.STDERR:
                 data = event.data or ""
                 if stderr_bytes < cap:
-                    take = data if stderr_bytes + len(data) <= cap else data[: int(cap - stderr_bytes)]
+                    take = (
+                        data if stderr_bytes + len(data) <= cap else data[: int(cap - stderr_bytes)]
+                    )
                     stderr_parts.append(take)
                     stderr_bytes += len(take)
                 if sink:
@@ -220,12 +291,23 @@ class ExecutionManager:
         """
         execution_id = execution_id or new_id("exec")
         self._executions[execution_id] = request.task_id
-        rt = self._resolve(request.runtime)
+        selected_backend = self._selected_backend(request.backend)
+        rt: Any = selected_backend or self._resolve(request.runtime)
+        backend_request = request
+        if selected_backend is not None:
+            # The backend protocol predates the manager-owned execution id.
+            # Keep that id internal to metadata so streamed events remain
+            # correlated without making it model-controlled request data.
+            backend_request = replace(
+                request,
+                metadata={**dict(request.metadata), "__execution_id": execution_id},
+            )
         runtime_session_id: str | None = request.runtime_session_id
         if runtime_session_id and runtime_session_id not in self._runtime_by_session:
             self._runtime_by_session[runtime_session_id] = rt
         exit_status: ExecutionExitStatus | None = None
         exit_code: int | None = None
+        execution_metadata: dict[str, Any] = {}
         persisted = False
         await self._persist_execution_start(
             execution_id,
@@ -242,28 +324,34 @@ class ExecutionManager:
                 "execution_id": execution_id,
                 "task_id": request.task_id,
                 "runtime": request.runtime,
+                "backend": request.backend,
             },
             task_id=request.task_id,
         )
         try:
-            async for event in rt.execute(request, execution_id):
+            if selected_backend is not None:
+                event_stream = selected_backend.execute(backend_request)
+            else:
+                event_stream = rt.execute(request, execution_id)
+            async for event in event_stream:
                 meta = event.metadata or {}
+                if event.type == ExecutionEventType.STARTED and meta:
+                    # Backend identities (for example a container image
+                    # digest) are part of the execution proof, not merely
+                    # live-stream decoration.
+                    execution_metadata.update(dict(meta))
                 if meta.get("runtime_session_id"):
                     await self._adopt_runtime_session(
                         rt, meta["runtime_session_id"], request.task_id
                     )
-                    self._exec_runtimes[execution_id] = (
-                        rt, meta["runtime_session_id"]
-                    )
+                    self._exec_runtimes[execution_id] = (rt, meta["runtime_session_id"])
                     if not persisted:
                         persisted = True
                         await self._update_execution_runtime_session(
                             execution_id, meta["runtime_session_id"]
                         )
                 else:
-                    self._exec_runtimes[execution_id] = (
-                        rt, runtime_session_id
-                    )
+                    self._exec_runtimes[execution_id] = (rt, runtime_session_id)
                 # Emit stream events for observability
                 if event.type == ExecutionEventType.STDOUT:
                     await self._emit_event(
@@ -301,6 +389,7 @@ class ExecutionManager:
                 exit_code=exit_code,
                 timed_out=(track_exit and exit_status == ExecutionExitStatus.TIMED_OUT),
                 interrupted=(track_exit and exit_status == ExecutionExitStatus.INTERRUPTED),
+                execution_metadata=execution_metadata,
             )
             # Emit execution exited event for observability
             exit_event_type = "ExecutionExited"
@@ -316,11 +405,14 @@ class ExecutionManager:
                     "runtime": request.runtime,
                     "exit_code": exit_code,
                     "exit_status": final_status.value,
+                    **({"metadata": execution_metadata} if execution_metadata else {}),
                 },
                 task_id=request.task_id,
             )
 
-    async def _adopt_runtime_session(self, rt: Runtime, runtime_session_id: str, task_id: str) -> None:
+    async def _adopt_runtime_session(
+        self, rt: Runtime, runtime_session_id: str, task_id: str
+    ) -> None:
         if runtime_session_id in self._runtime_by_session:
             return
         self._runtime_by_session[runtime_session_id] = rt
@@ -328,7 +420,9 @@ class ExecutionManager:
         if not any(sid == runtime_session_id for _r, sid in rooms):
             rooms.append((rt, runtime_session_id))
         await self._persist_session_start(
-            runtime_session_id, task_id, getattr(rt, "name", None),
+            runtime_session_id,
+            task_id,
+            getattr(rt, "name", None),
         )
 
     async def interrupt(self, execution_id: str) -> None:
@@ -342,6 +436,38 @@ class ExecutionManager:
             await fn(execution_id)
         else:
             fn(execution_id)
+
+    async def destroy_session(self, runtime_session_id: str) -> None:
+        """Close one owned runtime/backend session.
+
+        This is intentionally narrower than ``cancel_task`` for capabilities
+        such as the debugger that own a long-lived auxiliary session but must
+        not tear down the rest of the task's execution surface.
+        """
+        rt = self._runtime_by_session.pop(runtime_session_id, None)
+        if rt is None:
+            for sessions in self._task_sessions.values():
+                for candidate, sid in sessions:
+                    if sid == runtime_session_id:
+                        rt = candidate
+                        break
+                if rt is not None:
+                    break
+        for task_id, sessions in list(self._task_sessions.items()):
+            self._task_sessions[task_id] = [
+                (candidate, sid) for candidate, sid in sessions if sid != runtime_session_id
+            ]
+            if not self._task_sessions[task_id]:
+                self._task_sessions.pop(task_id, None)
+        if rt is None:
+            return
+        close = getattr(rt, "close", None) or getattr(rt, "destroy_session", None)
+        if close is not None:
+            if asyncio.iscoroutinefunction(close):
+                await close(runtime_session_id)
+            else:
+                close(runtime_session_id)
+        await self._persist_session_closed(runtime_session_id)
 
     async def cancel_task(self, task_id: str) -> None:
         """Interrupt/close every runtime session owned by a task (tree cancel)."""
@@ -384,6 +510,19 @@ class ExecutionManager:
     async def close_all(self) -> None:
         for task_id in list(self._task_sessions):
             await self.cancel_task(task_id)
+        for backend in list(self._backends.values()):
+            shutdown = getattr(backend, "shutdown", None)
+            if shutdown is None:
+                continue
+            try:
+                if asyncio.iscoroutinefunction(shutdown):
+                    await shutdown()
+                else:
+                    shutdown()
+            except Exception as exc:
+                _logger.warning(
+                    "backend %s shutdown failed: %s", getattr(backend, "name", "?"), exc
+                )
 
     async def _emit_event(self, event_type: str, payload: dict, task_id: str | None = None) -> None:
         """Emit an execution event to the event sink if one is configured."""
@@ -391,6 +530,7 @@ class ExecutionManager:
             return
         try:
             from athena.protocol.events import make_event
+
             event = make_event(event_type, payload, task_id=task_id)
             await self._event_sink(event)
         except Exception as exc:
@@ -413,7 +553,9 @@ class ExecutionManager:
         return False
 
     def owns_process(
-        self, task_id: str | None, pid: int,
+        self,
+        task_id: str | None,
+        pid: int,
         start_identity: str | None = None,
     ) -> bool:
         """Return whether *pid* is a currently live Athena runtime process.
@@ -436,23 +578,33 @@ class ExecutionManager:
         for runtime, known_sid in self._task_sessions.get(task_id, ()):
             session = getattr(runtime, "_sessions", {}).get(known_sid)
             process = getattr(session, "process", None)
-            if (process is not None and process.pid == pid
-                    and process.poll() is None):
+            if process is not None and process.pid == pid and process.poll() is None:
                 return True
         for execution_id, (runtime, adopted_sid) in self._exec_runtimes.items():
             if self._executions.get(execution_id) != task_id or not adopted_sid:
                 continue
             session = getattr(runtime, "_sessions", {}).get(adopted_sid)
             process = getattr(session, "process", None)
-            if (process is not None and process.pid == pid
-                    and process.poll() is None):
+            if process is not None and process.pid == pid and process.poll() is None:
                 return True
         return False
+
+    def _selected_backend(self, name: str) -> ExecutionBackend | None:
+        if name in {"local", "shadow", "sandbox", "verification"}:
+            return None
+        backend = self._backends.get(name)
+        if backend is None:
+            raise RuntimeError(
+                f"no such execution backend: {name!r}; registered: {self.available_backends()}"
+            )
+        return backend
 
     def _resolve(self, name: str) -> Runtime:
         rt = self._runtimes.get(name)
         if rt is None:
-            raise RuntimeError(f"no such runtime: {name!r}; registered: {self.available_runtimes()}")
+            raise RuntimeError(
+                f"no such runtime: {name!r}; registered: {self.available_runtimes()}"
+            )
         return rt
 
     def _resolve_runtime_by_execution(self, execution_id: str) -> Runtime | None:
@@ -477,8 +629,11 @@ class ExecutionManager:
             return
         try:
             await store.start(
-                session_id, task_id=task_id, backend=runtime or "unknown",
-                runtime=runtime, cwd=cwd,
+                session_id,
+                task_id=task_id,
+                backend=runtime or "unknown",
+                runtime=runtime,
+                cwd=cwd,
             )
         except Exception as exc:
             _logger.warning("failed to persist session start %s: %s", session_id, exc)
@@ -554,6 +709,7 @@ class ExecutionManager:
         exit_code: int | None,
         timed_out: bool = False,
         interrupted: bool = False,
+        execution_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         """Persist the post-effect record. Best-effort: log + emit event on
         failure so the audit gap is visible but the execution result is not
@@ -573,6 +729,7 @@ class ExecutionManager:
                     "cwd": cwd,
                     "timed_out": timed_out,
                     "interrupted": interrupted,
+                    **dict(execution_metadata or {}),
                 },
             )
         except Exception as exc:

@@ -29,8 +29,11 @@ async def env():
 
 def _spec(objective, session_id, *, parent=None):
     return TaskSpec(
-        id=new_id("task"), objective=objective, session_id=session_id,
-        parent_task_id=parent, resource_budget=ResourceBudget(),
+        id=new_id("task"),
+        objective=objective,
+        session_id=session_id,
+        parent_task_id=parent,
+        resource_budget=ResourceBudget(),
     )
 
 

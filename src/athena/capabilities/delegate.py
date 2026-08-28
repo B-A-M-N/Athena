@@ -38,15 +38,25 @@ _INPUT_SCHEMA = {
         "timeout": {"type": "number", "minimum": 0, "maximum": 3600},
         "metadata": {"type": "object", "maxProperties": 32},
         "context": {
-            "type": "array", "maxItems": 64,
+            "type": "array",
+            "maxItems": 64,
             "items": {
                 "type": "object",
                 "required": ["kind", "ref"],
                 "properties": {
-                    "kind": {"type": "string", "enum": [
-                        "session", "memory", "skill", "artifact",
-                        "file", "task", "web",
-                    ]},
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "session",
+                            "memory",
+                            "skill",
+                            "artifact",
+                            "context_block",
+                            "file",
+                            "task",
+                            "web",
+                        ],
+                    },
                     "ref": {"type": "string", "minLength": 1, "maxLength": 2048},
                     "source_id": {"type": "string", "maxLength": 256},
                     "summary": {"type": "string", "maxLength": 2000},
@@ -57,10 +67,11 @@ _INPUT_SCHEMA = {
         },
     },
     "oneOf": [
-        {"properties": {"operation": {"const": "spawn"}},
-         "required": ["objective"]},
-        {"properties": {"operation": {"enum": ["status", "collect", "cancel"]}},
-         "required": ["child_task_id"]},
+        {"properties": {"operation": {"const": "spawn"}}, "required": ["objective"]},
+        {
+            "properties": {"operation": {"enum": ["status", "collect", "cancel"]}},
+            "required": ["child_task_id"],
+        },
     ],
 }
 
@@ -92,14 +103,16 @@ class DelegateCapability:
         call_id = request.call_id or new_id("call")
         if self._handle is None:
             return CapabilityResult(
-                call_id, request.capability_id,
+                call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error="delegation handle not available",
             )
         operation = str(args.get("operation") or "spawn")
         if not request.task_id:
             return CapabilityResult(
-                call_id, request.capability_id,
+                call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error="delegation requires an owning task",
             )
@@ -113,13 +126,15 @@ class DelegateCapability:
             if operation == "cancel":
                 return await self._cancel(request, args, call_id)
             return CapabilityResult(
-                call_id, request.capability_id,
+                call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error=f"unknown delegate operation: {operation}",
             )
         except Exception as exc:
             return CapabilityResult(
-                call_id, request.capability_id,
+                call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error=f"delegate.{operation} failed: {exc}",
             )
@@ -136,11 +151,16 @@ class DelegateCapability:
             context=context,
         )
         return CapabilityResult(
-            call_id, request.capability_id, CapabilityResultStatus.OK,
+            call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
             output=f"delegated to {child_id}",
             ref_uri=f"task:{child_id}",
-            metadata={"operation": "spawn", "child_task_id": child_id,
-                      "status": TaskStatus.QUEUED.value},
+            metadata={
+                "operation": "spawn",
+                "child_task_id": child_id,
+                "status": TaskStatus.QUEUED.value,
+            },
         )
 
     async def _status(
@@ -149,18 +169,21 @@ class DelegateCapability:
         child_id = args.get("child_task_id")
         if not child_id:
             return CapabilityResult(
-                call_id, self.descriptor.id, CapabilityResultStatus.FAILED,
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
                 error="delegate.status requires child_task_id",
             )
         if not await self._owns_child(request.task_id, child_id):
             return self._ownership_failure(call_id, child_id)
         status = await self._handle.status_of(child_id)
         return CapabilityResult(
-            call_id, self.descriptor.id, CapabilityResultStatus.OK,
+            call_id,
+            self.descriptor.id,
+            CapabilityResultStatus.OK,
             output=f"child {child_id} status: {status.value}",
             ref_uri=f"task:{child_id}",
-            metadata={"operation": "status", "child_task_id": child_id,
-                     "status": status.value},
+            metadata={"operation": "status", "child_task_id": child_id, "status": status.value},
         )
 
     async def _collect(
@@ -169,18 +192,23 @@ class DelegateCapability:
         child_id = args.get("child_task_id")
         if not child_id:
             return CapabilityResult(
-                call_id, self.descriptor.id, CapabilityResultStatus.FAILED,
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
                 error="delegate.collect requires child_task_id",
             )
         if not await self._owns_child(request.task_id, child_id):
             return self._ownership_failure(call_id, child_id)
         timeout = args.get("timeout")
         result = await self._handle.collect(
-            child_id, timeout=timeout if timeout is None else float(timeout),
+            child_id,
+            timeout=timeout if timeout is None else float(timeout),
         )
         status = _result_status(result)
         return CapabilityResult(
-            call_id, self.descriptor.id, status,
+            call_id,
+            self.descriptor.id,
+            status,
             output=_format_result(result),
             ref_uri=f"task:{child_id}",
             metadata={
@@ -189,11 +217,16 @@ class DelegateCapability:
                 "status": result.status.value,
                 "summary": result.summary,
             },
-            error=(f"child ended with status {result.status.value}"
-                   if status is CapabilityResultStatus.FAILED
-                   and result.status in {TaskStatus.FAILED, TaskStatus.PARTIAL}
-                   else (f"child is not complete (status={result.status.value})"
-                         if status is CapabilityResultStatus.FAILED else None)),
+            error=(
+                f"child ended with status {result.status.value}"
+                if status is CapabilityResultStatus.FAILED
+                and result.status in {TaskStatus.FAILED, TaskStatus.PARTIAL}
+                else (
+                    f"child is not complete (status={result.status.value})"
+                    if status is CapabilityResultStatus.FAILED
+                    else None
+                )
+            ),
         )
 
     async def _cancel(
@@ -202,18 +235,21 @@ class DelegateCapability:
         child_id = args.get("child_task_id")
         if not child_id:
             return CapabilityResult(
-                call_id, self.descriptor.id, CapabilityResultStatus.FAILED,
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
                 error="delegate.cancel requires child_task_id",
             )
         if not await self._owns_child(request.task_id, child_id):
             return self._ownership_failure(call_id, child_id)
         status = await self._handle.cancel_child(child_id)
         return CapabilityResult(
-            call_id, self.descriptor.id, CapabilityResultStatus.OK,
+            call_id,
+            self.descriptor.id,
+            CapabilityResultStatus.OK,
             output=f"cancelled child {child_id}",
             ref_uri=f"task:{child_id}",
-            metadata={"operation": "cancel", "child_task_id": child_id,
-                     "status": status.value},
+            metadata={"operation": "cancel", "child_task_id": child_id, "status": status.value},
         )
 
     async def _owns_child(self, parent_task_id: str | None, child_id: str) -> bool:
@@ -224,7 +260,9 @@ class DelegateCapability:
 
     def _ownership_failure(self, call_id: str, child_id: str) -> CapabilityResult:
         return CapabilityResult(
-            call_id, self.descriptor.id, CapabilityResultStatus.FAILED,
+            call_id,
+            self.descriptor.id,
+            CapabilityResultStatus.FAILED,
             error=f"child task {child_id} is not owned by the requesting task",
         )
 
@@ -235,20 +273,23 @@ class DelegateCapability:
             if isinstance(item, ContextRef):
                 refs.append(item)
             elif isinstance(item, dict):
-                refs.append(ContextRef(
-                    kind=item.get("kind", "task"),
-                    ref=item.get("ref", ""),
-                    source_id=item.get("source_id"),
-                    summary=item.get("summary"),
-                    mime_type=item.get("mime_type"),
-                ))
+                refs.append(
+                    ContextRef(
+                        kind=item.get("kind", "task"),
+                        ref=item.get("ref", ""),
+                        source_id=item.get("source_id"),
+                        summary=item.get("summary"),
+                        mime_type=item.get("mime_type"),
+                    )
+                )
         return tuple(refs)
 
 
 def _format_result(result) -> str:
     return (
         f"child {result.task_id} {result.status.value}: {result.summary}"
-        if result.summary else f"child {result.task_id} {result.status.value}"
+        if result.summary
+        else f"child {result.task_id} {result.status.value}"
     )
 
 

@@ -16,7 +16,6 @@ from typing import Any, Mapping
 from athena.protocol.artifacts import ArtifactRef
 
 
-
 class Role(str, enum.Enum):
     SYSTEM = "system"
     USER = "user"

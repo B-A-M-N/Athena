@@ -13,9 +13,11 @@ Inverse operations:
     rmdir             — remove an empty directory
     noop              — no-op (nothing to undo)
 """
+
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -47,7 +49,10 @@ class RollbackExecutor:
             return {"status": "error", "error": f"mutation {mutation_id} not found"}
 
         if row.get("status") != COMPLETED:
-            return {"status": "error", "error": f"cannot rollback mutation in state {row.get('status')!r}"}
+            return {
+                "status": "error",
+                "error": f"cannot rollback mutation in state {row.get('status')!r}",
+            }
 
         if not row.get("reversible"):
             return {"status": "error", "error": "mutation is not reversible"}
@@ -56,8 +61,12 @@ class RollbackExecutor:
         if inverse is None:
             return {"status": "error", "error": "mutation has no inverse recorded"}
 
-        # Mark the original mutation as rolled back
-        await self._store.mark_rolled_back(mutation_id)
+        conflict = _inverse_conflict(row, inverse)
+        if conflict is not None:
+            return {
+                "status": "error",
+                "error": f"rollback refused: {conflict}",
+            }
 
         # Record the rollback as a new mutation (auditable)
         rollback_id = await self._store.record(
@@ -87,6 +96,10 @@ class RollbackExecutor:
                 "rollback_id": rollback_id,
             }
 
+        # Mark the original only after the inverse side effect succeeded. If
+        # the process stops before this write, the original remains COMPLETED
+        # and the same postcondition check makes retry behavior explicit.
+        await self._store.mark_rolled_back(mutation_id)
         # Mark the rollback as completed
         await self._store.mark_reversible(rollback_id, True)
         return {
@@ -167,3 +180,60 @@ class RollbackExecutor:
         elif source and target and os.path.exists(source):
             # Simple move back
             shutil.move(source, target)
+
+
+def _inverse_conflict(row: dict, inverse: dict) -> str | None:
+    """Reject compensation when the target no longer has the owned post-state."""
+    op = str(inverse.get("op") or "")
+    if op in {"noop", "none", "rmdir"}:
+        return None
+    if op in {"restore_from_ref", "delete"}:
+        target = inverse.get("target")
+        if not isinstance(target, str) or not target:
+            return "inverse target is missing"
+        current = _file_hash(target)
+        expected = row.get("after_state")
+        if expected is None:
+            if current is not None:
+                return f"expected {target} to be absent"
+            return None
+        if current != str(expected):
+            return f"{target} changed after mutation"
+        return None
+    if op == "create_from_ref":
+        target = inverse.get("target")
+        if not isinstance(target, str) or not target:
+            return "inverse target is missing"
+        if _file_hash(target) is not None:
+            return f"expected {target} to be absent"
+        return None
+    if op == "move_restore":
+        source = inverse.get("source")
+        target = inverse.get("target")
+        if not isinstance(source, str) or not isinstance(target, str):
+            return "move inverse paths are missing"
+        expected = row.get("after_state")
+        if expected is not None and _file_hash(source) != str(expected):
+            return f"{source} changed after mutation"
+        if _file_hash(target) is not None:
+            return f"{target} was recreated after mutation"
+        return None
+    return f"unsupported inverse operation {op!r}"
+
+
+def _file_hash(path: str) -> str | None:
+    """Hash only regular files; other resource kinds are conflicts."""
+    if os.path.islink(path):
+        return "<symlink>"
+    if not os.path.exists(path):
+        return None
+    if not os.path.isfile(path):
+        return "<unsupported-resource>"
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return "<unreadable>"
+    return digest.hexdigest()

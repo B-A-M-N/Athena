@@ -39,7 +39,10 @@ from athena.research.policy import (
 _SOURCE_TYPES = ("web", "paper", "documentation", "dataset", "code", "local")
 _EVIDENCE_TYPES = ("quote", "measurement", "observation", "derivation", "execution")
 _GAP_KINDS = (
-    "unsupported_claim", "conflict", "stale_source", "source_quality",
+    "unsupported_claim",
+    "conflict",
+    "stale_source",
+    "source_quality",
     "unanswered_question",
 )
 
@@ -61,11 +64,26 @@ class ResearchCapability:
             "type": "object",
             "required": ["operation"],
             "properties": {
-                "operation": {"type": "string", "enum": [
-                    "fetch", "discover", "record_source", "sources", "search", "record_evidence", "evidence",
-                    "record_gap", "gaps", "close_gap", "verify", "plan", "assess", "bundle",
-                    "run",
-                ]},
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "fetch",
+                        "discover",
+                        "record_source",
+                        "sources",
+                        "search",
+                        "record_evidence",
+                        "evidence",
+                        "record_gap",
+                        "gaps",
+                        "close_gap",
+                        "verify",
+                        "plan",
+                        "assess",
+                        "bundle",
+                        "run",
+                    ],
+                },
                 "uri": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "title": {"type": "string", "maxLength": 1000},
                 "source_type": {"type": "string", "enum": list(_SOURCE_TYPES)},
@@ -82,15 +100,18 @@ class ResearchCapability:
                 "evidence_type": {"type": "string", "enum": list(_EVIDENCE_TYPES)},
                 "extraction_method": {"type": "string", "maxLength": 128},
                 "extraction_model": {"type": "string", "maxLength": 256},
+                "receipt": {"type": "object", "additionalProperties": True},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "corroborates": {"type": "array", "items": {"type": "string"}},
                 "contradicts": {"type": "array", "items": {"type": "string"}},
                 "objective": {"type": "string", "minLength": 1, "maxLength": 20_000},
                 "question": {"type": "string", "minLength": 1, "maxLength": 20_000},
                 "requirements": {
-                    "type": "array", "maxItems": 50,
+                    "type": "array",
+                    "maxItems": 50,
                     "items": {
-                        "type": "object", "additionalProperties": False,
+                        "type": "object",
+                        "additionalProperties": False,
                         "required": ["question"],
                         "properties": {
                             "id": {"type": "string", "maxLength": 128},
@@ -99,24 +120,29 @@ class ResearchCapability:
                             "kind": {"type": "string", "enum": list(_GAP_KINDS)},
                             "required": {"type": "boolean"},
                             "queries": {
-                                "type": "array", "maxItems": 5,
+                                "type": "array",
+                                "maxItems": 5,
                                 "items": {"type": "string", "minLength": 1, "maxLength": 2000},
                             },
                         },
                     },
                 },
                 "queries": {
-                    "type": "array", "maxItems": 10,
+                    "type": "array",
+                    "maxItems": 10,
                     "items": {"type": "string", "minLength": 1, "maxLength": 2000},
                 },
                 "uris": {
-                    "type": "array", "maxItems": 50,
+                    "type": "array",
+                    "maxItems": 50,
                     "items": {"type": "string", "minLength": 1, "maxLength": 4096},
                 },
                 "source_specs": {
-                    "type": "array", "maxItems": 10,
+                    "type": "array",
+                    "maxItems": 10,
                     "items": {
-                        "type": "object", "additionalProperties": False,
+                        "type": "object",
+                        "additionalProperties": False,
                         "required": ["uri"],
                         "properties": {
                             "uri": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -130,9 +156,11 @@ class ResearchCapability:
                     },
                 },
                 "extractions": {
-                    "type": "array", "maxItems": 100,
+                    "type": "array",
+                    "maxItems": 100,
                     "items": {
-                        "type": "object", "additionalProperties": False,
+                        "type": "object",
+                        "additionalProperties": False,
                         "required": ["claim", "excerpt"],
                         "properties": {
                             "source_id": {"type": "string", "maxLength": 128},
@@ -144,6 +172,7 @@ class ResearchCapability:
                             "evidence_type": {"type": "string", "enum": list(_EVIDENCE_TYPES)},
                             "extraction_method": {"type": "string", "maxLength": 128},
                             "extraction_model": {"type": "string", "maxLength": 256},
+                            "receipt": {"type": "object", "additionalProperties": True},
                             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                             "corroborates": {"type": "array", "items": {"type": "string"}},
                             "contradicts": {"type": "array", "items": {"type": "string"}},
@@ -165,17 +194,25 @@ class ResearchCapability:
             },
             "additionalProperties": False,
         },
-        effects=frozenset({
-            EffectClass.READ_LOCAL,
-            EffectClass.WRITE_LOCAL,
-            EffectClass.NETWORK_READ,
-        }),
+        effects=frozenset(
+            {
+                EffectClass.READ_LOCAL,
+                EffectClass.WRITE_LOCAL,
+                EffectClass.NETWORK_READ,
+            }
+        ),
         origin=CapabilityOrigin.NATIVE,
     )
 
-    def __init__(self, store, *, artifact_store=None,
-                 source_policy: SourcePolicy | None = None,
-                 host_resolver=None, discovery_provider=None) -> None:
+    def __init__(
+        self,
+        store,
+        *,
+        artifact_store=None,
+        source_policy: SourcePolicy | None = None,
+        host_resolver=None,
+        discovery_provider=None,
+    ) -> None:
         self._store = store
         self._artifacts = artifact_store
         self._source_policy = source_policy or SourcePolicy()
@@ -245,7 +282,10 @@ class ResearchCapability:
         seen: set[str] = set()
 
         for hit in await self._search_content(
-            query, task_id=request.task_id, project_id=project_id, limit=limit,
+            query,
+            task_id=request.task_id,
+            project_id=project_id,
+            limit=limit,
         ):
             source = hit.get("source") if isinstance(hit, Mapping) else None
             if not isinstance(source, Mapping):
@@ -256,20 +296,24 @@ class ResearchCapability:
             if not key or key in seen:
                 continue
             seen.add(key)
-            candidates.append({
-                "uri": uri,
-                "source_id": source_id or None,
-                "title": str(source.get("title") or ""),
-                "source_type": str(source.get("source_type") or ""),
-                "snippet": str(hit.get("snippet") or "")[:2000],
-                "origin": "local_corpus",
-            })
+            candidates.append(
+                {
+                    "uri": uri,
+                    "source_id": source_id or None,
+                    "title": str(source.get("title") or ""),
+                    "source_type": str(source.get("source_type") or ""),
+                    "snippet": str(hit.get("snippet") or "")[:2000],
+                    "origin": "local_corpus",
+                }
+            )
 
         list_sources = getattr(self._store, "list_sources", None)
         if callable(list_sources) and len(candidates) < limit:
             sources = await list_sources(
-                task_id=request.task_id, project_id=project_id,
-                query=query, limit=limit,
+                task_id=request.task_id,
+                project_id=project_id,
+                query=query,
+                limit=limit,
             )
             for source in sources:
                 record = source.to_record() if hasattr(source, "to_record") else source
@@ -281,14 +325,16 @@ class ResearchCapability:
                 if not key or key in seen:
                     continue
                 seen.add(key)
-                candidates.append({
-                    "uri": uri,
-                    "source_id": source_id or None,
-                    "title": str(record.get("title") or ""),
-                    "source_type": str(record.get("source_type") or ""),
-                    "snippet": "",
-                    "origin": "local_catalog",
-                })
+                candidates.append(
+                    {
+                        "uri": uri,
+                        "source_id": source_id or None,
+                        "title": str(record.get("title") or ""),
+                        "source_type": str(record.get("source_type") or ""),
+                        "snippet": "",
+                        "origin": "local_catalog",
+                    }
+                )
                 if len(candidates) >= limit:
                     break
 
@@ -299,8 +345,11 @@ class ResearchCapability:
             if getattr(network_policy, "value", network_policy) == "deny":
                 return _result(request, ok=False, error="network denied by workspace policy")
             provided = provider(
-                query=query, limit=limit, task_id=request.task_id,
-                project_id=project_id, context=context,
+                query=query,
+                limit=limit,
+                task_id=request.task_id,
+                project_id=project_id,
+                context=context,
             )
             if asyncio.iscoroutine(provided):
                 provided = await provided
@@ -319,23 +368,30 @@ class ResearchCapability:
                 if canonical in seen:
                     continue
                 seen.add(canonical)
-                candidates.append({
-                    "uri": canonical,
-                    "title": str(item.get("title") or "")[:1000],
-                    "source_type": str(item.get("source_type") or "web"),
-                    "snippet": str(item.get("snippet") or "")[:2000],
-                    "origin": "configured_provider",
-                })
+                candidates.append(
+                    {
+                        "uri": canonical,
+                        "title": str(item.get("title") or "")[:1000],
+                        "source_type": str(item.get("source_type") or "web"),
+                        "snippet": str(item.get("snippet") or "")[:2000],
+                        "origin": "configured_provider",
+                    }
+                )
                 if len(candidates) >= limit:
                     break
 
-        return _result(request, output=_json({
-            "query": query,
-            "candidates": candidates[:limit],
-            "provider": "configured" if provider is not None else "local_corpus",
-            "network_used": provider is not None,
-            "rejected": rejected[:limit],
-        }))
+        return _result(
+            request,
+            output=_json(
+                {
+                    "query": query,
+                    "candidates": candidates[:limit],
+                    "provider": "configured" if provider is not None else "local_corpus",
+                    "network_used": provider is not None,
+                    "rejected": rejected[:limit],
+                }
+            ),
+        )
 
     async def _fetch(self, request, args, context) -> CapabilityResult:
         """Fetch one allowlisted source and persist its immutable snapshot.
@@ -350,12 +406,11 @@ class ResearchCapability:
         canonical = self._source_policy.check(str(args.get("uri") or ""))
         if canonical.startswith("artifact://"):
             return _result(
-                request, ok=False,
+                request,
+                ok=False,
                 error="fetch accepts http/https; use record_source for artifacts",
             )
-        network_policy = getattr(
-            getattr(context, "workspace", None), "network_policy", None
-        )
+        network_policy = getattr(getattr(context, "workspace", None), "network_policy", None)
         if getattr(network_policy, "value", network_policy) == "deny":
             return _result(request, ok=False, error="network denied by workspace policy")
         if self._artifacts is None:
@@ -368,8 +423,7 @@ class ResearchCapability:
         try:
             infos = await loop.run_in_executor(
                 None,
-                lambda: self._host_resolver(
-                    host, port, type=socket.SOCK_STREAM),
+                lambda: self._host_resolver(host, port, type=socket.SOCK_STREAM),
             )
             addresses = [str(info[4][0]) for info in infos]
             resolved_addresses = self._source_policy.check_resolved(host, addresses)
@@ -384,34 +438,42 @@ class ResearchCapability:
         size = 0
         try:
             transport = pinned_async_transport(host, resolved_addresses)
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=False,
-                trust_env=False,
-                headers={"User-Agent": "Athena-Research/1"},
-                transport=transport,
-            ) as client, client.stream("GET", canonical) as response:
-                    if response.status_code >= 300:
-                        location = response.headers.get("location")
-                        suffix = f" location={location}" if location else ""
+            async with (
+                httpx.AsyncClient(
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
+                    headers={"User-Agent": "Athena-Research/1"},
+                    transport=transport,
+                ) as client,
+                client.stream("GET", canonical) as response,
+            ):
+                if response.status_code >= 300:
+                    location = response.headers.get("location")
+                    suffix = f" location={location}" if location else ""
+                    return _result(
+                        request,
+                        ok=False,
+                        error=f"source fetch returned HTTP {response.status_code}{suffix}",
+                        metadata={"status_code": response.status_code},
+                    )
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
                         return _result(
-                            request, ok=False,
-                            error=f"source fetch returned HTTP {response.status_code}{suffix}",
+                            request,
+                            ok=False,
+                            error=f"source exceeds max_bytes={max_bytes}",
                             metadata={"status_code": response.status_code},
                         )
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > max_bytes:
-                            return _result(
-                                request, ok=False,
-                                error=f"source exceeds max_bytes={max_bytes}",
-                                metadata={"status_code": response.status_code},
-                            )
-                        chunks.append(chunk)
-                    media_type = response.headers.get(
-                        "content-type", "application/octet-stream"
-                    ).split(";", 1)[0].strip() or "application/octet-stream"
-                    status_code = response.status_code
+                    chunks.append(chunk)
+                media_type = (
+                    response.headers.get("content-type", "application/octet-stream")
+                    .split(";", 1)[0]
+                    .strip()
+                    or "application/octet-stream"
+                )
+                status_code = response.status_code
         except httpx.HTTPError as exc:
             return _result(request, ok=False, error=f"source fetch failed: {exc}")
 
@@ -463,7 +525,8 @@ class ResearchCapability:
         snapshot: bytes | str | None = None
         if content is not None and artifact_uri is not None:
             return _result(
-                request, ok=False,
+                request,
+                ok=False,
                 error="provide source content or artifact_uri, not both",
             )
         if content is not None:
@@ -486,7 +549,9 @@ class ResearchCapability:
             if parse_artifact_uri(str(artifact_uri)) is None:
                 return _result(request, ok=False, error="artifact_uri is not an artifact URI")
             if not await _artifact_visible(self._artifacts, str(artifact_uri), request.task_id):
-                return _result(request, ok=False, error="artifact snapshot is not visible to this task")
+                return _result(
+                    request, ok=False, error="artifact snapshot is not visible to this task"
+                )
             loaded_snapshot = await self._artifacts.load(str(artifact_uri))
             if not isinstance(loaded_snapshot, bytes):
                 return _result(request, ok=False, error="artifact snapshot is not bytes")
@@ -530,12 +595,16 @@ class ResearchCapability:
             return _result(request, ok=False, error="search requires query")
         workspace_id = getattr(getattr(context, "workspace", None), "id", None)
         sources = await self._store.list_sources(
-            task_id=request.task_id, project_id=workspace_id,
-            query=query, limit=int(args.get("limit") or 50),
+            task_id=request.task_id,
+            project_id=workspace_id,
+            query=query,
+            limit=int(args.get("limit") or 50),
         )
         evidence = await self._store.list_evidence(
-            task_id=request.task_id, project_id=workspace_id,
-            query=query, limit=int(args.get("limit") or 50),
+            task_id=request.task_id,
+            project_id=workspace_id,
+            query=query,
+            limit=int(args.get("limit") or 50),
         )
         content_hits = await self._search_content(
             query,
@@ -543,12 +612,17 @@ class ResearchCapability:
             project_id=workspace_id,
             limit=int(args.get("limit") or 50),
         )
-        return _result(request, output=_json({
-            "query": query,
-            "sources": [source.to_record() for source in sources],
-            "evidence": [item.to_record() for item in evidence],
-            "content_hits": content_hits,
-        }))
+        return _result(
+            request,
+            output=_json(
+                {
+                    "query": query,
+                    "sources": [source.to_record() for source in sources],
+                    "evidence": [item.to_record() for item in evidence],
+                    "content_hits": content_hits,
+                }
+            ),
+        )
 
     async def _search_content(
         self,
@@ -580,18 +654,23 @@ class ResearchCapability:
         # private source. Apply the same rule to relation targets below.
         if not _source_visible(source, request, context):
             return _result(request, ok=False, error=f"unknown source: {source_id}")
-        related_ids = tuple(args.get("corroborates") or ()) + tuple(
-            args.get("contradicts") or ()
-        )
+        related_ids = tuple(args.get("corroborates") or ()) + tuple(args.get("contradicts") or ())
         for related_id in related_ids:
             related = await self._store.get_evidence(str(related_id))
             if related is None or not await _evidence_visible(
                 related, request, context, self._store.get_source
             ):
                 return _result(
-                    request, ok=False,
+                    request,
+                    ok=False,
                     error=f"related evidence is not visible: {related_id}",
                 )
+        metadata = dict(args.get("metadata") or {})
+        receipt = args.get("receipt")
+        if receipt is not None:
+            if not isinstance(receipt, Mapping):
+                return _result(request, ok=False, error="receipt must be an object")
+            metadata["receipt"] = dict(receipt)
         evidence = EvidenceObject.for_content(
             source_id=source_id,
             extracted_claim=str(args.get("claim") or ""),
@@ -607,7 +686,7 @@ class ResearchCapability:
             claim_id=args.get("claim_id"),
             corroborates=tuple(args.get("corroborates") or ()),
             contradicts=tuple(args.get("contradicts") or ()),
-            metadata=args.get("metadata") or {},
+            metadata=metadata,
         )
         await self._store.save_evidence(evidence)
         return _result(request, output=_json({"evidence": evidence.to_record()}))
@@ -627,9 +706,11 @@ class ResearchCapability:
         if not request.task_id:
             return _result(request, ok=False, error="record_gap requires a task")
         gap = ResearchGap.create(
-            str(args.get("objective") or ""), str(args.get("question") or ""),
+            str(args.get("objective") or ""),
+            str(args.get("question") or ""),
             kind=str(args.get("kind") or "unsupported_claim"),
-            required=bool(args.get("required", True)), task_id=request.task_id,
+            required=bool(args.get("required", True)),
+            task_id=request.task_id,
             metadata=args.get("metadata") or {},
         )
         await self._store.save_gap(gap)
@@ -655,12 +736,13 @@ class ResearchCapability:
                 evidence, request, context, self._store.get_source
             ):
                 return _result(
-                    request, ok=False,
+                    request,
+                    ok=False,
                     error=f"evidence is not visible: {evidence_id}",
                 )
         gap = await self._store.close_gap(
-            gap_id, evidence_ids=tuple(args.get("evidence_ids") or ()),
-            task_id=request.task_id)
+            gap_id, evidence_ids=tuple(args.get("evidence_ids") or ()), task_id=request.task_id
+        )
         if gap is None:
             return _result(request, ok=False, error=f"unknown gap: {gap_id}")
         return _result(request, output=_json({"gap": gap.to_record()}))
@@ -680,11 +762,16 @@ class ResearchCapability:
         ):
             return _result(request, ok=False, error=f"unknown evidence: {evidence_id}")
         verification = await self._verify_evidence(evidence, source)
-        return _result(request, output=_json({
-            **verification,
-            "evidence_id": evidence.id,
-            "source_id": source.id,
-        }))
+        return _result(
+            request,
+            output=_json(
+                {
+                    **verification,
+                    "evidence_id": evidence.id,
+                    "source_id": source.id,
+                }
+            ),
+        )
 
     async def _plan(self, request, args, context) -> CapabilityResult:
         """Persist a bounded research plan and retrieve local candidates.
@@ -708,9 +795,12 @@ class ResearchCapability:
             "requirements": raw_requirements,
             "queries": global_queries,
         }
-        plan_id = "plan_" + hashlib.sha256(
-            json.dumps(plan_input, sort_keys=True, separators=(",", ":"), default=str).encode()
-        ).hexdigest()[:24]
+        plan_id = (
+            "plan_"
+            + hashlib.sha256(
+                json.dumps(plan_input, sort_keys=True, separators=(",", ":"), default=str).encode()
+            ).hexdigest()[:24]
+        )
         planned: list[dict[str, Any]] = []
         for index, raw in enumerate(raw_requirements):
             if not isinstance(raw, Mapping):
@@ -729,7 +819,8 @@ class ResearchCapability:
                 "queries": queries,
             }
             gap = ResearchGap.create(
-                objective, question,
+                objective,
+                question,
                 kind=str(raw.get("kind") or args.get("kind") or "unsupported_claim"),
                 required=bool(raw.get("required", True)),
                 task_id=request.task_id,
@@ -738,26 +829,35 @@ class ResearchCapability:
             await self._store.save_gap(gap)
             candidates: list[dict[str, Any]] = []
             for query in queries:
-                candidates.extend(await self._search_content(
-                    query,
-                    task_id=request.task_id,
-                    project_id=getattr(getattr(context, "workspace", None), "id", None),
-                    limit=5,
-                ))
-            planned.append({
-                "id": requirement_id,
-                "claim_id": claim_id,
-                "question": question,
-                "gap": gap.to_record(),
-                "queries": queries,
-                "candidate_count": len(candidates),
-                "candidates": _unique_candidates(candidates),
-            })
-        return _result(request, output=_json({
-            "plan_id": plan_id,
-            "objective": objective,
-            "requirements": planned,
-        }))
+                candidates.extend(
+                    await self._search_content(
+                        query,
+                        task_id=request.task_id,
+                        project_id=getattr(getattr(context, "workspace", None), "id", None),
+                        limit=5,
+                    )
+                )
+            planned.append(
+                {
+                    "id": requirement_id,
+                    "claim_id": claim_id,
+                    "question": question,
+                    "gap": gap.to_record(),
+                    "queries": queries,
+                    "candidate_count": len(candidates),
+                    "candidates": _unique_candidates(candidates),
+                }
+            )
+        return _result(
+            request,
+            output=_json(
+                {
+                    "plan_id": plan_id,
+                    "objective": objective,
+                    "requirements": planned,
+                }
+            ),
+        )
 
     async def _assess(self, request, args, context) -> CapabilityResult:
         """Assess captured evidence and close only durably verified gaps."""
@@ -769,7 +869,9 @@ class ResearchCapability:
         workspace_id = getattr(getattr(context, "workspace", None), "id", None)
         gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
         evidence = await self._store.list_evidence(
-            task_id=request.task_id, project_id=workspace_id, limit=200,
+            task_id=request.task_id,
+            project_id=workspace_id,
+            limit=200,
         )
         visible: list[EvidenceObject] = []
         for item in evidence:
@@ -785,7 +887,8 @@ class ResearchCapability:
             requirement_id = str(metadata.get("requirement_id") or "")
             claim_id = str(metadata.get("claim_id") or "")
             candidates = [
-                item for item in visible
+                item
+                for item in visible
                 if (
                     (requested_evidence and item.id in requested_evidence)
                     or (requested_claims and item.claim_id in requested_claims)
@@ -797,13 +900,16 @@ class ResearchCapability:
             for item in candidates:
                 source = await self._store.get_source(item.source_id)
                 if source is not None:
-                    checks.append({
-                        "evidence_id": item.id,
-                        **await self._verify_evidence(item, source),
-                    })
+                    checks.append(
+                        {
+                            "evidence_id": item.id,
+                            **await self._verify_evidence(item, source),
+                        }
+                    )
             candidate_ids = {item.id for item in candidates}
             conflicts = [
-                item.id for item in candidates
+                item.id
+                for item in candidates
                 if any(
                     related_id in candidate_ids
                     or (
@@ -815,17 +921,24 @@ class ResearchCapability:
                 )
             ]
             verified = [
-                check["evidence_id"] for check in checks
-                if check.get("status") == "verified"
+                check["evidence_id"] for check in checks if check.get("status") == "verified"
             ]
-            can_close = bool(candidates) and bool(verified) and not conflicts and all(
-                check.get("status") == "verified" for check in checks
+            can_close = (
+                bool(candidates)
+                and bool(verified)
+                and not conflicts
+                and all(check.get("status") == "verified" for check in checks)
             )
             updated = gap
             if gap.status == "OPEN" and can_close:
-                updated = await self._store.close_gap(
-                    gap.id, evidence_ids=tuple(verified), task_id=request.task_id,
-                ) or gap
+                updated = (
+                    await self._store.close_gap(
+                        gap.id,
+                        evidence_ids=tuple(verified),
+                        task_id=request.task_id,
+                    )
+                    or gap
+                )
             record = updated.to_record()
             record["assessment"] = {
                 "candidate_evidence_ids": [item.id for item in candidates],
@@ -836,14 +949,20 @@ class ResearchCapability:
             }
             assessed.append(record)
         required_open = [
-            record["id"] for record in assessed
+            record["id"]
+            for record in assessed
             if record.get("required", True) and record.get("status") != "CLOSED"
         ]
-        return _result(request, output=_json({
-            "ready": not required_open,
-            "required_open_gaps": required_open,
-            "gaps": assessed,
-        }))
+        return _result(
+            request,
+            output=_json(
+                {
+                    "ready": not required_open,
+                    "required_open_gaps": required_open,
+                    "gaps": assessed,
+                }
+            ),
+        )
 
     async def _bundle(self, request, args, context) -> CapabilityResult:
         """Return a bounded, task-scoped research packet for synthesis/judgment."""
@@ -852,10 +971,14 @@ class ResearchCapability:
         workspace_id = getattr(getattr(context, "workspace", None), "id", None)
         limit = int(args.get("limit") or 50)
         sources = await self._store.list_sources(
-            task_id=request.task_id, project_id=workspace_id, limit=limit,
+            task_id=request.task_id,
+            project_id=workspace_id,
+            limit=limit,
         )
         evidence = await self._store.list_evidence(
-            task_id=request.task_id, project_id=workspace_id, limit=limit,
+            task_id=request.task_id,
+            project_id=workspace_id,
+            limit=limit,
         )
         gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
         required_open = [gap.id for gap in gaps if gap.required and gap.status != "CLOSED"]
@@ -869,17 +992,26 @@ class ResearchCapability:
             for evidence_id in gap.evidence_ids:
                 item = await self._store.get_evidence(evidence_id)
                 source = await self._store.get_source(item.source_id) if item else None
-                if item is None or source is None or (await self._verify_evidence(item, source))["status"] != "verified":
+                if (
+                    item is None
+                    or source is None
+                    or (await self._verify_evidence(item, source))["status"] != "verified"
+                ):
                     unverified_closed.append(gap.id)
                     break
-        return _result(request, output=_json({
-            "ready": not required_open and not unverified_closed,
-            "required_open_gaps": required_open,
-            "unverified_closed_gaps": unverified_closed,
-            "sources": [source.to_record() for source in sources],
-            "evidence": [item.to_record() for item in evidence],
-            "gaps": [gap.to_record() for gap in gaps],
-        }))
+        return _result(
+            request,
+            output=_json(
+                {
+                    "ready": not required_open and not unverified_closed,
+                    "required_open_gaps": required_open,
+                    "unverified_closed_gaps": unverified_closed,
+                    "sources": [source.to_record() for source in sources],
+                    "evidence": [item.to_record() for item in evidence],
+                    "gaps": [gap.to_record() for gap in gaps],
+                }
+            ),
+        )
 
     async def _run(self, request, args, context) -> CapabilityResult:
         """Run one bounded, explicit research workflow.
@@ -900,12 +1032,14 @@ class ResearchCapability:
         raw_requirements = args.get("requirements")
         if not isinstance(raw_requirements, list) or not raw_requirements:
             queries = _strings(args.get("queries"), limit=10)
-            raw_requirements = [{
-                "id": "objective",
-                "claim_id": "research-objective",
-                "question": objective,
-                "queries": queries or [objective],
-            }]
+            raw_requirements = [
+                {
+                    "id": "objective",
+                    "claim_id": "research-objective",
+                    "question": objective,
+                    "queries": queries or [objective],
+                }
+            ]
 
         plan_result = await self._plan(
             request,
@@ -929,7 +1063,9 @@ class ResearchCapability:
         if isinstance(source_specs, list):
             for index, raw_spec in enumerate(source_specs[:10]):
                 if not isinstance(raw_spec, Mapping):
-                    capture_errors.append({"index": index, "error": "source spec must be an object"})
+                    capture_errors.append(
+                        {"index": index, "error": "source spec must be an object"}
+                    )
                     continue
                 spec = dict(raw_spec)
                 source_result = (
@@ -938,11 +1074,13 @@ class ResearchCapability:
                     else await self._fetch(request, spec, context)
                 )
                 if source_result.status is not CapabilityResultStatus.OK:
-                    capture_errors.append({
-                        "index": index,
-                        "uri": spec.get("uri"),
-                        "error": source_result.error or "source capture failed",
-                    })
+                    capture_errors.append(
+                        {
+                            "index": index,
+                            "uri": spec.get("uri"),
+                            "error": source_result.error or "source capture failed",
+                        }
+                    )
                     continue
                 payload = _decode_object(source_result.output)
                 source = payload.get("source")
@@ -962,14 +1100,14 @@ class ResearchCapability:
                 request, {"query": query, "limit": int(args.get("limit") or 50)}, context
             )
             if search_result.status is not CapabilityResultStatus.OK:
-                search_errors.append({"query": query, "error": search_result.error or "search failed"})
+                search_errors.append(
+                    {"query": query, "error": search_result.error or "search failed"}
+                )
                 continue
             search_results.append({"query": query, **_decode_object(search_result.output)})
 
         sources_by_id: dict[str, Mapping[str, Any]] = {
-            str(source["id"]): source
-            for source in captures
-            if source.get("id")
+            str(source["id"]): source for source in captures if source.get("id")
         }
         for source in await self._store.list_sources(
             task_id=request.task_id,
@@ -989,27 +1127,34 @@ class ResearchCapability:
         if isinstance(extractions, list):
             for index, raw_extraction in enumerate(extractions[:100]):
                 if not isinstance(raw_extraction, Mapping):
-                    evidence_errors.append({"index": index, "error": "extraction must be an object"})
+                    evidence_errors.append(
+                        {"index": index, "error": "extraction must be an object"}
+                    )
                     continue
                 extraction = dict(raw_extraction)
                 source_id = str(extraction.get("source_id") or "")
                 if not source_id and extraction.get("uri"):
                     try:
-                        source_id = str(sources_by_uri[canonicalize_uri(str(extraction["uri"]))]["id"])
+                        source_id = str(
+                            sources_by_uri[canonicalize_uri(str(extraction["uri"]))]["id"]
+                        )
                     except (KeyError, SourcePolicyError):
                         source_id = ""
                 evidence_args = {
-                    key: value for key, value in extraction.items()
+                    key: value
+                    for key, value in extraction.items()
                     if key not in {"source_id", "uri"}
                 }
                 evidence_args.update({"source_id": source_id, "operation": "record_evidence"})
                 evidence_result = await self._record_evidence(request, evidence_args, context)
                 if evidence_result.status is not CapabilityResultStatus.OK:
-                    evidence_errors.append({
-                        "index": index,
-                        "source_id": source_id,
-                        "error": evidence_result.error or "evidence recording failed",
-                    })
+                    evidence_errors.append(
+                        {
+                            "index": index,
+                            "source_id": source_id,
+                            "error": evidence_result.error or "evidence recording failed",
+                        }
+                    )
                     continue
                 evidence = _decode_object(evidence_result.output).get("evidence")
                 if isinstance(evidence, Mapping):
@@ -1020,35 +1165,50 @@ class ResearchCapability:
             {"gap_ids": gap_ids},
             context,
         )
-        assessed = _decode_object(assessed_result.output) if assessed_result.status is CapabilityResultStatus.OK else {
-            "ready": False,
-            "error": assessed_result.error or "research assessment failed",
-        }
+        assessed = (
+            _decode_object(assessed_result.output)
+            if assessed_result.status is CapabilityResultStatus.OK
+            else {
+                "ready": False,
+                "error": assessed_result.error or "research assessment failed",
+            }
+        )
         bundle_result = await self._bundle(request, {"limit": args.get("limit")}, context)
-        bundle = _decode_object(bundle_result.output) if bundle_result.status is CapabilityResultStatus.OK else {
-            "ready": False,
-            "error": bundle_result.error or "research bundle failed",
-        }
+        bundle = (
+            _decode_object(bundle_result.output)
+            if bundle_result.status is CapabilityResultStatus.OK
+            else {
+                "ready": False,
+                "error": bundle_result.error or "research bundle failed",
+            }
+        )
         ready = bool(bundle.get("ready")) and not (
             capture_errors or search_errors or evidence_errors
         )
-        return _result(request, output=_json({
-            "workflow": "bounded-research",
-            "objective": objective,
-            "plan": plan,
-            "captures": captures,
-            "capture_errors": capture_errors,
-            "search": search_results,
-            "search_errors": search_errors,
-            "evidence": evidence_records,
-            "evidence_errors": evidence_errors,
-            "assessment": assessed,
-            "bundle": bundle,
-            "ready": ready,
-        }))
+        return _result(
+            request,
+            output=_json(
+                {
+                    "workflow": "bounded-research",
+                    "objective": objective,
+                    "plan": plan,
+                    "captures": captures,
+                    "capture_errors": capture_errors,
+                    "search": search_results,
+                    "search_errors": search_errors,
+                    "evidence": evidence_records,
+                    "evidence_errors": evidence_errors,
+                    "assessment": assessed,
+                    "bundle": bundle,
+                    "ready": ready,
+                }
+            ),
+        )
 
     async def _verify_evidence(
-        self, evidence: EvidenceObject, source: SourceRecord,
+        self,
+        evidence: EvidenceObject,
+        source: SourceRecord,
     ) -> dict[str, Any]:
         if not source.artifact_uri or self._artifacts is None:
             return {"status": "unverified", "reason": "source snapshot not captured"}
@@ -1056,11 +1216,72 @@ class ResearchCapability:
         content_hash = hashlib.sha256(content).hexdigest()
         hash_matches = not source.content_hash or content_hash == source.content_hash
         found = hash_matches and evidence.exact_supporting_excerpt.encode("utf-8") in content
-        return {
+        result: dict[str, Any] = {
             "status": "verified" if found else "invalid",
             "content_hash": content_hash,
             "hash_matches": hash_matches,
         }
+        if not found:
+            return result
+
+        # Structured evidence is still evidence only when its receipt is
+        # internally coherent.  The source hash/excerpt check above proves
+        # the captured bytes; these checks prove that a measurement or
+        # execution claim has the fields needed for replay/review.
+        if evidence.evidence_type in {
+            "execution",
+            "measurement",
+            "observation",
+            "derivation",
+        }:
+            receipt = evidence.metadata.get("receipt")
+            structured = _verify_receipt(evidence.evidence_type, receipt)
+            result["receipt"] = structured
+            if structured["status"] != "verified":
+                result["status"] = "invalid"
+        return result
+
+
+def _verify_receipt(evidence_type: str, receipt: Any) -> dict[str, Any]:
+    """Validate the minimum replay boundary for structured evidence."""
+    if not isinstance(receipt, Mapping):
+        return {"status": "unverified", "reason": "structured receipt is missing"}
+    required: dict[str, tuple[str, ...]] = {
+        "execution": ("capability_id", "input_hash", "environment_fingerprint"),
+        "measurement": ("value", "unit", "observed_at", "environment_fingerprint"),
+        "observation": ("observation", "observed_at", "environment_fingerprint"),
+        "derivation": ("inputs", "derivation", "environment_fingerprint"),
+    }
+    missing = [
+        field
+        for field in required.get(evidence_type, ())
+        if field not in receipt or receipt[field] in (None, "", [])
+    ]
+    if missing:
+        return {"status": "invalid", "missing": missing}
+    if evidence_type == "execution":
+        exit_code = receipt.get("exit_code")
+        ok = receipt.get("ok")
+        status = str(receipt.get("status") or "").casefold()
+        if (
+            exit_code not in (None, 0)
+            or ok is False
+            or status
+            in {
+                "failed",
+                "error",
+                "cancelled",
+            }
+        ):
+            return {
+                "status": "invalid",
+                "reason": "execution receipt does not show a successful exit",
+            }
+    return {
+        "status": "verified",
+        "evidence_type": evidence_type,
+        "fields": sorted(str(key) for key in receipt),
+    }
 
 
 def _json(value: Any) -> str:
@@ -1126,7 +1347,8 @@ async def _index_snapshot(
         if not (
             media.startswith("text/")
             or media.endswith(("+json", "+xml"))
-            or media in {
+            or media
+            in {
                 "application/json",
                 "application/xml",
                 "application/javascript",
@@ -1146,8 +1368,14 @@ async def _index_snapshot(
     )
 
 
-def _result(request, *, ok: bool = True, output: str = "",
-            error: str | None = None, metadata: dict[str, Any] | None = None):
+def _result(
+    request,
+    *,
+    ok: bool = True,
+    output: str = "",
+    error: str | None = None,
+    metadata: dict[str, Any] | None = None,
+):
     return CapabilityResult(
         request.call_id,
         request.capability_id,
@@ -1158,8 +1386,7 @@ def _result(request, *, ok: bool = True, output: str = "",
     )
 
 
-def _source_visible(source: SourceRecord, request: CapabilityRequest,
-                    context: Any) -> bool:
+def _source_visible(source: SourceRecord, request: CapabilityRequest, context: Any) -> bool:
     """Return whether a source belongs to this task or its project overlay."""
     if source.task_id == request.task_id:
         return True

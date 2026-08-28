@@ -4,6 +4,7 @@ A service stopped before a task completes must leave the task INTERRUPTED,
 never CANCELLED or lost; a QUEUED task must survive restart. All of these use
 a real (file-backed) DB so state persists across the simulated crash.
 """
+
 from __future__ import annotations
 import pytest
 
@@ -12,11 +13,15 @@ from athena.state.database import Database
 
 
 _SLEEP_SCRIPT = (
-    {"match": {"user_contains": "SLEEPLONG"},
-     "respond": {"capability_call": {
-         "capability_id": "execute",
-         "arguments": {"language": "sh", "code": "sleep 30"},
-     }}},
+    {
+        "match": {"user_contains": "SLEEPLONG"},
+        "respond": {
+            "capability_call": {
+                "capability_id": "execute",
+                "arguments": {"language": "sh", "code": "sleep 30"},
+            }
+        },
+    },
 )
 
 
@@ -43,9 +48,7 @@ async def _read_task(db_path, task_id) -> dict:
 @pytest.mark.athena_claim("BHV-080")
 @pytest.mark.athena_evidence("test", "e2e")
 @pytest.mark.athena_scenario("RECOVERY-002")
-async def test_running_task_becomes_interrupted_on_hard_stop(
-    make_durable_service, durable_db_path
-):
+async def test_running_task_becomes_interrupted_on_hard_stop(make_durable_service, durable_db_path):
     """A RUNNING task is INTERRUPTED (not CANCELLED, not lost) on restart."""
     svc1 = await make_durable_service(durable_db_path, scripts=_SLEEP_SCRIPT)
     task = await svc1.submit(
@@ -127,7 +130,8 @@ async def test_mutation_intent_wal_survives_crash(make_durable_service, durable_
     # Restart on the same DB: recovery reconciles both intents.
     svc2 = await make_durable_service(durable_db_path, scripts=None)
     tables = await svc2._db.fetch_all(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='mutations'")
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='mutations'"
+    )
     assert tables, "mutations WAL table missing after restart"
     rows = await svc2._store_mutations.list_for_task(task.id)
     by_id = {r["id"]: r for r in rows}
@@ -136,14 +140,12 @@ async def test_mutation_intent_wal_survives_crash(make_durable_service, durable_
 
     planned_row = by_id[planned_id]
     assert planned_row["status"] == MUT_FAILED, (
-        f"PLANNED intent should be reconciled to FAILED, got "
-        f"{planned_row['status']!r}"
+        f"PLANNED intent should be reconciled to FAILED, got {planned_row['status']!r}"
     )
     assert planned_row["resource"] == "crash-probe.txt"
     assert planned_row["metadata"]["capability_id"] == "fs"
 
     started_row = by_id[started_id]
     assert started_row["status"] == RECOVERY_REQUIRED, (
-        f"STARTED intent should be reconciled to RECOVERY_REQUIRED, got "
-        f"{started_row['status']!r}"
+        f"STARTED intent should be reconciled to RECOVERY_REQUIRED, got {started_row['status']!r}"
     )

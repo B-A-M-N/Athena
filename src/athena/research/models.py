@@ -160,8 +160,11 @@ class EvidenceObject:
     ) -> EvidenceObject:
         return cls(
             id=_stable_id(
-                "evidence", source_id, extracted_claim,
-                exact_supporting_excerpt, json.dumps(dict(locator or {}), sort_keys=True),
+                "evidence",
+                source_id,
+                extracted_claim,
+                exact_supporting_excerpt,
+                json.dumps(dict(locator or {}), sort_keys=True),
             ),
             source_id=source_id,
             extracted_claim=extracted_claim,

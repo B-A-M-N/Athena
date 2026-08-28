@@ -41,6 +41,7 @@ Task = TaskSpec
 
 def _deserialize(row: dict[str, Any]) -> TaskSpec:
     from athena.kernel.lifecycle import deserialize_task
+
     return deserialize_task(row)
 
 
@@ -253,6 +254,7 @@ class TaskManager:
         evidence: tuple = (),
         artifacts: tuple = (),
         mutations: tuple = (),
+        _allow_recovery_completion: bool = False,
     ) -> TaskResult:
         task_id = task.id if isinstance(task, TaskSpec) else str(task)
         resolved = await self.get(task_id)
@@ -285,7 +287,12 @@ class TaskManager:
         # leave a terminal task with no result. Events are append-only side
         # effects emitted after commit.
         try:
-            await self._finalize_atomically(task_id, status, result)
+            await self._finalize_atomically(
+                task_id,
+                status,
+                result,
+                allow_recovery_completion=_allow_recovery_completion,
+            )
 
             self._running_emitted.discard(task_id)
 
@@ -330,7 +337,12 @@ class TaskManager:
             await asyncio.wait_for(barrier.wait(), timeout=max(float(timeout), 0.0))
 
     async def _finalize_atomically(
-        self, task_id: str, status: TaskStatus, result: TaskResult
+        self,
+        task_id: str,
+        status: TaskStatus,
+        result: TaskResult,
+        *,
+        allow_recovery_completion: bool = False,
     ) -> None:
         usage = {
             "input_tokens": result.usage.input_tokens,
@@ -351,6 +363,7 @@ class TaskManager:
             mutations=[_mut(e) for e in result.mutations],
             unresolved=list(result.unresolved),
             usage=usage,
+            allow_recovery_completion=allow_recovery_completion,
         )
 
     async def get_result(self, task_id: str) -> TaskResult | None:
@@ -394,9 +407,16 @@ class TaskManager:
     async def _emit(self, task: Task, status: TaskStatus) -> None:
         if self._events is None:
             return
+        payload: dict[str, Any] = {"status": status.value}
+        # Scheduler event triggers are durable observations. Preserve the
+        # bounded trigger envelope on the task lifecycle event so the task's
+        # world-state view can explain what caused this maintenance run.
+        trigger_event = (task.metadata or {}).get("_trigger_event")
+        if isinstance(trigger_event, dict):
+            payload["trigger_event"] = dict(trigger_event)
         await self._events.append_event(
             _event_type(status),
-            {"status": status.value},
+            payload,
             task_id=task.id,
             session_id=task.session_id,
         )
@@ -438,7 +458,9 @@ def _art(a: Any) -> dict:
 
 def _mut(m: Any) -> dict:
     return {
-        "id": m.id, "resource": m.resource, "operation": m.operation,
+        "id": m.id,
+        "resource": m.resource,
+        "operation": m.operation,
         "reversible": m.reversible,
     }
 
@@ -452,8 +474,10 @@ def _decode_result(row: dict[str, Any]) -> TaskResult | None:
         return None
     import json as _json
 
-    usage = row["usage"] if isinstance(row.get("usage"), dict) else (
-        _json.loads(row["usage"]) if row.get("usage") else {}
+    usage = (
+        row["usage"]
+        if isinstance(row.get("usage"), dict)
+        else (_json.loads(row["usage"]) if row.get("usage") else {})
     )
     return TaskResult(
         task_id=row["id"],
@@ -462,9 +486,9 @@ def _decode_result(row: dict[str, Any]) -> TaskResult | None:
         evidence=_decode_context_refs(row.get("evidence")),
         artifacts=_decode_artifact_refs(row.get("artifacts")),
         mutations=_decode_mutation_refs(row.get("mutations")),
-        unresolved=tuple(row["unresolved"]) if isinstance(row.get("unresolved"), (list, tuple)) else (
-            tuple(_json.loads(row["unresolved"])) if row.get("unresolved") else ()
-        ),
+        unresolved=tuple(row["unresolved"])
+        if isinstance(row.get("unresolved"), (list, tuple))
+        else (tuple(_json.loads(row["unresolved"])) if row.get("unresolved") else ()),
         usage=UsageSummary(
             input_tokens=int(usage.get("input_tokens", 0)),
             output_tokens=int(usage.get("output_tokens", 0)),
@@ -487,9 +511,13 @@ def _decode_context_refs(raw: Any) -> tuple[ContextRef, ...]:
     except ValueError:
         return ()
     return tuple(
-        ContextRef(kind=i.get("kind", "session"), ref=i.get("ref", ""),
-                   source_id=i.get("source_id"), summary=i.get("summary"),
-                   mime_type=i.get("mime_type"))
+        ContextRef(
+            kind=i.get("kind", "session"),
+            ref=i.get("ref", ""),
+            source_id=i.get("source_id"),
+            summary=i.get("summary"),
+            mime_type=i.get("mime_type"),
+        )
         for i in items
     )
 
@@ -509,12 +537,18 @@ def _decode_artifact_refs(raw: Any) -> tuple:
         if isinstance(i, ArtifactRef):
             out.append(i)
         elif isinstance(i, dict):
-            out.append(ArtifactRef(
-                id=i.get("id", ""), uri=i.get("uri", ""), hash=i.get("hash"),
-                mime_type=i.get("mime_type"), size=i.get("size"),
-                producer=i.get("producer"), task_id=i.get("task_id"),
-                metadata=i.get("metadata") or {},
-            ))
+            out.append(
+                ArtifactRef(
+                    id=i.get("id", ""),
+                    uri=i.get("uri", ""),
+                    hash=i.get("hash"),
+                    mime_type=i.get("mime_type"),
+                    size=i.get("size"),
+                    producer=i.get("producer"),
+                    task_id=i.get("task_id"),
+                    metadata=i.get("metadata") or {},
+                )
+            )
     return tuple(out)
 
 
@@ -529,8 +563,11 @@ def _decode_mutation_refs(raw: Any) -> tuple:
     except ValueError:
         return ()
     return tuple(
-        MutationRef(id=i.get("id", ""), resource=i.get("resource", ""),
-                    operation=i.get("operation", ""),
-                    reversible=bool(i.get("reversible", False)))
+        MutationRef(
+            id=i.get("id", ""),
+            resource=i.get("resource", ""),
+            operation=i.get("operation", ""),
+            reversible=bool(i.get("reversible", False)),
+        )
         for i in items
     )

@@ -29,8 +29,7 @@ def _req(cap="fs", **args) -> CapabilityRequest:
 
 
 def _ws(tmp_path) -> WorkspaceSpec:
-    return WorkspaceSpec(id="w", root=str(tmp_path),
-                         writable=(PathRule(str(tmp_path)),))
+    return WorkspaceSpec(id="w", root=str(tmp_path), writable=(PathRule(str(tmp_path)),))
 
 
 class _FailingStore(MutationStore):
@@ -42,8 +41,10 @@ async def test_dispatcher_inject_stores_into_executor(tmp_path):
     store = MutationStore(Database(":memory:"))
     fs = FilesystemCapability(workspace=_ws(tmp_path))
     dispatcher = CapabilityDispatcher(
-        CapabilityRegistry(), PolicyEngine(AutonomyLevel.AUTONOMOUS),
-        mutation_store=store, artifact_store="fake-artifact-store",
+        CapabilityRegistry(),
+        PolicyEngine(AutonomyLevel.AUTONOMOUS),
+        mutation_store=store,
+        artifact_store="fake-artifact-store",
     )
     dispatcher._inject_stores(fs)
     assert getattr(fs, "mutation_store", None) is store
@@ -56,11 +57,19 @@ class _MutationExecutor:
 
     async def invoke(self, request, *, output_accumulator=None, context=None):
         return CapabilityResult(
-            request.call_id, request.capability_id, CapabilityResultStatus.OK,
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
             output="done",
-            metadata={"mutation": {"resource": "/tmp/x.txt", "operation": "write",
-                                   "before_hash": "b", "after_hash": "a",
-                                   "reversible": True}},
+            metadata={
+                "mutation": {
+                    "resource": "/tmp/x.txt",
+                    "operation": "write",
+                    "before_hash": "b",
+                    "after_hash": "a",
+                    "reversible": True,
+                }
+            },
         )
 
 
@@ -71,7 +80,9 @@ async def test_dispatcher_completion_record_failure_does_not_silently_succeed(tm
         store = _FailingStore(db)
         exec_ = _MutationExecutor(
             CapabilityDescriptor(
-                id="files.modify", description="m", input_schema={"allow_extra": True},
+                id="files.modify",
+                description="m",
+                input_schema={"allow_extra": True},
                 effects=frozenset({EffectClass.READ_LOCAL}),
             )
         )
@@ -81,8 +92,6 @@ async def test_dispatcher_completion_record_failure_does_not_silently_succeed(tm
             reg, PolicyEngine(AutonomyLevel.SUPERVISED), mutation_store=store
         )
         with pytest.raises(RuntimeError):
-            await dispatcher.dispatch(
-                _req(cap="files.modify"), workspace=_ws(tmp_path)
-            )
+            await dispatcher.dispatch(_req(cap="files.modify"), workspace=_ws(tmp_path))
     finally:
         await db.close()

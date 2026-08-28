@@ -119,7 +119,9 @@ class NativeSession:
                     for item in (self.options.criteria or "").split(";")
                     if item.strip()
                 ],
-            } if self.options.criteria else {},
+            }
+            if self.options.criteria
+            else {},
         )
         task = await self.service.submit(request, wait=False)
         task_id = getattr(task, "id", task)

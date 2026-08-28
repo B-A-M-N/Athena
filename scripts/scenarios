@@ -16,7 +16,8 @@ What it does
        4 vhs failure, 5 artifact validation failure. Exit 2 with ``vhs``
        absent from PATH means "skipped" (environment lacks the renderer), not
        a failure.
-3. Writes a JSON manifest to ``--output`` (default ``scenarios-manifest.json``):
+3. Writes a JSON manifest to ``--output`` (default ``scenarios-manifest.json``
+   for an unfiltered run):
 
        {
          "generated_at": "...",
@@ -50,10 +51,10 @@ Honesty rules
 Usage
 -----
     scripts/scenarios                              # all families
-    scripts/scenarios --family SYNTH --family COMPAT
+    scripts/scenarios --family SYNTH --family COMPAT --output /tmp/scm.json
     scripts/scenarios --output /tmp/scm.json
     scripts/scenarios --list                       # registry dump, no runs
-    scripts/scenarios --only SYNTH-001             # single scenario by id
+    scripts/scenarios --only SYNTH-001 --output /tmp/scm.json
 
 Environment
 -----------
@@ -117,19 +118,75 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+def _release_identity() -> dict[str, str | bool]:
+    """Bind evidence to the exact source and interpreter that ran it."""
+
+    def git(*arguments: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", *arguments],
+                cwd=REPO_ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+
+    frozen_source = os.environ.get("ATHENA_FROZEN_SOURCE") == "1"
+    status = "" if frozen_source else git("status", "--porcelain", "--untracked-files=all")
+    runner = _python()
+    try:
+        version = (
+            subprocess.run(
+                [runner, "--version"],
+                cwd=REPO_ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            .stdout.strip()
+            .removeprefix("Python ")
+        )
+    except (OSError, subprocess.SubprocessError):
+        version = "unknown"
+    return {
+        "head_sha": (
+            os.environ.get("ATHENA_RELEASE_SHA", "unknown")
+            if frozen_source
+            else git("rev-parse", "HEAD")
+        ),
+        "dirty": bool(status),
+        "status_digest": __import__("hashlib").sha256(status.encode("utf-8")).hexdigest(),
+        "python": runner,
+        "python_version": version,
+        "platform": sys.platform,
+    }
+
+
 def _run(argv: list[str], *, timeout: float) -> dict:
     """Run one command; return an evidence record with the REAL exit code."""
     started = time.monotonic()
     try:
         proc = subprocess.run(
-            argv, cwd=REPO_ROOT, timeout=timeout, env=_child_env(),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            argv,
+            cwd=REPO_ROOT,
+            timeout=timeout,
+            env=_child_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
         rc, out = proc.returncode, proc.stdout
     except subprocess.TimeoutExpired as exc:
         rc = 124
-        out = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(
-            exc.stdout, bytes) else (exc.stdout or "")
+        out = (
+            (exc.stdout or b"").decode("utf-8", "replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
     except OSError as exc:
         rc = 127
         out = f"{type(exc).__name__}: {exc}"
@@ -144,13 +201,21 @@ def _run(argv: list[str], *, timeout: float) -> dict:
 
 def _run_pytest(nodeids: list[str]) -> dict:
     """Run one pytest invocation over the scenario's node IDs."""
-    argv = [_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider",
-            "--no-header", *nodeids]
+    # Do not pass pytest's ``--no-header`` here.  In this repository's plugin
+    # stack that option can leave the subprocess with no flushed output and
+    # hang otherwise fast scenario tests; the header is irrelevant to the
+    # machine-readable receipt anyway.
+    argv = [_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider", *nodeids]
     started = time.monotonic()
     try:
         proc = subprocess.run(
-            argv, cwd=REPO_ROOT, timeout=1200, env=_child_env(),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            argv,
+            cwd=REPO_ROOT,
+            timeout=1200,
+            env=_child_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
         rc, out = proc.returncode, proc.stdout
     except subprocess.TimeoutExpired:
@@ -182,8 +247,28 @@ def _vhs_probe_skipped(record: dict) -> bool:
     return "vhs not on PATH" in record.get("tail", "")
 
 
-def execute_scenario(sc: Scenario) -> dict:
+def execute_scenario(
+    sc: Scenario,
+    *,
+    identity: dict[str, str | bool],
+    receipt_dir: Path | None = None,
+    resume: bool = False,
+) -> dict:
     """Run one scenario; return its manifest entry with an honest status."""
+    receipt_path = receipt_dir / f"{sc.id}.json" if receipt_dir else None
+    if resume and receipt_path is not None:
+        try:
+            prior = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            prior = None
+        if (
+            isinstance(prior, dict)
+            and prior.get("source_identity") == identity
+            and prior.get("status") in {"passed", "skipped", "missing"}
+        ):
+            prior["resumed"] = True
+            return prior
+
     entry = {
         "scenario": sc.id,
         "family": sc.family,
@@ -192,12 +277,16 @@ def execute_scenario(sc: Scenario) -> dict:
         "status": None,
         "evidence": [],
         "duration_s": 0.0,
+        "source_identity": identity,
     }
     if sc.notes:
         entry["notes"] = sc.notes
 
     if sc.status == "MISSING":
         entry["status"] = "missing"
+        if receipt_path is not None:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(receipt_path, entry)
         return entry
 
     started = time.monotonic()
@@ -206,10 +295,13 @@ def execute_scenario(sc: Scenario) -> dict:
         entry["evidence"].append(record)
         entry["status"] = "passed" if record["exit_code"] == 0 else "failed"
     elif sc.probe:
-        record = _run(list(sc.probe), timeout=float(
-            os.environ.get("ATHENA_DEMO_TIMEOUT", DEFAULT_DEMO_TIMEOUT)) + 30.0)
+        record = _run(
+            list(sc.probe),
+            timeout=float(os.environ.get("ATHENA_DEMO_TIMEOUT", DEFAULT_DEMO_TIMEOUT)) + 30.0,
+        )
         record["probe_exit"] = RENDER_DEMO_EXIT_NAMES.get(
-            record["exit_code"], f"exit-{record['exit_code']}")
+            record["exit_code"], f"exit-{record['exit_code']}"
+        )
         entry["evidence"].append(record)
         if record["exit_code"] == 0:
             entry["status"] = "passed"
@@ -220,41 +312,85 @@ def execute_scenario(sc: Scenario) -> dict:
     else:  # registry validation makes this unreachable
         entry["status"] = "missing"
     entry["duration_s"] = round(time.monotonic() - started, 3)
+    if receipt_path is not None:
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(receipt_path, entry)
     return entry
+
+
+def _write_json_atomic(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="scripts/scenarios",
         description="Run release-gate scenario families and emit an "
-                    "evidence manifest (P1.29/P1.30).",
+        "evidence manifest (P1.29/P1.30).",
     )
     parser.add_argument(
-        "--output", "-o", default="scenarios-manifest.json",
-        help="path for the JSON evidence manifest (default: %(default)s)")
+        "--output",
+        "-o",
+        default=None,
+        help=(
+            "path for the JSON evidence manifest; unfiltered runs default to "
+            "scenarios-manifest.json (filtered runs require an explicit path)"
+        ),
+    )
     parser.add_argument(
-        "--family", action="append", default=None,
-        help="restrict to a family (repeatable): " + ", ".join(FAMILY_ORDER))
+        "--family",
+        action="append",
+        default=None,
+        help="restrict to a family (repeatable): " + ", ".join(FAMILY_ORDER),
+    )
     parser.add_argument(
-        "--only", action="append", default=None,
-        help="restrict to individual scenario ids (repeatable), e.g. SYNTH-001")
+        "--only",
+        action="append",
+        default=None,
+        help="restrict to individual scenario ids (repeatable), e.g. SYNTH-001",
+    )
     parser.add_argument(
-        "--list", action="store_true",
-        help="print the registry without running anything")
+        "--manifest-dir",
+        default=None,
+        help="directory for one atomic receipt per scenario (enables resume)",
+    )
     parser.add_argument(
-        "--quiet", "-q", action="store_true",
-        help="only print the summary line")
+        "--resume",
+        action="store_true",
+        help="reuse receipts only when their source identity matches exactly",
+    )
+    parser.add_argument(
+        "--require-clean",
+        action="store_true",
+        help="fail before running when the checkout has uncommitted changes",
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="print the registry without running anything"
+    )
+    parser.add_argument("--quiet", "-q", action="store_true", help="only print the summary line")
     args = parser.parse_args(argv)
 
     if args.list:
         for sc in SCENARIOS:
-            print(f"{sc.id:<15} {sc.status:<8} "
-                  f"{'required' if sc.required else 'optional':<9} {sc.title}")
+            print(
+                f"{sc.id:<15} {sc.status:<8} "
+                f"{'required' if sc.required else 'optional':<9} {sc.title}"
+            )
             for n in sc.nodeids:
                 print(f"                pytest  {n}")
             if sc.probe:
                 print(f"                probe   {' '.join(sc.probe)}")
         return 0
+
+    identity = _release_identity()
+    if args.require_clean and identity["dirty"]:
+        parser.error(
+            "checkout is dirty; use a clean release checkout or omit "
+            "--require-clean for developer runs"
+        )
 
     selected = SCENARIOS
     if args.family:
@@ -269,15 +405,28 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"unknown scenario id(s): {', '.join(unknown)}")
         selected = tuple(s for s in selected if s.id in set(args.only))
 
+    if args.output is None:
+        if args.family or args.only:
+            parser.error(
+                "filtered scenario runs require --output; refusing to overwrite "
+                "the full checked-in manifest"
+            )
+        args.output = "scenarios-manifest.json"
+
+    receipt_dir = Path(args.manifest_dir) if args.manifest_dir else None
     entries = []
     for sc in selected:
         if not args.quiet:
             print(f"[..] {sc.id} {sc.title}", flush=True)
-        entry = execute_scenario(sc)
+        entry = execute_scenario(
+            sc,
+            identity=identity,
+            receipt_dir=receipt_dir,
+            resume=args.resume,
+        )
         entries.append(entry)
         if not args.quiet:
-            print(f"[{entry['status']:>7}] {sc.id} "
-                  f"({entry['duration_s']}s)", flush=True)
+            print(f"[{entry['status']:>7}] {sc.id} ({entry['duration_s']}s)", flush=True)
 
     families: dict[str, dict] = {}
     for fam in FAMILY_ORDER:
@@ -288,18 +437,16 @@ def main(argv: list[str] | None = None) -> int:
         families[fam] = {
             "description": FAMILY_DESCRIPTIONS[fam],
             "total": len(fam_entries),
-            **{k: counts.get(k, 0)
-               for k in ("passed", "failed", "missing", "skipped")},
+            **{k: counts.get(k, 0) for k in ("passed", "failed", "missing", "skipped")},
         }
 
     summary = Counter(e["status"] for e in entries)
-    required_missing = [
-        e["scenario"] for e in entries
-        if e["required"] and e["status"] != "passed"
-    ]
+    required_missing = [e["scenario"] for e in entries if e["required"] and e["status"] != "passed"]
     manifest = {
         "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "repo_root": str(REPO_ROOT),
+        "source_identity": identity,
+        "resumed": bool(args.resume),
         "scenarios": entries,
         "families": families,
         "summary": {
@@ -314,15 +461,16 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    _write_json_atomic(out_path, manifest)
 
     s = manifest["summary"]
-    print(f"\nscenarios: {s['total']} total, {s['passed']} passed, "
-          f"{s['failed']} failed, {s['missing']} missing, {s['skipped']} skipped")
+    print(
+        f"\nscenarios: {s['total']} total, {s['passed']} passed, "
+        f"{s['failed']} failed, {s['missing']} missing, {s['skipped']} skipped"
+    )
     print(f"manifest: {out_path}")
     if s["required_not_passed"]:
-        print("REQUIRED scenarios not passed: "
-              + ", ".join(s["required_not_passed"]))
+        print("REQUIRED scenarios not passed: " + ", ".join(s["required_not_passed"]))
         return 1
     return 0
 

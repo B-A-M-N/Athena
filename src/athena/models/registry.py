@@ -40,8 +40,7 @@ class ProviderRegistry:
         self._providers.pop(provider_name, None)
         self._profiles.pop(provider_name, None)
         self._model_profiles = {
-            key: value for key, value in self._model_profiles.items()
-            if key[0] != provider_name
+            key: value for key, value in self._model_profiles.items() if key[0] != provider_name
         }
 
     def set_profile(self, provider_name: str, profile: object) -> None:
@@ -53,7 +52,10 @@ class ProviderRegistry:
         return self._profiles.get(provider_name)
 
     def set_model_profile(
-        self, provider_name: str, model_name: str, profile: object,
+        self,
+        provider_name: str,
+        model_name: str,
+        profile: object,
     ) -> None:
         if provider_name not in self._providers:
             raise ProviderUnavailable(f"provider {provider_name!r} is not registered")
@@ -109,9 +111,19 @@ def _with_provider(info: ModelInfo, provider_name: str) -> ModelInfo:
     fields = {
         k: getattr(info, k)
         for k in (
-            "id", "context_limit", "max_output_tokens", "tool_calling", "vision",
-            "audio_input", "audio_output", "reasoning", "structured_output",
-            "streaming", "cost", "latency_class", "privacy_class",
+            "id",
+            "context_limit",
+            "max_output_tokens",
+            "tool_calling",
+            "vision",
+            "audio_input",
+            "audio_output",
+            "reasoning",
+            "structured_output",
+            "streaming",
+            "cost",
+            "latency_class",
+            "privacy_class",
         )
     }
     return ModelInfo(provider=provider_name, **fields)

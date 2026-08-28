@@ -45,9 +45,7 @@ async def test_malformed_skill_md_is_skipped_gracefully(skills_dir: Path):
     )
     malformed_dir = skills_dir / "malformed"
     malformed_dir.mkdir()
-    (malformed_dir / "SKILL.md").write_text(
-        "---\nname: 99invalid\nbody:   \n---\n"
-    )
+    (malformed_dir / "SKILL.md").write_text("---\nname: 99invalid\nbody:   \n---\n")
 
     loader = SkillLoader(search_paths=[skills_dir])
     skills = await loader.load()

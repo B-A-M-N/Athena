@@ -14,18 +14,20 @@ from athena.service.service import AthenaService
 
 class _Approvals:
     async def list_granted(self):
-        return [{
-            "id": "apr-call",
-            "task_id": "task-1",
-            "metadata": {
-                "args_digest": args_digest({"path": "a.txt"}),
-                "capability_id": "fs",
-                "call_id": "call-1",
-                "effects": [EffectClass.WRITE_LOCAL.value],
-            },
-            "grant_scope": ApprovalScope.CALL.value,
-            "grant_expires_at": None,
-        }]
+        return [
+            {
+                "id": "apr-call",
+                "task_id": "task-1",
+                "metadata": {
+                    "args_digest": args_digest({"path": "a.txt"}),
+                    "capability_id": "fs",
+                    "call_id": "call-1",
+                    "effects": [EffectClass.WRITE_LOCAL.value],
+                },
+                "grant_scope": ApprovalScope.CALL.value,
+                "grant_expires_at": None,
+            }
+        ]
 
 
 class _Continuations:

@@ -13,14 +13,21 @@ from athena.cli.dual_pane import DualPaneSurface
 from athena.cli.layout import LayoutMode, compute_layout
 from athena.cli.projection import ProjectionState
 from athena.cli.render.ansi import CellGridDiffRenderer, cell_width, fit_cells
-from athena.cli.render.kitty import KittyAsset, KittyCapabilityProbe, KittyGraphicsProtocol, select_renderer
+from athena.cli.render.kitty import (
+    KittyAsset,
+    KittyCapabilityProbe,
+    KittyGraphicsProtocol,
+    select_renderer,
+)
 from athena.cli.render.scene import render_scene_lines
 from athena.cli.scene import build_oi_scene
 from athena.cli.terminal import TerminalSession, sanitize_terminal_text
 from athena.service.config import AthenaConfig, config_from_dict, config_to_dict, load_config
 
 
-@pytest.mark.parametrize("status", ["READY", "THINKING", "EXECUTING", "APPROVAL", "FAILURE", "RECOVERING"])
+@pytest.mark.parametrize(
+    "status", ["READY", "THINKING", "EXECUTING", "APPROVAL", "FAILURE", "RECOVERING"]
+)
 def test_oi_content_never_changes_equal_aperture_geometry(status: str) -> None:
     layout = compute_layout(160, 45)
     assert layout.apertures_equal
@@ -96,6 +103,18 @@ def test_animation_transitions_between_semantic_buddy_anchors() -> None:
     assert 0 < animator.visual.transition < 1
 
 
+def test_animation_has_action_channels_without_changing_semantic_state() -> None:
+    animator = OIAnimator()
+    animator.set_state("coding", "files", action_kind="code", code_lines=3)
+    assert animator.visual.action_kind == "code"
+    assert animator.visual.code_reveal == 0
+    assert animator.tick(0.1)
+    assert animator.visual.semantic_state == "coding"
+    assert animator.visual.action_kind == "code"
+    assert animator.visual.cursor_phase > 0
+    assert animator.visual.code_reveal > 0
+
+
 @pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
 def test_glass_framebuffer_caches_static_scene_layer() -> None:
     layout = compute_layout(120, 40)
@@ -139,6 +158,37 @@ def test_glass_framebuffer_exposes_small_dynamic_overlay() -> None:
     assert moved is not None
     assert moved.png != overlay.png
     assert len(moved.png) < len(framebuffer.render(scene, animator.visual, 640, 360).png)
+
+
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_glass_motion_layer_changes_without_invalidating_scene_base() -> None:
+    state = ProjectionState()
+    state.reduce(
+        "CapabilityRequested",
+        {
+            "call_id": "write-1",
+            "capability_id": "fs",
+            "arguments": {
+                "operation": "write",
+                "path": "src/example.py",
+                "content": "print('hello')\n",
+            },
+        },
+    )
+    scene = build_oi_scene(state, compute_layout(120, 40).oi, character="cat")
+    animator = OIAnimator()
+    animator.set_state("coding", "files", action_kind="code", code_lines=1)
+    framebuffer = OIFrameBuffer()
+
+    base = framebuffer.render_base(scene, 640, 360)
+    first = framebuffer.render_motion_overlay(scene, animator.visual, 640, 360)
+    animator.tick(0.1)
+    second = framebuffer.render_motion_overlay(scene, animator.visual, 640, 360)
+
+    assert base is not None and first is not None and second is not None
+    assert first.png != second.png
+    assert first.base_key == base.base_key == second.base_key
+    assert len(framebuffer._base_frames) == 1
 
 
 def test_animation_clock_only_repaints_the_glass_layer() -> None:
@@ -226,7 +276,9 @@ class _TTYBuffer(StringIO):
         return True
 
 
-def test_terminal_session_restores_handlers_and_screen_on_close(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_terminal_session_restores_handlers_and_screen_on_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     output = _TTYBuffer()
     previous = {
         signal.SIGINT: signal.SIG_IGN,
@@ -236,7 +288,9 @@ def test_terminal_session_restores_handlers_and_screen_on_close(monkeypatch: pyt
         previous[signal.SIGHUP] = signal.SIG_IGN
     installed: list[tuple[int, object]] = []
     monkeypatch.setattr(signal, "getsignal", lambda signum: previous[signum])
-    monkeypatch.setattr(signal, "signal", lambda signum, handler: installed.append((signum, handler)))
+    monkeypatch.setattr(
+        signal, "signal", lambda signum, handler: installed.append((signum, handler))
+    )
 
     session = TerminalSession(output)
     session.open()
@@ -257,7 +311,9 @@ def test_terminal_session_signal_cleanup_preserves_default_semantics(
     installed: list[tuple[int, object]] = []
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr(signal, "getsignal", lambda _signum: signal.SIG_DFL)
-    monkeypatch.setattr(signal, "signal", lambda signum, handler: installed.append((signum, handler)))
+    monkeypatch.setattr(
+        signal, "signal", lambda signum, handler: installed.append((signum, handler))
+    )
     monkeypatch.setattr(os, "kill", lambda pid, signum: killed.append((pid, signum)))
 
     session = TerminalSession(output)

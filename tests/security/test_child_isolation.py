@@ -84,9 +84,7 @@ async def test_child_policy_denies_execute_when_parent_denies_it():
     reg = CapabilityRegistry()
     exc = _RecordingExecutor("execute", EffectClass.EXECUTE)
     reg.register(exc)
-    dispatcher = CapabilityDispatcher(
-        reg, PolicyEngine(profile=AutonomyLevel.AUTONOMOUS)
-    )
+    dispatcher = CapabilityDispatcher(reg, PolicyEngine(profile=AutonomyLevel.AUTONOMOUS))
 
     result = await dispatcher.dispatch(
         _execute_req(), workspace=_ws("/parent"), task_policy=child_policy
@@ -121,9 +119,7 @@ async def test_child_workspace_denies_write_outside_child_root(tmp_path):
     reg = CapabilityRegistry()
     fs_exec = FilesystemCapability()
     reg.register(fs_exec)
-    dispatcher = CapabilityDispatcher(
-        reg, PolicyEngine(profile=AutonomyLevel.AUTONOMOUS)
-    )
+    dispatcher = CapabilityDispatcher(reg, PolicyEngine(profile=AutonomyLevel.AUTONOMOUS))
 
     # Child writes to the parent anchor path which is OUTSIDE the child root.
     result = await dispatcher.dispatch(
@@ -154,6 +150,5 @@ async def test_child_budget_derived_from_parent_cannot_exceed():
         objective="c",
         resource_budget=ResourceBudget(max_cost_usd=Decimal("5.0")),
     )
-    merged = _merged_budget(parent, child_spec.resource_budget,
-                            default_depth=1, default_children=4)
+    merged = _merged_budget(parent, child_spec.resource_budget, default_depth=1, default_children=4)
     assert merged.max_cost_usd == Decimal("1.0")

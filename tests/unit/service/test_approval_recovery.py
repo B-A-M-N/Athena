@@ -1,4 +1,5 @@
 """Restart recovery for resolved durable approval continuations."""
+
 from __future__ import annotations
 
 import asyncio
@@ -58,9 +59,7 @@ async def test_recover_approved_continuation_requeues_same_task_once():
         kernel=kernel,
     )
     assert continuations.released is True
-    assert manager.transitions == [
-        ("task-1", TaskStatus.RUNNING, "resume approved continuation")
-    ]
+    assert manager.transitions == [("task-1", TaskStatus.RUNNING, "resume approved continuation")]
     recovery = next(iter(service._approval_recovery_tasks))
     await kernel.ran.wait()
     await recovery

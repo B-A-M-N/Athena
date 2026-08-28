@@ -83,10 +83,9 @@ def _model_label(config: Any = None) -> str:
     providers = tuple(getattr(config, "providers", ()) or ())
     if providers:
         provider = providers[0]
-        return (
-            f"{getattr(provider, 'name', 'model')} / "
-            f"{getattr(provider, 'model', '')}"
-        ).rstrip(" /")
+        return (f"{getattr(provider, 'name', 'model')} / {getattr(provider, 'model', '')}").rstrip(
+            " /"
+        )
     return os.environ.get("OPENROUTER_MODEL", "local / fake-1")
 
 
@@ -129,8 +128,7 @@ async def _cmd_diff(service: Any, limit: int, surface: OperatorSurface) -> None:
         }.get(r.get("status"), "·")
         reversible = "reversible" if r.get("reversible") else "one-way"
         surface.render_notice(
-            f"│ {status_icon} {r.get('operation', '?'):10} "
-            f"{r.get('resource', '?')}  [{reversible}]"
+            f"│ {status_icon} {r.get('operation', '?'):10} {r.get('resource', '?')}  [{reversible}]"
         )
         surface.render_notice(f"│   id: {r.get('id')}  task: {r.get('task_id') or '—'}")
     surface.render_notice("└──────────────────────────────────────")
@@ -183,7 +181,9 @@ class ChatREPL:
         cfg_autonomy = getattr(config, "autonomy", None)
         opt_autonomy = getattr(options, "autonomy", None)
         self.autonomy = _autonomy(opt_autonomy or cfg_autonomy)
-        self.model_policy: str | None = getattr(options, "model", None) or getattr(config, "model", None)
+        self.model_policy: str | None = getattr(options, "model", None) or getattr(
+            config, "model", None
+        )
         self.workspace = _workspace_spec(getattr(options, "workspace", None))
         self._active_task_id: str | None = None
         option_animations = getattr(options, "animations", None)
@@ -193,14 +193,17 @@ class ChatREPL:
             mascot=getattr(options, "mascot", None) or getattr(config, "mascot", None),
             display=getattr(options, "display", None) or getattr(config, "display", None),
             model_label=_model_label(config),
-            animations=bool(
-                config_animations if option_animations is None else option_animations
+            animations=bool(config_animations if option_animations is None else option_animations),
+            reduced_motion=bool(
+                getattr(options, "reduced_motion", False)
+                or getattr(config, "reduced_motion", False)
             ),
-            reduced_motion=bool(getattr(options, "reduced_motion", False) or getattr(config, "reduced_motion", False)),
         )
-        self.criteria: list[str] = list(
-            (getattr(options, "criteria") or "").split(";")
-        ) if getattr(options, "criteria", None) else []
+        self.criteria: list[str] = (
+            list((getattr(options, "criteria") or "").split(";"))
+            if getattr(options, "criteria", None)
+            else []
+        )
 
     # -- input ------------------------------------------------------------
 
@@ -319,7 +322,9 @@ class ChatREPL:
             return True
         if name == "details":
             self.surface.details = not self.surface.details
-            self.surface.render_notice(f"details: {'expanded' if self.surface.details else 'collapsed'}")
+            self.surface.render_notice(
+                f"details: {'expanded' if self.surface.details else 'collapsed'}"
+            )
             repaint = getattr(self.surface, "repaint_oi", None)
             if callable(repaint):
                 repaint(force=True)
@@ -344,7 +349,9 @@ class ChatREPL:
             outcome = await self.service.undo_mutation(arg)
             status = outcome.get("status")
             if status == "ok":
-                self.surface.render_notice(f"rolled back {arg} (rollback {outcome.get('rollback_id')})")
+                self.surface.render_notice(
+                    f"rolled back {arg} (rollback {outcome.get('rollback_id')})"
+                )
             else:
                 self.surface.render_notice(f"undo failed: {outcome.get('error', status)}")
             return True
@@ -369,6 +376,7 @@ class ChatREPL:
         if name == "resume":
             if not self.session_id:
                 self.session_id = new_id("session")
+
             async def _approval(approval_id: str, scopes: list[str]) -> ApprovalChoice:
                 event = make_event(
                     "ApprovalRequested",
@@ -387,9 +395,12 @@ class ChatREPL:
                 task_id = rows[0]["id"]
                 self.surface.render_notice(f"resuming most recent: {task_id}")
             from athena.cli.chat import stream_task as _stream
+
             spec = await self.service.resume_task(task_id)
             self._active_task_id = spec.id
-            result = await _stream(self.service, spec.id, autonomy=self.autonomy, surface=self.surface)
+            result = await _stream(
+                self.service, spec.id, autonomy=self.autonomy, surface=self.surface
+            )
             if result is not None:
                 status = getattr(result, "status", None)
                 value = getattr(status, "value", None)
@@ -406,15 +417,25 @@ class ChatREPL:
             count = summary.get("message_count")
             if name == "compact":
                 self.surface.render_notice(f"context window: {window or '?'} tokens")
-                self.surface.render_notice(f"output reserve: {reserve if reserve is not None else '?'} tokens")
-                self.surface.render_notice(f"recent verbatim turns: {recent if recent is not None else '?'}")
+                self.surface.render_notice(
+                    f"output reserve: {reserve if reserve is not None else '?'} tokens"
+                )
+                self.surface.render_notice(
+                    f"recent verbatim turns: {recent if recent is not None else '?'}"
+                )
                 older = "compressed with provenance retained"
                 self.surface.render_notice(f"older transcript: {older}")
             else:
                 self.surface.render_notice(f"session: {self.session_id or '(none yet)'}")
-                self.surface.render_notice(f"durable messages: {count if count is not None else '?'}")
-                self.surface.render_notice("next turn includes: objective, policy boundaries, recent turns,")
-                self.surface.render_notice("capability calls/results, relevant memories and skills.")
+                self.surface.render_notice(
+                    f"durable messages: {count if count is not None else '?'}"
+                )
+                self.surface.render_notice(
+                    "next turn includes: objective, policy boundaries, recent turns,"
+                )
+                self.surface.render_notice(
+                    "capability calls/results, relevant memories and skills."
+                )
             return True
         return False
 
@@ -487,9 +508,7 @@ class ChatREPL:
             autonomy=self.autonomy,
             workspace=self.workspace,
             model_policy=_model_policy(self.model_policy),
-            metadata=(
-                {"acceptance_criteria": list(self.criteria)} if self.criteria else {}
-            ),
+            metadata=({"acceptance_criteria": list(self.criteria)} if self.criteria else {}),
         )
         spec = await self.service.submit(request, wait=False)
         self._active_task_id = spec.id

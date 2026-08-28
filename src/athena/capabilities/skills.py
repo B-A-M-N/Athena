@@ -31,8 +31,7 @@ _INPUT_SCHEMA = {
     },
     "oneOf": [
         {"properties": {"operation": {"const": "search"}}},
-        {"properties": {"operation": {"const": "trigger"}},
-         "required": ["skill_id"]},
+        {"properties": {"operation": {"const": "trigger"}}, "required": ["skill_id"]},
     ],
 }
 
@@ -63,7 +62,8 @@ class SkillsCapability:
         call_id = request.call_id or new_id("call")
         if self.skills_store is None:
             return CapabilityResult(
-                call_id, request.capability_id,
+                call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error="skills store not available",
             )
@@ -71,20 +71,27 @@ class SkillsCapability:
             query = str(args.get("query") or "")
             matches = await self.skills_store.search(query=query, limit=10)
             return CapabilityResult(
-                call_id, request.capability_id, CapabilityResultStatus.OK,
+                call_id,
+                request.capability_id,
+                CapabilityResultStatus.OK,
                 output=json.dumps([_skill_record(item) for item in matches], sort_keys=True),
             )
         if op == "trigger":
             outcome = await self.skills_store.trigger(
-                skill_id=args.get("skill_id"), arguments=args.get("arguments") or {},
+                skill_id=args.get("skill_id"),
+                arguments=args.get("arguments") or {},
                 task_id=request.task_id,
             )
             return CapabilityResult(
-                call_id, request.capability_id, CapabilityResultStatus.OK,
+                call_id,
+                request.capability_id,
+                CapabilityResultStatus.OK,
                 output=json.dumps(_skill_record(outcome), sort_keys=True),
             )
         return CapabilityResult(
-            call_id, request.capability_id, CapabilityResultStatus.FAILED,
+            call_id,
+            request.capability_id,
+            CapabilityResultStatus.FAILED,
             error=f"unknown operation: {op}",
         )
 

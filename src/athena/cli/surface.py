@@ -43,9 +43,7 @@ class OperatorSurface:
     ) -> None:
         self.output = output or sys.stdout
         self.error = error or sys.stderr
-        self.interactive = (
-            bool(sys.stdin.isatty()) if interactive is None else interactive
-        )
+        self.interactive = bool(sys.stdin.isatty()) if interactive is None else interactive
         self.details = details
         self._input_fn = input_fn or input
         self._input_supplied = input_fn is not None
@@ -209,11 +207,19 @@ class OperatorSurface:
             data = str(payload.get("data") or "")
             if event_type == "StdoutChunk":
                 self._stdout += data
-                if self.details or "\n" in self._stdout or len(self._stdout) >= self._OUTPUT_FLUSH_CHARS:
+                if (
+                    self.details
+                    or "\n" in self._stdout
+                    or len(self._stdout) >= self._OUTPUT_FLUSH_CHARS
+                ):
                     self._flush_stream("stdout")
             else:
                 self._stderr += data
-                if self.details or "\n" in self._stderr or len(self._stderr) >= self._OUTPUT_FLUSH_CHARS:
+                if (
+                    self.details
+                    or "\n" in self._stderr
+                    or len(self._stderr) >= self._OUTPUT_FLUSH_CHARS
+                ):
                     self._flush_stream("stderr")
             return
 
@@ -247,15 +253,26 @@ class OperatorSurface:
             if event_type == "TaskBlocked":
                 self._write("[task blocked]", stream=self.error)
             elif self.details:
-                label = event_type.removeprefix("Task").lower() if event_type.startswith("Task") else event_type
+                label = (
+                    event_type.removeprefix("Task").lower()
+                    if event_type.startswith("Task")
+                    else event_type
+                )
                 self._write(f"  · {label}")
             return
 
         if event_type in {
-            "MutationRecorded", "MutationRecordFailed", "MutationRolledBack",
-            "MemoryCandidateCreated", "MemoryWritten", "SkillCandidateCreated",
-            "SkillActivated", "InterpreterProposalDispatched",
-            "ToolInputCorrectionExhausted", "RecoveryStarted", "RecoveryCompleted",
+            "MutationRecorded",
+            "MutationRecordFailed",
+            "MutationRolledBack",
+            "MemoryCandidateCreated",
+            "MemoryWritten",
+            "SkillCandidateCreated",
+            "SkillActivated",
+            "InterpreterProposalDispatched",
+            "ToolInputCorrectionExhausted",
+            "RecoveryStarted",
+            "RecoveryCompleted",
         }:
             labels = {
                 "MutationRecorded": "mutation recorded",
@@ -301,7 +318,10 @@ class OperatorSurface:
         elif event_type == "TaskStateChanged":
             status = payload.get("status") or payload.get("to") or "changed"
             if self.details or str(status).upper() in {
-                "WAITING_APPROVAL", "WAITING_INPUT", "BLOCKED", "RECOVERY_REQUIRED",
+                "WAITING_APPROVAL",
+                "WAITING_INPUT",
+                "BLOCKED",
+                "RECOVERY_REQUIRED",
             }:
                 self._write(f"  state: {status}")
         elif event_type == "TaskIterationStarted" and self.details:
@@ -378,7 +398,12 @@ class OperatorSurface:
         self._write("")
         self._write("┌─ approval required ───────────────────")
         self._write(f"│ capability: {capability}")
-        target = payload.get("target") or payload.get("resource") or payload.get("path") or self._last_target
+        target = (
+            payload.get("target")
+            or payload.get("resource")
+            or payload.get("path")
+            or self._last_target
+        )
         reason = payload.get("reason") or payload.get("policy_reason") or self._last_policy_reason
         if target:
             self._write(f"│ target: {target}")
@@ -397,7 +422,9 @@ class OperatorSurface:
         if not scopes:
             scopes = ["call"]
         if not self.interactive:
-            self._write("approval unavailable without an interactive terminal; denied", stream=self.error)
+            self._write(
+                "approval unavailable without an interactive terminal; denied", stream=self.error
+            )
             return ApprovalChoice(False)
 
         while True:
@@ -444,7 +471,9 @@ class OperatorSurface:
         if not text:
             return
         prefix = "│ " if name == "stdout" else "│! "
-        self._write_block(text, prefix=prefix, stream=self.error if name == "stderr" else self.output)
+        self._write_block(
+            text, prefix=prefix, stream=self.error if name == "stderr" else self.output
+        )
         if name == "stdout":
             self._stdout = ""
         else:

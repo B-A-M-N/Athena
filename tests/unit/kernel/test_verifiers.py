@@ -1,4 +1,5 @@
 """Tests for acceptance verification (P9)."""
+
 from __future__ import annotations
 import pytest
 
@@ -35,6 +36,7 @@ def _task(ws_root: str = "/tmp") -> TaskSpec:
 def _run(coro):
     """Run a coroutine synchronously."""
     import asyncio
+
     return asyncio.run(coro)
 
 
@@ -62,7 +64,9 @@ def test_file_verifier_exists():
 
 def test_file_verifier_not_exists():
     v = _FileVerifier()
-    spec = VerificationSpec(type=VerificationType.FILE, path="/nonexistent/path", predicate="exists")
+    spec = VerificationSpec(
+        type=VerificationType.FILE, path="/nonexistent/path", predicate="exists"
+    )
     assert _run(v.verify_one(_task(), spec)) is False
 
 
@@ -74,7 +78,9 @@ def test_file_verifier_contains():
     try:
         spec = VerificationSpec(type=VerificationType.FILE, path=path, predicate="contains:world")
         assert _run(v.verify_one(_task(), spec)) is True
-        spec2 = VerificationSpec(type=VerificationType.FILE, path=path, predicate="contains:missing")
+        spec2 = VerificationSpec(
+            type=VerificationType.FILE, path=path, predicate="contains:missing"
+        )
         assert _run(v.verify_one(_task(), spec2)) is False
     finally:
         os.unlink(path)
@@ -90,7 +96,11 @@ def test_composite_dispatch():
     """CompositeVerifier dispatches to the right sub-verifier."""
     v = CompositeVerifier()
     criteria = (
-        Criterion(id="c1", description="manual", verification=VerificationSpec(type=VerificationType.MANUAL)),
+        Criterion(
+            id="c1",
+            description="manual",
+            verification=VerificationSpec(type=VerificationType.MANUAL),
+        ),
     )
     results = _run(v.verify(_task(), criteria))
     assert results == [False]
@@ -99,9 +109,7 @@ def test_composite_dispatch():
 def test_composite_no_verification_spec():
     """Criterion with no verification spec is unresolved."""
     v = CompositeVerifier()
-    criteria = (
-        Criterion(id="c1", description="no spec", verification=None),
-    )
+    criteria = (Criterion(id="c1", description="no spec", verification=None),)
     results = _run(v.verify(_task(), criteria))
     assert results == [False]
 
@@ -124,10 +132,12 @@ def test_capability_check_uses_task_scoped_fabric():
         capability="generated.check",
     )
     assert _run(_CapabilityCheckVerifier(Fabric()).verify_one(task, spec)) is True
-    assert calls == [(
-        "generated.check",
-        {"task_id": "task-7", "project_id": "project-2", "user_id": "user-3"},
-    )]
+    assert calls == [
+        (
+            "generated.check",
+            {"task_id": "task-7", "project_id": "project-2", "user_id": "user-3"},
+        )
+    ]
 
 
 def test_model_judgment_uses_kernel_broker():
@@ -148,7 +158,8 @@ def test_model_judgment_uses_kernel_broker():
         predicate="the result is correct",
     )
     verifier = _ModelJudgmentVerifier(
-        SimpleNamespace(), inference_broker=broker,
+        SimpleNamespace(),
+        inference_broker=broker,
     )
     assert _run(verifier.verify_one(task, spec)) is True
     assert calls and calls[0]["task"] == task

@@ -10,6 +10,7 @@ from __future__ import annotations
 import textwrap
 from collections.abc import Iterable, Sequence
 
+from athena.cli.activity import VisualActionKind
 from athena.cli.projection import OperationNode, ProjectionState
 from athena.cli.render.ansi import cell_width, fit_cells
 from athena.cli.scene import OIScene
@@ -62,9 +63,7 @@ class _CellCanvas:
     def __init__(self, width: int, height: int) -> None:
         self.width = max(int(width), 1)
         self.height = max(int(height), 1)
-        self._cells: list[list[str | None]] = [
-            [None] * self.width for _ in range(self.height)
-        ]
+        self._cells: list[list[str | None]] = [[None] * self.width for _ in range(self.height)]
 
     def put(self, row: int, column: int, value: object, *, overwrite: bool = True) -> bool:
         if not 0 <= row < self.height:
@@ -152,6 +151,172 @@ def _operation_lines(operation: OperationNode | None) -> list[str]:
     return lines
 
 
+def _action_lines(
+    state: ProjectionState,
+    scene: OIScene,
+    *,
+    width: int,
+    height: int,
+    buddy_lines: Iterable[str],
+    buddy_enabled: bool,
+) -> list[str] | None:
+    """Render material for an active action when a specialized view exists."""
+    if scene.mode not in {
+        VisualActionKind.CODE,
+        VisualActionKind.TEST,
+        VisualActionKind.VERIFY,
+        VisualActionKind.FAILURE,
+        VisualActionKind.SEARCH,
+        VisualActionKind.APPROVAL,
+        VisualActionKind.RECOVER,
+        VisualActionKind.GENERATE,
+    }:
+        return None
+    # A task-level failure without structured diagnostics still belongs in the
+    # ordinary activity/history view.  The specialized result scene is for an
+    # actual mismatch payload, so it never hides useful recent activity.
+    if scene.mode is VisualActionKind.FAILURE and not scene.diagnostics:
+        return None
+    if scene.mode is VisualActionKind.CODE and scene.code_view is None:
+        return None
+    canvas = _CellCanvas(width, height)
+    operation = state.operations.get(state.active_operation_id or "")
+    if operation is None and state.last_operation_id:
+        operation = state.operations.get(state.last_operation_id)
+    label = operation.target if operation else (operation.label if operation else "workspace")
+    titles = {
+        VisualActionKind.CODE: f"CODE // {label}",
+        VisualActionKind.TEST: f"TESTING // {label}",
+        VisualActionKind.VERIFY: f"VERIFYING // {label}",
+        VisualActionKind.FAILURE: "RESULT // MISMATCH DETECTED",
+        VisualActionKind.SEARCH: "SEARCHING // SYMBOL GRAPH",
+        VisualActionKind.APPROVAL: "APPROVAL // OPERATION SCOPE",
+        VisualActionKind.RECOVER: "RECOVERING // RETAINED EVIDENCE",
+        VisualActionKind.GENERATE: "GENERATING // CAPABILITY",
+    }
+    canvas.put(0, 0, titles[scene.mode])
+    if scene.mode is VisualActionKind.TEST and operation is not None:
+        canvas.put(
+            1,
+            0,
+            f"ACTIVE OPERATION  {operation.label}  {operation.state.upper()}",
+        )
+    canvas.put(0, max(width // 2, 1), f"{state.status} · {scene.mode.value.upper()}")
+
+    if scene.mode is VisualActionKind.CODE and scene.code_view is not None:
+        view = scene.code_view
+        canvas.put(1, 0, f"{view.language}  {view.mutation_state.upper() or 'PROPOSED'}")
+        source = view.diff_hunks or tuple(view.lines)
+        available = max(height - 5, 1)
+        for row, line in enumerate(source[:available], 2):
+            marker = "" if line.startswith(("+", "-", "@")) else " "
+            canvas.put(row, 0, f"{marker}{row - 1:>4} {line}")
+        if view.preview_truncated:
+            canvas.put(min(height - 2, available + 2), 0, "… preview bounded for display")
+    elif scene.mode is VisualActionKind.FAILURE:
+        row = 2
+        for diagnostic in scene.diagnostics[: max(height - 4, 1)]:
+            message = (
+                diagnostic.get("message")
+                or diagnostic.get("detail")
+                or diagnostic.get("error")
+                or str(diagnostic)
+            )
+            location = (
+                diagnostic.get("path") or diagnostic.get("file") or diagnostic.get("location") or ""
+            )
+            canvas.put(row, 0, f"! {location} {message}".strip())
+            row += 1
+    elif scene.mode is VisualActionKind.VERIFY:
+        checks = scene.verification_checks
+        for row, check in enumerate(checks[: max(height - 4, 1)], 2):
+            status = str(check.get("status") or "running").casefold()
+            glyph = (
+                "✓"
+                if status in {"passed", "complete", "completed"}
+                else "!"
+                if status in {"failed", "error"}
+                else "●"
+            )
+            label = check.get("criterion") or check.get("check_id") or "check"
+            canvas.put(row, 0, f"{glyph} {label}  {status}")
+        if not checks:
+            canvas.put(2, 0, "● waiting for verification checks")
+    elif scene.mode is VisualActionKind.TEST:
+        canvas.put(2, 0, "· impacted tests")
+        progress = scene.progress
+        if progress.get("determinate") and progress.get("value") is not None:
+            total_cells = max(width - 4, 8)
+            filled = int(total_cells * min(max(float(progress["value"]), 0.0), 1.0))
+            canvas.put(3, 0, "[" + "█" * filled + "░" * (total_cells - filled) + "]")
+            canvas.put(4, 0, str(progress.get("label") or ""))
+        else:
+            canvas.put(3, 0, str(progress.get("label") or "● running tests"))
+    elif scene.mode is VisualActionKind.SEARCH:
+        for row, entity in enumerate(scene.entities[: max(height - 3, 1)], 2):
+            canvas.put(row, 0, f"· {entity.label}")
+    elif scene.mode is VisualActionKind.APPROVAL:
+        approval = state.pending_approval or {}
+        # Keep the operator-facing sentence readable in both the ANSI and
+        # retained renderers.  The scene title already carries the all-caps
+        # machine label; this line is the actionable human message.
+        canvas.put(2, 0, "Approval required")
+        label = operation.label if operation else approval.get("capability_id") or "capability"
+        canvas.put(3, 0, f"? {label}  PAUSED")
+        target = (
+            operation.target if operation else approval.get("target") or approval.get("path") or ""
+        )
+        if target:
+            canvas.put(4, 0, f"target  {target}")
+        reason = (
+            approval.get("reason")
+            or approval.get("policy_reason")
+            or (operation.detail if operation else "")
+        )
+        if reason:
+            canvas.put(5, 0, f"reason  {reason}")
+        scopes = [str(scope) for scope in approval.get("scopes") or ()]
+        canvas.put(
+            6,
+            0,
+            f"keys  {' '.join(f'{i}:{scope}' for i, scope in enumerate(scopes, 1)) or '1:allow'} d:deny",
+        )
+    elif scene.mode is VisualActionKind.RECOVER:
+        canvas.put(2, 0, state.status_message)
+        canvas.put(3, 0, "· no speculative evidence is promoted during recovery")
+    elif scene.mode is VisualActionKind.GENERATE:
+        canvas.put(2, 0, "· constructing a bounded generated capability")
+        if operation:
+            canvas.put(3, 0, f"{operation.label}  {operation.state.upper()}")
+
+    recent_items = list(state.recent)
+    if recent_items and height >= 3:
+        canvas.put(height - 2, 0, "RECENT ACTIVITY")
+        glyph, text = recent_items[-1]
+        canvas.put(height - 1, 0, f"{glyph} {text}")
+
+    art = [
+        fit_cells(sanitize_terminal_text(line), min(width, 20)).rstrip()
+        for line in buddy_lines
+        if line
+    ]
+    if buddy_enabled and art and height >= 8 and width >= 20:
+        fx, fy = scene.anchors.get(scene.buddy_anchor, scene.anchors["center"])
+        target_x = int((width - 1) * fx) - 5
+        target_y = int((height - 1) * fy) - 1
+        candidates = [
+            (max(0, target_y + dy), max(0, target_x + dx))
+            for distance in range(0, max(width, height))
+            for dy, dx in ((0, distance), (0, -distance), (distance, 0), (-distance, 0))
+        ]
+        for row, column in candidates:
+            if canvas.can_put(row, column, art):
+                for offset, line in enumerate(art):
+                    canvas.put(row + offset, column, line, overwrite=False)
+                break
+    return canvas.lines()
+
+
 def render_scene_lines(
     state: ProjectionState,
     scene: OIScene,
@@ -169,6 +334,16 @@ def render_scene_lines(
     textual scene remains; no overlay is allowed to damage operation data.
     """
     width, height = max(int(width), 1), max(int(height), 1)
+    action = _action_lines(
+        state,
+        scene,
+        width=width,
+        height=height,
+        buddy_lines=buddy_lines,
+        buddy_enabled=buddy_enabled,
+    )
+    if action is not None:
+        return action
     canvas = _CellCanvas(width, height)
     split = max(width // 2, 18)
     canvas.put(0, 0, "WORKSPACE MAP")
@@ -176,19 +351,18 @@ def render_scene_lines(
         canvas.put(0, split, "RUNTIME GRAPH")
 
     resources = [
-        entity for entity in scene.entities
-        if entity.kind in {"resource", "research", "artifact"}
+        entity for entity in scene.entities if entity.kind in {"resource", "research", "artifact"}
     ]
-    tree = tuple(
-        f"{_entity_marker(entity.status)} {entity.label}"
-        for entity in resources[:8]
-    ) or ("· no workspace resources observed",)
+    tree = tuple(f"{_entity_marker(entity.status)} {entity.label}" for entity in resources[:8]) or (
+        "· no workspace resources observed",
+    )
     for row, line in enumerate(tree, 1):
         canvas.put(row, 0, line)
 
     graph_x = min(max(split + 4, 21), max(width - 1, 0))
     runtime_entities = [
-        entity for entity in scene.entities
+        entity
+        for entity in scene.entities
         if entity.kind in {"operation", "child_task", "workflow", "verification", "generated_tool"}
     ]
     if runtime_entities:
@@ -209,7 +383,7 @@ def render_scene_lines(
         stream = list(state.stream)[-3:]
         if state.stream_partial:
             stream.append(state.stream_partial)
-        for row, line in enumerate(stream[-max(height - 3, 1):], 2):
+        for row, line in enumerate(stream[-max(height - 3, 1) :], 2):
             canvas.put(row, 0, line)
     else:
         active = state.operations.get(state.active_operation_id or "")
@@ -226,14 +400,29 @@ def render_scene_lines(
                 "APPROVAL REQUIRED",
                 f"? {label}  PAUSED",
             ]
-            target = active.target if active else approval.get("target") or approval.get("resource") or approval.get("path") or ""
+            target = (
+                active.target
+                if active
+                else approval.get("target")
+                or approval.get("resource")
+                or approval.get("path")
+                or ""
+            )
             if target:
                 approval_lines.append(f"target  {target}")
-            reason = approval.get("reason") or approval.get("policy_reason") or (active.detail if active else "")
+            reason = (
+                approval.get("reason")
+                or approval.get("policy_reason")
+                or (active.detail if active else "")
+            )
             if reason:
-                approval_lines.extend(f"reason  {line}" for line in _wrap(reason, max(width - 9, 1))[:2])
+                approval_lines.extend(
+                    f"reason  {line}" for line in _wrap(reason, max(width - 9, 1))[:2]
+                )
             scopes = [str(scope) for scope in approval.get("scopes") or ()]
-            approval_lines.append(f"keys  {' '.join(f'{i}:{scope}' for i, scope in enumerate(scopes, 1)) or '1:allow'} d:deny")
+            approval_lines.append(
+                f"keys  {' '.join(f'{i}:{scope}' for i, scope in enumerate(scopes, 1)) or '1:allow'} d:deny"
+            )
             for row, line in enumerate(approval_lines[: max(height - next_y, 0)], next_y):
                 canvas.put(row, 0, line, overwrite=False)
             next_y += len(approval_lines) + 1

@@ -223,12 +223,15 @@ class ModelResponseAccumulator:
 
         if streamed_reasoning:
             base = _replace_or_prepend(
-                base, ReasoningBlock(type="reasoning", text=streamed_reasoning),
+                base,
+                ReasoningBlock(type="reasoning", text=streamed_reasoning),
                 ReasoningBlock,
             )
         if streamed_text:
             base = _replace_or_prepend(
-                base, TextBlock(type="text", text=streamed_text), TextBlock,
+                base,
+                TextBlock(type="text", text=streamed_text),
+                TextBlock,
             )
 
         identities = {_content_identity(block) for block in base}
@@ -249,7 +252,9 @@ class ModelResponseAccumulator:
 
 
 def _replace_or_prepend(
-    blocks: list[ContentBlock], replacement: ContentBlock, block_type: type,
+    blocks: list[ContentBlock],
+    replacement: ContentBlock,
+    block_type: type,
 ) -> list[ContentBlock]:
     for index, block in enumerate(blocks):
         if isinstance(block, block_type):
@@ -257,8 +262,7 @@ def _replace_or_prepend(
             return blocks
     # Text/reasoning precedes tool calls in the canonical message shape.
     insert_at = next(
-        (index for index, block in enumerate(blocks)
-         if isinstance(block, CapabilityCallBlock)),
+        (index for index, block in enumerate(blocks) if isinstance(block, CapabilityCallBlock)),
         len(blocks),
     )
     blocks.insert(insert_at, replacement)
@@ -272,20 +276,24 @@ def _content_identity(block: ContentBlock) -> tuple[str, str]:
 
 
 class ModelProvider(Protocol):
-    async def list_models(self) -> Sequence[ModelInfo]:
-        ...
+    async def list_models(self) -> Sequence[ModelInfo]: ...
 
-    def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
-        ...
+    def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]: ...
 
-    async def cancel(self, request_id: str) -> None:
-        ...
+    async def cancel(self, request_id: str) -> None: ...
 
 
 __all__ = [
-    "PrivacyClass", "CostInfo", "ModelInfo", "ModelRequest", "UsageInfo",
+    "PrivacyClass",
+    "CostInfo",
+    "ModelInfo",
+    "ModelRequest",
+    "UsageInfo",
     "ToolCallCandidate",
-    "ModelResponse", "ModelDelta", "ModelEvent", "ModelEventType",
+    "ModelResponse",
+    "ModelDelta",
+    "ModelEvent",
+    "ModelEventType",
     "ModelResponseAccumulator",
     "ModelProvider",
 ]

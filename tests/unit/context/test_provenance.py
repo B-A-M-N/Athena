@@ -1,4 +1,3 @@
-
 import pytest
 from athena.context.provenance import TRUST_ORDER, merge_provenance, prov, trust_rank
 from athena.protocol.messages import SourceType, TrustClass, utcnow

@@ -10,19 +10,40 @@ from typing import Callable
 
 
 _logger = logging.getLogger("athena.cli.animation")
-_ACTIVE_STATES = frozenset({
-    "THINKING", "READING", "SEARCHING", "TOOLS", "EXECUTING", "APPROVAL",
-    "FAILURE", "RECOVERING", "DELEGATED",
-})
+_ACTIVE_STATES = frozenset(
+    {
+        "THINKING",
+        "READING",
+        "SEARCHING",
+        "TOOLS",
+        "EXECUTING",
+        "APPROVAL",
+        "FAILURE",
+        "RECOVERING",
+        "DELEGATED",
+        "CODING",
+        "VERIFYING",
+        "TESTING",
+    }
+)
 
 
 @dataclass
 class OIVisualState:
     semantic_state: str = "idle"
+    action_kind: str = "idle"
+    code_line_count: int = 0
     buddy_anchor: str = "center"
     previous_anchor: str = "center"
     phase: float = 0.0
     transition: float = 1.0
+    scene_transition: float = 1.0
+    cursor_phase: float = 0.0
+    scan_phase: float = 0.0
+    pulse_phase: float = 0.0
+    grid_phase: float = 0.0
+    code_reveal: float = 1.0
+    activity_phase: float = 0.0
     dirty: bool = True
 
 
@@ -31,13 +52,30 @@ class OIAnimator:
         self.reduced_motion = reduced_motion
         self.visual = OIVisualState()
 
-    def set_state(self, semantic_state: str, buddy_anchor: str) -> None:
-        changed = semantic_state != self.visual.semantic_state or buddy_anchor != self.visual.buddy_anchor
+    def set_state(
+        self,
+        semantic_state: str,
+        buddy_anchor: str,
+        *,
+        action_kind: str | None = None,
+        code_lines: int = 0,
+    ) -> None:
+        action_kind = action_kind or semantic_state
+        changed = (
+            semantic_state != self.visual.semantic_state
+            or action_kind != self.visual.action_kind
+            or buddy_anchor != self.visual.buddy_anchor
+            or (action_kind.casefold() == "code" and code_lines != self.visual.code_line_count)
+        )
         if changed:
             self.visual.previous_anchor = self.visual.buddy_anchor
             self.visual.semantic_state = semantic_state
+            self.visual.action_kind = action_kind
+            self.visual.code_line_count = max(int(code_lines), 0)
             self.visual.buddy_anchor = buddy_anchor
             self.visual.transition = 1.0 if self.reduced_motion else 0.0
+            self.visual.scene_transition = 1.0 if self.reduced_motion else 0.0
+            self.visual.code_reveal = 1.0 if self.reduced_motion or not code_lines else 0.0
             self.visual.dirty = True
 
     def tick(self, dt: float) -> bool:
@@ -50,6 +88,15 @@ class OIAnimator:
             return False
         self.visual.phase = (self.visual.phase + max(float(dt), 0.0) * 2.0) % 1.0
         self.visual.transition = min(1.0, self.visual.transition + max(float(dt), 0.0) * 3.0)
+        delta = max(float(dt), 0.0)
+        self.visual.scene_transition = min(1.0, self.visual.scene_transition + delta * 2.5)
+        self.visual.cursor_phase = (self.visual.cursor_phase + delta * 5.0) % 1.0
+        self.visual.scan_phase = (self.visual.scan_phase + delta * 0.9) % 1.0
+        self.visual.pulse_phase = (self.visual.pulse_phase + delta * 2.2) % 1.0
+        self.visual.grid_phase = (self.visual.grid_phase + delta * 0.35) % 1.0
+        self.visual.activity_phase = (self.visual.activity_phase + delta * 1.6) % 1.0
+        if self.visual.action_kind.casefold() == "code":
+            self.visual.code_reveal = min(1.0, self.visual.code_reveal + delta * 3.5)
         self.visual.dirty = True
         return True
 
@@ -57,7 +104,13 @@ class OIAnimator:
 class AnimationClock:
     """Low-rate async clock that invalidates only the OI viewport."""
 
-    def __init__(self, callback: Callable[[float], bool | None], *, enabled: bool = True, reduced_motion: bool = False) -> None:
+    def __init__(
+        self,
+        callback: Callable[[float], bool | None],
+        *,
+        enabled: bool = True,
+        reduced_motion: bool = False,
+    ) -> None:
         self.callback = callback
         self.enabled = enabled and not reduced_motion
         self.reduced_motion = reduced_motion

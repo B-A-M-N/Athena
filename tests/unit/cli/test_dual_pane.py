@@ -30,23 +30,25 @@ def tty_surface(monkeypatch):
 async def test_conversation_and_operations_have_separate_owners(tty_surface):
     surface, _ = tty_surface
     surface.render_user_message("Please inspect the repository.")
-    await surface.render_event(make_event(
-        "ModelDelta", {"text": "I am checking the repository now."}
-    ))
-    await surface.render_event(make_event(
-        "CapabilityRequested",
-        {
-            "call_id": "call-1",
-            "capability_id": "execute",
-            "arguments": {"language": "shell", "code": "pytest -q"},
-        },
-    ))
-    await surface.render_event(make_event(
-        "CapabilityStarted", {"call_id": "call-1", "capability_id": "execute"}
-    ))
-    await surface.render_event(make_event(
-        "StdoutChunk", {"execution_id": "missing-map", "data": "ok\n"}
-    ))
+    await surface.render_event(
+        make_event("ModelDelta", {"text": "I am checking the repository now."})
+    )
+    await surface.render_event(
+        make_event(
+            "CapabilityRequested",
+            {
+                "call_id": "call-1",
+                "capability_id": "execute",
+                "arguments": {"language": "shell", "code": "pytest -q"},
+            },
+        )
+    )
+    await surface.render_event(
+        make_event("CapabilityStarted", {"call_id": "call-1", "capability_id": "execute"})
+    )
+    await surface.render_event(
+        make_event("StdoutChunk", {"execution_id": "missing-map", "data": "ok\n"})
+    )
 
     screen = "\n".join(surface._frame_lines())
     assert "YOU     Please inspect the repository." in screen
@@ -66,13 +68,15 @@ async def test_conversation_and_operations_have_separate_owners(tty_surface):
 @pytest.mark.asyncio
 async def test_event_reduction_does_not_duplicate_stream_chunks(tty_surface):
     surface, _ = tty_surface
-    await surface.render_event(make_event(
-        "CapabilityRequested",
-        {"call_id": "call-stream", "capability_id": "execute"},
-    ))
-    await surface.render_event(make_event(
-        "StdoutChunk", {"call_id": "call-stream", "data": "hello\n"}
-    ))
+    await surface.render_event(
+        make_event(
+            "CapabilityRequested",
+            {"call_id": "call-stream", "capability_id": "execute"},
+        )
+    )
+    await surface.render_event(
+        make_event("StdoutChunk", {"call_id": "call-stream", "data": "hello\n"})
+    )
 
     operation = surface.projection.operations["call-stream"]
     assert list(operation.output) == ["hello"]
@@ -83,24 +87,28 @@ async def test_event_reduction_does_not_duplicate_stream_chunks(tty_surface):
 async def test_approval_is_embedded_with_context_and_does_not_replace_chat(tty_surface):
     surface, _ = tty_surface
     surface.render_user_message("Run the migration, but show me what needs approval.")
-    await surface.render_event(make_event(
-        "CapabilityRequested",
-        {
-            "call_id": "call-2",
-            "capability_id": "execute",
-            "arguments": {"code": "python migrate.py", "path": "migrate.py"},
-        },
-    ))
-    await surface.render_event(make_event(
-        "ApprovalRequested",
-        {
-            "call_id": "call-2",
-            "approval_id": "approval-2",
-            "capability_id": "execute",
-            "scopes": ["call", "task"],
-            "reason": "running a migration changes repository state",
-        },
-    ))
+    await surface.render_event(
+        make_event(
+            "CapabilityRequested",
+            {
+                "call_id": "call-2",
+                "capability_id": "execute",
+                "arguments": {"code": "python migrate.py", "path": "migrate.py"},
+            },
+        )
+    )
+    await surface.render_event(
+        make_event(
+            "ApprovalRequested",
+            {
+                "call_id": "call-2",
+                "approval_id": "approval-2",
+                "capability_id": "execute",
+                "scopes": ["call", "task"],
+                "reason": "running a migration changes repository state",
+            },
+        )
+    )
 
     screen = "\n".join(surface._frame_lines())
     assert "Run the migration" in screen
@@ -118,24 +126,28 @@ async def test_approval_is_embedded_with_context_and_does_not_replace_chat(tty_s
 @pytest.mark.asyncio
 async def test_approval_summary_does_not_erase_actionable_context(tty_surface):
     surface, _ = tty_surface
-    await surface.render_event(make_event(
-        "CapabilityRequested",
-        {
-            "call_id": "call-3",
-            "capability_id": "write_file",
-            "arguments": {"path": "notes.md", "content": "hello"},
-        },
-    ))
-    await surface.render_event(make_event(
-        "ApprovalRequested",
-        {
-            "call_id": "call-3",
-            "approval_id": "approval-3",
-            "capability_id": "write_file",
-            "scopes": ["call", "session"],
-            "reason": "writing the file changes the workspace",
-        },
-    ))
+    await surface.render_event(
+        make_event(
+            "CapabilityRequested",
+            {
+                "call_id": "call-3",
+                "capability_id": "write_file",
+                "arguments": {"path": "notes.md", "content": "hello"},
+            },
+        )
+    )
+    await surface.render_event(
+        make_event(
+            "ApprovalRequested",
+            {
+                "call_id": "call-3",
+                "approval_id": "approval-3",
+                "capability_id": "write_file",
+                "scopes": ["call", "session"],
+                "reason": "writing the file changes the workspace",
+            },
+        )
+    )
     await surface.render_event(make_event("ApprovalRequested", {"calls": 1}))
 
     assert surface._pending_approval["approval_id"] == "approval-3"
@@ -148,27 +160,31 @@ async def test_approval_summary_does_not_erase_actionable_context(tty_surface):
 @pytest.mark.asyncio
 async def test_completed_operations_move_to_history_and_keep_artifacts(tty_surface):
     surface, _ = tty_surface
-    await surface.render_event(make_event(
-        "CapabilityRequested",
-        {
-            "call_id": "call-4",
-            "capability_id": "execute",
-            "arguments": {"code": "python build.py", "path": "build.py"},
-        },
-    ))
-    await surface.render_event(make_event(
-        "CapabilityStarted", {"call_id": "call-4", "capability_id": "execute"}
-    ))
-    await surface.render_event(make_event(
-        "ExecutionStarted",
-        {"call_id": "call-4", "execution_id": "exec-4", "runtime": "python"},
-    ))
-    await surface.render_event(make_event(
-        "ExecutionExited", {"execution_id": "exec-4", "exit_code": 0}
-    ))
-    await surface.render_event(make_event(
-        "ArtifactCreated", {"call_id": "call-4", "uri": "artifact://build-report"}
-    ))
+    await surface.render_event(
+        make_event(
+            "CapabilityRequested",
+            {
+                "call_id": "call-4",
+                "capability_id": "execute",
+                "arguments": {"code": "python build.py", "path": "build.py"},
+            },
+        )
+    )
+    await surface.render_event(
+        make_event("CapabilityStarted", {"call_id": "call-4", "capability_id": "execute"})
+    )
+    await surface.render_event(
+        make_event(
+            "ExecutionStarted",
+            {"call_id": "call-4", "execution_id": "exec-4", "runtime": "python"},
+        )
+    )
+    await surface.render_event(
+        make_event("ExecutionExited", {"execution_id": "exec-4", "exit_code": 0})
+    )
+    await surface.render_event(
+        make_event("ArtifactCreated", {"call_id": "call-4", "uri": "artifact://build-report"})
+    )
 
     screen = "\n".join(surface._frame_lines())
     assert "· no capability is running" in screen
@@ -180,22 +196,28 @@ async def test_completed_operations_move_to_history_and_keep_artifacts(tty_surfa
 @pytest.mark.asyncio
 async def test_right_scroll_is_independent_and_live_output_does_not_reset_it(tty_surface):
     surface, _ = tty_surface
-    await surface.render_event(make_event(
-        "CapabilityRequested",
-        {"call_id": "call-scroll", "capability_id": "execute", "arguments": {"code": "tail -f log"}},
-    ))
-    await surface.render_event(make_event(
-        "CapabilityStarted", {"call_id": "call-scroll", "capability_id": "execute"}
-    ))
+    await surface.render_event(
+        make_event(
+            "CapabilityRequested",
+            {
+                "call_id": "call-scroll",
+                "capability_id": "execute",
+                "arguments": {"code": "tail -f log"},
+            },
+        )
+    )
+    await surface.render_event(
+        make_event("CapabilityStarted", {"call_id": "call-scroll", "capability_id": "execute"})
+    )
     for index in range(24):
-        await surface.render_event(make_event(
-            "StdoutChunk", {"call_id": "call-scroll", "data": f"line-{index}\n"}
-        ))
+        await surface.render_event(
+            make_event("StdoutChunk", {"call_id": "call-scroll", "data": f"line-{index}\n"})
+        )
 
     assert surface.scroll("right", 5) is True
-    await surface.render_event(make_event(
-        "StdoutChunk", {"call_id": "call-scroll", "data": "new-live-line\n"}
-    ))
+    await surface.render_event(
+        make_event("StdoutChunk", {"call_id": "call-scroll", "data": "new-live-line\n"})
+    )
     assert surface._right_scroll == 5
     assert "OI // HISTORY" in "\n".join(surface._frame_lines())
     assert surface.scroll_to_bottom("right") is True
@@ -205,14 +227,9 @@ async def test_right_scroll_is_independent_and_live_output_does_not_reset_it(tty
 @pytest.mark.asyncio
 async def test_search_and_background_events_are_intentionally_projected(tty_surface):
     surface, _ = tty_surface
-    await surface.render_event(make_event(
-        "SearchStarted", {"query": "approval lifecycle"}
-    ))
+    await surface.render_event(make_event("SearchStarted", {"query": "approval lifecycle"}))
     assert surface._status == "SEARCHING"
-    assert any(
-        text == "Search · approval lifecycle"
-        for _, text in surface._recent
-    )
+    assert any(text == "Search · approval lifecycle" for _, text in surface._recent)
 
     await surface.render_event(make_event("BackgroundTaskStarted", {}))
     assert surface._status == "DELEGATED"

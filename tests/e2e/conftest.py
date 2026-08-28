@@ -5,6 +5,7 @@ workspace, fake model that emits ``execute`` / ``fs`` capability calls). The
 fake provider only *decides* what to call; the actual code runs on the real
 ``ShellRuntime`` / ``PythonRuntime`` subprocesses via ``ExecutionManager``.
 """
+
 from __future__ import annotations
 
 import pytest

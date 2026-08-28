@@ -95,10 +95,13 @@ async def candidates_from_task(
         ),
         trust=TrustClass.AGENT_CURATED,
         created_at=utcnow(),
-        metadata={"promotion": "required",
-                  "origin": "episodic", "task_id": task_id,
-                  "session_id": session_id,
-                  "status": getattr(result, "status", None)},
+        metadata={
+            "promotion": "required",
+            "origin": "episodic",
+            "task_id": task_id,
+            "session_id": session_id,
+            "status": getattr(result, "status", None),
+        },
     )
     return [episodic, *lessons]
 
@@ -130,8 +133,7 @@ def _extract_lessons(*, task_id: str, texts: list[str]) -> list[MemoryRecord]:
                     ),
                     trust=TrustClass.AGENT_CURATED,
                     created_at=utcnow(),
-                    metadata={"promotion": "required",
-                              "candidate_type": MemoryKind.SEMANTIC.value},
+                    metadata={"promotion": "required", "candidate_type": MemoryKind.SEMANTIC.value},
                 )
             )
     return records

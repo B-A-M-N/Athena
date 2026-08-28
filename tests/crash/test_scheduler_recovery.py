@@ -5,6 +5,7 @@ FIRED), restart reconciliation must FIRED the occurrence (a matching Task
 exists via its deterministic ``_occurrence`` metadata key) or release it. A job
 that never fired must fire normally after restart.
 """
+
 from __future__ import annotations
 import pytest
 
@@ -24,8 +25,7 @@ async def _read_run(db_path, job_id) -> dict | None:
     await db._ensure_ready()
     try:
         rows = await db.fetch_all(
-            "SELECT status, task_id, id FROM job_runs WHERE job_id = ? "
-            "ORDER BY started_at ASC",
+            "SELECT status, task_id, id FROM job_runs WHERE job_id = ? ORDER BY started_at ASC",
             (job_id,),
         )
         return rows[-1] if rows else None
@@ -46,11 +46,14 @@ async def test_claimed_occurrence_reconciled_to_fired_on_restart(
 
     svc1 = await make_durable_service(durable_db_path, scripts=None)
     await svc1._store_schedules.upsert_job(
-        job_id, "midfire", payload={
+        job_id,
+        "midfire",
+        payload={
             "template": {"objective": "SCHED_MIDFIRE", "session_id": token},
         },
         trigger_spec={"type": "once", "at": due},
-        enabled=True, next_run=due,
+        enabled=True,
+        next_run=due,
     )
     await svc1.stop()  # never ticked, nothing claimed yet
 
@@ -76,9 +79,7 @@ async def test_claimed_occurrence_reconciled_to_fired_on_restart(
     assert run["task_id"], "occurrence FIRED but has no linked task"
 
 
-async def test_job_not_fired_before_stop_fires_after_restart(
-    make_durable_service, durable_db_path
-):
+async def test_job_not_fired_before_stop_fires_after_restart(make_durable_service, durable_db_path):
     """A scheduled job stopped before firing runs normally after restart."""
     job_id = "job-never-fired"
     due = _due_iso()
@@ -86,11 +87,14 @@ async def test_job_not_fired_before_stop_fires_after_restart(
 
     svc1 = await make_durable_service(durable_db_path, scripts=None)
     await svc1._store_schedules.upsert_job(
-        job_id, "never-fired", payload={
+        job_id,
+        "never-fired",
+        payload={
             "template": {"objective": "SCHED_FIRED_OK", "session_id": token},
         },
         trigger_spec={"type": "once", "at": due},
-        enabled=True, next_run=due,
+        enabled=True,
+        next_run=due,
     )
     await svc1.stop()  # stopped before it fired
 
@@ -104,13 +108,17 @@ async def test_job_not_fired_before_stop_fires_after_restart(
     assert run["status"] == "FIRED", run["status"]
     assert run["task_id"], "fired occurrence missing a linked task"
     status = await svc2.get_task_status(run["task_id"])
-    assert status in (TaskStatus.COMPLETE.value, TaskStatus.RUNNING.value,
-                      TaskStatus.QUEUED.value), status
+    assert status in (
+        TaskStatus.COMPLETE.value,
+        TaskStatus.RUNNING.value,
+        TaskStatus.QUEUED.value,
+    ), status
 
 
 def _occurrence_task(job_id: str, scheduled_for: str, session_id: str):
     """Build a TaskSpec matching the scheduler's deterministic occurrence key."""
     from athena.protocol.tasks import TaskSpec
+
     return TaskSpec(
         id=new_id("task"),
         objective="SCHED_MIDFIRE",

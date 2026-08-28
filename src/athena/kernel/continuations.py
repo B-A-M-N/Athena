@@ -8,6 +8,7 @@ continuation — the call identity, canonical arguments, schema hash and
 effects — so a restarted service can reconstruct what to re-dispatch once an
 approval resolves.
 """
+
 from __future__ import annotations
 
 import json
@@ -134,8 +135,7 @@ class ContinuationStore:
             )
         else:
             rows = await self._db.fetch_all(
-                "SELECT * FROM continuations WHERE resolved_at IS NULL "
-                "ORDER BY created_at ASC"
+                "SELECT * FROM continuations WHERE resolved_at IS NULL ORDER BY created_at ASC"
             )
         return [_decode_row(r) for r in rows]
 
@@ -191,8 +191,7 @@ class ContinuationStore:
         """Return an unconsumed claim to the recovery queue after failure."""
         await self.ensure_table()
         await self._db.execute(
-            "UPDATE continuations SET claimed_at = NULL "
-            "WHERE call_id = ? AND consumed_at IS NULL",
+            "UPDATE continuations SET claimed_at = NULL WHERE call_id = ? AND consumed_at IS NULL",
             (call_id,),
         )
 
@@ -243,7 +242,7 @@ class ContinuationStore:
 
 
 def _decode_row(row: dict) -> dict:
-    for key in ("canonical_arguments", "effects"):
+    for key in ("canonical_arguments", "effects", "policy_context"):
         val = row.get(key)
         if val:
             try:

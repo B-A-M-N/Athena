@@ -49,24 +49,18 @@ class SkillValidator:
                 errors.append(f"missing required field: {field_}")
 
         if not _NAME_RE.match(skill.name or ""):
-            errors.append(
-                "invalid name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{1,63}"
-            )
+            errors.append("invalid name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{1,63}")
 
         if not isinstance(skill.trust, TrustClass):
             errors.append(f"invalid trust class: {skill.trust!r}")
 
         if skill.scope not in _VALID_SCOPES:
-            warnings.append(
-                f"unknown scope {skill.scope!r}; expected {sorted(_VALID_SCOPES)}"
-            )
+            warnings.append(f"unknown scope {skill.scope!r}; expected {sorted(_VALID_SCOPES)}")
 
         if not isinstance(skill.version, int) or skill.version < 1:
             errors.append("version must be a positive integer")
 
-        bad_triggers = [
-            t for t in skill.triggers if not _TRIGGER_RE.match(t or "")
-        ]
+        bad_triggers = [t for t in skill.triggers if not _TRIGGER_RE.match(t or "")]
         if bad_triggers:
             errors.append(
                 f"invalid trigger value(s): {bad_triggers[:3]!r} (1-80 chars, single line)"
@@ -82,16 +76,13 @@ class SkillValidator:
                 )
             if _WARNING_RE.search(skill.body):
                 warnings.append(
-                    "body references execution/shell concepts; ensure "
-                    "instructions-only framing"
+                    "body references execution/shell concepts; ensure instructions-only framing"
                 )
 
         if skill.description and len(skill.description) > 2000:
             warnings.append("description is unusually long")
 
-        return ValidationResult(
-            ok=not errors, errors=tuple(errors), warnings=tuple(warnings)
-        )
+        return ValidationResult(ok=not errors, errors=tuple(errors), warnings=tuple(warnings))
 
     def validate_candidate(self, candidate: "object") -> ValidationResult:
         from athena.skills.models import SkillCandidate

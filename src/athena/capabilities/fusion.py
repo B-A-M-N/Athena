@@ -32,16 +32,31 @@ class FusionCapability:
             "and capture workspace checkpoints."
         ),
         input_schema={
-            "type": "object", "required": ["operation"],
+            "type": "object",
+            "required": ["operation"],
             "properties": {
-                "operation": {"type": "string", "enum": [
-                    "run", "status", "commit", "discard", "fork", "checkpoint",
-                ]},
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "run",
+                        "compare",
+                        "status",
+                        "commit",
+                        "discard",
+                        "fork",
+                        "checkpoint",
+                        "inspect_checkpoint",
+                        "release_checkpoint",
+                    ],
+                },
                 "branch_id": {"type": "string", "minLength": 1, "maxLength": 128},
                 "proposal": {
-                    "type": "array", "minItems": 1, "maxItems": 100,
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
                     "items": {
-                        "type": "object", "required": ["capability_id", "arguments"],
+                        "type": "object",
+                        "required": ["capability_id", "arguments"],
                         "properties": {
                             "capability_id": {"type": "string", "minLength": 1, "maxLength": 128},
                             "arguments": {"type": "object"},
@@ -49,12 +64,37 @@ class FusionCapability:
                         "additionalProperties": False,
                     },
                 },
+                "proposals": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "required": ["capability_id", "arguments"],
+                            "properties": {
+                                "capability_id": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 128,
+                                },
+                                "arguments": {"type": "object"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
                 "criteria_probes": {
-                    "type": "array", "maxItems": 100,
+                    "type": "array",
+                    "maxItems": 100,
                     "items": {"type": "object", "additionalProperties": True},
                 },
                 "invariants": {
-                    "type": "array", "maxItems": 100,
+                    "type": "array",
+                    "maxItems": 100,
                     "items": {"type": "object", "additionalProperties": True},
                 },
                 "profile": {"type": "string", "maxLength": 128},
@@ -66,20 +106,37 @@ class FusionCapability:
                 "reason": {"type": "string"},
             },
             "oneOf": [
-                {"properties": {"operation": {"const": "run"}},
-                 "required": ["proposal"]},
-                {"properties": {"operation": {"enum": ["status", "commit", "discard"]}},
-                 "required": ["branch_id"]},
-                {"properties": {"operation": {"const": "fork"}},
-                 "required": ["after_event_sequence"]},
+                {"properties": {"operation": {"const": "run"}}, "required": ["proposal"]},
+                {"properties": {"operation": {"const": "compare"}}, "required": ["proposals"]},
+                {
+                    "properties": {"operation": {"enum": ["status", "commit", "discard"]}},
+                    "required": ["branch_id"],
+                },
+                {
+                    "properties": {"operation": {"const": "fork"}},
+                    "required": ["after_event_sequence"],
+                },
+                {
+                    "properties": {"operation": {"const": "inspect_checkpoint"}},
+                    "required": ["checkpoint_id"],
+                },
+                {
+                    "properties": {"operation": {"const": "release_checkpoint"}},
+                    "required": ["checkpoint_id"],
+                },
                 {"properties": {"operation": {"const": "checkpoint"}}},
             ],
             "additionalProperties": False,
         },
-        effects=frozenset({
-            EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL, EffectClass.DELETE,
-            EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS,
-        }),
+        effects=frozenset(
+            {
+                EffectClass.READ_LOCAL,
+                EffectClass.WRITE_LOCAL,
+                EffectClass.DELETE,
+                EffectClass.EXECUTE,
+                EffectClass.SPAWN_PROCESS,
+            }
+        ),
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -107,6 +164,24 @@ class FusionCapability:
                     auto_fork_on_failure=bool(args.get("auto_fork_on_failure", True)),
                 )
                 return _result(request, output=json.dumps(dataclasses.asdict(outcome)))
+            if operation == "compare":
+                proposals = [
+                    [dict(step) for step in proposal] for proposal in args.get("proposals") or ()
+                ]
+                if len(proposals) < 2:
+                    return _result(
+                        request,
+                        ok=False,
+                        error="compare requires at least two proposals",
+                    )
+                outcome = await orchestrator.compare(
+                    task_id=task_id,
+                    proposals=proposals,
+                    criteria_probes=[dict(item) for item in args.get("criteria_probes") or ()],
+                    invariants=[dict(item) for item in args.get("invariants") or ()],
+                    profile=args.get("profile"),
+                )
+                return _result(request, output=json.dumps(outcome))
 
             branch_id = str(args.get("branch_id") or "")
             if operation == "status":
@@ -130,8 +205,7 @@ class FusionCapability:
                 return _result(request, output=json.dumps(outcome))
             if operation == "fork":
                 if "after_event_sequence" not in args:
-                    return _result(request, ok=False,
-                                   error="fork requires after_event_sequence")
+                    return _result(request, ok=False, error="fork requires after_event_sequence")
                 outcome = await orchestrator.fork_from_event(
                     task_id=task_id,
                     after_event_sequence=int(args["after_event_sequence"]),
@@ -142,14 +216,50 @@ class FusionCapability:
             if operation == "checkpoint":
                 workspace = getattr(context, "workspace", None)
                 if workspace is None:
-                    return _result(request, ok=False,
-                                   error="checkpoint requires workspace context")
-                outcome = await orchestrator.checkpoints.capture(
+                    return _result(request, ok=False, error="checkpoint requires workspace context")
+                outcome = await orchestrator.capture_checkpoint(
                     task_id=task_id,
                     workspace_root=workspace.root,
                     label=str(args.get("label") or "operator checkpoint"),
                 )
                 return _result(request, output=json.dumps(outcome))
+            if operation == "inspect_checkpoint":
+                checkpoint_id = str(args.get("checkpoint_id") or "")
+                if not checkpoint_id:
+                    return _result(
+                        request,
+                        ok=False,
+                        error="checkpoint_id is required",
+                    )
+                outcome = await orchestrator.checkpoints.inspect(checkpoint_id)
+                if not _checkpoint_owned_by_task(outcome, task_id):
+                    return _result(request, ok=False, error="checkpoint not found")
+                return _result(request, output=json.dumps(outcome))
+            if operation == "release_checkpoint":
+                checkpoint_id = str(args.get("checkpoint_id") or "")
+                if not checkpoint_id:
+                    return _result(
+                        request,
+                        ok=False,
+                        error="checkpoint_id is required",
+                    )
+                inspected = await orchestrator.checkpoints.inspect(checkpoint_id)
+                if not _checkpoint_owned_by_task(inspected, task_id):
+                    return _result(request, ok=False, error="checkpoint not found")
+                released = await orchestrator.checkpoints.release(
+                    checkpoint_id,
+                    owner=task_id,
+                )
+                return _result(
+                    request,
+                    output=json.dumps(
+                        {
+                            "checkpoint_id": checkpoint_id,
+                            "released": True,
+                            "deleted": bool(released),
+                        }
+                    ),
+                )
             return _result(request, ok=False, error=f"unknown fusion operation: {operation}")
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             return _result(request, ok=False, error=str(exc))
@@ -182,11 +292,26 @@ def _owned_branch(orchestrator: Any, branch_id: str, task_id: str) -> Any | None
     return branch
 
 
+def _checkpoint_owned_by_task(checkpoint: Any, task_id: str) -> bool:
+    """Keep checkpoint inspection/release inside the creating task scope.
+
+    Older checkpoint adapters and small test doubles may omit ``task_id``;
+    those are accepted for compatibility. Durable manifests always include
+    it, so a real checkpoint cannot be used to probe another task's snapshot.
+    """
+    if not isinstance(checkpoint, dict):
+        return False
+    owner = checkpoint.get("task_id")
+    return owner is None or str(owner) == task_id
+
+
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):
     return CapabilityResult(
-        request.call_id, request.capability_id,
+        request.call_id,
+        request.capability_id,
         CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
-        output=output, error=error,
+        output=output,
+        error=error,
     )
 
 

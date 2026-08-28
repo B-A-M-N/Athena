@@ -12,6 +12,7 @@ from __future__ import annotations
 import platform
 import queue
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -37,11 +38,16 @@ class ShellRuntime(BaseRuntime):
     aliases: tuple[str, ...] = ("bash", "sh", "zsh")
     start_cmd: list[str] | None = None
 
-    def _make_session(self, *, env=None, cwd=None, sandbox_root=None,
-                      network_policy=None) -> "_SubprocessSession":
+    def _make_session(
+        self, *, env=None, cwd=None, sandbox_root=None, network_policy=None
+    ) -> "_SubprocessSession":
         sess = _SubprocessSession(
-            env=env, cwd=cwd, start_cmd=self.start_cmd,
-            sandbox_root=sandbox_root, network_policy=network_policy)
+            env=env,
+            cwd=cwd,
+            start_cmd=self.start_cmd,
+            sandbox_root=sandbox_root,
+            network_policy=network_policy,
+        )
         sess.start()
         return sess
 
@@ -58,8 +64,7 @@ class ShellRuntime(BaseRuntime):
 class _SubprocessSession:
     """One long-lived shell process speaking the OI marker protocol."""
 
-    def __init__(self, env=None, cwd=None, start_cmd=None, sandbox_root=None,
-                 network_policy=None):
+    def __init__(self, env=None, cwd=None, start_cmd=None, sandbox_root=None, network_policy=None):
         self.env = env or {}
         self.cwd = cwd
         self.start_cmd = start_cmd
@@ -70,6 +75,7 @@ class _SubprocessSession:
         self.done = threading.Event()
         self.exit_code: int | None = 0
         self._exit_lock = threading.Lock()
+        self._marker: str | None = None
 
     # -- lifecycle ------------------------------------------------------- #
     def start(self) -> None:
@@ -124,10 +130,11 @@ class _SubprocessSession:
     def _handle_stream(self, stream, is_error):
         try:
             for line in iter(stream.readline, ""):
-                if detect_end_of_execution(line):
-                    marker, _, rest = line.partition("##end_of_execution##")
-                    if marker:
-                        self.output_queue.put({"err": is_error, "text": strip_active_line(marker)})
+                marker_token = self._marker
+                if marker_token and detect_end_of_execution(line, marker_token):
+                    output, _, rest = line.partition(marker_token)
+                    if output:
+                        self.output_queue.put({"err": is_error, "text": strip_active_line(output)})
                     code = _parse_marker_exit_code(rest)
                     if code is not None:
                         with self._exit_lock:
@@ -142,7 +149,8 @@ class _SubprocessSession:
 
     # -- execution -- ---------------------------------------------------- #
     def run(self, code, timeout, execution_id):
-        code_processed = preprocess_shell(code)
+        self._marker = f"##athena_end_{secrets.token_hex(16)}##"
+        code_processed = preprocess_shell(code, marker=self._marker)
         process = self.process
         if process is None or process.poll() is not None:
             self.close()
@@ -241,7 +249,7 @@ class _SubprocessSession:
 # --------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------- #
-def preprocess_shell(code: str) -> str:
+def preprocess_shell(code: str, *, marker: str | None = None) -> str:
     """Run a script as one complete construct without per-line injection.
 
     The whole script is wrapped in a command group (NOT a subshell) so state
@@ -253,37 +261,45 @@ def preprocess_shell(code: str) -> str:
     printed — ``_SubprocessSession.run()`` detects the process death and
     reports the exit code directly; the next execution restarts the shell.
     """
-    wrapped = (
-        "{\n"
-        f"{code}\n"
-        "} ; athena_rc=$?\n"
-        "printf '##end_of_execution##%s\\n' \"$athena_rc\""
-    )
+    marker = marker or "##end_of_execution##"
+    wrapped = f"{{\n{code}\n}} ; athena_rc=$?\nprintf '%s%%s\\n' \"$athena_rc\"" % marker
     return wrapped
 
 
 def _parse_marker_exit_code(rest: str) -> int | None:
-    m = re.search(r"-?\d+", rest)
+    m = re.fullmatch(r"\s*(-?\d+)\s*", rest)
     if m is None:
         return None
     return int(m.group(0))
 
 
-def detect_end_of_execution(line: str) -> bool:
-    return "##end_of_execution##" in line
+def detect_end_of_execution(line: str, marker: str | None = None) -> bool:
+    return (marker or "##end_of_execution##") in line
 
 
 def strip_active_line(line: str) -> str:
     return re.sub(r"##active_line_\d+##", "", line)
 
 
-def detect_error_handler(line: str) -> bool:
-    return "##end_of_execution##" in line
+def detect_error_handler(line: str, marker: str | None = None) -> bool:
+    return detect_end_of_execution(line, marker)
 
 
 def has_multiline_commands(script_text: str) -> bool:
-    patterns = [r"\\$", r"\|$", r"&&\s*$", r"\|\|\s*$", r"<\($", r"\($", r"{\s*$",
-                r"\bif\b", r"\bwhile\b", r"\bfor\b", r"do\s*$", r"then\s*$"]
+    patterns = [
+        r"\\$",
+        r"\|$",
+        r"&&\s*$",
+        r"\|\|\s*$",
+        r"<\($",
+        r"\($",
+        r"{\s*$",
+        r"\bif\b",
+        r"\bwhile\b",
+        r"\bfor\b",
+        r"do\s*$",
+        r"then\s*$",
+    ]
     for line in script_text.splitlines():
         if any(re.search(p, line.rstrip()) for p in patterns):
             return True

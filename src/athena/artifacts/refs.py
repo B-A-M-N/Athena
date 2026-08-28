@@ -85,11 +85,7 @@ async def maybe_artifactize(
 
 def legitimate_excerpt(content: bytes | str, limit: int = EXCERPT_LIMIT) -> str:
     """Return a bounded excerpt; callers use this instead of the full blob."""
-    text = (
-        content.decode("utf-8", errors="replace")
-        if isinstance(content, bytes)
-        else content
-    )
+    text = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else content
     return text[:limit]
 
 

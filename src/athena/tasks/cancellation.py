@@ -31,7 +31,9 @@ class CancellationManager:
     ) -> None:
         self._tasks = task_manager
         self._exec = execution_manager
-        self._store = task_store if task_store is not None else getattr(task_manager, "_store", None)
+        self._store = (
+            task_store if task_store is not None else getattr(task_manager, "_store", None)
+        )
         self._tokens: dict[str, asyncio.Event] = {}
         self._reasons: dict[str, str] = {}
 
@@ -102,8 +104,7 @@ class CancellationManager:
                 try:
                     await self._exec.cancel_task(current)
                 except Exception as exc:
-                    _logger.warning(
-                        "runtime cancel failed for task %s: %s", current, exc)
+                    _logger.warning("runtime cancel failed for task %s: %s", current, exc)
         for current in task_ids:
             await self._transition_status(current, TaskStatus.CANCELLED)
 

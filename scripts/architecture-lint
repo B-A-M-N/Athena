@@ -126,9 +126,11 @@ RULES: tuple[Rule, ...] = (
             # owned short-lived workers / generated-code validation:
             "causal/checkpoint.py",       # checkpoint worker child process
             "synthesis/engine.py",        # sandboxed generated-code validation
+            "synthesis/runtime.py",       # persistent sandboxed generated runtime
             "worldstate/core.py",         # read-only `git status` projection
             "fusion/orchestrator.py",     # comment-only mention (no call)
             "cli/native.py",              # owned native terminal frontend
+            "delegates/sessions.py",      # host-configured specialist transport
         ),
     ),
     Rule(

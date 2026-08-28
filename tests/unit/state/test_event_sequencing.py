@@ -82,11 +82,8 @@ async def test_sequence_continues_across_restart(db):
 async def test_causal_id_persists_and_reads_back(db):
     events = EventStore(db)
     task = await _create_task(events)
-    await events.append_event(
-        "CapabilityRequested", {}, task_id=task.id, causal_id="call-0001"
-    )
-    [event] = [e for e in await events.list_for_task(task.id)
-               if e.type == "CapabilityRequested"]
+    await events.append_event("CapabilityRequested", {}, task_id=task.id, causal_id="call-0001")
+    [event] = [e for e in await events.list_for_task(task.id) if e.type == "CapabilityRequested"]
     assert event.causal_id == "call-0001"
 
 

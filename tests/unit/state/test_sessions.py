@@ -58,4 +58,3 @@ async def test_task_transition_illegal_rejected(repo, db):
         await store.transition("task_2", TaskStatus.RUNNING)
     row = await store.get("task_2")
     assert row["status"] == TaskStatus.COMPLETE.value
-

@@ -28,12 +28,29 @@ mod x11;
 struct ProjectionFrame {
     title: Option<String>,
     status: Option<String>,
+    semantic_state: Option<String>,
     #[serde(default)]
     oi: Vec<String>,
     #[serde(default)]
     entities: Option<Vec<ProjectionEntity>>,
     #[serde(default)]
+    workspace_entities: Option<Vec<ProjectionEntity>>,
+    #[serde(default)]
+    runtime_entities: Option<Vec<ProjectionEntity>>,
+    #[serde(default)]
     alerts: Option<Vec<String>>,
+    #[serde(default)]
+    active_operation: Option<ProjectionOperation>,
+    #[serde(default)]
+    code_view: Option<ProjectionCodeView>,
+    #[serde(default)]
+    diagnostics: Option<Vec<ProjectionDiagnostic>>,
+    #[serde(default)]
+    verification: Option<ProjectionVerification>,
+    #[serde(default)]
+    progress: Option<serde_json::Value>,
+    #[serde(default)]
+    buddy: Option<ProjectionBuddy>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -49,13 +66,94 @@ struct ProjectionEntity {
     parent_id: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionOperation {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    action_kind: String,
+    #[serde(default)]
+    mutation_state: String,
+    #[serde(default)]
+    progress: String,
+    #[serde(default)]
+    progress_value: Option<f64>,
+    #[serde(default)]
+    progress_determinate: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionCodeView {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    lines: Vec<String>,
+    #[serde(default)]
+    diff: Vec<String>,
+    #[serde(default)]
+    mutation_state: String,
+    #[serde(default)]
+    preview_truncated: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionDiagnostic {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    line: Option<i64>,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    detail: String,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionVerification {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    checks: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionBuddy {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    anchor: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    character: String,
+}
+
 #[derive(Debug, Default, Clone)]
 struct Projection {
     title: String,
     status: String,
+    semantic_state: String,
     oi: Vec<String>,
     entities: Vec<ProjectionEntity>,
+    workspace_entities: Vec<ProjectionEntity>,
+    runtime_entities: Vec<ProjectionEntity>,
     alerts: Vec<String>,
+    active_operation: Option<ProjectionOperation>,
+    code_view: Option<ProjectionCodeView>,
+    diagnostics: Vec<ProjectionDiagnostic>,
+    verification: ProjectionVerification,
+    progress: Option<serde_json::Value>,
+    buddy: Option<ProjectionBuddy>,
 }
 
 impl Projection {
@@ -66,15 +164,26 @@ impl Projection {
         if let Some(status) = frame.status {
             self.status = status;
         }
+        if let Some(semantic_state) = frame.semantic_state {
+            self.semantic_state = semantic_state;
+        }
         if !frame.oi.is_empty() {
             self.oi = frame.oi;
         }
         if let Some(entities) = frame.entities {
             self.entities = entities;
         }
+        self.workspace_entities = frame.workspace_entities.unwrap_or_default();
+        self.runtime_entities = frame.runtime_entities.unwrap_or_default();
         if let Some(alerts) = frame.alerts {
             self.alerts = alerts;
         }
+        self.active_operation = frame.active_operation;
+        self.code_view = frame.code_view;
+        self.diagnostics = frame.diagnostics.unwrap_or_default();
+        self.verification = frame.verification.unwrap_or_default();
+        self.progress = frame.progress;
+        self.buddy = frame.buddy;
     }
 }
 
@@ -189,6 +298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         entities: Vec::new(),
         alerts: Vec::new(),
+        ..Projection::default()
     };
 
     let result = if args.headless {

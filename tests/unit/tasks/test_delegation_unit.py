@@ -31,8 +31,11 @@ async def env():
 
 def _spec(objective, session_id, *, budget=None, parent=None):
     return TaskSpec(
-        id=new_id("task"), objective=objective, session_id=session_id,
-        parent_task_id=parent, resource_budget=budget or ResourceBudget(),
+        id=new_id("task"),
+        objective=objective,
+        session_id=session_id,
+        parent_task_id=parent,
+        resource_budget=budget or ResourceBudget(),
     )
 
 
@@ -43,9 +46,7 @@ async def _create(manager, sessions, objective, *, budget=None, parent=None):
 
 
 async def _spawn(delegation, parent_id, objective="child work"):
-    return await delegation.spawn_child(
-        objective=objective, parent_task_id=parent_id
-    )
+    return await delegation.spawn_child(objective=objective, parent_task_id=parent_id)
 
 
 @pytest.mark.athena_claim("BHV-087", "BHV-092")
@@ -75,7 +76,9 @@ async def test_descendant_ownership_is_explicit(env):
 async def test_max_child_depth_blocks_grandchildren(env):
     manager, delegation, sessions = env
     root = await _create(
-        manager, sessions, "root",
+        manager,
+        sessions,
+        "root",
         budget=ResourceBudget(max_child_depth=1, max_children=4),
     )
     child = await _create(manager, sessions, "child", parent=root.id)
@@ -92,7 +95,9 @@ async def test_max_child_depth_blocks_grandchildren(env):
 async def test_child_budget_derived_from_parent(env):
     manager, delegation, sessions = env
     parent = await _create(
-        manager, sessions, "parent",
+        manager,
+        sessions,
+        "parent",
         budget=ResourceBudget(max_agent_iterations=5, max_child_depth=2),
     )
     child_id = await _spawn(delegation, parent.id)

@@ -48,15 +48,26 @@ def select_strategy(objective: str, capability_ids: Iterable[str]) -> StrategyGu
     if any(word in text for word in ("experiment", "shadow", "speculative", "fork")):
         preferred = ("fusion", "workflow", "fs", "execute")
         route = "fusion"
-        rationale = "The objective describes bounded speculative work; prove it in a shadow before commit."
-    elif any(word in text for word in ("research", "compare", "sources", "evidence", "investigate")):
+        rationale = (
+            "The objective describes bounded speculative work; prove it in a shadow before commit."
+        )
+    elif any(
+        word in text for word in ("research", "compare", "sources", "evidence", "investigate")
+    ):
         preferred = ("research", "workflow", "artifacts")
         route = "evidence_acquisition"
-        rationale = "The objective needs sourced evidence, bounded acquisition, and explicit gap handling."
-    elif any(word in text for word in ("build a tool", "create a tool", "automate", "generate a capability")):
+        rationale = (
+            "The objective needs sourced evidence, bounded acquisition, and explicit gap handling."
+        )
+    elif any(
+        word in text
+        for word in ("build a tool", "create a tool", "automate", "generate a capability")
+    ):
         preferred = ("synthesis", "scratch", "workflow")
         route = "synthesize"
-        rationale = "The objective suggests a reusable affordance; validate task-locally before promotion."
+        rationale = (
+            "The objective suggests a reusable affordance; validate task-locally before promotion."
+        )
     elif any(word in text for word in ("workflow", "pipeline", "release", "deploy")):
         preferred = ("workflow", "execute", "fs")
         route = "compose"

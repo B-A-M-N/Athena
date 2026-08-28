@@ -52,15 +52,17 @@ async def test_oi_viewer_does_not_prompt_twice_for_kernel_approval_summary():
         input_fn=lambda _prompt: "1",
         output=StringIO(),
     )
-    await viewer.handle_event(make_event(
-        "ApprovalRequested",
-        {
-            "approval_id": "approval-oi",
-            "capability_id": "execute",
-            "scopes": ["call", "task"],
-            "reason": "execution requires authorization",
-        },
-    ))
+    await viewer.handle_event(
+        make_event(
+            "ApprovalRequested",
+            {
+                "approval_id": "approval-oi",
+                "capability_id": "execute",
+                "scopes": ["call", "task"],
+                "reason": "execution requires authorization",
+            },
+        )
+    )
     await viewer.handle_event(make_event("ApprovalRequested", {"calls": 1}))
 
     assert service.approvals == [("approval-oi", True, "call")]

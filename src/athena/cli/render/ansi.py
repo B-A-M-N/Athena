@@ -106,9 +106,7 @@ class CellGridDiffRenderer:
                         row,
                     )
                 )
-            payload = "".join(
-                f"{ESC}{span.row + 1};{span.start + 1}H{span.text}" for span in spans
-            )
+            payload = "".join(f"{ESC}{span.row + 1};{span.start + 1}H{span.text}" for span in spans)
         self._previous = current
         self.last_changed_spans = tuple(spans)
         if payload:

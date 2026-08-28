@@ -135,7 +135,9 @@ class SecretManager:
             EnvSource(),
             FileSource("/etc/athena/secrets"),
         ]
-        self._sources: list[SecretSource] = list(sources) if sources is not None else default_sources
+        self._sources: list[SecretSource] = (
+            list(sources) if sources is not None else default_sources
+        )
         self._leases: list[CredentialLease] = []
         self._delegations: list[SecretDelegation] = []
         self._on_lease = on_lease
@@ -170,17 +172,14 @@ class SecretManager:
         value: the task must own the credential or hold an explicit
         delegation, otherwise the lease is denied.
         """
-        if not self.can_use(
-            task_id, credential_id, parent_task_id, owner_task=owner_task
-        ):
-            raise SecretError(
-                f"task {task_id} not permitted to use credential {credential_id}"
-            )
+        if not self.can_use(task_id, credential_id, parent_task_id, owner_task=owner_task):
+            raise SecretError(f"task {task_id} not permitted to use credential {credential_id}")
         value = self._resolve(credential_id)
         if value is None:
             raise SecretError(f"cannot resolve credential: {credential_id}")
         now = datetime.now()
         from athena.protocol.ids import new_id
+
         lease = CredentialLease(
             credential_id=credential_id,
             task_id=task_id,
@@ -246,9 +245,7 @@ class SecretManager:
     def is_delegated(self, child_task: str, credential_id: str) -> bool:
         now = datetime.now()
         return any(
-            d.child_task == child_task
-            and d.credential_id == credential_id
-            and d.is_valid(now)
+            d.child_task == child_task and d.credential_id == credential_id and d.is_valid(now)
             for d in self._delegations
         )
 

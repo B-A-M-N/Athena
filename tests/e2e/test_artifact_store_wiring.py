@@ -1,5 +1,6 @@
 """E2E test: ArtifactStore is wired into the dispatcher so mutations capture
 before-state and rollback restores it."""
+
 from __future__ import annotations
 
 import os
@@ -55,5 +56,6 @@ async def test_artifact_store_persists_artifacts():
 
 if __name__ == "__main__":
     import asyncio
+
     asyncio.run(test_artifact_store_injected_into_dispatcher())
     asyncio.run(test_artifact_store_persists_artifacts())

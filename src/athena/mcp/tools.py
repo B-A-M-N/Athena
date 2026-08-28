@@ -31,21 +31,59 @@ _SERVER_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_.+-]")
 
 _MUTATING_VERBS = frozenset(
     {
-        "create", "insert", "update", "set", "put", "write", "add", "delete",
-        "remove", "drop", "patch", "modify", "save", "append", "post", "push",
-        "send", "publish", "upsert", "edit", "destroy", "revoke", "grant",
-        "start", "stop", "kill", "restart", "upload", "archive", "move", "copy",
-        "merge", "replace",
+        "create",
+        "insert",
+        "update",
+        "set",
+        "put",
+        "write",
+        "add",
+        "delete",
+        "remove",
+        "drop",
+        "patch",
+        "modify",
+        "save",
+        "append",
+        "post",
+        "push",
+        "send",
+        "publish",
+        "upsert",
+        "edit",
+        "destroy",
+        "revoke",
+        "grant",
+        "start",
+        "stop",
+        "kill",
+        "restart",
+        "upload",
+        "archive",
+        "move",
+        "copy",
+        "merge",
+        "replace",
     }
 )
 _NETWORK_TOKENS = (
-    "http", "https", "url", "web", "api", "network", "remote", "github",
-    "slack", "gmail", "twitter", "fetch", "request", "socket",
+    "http",
+    "https",
+    "url",
+    "web",
+    "api",
+    "network",
+    "remote",
+    "github",
+    "slack",
+    "gmail",
+    "twitter",
+    "fetch",
+    "request",
+    "socket",
 )
 
-_KNOWN_TYPES = frozenset(
-    {"string", "boolean", "number", "integer", "object", "array", "null"}
-)
+_KNOWN_TYPES = frozenset({"string", "boolean", "number", "integer", "object", "array", "null"})
 
 
 def sanitize_server_name(name: str) -> str:

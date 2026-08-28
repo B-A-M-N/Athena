@@ -226,7 +226,9 @@ def _render_result(result: Any, task_id: str) -> None:
     for art in getattr(result, "artifacts", ()) or ():
         print(f"  artifact  : {_fmt(getattr(art, 'uri', art))}")
     for mut in getattr(result, "mutations", ()) or ():
-        print(f"  mutation  : {_fmt(getattr(mut, 'resource', mut))} ({_fmt(getattr(mut, 'operation', ''))})")
+        print(
+            f"  mutation  : {_fmt(getattr(mut, 'resource', mut))} ({_fmt(getattr(mut, 'operation', ''))})"
+        )
     for un in getattr(result, "unresolved", ()) or ():
         print(f"  unresolved: {un}")
     evidence = getattr(result, "evidence", ()) or ()

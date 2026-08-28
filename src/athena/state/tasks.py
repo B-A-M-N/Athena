@@ -77,9 +77,7 @@ class TaskStore:
     async def transition(self, task_id: str, new_status: TaskStatus) -> None:
         """Atomically transition a task, enforcing protocol LEGAL_TRANSITIONS."""
         async with self._db.transaction():
-            row = await self._db.fetch_one_raw(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,)
-            )
+            row = await self._db.fetch_one_raw("SELECT status FROM tasks WHERE id = ?", (task_id,))
             if row is None:
                 raise KeyError(f"Task not found: {task_id}")
             current = TaskStatus(row["status"])
@@ -160,9 +158,7 @@ class TaskStore:
 
     async def set_retry_count(self, task_id: str, count: int) -> None:
         """Persist ``worker_retries`` into the task's metadata column."""
-        row = await self._db.fetch_one(
-            "SELECT metadata FROM tasks WHERE id = ?", (task_id,)
-        )
+        row = await self._db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
         if row is None:
             return
         try:
@@ -186,6 +182,7 @@ class TaskStore:
         mutations: Any,
         unresolved: Any,
         usage: Any,
+        allow_recovery_completion: bool = False,
     ) -> None:
         """Persist a result row for an existing task without a status transition.
 
@@ -220,20 +217,26 @@ class TaskStore:
         mutations: Any,
         unresolved: Any,
         usage: Any,
+        allow_recovery_completion: bool = False,
     ) -> None:
         """Atomically transition a task to a terminal status and persist its
         result in a single transaction (BUILDSPEC §86): a crash cannot leave a
         terminal task with no result.
         """
         async with self._db.transaction():
-            row = await self._db.fetch_one_raw(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,)
-            )
+            row = await self._db.fetch_one_raw("SELECT status FROM tasks WHERE id = ?", (task_id,))
             if row is None:
                 raise KeyError(f"Task not found: {task_id}")
             current = TaskStatus(row["status"])
             allowed = current.legal_transitions()
-            if status not in allowed:
+            if (
+                not (
+                    allow_recovery_completion
+                    and current in {TaskStatus.INTERRUPTED, TaskStatus.RECOVERY_REQUIRED}
+                    and status is TaskStatus.COMPLETE
+                )
+                and status not in allowed
+            ):
                 raise ValueError(
                     f"Illegal transition {current.value} -> {status.value}; "
                     f"allowed: {sorted(s.value for s in allowed)}"
@@ -293,9 +296,7 @@ class TaskStore:
                 "UPDATE tasks SET status = ?, updated_at = ?, started_at = ? WHERE id = ?",
                 (running.value, now, now, task_id),
             )
-            claimed = await self._db.fetch_one_raw(
-                "SELECT * FROM tasks WHERE id = ?", (task_id,)
-            )
+            claimed = await self._db.fetch_one_raw("SELECT * FROM tasks WHERE id = ?", (task_id,))
             return _decode_task_row(claimed) if claimed else None
 
     async def claim_with_lease(
@@ -355,9 +356,7 @@ class TaskStore:
                 f"WHERE {cas_where}",
                 (now_iso, now_iso, worker_id, now_iso, lease_expires.isoformat(), *cas_params),
             )
-            claimed = await self._db.fetch_one_raw(
-                "SELECT * FROM tasks WHERE id = ?", (task_id,)
-            )
+            claimed = await self._db.fetch_one_raw("SELECT * FROM tasks WHERE id = ?", (task_id,))
             return _decode_task_row(claimed) if claimed else None
 
     async def acquire_with_ownership(
@@ -392,7 +391,9 @@ class TaskStore:
             elif current == running:
                 lease_expires = row.get("lease_expires_at")
                 expires = _parse_iso(lease_expires) if lease_expires else None
-                owned_by_other = row.get("claimed_by") is not None and row.get("claimed_by") != worker_id
+                owned_by_other = (
+                    row.get("claimed_by") is not None and row.get("claimed_by") != worker_id
+                )
                 if expires is not None and expires <= now:
                     pass  # lease expired: allow re-acquire by new worker
                 elif owned_by_other:
@@ -416,9 +417,7 @@ class TaskStore:
                     task_id,
                 ),
             )
-            claimed = await self._db.fetch_one_raw(
-                "SELECT * FROM tasks WHERE id = ?", (task_id,)
-            )
+            claimed = await self._db.fetch_one_raw("SELECT * FROM tasks WHERE id = ?", (task_id,))
             return _decode_task_row(claimed) if claimed else None
 
 

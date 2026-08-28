@@ -59,7 +59,7 @@ _logger = logging.getLogger("athena.provider.anthropic")
 
 def _load_anthropic():
     try:
-        import anthropic  # type: ignore
+        import anthropic
 
         return anthropic
     except ImportError:
@@ -87,16 +87,25 @@ def _done_event(
     metadata: dict[str, Any] | None = None,
 ) -> ModelEvent:
     request_keys = (
-        "task_id", "session_id", "provider_profile_id",
-        "provider_profile_fingerprint", "profile_id", "model_id",
-        "compatibility_profile", "model_profile", "protocol",
-        "tool_repair_mode", "max_tool_correction_cycles", "cache_mode",
-        "cache_session_key", "prefix_fingerprint", "full_fingerprint",
+        "task_id",
+        "session_id",
+        "provider_profile_id",
+        "provider_profile_fingerprint",
+        "profile_id",
+        "model_id",
+        "compatibility_profile",
+        "model_profile",
+        "protocol",
+        "tool_repair_mode",
+        "max_tool_correction_cycles",
+        "cache_mode",
+        "cache_session_key",
+        "prefix_fingerprint",
+        "full_fingerprint",
         "components_fp",
     )
     response_metadata = {
-        key: request.metadata[key]
-        for key in request_keys if key in request.metadata
+        key: request.metadata[key] for key in request_keys if key in request.metadata
     }
     response_metadata.update(metadata or {})
     usage = usage or UsageInfo()
@@ -195,9 +204,7 @@ class AnthropicProvider:
             if content.type == "text" and getattr(content, "text", None):
                 blocks.append(TextBlock(type="text", text=content.text))
             elif content.type == "thinking" and getattr(content, "thinking", None):
-                blocks.append(
-                    ReasoningBlock(type="reasoning", text=content.thinking)
-                )
+                blocks.append(ReasoningBlock(type="reasoning", text=content.thinking))
             elif content.type == "tool_use":
                 call_id = content.id or new_id("call")
                 raw_input = json.dumps(
@@ -248,10 +255,7 @@ class AnthropicProvider:
                     }
                 },
             ),
-            metadata=(
-                {"response_id": response.id}
-                if getattr(response, "id", None) else None
-            ),
+            metadata=({"response_id": response.id} if getattr(response, "id", None) else None),
         )
 
     async def _complete_rest(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
@@ -285,14 +289,14 @@ class AnthropicProvider:
             "stream": stream,
         }
         if system:
-            if request.metadata.get("cache_mode") in {
-                "session-key", "explicit-cache-api"
-            }:
-                kwargs["system"] = [{
-                    "type": "text",
-                    "text": system,
-                    "cache_control": {"type": "ephemeral"},
-                }]
+            if request.metadata.get("cache_mode") in {"session-key", "explicit-cache-api"}:
+                kwargs["system"] = [
+                    {
+                        "type": "text",
+                        "text": system,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
             else:
                 kwargs["system"] = system
         if request.max_tokens is not None:
@@ -322,34 +326,43 @@ class AnthropicProvider:
                 if isinstance(block, (TextBlock, ReasoningBlock)) and block.text:
                     content.append({"type": "text", "text": block.text})
                 elif isinstance(block, ImageBlock) and block.data_path:
-                    content.append({
-                        "type": "image",
-                        "source": {
-                            "type": "url", "url": block.data_path,
-                        },
-                    })
+                    content.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": block.data_path,
+                            },
+                        }
+                    )
                 elif isinstance(block, ArtifactRefBlock) and block.uri:
                     # Anthropic has no portable artifact-ref block. Keep the
                     # reference visible to the model instead of silently
                     # dropping durable context; callers that need native
                     # media should resolve it to an image/data URL first.
-                    content.append({
-                        "type": "text",
-                        "text": f"[artifact attachment: {block.uri}]",
-                    })
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": f"[artifact attachment: {block.uri}]",
+                        }
+                    )
                 elif isinstance(block, FileRefBlock) and block.uri:
-                    content.append({
-                        "type": "text",
-                        "text": f"[file attachment: {block.uri}]",
-                    })
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": f"[file attachment: {block.uri}]",
+                        }
+                    )
                 elif isinstance(block, AudioBlock) and block.data_path:
                     # Anthropic Messages currently has no canonical audio
                     # input block. Preserve the attachment explicitly so an
                     # unsupported request is observable rather than omitted.
-                    content.append({
-                        "type": "text",
-                        "text": f"[audio attachment: {block.data_path}]",
-                    })
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": f"[audio attachment: {block.data_path}]",
+                        }
+                    )
                 elif isinstance(block, CapabilityResultBlock):
                     result: dict[str, Any] = {
                         "type": "tool_result",
@@ -427,9 +440,7 @@ class AnthropicProvider:
                     yield ModelEvent(
                         type=ModelEventType.DELTA,
                         request_id=request.request_id,
-                        delta=ModelDelta(
-                            request_id=request.request_id, text=delta["text"]
-                        ),
+                        delta=ModelDelta(request_id=request.request_id, text=delta["text"]),
                     )
                 elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
                     reasoning_parts.append(delta["thinking"])
@@ -457,7 +468,9 @@ class AnthropicProvider:
                     # malformed model call into a valid one silently.
                     raw_input = "".join(slot["input_tokens"])
                     candidate = ToolCallCandidate.parse(
-                        call_id, slot["name"], raw_input,
+                        call_id,
+                        slot["name"],
+                        raw_input,
                         completion_state="CLEAN" if stream_complete else "INTERRUPTED",
                         provider_profile_id=request.metadata.get("provider_profile_id"),
                         model_id=request.model,
@@ -503,9 +516,7 @@ class AnthropicProvider:
             if content.get("type") == "text" and content.get("text"):
                 blocks.append(TextBlock(type="text", text=content["text"]))
             elif content.get("type") == "thinking" and content.get("thinking"):
-                blocks.append(ReasoningBlock(
-                    type="reasoning", text=content["thinking"]
-                ))
+                blocks.append(ReasoningBlock(type="reasoning", text=content["thinking"]))
             elif content.get("type") == "tool_use":
                 call_id = content.get("id") or new_id("call")
                 raw_input = content.get("input")

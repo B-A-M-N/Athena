@@ -56,11 +56,17 @@ async def test_protected_items_never_dropped():
     compressor = ContextCompressor(recent_turns=0)
 
     objective = _sel(
-        "objective", "the mission objective text",
-        category="user_task", mandatory=True, created_at=now,
+        "objective",
+        "the mission objective text",
+        category="user_task",
+        mandatory=True,
+        created_at=now,
     )
     approval = _sel(
-        "approval", "approval payload", category="approval", created_at=now,
+        "approval",
+        "approval payload",
+        category="approval",
+        created_at=now,
     )
     old = _sel("old", "d " * 300, created_at=now - timedelta(hours=9))
 

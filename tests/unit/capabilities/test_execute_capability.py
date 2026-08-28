@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from athena.capabilities.execute import ExecuteCapability
-from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus, InvocationContext
+from athena.protocol.capabilities import (
+    CapabilityRequest,
+    CapabilityResultStatus,
+    InvocationContext,
+)
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionEventType,
@@ -21,9 +25,7 @@ class _ExecutionManager:
 
     async def stream(self, request, execution_id):
         yield ExecutionEvent(ExecutionEventType.STDOUT, execution_id, data="hello")
-        yield ExecutionEvent(
-            ExecutionEventType.STDERR, execution_id, data="warning: degraded"
-        )
+        yield ExecutionEvent(ExecutionEventType.STDERR, execution_id, data="warning: degraded")
         yield ExecutionEvent(
             ExecutionEventType.EXITED,
             execution_id,
@@ -45,7 +47,9 @@ async def test_execute_forwards_live_output_to_accumulator(tmp_path):
     sink = _Sink()
     result = await capability.invoke(
         CapabilityRequest(
-            capability_id="execute", task_id="task-a", call_id="exec-1",
+            capability_id="execute",
+            task_id="task-a",
+            call_id="exec-1",
             arguments={"language": "python", "code": "print('hello')"},
         ),
         output_accumulator=sink,
@@ -62,7 +66,9 @@ async def test_execute_rejects_unknown_language_without_falling_back(tmp_path):
     capability = ExecuteCapability(_ExecutionManager())
     result = await capability.invoke(
         CapabilityRequest(
-            capability_id="execute", task_id="task-a", call_id="exec-2",
+            capability_id="execute",
+            task_id="task-a",
+            call_id="exec-2",
             arguments={"language": "made-up", "code": "noop"},
         ),
         context=InvocationContext(workspace=WorkspaceSpec(id="repo", root=str(tmp_path))),

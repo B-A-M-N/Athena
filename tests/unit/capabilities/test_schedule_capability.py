@@ -76,4 +76,3 @@ async def test_schedule_api_rejects_incomplete_trigger_contract(trigger, message
             owner={"task_id": "task-a"},
         )
     await db.close()
-

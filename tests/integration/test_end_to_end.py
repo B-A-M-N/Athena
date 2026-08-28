@@ -4,6 +4,7 @@ These run the full composition root (TaskManager -> TaskWorker -> AgentKernel ->
 real in-memory stores -> background worker / scheduler) against a scripted fake
 model. Every test uses a fresh :func:`AthenaService.in_memory` instance.
 """
+
 from __future__ import annotations
 import pytest
 
@@ -51,6 +52,7 @@ async def test_non_blocking_submit_runs_via_worker(make_service):
         if (await svc.get_task_status(task.id)) == TaskStatus.COMPLETE.value:
             break
         from asyncio import sleep
+
         await sleep(0.02)
     assert await svc.get_task_status(task.id) == TaskStatus.COMPLETE.value
 
@@ -59,19 +61,27 @@ async def test_non_blocking_submit_runs_via_worker(make_service):
 @pytest.mark.athena_evidence("test", "e2e")
 async def test_cancel_park_result_is_cancelled(make_service):
     """A task parked on approval can be cancelled -> CANCELLED, not FAILED."""
-    svc = await make_service(scripts=[
-        {"match": {"user_contains": "STALL_ME"},
-         "respond": {"capability_call": {
-             "capability_id": "execute",
-             "arguments": {"language": "sh", "code": "sleep 30"},
-         }}},
-    ])
-    task = await svc.submit(AgentRequest(prompt="STALL_ME now", session_id=new_id("session")),
-                            wait=False)
+    svc = await make_service(
+        scripts=[
+            {
+                "match": {"user_contains": "STALL_ME"},
+                "respond": {
+                    "capability_call": {
+                        "capability_id": "execute",
+                        "arguments": {"language": "sh", "code": "sleep 30"},
+                    }
+                },
+            },
+        ]
+    )
+    task = await svc.submit(
+        AgentRequest(prompt="STALL_ME now", session_id=new_id("session")), wait=False
+    )
     for _ in range(150):
         if (await svc.get_task_status(task.id)) == TaskStatus.WAITING_APPROVAL.value:
             break
         from asyncio import sleep
+
         await sleep(0.02)
     assert await svc.get_task_status(task.id) == TaskStatus.WAITING_APPROVAL.value
 
@@ -84,13 +94,19 @@ async def test_cancel_park_result_is_cancelled(make_service):
 @pytest.mark.athena_evidence("test", "e2e")
 async def test_budget_exhaustion_yields_partial_not_failed(make_service):
     """A tiny iteration budget ends PARTIAL, never FAILED, after real work."""
-    svc = await make_service(scripts=[
-        {"match": {"user_contains": "BUDGET_TICK"},
-         "respond": {"capability_call": {
-             "capability_id": "execute",
-             "arguments": {"language": "sh", "code": "echo tick"},
-         }}},
-    ])
+    svc = await make_service(
+        scripts=[
+            {
+                "match": {"user_contains": "BUDGET_TICK"},
+                "respond": {
+                    "capability_call": {
+                        "capability_id": "execute",
+                        "arguments": {"language": "sh", "code": "echo tick"},
+                    }
+                },
+            },
+        ]
+    )
     # submit() cannot carry a custom budget (see source note); build the spec
     # with the real stores and let the worker + kernel drive it integration-real.
     spec = TaskSpec(

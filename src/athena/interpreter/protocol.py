@@ -28,14 +28,14 @@ class InterpreterObservation:
     observation warrants interpreter reasoning.
     """
 
-    kind: str                          # "runtime.evaluate" | "terminal.screen" | ...
+    kind: str  # "runtime.evaluate" | "terminal.screen" | ...
     payload: dict[str, Any] = field(default_factory=dict)
     task_id: str | None = None
     session_id: str | None = None
     execution_id: str | None = None
     runtime_session_id: str | None = None
     process_ref: str | None = None
-    artifact_uri: str | None = None    # large outputs live in artifacts
+    artifact_uri: str | None = None  # large outputs live in artifacts
 
 
 @dataclass(frozen=True)

@@ -66,14 +66,10 @@ async def test_capability_event_payload_redacts_secret(tmp_path):
 
     payloads = [ev for ev in events]
     assert payloads, "expected at least one emitted event"
-    raw_found = any(
-        _SECRET in json.dumps(_as_dict(p), default=str) for p in payloads
-    )
+    raw_found = any(_SECRET in json.dumps(_as_dict(p), default=str) for p in payloads)
     assert not raw_found, "raw secret leaked into an event payload"
     # The redaction marker is present somewhere.
-    redacted_found = any(
-        "REDACTED" in json.dumps(_as_dict(p), default=str) for p in payloads
-    )
+    redacted_found = any("REDACTED" in json.dumps(_as_dict(p), default=str) for p in payloads)
     assert redacted_found
 
 

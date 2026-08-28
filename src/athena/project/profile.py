@@ -7,21 +7,46 @@ import json
 import os
 import re
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 _IGNORED_DIRS = {
-    ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
-    ".pytest_cache", ".mypy_cache", "target", "dist", "build", ".tox",
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "target",
+    "dist",
+    "build",
+    ".tox",
 }
 _SOURCE_EXTENSIONS = {
-    ".py": "Python", ".pyi": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
-    ".ts": "TypeScript", ".tsx": "TypeScript", ".go": "Go", ".rs": "Rust",
-    ".java": "Java", ".kt": "Kotlin", ".rb": "Ruby", ".php": "PHP",
-    ".c": "C", ".h": "C", ".cpp": "C++", ".cc": "C++", ".cs": "C#",
-    ".swift": "Swift", ".sh": "Shell", ".ps1": "PowerShell",
+    ".py": "Python",
+    ".pyi": "Python",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".java": "Java",
+    ".kt": "Kotlin",
+    ".rb": "Ruby",
+    ".php": "PHP",
+    ".c": "C",
+    ".h": "C",
+    ".cpp": "C++",
+    ".cc": "C++",
+    ".cs": "C#",
+    ".swift": "Swift",
+    ".sh": "Shell",
+    ".ps1": "PowerShell",
 }
 _PROFILE_FILES = {
     "pyproject.toml": ("Python", "pyproject"),
@@ -48,6 +73,37 @@ _IMPORT_PATTERNS = (
 
 
 @dataclass(frozen=True)
+class ProjectEnvironment:
+    """Machine-dependent facts kept separate from project identity."""
+
+    root: str
+    commands: dict[str, tuple[str, ...]] | None = None
+    toolchain: dict[str, str] | None = None
+    git: dict[str, str | None] | None = None
+    fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.fingerprint:
+            encoded = json.dumps(
+                self.to_dict(include_fingerprint=False),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            object.__setattr__(self, "fingerprint", hashlib.sha256(encoded).hexdigest())
+
+    def to_dict(self, *, include_fingerprint: bool = True) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "root": self.root,
+            "commands": {key: list(value) for key, value in (self.commands or {}).items()},
+            "toolchain": dict(self.toolchain or {}),
+            "git": dict(self.git or {}),
+        }
+        if include_fingerprint:
+            result["fingerprint"] = self.fingerprint
+        return result
+
+
+@dataclass(frozen=True)
 class ProjectProfile:
     root: str
     languages: tuple[str, ...] = ()
@@ -60,12 +116,19 @@ class ProjectProfile:
     commands: dict[str, tuple[str, ...]] | None = None
     toolchain: dict[str, str] | None = None
     git: dict[str, str | None] | None = None
+    environment: ProjectEnvironment | None = None
     fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if not self.fingerprint:
-            encoded = json.dumps(self.to_dict(include_fingerprint=False),
-                                 sort_keys=True, separators=(",", ":")).encode()
+            # PATH/toolchain discovery and live git placement are environment
+            # facts. They must not alter the intrinsic project identity.
+            intrinsic = self.to_dict(include_fingerprint=False)
+            intrinsic.pop("commands", None)
+            intrinsic.pop("toolchain", None)
+            intrinsic.pop("git", None)
+            intrinsic.pop("environment", None)
+            encoded = json.dumps(intrinsic, sort_keys=True, separators=(",", ":")).encode()
             object.__setattr__(self, "fingerprint", hashlib.sha256(encoded).hexdigest())
 
     def to_dict(self, *, include_fingerprint: bool = True) -> dict[str, Any]:
@@ -78,19 +141,24 @@ class ProjectProfile:
             "generated_dirs": list(self.generated_dirs),
             "lockfiles": list(self.lockfiles),
             "entrypoints": list(self.entrypoints),
-            "commands": {
-                key: list(value) for key, value in (self.commands or {}).items()
-            },
+            "commands": {key: list(value) for key, value in (self.commands or {}).items()},
             "toolchain": dict(self.toolchain or {}),
             "git": dict(self.git or {}),
         }
+        if self.environment is not None:
+            result["environment"] = self.environment.to_dict()
         if include_fingerprint:
             result["fingerprint"] = self.fingerprint
         return result
 
 
 class ProjectInspector:
-    """Perform bounded project scans without executing project code."""
+    """Perform bounded project scans without executing project code.
+
+    Pure filesystem/config parsing only — no subprocess.  Git and enriched
+    toolchain facts are layered on by a coordinator that routes through
+    Athena's existing governed surfaces.
+    """
 
     def __init__(self, *, max_files: int = 10_000, max_file_bytes: int = 1_000_000) -> None:
         self.max_files = max_files
@@ -99,8 +167,11 @@ class ProjectInspector:
     def inspect(self, root: str) -> ProjectProfile:
         root_path = Path(os.path.realpath(os.path.abspath(root)))
         files = list(self._files(root_path))
-        languages = {_SOURCE_EXTENSIONS[path.suffix.lower()] for path in files
-                     if path.suffix.lower() in _SOURCE_EXTENSIONS}
+        languages = {
+            _SOURCE_EXTENSIONS[path.suffix.lower()]
+            for path in files
+            if path.suffix.lower() in _SOURCE_EXTENSIONS
+        }
         systems: set[str] = set()
         lockfiles: list[str] = []
         for path in files:
@@ -109,27 +180,41 @@ class ProjectInspector:
                 languages.add(marker[0])
                 systems.add(marker[1])
                 if "lock" in path.name.casefold() or path.name in {
-                    "requirements.txt", "poetry.lock", "Pipfile.lock",
+                    "requirements.txt",
+                    "poetry.lock",
+                    "Pipfile.lock",
                 }:
                     lockfiles.append(self._relative(path, root_path))
 
         relative_files = [self._relative(path, root_path) for path in files]
         source_roots = self._roots(relative_files, {"src", "lib", "app", "source"})
-        test_roots = self._roots(
-            relative_files, {"test", "tests", "__tests__", "spec", "specs"}
-        )
+        test_roots = self._roots(relative_files, {"test", "tests", "__tests__", "spec", "specs"})
         generated_dirs = self._roots(
             relative_files, {"generated", "gen", "build", "dist", "target"}
         )
         entrypoints = [
-            relative for relative in relative_files
-            if Path(relative).name in {
-                "main.py", "__main__.py", "main.go", "main.rs", "index.js",
-                "index.ts", "app.py", "manage.py",
+            relative
+            for relative in relative_files
+            if Path(relative).name
+            in {
+                "main.py",
+                "__main__.py",
+                "main.go",
+                "main.rs",
+                "index.js",
+                "index.ts",
+                "app.py",
+                "manage.py",
             }
         ][:100]
         commands, toolchain = self._commands(languages, systems)
         git = self._git(root_path)
+        environment = ProjectEnvironment(
+            root=str(root_path),
+            commands=commands,
+            toolchain=toolchain,
+            git=git,
+        )
         return ProjectProfile(
             root=str(root_path),
             languages=tuple(sorted(languages)),
@@ -142,6 +227,7 @@ class ProjectInspector:
             commands=commands,
             toolchain=toolchain,
             git=git,
+            environment=environment,
         )
 
     def impact(self, root: str, paths: list[str]) -> dict[str, Any]:
@@ -156,13 +242,15 @@ class ProjectInspector:
                 continue
             relative = self._relative(path, root_path)
             changed.append(relative)
-            targets.update({
-                path.name,
-                path.stem,
-                relative,
-                relative.rsplit(".", 1)[0],
-                relative.replace(os.sep, ".").rsplit(".", 1)[0],
-            })
+            targets.update(
+                {
+                    path.name,
+                    path.stem,
+                    relative,
+                    relative.rsplit(".", 1)[0],
+                    relative.replace(os.sep, ".").rsplit(".", 1)[0],
+                }
+            )
 
         impacted: dict[str, dict[str, Any]] = {}
         for candidate in self._files(root_path):
@@ -187,7 +275,8 @@ class ProjectInspector:
                 for target in targets:
                     if len(target) >= 3 and re.search(
                         rf"(?<![A-Za-z0-9_]){re.escape(Path(target).stem)}"
-                        r"(?![A-Za-z0-9_])", text
+                        r"(?![A-Za-z0-9_])",
+                        text,
                     ):
                         reasons.add(f"mentions {Path(target).stem}")
             if reasons:
@@ -195,8 +284,10 @@ class ProjectInspector:
                     "path": relative,
                     "reasons": sorted(reasons),
                     "confidence": confidence,
-                    "test": any(part in {"test", "tests", "__tests__", "spec", "specs"}
-                                for part in Path(relative).parts),
+                    "test": any(
+                        part in {"test", "tests", "__tests__", "spec", "specs"}
+                        for part in Path(relative).parts
+                    ),
                 }
         return {
             "changed": sorted(set(changed)),
@@ -207,9 +298,7 @@ class ProjectInspector:
     def _files(self, root: Path):
         count = 0
         for directory, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = sorted(
-                name for name in dirnames if name not in _IGNORED_DIRS
-            )
+            dirnames[:] = sorted(name for name in dirnames if name not in _IGNORED_DIRS)
             for name in sorted(filenames):
                 if count >= self.max_files:
                     return
@@ -225,9 +314,9 @@ class ProjectInspector:
 
     @staticmethod
     def _resolve(path: Path, root: Path) -> Path | None:
-        candidate = Path(os.path.realpath(os.path.abspath(
-            str(path) if path.is_absolute() else str(root / path)
-        )))
+        candidate = Path(
+            os.path.realpath(os.path.abspath(str(path) if path.is_absolute() else str(root / path)))
+        )
         if candidate != root and not str(candidate).startswith(str(root) + os.sep):
             return None
         return candidate
@@ -256,20 +345,22 @@ class ProjectInspector:
         }
         for language in sorted(languages):
             available = tuple(
-                command for command in candidates.get(language, ())
+                command
+                for command in candidates.get(language, ())
                 if shutil.which(command.split()[0])
             )
             if available:
                 commands[language.casefold()] = available
             binary = candidates.get(language, ())[0] if candidates.get(language) else None
             if binary and shutil.which(binary):
-                toolchain[language.casefold()] = _version(binary)
+                toolchain[language.casefold()] = str(shutil.which(binary))
         if "npm" in systems and shutil.which("npm"):
-            toolchain["npm"] = _version("npm")
+            toolchain["npm"] = str(shutil.which("npm"))
         return commands, toolchain
 
     @staticmethod
     def _git(root: Path) -> dict[str, str | None]:
+        """Read git facts from the filesystem directly — no subprocess."""
         result: dict[str, str | None] = {
             "repository": "yes" if (root / ".git").exists() else "no",
             "baseline": None,
@@ -277,19 +368,23 @@ class ProjectInspector:
         }
         if result["repository"] != "yes":
             return result
-        for key, command in (
-            ("baseline", ["git", "rev-parse", "HEAD"]),
-            ("branch", ["git", "branch", "--show-current"]),
-        ):
-            try:
-                completed = subprocess.run(
-                    command, cwd=root, capture_output=True, text=True,
-                    timeout=5, check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if completed.returncode == 0:
-                result[key] = completed.stdout.strip() or None
+        git_head = root / ".git" / "HEAD"
+        try:
+            head_text = git_head.read_text(encoding="utf-8").strip()
+        except OSError:
+            return result
+        if head_text.startswith("ref: refs/heads/"):
+            result["branch"] = head_text[len("ref: refs/heads/") :]
+            ref_path = root / ".git" / head_text[5:]
+        else:
+            # Detached HEAD: the file content is the commit sha.
+            result["baseline"] = head_text
+            return result
+        try:
+            result["baseline"] = ref_path.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            # Ref may be packed; the branch name is still valid.
+            pass
         return result
 
 
@@ -299,16 +394,4 @@ def _token_matches(imported: str, target: str) -> bool:
     return imported == target or imported.endswith("." + target) or imported.endswith("/" + target)
 
 
-def _version(binary: str) -> str:
-    try:
-        completed = subprocess.run(
-            [binary, "--version"], capture_output=True, text=True,
-            timeout=3, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "available"
-    line = (completed.stdout or completed.stderr).splitlines()
-    return line[0][:200] if line else "available"
-
-
-__all__ = ["ProjectInspector", "ProjectProfile"]
+__all__ = ["ProjectEnvironment", "ProjectInspector", "ProjectProfile"]

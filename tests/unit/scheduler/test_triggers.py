@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 
 from athena.scheduler.triggers import TriggerSpec, TriggerType, next_fire
+from athena.scheduler.scheduler import _template_from_job
 
 UTC = timezone.utc
 
@@ -65,3 +66,30 @@ async def test_event_trigger_is_advanced_by_event_delivery():
         event_filters={"kind": "report"},
     )
     assert next_fire(trigger, _dt(2026, 3, 15, 10, 30, 15)) is None
+
+
+async def test_scheduled_template_rehydrates_acceptance_criteria():
+    template = _template_from_job(
+        {
+            "id": "job-1",
+            "name": "maintenance",
+            "payload": {
+                "template": {
+                    "objective": "check",
+                    "acceptance_criteria": [
+                        {
+                            "id": "check",
+                            "description": "tests pass",
+                            "verification": {
+                                "type": "command",
+                                "command": "pytest -q",
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+    )
+    spec = template.build_task_spec("job-1")
+    assert spec.acceptance_criteria[0].verification is not None
+    assert spec.acceptance_criteria[0].verification.command == "pytest -q"

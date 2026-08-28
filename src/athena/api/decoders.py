@@ -92,7 +92,9 @@ def decode_workspace(
         try:
             net = NetworkPolicy(str(net))
         except ValueError as exc:
-            raise DecodeError(f"field 'network_policy' must be one of {[p.value for p in NetworkPolicy]}") from exc
+            raise DecodeError(
+                f"field 'network_policy' must be one of {[p.value for p in NetworkPolicy]}"
+            ) from exc
     mutation_mode = data.get("mutation_mode", MutationMode.DIRECT)
     if not isinstance(mutation_mode, MutationMode):
         try:
@@ -175,14 +177,14 @@ def decode_budget(raw: Any) -> ResourceBudget:
     wall = data.get("max_wall_time")
     cost = data.get("max_cost_usd")
     return ResourceBudget(
-        max_agent_iterations=_int(data.get("max_agent_iterations"), 100),
+        max_agent_iterations=_int(data.get("max_agent_iterations"), 500),
         max_input_tokens=_opt_int(data.get("max_input_tokens")),
         max_output_tokens=_opt_int(data.get("max_output_tokens")),
         max_cost_usd=Decimal(str(cost)) if cost else None,
         max_wall_time=timedelta(seconds=float(wall)) if wall else None,
-        max_children=_int(data.get("max_children"), 4),
+        max_children=_int(data.get("max_children"), 16),
         max_child_depth=_int(data.get("max_child_depth"), 1),
         max_parallel_model_calls=_int(data.get("max_parallel_model_calls"), 4),
-        max_parallel_executions=_int(data.get("max_parallel_executions"), 4),
-        max_artifact_bytes=_int(data.get("max_artifact_bytes"), 10 * 1024 * 1024),
+        max_parallel_executions=_int(data.get("max_parallel_executions"), 16),
+        max_artifact_bytes=_int(data.get("max_artifact_bytes"), 100 * 1024 * 1024),
     )

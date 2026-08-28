@@ -13,8 +13,10 @@ import pytest
 from athena.mcp.tools import infer_effects
 from athena.protocol.capabilities import EffectClass
 
+
 def _has(effects, cls) -> bool:
     return cls in effects
+
 
 @pytest.mark.athena_claim("BHV-109")
 @pytest.mark.athena_evidence("test", "invariant")

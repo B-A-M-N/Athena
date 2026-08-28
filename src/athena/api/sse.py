@@ -141,7 +141,7 @@ async def sse_stream(
             generator = maybe
         async for event in generator:
             yield encode_frame(event)
-        yield "id: done\ndata: {\"done\": true}\n\n"
+        yield 'id: done\ndata: {"done": true}\n\n'
 
     response = StreamingResponse(
         event_source(),
@@ -155,7 +155,13 @@ async def sse_stream(
     return response
 
 
-def run(app: Any = None, *, host: str = "127.0.0.1", port: int = 8000, server_config: Mapping[str, Any] | None = None) -> None:
+def run(
+    app: Any = None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    server_config: Mapping[str, Any] | None = None,
+) -> None:
     """Serve the HTTP API with uvicorn.
 
     Both ``service``/``app`` resolution and uvicorn itself are lazy so importing

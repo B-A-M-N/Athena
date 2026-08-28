@@ -93,3 +93,97 @@ async def test_fallback_after_first_choice_fails_respects_privacy():
     assert fallback.provider != first.provider
     # Privacy discipline is preserved: still local.
     assert fallback.info.privacy_class is PrivacyClass.LOCAL
+
+
+async def test_router_uses_role_scoped_reliability_after_policy_filters():
+    slow = _fake("slow", privacy=PrivacyClass.LOCAL)
+    reliable = _fake("reliable", privacy=PrivacyClass.LOCAL)
+    reg = _registry({"slow": slow, "reliable": reliable})
+
+    class Usage:
+        async def list_recent(self, limit=500):
+            del limit
+            return [
+                {
+                    "provider": "slow",
+                    "model": "slow",
+                    "metadata": {
+                        "role": "primary",
+                        "state": "failed",
+                        "duration_ms": 1,
+                    },
+                },
+                {
+                    "provider": "slow",
+                    "model": "slow",
+                    "metadata": {
+                        "role": "primary",
+                        "state": "failed",
+                        "duration_ms": 1,
+                    },
+                },
+                {
+                    "provider": "reliable",
+                    "model": "reliable",
+                    "metadata": {
+                        "role": "primary",
+                        "state": "success",
+                        "duration_ms": 50,
+                    },
+                },
+            ]
+
+    selection = await ModelRouter(reg, usage_provider=Usage()).select(
+        policy=ModelPolicy(require_tools=False),
+    )
+    assert selection.provider == "reliable"
+
+
+async def test_router_cache_keeps_role_histories_separate():
+    primary_model = _fake("primary-model", privacy=PrivacyClass.LOCAL)
+    judge_model = _fake("judge-model", privacy=PrivacyClass.LOCAL)
+    reg = _registry(
+        {
+            "primary-model": primary_model,
+            "judge-model": judge_model,
+        }
+    )
+
+    class Usage:
+        async def list_recent(self, limit=500):
+            del limit
+            return [
+                {
+                    "provider": "primary-model",
+                    "model": "primary-model",
+                    "metadata": {"role": "primary", "state": "failed", "duration_ms": 1},
+                },
+                {
+                    "provider": "judge-model",
+                    "model": "judge-model",
+                    "metadata": {"role": "primary", "state": "success", "duration_ms": 1},
+                },
+                {
+                    "provider": "primary-model",
+                    "model": "primary-model",
+                    "metadata": {"role": "judge", "state": "success", "duration_ms": 1},
+                },
+                {
+                    "provider": "judge-model",
+                    "model": "judge-model",
+                    "metadata": {"role": "judge", "state": "failed", "duration_ms": 1},
+                },
+            ]
+
+    router = ModelRouter(reg, usage_provider=Usage())
+    primary = await router.select(
+        policy=ModelPolicy(role="primary", require_tools=False),
+    )
+    judge = await router.select(
+        policy=ModelPolicy(role="judge", require_tools=False),
+    )
+
+    assert primary.provider == "judge-model"
+    assert judge.provider == "primary-model"
+    assert "history=rolling_attempts" in primary.rationale
+    assert "history=rolling_attempts" in judge.rationale

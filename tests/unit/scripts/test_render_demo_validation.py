@@ -69,12 +69,18 @@ def test_render_demo_script_parses_known_good_dimensions(tmp_path):
     path = tmp_path / "probe.gif"
     path.write_bytes(gif)
     result = subprocess.run(
-        ["bash", "-c",
-         'WIDTH="$(head -c 8 "$1" | tail -c 2 | od -An -tu2 --endian=little | tr -d \' \')" ; '
-         'HEIGHT="$(head -c 10 "$1" | tail -c 2 | od -An -tu2 --endian=little | tr -d \' \')" ; '
-         'echo "${WIDTH}x${HEIGHT}"',
-         "bash", str(path)],
-        capture_output=True, text=True, timeout=30,
+        [
+            "bash",
+            "-c",
+            'WIDTH="$(head -c 8 "$1" | tail -c 2 | od -An -tu2 --endian=little | tr -d \' \')" ; '
+            'HEIGHT="$(head -c 10 "$1" | tail -c 2 | od -An -tu2 --endian=little | tr -d \' \')" ; '
+            'echo "${WIDTH}x${HEIGHT}"',
+            "bash",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "1280x720"
@@ -92,6 +98,7 @@ def test_published_demo_gif_has_correct_header():
     gif_path = REPO_ROOT / "demos" / "capability_fabric.gif"
     if not gif_path.exists():
         import pytest
+
         pytest.skip("demo gif not rendered in this checkout")
     data = gif_path.read_bytes()[:10]
     assert data[:6] in (b"GIF89a", b"GIF87a")

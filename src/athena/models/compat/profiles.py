@@ -76,13 +76,19 @@ class ProviderProfile:
     base_url: str = ""
     model_id: str = ""
     auth_mode: str = AuthMode.OPTIONAL_KEY
-    api_key_ref: str | None = None          # env var NAME, never the value
+    api_key_ref: str | None = None  # env var NAME, never the value
     roles: frozenset[str] = frozenset({"system"})
     capabilities: frozenset[str] = frozenset({"streaming", "tools"})
     cache_mode: str = CacheMode.NONE
     cache_session_key: bool = True
-    timeouts: Mapping[str, float] = field(default_factory=lambda: {
-        "connect": 10.0, "first_event": 120.0, "idle": 300.0, "total": 1800.0})
+    timeouts: Mapping[str, float] = field(
+        default_factory=lambda: {
+            "connect": 10.0,
+            "first_event": 120.0,
+            "idle": 300.0,
+            "total": 1800.0,
+        }
+    )
     compatibility_profile: str = "auto"
     discovery_mode: str = DiscoveryMode.MANUAL
 
@@ -94,15 +100,15 @@ class ProviderProfile:
 class ModelProfile:
     """Declared/observed behavioral quirks for one model family."""
 
-    model_pattern: str                       # prefix match on model id
+    model_pattern: str  # prefix match on model id
     tools_structured: bool = True
     tools_parallel: bool = True
-    tools_textual_fallback: bool = False     # emits pseudo-XML tool calls
+    tools_textual_fallback: bool = False  # emits pseudo-XML tool calls
     reasoning_native: bool = False
-    empty_content_with_tools: bool = False   # sends "" content alongside calls
+    empty_content_with_tools: bool = False  # sends "" content alongside calls
     requires_tool_result_name: bool = False
     requires_assistant_replay_fields: bool = False
-    malformed_json_tendency: bool = False    # benefit from repair pass
+    malformed_json_tendency: bool = False  # benefit from repair pass
     context_window: int | None = None
     output_limit: int | None = None
 
@@ -112,11 +118,11 @@ class CompatibilityProfile:
     """Named repair/replay behavior applied at the model boundary."""
 
     id: str
-    tool_repair: str = "safe"                # safe | strict | off
+    tool_repair: str = "safe"  # safe | strict | off
     max_tool_correction_cycles: int = 2
-    textual_tool_calls: bool = True          # extract textual candidates
+    textual_tool_calls: bool = True  # extract textual candidates
     preserve_reasoning_replay: bool = True
-    strict_mcp_aliases: bool = True          # MCP gets no fuzzy aliases
+    strict_mcp_aliases: bool = True  # MCP gets no fuzzy aliases
 
 
 COMPATIBILITY_PRESETS: dict[str, CompatibilityProfile] = {
@@ -133,13 +139,13 @@ def resolve_compatibility_profile(profile_id: str) -> CompatibilityProfile:
         return COMPATIBILITY_PRESETS[profile_id]
     except KeyError:
         known = ", ".join(sorted(COMPATIBILITY_PRESETS))
-        raise ValueError(
-            f"unknown compatibility profile {profile_id!r}; known: {known}") from None
+        raise ValueError(f"unknown compatibility profile {profile_id!r}; known: {known}") from None
 
 
 # ---------------------------------------------------------------------------
 # Fingerprints (stable serialization -> cache identity + schema hashes)
 # ---------------------------------------------------------------------------
+
 
 def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str)
@@ -151,8 +157,10 @@ def profile_fingerprint(profile: ProviderProfile) -> str:
         # routes currently happen to share identical wire settings. A later
         # profile revision must not silently reuse the old boundary.
         "id": profile.id,
-        "protocol": profile.protocol, "base_url": profile.base_url,
-        "model_id": profile.model_id, "auth_mode": profile.auth_mode,
+        "protocol": profile.protocol,
+        "base_url": profile.base_url,
+        "model_id": profile.model_id,
+        "auth_mode": profile.auth_mode,
         "roles": sorted(profile.roles),
         "capabilities": sorted(profile.capabilities),
         "cache_mode": profile.cache_mode,
@@ -166,22 +174,28 @@ def profile_fingerprint(profile: ProviderProfile) -> str:
 
 
 def schema_fingerprint(schema: Mapping[str, Any]) -> str:
-    return hashlib.sha256(
-        _canonical_json(dict(schema)).encode()).hexdigest()[:16]
+    return hashlib.sha256(_canonical_json(dict(schema)).encode()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
 # Local/OpenAI-compatible presets (base_url/model_id remain independent)
 # ---------------------------------------------------------------------------
 
+
 def _preset(pid: str, base_url: str, *, keyless: bool, protocol: str) -> ProviderProfile:
     return ProviderProfile(
-        id=pid, protocol=protocol, base_url=base_url,
+        id=pid,
+        protocol=protocol,
+        base_url=base_url,
         auth_mode=AuthMode.KEYLESS if keyless else AuthMode.OPTIONAL_KEY,
         capabilities=frozenset({"streaming", "tools"}),
         cache_mode=CacheMode.NONE,
-        timeouts={"connect": 5.0, "first_event": 300.0,
-                  "idle": 600.0, "total": 3600.0},   # local-model friendly
+        timeouts={
+            "connect": 5.0,
+            "first_event": 300.0,
+            "idle": 600.0,
+            "total": 3600.0,
+        },  # local-model friendly
         discovery_mode=DiscoveryMode.MANUAL,
         compatibility_profile="local",
     )
@@ -191,43 +205,52 @@ PRESETS: dict[str, ProviderProfile] = {
     # The deterministic test/local adapter participates in the same
     # provenance chain as network providers; it simply has no wire endpoint.
     "fake": ProviderProfile(
-        id="fake", protocol=Protocol.OPENAI_COMPAT, base_url="",
-        auth_mode=AuthMode.KEYLESS, cache_mode=CacheMode.NONE,
+        id="fake",
+        protocol=Protocol.OPENAI_COMPAT,
+        base_url="",
+        auth_mode=AuthMode.KEYLESS,
+        cache_mode=CacheMode.NONE,
         compatibility_profile="test",
     ),
-    "ollama": _preset("ollama", "http://127.0.0.1:11434/v1",
-                      keyless=True, protocol=Protocol.OPENAI_COMPAT),
-    "lmstudio": _preset("lmstudio", "http://127.0.0.1:1234/v1",
-                        keyless=True, protocol=Protocol.OPENAI_COMPAT),
-    "vllm": _preset("vllm", "http://127.0.0.1:8000/v1",
-                    keyless=True, protocol=Protocol.OPENAI_COMPAT),
-    "llamacpp": _preset("llamacpp", "http://127.0.0.1:8080/v1",
-                        keyless=True, protocol=Protocol.OPENAI_COMPAT),
-    "openai-compat": _preset("openai-compat", "",
-                             keyless=False, protocol=Protocol.OPENAI_COMPAT),
+    "ollama": _preset(
+        "ollama", "http://127.0.0.1:11434/v1", keyless=True, protocol=Protocol.OPENAI_COMPAT
+    ),
+    "lmstudio": _preset(
+        "lmstudio", "http://127.0.0.1:1234/v1", keyless=True, protocol=Protocol.OPENAI_COMPAT
+    ),
+    "vllm": _preset(
+        "vllm", "http://127.0.0.1:8000/v1", keyless=True, protocol=Protocol.OPENAI_COMPAT
+    ),
+    "llamacpp": _preset(
+        "llamacpp", "http://127.0.0.1:8080/v1", keyless=True, protocol=Protocol.OPENAI_COMPAT
+    ),
+    "openai-compat": _preset("openai-compat", "", keyless=False, protocol=Protocol.OPENAI_COMPAT),
     "openai": ProviderProfile(
-        id="openai", protocol=Protocol.OPENAI,
+        id="openai",
+        protocol=Protocol.OPENAI,
         base_url="https://api.openai.com/v1",
-        auth_mode=AuthMode.REQUIRED_KEY, api_key_ref="OPENAI_API_KEY",
-        capabilities=frozenset({"streaming", "tools", "parallel_tools",
-                                "vision", "reasoning"}),
+        auth_mode=AuthMode.REQUIRED_KEY,
+        api_key_ref="OPENAI_API_KEY",
+        capabilities=frozenset({"streaming", "tools", "parallel_tools", "vision", "reasoning"}),
         cache_mode=CacheMode.AUTOMATIC_PREFIX,
         compatibility_profile="hosted",
     ),
     "anthropic": ProviderProfile(
-        id="anthropic", protocol=Protocol.ANTHROPIC,
+        id="anthropic",
+        protocol=Protocol.ANTHROPIC,
         base_url="https://api.anthropic.com",
-        auth_mode=AuthMode.REQUIRED_KEY, api_key_ref="ANTHROPIC_API_KEY",
-        capabilities=frozenset({"streaming", "tools", "vision",
-                                "reasoning"}),
+        auth_mode=AuthMode.REQUIRED_KEY,
+        api_key_ref="ANTHROPIC_API_KEY",
+        capabilities=frozenset({"streaming", "tools", "vision", "reasoning"}),
         cache_mode=CacheMode.SESSION_KEY,
         compatibility_profile="hosted",
     ),
 }
 
 
-def resolve_profile(kind_or_id: str, *, base_url: str | None = None,
-                    model_id: str | None = None) -> ProviderProfile:
+def resolve_profile(
+    kind_or_id: str, *, base_url: str | None = None, model_id: str | None = None
+) -> ProviderProfile:
     """Resolve a preset by kind, optionally overriding endpoint/model.
 
     Discovery failure never erases manual configuration: an explicit
@@ -244,7 +267,8 @@ def resolve_profile(kind_or_id: str, *, base_url: str | None = None,
         raise ValueError(
             f"unknown provider profile {kind_or_id!r}; known: {known}. "
             "For a custom OpenAI-compatible endpoint use kind='openai-compat' "
-            "with an explicit base_url.")
+            "with an explicit base_url."
+        )
     overrides: dict[str, Any] = {}
     if base_url:
         overrides["base_url"] = base_url
@@ -257,6 +281,7 @@ def resolve_profile(kind_or_id: str, *, base_url: str | None = None,
 # Compatibility candidate discovery (observed quirks -> reviewed promotion)
 # ---------------------------------------------------------------------------
 
+
 class CompatibilityCandidates:
     """Telemetry-driven alias/coercion suggestions. NEVER auto-promotes.
 
@@ -267,17 +292,26 @@ class CompatibilityCandidates:
     def __init__(self) -> None:
         self._observed: dict[str, dict] = {}
 
-    def record_failure(self, *, model: str, capability: str,
-                       rule: str, detail: str = "") -> None:
+    def record_failure(self, *, model: str, capability: str, rule: str, detail: str = "") -> None:
         key = f"{model}|{capability}|{rule}"
-        entry = self._observed.setdefault(key, {
-            "model_pattern": model, "capability": capability,
-            "rule": rule, "count": 0, "ambiguity": 0, "examples": [],
-        })
+        entry = self._observed.setdefault(
+            key,
+            {
+                "model_pattern": model,
+                "capability": capability,
+                "rule": rule,
+                "count": 0,
+                "ambiguity": 0,
+                "examples": [],
+            },
+        )
         entry["count"] += 1
         if len(entry["examples"]) < 3 and detail:
             entry["examples"].append(detail)
 
     def proposals(self, min_count: int = 10) -> list[dict]:
-        return [dict(v, suggested=True) for v in self._observed.values()
-                if v["count"] >= min_count and v["ambiguity"] == 0]
+        return [
+            dict(v, suggested=True)
+            for v in self._observed.values()
+            if v["count"] >= min_count and v["ambiguity"] == 0
+        ]

@@ -4,6 +4,7 @@ These tests create a service, start a long-running task, then SIMULATE A CRASH
 by closing the database connection without graceful shutdown (no stop() call).
 They then restart on the same DB file and verify recovery works.
 """
+
 from __future__ import annotations
 
 import os
@@ -65,11 +66,15 @@ async def test_running_task_recovered_after_hard_crash():
     db_path = os.path.join(tmpdir, "test.db")
 
     sleep_script = [
-        {"match": {"user_contains": "SLEEPLONG"},
-         "respond": {"capability_call": {
-             "capability_id": "execute",
-             "arguments": {"language": "sh", "code": "sleep 30"},
-         }}},
+        {
+            "match": {"user_contains": "SLEEPLONG"},
+            "respond": {
+                "capability_call": {
+                    "capability_id": "execute",
+                    "arguments": {"language": "sh", "code": "sleep 30"},
+                }
+            },
+        },
     ]
 
     svc1 = await _make_service(db_path, tmpdir, scripts=sleep_script)
@@ -109,13 +114,16 @@ async def test_worker_parallelism_real():
     # capability_result_ok script terminal-completes once the execute call
     # succeeds, so each task performs a single ~1s execution and then stops.
     scripts = [
-        {"match": {"capability_result_ok": True},
-         "respond": {"text": "done", "done": True}},
-        {"match": {"user_contains": "PAR"},
-         "respond": {"capability_call": {
-             "capability_id": "execute",
-             "arguments": {"language": "sh", "code": "sleep 1"},
-         }}},
+        {"match": {"capability_result_ok": True}, "respond": {"text": "done", "done": True}},
+        {
+            "match": {"user_contains": "PAR"},
+            "respond": {
+                "capability_call": {
+                    "capability_id": "execute",
+                    "arguments": {"language": "sh", "code": "sleep 1"},
+                }
+            },
+        },
     ]
 
     config = AthenaConfig(
@@ -157,11 +165,15 @@ async def test_run_task_rejects_already_claimed():
     db_path = os.path.join(tmpdir, "test.db")
 
     sleep_script = [
-        {"match": {"user_contains": "SLEEP"},
-         "respond": {"capability_call": {
-             "capability_id": "execute",
-             "arguments": {"language": "sh", "code": "sleep 30"},
-         }}},
+        {
+            "match": {"user_contains": "SLEEP"},
+            "respond": {
+                "capability_call": {
+                    "capability_id": "execute",
+                    "arguments": {"language": "sh", "code": "sleep 30"},
+                }
+            },
+        },
     ]
     svc = await _make_service(db_path, tmpdir, scripts=sleep_script)
     task = await svc.submit(

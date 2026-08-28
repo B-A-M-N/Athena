@@ -60,8 +60,7 @@ class ApprovalStore:
         capability_id = await self._capability_of(approval_id)
         async with self._db.transaction():
             await self._db.execute_raw(
-                "UPDATE approvals SET status = ?, resolved_at = ?, resolver = ? "
-                "WHERE id = ?",
+                "UPDATE approvals SET status = ?, resolved_at = ?, resolver = ? WHERE id = ?",
                 (self.GRANTED, now, resolver, approval_id),
             )
             await self._db.execute_raw(
@@ -108,8 +107,7 @@ class ApprovalStore:
     async def list_pending(self, task_id: str | None = None) -> list[dict]:
         if task_id is not None:
             rows = await self._db.fetch_all(
-                "SELECT * FROM approvals WHERE task_id = ? AND status = ? "
-                "ORDER BY created_at ASC",
+                "SELECT * FROM approvals WHERE task_id = ? AND status = ? ORDER BY created_at ASC",
                 (task_id, self.PENDING),
             )
         else:

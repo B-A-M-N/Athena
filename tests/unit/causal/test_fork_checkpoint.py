@@ -66,7 +66,8 @@ async def test_fork_task_creation_failure_removes_speculative_session(svc):
     try:
         with pytest.raises(RuntimeError, match="simulated task insert failure"):
             await TaskForker(service=svc).fork(
-                task_id=task.id, after_event_sequence=1,
+                task_id=task.id,
+                after_event_sequence=1,
             )
     finally:
         task_manager.create = original_create
@@ -93,9 +94,7 @@ async def test_checkpoint_capture_and_restore(tmp_path: Path):
     (ws / "sub" / "nested.txt").write_text("nested")
 
     mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
-    manifest = await mgr.capture(
-        task_id="task_1", workspace_root=str(ws), label="before-change"
-    )
+    manifest = await mgr.capture(task_id="task_1", workspace_root=str(ws), label="before-change")
     assert manifest["task_id"] == "task_1"
     assert manifest["label"] == "before-change"
     assert manifest["file_count"] == 2
@@ -110,8 +109,30 @@ async def test_checkpoint_capture_and_restore(tmp_path: Path):
     assert summary["restored_files"] == 2
     assert (ws / "keep.txt").read_text() == "original"
     assert (ws / "sub" / "nested.txt").read_text() == "nested"
-    assert not (ws / "extra.txt").exists(), \
-        "file added after capture should be removed on restore"
+    assert not (ws / "extra.txt").exists(), "file added after capture should be removed on restore"
+
+
+async def test_checkpoint_inspects_immutable_metadata(tmp_path: Path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "value.txt").write_text("captured")
+    mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
+
+    manifest = await mgr.capture(
+        task_id="task_1",
+        workspace_root=str(ws),
+        label="semantic",
+        metadata={
+            "type": "semantic_state_checkpoint",
+            "version": 1,
+            "state": {"event_boundary": {"last_sequence": 4}},
+        },
+    )
+    inspected = await mgr.inspect(manifest["id"])
+
+    assert inspected["id"] == manifest["id"]
+    assert inspected["metadata"]["type"] == "semantic_state_checkpoint"
+    assert inspected["metadata"]["state"]["event_boundary"]["last_sequence"] == 4
 
 
 async def test_restore_unknown_checkpoint(tmp_path: Path):
@@ -125,15 +146,15 @@ async def test_checkpoint_restore_rejects_concurrent_workspace_change(tmp_path: 
     ws.mkdir()
     (ws / "value.txt").write_text("before")
     mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
-    manifest = await mgr.capture(
-        task_id="task_1", workspace_root=str(ws), label="before-change"
-    )
+    manifest = await mgr.capture(task_id="task_1", workspace_root=str(ws), label="before-change")
     expected = await mgr.fingerprint(str(ws))
     (ws / "value.txt").write_text("concurrent")
 
     with pytest.raises(CheckpointConflict):
         await mgr.restore(
-            manifest["id"], str(ws), expected_fingerprint=expected,
+            manifest["id"],
+            str(ws),
+            expected_fingerprint=expected,
         )
     assert (ws / "value.txt").read_text() == "concurrent"
 
@@ -143,9 +164,7 @@ async def test_checkpoint_materialize_creates_independent_workspace(tmp_path: Pa
     source.mkdir()
     (source / "value.txt").write_text("captured")
     mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
-    manifest = await mgr.capture(
-        task_id="task_1", workspace_root=str(source), label="fork-base"
-    )
+    manifest = await mgr.capture(task_id="task_1", workspace_root=str(source), label="fork-base")
 
     destination = tmp_path / "fork"
     await mgr.materialize(manifest["id"], str(destination))
@@ -154,3 +173,27 @@ async def test_checkpoint_materialize_creates_independent_workspace(tmp_path: Pa
 
     assert (source / "value.txt").read_text() == "parent-changed"
     assert (destination / "value.txt").read_text() == "fork-changed"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_owner_refs_survive_and_gc_after_last_release(tmp_path: Path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "value.txt").write_text("captured")
+    root = tmp_path / "ckpts"
+    mgr = CheckpointManager(root=str(root))
+    manifest = await mgr.capture(
+        task_id="task_1",
+        workspace_root=str(ws),
+        label="owned",
+    )
+    checkpoint_id = manifest["id"]
+    mgr.retain(checkpoint_id, owner="recovery-worker")
+
+    refs = (root / "refs.json").read_text()
+    assert '"refcount": 2' in refs
+    assert await mgr.release(checkpoint_id, owner="task_1") is False
+    assert (root / checkpoint_id).is_dir()
+    assert await mgr.release(checkpoint_id, owner="recovery-worker") is True
+    assert not (root / checkpoint_id).exists()
+    assert not (root / f"{checkpoint_id}.manifest.json").exists()

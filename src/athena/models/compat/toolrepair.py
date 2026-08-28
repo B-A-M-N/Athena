@@ -55,8 +55,10 @@ class RepairReceipt:
 
     def to_dict(self) -> dict:
         return {
-            "call_id": self.call_id, "tool_name": self.tool_name,
-            "outcome": self.outcome, "rules": self.rules,
+            "call_id": self.call_id,
+            "tool_name": self.tool_name,
+            "outcome": self.outcome,
+            "rules": self.rules,
             "issue_codes": self.issue_codes,
             "original_shape_hash": self.original_shape_hash,
             "repaired_shape_hash": self.repaired_shape_hash,
@@ -72,8 +74,7 @@ def _shape_hash(args: Any) -> str:
 
     if isinstance(args, Mapping):
         keys = ",".join(sorted(args)) if args else ""
-        types = ",".join(type(v).__name__
-                         for _, v in sorted((args or {}).items()))
+        types = ",".join(type(v).__name__ for _, v in sorted((args or {}).items()))
         payload = f"keys={keys};types={types}"
     else:
         payload = type(args).__name__
@@ -132,10 +133,9 @@ class _Ctx:
 class ToolInputRepairer:
     """One bounded deterministic repair pass at the model boundary."""
 
-    def __init__(self, *, mode: str = "safe",
-                 candidates=None) -> None:
-        self.mode = mode                    # safe | strict | off
-        self.candidates = candidates        # CompatibilityCandidates telemetry
+    def __init__(self, *, mode: str = "safe", candidates=None) -> None:
+        self.mode = mode  # safe | strict | off
+        self.candidates = candidates  # CompatibilityCandidates telemetry
 
     # -- public entry -----------------------------------------------------
     def repair(
@@ -154,7 +154,8 @@ class ToolInputRepairer:
     ) -> tuple[Any, RepairReceipt]:
         """Returns (canonical_arguments, receipt). Never raises."""
         receipt = RepairReceipt(
-            call_id=call_id, tool_name=tool_name,
+            call_id=call_id,
+            tool_name=tool_name,
             outcome=RepairOutcome.UNCHANGED,
             original_shape_hash=_shape_hash(arguments),
             schema_hash=_schema_fp(input_schema),
@@ -179,8 +180,7 @@ class ToolInputRepairer:
         selected_mode = mode or self.mode
         if selected_mode == "off":
             ok = not validate_fn(input_schema, arguments)
-            receipt.outcome = (RepairOutcome.UNCHANGED if ok
-                               else RepairOutcome.INVALID)
+            receipt.outcome = RepairOutcome.UNCHANGED if ok else RepairOutcome.INVALID
             if not ok:
                 receipt.issue_codes.append("invalid_unrepaired")
             return arguments, receipt
@@ -190,10 +190,8 @@ class ToolInputRepairer:
             receipt.outcome = RepairOutcome.UNCHANGED
             return arguments, receipt
 
-        ctx = _Ctx(tool_name=tool_name, schema=input_schema,
-                   rules=[], issues=list(errors))
-        repaired, changed = _repair_pass(arguments, input_schema, ctx,
-                                         mcp_origin=mcp_origin)
+        ctx = _Ctx(tool_name=tool_name, schema=input_schema, rules=[], issues=list(errors))
+        repaired, changed = _repair_pass(arguments, input_schema, ctx, mcp_origin=mcp_origin)
         if repaired is None:
             receipt.outcome = RepairOutcome.INVALID
             receipt.issue_codes.extend(ctx.issues[:5])
@@ -214,8 +212,11 @@ class ToolInputRepairer:
                 for rule in ctx.rules:
                     rule_name = rule.split(":", 1)[0]
                     self.candidates.record_failure(
-                        model=model_id or "unknown", capability=tool_name,
-                        rule=rule_name, detail=str(sorted(args2_keys(arguments))))
+                        model=model_id or "unknown",
+                        capability=tool_name,
+                        rule=rule_name,
+                        detail=str(sorted(args2_keys(arguments))),
+                    )
             return repaired, receipt
 
         receipt.outcome = RepairOutcome.INVALID
@@ -226,16 +227,16 @@ class ToolInputRepairer:
 def _schema_fp(schema) -> str:
     import hashlib
 
-    return hashlib.sha256(json.dumps(
-        dict(schema), sort_keys=True).encode()).hexdigest()[:16]
+    return hashlib.sha256(json.dumps(dict(schema), sort_keys=True).encode()).hexdigest()[:16]
 
 
 def args2_keys(args):
     return args if isinstance(args, Mapping) else {}
 
 
-def _repair_pass(args, schema: Mapping[str, Any], ctx: _Ctx,
-                 *, mcp_origin: bool) -> tuple[dict | None, bool]:
+def _repair_pass(
+    args, schema: Mapping[str, Any], ctx: _Ctx, *, mcp_origin: bool
+) -> tuple[dict | None, bool]:
     """Apply the ordered safe rules once. Returns (obj, changed)."""
     obj, changed = args, False
 
@@ -253,8 +254,7 @@ def _repair_pass(args, schema: Mapping[str, Any], ctx: _Ctx,
                 pass
 
     # Rule 1b: raw control characters inside JSON strings (lexical proof).
-    if (isinstance(obj, str) and not changed
-            and '"' in obj and re.search(r'[\n\r\t]', obj)):
+    if isinstance(obj, str) and not changed and '"' in obj and re.search(r"[\n\r\t]", obj):
         fixed = _escape_controls_in_strings(obj)
         if fixed != obj:
             try:
@@ -342,8 +342,11 @@ def _repair_pass(args, schema: Mapping[str, Any], ctx: _Ctx,
                 obj[prop] = low == "true"
                 changed = True
                 ctx.rules.append(f"bool_string:{prop}")
-        elif (expected == "array" and not isinstance(value, list)
-              and isinstance(value, (str, int, float, bool))):
+        elif (
+            expected == "array"
+            and not isinstance(value, list)
+            and isinstance(value, (str, int, float, bool))
+        ):
             obj[prop] = [value]
             changed = True
             ctx.rules.append(f"scalar_to_array:{prop}")
@@ -370,9 +373,11 @@ def _root_wrap(value, schema: Mapping[str, Any], ctx: _Ctx) -> dict | None:
     if primary not in _ROOT_WRAP_FIELDS:
         return None
     expected = props[primary].get("type")
-    match = ((expected == "string" and isinstance(value, str))
-             or (expected == "number" and isinstance(value, (int, float)))
-             or (expected == "integer" and isinstance(value, int)))
+    match = (
+        (expected == "string" and isinstance(value, str))
+        or (expected == "number" and isinstance(value, (int, float)))
+        or (expected == "integer" and isinstance(value, int))
+    )
     if not match:
         return None
     ctx.rules.append(f"root_wrap:{primary}")

@@ -81,9 +81,7 @@ async def test_caller_allowlist_wins_over_role(registry):
         registry,
         role_policies={"summarizer": ModelPolicy(role="summarizer", allowed=("prov/cheap",))},
     )
-    sel = await router.select(
-        policy=ModelPolicy(role="summarizer", allowed=("prov/pricey",))
-    )
+    sel = await router.select(policy=ModelPolicy(role="summarizer", allowed=("prov/pricey",)))
     assert sel.model == "pricey"
 
 

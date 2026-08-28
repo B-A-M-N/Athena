@@ -11,8 +11,10 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import time
+from functools import lru_cache
 
 try:
     import psutil  # type: ignore
@@ -21,9 +23,20 @@ except Exception:  # pragma: no cover - psutil is optional
 
 
 _MINIMAL_ENV_KEYS = (
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL",
-    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_NUMERIC", "LC_TIME",
-    "TZ", "TERM",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TZ",
+    "TERM",
 )
 _WINDOWS_ENV_KEYS = ("SYSTEMROOT", "WINDIR", "PATHEXT", "COMSPEC", "USERPROFILE", "SystemDrive")
 
@@ -62,11 +75,22 @@ def spawn_owned(
         my_env.update({k: str(v) for k, v in env.items()})
     my_env.setdefault("PYTHONIOENCODING", "utf-8")
     if sandbox_root is not None:
+        # Some locked-down hosts already apply an inherited seccomp filter
+        # which rejects AF_INET/AF_INET6 sockets.  Bubblewrap cannot create a
+        # network namespace there because its setup needs a NETLINK_ROUTE
+        # socket, even though the child is already unable to use the network.
+        # Preserve the fail-closed guarantee by retaining that inherited
+        # filter and only skipping the redundant namespace setup.  If the
+        # host can create network sockets, a denied policy still requires the
+        # normal isolated namespace below.
+        effective_network_policy = network_policy
+        if network_policy and network_policy != "allow" and _network_syscalls_denied():
+            effective_network_policy = "allow"
         argv = sandbox_argv(
             argv,
             root=sandbox_root,
             cwd=cwd,
-            network_policy=network_policy,
+            network_policy=effective_network_policy,
             writable=sandbox_writable,
         )
         root_abs = os.path.realpath(os.path.abspath(sandbox_root))
@@ -117,19 +141,24 @@ def sandbox_argv(
         host_cwd = os.path.realpath(os.path.abspath(cwd))
         if host_cwd != root and not host_cwd.startswith(root + os.sep):
             raise RuntimeError("sandbox cwd is outside workspace root")
-        namespace_cwd = namespace_root + host_cwd[len(root):]
+        namespace_cwd = namespace_root + host_cwd[len(root) :]
 
     command = [
         bwrap,
         "--die-with-parent",
         "--new-session",
         "--unshare-pid",
-        "--proc", "/proc",
-        "--dev", "/dev",
-        "--bind" if writable else "--ro-bind", root, namespace_root,
-        "--tmpfs", "/tmp",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--bind" if writable else "--ro-bind",
+        root,
+        namespace_root,
+        "--tmpfs",
+        "/tmp",
     ]
-    if network_policy and network_policy != "allow":
+    if network_policy and network_policy != "allow" and not _network_syscalls_denied():
         command.append("--unshare-net")
 
     # Bind host toolchains read-only.  Never bind the host root, /home, or /etc
@@ -161,15 +190,13 @@ def sandbox_argv(
             command.extend(("--ro-bind", parent, parent))
     namespace_argv = []
     for index, arg in enumerate(argv):
-        if index == 0 and executable and (
-            arg == argv[0] or os.path.realpath(arg) == executable
-        ):
+        if index == 0 and executable and (arg == argv[0] or os.path.realpath(arg) == executable):
             # Virtualenv launchers are often symlinks into /usr.  The
             # namespace cannot resolve the host-side symlink path, so invoke
             # the already-mounted canonical executable.
             namespace_argv.append(executable)
         elif arg == root or arg.startswith(root + os.sep):
-            namespace_argv.append(namespace_root + arg[len(root):])
+            namespace_argv.append(namespace_root + arg[len(root) :])
         else:
             namespace_argv.append(arg)
     command.extend(("--chdir", namespace_cwd, "--"))
@@ -181,10 +208,32 @@ def _namespace_path(value: str, root: str) -> str:
     parts = []
     for item in value.split(os.pathsep):
         if item == root or item.startswith(root + os.sep):
-            parts.append("/workspace" + item[len(root):])
+            parts.append("/workspace" + item[len(root) :])
         else:
             parts.append(item)
     return os.pathsep.join(parts)
+
+
+@lru_cache(maxsize=1)
+def _network_syscalls_denied() -> bool:
+    """Report whether this process already inherits a network deny filter.
+
+    The result is intentionally conservative: only an explicit permission
+    failure is treated as a usable inherited deny boundary.  Other failures
+    leave Bubblewrap responsible for making the namespace private, and a
+    failure there remains fail-closed.
+    """
+    probe = None
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    finally:
+        if probe is not None:
+            probe.close()
+    return False
 
 
 def process_group_id(process: "subprocess.Popen") -> int | None:

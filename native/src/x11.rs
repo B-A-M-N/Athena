@@ -20,7 +20,7 @@ use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
 
 use athena_terminal::NativeTerminalCore;
 
-use crate::{Projection, ProjectionEntity, ProjectionFrame, apply_available};
+use crate::{Projection, ProjectionCodeView, ProjectionEntity, ProjectionFrame, apply_available};
 
 type Display = c_void;
 type Window = c_ulong;
@@ -885,6 +885,38 @@ fn draw_frame(
         body_y as c_int + 22,
         &projection.status,
     );
+    if let Some(operation) = projection.active_operation.as_ref() {
+        unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
+        let progress = if operation.progress_determinate {
+            operation
+                .progress_value
+                .map(|value| format!(" {:.0}%", value * 100.0))
+                .unwrap_or_default()
+        } else {
+            if operation.progress.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", operation.progress)
+            }
+        };
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 12,
+            body_y as c_int + 40,
+            &format!(
+                "{} {} ({}) {} [{}] {}{}",
+                operation.action_kind.to_ascii_uppercase(),
+                operation.label,
+                operation.id,
+                operation.target,
+                operation.state,
+                operation.mutation_state,
+                progress,
+            ),
+        );
+    }
     unsafe { XSetForeground(display, gc, rgb(193, 214, 239)) };
     let line_height = 18_i32;
     let max_lines = ((body_h as i32 - 42) / line_height).max(1) as usize;
@@ -898,16 +930,239 @@ fn draw_frame(
             line.trim_end(),
         );
     }
-    unsafe { XSetForeground(display, gc, rgb(183, 210, 236)) };
-    for (row, line) in projection.oi.iter().take(max_lines).enumerate() {
+    if !projection.workspace_entities.is_empty() {
+        unsafe { XSetForeground(display, gc, rgb(145, 181, 216)) };
+        let files = projection
+            .workspace_entities
+            .iter()
+            .take(3)
+            .map(|entity| {
+                if entity.label.is_empty() {
+                    &entity.id
+                } else {
+                    &entity.label
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         draw_text(
             display,
             window,
             gc,
             right_x as c_int + 16,
-            body_y as c_int + 44 + row as c_int * line_height,
-            line,
+            body_y as c_int + 58,
+            &format!("files: {files}"),
         );
+    }
+    unsafe { XSetForeground(display, gc, rgb(183, 210, 236)) };
+    if projection.semantic_state.eq_ignore_ascii_case("code") {
+        if let Some(code) = projection.code_view.as_ref() {
+            draw_code_view(
+                display,
+                window,
+                gc,
+                right_x as c_int + 16,
+                body_y as c_int + 44,
+                max_lines,
+                code,
+            );
+        }
+    } else if projection.semantic_state.eq_ignore_ascii_case("failure")
+        && !projection.diagnostics.is_empty()
+    {
+        for (row, diagnostic) in projection.diagnostics.iter().take(max_lines).enumerate() {
+            unsafe { XSetForeground(display, gc, rgb(224, 119, 126)) };
+            let message = if diagnostic.message.is_empty() {
+                &diagnostic.detail
+            } else {
+                &diagnostic.message
+            };
+            draw_text(
+                display,
+                window,
+                gc,
+                right_x as c_int + 16,
+                body_y as c_int + 44 + row as c_int * line_height,
+                &format!(
+                    "! {}:{} {}",
+                    diagnostic.path,
+                    diagnostic.line.unwrap_or_default(),
+                    message,
+                ),
+            );
+        }
+    } else if projection.semantic_state.eq_ignore_ascii_case("verify") {
+        unsafe { XSetForeground(display, gc, rgb(222, 176, 108)) };
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            body_y as c_int + 44,
+            &format!(
+                "verification: {} ({} checks)",
+                projection.verification.status,
+                projection.verification.checks.len(),
+            ),
+        );
+        for (row, check) in projection
+            .verification
+            .checks
+            .iter()
+            .take(max_lines.saturating_sub(1))
+            .enumerate()
+        {
+            unsafe { XSetForeground(display, gc, rgb(177, 196, 225)) };
+            draw_text(
+                display,
+                window,
+                gc,
+                right_x as c_int + 16,
+                body_y as c_int + 62 + row as c_int * line_height,
+                &check.to_string(),
+            );
+        }
+    } else if projection.semantic_state.eq_ignore_ascii_case("test") {
+        unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            body_y as c_int + 44,
+            &format!(
+                "test progress {}",
+                projection
+                    .progress
+                    .as_ref()
+                    .map_or("active".to_owned(), ToString::to_string),
+            ),
+        );
+        for (row, line) in projection
+            .oi
+            .iter()
+            .take(max_lines.saturating_sub(1))
+            .enumerate()
+        {
+            draw_text(
+                display,
+                window,
+                gc,
+                right_x as c_int + 16,
+                body_y as c_int + 62 + row as c_int * line_height,
+                line,
+            );
+        }
+    } else if projection.semantic_state.eq_ignore_ascii_case("search") {
+        unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            body_y as c_int + 44,
+            "SEARCHING // SYMBOL GRAPH",
+        );
+        for (row, entity) in projection
+            .entities
+            .iter()
+            .take(max_lines.saturating_sub(1))
+            .enumerate()
+        {
+            draw_text(
+                display,
+                window,
+                gc,
+                right_x as c_int + 16,
+                body_y as c_int + 62 + row as c_int * line_height,
+                &format!(
+                    "· {}",
+                    if entity.label.is_empty() {
+                        &entity.id
+                    } else {
+                        &entity.label
+                    }
+                ),
+            );
+        }
+    } else if projection.semantic_state.eq_ignore_ascii_case("approval") {
+        unsafe { XSetForeground(display, gc, rgb(222, 176, 108)) };
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            body_y as c_int + 44,
+            "APPROVAL // OPERATION SCOPE",
+        );
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            body_y as c_int + 62,
+            "? choose a permitted scope",
+        );
+        if let Some(progress) = projection.progress.as_ref() {
+            draw_text(
+                display,
+                window,
+                gc,
+                right_x as c_int + 16,
+                body_y as c_int + 80,
+                &progress.to_string(),
+            );
+        }
+    } else if projection.semantic_state.eq_ignore_ascii_case("recover") {
+        unsafe { XSetForeground(display, gc, rgb(222, 176, 108)) };
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            body_y as c_int + 44,
+            "RECOVERING // RETAINED EVIDENCE",
+        );
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            body_y as c_int + 62,
+            &projection.status,
+        );
+    } else if projection.semantic_state.eq_ignore_ascii_case("generate") {
+        unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
+        draw_text(
+            display,
+            window,
+            gc,
+            right_x as c_int + 16,
+            body_y as c_int + 44,
+            "GENERATING // CAPABILITY",
+        );
+        if let Some(operation) = projection.active_operation.as_ref() {
+            draw_text(
+                display,
+                window,
+                gc,
+                right_x as c_int + 16,
+                body_y as c_int + 62,
+                &format!("{} [{}]", operation.label, operation.state),
+            );
+        }
+    } else {
+        for (row, line) in projection.oi.iter().take(max_lines).enumerate() {
+            draw_text(
+                display,
+                window,
+                gc,
+                right_x as c_int + 16,
+                body_y as c_int + 44 + row as c_int * line_height,
+                line,
+            );
+        }
     }
     unsafe { XSetForeground(display, gc, rgb(145, 181, 216)) };
     for (index, entity) in projection.entities.iter().take(8).enumerate() {
@@ -1015,8 +1270,12 @@ fn draw_oi_scene(x: f32, y: f32, width: f32, height: f32, projection: &Projectio
         glEnd();
     }
 
-    let runtime: Vec<&ProjectionEntity> = projection
-        .entities
+    let runtime_source = if projection.runtime_entities.is_empty() {
+        &projection.entities
+    } else {
+        &projection.runtime_entities
+    };
+    let runtime: Vec<&ProjectionEntity> = runtime_source
         .iter()
         .filter(|entity| {
             matches!(
@@ -1066,15 +1325,100 @@ fn draw_oi_scene(x: f32, y: f32, width: f32, height: f32, projection: &Projectio
         };
         draw_node(*nx, *ny, 18.0, color);
     }
-
-    let (buddy_x, buddy_y) = match projection.status.to_ascii_uppercase().as_str() {
-        "READING" | "SEARCHING" => (x + width * 0.18, y + height * 0.28),
-        "EXECUTING" | "TOOLS" => (x + width * 0.76, y + height * 0.26),
+    let action = if let Some(buddy) = projection.buddy.as_ref() {
+        if !buddy.state.is_empty() {
+            buddy.state.as_str()
+        } else if buddy.anchor.is_empty() {
+            projection.semantic_state.as_str()
+        } else {
+            buddy.anchor.as_str()
+        }
+    } else if projection.semantic_state.is_empty() {
+        projection.status.as_str()
+    } else {
+        projection.semantic_state.as_str()
+    };
+    let (buddy_x, buddy_y) = match action.to_ascii_uppercase().as_str() {
+        "READ" | "INSPECT" | "SEARCH" | "READING" | "SEARCHING" => {
+            (x + width * 0.18, y + height * 0.28)
+        }
+        "CODE" | "TEST" | "VERIFY" | "EXECUTE" | "EXECUTING" | "TOOLS" => {
+            (x + width * 0.76, y + height * 0.26)
+        }
         "FAILURE" | "BLOCKED" => (x + width * 0.78, y + height * 0.76),
         "APPROVAL" => (x + width * 0.72, y + height * 0.84),
         _ => (x + width * 0.50, y + height * 0.58),
     };
-    draw_buddy(buddy_x, buddy_y, projection.status.as_str());
+    let buddy_status = projection
+        .buddy
+        .as_ref()
+        .filter(|buddy| !buddy.status.is_empty())
+        .map(|buddy| buddy.status.as_str())
+        .unwrap_or(projection.status.as_str());
+    let buddy_character = projection
+        .buddy
+        .as_ref()
+        .map(|buddy| buddy.character.as_str())
+        .filter(|character| !character.is_empty())
+        .unwrap_or("owl");
+    draw_buddy(buddy_x, buddy_y, buddy_status, buddy_character);
+}
+
+fn draw_code_view(
+    display: *mut Display,
+    window: Window,
+    gc: *mut c_void,
+    x: c_int,
+    y: c_int,
+    max_lines: usize,
+    code: &ProjectionCodeView,
+) {
+    unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
+    draw_text(
+        display,
+        window,
+        gc,
+        x,
+        y,
+        &format!(
+            "{}  {}  {}",
+            code.path,
+            code.language.to_ascii_uppercase(),
+            code.mutation_state.to_ascii_uppercase()
+        ),
+    );
+    let fallback_lines: Vec<String> = code.text.lines().map(str::to_owned).collect();
+    let lines = if code.diff.is_empty() && code.lines.is_empty() {
+        &fallback_lines
+    } else if code.diff.is_empty() {
+        &code.lines
+    } else {
+        &code.diff
+    };
+    for (row, line) in lines.iter().take(max_lines.saturating_sub(2)).enumerate() {
+        let color = if line.starts_with('+') {
+            rgb(101, 183, 206)
+        } else if line.starts_with('-') {
+            rgb(224, 119, 126)
+        } else if line.starts_with('@') {
+            rgb(222, 176, 108)
+        } else {
+            rgb(177, 196, 225)
+        };
+        unsafe { XSetForeground(display, gc, color) };
+        draw_text(display, window, gc, x, y + 18 + row as c_int * 18, line);
+    }
+    if code.preview_truncated {
+        unsafe { XSetForeground(display, gc, rgb(222, 176, 108)) };
+        draw_text(
+            display,
+            window,
+            gc,
+            x,
+            y + max_lines as c_int * 18,
+            "... preview bounded for display",
+        );
+    }
 }
 
 fn draw_node(x: f32, y: f32, radius: f32, color: (f32, f32, f32)) {
@@ -1090,7 +1434,7 @@ fn draw_node(x: f32, y: f32, radius: f32, color: (f32, f32, f32)) {
     }
 }
 
-fn draw_buddy(x: f32, y: f32, status: &str) {
+fn draw_buddy(x: f32, y: f32, status: &str, character: &str) {
     let color = match status.to_ascii_uppercase().as_str() {
         "FAILURE" | "BLOCKED" => (0.86, 0.36, 0.40),
         "APPROVAL" => (0.88, 0.67, 0.36),
@@ -1114,6 +1458,25 @@ fn draw_buddy(x: f32, y: f32, status: &str) {
         glVertex2f(x, y - 14.0);
         glVertex2f(x + 8.0, y - 28.0);
         glEnd();
+        match character.to_ascii_lowercase().as_str() {
+            "cat" => {
+                glBegin(GL_LINES);
+                glVertex2f(x - 18.0, y - 14.0);
+                glVertex2f(x - 10.0, y - 24.0);
+                glVertex2f(x + 18.0, y - 14.0);
+                glVertex2f(x + 10.0, y - 24.0);
+                glEnd();
+            }
+            "owl" => {
+                glBegin(GL_LINES);
+                glVertex2f(x - 18.0, y - 14.0);
+                glVertex2f(x - 10.0, y - 22.0);
+                glVertex2f(x + 18.0, y - 14.0);
+                glVertex2f(x + 10.0, y - 22.0);
+                glEnd();
+            }
+            _ => {}
+        }
     }
 }
 

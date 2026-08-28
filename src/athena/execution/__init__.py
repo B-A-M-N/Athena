@@ -15,7 +15,12 @@ from athena.execution.backend import (
 from athena.execution.container import ContainerBackend
 from athena.execution.local import LocalBackend
 from athena.execution.manager import ExecutionManager, Sink
-from athena.execution.diagnostics import Diagnostic, normalize_diagnostics
+from athena.execution.diagnostics import (
+    Diagnostic,
+    normalize_diagnostics,
+    normalize_diagnostics_payload,
+)
+from athena.execution.environment import ProjectEnvironmentFingerprint
 
 __all__ = [
     "ExecutionManager",
@@ -29,4 +34,6 @@ __all__ = [
     "process_tree",
     "Diagnostic",
     "normalize_diagnostics",
+    "normalize_diagnostics_payload",
+    "ProjectEnvironmentFingerprint",
 ]

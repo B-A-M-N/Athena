@@ -3,6 +3,7 @@
 These tests verify that a child task cannot escape the parent workspace
 boundary through path traversal, symlinks, or sibling-path confusion.
 """
+
 from __future__ import annotations
 import pytest
 

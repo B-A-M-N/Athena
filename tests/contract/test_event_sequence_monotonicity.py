@@ -15,12 +15,15 @@ from athena.state.database import Database
 from athena.state.events import EventStore
 from athena.state.tasks import TaskStore
 
+
 def _sequences(events):
     return [e.sequence for e in events]
+
 
 async def _ensure_task(db, task_id: str) -> None:
     """Create the parent task row so the events FK holds."""
     await TaskStore(db).insert_task(task_id, None, None, "objective")
+
 
 @pytest.mark.athena_claim("BHV-117", "BHV-119")
 @pytest.mark.athena_evidence("test", "invariant")
@@ -54,6 +57,7 @@ class TestSequences:
         assert [e.sequence for e in stored] == [1, 2]
         assert stored[1].id == ev.id
         assert stored[1].sequence == 2
+
 
 @pytest.mark.athena_claim("BHV-119")
 @pytest.mark.athena_evidence("test", "invariant")
@@ -94,6 +98,7 @@ class TestConcurrency:
             _asyncio.run(_run())
 
         import threading
+
         threads = [threading.Thread(target=run_worker, args=(idx,)) for idx in range(3)]
         for t in threads:
             t.start()
@@ -118,17 +123,28 @@ class TestConcurrency:
         await _ensure_task(db, "t")
         ev = await store.append_event("dup", task_id="t")
         from athena.protocol.events import make_event
+
         dup = make_event("forged", task_id="t", sequence=ev.sequence)
         import aiosqlite
+
         with pytest.raises(aiosqlite.IntegrityError):
             async with db.transaction():
                 await db.execute_raw(
                     "INSERT INTO events(id, task_id, type, sequence, "
                     "timestamp, schema_version, payload, causal_id) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (dup.id, "t", dup.type, dup.sequence,
-                     dup.timestamp.isoformat(), dup.schema_version, "{}", None),
+                    (
+                        dup.id,
+                        "t",
+                        dup.type,
+                        dup.sequence,
+                        dup.timestamp.isoformat(),
+                        dup.schema_version,
+                        "{}",
+                        None,
+                    ),
                 )
+
 
 class TestRestart:
     async def test_sequence_continues_after_restart(self, tmp_path):

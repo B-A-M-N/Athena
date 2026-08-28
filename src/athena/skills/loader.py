@@ -174,9 +174,7 @@ class SkillLoader:
 
     def _parse_root(self, root: Path, scope: str) -> Iterator[Skill]:
         for skill_root in _iter_skill_roots(root):
-            skill = self.parse_skill_file(
-                skill_root / _skill_filename(skill_root), scope=scope
-            )
+            skill = self.parse_skill_file(skill_root / _skill_filename(skill_root), scope=scope)
             if skill is not None:
                 yield skill
 
@@ -243,9 +241,7 @@ class SkillLoader:
         )
         result = self._validator.validate(skill)
         if not result.ok:
-            self._record_error(
-                f"{path}: invalid skill ({'; '.join(result.errors)})"
-            )
+            self._record_error(f"{path}: invalid skill ({'; '.join(result.errors)})")
             return None
         return skill
 
@@ -257,9 +253,7 @@ class SkillLoader:
 def _scope_for(pth, project_dir, user_dir, bundled_dir) -> str:
     def under(cfg) -> bool:
         try:
-            return cfg is not None and Path(pth).resolve().is_relative_to(
-                Path(cfg).resolve()
-            )
+            return cfg is not None and Path(pth).resolve().is_relative_to(Path(cfg).resolve())
         except Exception:
             return False
 

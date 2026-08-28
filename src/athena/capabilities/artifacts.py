@@ -92,9 +92,14 @@ class ArtifactCapability:
         try:
             if operation == "list":
                 refs = await self._store.list(task_id=request.task_id, limit=100)
-                return _result(request, output=_json({
-                    "artifacts": [_ref_record(ref) for ref in refs],
-                }))
+                return _result(
+                    request,
+                    output=_json(
+                        {
+                            "artifacts": [_ref_record(ref) for ref in refs],
+                        }
+                    ),
+                )
             uri = str(args.get("artifact_uri") or "")
             if not _valid_artifact_uri(uri):
                 return _result(request, ok=False, error="artifact_uri is invalid")
@@ -120,14 +125,19 @@ class ArtifactCapability:
         limit = min(int(args.get("limit") or self._max_read_bytes), self._max_read_bytes)
         chunk, size, eof = await self._text_slice(uri, offset, limit)
         next_offset = offset + len(chunk)
-        return _result(request, output=_json({
-            "artifact_uri": uri,
-            "offset": offset,
-            "content": chunk,
-            "next_offset": next_offset,
-            "eof": eof,
-            "size": size,
-        }))
+        return _result(
+            request,
+            output=_json(
+                {
+                    "artifact_uri": uri,
+                    "offset": offset,
+                    "content": chunk,
+                    "next_offset": next_offset,
+                    "eof": eof,
+                    "size": size,
+                }
+            ),
+        )
 
     async def _search(self, request, args: dict[str, Any], uri: str) -> CapabilityResult:
         query = str(args.get("query") or "")
@@ -147,21 +157,30 @@ class ArtifactCapability:
                     line_preview = []
                 elif len(line_preview) < self._max_read_bytes:
                     line_preview.append(char)
-                rolling = (rolling + char)[-len(needle):]
+                rolling = (rolling + char)[-len(needle) :]
                 if rolling.casefold().endswith(needle):
-                    matches.append({
-                        "offset": offset - len(query) + 1,
-                        "line": line_number,
-                        "text": "".join(line_preview),
-                    })
+                    matches.append(
+                        {
+                            "offset": offset - len(query) + 1,
+                            "line": line_number,
+                            "text": "".join(line_preview),
+                        }
+                    )
                     if len(matches) >= limit:
                         break
                 offset += 1
             if len(matches) >= limit:
                 break
-        return _result(request, output=_json({
-            "artifact_uri": uri, "query": query, "matches": matches,
-        }))
+        return _result(
+            request,
+            output=_json(
+                {
+                    "artifact_uri": uri,
+                    "query": query,
+                    "matches": matches,
+                }
+            ),
+        )
 
     async def _text_slice(self, uri: str, offset: int, limit: int) -> tuple[str, int, bool]:
         """Read a bounded character slice while keeping blob memory bounded."""
@@ -177,7 +196,7 @@ class ArtifactCapability:
             start = max(0, offset - position)
             remaining = limit - collected
             if remaining > 0:
-                piece = text[start:start + remaining]
+                piece = text[start : start + remaining]
                 pieces.append(piece)
                 collected += len(piece)
             position += len(text)
@@ -222,11 +241,7 @@ def _json(value: Any) -> str:
 
 def _valid_artifact_uri(uri: str) -> bool:
     parsed = parse_artifact_uri(uri)
-    return bool(
-        parsed
-        and parsed[0] == "sha256"
-        and re.fullmatch(r"[0-9a-f]{64}", parsed[1])
-    )
+    return bool(parsed and parsed[0] == "sha256" and re.fullmatch(r"[0-9a-f]{64}", parsed[1]))
 
 
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):

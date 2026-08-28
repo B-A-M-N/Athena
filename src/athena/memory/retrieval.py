@@ -53,24 +53,23 @@ class MemoryRetriever:
         if limit == 0:
             return []
         if mode is RetrievalMode.RECENCY:
-            return await self._store.retrieve_by_recency(
-                scope, scope_id, limit, tags=tags)
+            return await self._store.retrieve_by_recency(scope, scope_id, limit, tags=tags)
         if mode is RetrievalMode.EXACT:
-            return await self._store.retrieve_by_fts(
-                query, scope, scope_id, limit, tags=tags)
+            return await self._store.retrieve_by_fts(query, scope, scope_id, limit, tags=tags)
         return await self._by_semantic(query, scope, scope_id, limit, tags=tags)
 
-    async def retrieve_all(
-        self, query: str, limit: int = 10
-    ) -> list[MemoryRecord]:
+    async def retrieve_all(self, query: str, limit: int = 10) -> list[MemoryRecord]:
         return await self._by_semantic(query, None, None, limit)
 
     async def _by_semantic(
-        self, query: str, scope: MemoryScope | None, scope_id: str | None,
-        limit: int, tags: Sequence[str] | None = None,
+        self,
+        query: str,
+        scope: MemoryScope | None,
+        scope_id: str | None,
+        limit: int,
+        tags: Sequence[str] | None = None,
     ) -> list[MemoryRecord]:
-        candidate = await self._store.retrieve_by_fts(
-            query, scope, scope_id, limit * 8, tags=tags)
+        candidate = await self._store.retrieve_by_fts(query, scope, scope_id, limit * 8, tags=tags)
         qset = _tokens(query)
         if not qset:
             return candidate[:limit]

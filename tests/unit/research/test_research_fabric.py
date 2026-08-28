@@ -36,10 +36,8 @@ def test_source_policy_requires_explicit_external_allowlist():
 
 
 def test_source_identity_changes_when_snapshot_changes():
-    first = SourceRecord.for_uri(
-        canonicalize_uri("https://example.test/doc"), content_hash="a")
-    second = SourceRecord.for_uri(
-        canonicalize_uri("https://example.test/doc"), content_hash="b")
+    first = SourceRecord.for_uri(canonicalize_uri("https://example.test/doc"), content_hash="a")
+    second = SourceRecord.for_uri(canonicalize_uri("https://example.test/doc"), content_hash="b")
     assert first.id != second.id
 
 
@@ -47,9 +45,7 @@ def test_source_policy_rejects_private_dns_result():
     policy = SourcePolicy(allowed_domains=("example.test",))
     with pytest.raises(SourcePolicyError, match="private/local"):
         policy.check_resolved("docs.example.test", ("127.0.0.1",))
-    assert policy.check_resolved("docs.example.test", ("93.184.216.34",)) == (
-        "93.184.216.34",
-    )
+    assert policy.check_resolved("docs.example.test", ("93.184.216.34",)) == ("93.184.216.34",)
 
 
 class _MemoryResearchStore:
@@ -80,12 +76,14 @@ class _MemoryResearchStore:
                 continue
             content = self.content.get(source.id, "")
             if terms and all(term in content.casefold() for term in terms):
-                hits.append({
-                    "source": source.to_record(),
-                    "snippet": content,
-                    "indexed_content_hash": source.content_hash,
-                    "mime_type": "text/plain",
-                })
+                hits.append(
+                    {
+                        "source": source.to_record(),
+                        "snippet": content,
+                        "indexed_content_hash": source.content_hash,
+                        "mime_type": "text/plain",
+                    }
+                )
         return hits[:limit]
 
     async def save_evidence(self, evidence):
@@ -110,6 +108,7 @@ class _MemoryResearchStore:
         if gap is None or (task_id is not None and gap.task_id != task_id):
             return None
         from athena.research.models import ResearchGap
+
         updated = ResearchGap(
             **{**gap.to_record(), "status": "CLOSED", "evidence_ids": list(evidence_ids)}
         )
@@ -128,9 +127,7 @@ class _MemoryArtifacts:
             content = content.encode()
         uri = "artifact://sha256/source"
         self.data[uri] = content
-        ref = ArtifactRef(
-            id=uri, uri=uri, hash="source", task_id=kwargs.get("task_id")
-        )
+        ref = ArtifactRef(id=uri, uri=uri, hash="source", task_id=kwargs.get("task_id"))
         self.refs.append(ref)
         return ref
 
@@ -147,23 +144,27 @@ async def test_record_source_cannot_import_another_tasks_artifact():
     artifacts = _MemoryArtifacts()
     foreign_uri = "artifact://sha256/foreign"
     artifacts.data[foreign_uri] = b"private snapshot"
-    artifacts.refs.append(ArtifactRef(
-        id=foreign_uri, uri=foreign_uri, hash="foreign", task_id="task-other"
-    ))
+    artifacts.refs.append(
+        ArtifactRef(id=foreign_uri, uri=foreign_uri, hash="foreign", task_id="task-other")
+    )
     capability = ResearchCapability(
         store,
         artifact_store=artifacts,
         source_policy=SourcePolicy(allowed_domains=("example.test",)),
     )
 
-    result = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-a", call_id="foreign-artifact",
-        arguments={
-            "operation": "record_source",
-            "uri": "https://example.test/private",
-            "artifact_uri": foreign_uri,
-        },
-    ))
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-a",
+            call_id="foreign-artifact",
+            arguments={
+                "operation": "record_source",
+                "uri": "https://example.test/private",
+                "artifact_uri": foreign_uri,
+            },
+        )
+    )
 
     assert result.status is CapabilityResultStatus.FAILED
     assert "not visible" in (result.error or "")
@@ -179,44 +180,71 @@ async def test_capability_records_and_verifies_evidence():
         source_policy=SourcePolicy(allowed_domains=("example.test",)),
     )
     context = SimpleNamespace(workspace=SimpleNamespace(id="repo"))
-    source_result = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-1", call_id="source-1",
-        arguments={
-            "operation": "record_source", "uri": "https://example.test/doc",
-            "source_type": "documentation", "content": "status=ready",
-        },
-    ), context=context)
+    source_result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-1",
+            call_id="source-1",
+            arguments={
+                "operation": "record_source",
+                "uri": "https://example.test/doc",
+                "source_type": "documentation",
+                "content": "status=ready",
+            },
+        ),
+        context=context,
+    )
     assert source_result.status is CapabilityResultStatus.OK
     source_id = json.loads(source_result.output)["source"]["id"]
 
-    evidence_result = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-1", call_id="evidence-1",
-        arguments={
-            "operation": "record_evidence", "source_id": source_id,
-            "claim": "The status is ready.", "excerpt": "status=ready",
-        },
-    ))
+    evidence_result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-1",
+            call_id="evidence-1",
+            arguments={
+                "operation": "record_evidence",
+                "source_id": source_id,
+                "claim": "The status is ready.",
+                "excerpt": "status=ready",
+            },
+        )
+    )
     assert evidence_result.status is CapabilityResultStatus.OK
     evidence_id = json.loads(evidence_result.output)["evidence"]["id"]
 
-    verified = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-1", call_id="verify-1",
-        arguments={"operation": "verify", "evidence_id": evidence_id},
-    ))
+    verified = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-1",
+            call_id="verify-1",
+            arguments={"operation": "verify", "evidence_id": evidence_id},
+        )
+    )
     assert json.loads(verified.output)["status"] == "verified"
 
-    searched = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-1", call_id="search-1",
-        arguments={"operation": "search", "query": "status"},
-    ), context=context)
+    searched = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-1",
+            call_id="search-1",
+            arguments={"operation": "search", "query": "status"},
+        ),
+        context=context,
+    )
     search_payload = json.loads(searched.output)
     assert search_payload["sources"][0]["id"] == source_id
     assert search_payload["evidence"][0]["id"] == evidence_id
 
-    discovered = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-1", call_id="discover-1",
-        arguments={"operation": "discover", "query": "status"},
-    ), context=context)
+    discovered = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-1",
+            call_id="discover-1",
+            arguments={"operation": "discover", "query": "status"},
+        ),
+        context=context,
+    )
     assert discovered.status is CapabilityResultStatus.OK
     discover_payload = json.loads(discovered.output)
     assert discover_payload["provider"] == "local_corpus"
@@ -225,10 +253,87 @@ async def test_capability_records_and_verifies_evidence():
 
 
 @pytest.mark.asyncio
+async def test_execution_evidence_requires_a_replayable_receipt():
+    store = _MemoryResearchStore()
+    artifacts = _MemoryArtifacts()
+    capability = ResearchCapability(
+        store,
+        artifact_store=artifacts,
+        source_policy=SourcePolicy(allowed_domains=("example.test",)),
+    )
+    source_result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-receipt",
+            call_id="source-receipt",
+            arguments={
+                "operation": "record_source",
+                "uri": "https://example.test/run",
+                "content": "execution completed",
+            },
+        )
+    )
+    source_id = json.loads(source_result.output)["source"]["id"]
+    evidence_result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-receipt",
+            call_id="evidence-receipt",
+            arguments={
+                "operation": "record_evidence",
+                "source_id": source_id,
+                "evidence_type": "execution",
+                "claim": "the check passed",
+                "excerpt": "execution completed",
+                "receipt": {
+                    "capability_id": "execute",
+                    "input_hash": "abc",
+                    "environment_fingerprint": "env-1",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            },
+        )
+    )
+    evidence_id = json.loads(evidence_result.output)["evidence"]["id"]
+
+    verified = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-receipt",
+            call_id="verify-receipt",
+            arguments={"operation": "verify", "evidence_id": evidence_id},
+        )
+    )
+    payload = json.loads(verified.output)
+    assert payload["status"] == "verified"
+    assert payload["receipt"]["status"] == "verified"
+
+    missing_receipt = EvidenceObject.for_content(
+        source_id=source_id,
+        evidence_type="execution",
+        extracted_claim="the check passed",
+        exact_supporting_excerpt="execution completed",
+        task_id="task-receipt",
+    )
+    await store.save_evidence(missing_receipt)
+    invalid = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-receipt",
+            call_id="verify-missing-receipt",
+            arguments={"operation": "verify", "evidence_id": missing_receipt.id},
+        )
+    )
+    assert json.loads(invalid.output)["status"] == "invalid"
+
+
+@pytest.mark.asyncio
 async def test_task_cannot_cite_or_verify_another_tasks_private_evidence():
     store = _MemoryResearchStore()
     foreign_source = SourceRecord.for_uri(
-        "https://example.test/private", content_hash="foreign",
+        "https://example.test/private",
+        content_hash="foreign",
         task_id="task-2",
     )
     await store.save_source(foreign_source)
@@ -244,19 +349,31 @@ async def test_task_cannot_cite_or_verify_another_tasks_private_evidence():
     )
     context = SimpleNamespace(workspace=SimpleNamespace(id="repo"))
 
-    cited = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-1", call_id="foreign-cite",
-        arguments={
-            "operation": "record_evidence", "source_id": foreign_source.id,
-            "claim": "leak", "excerpt": "private",
-        },
-    ), context=context)
+    cited = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-1",
+            call_id="foreign-cite",
+            arguments={
+                "operation": "record_evidence",
+                "source_id": foreign_source.id,
+                "claim": "leak",
+                "excerpt": "private",
+            },
+        ),
+        context=context,
+    )
     assert cited.status is CapabilityResultStatus.FAILED
 
-    verified = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-1", call_id="foreign-verify",
-        arguments={"operation": "verify", "evidence_id": evidence.id},
-    ), context=context)
+    verified = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-1",
+            call_id="foreign-verify",
+            arguments={"operation": "verify", "evidence_id": evidence.id},
+        ),
+        context=context,
+    )
     assert verified.status is CapabilityResultStatus.FAILED
 
 
@@ -302,15 +419,20 @@ async def test_fetch_snapshots_allowlisted_source(monkeypatch):
             return _Response()
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    result = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-fetch", call_id="fetch-1",
-        arguments={
-            "operation": "fetch",
-            "uri": "https://example.test/doc#section",
-            "max_bytes": 100,
-        },
-    ))
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-fetch",
+            call_id="fetch-1",
+            arguments={
+                "operation": "fetch",
+                "uri": "https://example.test/doc#section",
+                "max_bytes": 100,
+            },
+        )
+    )
 
     assert result.status is CapabilityResultStatus.OK
     source = json.loads(result.output)["source"]
@@ -330,16 +452,21 @@ async def test_fetch_rejects_non_allowlisted_source_before_network(monkeypatch):
             called = True
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
     capability = ResearchCapability(
         _MemoryResearchStore(),
         artifact_store=_MemoryArtifacts(),
         source_policy=SourcePolicy(allowed_domains=("example.test",)),
     )
-    result = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-fetch", call_id="fetch-2",
-        arguments={"operation": "fetch", "uri": "https://other.test/doc"},
-    ))
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-fetch",
+            call_id="fetch-2",
+            arguments={"operation": "fetch", "uri": "https://other.test/doc"},
+        )
+    )
 
     assert result.status is CapabilityResultStatus.FAILED
     assert "allowlisted" in (result.error or "")
@@ -357,59 +484,95 @@ async def test_plan_assess_and_bundle_require_verified_evidence():
     )
     context = SimpleNamespace(workspace=SimpleNamespace(id="repo"))
 
-    plan = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-plan", call_id="plan-1",
-        arguments={
-            "operation": "plan",
-            "objective": "verify the release status",
-            "requirements": [{
-                "id": "release-status",
-                "claim_id": "claim-release-status",
-                "question": "Is the release ready?",
-                "queries": ["status=ready"],
-            }],
-        },
-    ), context=context)
+    plan = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-plan",
+            call_id="plan-1",
+            arguments={
+                "operation": "plan",
+                "objective": "verify the release status",
+                "requirements": [
+                    {
+                        "id": "release-status",
+                        "claim_id": "claim-release-status",
+                        "question": "Is the release ready?",
+                        "queries": ["status=ready"],
+                    }
+                ],
+            },
+        ),
+        context=context,
+    )
     plan_payload = json.loads(plan.output)
     gap = plan_payload["requirements"][0]["gap"]
 
-    before = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-plan", call_id="assess-1",
-        arguments={"operation": "assess"},
-    ), context=context)
+    before = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-plan",
+            call_id="assess-1",
+            arguments={"operation": "assess"},
+        ),
+        context=context,
+    )
     assert json.loads(before.output)["ready"] is False
 
-    source = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-plan", call_id="source-1",
-        arguments={
-            "operation": "record_source", "uri": "https://example.test/release",
-            "content": "status=ready", "title": "release snapshot",
-        },
-    ), context=context)
+    source = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-plan",
+            call_id="source-1",
+            arguments={
+                "operation": "record_source",
+                "uri": "https://example.test/release",
+                "content": "status=ready",
+                "title": "release snapshot",
+            },
+        ),
+        context=context,
+    )
     source_id = json.loads(source.output)["source"]["id"]
-    evidence = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-plan", call_id="evidence-1",
-        arguments={
-            "operation": "record_evidence", "source_id": source_id,
-            "claim_id": "claim-release-status", "claim": "The release is ready.",
-            "excerpt": "status=ready",
-        },
-    ), context=context)
+    evidence = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-plan",
+            call_id="evidence-1",
+            arguments={
+                "operation": "record_evidence",
+                "source_id": source_id,
+                "claim_id": "claim-release-status",
+                "claim": "The release is ready.",
+                "excerpt": "status=ready",
+            },
+        ),
+        context=context,
+    )
     evidence_id = json.loads(evidence.output)["evidence"]["id"]
 
-    assessed = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-plan", call_id="assess-2",
-        arguments={"operation": "assess", "gap_ids": [gap["id"]]},
-    ), context=context)
+    assessed = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-plan",
+            call_id="assess-2",
+            arguments={"operation": "assess", "gap_ids": [gap["id"]]},
+        ),
+        context=context,
+    )
     assessed_payload = json.loads(assessed.output)
     assert assessed_payload["ready"] is True
     assert assessed_payload["gaps"][0]["status"] == "CLOSED"
     assert assessed_payload["gaps"][0]["evidence_ids"] == [evidence_id]
 
-    bundle = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-plan", call_id="bundle-1",
-        arguments={"operation": "bundle"},
-    ), context=context)
+    bundle = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-plan",
+            call_id="bundle-1",
+            arguments={"operation": "bundle"},
+        ),
+        context=context,
+    )
     bundle_payload = json.loads(bundle.output)
     assert bundle_payload["ready"] is True
     assert bundle_payload["evidence"][0]["id"] == evidence_id
@@ -426,31 +589,42 @@ async def test_run_composes_objective_capture_search_evidence_and_verification()
     )
     context = SimpleNamespace(workspace=SimpleNamespace(id="repo"))
 
-    result = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-run", call_id="run-1",
-        arguments={
-            "operation": "run",
-            "objective": "verify the release status",
-            "requirements": [{
-                "id": "release-status",
-                "claim_id": "claim-release-status",
-                "question": "Is the release ready?",
-                "queries": ["status=ready"],
-            }],
-            "source_specs": [{
-                "uri": "https://example.test/release",
-                "title": "release snapshot",
-                "content": "status=ready",
-            }],
-            "extractions": [{
-                "uri": "https://example.test/release",
-                "claim_id": "claim-release-status",
-                "claim": "The release is ready.",
-                "excerpt": "status=ready",
-                "confidence": 0.99,
-            }],
-        },
-    ), context=context)
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-run",
+            call_id="run-1",
+            arguments={
+                "operation": "run",
+                "objective": "verify the release status",
+                "requirements": [
+                    {
+                        "id": "release-status",
+                        "claim_id": "claim-release-status",
+                        "question": "Is the release ready?",
+                        "queries": ["status=ready"],
+                    }
+                ],
+                "source_specs": [
+                    {
+                        "uri": "https://example.test/release",
+                        "title": "release snapshot",
+                        "content": "status=ready",
+                    }
+                ],
+                "extractions": [
+                    {
+                        "uri": "https://example.test/release",
+                        "claim_id": "claim-release-status",
+                        "claim": "The release is ready.",
+                        "excerpt": "status=ready",
+                        "confidence": 0.99,
+                    }
+                ],
+            },
+        ),
+        context=context,
+    )
 
     assert result.status is CapabilityResultStatus.OK
     payload = json.loads(result.output)
@@ -499,38 +673,45 @@ async def test_run_keeps_unverified_or_contradictory_research_unready():
         task_id="task-run-conflict",
     ).id
 
-    result = await capability.invoke(CapabilityRequest(
-        capability_id="research", task_id="task-run-conflict", call_id="run-2",
-        arguments={
-            "operation": "run",
-            "objective": "compare release claims",
-            "requirements": [{
-                "id": "release-status",
-                "claim_id": "claim-release-status",
-                "question": "What is the release status?",
-                "queries": ["status"],
-            }],
-            "source_specs": [
-                {"uri": "https://example.test/one", "content": "status=ready"},
-                {"uri": "https://example.test/two", "content": "status=blocked"},
-            ],
-            "extractions": [
-                {
-                    "uri": "https://example.test/one",
-                    "claim_id": "claim-release-status",
-                    "claim": "The release is ready.",
-                    "excerpt": "status=ready",
-                },
-                {
-                    "uri": "https://example.test/two",
-                    "claim_id": "claim-release-status",
-                    "claim": "The release is blocked.",
-                    "excerpt": "status=blocked",
-                    "contradicts": [first_evidence_id],
-                },
-            ],
-        },
-    ), context=context)
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-run-conflict",
+            call_id="run-2",
+            arguments={
+                "operation": "run",
+                "objective": "compare release claims",
+                "requirements": [
+                    {
+                        "id": "release-status",
+                        "claim_id": "claim-release-status",
+                        "question": "What is the release status?",
+                        "queries": ["status"],
+                    }
+                ],
+                "source_specs": [
+                    {"uri": "https://example.test/one", "content": "status=ready"},
+                    {"uri": "https://example.test/two", "content": "status=blocked"},
+                ],
+                "extractions": [
+                    {
+                        "uri": "https://example.test/one",
+                        "claim_id": "claim-release-status",
+                        "claim": "The release is ready.",
+                        "excerpt": "status=ready",
+                    },
+                    {
+                        "uri": "https://example.test/two",
+                        "claim_id": "claim-release-status",
+                        "claim": "The release is blocked.",
+                        "excerpt": "status=blocked",
+                        "contradicts": [first_evidence_id],
+                    },
+                ],
+            },
+        ),
+        context=context,
+    )
 
     assert result.status is CapabilityResultStatus.OK
     payload = json.loads(result.output)
@@ -545,23 +726,33 @@ def test_research_effect_contract_is_exact():
     descriptor = ResearchCapability.descriptor
     assert descriptor.resolve_effects({"operation": "sources"})
     assert descriptor.resolve_effects({"operation": "record_source"})
-    assert descriptor.resolve_effects({"operation": "fetch"}) == frozenset({
-        EffectClass.WRITE_LOCAL,
-        EffectClass.NETWORK_READ,
-    })
-    assert descriptor.resolve_effects({"operation": "plan"}) == frozenset({
-        EffectClass.READ_LOCAL,
-        EffectClass.WRITE_LOCAL,
-    })
-    assert descriptor.resolve_effects({"operation": "assess"}) == frozenset({
-        EffectClass.READ_LOCAL,
-        EffectClass.WRITE_LOCAL,
-    })
-    assert descriptor.resolve_effects({"operation": "bundle"}) == frozenset({
-        EffectClass.READ_LOCAL,
-    })
-    assert descriptor.resolve_effects({"operation": "run"}) == frozenset({
-        EffectClass.READ_LOCAL,
-        EffectClass.WRITE_LOCAL,
-        EffectClass.NETWORK_READ,
-    })
+    assert descriptor.resolve_effects({"operation": "fetch"}) == frozenset(
+        {
+            EffectClass.WRITE_LOCAL,
+            EffectClass.NETWORK_READ,
+        }
+    )
+    assert descriptor.resolve_effects({"operation": "plan"}) == frozenset(
+        {
+            EffectClass.READ_LOCAL,
+            EffectClass.WRITE_LOCAL,
+        }
+    )
+    assert descriptor.resolve_effects({"operation": "assess"}) == frozenset(
+        {
+            EffectClass.READ_LOCAL,
+            EffectClass.WRITE_LOCAL,
+        }
+    )
+    assert descriptor.resolve_effects({"operation": "bundle"}) == frozenset(
+        {
+            EffectClass.READ_LOCAL,
+        }
+    )
+    assert descriptor.resolve_effects({"operation": "run"}) == frozenset(
+        {
+            EffectClass.READ_LOCAL,
+            EffectClass.WRITE_LOCAL,
+            EffectClass.NETWORK_READ,
+        }
+    )

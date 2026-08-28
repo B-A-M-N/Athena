@@ -58,8 +58,7 @@ class _Service:
 class _Ev:
     """Minimal event stand-in mirroring protocol.events.Event."""
 
-    def __init__(self, type_: str, payload: dict, *, id: str = "evt-1",
-                 sequence: int = 1):
+    def __init__(self, type_: str, payload: dict, *, id: str = "evt-1", sequence: int = 1):
         self.id = id
         self.type = type_
         self.sequence = sequence
@@ -75,14 +74,15 @@ async def test_inspect_renders_inference_section_from_events_and_usage(capsys):
         _Ev("TaskStarted", {}, id="evt-0", sequence=0),
         _Ev(
             "ModelRequestStarted",
-            {"provider": "fake", "model": "fake-standard",
-             "provider_profile_id": "fake"},
-            id="evt-1", sequence=1,
+            {"provider": "fake", "model": "fake-standard", "provider_profile_id": "fake"},
+            id="evt-1",
+            sequence=1,
         ),
         _Ev(
             "ModelResponseCompleted",
             {"provider": "fake", "model": "fake-standard"},
-            id="evt-2", sequence=2,
+            id="evt-2",
+            sequence=2,
         ),
         _Ev("ModelDelta", {"text": "hello"}, id="evt-3", sequence=3),
     ]
@@ -154,7 +154,8 @@ async def test_inspect_role_rendered_from_metadata_when_present(capsys):
         _Ev(
             "ModelRequestStarted",
             {"provider": "fake", "model": "fake-judge", "role": "judge"},
-            id="evt-9", sequence=1,
+            id="evt-9",
+            sequence=1,
         ),
     ]
     service = _Service(task=_Task(), events=events, usage_rows=[])
@@ -185,7 +186,8 @@ async def test_inspect_survives_service_without_usage_store(capsys):
             yield _Ev(
                 "ModelRequestStarted",
                 {"provider": "fake", "model": "fake-standard"},
-                id="evt-1", sequence=1,
+                id="evt-1",
+                sequence=1,
             )
 
     code = await run_inspect(_BareService(), "task-1")

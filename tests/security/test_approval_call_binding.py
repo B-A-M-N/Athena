@@ -4,6 +4,7 @@ A CALL-scoped grant must be bound to the EXACT call_id and task_id that
 originated the request. A different task or different call must NOT be able
 to consume another's single-use CALL grant.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -45,7 +46,8 @@ def test_call_grant_consumed_by_same_call():
     digest = args_digest(req.arguments)
 
     aid = mgr.create_request(
-        req.principal, ApprovalScope.CALL,
+        req.principal,
+        ApprovalScope.CALL,
         capability="fs",
         effect="WRITE_LOCAL",
         task_id=req.task_id,
@@ -71,7 +73,8 @@ def test_call_grant_not_consumable_by_different_task():
     digest = args_digest(req_a.arguments)
 
     aid = mgr.create_request(
-        req_a.principal, ApprovalScope.CALL,
+        req_a.principal,
+        ApprovalScope.CALL,
         capability="fs",
         effect="WRITE_LOCAL",
         task_id="task-A",
@@ -94,7 +97,8 @@ def test_call_grant_not_consumable_by_different_call_id():
     digest = args_digest({"path": "/file.txt", "content": "data"})
 
     aid = mgr.create_request(
-        Principal("agent", "athena"), ApprovalScope.CALL,
+        Principal("agent", "athena"),
+        ApprovalScope.CALL,
         capability="fs",
         effect="WRITE_LOCAL",
         task_id="task-A",
@@ -117,7 +121,8 @@ def test_call_grant_rejected_on_argument_substitution():
     digest = args_digest({"path": "/file.txt", "content": "original"})
 
     aid = mgr.create_request(
-        Principal("agent", "athena"), ApprovalScope.CALL,
+        Principal("agent", "athena"),
+        ApprovalScope.CALL,
         capability="fs",
         effect="WRITE_LOCAL",
         task_id="task-A",
@@ -143,7 +148,8 @@ def test_task_scope_grant_still_works_without_call_id():
     digest = args_digest({"path": "/file.txt", "content": "data"})
 
     aid = mgr.create_request(
-        Principal("agent", "athena"), ApprovalScope.TASK,
+        Principal("agent", "athena"),
+        ApprovalScope.TASK,
         capability="fs",
         effect="WRITE_LOCAL",
         task_id="task-A",

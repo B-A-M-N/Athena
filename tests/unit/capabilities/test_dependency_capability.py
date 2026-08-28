@@ -41,11 +41,15 @@ async def test_dependency_install_writes_reproducibility_lock(tmp_path, monkeypa
     monkeypatch.setattr(
         "athena.capabilities.dependency.importlib.metadata.distributions",
         lambda path: [
-            type("Distribution", (), {
-                "metadata": {"Name": "demo"},
-                "version": _Distribution.version,
-                "read_text": lambda self, name: _Distribution.read_text(name),
-            })()
+            type(
+                "Distribution",
+                (),
+                {
+                    "metadata": {"Name": "demo"},
+                    "version": _Distribution.version,
+                    "read_text": lambda self, name: _Distribution.read_text(name),
+                },
+            )()
         ],
     )
     context = SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path)))
@@ -70,9 +74,7 @@ async def test_dependency_inspect_reports_locked_version(tmp_path):
     )
     context = SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path)))
 
-    result = await DependencyCapability().invoke(
-        _request("inspect", name="demo"), context=context
-    )
+    result = await DependencyCapability().invoke(_request("inspect", name="demo"), context=context)
 
     assert result.status is CapabilityResultStatus.OK
     assert "1.2.3" in result.output

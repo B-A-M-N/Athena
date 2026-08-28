@@ -67,9 +67,7 @@ async def stack():
     messages = MessageStore(db)
 
     manager = TaskManager(task_store=tasks, events=events, sessions=sessions)
-    provider = FakeModelProvider(
-        scripts=[], model="fake-1", provider="fake", tool_calling=True
-    )
+    provider = FakeModelProvider(scripts=[], model="fake-1", provider="fake", tool_calling=True)
     registry = ProviderRegistry()
     registry.register("fake", provider)
     router = ModelRouter(registry)
@@ -85,8 +83,14 @@ async def stack():
         termination=TerminationEvaluator(),
     )
     yield Stack(
-        db=db, sessions=sessions, tasks=tasks, messages=messages,
-        events=events, manager=manager, provider=provider, kernel=kernel,
+        db=db,
+        sessions=sessions,
+        tasks=tasks,
+        messages=messages,
+        events=events,
+        manager=manager,
+        provider=provider,
+        kernel=kernel,
     )
     await db.close()
 

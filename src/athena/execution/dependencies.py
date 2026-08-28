@@ -61,9 +61,7 @@ def resolve_dependency_environment(
     if root not in target.parents:
         raise DependencyEnvironmentError("dependency target escaped workspace")
     if not target.is_dir():
-        raise DependencyEnvironmentError(
-            f"dependency environment is missing: {target}"
-        )
+        raise DependencyEnvironmentError(f"dependency environment is missing: {target}")
 
     lock_path = root / ".athena" / "dependencies.lock.json"
     try:
@@ -154,9 +152,7 @@ def verify_record_files(distribution: Any) -> None:
     record_text = distribution.read_text("RECORD")
     locate_file = getattr(distribution, "locate_file", None)
     if not record_text or locate_file is None:
-        raise DependencyEnvironmentError(
-            "installed dependency has no verifiable RECORD file"
-        )
+        raise DependencyEnvironmentError("installed dependency has no verifiable RECORD file")
     for line in record_text.splitlines():
         path, encoded, *_ = line.split(",", 2) + [""]
         if not encoded.startswith("sha256="):
@@ -164,22 +160,18 @@ def verify_record_files(distribution: Any) -> None:
         expected = encoded.removeprefix("sha256=")
         candidate = Path(locate_file(unquote(path))).resolve()
         if not candidate.is_file():
-            raise DependencyEnvironmentError(
-                f"dependency RECORD entry is missing: {path}"
-            )
-        actual = base64.urlsafe_b64encode(
-            hashlib.sha256(candidate.read_bytes()).digest()
-        ).rstrip(b"=").decode("ascii")
+            raise DependencyEnvironmentError(f"dependency RECORD entry is missing: {path}")
+        actual = (
+            base64.urlsafe_b64encode(hashlib.sha256(candidate.read_bytes()).digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
         if actual != expected:
-            raise DependencyEnvironmentError(
-                f"dependency RECORD content hash mismatch: {path}"
-            )
+            raise DependencyEnvironmentError(f"dependency RECORD content hash mismatch: {path}")
 
 
 def environment_fingerprint(packages: Sequence[Mapping[str, Any]]) -> str:
-    encoded = json.dumps(
-        list(packages), sort_keys=True, separators=(",", ":")
-    ).encode()
+    encoded = json.dumps(list(packages), sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 

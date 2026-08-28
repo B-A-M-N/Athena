@@ -5,9 +5,12 @@ bridges the model's ``execute(language, code)`` request to the ExecutionManager
 and its persistent runtimes (shell, python). Execution remains behind
 ``ExecutionManager`` (INV-005) and policy (INV-004).
 """
+
 from __future__ import annotations
 
 import os
+import hashlib
+from collections.abc import Mapping
 from datetime import timedelta
 
 from athena.execution.diagnostics import normalize_diagnostics
@@ -55,11 +58,19 @@ class ExecuteCapability:
         origin=CapabilityOrigin.NATIVE,
     )
 
-    def __init__(self, execution_manager, workspace=None, event_sink=None, artifact_store=None) -> None:
+    def __init__(
+        self,
+        execution_manager,
+        workspace=None,
+        event_sink=None,
+        artifact_store=None,
+        failure_memory=None,
+    ) -> None:
         self.execution_manager = execution_manager
         self.workspace = workspace
         self._event_sink = event_sink
         self._artifact_store = artifact_store
+        self._failure_memory = failure_memory
 
     async def invoke(
         self,
@@ -72,7 +83,8 @@ class ExecuteCapability:
         language = (args.get("language") or "sh").lower()
         if language not in _LANGUAGES:
             return CapabilityResult(
-                request.call_id, request.capability_id,
+                request.call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error=f"unsupported language: {language}",
             )
@@ -80,7 +92,8 @@ class ExecuteCapability:
         runtime_name = _map_runtime(language)
         if runtime_name not in self.execution_manager.available_runtimes():
             return CapabilityResult(
-                request.call_id, request.capability_id,
+                request.call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error=f"runtime unavailable: {language}",
             )
@@ -88,7 +101,8 @@ class ExecuteCapability:
         ws = context.workspace if context else self.workspace
         if ws is None:
             return CapabilityResult(
-                request.call_id, request.capability_id,
+                request.call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error="no workspace bound",
             )
@@ -97,7 +111,8 @@ class ExecuteCapability:
             cwd = self._resolve_cwd(ws, args.get("cwd"))
         except ValueError as exc:
             return CapabilityResult(
-                request.call_id, request.capability_id,
+                request.call_id,
+                request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error=str(exc),
             )
@@ -109,13 +124,15 @@ class ExecuteCapability:
                 timeout_sec = float(args["timeout"])
             except (TypeError, ValueError):
                 return CapabilityResult(
-                    request.call_id, request.capability_id,
+                    request.call_id,
+                    request.capability_id,
                     CapabilityResultStatus.FAILED,
                     error="timeout must be a number (seconds)",
                 )
             if timeout_sec <= 0:
                 return CapabilityResult(
-                    request.call_id, request.capability_id,
+                    request.call_id,
+                    request.capability_id,
                     CapabilityResultStatus.FAILED,
                     error="timeout must be positive (seconds)",
                 )
@@ -128,7 +145,8 @@ class ExecuteCapability:
                 runtime_session_id, request.task_id
             ):
                 return CapabilityResult(
-                    request.call_id, request.capability_id,
+                    request.call_id,
+                    request.capability_id,
                     CapabilityResultStatus.FAILED,
                     error=f"session {runtime_session_id} is not owned by task {request.task_id}",
                 )
@@ -154,9 +172,12 @@ class ExecuteCapability:
         exit_code: int | None = None
         timed_out = False
         interrupted = False
+        execution_metadata: dict[str, object] = {}
 
         async for event in self.execution_manager.stream(exec_req, execution_id):
-            if event.type == ExecutionEventType.STDOUT:
+            if event.type == ExecutionEventType.STARTED:
+                execution_metadata.update(dict(event.metadata or {}))
+            elif event.type == ExecutionEventType.STDOUT:
                 data = event.data or ""
                 stdout_parts.append(data)
                 if self._event_sink:
@@ -183,13 +204,21 @@ class ExecuteCapability:
 
         if timed_out:
             return CapabilityResult(
-                request.call_id, request.capability_id, CapabilityResultStatus.FAILED,
-                output=stdout, error="execution timed out",
+                request.call_id,
+                request.capability_id,
+                CapabilityResultStatus.FAILED,
+                output=stdout,
+                error="execution timed out",
+                metadata=_execution_metadata(execution_metadata),
             )
         if interrupted:
             return CapabilityResult(
-                request.call_id, request.capability_id, CapabilityResultStatus.FAILED,
-                output=stdout, error="execution interrupted",
+                request.call_id,
+                request.capability_id,
+                CapabilityResultStatus.FAILED,
+                output=stdout,
+                error="execution interrupted",
+                metadata=_execution_metadata(execution_metadata),
             )
 
         combined = stdout + ("\n" + stderr if stderr else "")
@@ -201,7 +230,13 @@ class ExecuteCapability:
         result_metadata: dict[str, object] = {
             "diagnostics": [diagnostic.to_dict() for diagnostic in diagnostics],
             "diagnostic_count": len(diagnostics),
+            "failure_environment_fingerprint": _failure_environment(
+                runtime_name,
+                ws,
+                backend_metadata=execution_metadata,
+            ),
         }
+        result_metadata.update(_execution_metadata(execution_metadata))
         if len(combined) > max_inline and self._artifact_store is not None:
             try:
                 artifact = await self._artifact_store.save(
@@ -211,7 +246,9 @@ class ExecuteCapability:
                     producer="execute",
                 )
                 ref_uri = artifact.uri
-                combined = combined[:max_inline] + f"\n…[truncated, full output in artifact {ref_uri}]"
+                combined = (
+                    combined[:max_inline] + f"\n…[truncated, full output in artifact {ref_uri}]"
+                )
             except Exception as exc:
                 # Preserve the complete output and make the degraded
                 # observability state explicit.  Silently pretending that a
@@ -223,18 +260,68 @@ class ExecuteCapability:
             result_metadata["artifactization"] = "unavailable"
 
         if exit_code not in (0, None):
+            await self._remember_failures(
+                diagnostics,
+                request=request,
+                workspace=ws,
+                runtime=runtime_name,
+                error=stderr or f"exit code {exit_code}",
+                backend_metadata=execution_metadata,
+            )
             return CapabilityResult(
-                request.call_id, request.capability_id, CapabilityResultStatus.FAILED,
-                output=combined, error=stderr or f"exit code {exit_code}",
+                request.call_id,
+                request.capability_id,
+                CapabilityResultStatus.FAILED,
+                output=combined,
+                error=stderr or f"exit code {exit_code}",
                 ref_uri=ref_uri,
                 metadata={"exit_code": exit_code, **result_metadata},
             )
         return CapabilityResult(
-            request.call_id, request.capability_id, CapabilityResultStatus.OK,
+            request.call_id,
+            request.capability_id,
+            CapabilityResultStatus.OK,
             output=combined,
             ref_uri=ref_uri,
             metadata=result_metadata,
         )
+
+    async def _remember_failures(
+        self,
+        diagnostics,
+        *,
+        request,
+        workspace,
+        runtime: str,
+        error: str,
+        backend_metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        if self._failure_memory is None:
+            return
+        environment = _failure_environment(
+            runtime,
+            workspace,
+            backend_metadata=backend_metadata,
+        )
+        for diagnostic in diagnostics:
+            try:
+                await self._failure_memory.record(
+                    signature_fingerprint=diagnostic.signature_fingerprint,
+                    capability_id="execute",
+                    environment_fingerprint=environment,
+                    project_scope=workspace.id,
+                    strategy={
+                        "kind": "execution-diagnostic",
+                        "tool": diagnostic.tool,
+                        "code": diagnostic.code,
+                    },
+                    remediation={"error": error, "status": "advisory"},
+                    success=False,
+                )
+            except Exception:
+                # Failure memory is observability. It must never turn the
+                # underlying execution result into a different failure.
+                continue
 
     @staticmethod
     def _resolve_cwd(ws, cwd: str | None) -> str | None:
@@ -256,13 +343,45 @@ class ExecuteCapability:
         return candidate
 
 
+def _failure_environment(
+    runtime: str,
+    workspace,
+    *,
+    backend_metadata: Mapping[str, object] | None = None,
+) -> str:
+    identity = f"{runtime}\x1f{workspace.execution_backend}\x1f{workspace.network_policy.value}"
+    image_digest = str((backend_metadata or {}).get("image_digest") or "")
+    if image_digest:
+        identity += f"\x1f{image_digest}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _execution_metadata(metadata: Mapping[str, object]) -> dict[str, object]:
+    """Expose backend identity in the execution proof without raw internals."""
+    selected = {
+        key: metadata[key]
+        for key in ("backend", "image", "image_digest", "container_id")
+        if key in metadata
+    }
+    return {"execution_environment": selected} if selected else {}
+
+
 def _map_runtime(language: str) -> str:
     aliases = {
-        "python": "python", "py": "python", "python3": "python",
-        "shell": "shell", "bash": "shell", "sh": "shell", "zsh": "shell",
-        "powershell": "powershell", "pwsh": "powershell", "ps1": "powershell",
+        "python": "python",
+        "py": "python",
+        "python3": "python",
+        "shell": "shell",
+        "bash": "shell",
+        "sh": "shell",
+        "zsh": "shell",
+        "powershell": "powershell",
+        "pwsh": "powershell",
+        "ps1": "powershell",
         "cmd": "powershell",
-        "node": "node", "nodejs": "node", "js": "node",
+        "node": "node",
+        "nodejs": "node",
+        "js": "node",
     }
     base = aliases.get(language, language)
     return base if base in ("python", "shell", "node", "powershell") else "shell"
@@ -274,6 +393,7 @@ def _language_name(language: str) -> str:
 
 def _new_id() -> str:
     from athena.protocol.ids import new_id
+
     return new_id("exec")
 
 

@@ -63,9 +63,7 @@ class BackendRegistry:
     def get(self, name: str) -> ExecutionBackend:
         backend = self._backends.get(name)
         if backend is None:
-            raise RuntimeError(
-                f"no such backend: {name!r}; available: {sorted(self._backends)}"
-            )
+            raise RuntimeError(f"no such backend: {name!r}; available: {sorted(self._backends)}")
         return backend
 
     def available(self) -> list[str]:

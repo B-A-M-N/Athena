@@ -94,8 +94,7 @@ class MCPResourceProvider:
             if uri in client._resource_cache:
                 return client
         raise LookupError(
-            "cannot resolve MCP resource; specify connection_id or list "
-            "resources first"
+            "cannot resolve MCP resource; specify connection_id or list resources first"
         )
 
     @staticmethod

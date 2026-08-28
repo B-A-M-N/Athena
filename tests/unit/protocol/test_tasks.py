@@ -69,10 +69,14 @@ def test_interrupted_is_paused_not_final():
 
 
 def test_final_exactly_the_terminal_four():
-    assert FINAL_STATUSES == frozenset({
-        TaskStatus.COMPLETE, TaskStatus.PARTIAL,
-        TaskStatus.FAILED, TaskStatus.CANCELLED,
-    })
+    assert FINAL_STATUSES == frozenset(
+        {
+            TaskStatus.COMPLETE,
+            TaskStatus.PARTIAL,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }
+    )
 
 
 def test_paused_includes_resumable_states():

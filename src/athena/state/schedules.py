@@ -38,9 +38,7 @@ class ScheduleStore:
         if trigger_spec is not None:
             meta["_trigger_spec"] = trigger_spec
         now = utcnow().isoformat()
-        existing = await self._db.fetch_one(
-            "SELECT id FROM scheduled_jobs WHERE id = ?", (job_id,)
-        )
+        existing = await self._db.fetch_one("SELECT id FROM scheduled_jobs WHERE id = ?", (job_id,))
         if existing is None:
             await self._db.execute(
                 "INSERT INTO scheduled_jobs("
@@ -81,9 +79,7 @@ class ScheduleStore:
         return await self.get_job_id(job_id)
 
     async def get_job_id(self, job_id: str) -> dict | None:
-        row = await self._db.fetch_one(
-            "SELECT * FROM scheduled_jobs WHERE id = ?", (job_id,)
-        )
+        row = await self._db.fetch_one("SELECT * FROM scheduled_jobs WHERE id = ?", (job_id,))
         if row is None:
             return None
         return _decode_job(row)
@@ -91,13 +87,10 @@ class ScheduleStore:
     async def list_jobs(self, enabled_only: bool = True) -> list[dict]:
         if enabled_only:
             rows = await self._db.fetch_all(
-                "SELECT * FROM scheduled_jobs WHERE enabled = 1 "
-                "ORDER BY next_run ASC"
+                "SELECT * FROM scheduled_jobs WHERE enabled = 1 ORDER BY next_run ASC"
             )
         else:
-            rows = await self._db.fetch_all(
-                "SELECT * FROM scheduled_jobs ORDER BY next_run ASC"
-            )
+            rows = await self._db.fetch_all("SELECT * FROM scheduled_jobs ORDER BY next_run ASC")
         return [_decode_job(r) for r in rows]
 
     async def set_next_run(self, job_id: str, next_run: str | None) -> None:
@@ -157,8 +150,7 @@ class ScheduleStore:
     async def mark_fired(self, claim_id: str, task_id: str | None = None) -> None:
         now = self._now_iso()
         await self._db.execute(
-            "UPDATE job_runs SET status = ?, task_id = ?, ended_at = ? "
-            "WHERE id = ?",
+            "UPDATE job_runs SET status = ?, task_id = ?, ended_at = ? WHERE id = ?",
             ("FIRED", task_id, now, claim_id),
         )
 
@@ -173,8 +165,7 @@ class ScheduleStore:
     ) -> None:
         now = self._now_iso()
         await self._db.execute(
-            "UPDATE job_runs SET status = ?, task_id = ?, ended_at = ? "
-            "WHERE id = ?",
+            "UPDATE job_runs SET status = ?, task_id = ?, ended_at = ? WHERE id = ?",
             ("FIRED", task_id, now, claim_id),
         )
         if job_id is not None:
@@ -188,9 +179,7 @@ class ScheduleStore:
                     (job_id,),
                 )
 
-    async def release_claim(
-        self, claim_id: str, job_id: str, scheduled_for: str
-    ) -> None:
+    async def release_claim(self, claim_id: str, job_id: str, scheduled_for: str) -> None:
         """Release a CLAIMED occurrence without marking it fired.
 
         Deletes the claim row and restores ``next_run`` to the occurrence time so
@@ -200,12 +189,9 @@ class ScheduleStore:
         now = self._now_iso()
         try:
             async with self._db.transaction():
+                await self._db.execute_raw("DELETE FROM job_runs WHERE id = ?", (claim_id,))
                 await self._db.execute_raw(
-                    "DELETE FROM job_runs WHERE id = ?", (claim_id,)
-                )
-                await self._db.execute_raw(
-                    "UPDATE scheduled_jobs SET next_run = ?, updated_at = ? "
-                    "WHERE id = ?",
+                    "UPDATE scheduled_jobs SET next_run = ?, updated_at = ? WHERE id = ?",
                     (scheduled_for, now, job_id),
                 )
         except Exception:
@@ -216,8 +202,7 @@ class ScheduleStore:
     ) -> None:
         now = self._now_iso()
         await self._db.execute(
-            "UPDATE job_runs SET status = ?, task_id = ?, ended_at = ?, error = ? "
-            "WHERE id = ?",
+            "UPDATE job_runs SET status = ?, task_id = ?, ended_at = ?, error = ? WHERE id = ?",
             ("FAILED", task_id, now, error, claim_id),
         )
 
@@ -228,8 +213,7 @@ class ScheduleStore:
         matching instead of LIKE substring search on JSON metadata.
         """
         rows = await self._db.fetch_all(
-            "SELECT id, job_id, scheduled_for FROM job_runs "
-            "WHERE status = 'CLAIMED'"
+            "SELECT id, job_id, scheduled_for FROM job_runs WHERE status = 'CLAIMED'"
         )
         reconciled = 0
         for row in rows or []:
@@ -255,8 +239,7 @@ class ScheduleStore:
 
     async def last_run(self, job_id: str) -> dict | None:
         row = await self._db.fetch_one(
-            "SELECT * FROM job_runs WHERE job_id = ? "
-            "ORDER BY started_at DESC LIMIT 1",
+            "SELECT * FROM job_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1",
             (job_id,),
         )
         return _decode_run(row) if row else None
@@ -269,15 +252,11 @@ class ScheduleStore:
         return int(row.get("count", 0)) if row else 0
 
     async def _job_enabled(self, job_id: str) -> bool:
-        row = await self._db.fetch_one(
-            "SELECT enabled FROM scheduled_jobs WHERE id = ?", (job_id,)
-        )
+        row = await self._db.fetch_one("SELECT enabled FROM scheduled_jobs WHERE id = ?", (job_id,))
         return bool(row and row.get("enabled", 0))
 
     async def _get_claim(self, claim_id: str) -> dict | None:
-        row = await self._db.fetch_one(
-            "SELECT * FROM job_runs WHERE id = ?", (claim_id,)
-        )
+        row = await self._db.fetch_one("SELECT * FROM job_runs WHERE id = ?", (claim_id,))
         return _decode_run(row) if row else None
 
     def _now_iso(self) -> str:
@@ -292,12 +271,8 @@ class ScheduleStore:
                 )
                 if existing is None:
                     return False
-                await self._db.execute_raw(
-                    "DELETE FROM job_runs WHERE job_id = ?", (job_id,)
-                )
-                await self._db.execute_raw(
-                    "DELETE FROM scheduled_jobs WHERE id = ?", (job_id,)
-                )
+                await self._db.execute_raw("DELETE FROM job_runs WHERE job_id = ?", (job_id,))
+                await self._db.execute_raw("DELETE FROM scheduled_jobs WHERE id = ?", (job_id,))
                 return True
         except Exception:
             return False

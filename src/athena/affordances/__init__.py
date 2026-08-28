@@ -10,14 +10,18 @@ from athena.affordances.fabric import CapabilityFabric
 from athena.affordances.models import (
     AffordanceScope,
     DependencyRequirement,
+    EvidenceDependency,
     GeneratedCapability,
+    GeneratedValidationCase,
     ScratchAdapter,
     ScratchAnalyzer,
+    ScratchComputationRecord,
     ScratchHelper,
     ScratchProgram,
 )
 from athena.affordances.scratch import ScratchManager
 from athena.affordances.store import GeneratedCapabilityStore
+from athena.affordances.optimizer import AffordanceOptimizer
 from athena.affordances.validation import (
     GeneratedSourceValidator,
     SourceValidation,
@@ -35,21 +39,29 @@ def __getattr__(name):
             WorkflowStep,
             WorkflowValidator,
         )
+
         return {
-            "Workflow": Workflow, "WorkflowResult": WorkflowResult,
-            "WorkflowStep": WorkflowStep, "WorkflowValidator": WorkflowValidator,
+            "Workflow": Workflow,
+            "WorkflowResult": WorkflowResult,
+            "WorkflowStep": WorkflowStep,
+            "WorkflowValidator": WorkflowValidator,
         }[name]
     raise AttributeError(name)
+
 
 __all__ = [
     "AffordanceScope",
     "CapabilityFabric",
+    "AffordanceOptimizer",
     "DependencyRequirement",
+    "EvidenceDependency",
     "GeneratedCapability",
+    "GeneratedValidationCase",
     "GeneratedCapabilityStore",
     "GeneratedSourceValidator",
     "ScratchAdapter",
     "ScratchAnalyzer",
+    "ScratchComputationRecord",
     "ScratchHelper",
     "ScratchManager",
     "ScratchProgram",

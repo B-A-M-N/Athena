@@ -90,7 +90,11 @@ class FakeModelProvider:
         if text is not None:
             blocks.append(TextBlock(type="text", text=text))
         if capability_call is not None and not done:
-            cid = capability_call.get("capability_id", "") if isinstance(capability_call, dict) else ""
+            cid = (
+                capability_call.get("capability_id", "")
+                if isinstance(capability_call, dict)
+                else ""
+            )
             args = capability_call.get("arguments", {}) if isinstance(capability_call, dict) else {}
             blocks.append(
                 CapabilityCallBlock(

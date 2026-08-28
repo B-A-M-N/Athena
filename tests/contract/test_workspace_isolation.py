@@ -1,10 +1,10 @@
 """Contract: workspace isolation is enforced by the EXECUTOR, not just policy.
 
-  * FilesystemCapability resolves all paths against the task workspace; a
-    ``../`` escape is denied by the executor with a FAILED result (no file
-    touched).
-  * ExecuteCapability resolves ``cwd`` against the task workspace root — a
-    path outside it fails closed even when the policy engine is absent.
+* FilesystemCapability resolves all paths against the task workspace; a
+  ``../`` escape is denied by the executor with a FAILED result (no file
+  touched).
+* ExecuteCapability resolves ``cwd`` against the task workspace root — a
+  path outside it fails closed even when the policy engine is absent.
 """
 
 from __future__ import annotations
@@ -23,8 +23,10 @@ from athena.protocol.capabilities import (
 from athena.protocol.execution import ExecutionExitStatus, ExecutionResult
 from athena.protocol.tasks import WorkspaceSpec
 
+
 def _ws(tmp_path, *, writable=None) -> WorkspaceSpec:
     return WorkspaceSpec(id="ws", root=str(tmp_path), writable=tuple(writable or ()))
+
 
 def _req(op, path, **extra) -> CapabilityRequest:
     args = {"operation": op, "path": path, **extra}
@@ -32,11 +34,13 @@ def _req(op, path, **extra) -> CapabilityRequest:
     object.__setattr__(request, "call_id", "ws-call")
     return request
 
+
 def _exec_req(**args) -> CapabilityRequest:
     defaults = {"language": "shell", "code": "echo hi"}
     request = CapabilityRequest("execute", {**defaults, **args}, "task-1")
     object.__setattr__(request, "call_id", "exec-call")
     return request
+
 
 class _FakeExecManager:
     def __init__(self):
@@ -51,10 +55,20 @@ class _FakeExecManager:
 
     async def stream(self, exec_req, execution_id):
         self.calls.append(exec_req)
-        from athena.protocol.execution import ExecutionEvent, ExecutionEventType, ExecutionExitStatus
+        from athena.protocol.execution import (
+            ExecutionEvent,
+            ExecutionEventType,
+            ExecutionExitStatus,
+        )
+
         yield ExecutionEvent(type=ExecutionEventType.STDOUT, execution_id=execution_id, data="ok")
-        yield ExecutionEvent(type=ExecutionEventType.EXITED, execution_id=execution_id,
-                             exit_status=ExecutionExitStatus.EXITED, exit_code=0)
+        yield ExecutionEvent(
+            type=ExecutionEventType.EXITED,
+            execution_id=execution_id,
+            exit_status=ExecutionExitStatus.EXITED,
+            exit_code=0,
+        )
+
 
 @pytest.mark.athena_claim("BHV-053", "BHV-145")
 @pytest.mark.athena_evidence("test", "invariant")
@@ -109,6 +123,7 @@ class TestWorkspaceIsolation:
         )
         assert result.status == CapabilityResultStatus.FAILED
 
+
 @pytest.mark.athena_claim("BHV-149")
 @pytest.mark.athena_evidence("test", "invariant")
 class TestExecuteCwd:
@@ -116,9 +131,7 @@ class TestExecuteCwd:
         mgr = _FakeExecManager()
         cap = ExecuteCapability(mgr)
         req = _exec_req(cwd="sub")
-        result = await cap.invoke(
-            req, context=InvocationContext(workspace=_ws(tmp_path))
-        )
+        result = await cap.invoke(req, context=InvocationContext(workspace=_ws(tmp_path)))
         assert result.status == CapabilityResultStatus.OK
         assert mgr.calls
         expected = os.path.realpath(str(tmp_path / "sub"))
@@ -128,9 +141,7 @@ class TestExecuteCwd:
         mgr = _FakeExecManager()
         cap = ExecuteCapability(mgr)
         req = _exec_req(cwd="../escape")
-        result = await cap.invoke(
-            req, context=InvocationContext(workspace=_ws(tmp_path))
-        )
+        result = await cap.invoke(req, context=InvocationContext(workspace=_ws(tmp_path)))
         assert result.status == CapabilityResultStatus.FAILED
         assert "outside workspace" in (result.error or "")
         assert not mgr.calls

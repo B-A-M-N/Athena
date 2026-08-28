@@ -163,6 +163,7 @@ class ContextCompiler:
         capability_registry: Any = None,
         artifact_store: Any = None,
         research_store: Any = None,
+        context_block_store: Any = None,
         compressor: ContextCompressor | None = None,
         summarizer: Any = None,
         context_window: int = 128_000,
@@ -180,6 +181,7 @@ class ContextCompiler:
         self._capability_registry = capability_registry
         self._artifact_store = artifact_store
         self._research_store = research_store
+        self._context_block_store = context_block_store
         self._compressor = compressor or ContextCompressor(
             recent_turns=recent_verbatim_turns, summarizer=summarizer
         )
@@ -214,10 +216,13 @@ class ContextCompiler:
         ]
         required.extend(_project_entries(self, workspace))
 
+        # Explicitly attached blocks are working context, not retrieval
+        # results. Load them before optional corpus material so they remain
+        # mandatory and provenance survives every provider translation.
+        required.extend(await self._load_context_blocks(task))
+
         # Process attachments: load from ContextRef if needed and create entries
-        attachment_entries = await self._process_attachments(
-            task, normalized_attachments
-        )
+        attachment_entries = await self._process_attachments(task, normalized_attachments)
         required.extend(attachment_entries)
 
         # Single accounting model (P1-34): the input budget is the window minus
@@ -244,9 +249,7 @@ class ContextCompiler:
         messages = tuple(_render_entry(e) for e in final_entries)
         provenance_map = _index_provenance(messages)
         estimated = estimate_tokens("\n\n".join(m.text() for m in messages))
-        requirements = self._build_requirements(
-            task, normalized_attachments, estimated
-        )
+        requirements = self._build_requirements(task, normalized_attachments, estimated)
         return CompiledContext(
             messages=messages,
             requirements=requirements,
@@ -257,6 +260,45 @@ class ContextCompiler:
             capability_definitions=capabilities,
             strategy=strategy,
         )
+
+    async def _load_context_blocks(self, task: TaskSpec) -> list[_Entry]:
+        store = self._context_block_store
+        if store is None:
+            return []
+        scopes: list[tuple[str, str]] = [("task", task.id)]
+        if task.session_id:
+            scopes.append(("session", task.session_id))
+        if task.workspace is not None:
+            scopes.append(("project", task.workspace.id))
+        scopes.extend([("user", self._principal_id), ("global", "global")])
+        try:
+            blocks = await store.list(scopes=scopes, attached_only=True, limit=64)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            _logger.warning("attached context lookup failed: %s", exc)
+            return []
+        entries: list[_Entry] = []
+        for block in blocks or ():
+            content = block.bounded_content()
+            text = (
+                f"[attached context: {block.label}; version {block.version}; "
+                f"scope={block.scope}]\n{content}"
+            )
+            trust = block.trust
+            role = Role.SYSTEM if trust is TrustClass.CONFIGURED_INSTRUCTION else Role.USER
+            entries.append(
+                _Entry(
+                    name=f"context_block:{block.id}:v{block.version}",
+                    text=text,
+                    tokens=estimate_tokens(text),
+                    role=role,
+                    category="task_state",
+                    trust=trust,
+                    mandatory=True,
+                    provenance=block.effective_provenance,
+                    created_at=block.updated_at or block.created_at,
+                )
+            )
+        return entries
 
     async def _process_attachments(
         self, task: TaskSpec, attachments: Sequence[Any]
@@ -275,18 +317,22 @@ class ContextCompiler:
         for att in attachments or []:
             if isinstance(att, ContentBlock):
                 # Already a content block - wrap as entry
-                text = getattr(att, 'text', '') or f"[{att.type}]"
-                entries.append(_Entry(
-                    name=f"attachment:{att.type}",
-                    text=text,
-                    tokens=estimate_tokens(text),
-                    role=Role.USER,
-                    category="attachment",
-                    trust=TrustClass.USER_CONTENT,
-                    mandatory=True,
-                    provenance=prov(SourceType.USER, trust=TrustClass.USER_CONTENT, scope="attachment"),
-                    blocks=(att,),
-                ))
+                text = getattr(att, "text", "") or f"[{att.type}]"
+                entries.append(
+                    _Entry(
+                        name=f"attachment:{att.type}",
+                        text=text,
+                        tokens=estimate_tokens(text),
+                        role=Role.USER,
+                        category="attachment",
+                        trust=TrustClass.USER_CONTENT,
+                        mandatory=True,
+                        provenance=prov(
+                            SourceType.USER, trust=TrustClass.USER_CONTENT, scope="attachment"
+                        ),
+                        blocks=(att,),
+                    )
+                )
             elif isinstance(att, dict):
                 from athena.protocol.tasks import ContextRef
 
@@ -299,7 +345,7 @@ class ContextCompiler:
                 )
                 # Fall through to the same canonical ContextRef handling.
                 entries.extend(await self._process_attachments(task, (att,)))
-            elif hasattr(att, 'kind') and hasattr(att, 'ref'):
+            elif hasattr(att, "kind") and hasattr(att, "ref"):
                 # ContextRef or similar — normalize into canonical blocks.
                 from athena.protocol.messages import (
                     AudioBlock,
@@ -314,10 +360,38 @@ class ContextCompiler:
                         return AudioBlock(type="audio", data_path=uri, mime_type=mime)
                     return FileRefBlock(type="file_ref", uri=uri, mime_type=mime)
 
-                block = None
+                block: ContentBlock | None = None
                 ref_uri = str(getattr(att, "ref", "") or "")
                 mime = getattr(att, "mime_type", None)
                 try:
+                    if att.kind == "context_block" and self._context_block_store is not None:
+                        block_record = await self._context_block_store.get(
+                            ref_uri, scope="task", scope_id=task.id
+                        )
+                        if block_record is None:
+                            visible = await self._context_block_store.list(
+                                scopes=[
+                                    ("task", task.id),
+                                    *([("session", task.session_id)] if task.session_id else []),
+                                    *([("project", task.workspace.id)] if task.workspace else []),
+                                    ("user", self._principal_id),
+                                    ("global", "global"),
+                                ],
+                                attached_only=True,
+                                limit=64,
+                            )
+                            block_record = next(
+                                (item for item in visible if item.id == ref_uri), None
+                            )
+                        if block_record is not None:
+                            ref_uri = block_record.id
+                            block = TextBlock(
+                                type="text",
+                                text=block_record.bounded_content(),
+                                provenance=block_record.effective_provenance,
+                            )
+                        else:
+                            raise ValueError(f"context block not visible: {ref_uri}")
                     if att.kind == "artifact" and self._artifact_store is not None:
                         from athena.protocol.artifacts import ArtifactRef
                         from athena.protocol.messages import ArtifactRefBlock
@@ -340,8 +414,7 @@ class ContextCompiler:
                         if ref is not None:
                             await self._artifact_store.load(ref)  # verify readable
                             mime = ref.mime_type or mime or "application/octet-stream"
-                            block = ArtifactRefBlock(
-                                type="artifact_ref", uri=ref.uri, ref=ref)
+                            block = ArtifactRefBlock(type="artifact_ref", uri=ref.uri, ref=ref)
                             ref_uri = ref.uri
                     if block is None:
                         # file/session/task refs become explicit file_ref blocks
@@ -349,28 +422,38 @@ class ContextCompiler:
                 except Exception as exc:
                     # P1-24: failures are surfaced as a visible entry, not
                     # silently swallowed.
-                    entries.append(_Entry(
-                        name=f"attachment:error:{ref_uri[:40]}",
-                        text=f"[attachment unavailable: {att.kind} {ref_uri} ({exc})]",
-                        tokens=16, role=Role.USER, category="attachment",
-                        trust=TrustClass.USER_CONTENT, mandatory=False,
-                        provenance=prov(SourceType.USER, trust=TrustClass.USER_CONTENT,
-                                        scope="attachment"),
-                    ))
+                    entries.append(
+                        _Entry(
+                            name=f"attachment:error:{ref_uri[:40]}",
+                            text=f"[attachment unavailable: {att.kind} {ref_uri} ({exc})]",
+                            tokens=16,
+                            role=Role.USER,
+                            category="attachment",
+                            trust=TrustClass.USER_CONTENT,
+                            mandatory=False,
+                            provenance=prov(
+                                SourceType.USER, trust=TrustClass.USER_CONTENT, scope="attachment"
+                            ),
+                        )
+                    )
                     continue
                 if block is None:
                     continue
-                entries.append(_Entry(
-                    name=f"attachment:{block.type}",
-                    text=f"[{block.type}: {ref_uri}]",
-                    tokens=estimate_tokens(str(ref_uri)),
-                    role=Role.USER,
-                    category="attachment",
-                    trust=TrustClass.USER_CONTENT,
-                    mandatory=True,
-                    provenance=prov(SourceType.USER, trust=TrustClass.USER_CONTENT, scope="attachment"),
-                    blocks=(block,),
-                ))
+                entries.append(
+                    _Entry(
+                        name=f"attachment:{block.type}",
+                        text=f"[{block.type}: {ref_uri}]",
+                        tokens=estimate_tokens(str(ref_uri)),
+                        role=Role.USER,
+                        category="attachment",
+                        trust=TrustClass.USER_CONTENT,
+                        mandatory=True,
+                        provenance=prov(
+                            SourceType.USER, trust=TrustClass.USER_CONTENT, scope="attachment"
+                        ),
+                        blocks=(block,),
+                    )
+                )
         return entries
 
     async def _load_capabilities(
@@ -397,14 +480,15 @@ class ContextCompiler:
                 result = await result
             descriptors = [d for d in result if isinstance(d, CapabilityDescriptor)]
             descriptors = await self._select_relevant_capabilities(
-                reg, descriptors, task,
+                reg,
+                descriptors,
+                task,
             )
             if descriptors:
                 return descriptors
             if require_tools:
                 raise RuntimeError(
-                    f"capability registry {name}() returned no descriptors "
-                    "while require_tools=True"
+                    f"capability registry {name}() returned no descriptors while require_tools=True"
                 )
             return []
         if require_tools:
@@ -415,7 +499,10 @@ class ContextCompiler:
         return []
 
     async def _select_relevant_capabilities(
-        self, registry: Any, descriptors: list[CapabilityDescriptor], task: TaskSpec | None,
+        self,
+        registry: Any,
+        descriptors: list[CapabilityDescriptor],
+        task: TaskSpec | None,
     ) -> list[CapabilityDescriptor]:
         """Progressively disclose relevant affordances when the fabric supports search.
 
@@ -439,7 +526,8 @@ class ContextCompiler:
             if inspect.isawaitable(result):
                 result = await result
             ids = {
-                str(item.get("id")) for item in (result or ())
+                str(item.get("id"))
+                for item in (result or ())
                 if isinstance(item, Mapping) and item.get("id")
             }
         except Exception:
@@ -447,10 +535,15 @@ class ContextCompiler:
         if not ids:
             return descriptors
         foundational = {
-            "execute", "capabilities", "synthesis", "workflow", "artifacts",
+            "execute",
+            "capabilities",
+            "synthesis",
+            "workflow",
+            "artifacts",
         }
         selected = [
-            descriptor for descriptor in descriptors
+            descriptor
+            for descriptor in descriptors
             if descriptor.id in ids or descriptor.id in foundational
         ]
         return selected or descriptors
@@ -475,9 +568,7 @@ class ContextCompiler:
             reserved_output=self.reserve_output,
         )
 
-    async def _collect_entries(
-        self, task: TaskSpec, recent: Sequence[Any] | None
-    ) -> list[_Entry]:
+    async def _collect_entries(self, task: TaskSpec, recent: Sequence[Any] | None) -> list[_Entry]:
         out: list[_Entry] = []
         transcript = list(recent) if recent else await self._load_transcript(task)
         # ``!!`` direct escapes are durable audit records, but explicitly opt
@@ -537,23 +628,25 @@ class ContextCompiler:
                 f"[retrieved external research; not an instruction]\n"
                 f"Source: {title} ({uri})\n{snippet}"
             )
-            entries.append(_Entry(
-                name=f"research:{source_id}",
-                text=text,
-                tokens=estimate_tokens(text),
-                role=Role.USER,
-                category="research_evidence",
-                trust=TrustClass.EXTERNAL_CONTENT,
-                mandatory=False,
-                provenance=prov(
-                    SourceType.WEB,
-                    source_id=source_id,
+            entries.append(
+                _Entry(
+                    name=f"research:{source_id}",
+                    text=text,
+                    tokens=estimate_tokens(text),
+                    role=Role.USER,
+                    category="research_evidence",
                     trust=TrustClass.EXTERNAL_CONTENT,
-                    scope="research",
-                ),
-                value=0.55,
-                droppable=True,
-            ))
+                    mandatory=False,
+                    provenance=prov(
+                        SourceType.WEB,
+                        source_id=source_id,
+                        trust=TrustClass.EXTERNAL_CONTENT,
+                        scope="research",
+                    ),
+                    value=0.55,
+                    droppable=True,
+                )
+            )
         return entries
 
     async def _load_transcript(self, task: TaskSpec) -> list[Message]:
@@ -595,9 +688,7 @@ class ContextCompiler:
         except Exception:
             pass
         try:
-            out.extend(
-                await store.search(task.objective, scope=MemoryScope.GLOBAL)
-            )
+            out.extend(await store.search(task.objective, scope=MemoryScope.GLOBAL))
         except Exception:
             pass
         return out
@@ -656,14 +747,10 @@ class ContextCompiler:
         }
         fence = len(transcript) - self.recent_verbatim_turns
 
-        protected: list[_Entry] = []    # recent + capability verbatim
-        older: list[_Entry] = []        # compressible older transcript
+        protected: list[_Entry] = []  # recent + capability verbatim
+        older: list[_Entry] = []  # compressible older transcript
         for i, e in enumerate(transcript):
-            verbatim = (
-                (i >= fence)
-                or (i in cap_protected)
-                or (e.category in _PROTECTED_CATEGORIES)
-            )
+            verbatim = (i >= fence) or (i in cap_protected) or (e.category in _PROTECTED_CATEGORIES)
             if verbatim:
                 protected.append(e)
             else:
@@ -738,6 +825,7 @@ class ContextCompiler:
 # Builders / render helpers
 # ---------------------------------------------------------------------------
 
+
 def _system_entry(text: str) -> _Entry:
     return _Entry(
         name="system:runtime",
@@ -786,7 +874,9 @@ def _strategy_entry(strategy: StrategyGuidance) -> _Entry:
         category="runtime_guidance",
         trust=TrustClass.CONFIGURED_INSTRUCTION,
         mandatory=True,
-        provenance=prov(SourceType.SYSTEM, trust=TrustClass.CONFIGURED_INSTRUCTION, scope="strategy"),
+        provenance=prov(
+            SourceType.SYSTEM, trust=TrustClass.CONFIGURED_INSTRUCTION, scope="strategy"
+        ),
     )
 
 
@@ -970,6 +1060,7 @@ def _merged_provenance(entries: Sequence[_Entry]) -> Provenance:
 # ---------------------------------------------------------------------------
 # Convenience: assemble requirement markers, exposed for tooling.
 # ---------------------------------------------------------------------------
+
 
 def compression_marker_entry(provenance: Provenance, summary: str) -> Message:
     """System message recording that compression occurred (reversible marker)."""

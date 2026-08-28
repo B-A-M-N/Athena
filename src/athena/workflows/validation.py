@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from athena.capabilities.registry import validate_schema
+from athena.capabilities.registry import _compile_validator
 from athena.workflows.models import Workflow
 
 
@@ -31,7 +31,9 @@ class WorkflowValidator:
         # step can run. Generated workflows may infer this schema from their
         # construction fixtures, while no-input workflows can leave it empty.
         try:
-            validate_schema(dict(workflow.input_schema), {})
+            _compile_validator(dict(workflow.input_schema))
+            if workflow.output_schema is not None:
+                _compile_validator(dict(workflow.output_schema))
         except (TypeError, ValueError) as exc:
             errors.append(f"workflow input_schema: {exc}")
 
@@ -42,6 +44,36 @@ class WorkflowValidator:
             if not current.enabled:
                 errors.append(f"workflow {current.id} is disabled")
                 return
+            step_ids = [step.id for step in current.steps]
+            known_steps = set(step_ids)
+            for step_id in sorted({item for item in step_ids if step_ids.count(item) > 1}):
+                errors.append(f"workflow {current.id}: duplicate step id {step_id}")
+            dependency_edges: dict[str, tuple[str, ...]] = {}
+            for step in current.steps:
+                dependency_edges[step.id] = tuple(step.depends_on)
+                for dependency in step.depends_on:
+                    if dependency not in known_steps:
+                        errors.append(f"{step.id}: unknown dependency {dependency}")
+            visiting: set[str] = set()
+            visited: set[str] = set()
+
+            def visit(step_id: str, trail: tuple[str, ...] = ()) -> None:
+                if step_id in visiting:
+                    cycle_start = trail.index(step_id) if step_id in trail else 0
+                    errors.append(
+                        "step dependency cycle: " + " -> ".join((*trail[cycle_start:], step_id))
+                    )
+                    return
+                if step_id in visited or step_id not in dependency_edges:
+                    return
+                visiting.add(step_id)
+                for dependency in dependency_edges[step_id]:
+                    visit(dependency, (*trail, step_id))
+                visiting.remove(step_id)
+                visited.add(step_id)
+
+            for step_id in step_ids:
+                visit(step_id)
             for step in current.steps:
                 if step.if_condition is not None:
                     condition = step.if_condition.strip()
@@ -80,8 +112,9 @@ class WorkflowValidator:
                         walk(nested, (*path, current.id))
 
         walk(workflow, ())
-        return WorkflowValidation(ok=not errors, errors=tuple(errors),
-                                  effects=tuple(sorted(effects)))
+        return WorkflowValidation(
+            ok=not errors, errors=tuple(errors), effects=tuple(sorted(effects))
+        )
 
 
 def _step_effects(descriptor: Any, arguments: Mapping[str, Any]) -> frozenset[Any]:

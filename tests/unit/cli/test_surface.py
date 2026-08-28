@@ -36,10 +36,15 @@ class _Service:
 async def test_surface_groups_code_and_runtime_output():
     output = StringIO()
     surface = OperatorSurface(output=output, interactive=False)
-    await surface.render_event(make_event(
-        "CapabilityRequested",
-        {"capability_id": "execute", "arguments": {"language": "python", "code": "print(2 + 2)"}},
-    ))
+    await surface.render_event(
+        make_event(
+            "CapabilityRequested",
+            {
+                "capability_id": "execute",
+                "arguments": {"language": "python", "code": "print(2 + 2)"},
+            },
+        )
+    )
     await surface.render_event(make_event("StdoutChunk", {"data": "4\n"}))
     await surface.render_event(make_event("CapabilityCompleted", {"capability_id": "execute"}))
     rendered = output.getvalue()

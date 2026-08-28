@@ -13,7 +13,10 @@ from athena.protocol.models import (
 
 def _request() -> ModelRequest:
     return ModelRequest(
-        messages=(), model="model", provider="provider", request_id="request",
+        messages=(),
+        model="model",
+        provider="provider",
+        request_id="request",
     )
 
 
@@ -22,26 +25,32 @@ def test_accumulator_merges_mixed_stream_without_duplicate_text():
     request = _request()
     accumulator = ModelResponseAccumulator(request)
     call = CapabilityCallBlock(call_id="call-1", capability_id="files.read")
-    accumulator.ingest(ModelEvent(
-        type=ModelEventType.DELTA,
-        request_id=request.request_id,
-        delta=ModelDelta(request_id=request.request_id, text="hello"),
-    ))
-    accumulator.ingest(ModelEvent(
-        type=ModelEventType.DELTA,
-        request_id=request.request_id,
-        delta=ModelDelta(request_id=request.request_id, block=call),
-    ))
-    accumulator.ingest(ModelEvent(
-        type=ModelEventType.DONE,
-        request_id=request.request_id,
-        response=ModelResponse(
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DELTA,
             request_id=request.request_id,
-            model=request.model,
-            provider=request.provider,
-            blocks=(TextBlock(text="hello"),),
-        ),
-    ))
+            delta=ModelDelta(request_id=request.request_id, text="hello"),
+        )
+    )
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DELTA,
+            request_id=request.request_id,
+            delta=ModelDelta(request_id=request.request_id, block=call),
+        )
+    )
+    accumulator.ingest(
+        ModelEvent(
+            type=ModelEventType.DONE,
+            request_id=request.request_id,
+            response=ModelResponse(
+                request_id=request.request_id,
+                model=request.model,
+                provider=request.provider,
+                blocks=(TextBlock(text="hello"),),
+            ),
+        )
+    )
 
     response = accumulator.finish()
     assert [type(block) for block in response.blocks] == [TextBlock, CapabilityCallBlock]

@@ -25,7 +25,7 @@ class InterpreterContext:
 
     task_id: str
     session_id: str | None
-    run_state: Any                     # kernel.RunState (kept Any to avoid import cycle)
+    run_state: Any  # kernel.RunState (kept Any to avoid import cycle)
     role: str = "interpreter"
 
     # Durable handles the extension may reference (never mutate).

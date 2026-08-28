@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol
+import time
+from typing import Any, Protocol
 
 from athena.protocol.errors import ModelUnavailable, ProviderUnavailable
 from athena.protocol.models import ModelInfo, PrivacyClass
@@ -108,9 +109,14 @@ class ModelRouter:
         registry: ModelSource,
         *,
         role_policies: Mapping[str, ModelPolicy] | None = None,
+        usage_provider: Any = None,
     ) -> None:
         self._registry = registry
         self._role_policies: dict[str, ModelPolicy] = dict(role_policies or {})
+        self._usage_provider = usage_provider
+        self._stats_cache: (
+            tuple[float, dict[tuple[str, str, str], tuple[int, int, float]]] | None
+        ) = None
 
     def set_role_policy(self, role: str, policy: ModelPolicy) -> None:
         """Assign (or replace) the default policy for a role."""
@@ -186,12 +192,90 @@ class ModelRouter:
                 f"offline={offline})"
             )
 
-        best = min(candidates, key=_candidate_key)
+        stats = await self._historical_stats(policy.role)
+        history_used = any((info.provider, info.id, policy.role) in stats for info in candidates)
+        best = min(
+            candidates,
+            key=lambda info: self._selection_key(info, stats, policy.role),
+        )
         return ModelSelection(
             provider=best.provider,
             model=best.id,
             info=best,
-            rationale=self._rationale(best, policy, requirements),
+            rationale=self._rationale(
+                best,
+                policy,
+                requirements,
+                history_used=history_used,
+            ),
+        )
+
+    async def _historical_stats(
+        self,
+        role: str,
+    ) -> dict[tuple[str, str, str], tuple[int, int, float]]:
+        """Read a short rolling window of canonical provider attempt telemetry."""
+        usage_source = self._usage_provider
+        if usage_source is None or not hasattr(usage_source, "list_recent"):
+            return {}
+        now = time.monotonic()
+        if self._stats_cache is not None and now - self._stats_cache[0] < 5.0:
+            return {key: value for key, value in self._stats_cache[1].items() if key[2] == role}
+        try:
+            rows = await usage_source.list_recent(limit=500)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return {}
+        stats: dict[tuple[str, str, str], tuple[int, int, float]] = {}
+        for row in rows or ():
+            if not isinstance(row, Mapping):
+                continue
+            metadata = row.get("metadata")
+            if not isinstance(metadata, Mapping):
+                continue
+            row_role = str(metadata.get("role") or "primary")
+            state = str(metadata.get("state") or "").lower()
+            if state not in {"success", "failed"}:
+                continue
+            key = (
+                str(row.get("provider") or ""),
+                str(row.get("model") or ""),
+                row_role,
+            )
+            attempts, successes, latency = stats.get(key, (0, 0, 0.0))
+            duration = metadata.get("duration_ms")
+            try:
+                measured = max(
+                    0.0,
+                    float(duration) if isinstance(duration, (int, float, str)) else 0.0,
+                )
+            except (TypeError, ValueError):
+                measured = 0.0
+            stats[key] = (
+                attempts + 1,
+                successes + int(state == "success"),
+                latency + measured,
+            )
+        self._stats_cache = (now, stats)
+        return {key: value for key, value in stats.items() if key[2] == role}
+
+    @staticmethod
+    def _selection_key(
+        info: ModelInfo,
+        stats: Mapping[tuple[str, str, str], tuple[int, int, float]],
+        role: str,
+    ) -> tuple:
+        attempts, successes, total_latency = stats.get((info.provider, info.id, role), (0, 0, 0.0))
+        # Use a small conservative prior (three successes, one failure).
+        # One transient failure therefore influences routing without making a
+        # previously viable provider permanently lose the role.
+        reliability_penalty = (attempts - successes + 1) / (attempts + 4) if attempts else 0.25
+        average_latency = total_latency / attempts if attempts else 0.0
+        return (
+            _privacy_rank(info.privacy_class),
+            reliability_penalty,
+            average_latency,
+            _cost_per_1m(info),
+            f"{info.provider}/{info.id}",
         )
 
     def _privacy_gate(self, policy: ModelPolicy) -> Callable[[ModelInfo], bool]:
@@ -239,12 +323,16 @@ class ModelRouter:
         best: ModelInfo,
         policy: ModelPolicy,
         requirements: ModelRequirements,
+        *,
+        history_used: bool = False,
     ) -> tuple[str, ...]:
         parts = [f"model={best.id}", f"provider={best.provider}"]
         if policy.privacy:
             parts.append(f"privacy={best.privacy_class.value}")
         if requirements.required_capabilities:
             parts.append("caps=" + ",".join(sorted(requirements.required_capabilities)))
+        if history_used:
+            parts.append("history=rolling_attempts")
         return tuple(parts)
 
 

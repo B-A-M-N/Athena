@@ -21,11 +21,12 @@ class WorkflowStep:
     capability_id: str | None = None
     workflow_id: str | None = None
     arguments: Mapping[str, Any] = field(default_factory=dict)
+    depends_on: tuple[str, ...] = ()
     if_condition: str | None = None
     foreach: str | None = None
     max_iterations: int = 100
     parallel: bool = False
-    max_parallel: int = 4
+    max_parallel: int = 16
     continue_on_error: bool = False
 
     def __post_init__(self) -> None:
@@ -38,19 +39,26 @@ class WorkflowStep:
 
     @classmethod
     def from_record(cls, data: Mapping[str, Any], index: int = 0) -> WorkflowStep:
+        raw_dependencies: Any = data.get("depends_on")
+        if raw_dependencies is None:
+            raw_dependencies = data.get("dependsOn")
         return cls(
             id=str(data.get("id") or f"step_{index + 1}"),
             capability_id=(str(data["capability"]) if data.get("capability") else None),
             workflow_id=(str(data["workflow"]) if data.get("workflow") else None),
             arguments=dict(data.get("arguments") or {}),
-            if_condition=(str(data["if"]) if data.get("if") is not None
-                          else str(data["if_condition"])
-                          if data.get("if_condition") is not None else None),
-            foreach=(str(data["foreach"]) if data.get("foreach") is not None
-                     else None),
+            depends_on=tuple(str(value) for value in (raw_dependencies or [])),
+            if_condition=(
+                str(data["if"])
+                if data.get("if") is not None
+                else str(data["if_condition"])
+                if data.get("if_condition") is not None
+                else None
+            ),
+            foreach=(str(data["foreach"]) if data.get("foreach") is not None else None),
             max_iterations=int(data.get("max_iterations") or 100),
             parallel=bool(data.get("parallel", False)),
-            max_parallel=int(data.get("max_parallel") or 4),
+            max_parallel=int(data.get("max_parallel") or 16),
             continue_on_error=bool(data.get("continue_on_error", False)),
         )
 
@@ -60,6 +68,7 @@ class WorkflowStep:
             **({"capability": self.capability_id} if self.capability_id else {}),
             **({"workflow": self.workflow_id} if self.workflow_id else {}),
             "arguments": dict(self.arguments),
+            "depends_on": list(self.depends_on),
             **({"if": self.if_condition} if self.if_condition is not None else {}),
             **({"foreach": self.foreach} if self.foreach is not None else {}),
             "max_iterations": self.max_iterations,
@@ -84,36 +93,47 @@ class Workflow:
     provenance: Mapping[str, Any] = field(default_factory=dict)
     version: int = 1
     enabled: bool = True
+    lifecycle_state: str = "ACTIVE"
 
     @classmethod
     def create(
-        cls, *, name: str, description: str, steps: tuple[WorkflowStep, ...],
+        cls,
+        *,
+        name: str,
+        description: str,
+        steps: tuple[WorkflowStep, ...],
         **kwargs: Any,
     ) -> Workflow:
-        return cls(id=new_id("workflow"), name=name, description=description,
-                   steps=steps, **kwargs)
+        return cls(id=new_id("workflow"), name=name, description=description, steps=steps, **kwargs)
 
     def to_record(self) -> dict[str, Any]:
         return {
-            "id": self.id, "name": self.name, "description": self.description,
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
             "steps": [step.to_record() for step in self.steps],
-            "scope": self.scope.value, "task_scope": self.task_scope,
+            "scope": self.scope.value,
+            "task_scope": self.task_scope,
             "project_scope": self.project_scope,
             "user_scope": self.user_scope,
             "input_schema": dict(self.input_schema),
             "output_schema": dict(self.output_schema or {}),
-            "provenance": dict(self.provenance), "version": self.version,
+            "provenance": dict(self.provenance),
+            "version": self.version,
             "enabled": self.enabled,
+            "lifecycle_state": self.lifecycle_state,
         }
 
     @classmethod
     def from_record(cls, data: Mapping[str, Any]) -> Workflow:
         raw_scope = data.get("scope", AffordanceScope.TASK.value)
         return cls(
-            id=str(data["id"]), name=str(data.get("name") or data["id"]),
+            id=str(data["id"]),
+            name=str(data.get("name") or data["id"]),
             description=str(data.get("description") or ""),
-            steps=tuple(WorkflowStep.from_record(step, i)
-                        for i, step in enumerate(data.get("steps") or ())),
+            steps=tuple(
+                WorkflowStep.from_record(step, i) for i, step in enumerate(data.get("steps") or ())
+            ),
             scope=AffordanceScope(raw_scope),
             task_scope=data.get("task_scope"),
             project_scope=data.get("project_scope"),
@@ -123,6 +143,7 @@ class Workflow:
             provenance=dict(data.get("provenance") or {}),
             version=int(data.get("version") or 1),
             enabled=bool(data.get("enabled", True)),
+            lifecycle_state=str(data.get("lifecycle_state") or "ACTIVE"),
         )
 
 

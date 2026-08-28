@@ -65,10 +65,15 @@ def autonomous() -> RuleSet:
             _external_publish(ASK),
             _computer(ASK),
             _financial(ASK),
+            _read(ALLOW, 50),
             _write(ALLOW, 90),
             _execute(ALLOW, 85),
             _net_read(ALLOW, 70),
-            _net_write(ALLOW, 60),
+            # RealityGate can verify local project state, but it cannot
+            # shadow or compensate an arbitrary remote mutation. Keep the
+            # approval floor explicit until a capability provides an
+            # external transaction contract.
+            _net_write(ASK, 95),
         ),
         default=ASK,
     )
@@ -115,6 +120,7 @@ def available_profiles() -> tuple[AutonomyLevel, ...]:
 
 # --- shared rule constructors ---------------------------------------------------
 
+
 def _read(verdict: str, priority: int = 50) -> Rule:
     return Rule(verdict, effect=EffectClass.READ_LOCAL, priority=priority, reason="local read")
 
@@ -128,7 +134,9 @@ def _net_read(verdict: str, priority: int = 50) -> Rule:
 
 
 def _net_write(verdict: str, priority: int = 50) -> Rule:
-    return Rule(verdict, effect=EffectClass.NETWORK_WRITE, priority=priority, reason="network write")
+    return Rule(
+        verdict, effect=EffectClass.NETWORK_WRITE, priority=priority, reason="network write"
+    )
 
 
 def _delete(verdict: str, priority: int = 50) -> Rule:
@@ -144,7 +152,9 @@ def _secret_read(verdict: str) -> Rule:
 
 
 def _external_publish(verdict: str) -> Rule:
-    return Rule(verdict, effect=EffectClass.EXTERNAL_PUBLISH, priority=90, reason="external publish")
+    return Rule(
+        verdict, effect=EffectClass.EXTERNAL_PUBLISH, priority=90, reason="external publish"
+    )
 
 
 def _privileged(verdict: str) -> Rule:
@@ -164,11 +174,19 @@ def _computer(verdict: str) -> Rule:
 
 
 def _remote_inference(verdict: str) -> Rule:
-    return Rule(verdict, resource="remote", capability_id="model", priority=120, reason="remote inference")
+    return Rule(
+        verdict, resource="remote", capability_id="model", priority=120, reason="remote inference"
+    )
 
 
 def _local_inference(verdict: str, priority: int = 50) -> Rule:
-    return Rule(verdict, resource="local", capability_id="model", priority=priority, reason="local inference")
+    return Rule(
+        verdict,
+        resource="local",
+        capability_id="model",
+        priority=priority,
+        reason="local inference",
+    )
 
 
 def _remote_mcp(verdict: str) -> Rule:

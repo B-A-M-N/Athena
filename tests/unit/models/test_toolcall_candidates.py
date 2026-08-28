@@ -22,13 +22,13 @@ def _validate(schema, args):
         if key not in args:
             errors.append(f"missing:{key}")
     for key, spec in (schema.get("properties") or {}).items():
-        if key in args and spec.get("type") == "string" \
-                and not isinstance(args[key], str):
+        if key in args and spec.get("type") == "string" and not isinstance(args[key], str):
             errors.append(f"type:{key}")
     return errors
 
 
 # -- parse round trip -------------------------------------------------------
+
 
 def test_parse_success_populates_parsed_arguments():
     raw = json.dumps({"path": "/tmp/x"})
@@ -58,8 +58,12 @@ def test_parse_never_manufactures_empty_dict():
 
 def test_parse_carries_optional_ids_and_metadata():
     c = ToolCallCandidate.parse(
-        "call-5", "fs", "{}",
-        provider_profile_id="p1", model_id="m1", stream="openai-compat",
+        "call-5",
+        "fs",
+        "{}",
+        provider_profile_id="p1",
+        model_id="m1",
+        stream="openai-compat",
     )
     assert c.provider_profile_id == "p1"
     assert c.model_id == "m1"
@@ -67,6 +71,7 @@ def test_parse_carries_optional_ids_and_metadata():
 
 
 # -- registry ---------------------------------------------------------------
+
 
 def test_record_get_registry_roundtrip():
     clear_raw_candidates()
@@ -80,6 +85,7 @@ def test_record_get_registry_roundtrip():
 
 
 # -- repair of a raw double-encoded string ----------------------------------
+
 
 def test_repair_double_encoded_raw_string_yields_repaired():
     # Arguments arrived as a JSON *string* wrapping the object — exactly what
@@ -103,7 +109,8 @@ def test_repair_double_encoded_raw_string_yields_repaired():
     assert args == {"command": "ls -la"}
     # idempotent: repairing the repaired output changes nothing
     args2, receipt2 = repairer.repair(
-        call_id="call-d", tool_name="terminal_session",
+        call_id="call-d",
+        tool_name="terminal_session",
         arguments=args,
         input_schema={
             "type": "object",

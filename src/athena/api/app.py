@@ -106,7 +106,9 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
     body = dict(body or {})
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
-        raise HTTPError(400, "validation_error", "field 'prompt' is required and must be a non-empty string")
+        raise HTTPError(
+            400, "validation_error", "field 'prompt' is required and must be a non-empty string"
+        )
 
     autonomy = body.get("autonomy")
     if autonomy is not None:
@@ -134,15 +136,14 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
 
     requested = body.get("requested_capabilities")
     if requested is not None and (
-        not isinstance(requested, (list, tuple)) or not all(
-            isinstance(item, str) and item.strip() for item in requested
-        )
+        not isinstance(requested, (list, tuple))
+        or not all(isinstance(item, str) and item.strip() for item in requested)
     ):
-            raise HTTPError(
-                400,
-                "validation_error",
-                "field 'requested_capabilities' must be an array of non-empty strings",
-            )
+        raise HTTPError(
+            400,
+            "validation_error",
+            "field 'requested_capabilities' must be an array of non-empty strings",
+        )
 
     raw_attachments = body.get("attachments", body.get("context_refs", ()))
     if raw_attachments is None:
@@ -174,9 +175,7 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
         workspace=workspace,
         model_policy=model_policy,
         attachments=tuple(attachments),
-        requested_capabilities=(
-            frozenset(requested) if requested is not None else None
-        ),
+        requested_capabilities=(frozenset(requested) if requested is not None else None),
         metadata=dict(metadata),
     )
 
@@ -321,13 +320,10 @@ def _approve_handler(service: Any) -> Any:
         # boolean; string "false" must never coerce to True.
         granted = body.get("granted")
         if not isinstance(granted, bool):
-            return json_response(
-                {"error": "'granted' must be a JSON boolean"},
-                status=400)
+            return json_response({"error": "'granted' must be a JSON boolean"}, status=400)
         scope = body.get("scope")
         if scope is not None and not isinstance(scope, str):
-            return json_response(
-                {"error": "'scope' must be a string or null"}, status=400)
+            return json_response({"error": "'scope' must be a string or null"}, status=400)
         try:
             await service.approve(approval_id, granted=granted, scope=scope)
         except Exception as exc:  # noqa: BLE001
@@ -377,9 +373,7 @@ def _input_handler(service: Any) -> Any:
                 task = await service.get_task(task_id)
                 if task is None:
                     raise KeyError(task_id)
-                outcome = await service.resume(
-                    getattr(task, "session_id", None), prompt=str(value)
-                )
+                outcome = await service.resume(getattr(task, "session_id", None), prompt=str(value))
         except KeyError:
             raise _task_not_found(task_id)
         except Exception as exc:  # noqa: BLE001
@@ -396,9 +390,15 @@ def _get_session_handler(service: Any) -> Any:
             sessions = await service.list_sessions()
         except Exception as exc:  # noqa: BLE001
             raise _status_for_error(exc)
-        match = next((item for item in sessions if str(
-            item.get("id") if isinstance(item, Mapping) else getattr(item, "id", "")
-        ) == session_id), None)
+        match = next(
+            (
+                item
+                for item in sessions
+                if str(item.get("id") if isinstance(item, Mapping) else getattr(item, "id", ""))
+                == session_id
+            ),
+            None,
+        )
         if match is None:
             raise HTTPError(404, "session_not_found", f"session {session_id!r} not found")
         return json_response({"session": _serializable(match)})
@@ -445,9 +445,7 @@ def _health_handler(service: Any) -> Any:
                 database_ok = False
                 database_error = str(exc)
         worker = getattr(service, "_worker", None)
-        worker_health = (
-            worker.health() if worker is not None and hasattr(worker, "health") else {}
-        )
+        worker_health = worker.health() if worker is not None and hasattr(worker, "health") else {}
         checks = {
             "service": started,
             "database": database_ok,

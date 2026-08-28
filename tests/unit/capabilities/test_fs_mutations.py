@@ -31,8 +31,7 @@ def _req(**args) -> CapabilityRequest:
 
 
 def _ws(tmp_path) -> WorkspaceSpec:
-    return WorkspaceSpec(id="w", root=str(tmp_path),
-                         writable=(PathRule(str(tmp_path)),))
+    return WorkspaceSpec(id="w", root=str(tmp_path), writable=(PathRule(str(tmp_path)),))
 
 
 class _RecordingStore(MutationStore):
@@ -165,9 +164,11 @@ async def test_write_ahead_intent_precedes_side_effect(env):
     seen = {}
     fs, store = await _fs(tmp_path, db, recording=True)
     original = store.record_intent
+
     async def wrap(*a, **k):
         seen["at_intent"] = target.read_text()
         return await original(*a, **k)
+
     store.record_intent = wrap
     await fs.invoke(_req(operation="write", path=str(target), content="new"))
     assert seen["at_intent"] == "old"
@@ -196,8 +197,7 @@ async def test_move_snapshots_source_and_destination(env):
     src.write_text("mv")
     dest = tmp_path / "dest.txt"
     fs, _ = await _fs(tmp_path, db)
-    r = await fs.invoke(_req(operation="move", path=str(src),
-                             destination=str(dest)))
+    r = await fs.invoke(_req(operation="move", path=str(src), destination=str(dest)))
     assert r.status == CapabilityResultStatus.OK
     row = await db.fetch_one("SELECT * FROM mutations")
     assert row["resource"] == str(src)
@@ -213,8 +213,7 @@ async def test_copy_captures_destination_before_state(env):
     dest = tmp_path / "dest.txt"
     dest.write_text("holder")
     fs, _ = await _fs(tmp_path, db)
-    r = await fs.invoke(_req(operation="copy", path=str(src),
-                             destination=str(dest)))
+    r = await fs.invoke(_req(operation="copy", path=str(src), destination=str(dest)))
     assert r.status == CapabilityResultStatus.OK
     row = await db.fetch_one("SELECT * FROM mutations")
     assert row["resource"] == str(dest)
@@ -228,29 +227,37 @@ async def test_binary_content_round_trips_without_hash_corruption(env):
     original = bytes(range(256)) + b"\x00\xff\xfe"
     fs, _ = await _fs(tmp_path, db)
 
-    written = await fs.invoke(_req(
-        operation="write",
-        path=str(target),
-        content_base64=base64.b64encode(original).decode("ascii"),
-    ))
+    written = await fs.invoke(
+        _req(
+            operation="write",
+            path=str(target),
+            content_base64=base64.b64encode(original).decode("ascii"),
+        )
+    )
     assert written.status is CapabilityResultStatus.OK
     assert target.read_bytes() == original
     assert written.metadata["mutation"]["after_hash"] == hashlib.sha256(original).hexdigest()
 
-    read = await fs.invoke(_req(
-        operation="read", path=str(target), encoding="base64",
-    ))
+    read = await fs.invoke(
+        _req(
+            operation="read",
+            path=str(target),
+            encoding="base64",
+        )
+    )
     assert read.status is CapabilityResultStatus.OK
     assert read.output == base64.b64encode(original).decode("ascii")
     assert read.metadata == {"encoding": "base64", "bytes": len(original)}
 
     patched = b"\x80\x81\x82"
-    patch = await fs.invoke(_req(
-        operation="patch",
-        path=str(target),
-        expected_sha256=hashlib.sha256(original).hexdigest(),
-        new_content_base64=base64.b64encode(patched).decode("ascii"),
-    ))
+    patch = await fs.invoke(
+        _req(
+            operation="patch",
+            path=str(target),
+            expected_sha256=hashlib.sha256(original).hexdigest(),
+            new_content_base64=base64.b64encode(patched).decode("ascii"),
+        )
+    )
     assert patch.status is CapabilityResultStatus.OK
     assert target.read_bytes() == patched
 

@@ -27,8 +27,9 @@ class CapabilityRegistry:
         self._validators: dict[str, Any] = {}
         self._registration_audit: list[dict[str, Any]] = []
 
-    def register(self, executor: CapabilityExecutor, *,
-                 authority: str = "native", replace: bool = False) -> dict[str, Any]:
+    def register(
+        self, executor: CapabilityExecutor, *, authority: str = "native", replace: bool = False
+    ) -> dict[str, Any]:
         """Register an executor by its descriptor id.
 
         Duplicate ids are a HARD error: later extensions (MCP, plugins,
@@ -43,13 +44,15 @@ class CapabilityRegistry:
         if descriptor.id in self._by_id and not replace:
             raise ValueError(
                 f"capability '{descriptor.id}' already registered "
-                f"(authority={authority}); use replace=True to override")
+                f"(authority={authority}); use replace=True to override"
+            )
         if descriptor.id in self._by_id and replace and not authority:
             raise ValueError("explicit capability replacement requires authority")
         audit = {
             "capability_id": descriptor.id,
             "replaced": self._by_id.get(descriptor.id).__class__.__name__
-            if descriptor.id in self._by_id else None,
+            if descriptor.id in self._by_id
+            else None,
             "new_executor": executor.__class__.__name__,
             "authority": authority,
         }
@@ -82,8 +85,7 @@ class CapabilityRegistry:
             raise CapabilityUnavailable(f"unknown capability: {capability_id}")
         if executor.descriptor.availability is not Availability.AVAILABLE:
             raise CapabilityUnavailable(
-                f"capability '{capability_id}' is "
-                f"{executor.descriptor.availability.value}"
+                f"capability '{capability_id}' is {executor.descriptor.availability.value}"
             )
         return executor
 
@@ -98,9 +100,7 @@ class CapabilityRegistry:
             raise CapabilityUnavailable(f"unknown capability: {capability_id}")
         descriptor = executor.descriptor
         for error in self._validate_descriptor(descriptor, arguments):
-            raise CapabilityValidationError(
-                f"invalid arguments for {capability_id}: {error}"
-            )
+            raise CapabilityValidationError(f"invalid arguments for {capability_id}: {error}")
 
     def list_available(
         self,
@@ -154,8 +154,7 @@ def validate_schema(schema: dict[str, Any], arguments: Any) -> list[str]:
 def _effective_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
     """Translate Athena's legacy alias without weakening JSON Schema."""
     effective = dict(schema)
-    if effective.pop("allow_extra", True) is False \
-            and "additionalProperties" not in effective:
+    if effective.pop("allow_extra", True) is False and "additionalProperties" not in effective:
         effective["additionalProperties"] = False
     if "$schema" not in effective:
         effective["$schema"] = "https://json-schema.org/draft/2020-12/schema"
@@ -204,11 +203,11 @@ def _validate_schema_subset(schema: dict[str, Any], arguments: Mapping[str, Any]
             errors.append(f"{prop}: expected string")
         elif expected == "boolean" and not isinstance(value, bool):
             errors.append(f"{prop}: expected boolean")
-        elif expected == "integer" and (
-                not isinstance(value, int) or isinstance(value, bool)):
+        elif expected == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
             errors.append(f"{prop}: expected integer")
         elif expected == "number" and (
-                isinstance(value, bool) or not isinstance(value, (int, float))):
+            isinstance(value, bool) or not isinstance(value, (int, float))
+        ):
             errors.append(f"{prop}: expected number")
         enum = spec.get("enum")
         if enum is not None and value not in enum:

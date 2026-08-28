@@ -12,8 +12,7 @@ from __future__ import annotations
 
 from athena.protocol.models import ToolCallCandidate
 
-__all__ = ["ToolCallCandidate", "record_raw_candidate", "get_raw_candidate",
-           "clear_raw_candidates"]
+__all__ = ["ToolCallCandidate", "record_raw_candidate", "get_raw_candidate", "clear_raw_candidates"]
 
 
 # -- process-local registry keyed by call_id --------------------------------

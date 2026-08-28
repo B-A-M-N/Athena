@@ -69,14 +69,16 @@ def test_preflight_aborts_batch_on_unrepairable_call():
     ok_exec, bad_exec = _read_exec("files.read"), _read_exec("files.write")
     dispatcher, execs = _dispatcher(ok_exec, bad_exec)
 
-    results = asyncio.run(dispatcher.dispatch_many(
-        [
-            _req("files.read", path="/tmp/ws/a.txt"),
-            # required "path" is an int -> no safe repair rule applies
-            _req("files.write", path=12345),
-        ],
-        workspace=_workspace(),
-    ))
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            [
+                _req("files.read", path="/tmp/ws/a.txt"),
+                # required "path" is an int -> no safe repair rule applies
+                _req("files.write", path=12345),
+            ],
+            workspace=_workspace(),
+        )
+    )
 
     assert len(results) == 1
     result = results[0]
@@ -91,10 +93,12 @@ def test_preflight_aborts_batch_on_unknown_capability():
     exec_ = _read_exec()
     dispatcher, _ = _dispatcher(exec_)
 
-    results = asyncio.run(dispatcher.dispatch_many(
-        [_req("files.read", path="/tmp/ws/a.txt"), _req("no.such", x=1)],
-        workspace=_workspace(),
-    ))
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            [_req("files.read", path="/tmp/ws/a.txt"), _req("no.such", x=1)],
+            workspace=_workspace(),
+        )
+    )
 
     assert len(results) == 1
     result = results[0]
@@ -107,11 +111,12 @@ def test_preflight_all_valid_batch_executes_everything():
     a, b = _read_exec("files.read"), _read_exec("files.stat")
     dispatcher, execs = _dispatcher(a, b)
 
-    results = asyncio.run(dispatcher.dispatch_many(
-        [_req("files.read", path="/tmp/ws/a.txt"),
-         _req("files.stat", path="/tmp/ws/b.txt")],
-        workspace=_workspace(),
-    ))
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            [_req("files.read", path="/tmp/ws/a.txt"), _req("files.stat", path="/tmp/ws/b.txt")],
+            workspace=_workspace(),
+        )
+    )
 
     assert len(results) == 2
     assert all(r.status == CapabilityResultStatus.OK for r in results)
@@ -120,19 +125,23 @@ def test_preflight_all_valid_batch_executes_everything():
 
 @pytest.mark.athena_scenario("COMPAT-006")
 def test_preflight_repaired_arguments_are_used():
-    exec_ = _read_exec(schema={
-        "properties": {"path": {"type": "string"}},
-        "required": ["path"],
-        "x-athena-aliases": {"path": ["file_path"]},
-    })
+    exec_ = _read_exec(
+        schema={
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "x-athena-aliases": {"path": ["file_path"]},
+        }
+    )
     dispatcher, _ = _dispatcher(exec_)
 
-    results = asyncio.run(dispatcher.dispatch_many(
-        # numeric_string coercion repairs "3" -> 3? No — path stays str; use
-        # alias repair instead: fs family maps file_path -> path.
-        [_req("files.read", file_path="/tmp/ws/a.txt")],
-        workspace=_workspace(),
-    ))
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            # numeric_string coercion repairs "3" -> 3? No — path stays str; use
+            # alias repair instead: fs family maps file_path -> path.
+            [_req("files.read", file_path="/tmp/ws/a.txt")],
+            workspace=_workspace(),
+        )
+    )
 
     assert len(results) == 1
     assert results[0].status == CapabilityResultStatus.OK
@@ -143,15 +152,16 @@ def test_preflight_false_restores_legacy_behavior():
     exec_ = _read_exec()
     dispatcher, _ = _dispatcher(exec_)
 
-    results = asyncio.run(dispatcher.dispatch_many(
-        [_req("files.read", path="/tmp/ws/a.txt"), _req("no.such", x=1)],
-        workspace=_workspace(),
-        preflight=False,
-    ))
+    results = asyncio.run(
+        dispatcher.dispatch_many(
+            [_req("files.read", path="/tmp/ws/a.txt"), _req("no.such", x=1)],
+            workspace=_workspace(),
+            preflight=False,
+        )
+    )
 
     # Without preflight the valid call still executes; the unknown one fails.
-    statuses = sorted(r.status.value if isinstance(r, CapabilityResult) else "?"
-                      for r in results)
+    statuses = sorted(r.status.value if isinstance(r, CapabilityResult) else "?" for r in results)
     assert statuses == ["failed", "ok"]
     assert len(exec_.invocations) == 1
 

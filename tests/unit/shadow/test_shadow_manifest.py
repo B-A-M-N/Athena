@@ -57,9 +57,7 @@ def test_shadow_conflict_rejects_same_size_concurrent_edit(tmp_path):
         engine._diff_trees(branch)["base_hashes"],
     )
 
-    assert conflicts == [
-        {"resource": "state.json", "reason": "modified_elsewhere"}
-    ]
+    assert conflicts == [{"resource": "state.json", "reason": "modified_elsewhere"}]
     assert (base / "state.json").read_text(encoding="utf-8") == "null"
 
 
@@ -72,9 +70,7 @@ async def test_shadow_branch_metadata_survives_engine_restart(tmp_path):
     workspace = WorkspaceSpec(id="base", root=str(base))
     roots = state / "shadows"
 
-    engine = ShadowEngine(
-        dispatcher=object(), roots_parent=str(roots), state_root=str(state)
-    )
+    engine = ShadowEngine(dispatcher=object(), roots_parent=str(roots), state_root=str(state))
     branch = await engine.open_branch(
         task_id="task-restart",
         base_workspace=workspace,
@@ -82,9 +78,7 @@ async def test_shadow_branch_metadata_survives_engine_restart(tmp_path):
         profile="supervised",
     )
 
-    restored = ShadowEngine(
-        dispatcher=object(), roots_parent=str(roots), state_root=str(state)
-    )
+    restored = ShadowEngine(dispatcher=object(), roots_parent=str(roots), state_root=str(state))
     loaded = restored.get_branch(branch.id)
     assert loaded is not None
     assert loaded.status == BranchStatus.PROPOSED
@@ -101,9 +95,7 @@ async def test_missing_shadow_workspace_requires_recovery(tmp_path):
     workspace = WorkspaceSpec(id="base", root=str(base))
     roots = state / "shadows"
 
-    engine = ShadowEngine(
-        dispatcher=object(), roots_parent=str(roots), state_root=str(state)
-    )
+    engine = ShadowEngine(dispatcher=object(), roots_parent=str(roots), state_root=str(state))
     branch = await engine.open_branch(
         task_id="task-recovery",
         base_workspace=workspace,
@@ -113,9 +105,7 @@ async def test_missing_shadow_workspace_requires_recovery(tmp_path):
 
     shutil.rmtree(branch.shadow_workspace.root)
 
-    restored = ShadowEngine(
-        dispatcher=object(), roots_parent=str(roots), state_root=str(state)
-    )
+    restored = ShadowEngine(dispatcher=object(), roots_parent=str(roots), state_root=str(state))
     loaded = restored.get_branch(branch.id)
     assert loaded is not None
     assert loaded.status == BranchStatus.RECOVERY_REQUIRED
@@ -131,7 +121,8 @@ async def test_interrupted_commit_reconciles_without_guessing_outcome(tmp_path):
     workspace = WorkspaceSpec(id="base", root=str(base))
 
     engine = ShadowEngine(
-        dispatcher=object(), roots_parent=str(state / "shadows"),
+        dispatcher=object(),
+        roots_parent=str(state / "shadows"),
         state_root=str(state),
     )
     branch = await engine.open_branch(
@@ -141,16 +132,21 @@ async def test_interrupted_commit_reconciles_without_guessing_outcome(tmp_path):
     )
     branch.status = BranchStatus.COMMITTING
     branch.commit_state = "APPLYING"
-    branch.commit_plan = [{
-        "call_id": "commit-1", "capability_id": "fs",
-        "operation": "write", "path": "state.json",
-        "content_sha256": "planned-hash",
-    }]
+    branch.commit_plan = [
+        {
+            "call_id": "commit-1",
+            "capability_id": "fs",
+            "operation": "write",
+            "path": "state.json",
+            "content_sha256": "planned-hash",
+        }
+    ]
     branch.checkpoint_id = "ckpt-before-commit"
     engine._persist_branches()
 
     restored = ShadowEngine(
-        dispatcher=object(), roots_parent=str(state / "shadows"),
+        dispatcher=object(),
+        roots_parent=str(state / "shadows"),
         state_root=str(state),
     )
     loaded = restored.get_branch(branch.id)

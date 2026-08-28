@@ -1,4 +1,5 @@
 """Skill selection/injection through the real SkillLifecycle + ContextCompiler."""
+
 from __future__ import annotations
 import pytest
 
@@ -12,28 +13,31 @@ _MARKER = "APISUMMARIZER_RULEBOOK_SENTINEL"
 
 async def _install_summarizer_skill(svc) -> None:
     lifecycle = svc._skills._lifecycle
-    await lifecycle.install(Skill(
-        id="skill-api-summarizer",
-        name="api-summarizer",
-        description="Produce API docs in the project's summarizer style.",
-        body=(
-            f"{_MARKER}\n"
-            "When documenting endpoints always follow the local conventions."
-        ),
-        triggers=("summarize", "doxy", "docs"),
-        trust=TrustClass.AGENT_CURATED,
-        source=Provenance(
-            source_type=SourceType.SKILL,
-            source_id="skill-api-summarizer",
+    await lifecycle.install(
+        Skill(
+            id="skill-api-summarizer",
+            name="api-summarizer",
+            description="Produce API docs in the project's summarizer style.",
+            body=(f"{_MARKER}\nWhen documenting endpoints always follow the local conventions."),
+            triggers=("summarize", "doxy", "docs"),
             trust=TrustClass.AGENT_CURATED,
-        ),
-    ))
+            source=Provenance(
+                source_type=SourceType.SKILL,
+                source_id="skill-api-summarizer",
+                trust=TrustClass.AGENT_CURATED,
+            ),
+        )
+    )
 
 
 async def _compile_objective(svc, objective: str) -> str:
-    spec = TaskSpec(id=new_id("task"), objective=objective,
-                    session_id=new_id("session"), resource_budget=ResourceBudget(),
-                    metadata={"autonomy": "supervised"})
+    spec = TaskSpec(
+        id=new_id("task"),
+        objective=objective,
+        session_id=new_id("session"),
+        resource_budget=ResourceBudget(),
+        metadata={"autonomy": "supervised"},
+    )
     compiled = await svc._compiler.compile(spec)
     return "\n".join(m.text() for m in compiled.messages)
 

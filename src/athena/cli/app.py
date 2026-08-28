@@ -55,9 +55,7 @@ def _autonomy(value: str | None) -> AutonomyLevel:
         return AutonomyLevel(value.strip().lower())
     except ValueError:
         valid = ", ".join(a.value for a in AutonomyLevel)
-        raise ValueError(
-            f"unknown autonomy {value!r}; choose one of: {valid}"
-        ) from None
+        raise ValueError(f"unknown autonomy {value!r}; choose one of: {valid}") from None
 
 
 def _criteria_metadata(o: "Options") -> dict:
@@ -109,9 +107,7 @@ def build_config(o: "Options"):
         explicit_path=o.config_path,
         cli_overrides={
             "db_path": o.db_path,
-            "workspace_root": (
-                os.path.abspath(os.path.expanduser(root)) if root else None
-            ),
+            "workspace_root": (os.path.abspath(os.path.expanduser(root)) if root else None),
             "autonomy": _autonomy(o.autonomy).value if o.autonomy else None,
             "artifact_root": o.artifact_root,
             "mascot": o.mascot,
@@ -151,8 +147,7 @@ def build_service(config) -> Any:
         from athena.service.service import AthenaService
     except ImportError as exc:  # pragma: no cover
         raise ServiceUnavailable(
-            "AthenaService is not available yet; cannot run tasks. "
-            "(reason: %s)" % exc
+            "AthenaService is not available yet; cannot run tasks. (reason: %s)" % exc
         ) from exc
     return AthenaService(config=config)
 
@@ -165,9 +160,7 @@ def _doctor_display(o: "Options", config: Any) -> int:
 
     requested = str(o.display or getattr(config, "display", None) or "auto")
     columns, rows = shutil.get_terminal_size((120, 30))
-    env_override = os.environ.get("ATHENA_KITTY_CONFIRMED", "").lower() in {
-        "1", "true", "yes"
-    }
+    env_override = os.environ.get("ATHENA_KITTY_CONFIRMED", "").lower() in {"1", "true", "yes"}
     tty = bool(
         getattr(sys.stdout, "isatty", lambda: False)()
         and getattr(sys.stdin, "isatty", lambda: False)()
@@ -325,7 +318,7 @@ async def _run(o: Options, service: Any) -> int:
         sess_id = o.args[0]
         resumed = await _resume(service, sess_id)
         repl = ChatREPL(service=service, config=getattr(service, "config", None), options=o)
-        repl.session_id = (getattr(resumed, "session_id", None) or sess_id)
+        repl.session_id = getattr(resumed, "session_id", None) or sess_id
         return await repl.run_forever()
     if cmd == "approve":
         return await _cmd_approve(o, service)
@@ -353,6 +346,7 @@ async def _cmd_run(o: Options, service: Any) -> int:
     )
     surface = None
     from athena.cli.chat import _make_surface, _model_label
+
     surface = _make_surface(
         details=o.details,
         mascot=o.mascot,
@@ -389,9 +383,7 @@ async def _cmd_run(o: Options, service: Any) -> int:
                 surface.render_notice(extra)
             status = getattr(result, "status", None)
             status_str = (
-                status.value
-                if status is not None and hasattr(status, "value")
-                else str(status)
+                status.value if status is not None and hasattr(status, "value") else str(status)
             )
             surface.render_result(summary, status=status_str)
             return 0
@@ -471,14 +463,36 @@ def _click_cli(click: Any):
     @click.option("--workspace", default=None, help="Workspace root directory.")
     @click.option("--autonomy", default=None, type=click.Choice(levels), help="Autonomy profile.")
     @click.option("--model", default=None, help="Model policy.")
-    @click.option("--mascot", default=None, help="Mascot/buddy character (e.g. owl, cat, bot, off).")
-    @click.option("--display", type=click.Choice(["auto", "glass", "ansi", "plain"]), default=None, help="Display frontend: auto, glass, ansi, or plain.")
-    @click.option("--no-animations", "no_animations", is_flag=True, help="Disable presentation animation.")
+    @click.option(
+        "--mascot", default=None, help="Mascot/buddy character (e.g. owl, cat, bot, off)."
+    )
+    @click.option(
+        "--display",
+        type=click.Choice(["auto", "glass", "ansi", "plain"]),
+        default=None,
+        help="Display frontend: auto, glass, ansi, or plain.",
+    )
+    @click.option(
+        "--no-animations", "no_animations", is_flag=True, help="Disable presentation animation."
+    )
     @click.option("--reduced-motion", is_flag=True, help="Use reduced-motion presentation.")
     @click.option("--verbose", is_flag=True, help="Verbose output.")
     @click.option("--details", is_flag=True, help="Show detailed model and task activity.")
     @click.pass_context
-    def cli(ctx: click.Context, config_path, db_path, workspace, autonomy, model, mascot, display, no_animations, reduced_motion, verbose, details) -> None:
+    def cli(
+        ctx: click.Context,
+        config_path,
+        db_path,
+        workspace,
+        autonomy,
+        model,
+        mascot,
+        display,
+        no_animations,
+        reduced_motion,
+        verbose,
+        details,
+    ) -> None:
         obj = ctx.ensure_object(dict)
         obj.update(
             config_path=config_path,
@@ -528,7 +542,9 @@ def _click_cli(click: Any):
 
     @cli.command()
     @click.argument("objective", required=False)
-    @click.option("--details", "c_details", is_flag=True, help="Show detailed model and task activity.")
+    @click.option(
+        "--details", "c_details", is_flag=True, help="Show detailed model and task activity."
+    )
     @click.pass_context
     def chat(ctx, objective, c_details):
         if c_details:
@@ -542,8 +558,15 @@ def _click_cli(click: Any):
     @click.option("--autonomy", "a_autonomy", type=click.Choice([a.value for a in AutonomyLevel]))
     @click.option("--workspace", "a_workspace", default=None)
     @click.option("--model", "a_model", default=None)
-    @click.option("--details", "r_details", is_flag=True, help="Show detailed model and task activity.")
-    @click.option("--criteria", "r_criteria", default=None, help="Acceptance criteria separated by ';'. Prefix 'command:' for an executable probe.")
+    @click.option(
+        "--details", "r_details", is_flag=True, help="Show detailed model and task activity."
+    )
+    @click.option(
+        "--criteria",
+        "r_criteria",
+        default=None,
+        help="Acceptance criteria separated by ';'. Prefix 'command:' for an executable probe.",
+    )
     @click.pass_context
     def run(ctx, objective, **kw):
         o = base_options(ctx, "run", [objective])
@@ -587,16 +610,15 @@ def _click_cli(click: Any):
         sys.exit(dispatch(base_options(ctx, "cancel", [task_id])))
 
     @cli.command("oi-stream")
-    @click.option("--task", "task_id", default=None,
-                  help="Stream a specific task instead of the global tail.")
-    @click.option("--config", "oi_config_path", default=None,
-                  help="Path to the Athena config file.")
-    @click.option("--db", "oi_db_path", default=None,
-                  help="Path to the Athena persistence DB.")
-    @click.option("--workspace", "oi_workspace", default=None,
-                  help="Workspace root directory.")
-    @click.option("--mascot", "oi_mascot", default=None,
-                  help="Mascot/buddy character.")
+    @click.option(
+        "--task", "task_id", default=None, help="Stream a specific task instead of the global tail."
+    )
+    @click.option(
+        "--config", "oi_config_path", default=None, help="Path to the Athena config file."
+    )
+    @click.option("--db", "oi_db_path", default=None, help="Path to the Athena persistence DB.")
+    @click.option("--workspace", "oi_workspace", default=None, help="Workspace root directory.")
+    @click.option("--mascot", "oi_mascot", default=None, help="Mascot/buddy character.")
     @click.pass_context
     def oi_stream(ctx, task_id, oi_config_path, oi_db_path, oi_workspace, oi_mascot):
         """Live OI window: unbuffered model/runtime stream + activity mascot."""
@@ -633,13 +655,21 @@ def _arg_parse(argv: list[str]) -> Options:
         sp.add_argument("--workspace", default=None)
         sp.add_argument("--autonomy", default=None)
         sp.add_argument("--model", default=None)
-        sp.add_argument("--mascot", default=None, help="Mascot/buddy character (e.g. owl, cat, bot, off).")
+        sp.add_argument(
+            "--mascot", default=None, help="Mascot/buddy character (e.g. owl, cat, bot, off)."
+        )
         sp.add_argument("--display", choices=["auto", "glass", "ansi", "plain"], default=None)
         sp.add_argument("--no-animations", dest="no_animations", action="store_true")
         sp.add_argument("--reduced-motion", action="store_true")
         sp.add_argument("--verbose", action="store_true")
-        sp.add_argument("--details", action="store_true", help="Show detailed model and task activity.")
-        sp.add_argument("--criteria", default=None, help="Acceptance criteria separated by ';'. Prefix 'command:' for an executable probe.")
+        sp.add_argument(
+            "--details", action="store_true", help="Show detailed model and task activity."
+        )
+        sp.add_argument(
+            "--criteria",
+            default=None,
+            help="Acceptance criteria separated by ';'. Prefix 'command:' for an executable probe.",
+        )
 
     for name, help_, pos in (
         ("run", "Submit a one-shot objective.", "objective"),
@@ -693,11 +723,21 @@ def _arg_parse(argv: list[str]) -> Options:
     elif command == "run":
         o.args = [ns.objective]
     elif command in ("inspect", "resume", "cancel", "approve"):
-        o.args = [getattr(ns, "task_id" if command in ("inspect", "cancel") else ("session_id" if command == "resume" else "approval_id"), "")]
+        o.args = [
+            getattr(
+                ns,
+                "task_id"
+                if command in ("inspect", "cancel")
+                else ("session_id" if command == "resume" else "approval_id"),
+                "",
+            )
+        ]
     elif command == "chat" and getattr(ns, "objective", None):
         o.command = "run"
         o.args = [ns.objective]
-    if (o.command in ("run", "inspect", "resume", "approve", "cancel")) and (not o.args or not o.args[0]):
+    if (o.command in ("run", "inspect", "resume", "approve", "cancel")) and (
+        not o.args or not o.args[0]
+    ):
         print(f"athena {o.command}: missing required argument", file=sys.stderr)
         p.print_usage(file=sys.stderr)
         return o  # argparse will have printed usage; we return nonzero

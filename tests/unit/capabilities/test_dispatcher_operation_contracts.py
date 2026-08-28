@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
+import pkgutil
+
+import athena.capabilities as capabilities_package
 from athena.capabilities.delegate import DelegateCapability
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.memory import MemoryCapability
@@ -11,6 +16,7 @@ from athena.capabilities.schedule import ScheduleCapability
 from athena.capabilities.skills import SkillsCapability
 from athena.policy.engine import PolicyEngine
 from athena.protocol.capabilities import (
+    CapabilityDescriptor,
     CapabilityRequest,
     CapabilityRequestOrigin,
     CapabilityResult,
@@ -29,9 +35,7 @@ def _request(capability_id: str, operation: str, **arguments) -> CapabilityReque
     )
 
 
-def _dispatcher(
-    *executors, profile: AutonomyLevel = AutonomyLevel.CODING
-) -> CapabilityDispatcher:
+def _dispatcher(*executors, profile: AutonomyLevel = AutonomyLevel.CODING) -> CapabilityDispatcher:
     registry = CapabilityRegistry()
     for executor in executors:
         registry.register(executor)
@@ -98,9 +102,7 @@ async def test_memory_and_skills_accept_dispatcher_context(tmp_path):
 
 
 async def test_schedule_read_operations_fit_descriptor_effect_envelope(tmp_path):
-    dispatcher = _dispatcher(
-        ScheduleCapability(_ScheduleAPI()), profile=AutonomyLevel.SUPERVISED
-    )
+    dispatcher = _dispatcher(ScheduleCapability(_ScheduleAPI()), profile=AutonomyLevel.SUPERVISED)
     workspace = WorkspaceSpec(id="repo", root=str(tmp_path))
 
     listed = await _dispatch(dispatcher, _request("schedule", "list"), workspace)
@@ -161,9 +163,7 @@ async def test_delegate_collect_does_not_report_pending_as_success(tmp_path):
     assert "not complete" in (result.error or "")
 
 
-async def test_research_fetch_reaches_executor_after_effect_resolution(
-    tmp_path, monkeypatch
-):
+async def test_research_fetch_reaches_executor_after_effect_resolution(tmp_path, monkeypatch):
     capability = ResearchCapability(store=object())
 
     async def fake_fetch(request, args, context):
@@ -184,6 +184,37 @@ async def test_research_fetch_reaches_executor_after_effect_resolution(
 
     assert result.status is CapabilityResultStatus.OK
     assert result.output == "fetch stub reached"
+
+
+def test_native_operation_schemas_and_static_effect_maps_cannot_drift():
+    """Every declared static operation must have exactly one effect contract."""
+    modules = [
+        importlib.import_module(module.name)
+        for module in pkgutil.iter_modules(
+            capabilities_package.__path__, capabilities_package.__name__ + "."
+        )
+    ]
+    descriptors: dict[str, CapabilityDescriptor] = {}
+    for module in modules:
+        for _, cls in inspect.getmembers(module, inspect.isclass):
+            descriptor = getattr(cls, "descriptor", None)
+            if isinstance(descriptor, CapabilityDescriptor):
+                descriptors[descriptor.id] = descriptor
+
+    mismatches = []
+    for descriptor in descriptors.values():
+        operations = set(
+            descriptor.input_schema.get("properties", {}).get("operation", {}).get("enum", ())
+        )
+        if not operations or descriptor.operation_effects is None:
+            continue
+        declared = set(descriptor.operation_effects)
+        missing = sorted(operations - declared)
+        extra = sorted(declared - operations)
+        if missing or extra:
+            mismatches.append(f"{descriptor.id}: missing={missing!r}, extra={extra!r}")
+
+    assert not mismatches, "operation/effect contract drift: " + "; ".join(mismatches)
 
 
 async def test_research_run_reaches_executor_after_effect_resolution(tmp_path, monkeypatch):

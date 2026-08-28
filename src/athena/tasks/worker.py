@@ -21,11 +21,9 @@ _logger = logging.getLogger("athena.tasks.worker")
 class WorkerConfig:
     """Worker tunables (BUILDSPEC §22 backpressure, §73 parallelism)."""
 
-    max_parallel: int = 4
+    max_parallel: int = 16
     max_retries: int = 0
-    retryable_statuses: tuple[TaskStatus, ...] = (
-        TaskStatus.INTERRUPTED,
-    )
+    retryable_statuses: tuple[TaskStatus, ...] = (TaskStatus.INTERRUPTED,)
     poll_wait_s: float = 0.5
 
 
@@ -68,7 +66,7 @@ class TaskWorker:
     async def stop(self) -> None:
         """Signal the background loop to stop and await its graceful exit."""
         self._stop.set()
-        tasks = getattr(self, '_worker_tasks', None) or ([] if self._task is None else [self._task])
+        tasks = getattr(self, "_worker_tasks", None) or ([] if self._task is None else [self._task])
         for t in tasks:
             try:
                 await asyncio.wait_for(t, timeout=5)
@@ -117,8 +115,7 @@ class TaskWorker:
 
     async def run_forever(self) -> None:
         workers = [
-            asyncio.create_task(self._worker_loop(worker_id=i))
-            for i in range(self._max_parallel)
+            asyncio.create_task(self._worker_loop(worker_id=i)) for i in range(self._max_parallel)
         ]
         self._worker_tasks = workers
         try:
@@ -184,9 +181,7 @@ class TaskWorker:
         try:
             return await self._kernel.run_task(task_id)
         except RequestCancelled as exc:
-            return await self._mark_failed(
-                task_id, TaskStatus.CANCELLED, f"task cancelled: {exc}"
-            )
+            return await self._mark_failed(task_id, TaskStatus.CANCELLED, f"task cancelled: {exc}")
         except Exception as exc:  # noqa: BLE001 - classify every kernel failure truthfully
             return await self._mark_failed(
                 task_id, TaskStatus.FAILED, f"worker kernel failure: {exc}"
@@ -195,7 +190,10 @@ class TaskWorker:
     async def _mark_failed(self, task_id: str, status: TaskStatus, reason: str) -> TaskResult:
         try:
             return await self._tasks.finalize(
-                task_id, status=status, reason=reason, summary=reason,
+                task_id,
+                status=status,
+                reason=reason,
+                summary=reason,
             )
         except Exception as exc:
             self._record_store_error("finalization", exc)
@@ -209,9 +207,7 @@ class TaskWorker:
     async def _claim(self, *, worker_id: str) -> str | None:
         store = getattr(self._tasks, "_store", None)
         if store is None:
-            self._record_store_error(
-                "claim", RuntimeError("task store is unavailable")
-            )
+            self._record_store_error("claim", RuntimeError("task store is unavailable"))
             return None
         try:
             row = await store.claim_with_lease(self._claim_statuses, worker_id=worker_id)

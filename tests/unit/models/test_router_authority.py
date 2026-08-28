@@ -25,7 +25,6 @@ from athena.tasks.manager import TaskManager
 
 async def _base_stores():
     db = Database(":memory:")
-    await db._ensure_ready()
     sessions = SessionRepository(db)
     tasks = TaskStore(db)
     events = EventStore(db)
@@ -53,8 +52,7 @@ async def test_kernel_without_router_is_construction_error():
     registry = ProviderRegistry()
     registry.register("fake", FakeModelProvider(model="fake-1", provider="fake"))
     with pytest.raises(ValueError, match="injected ModelRouter"):
-        AgentKernel(**_kernel_kwargs(tasks, events, messages, manager,
-                                     registry, router=None))
+        AgentKernel(**_kernel_kwargs(tasks, events, messages, manager, registry, router=None))
     await db.close()
 
 
@@ -64,7 +62,8 @@ async def test_kernel_holds_the_injected_router_instance():
     registry = ProviderRegistry()
     registry.register("fake", FakeModelProvider(model="fake-1", provider="fake"))
     router = ModelRouter(registry)
-    kernel = AgentKernel(**_kernel_kwargs(tasks, events, messages, manager,
-                                          registry, router=router))
+    kernel = AgentKernel(
+        **_kernel_kwargs(tasks, events, messages, manager, registry, router=router)
+    )
     assert kernel._router is router
     await db.close()

@@ -18,10 +18,12 @@ subsystems, registers the core capabilities, registers model providers, loads
 skills, connects configured MCP servers (best-effort) and starts the scheduler
 background loop. ``AthenaService.stop()`` shuts down in reverse order.
 """
+
 from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import tempfile
@@ -31,7 +33,9 @@ from typing import Any, Mapping
 
 from athena.artifacts.store import ArtifactStore
 from athena.affordances import (
-    CapabilityFabric, GeneratedCapabilityStore, ScratchManager,
+    CapabilityFabric,
+    GeneratedCapabilityStore,
+    ScratchManager,
 )
 from athena.capabilities.delegate import DelegateCapability
 from athena.capabilities.dispatcher import CapabilityDispatcher
@@ -43,6 +47,7 @@ from athena.capabilities.registry import CapabilityRegistry
 from athena.capabilities.skills import SkillsCapability
 from athena.context.compiler import ContextCompiler
 from athena.execution.manager import ExecutionManager
+from athena.execution.container import ContainerBackend
 from athena.knowledge.pipeline import KnowledgePipeline
 from athena.models.router import ModelRouter
 from athena.interpreter import InterpreterExtension
@@ -69,6 +74,7 @@ from athena.kernel.continuations import ContinuationStore
 from athena.state.approvals import ApprovalStore
 from athena.state.database import Database
 from athena.state.events import EventStore
+from athena.state.external_effects import ExternalEffectStore
 from athena.state.executions import ExecutionStore
 from athena.state.messages import MessageStore
 from athena.state.mutations import MutationStore
@@ -77,6 +83,14 @@ from athena.state.schedules import ScheduleStore
 from athena.state.sessions import SessionRepository
 from athena.state.tasks import TaskStore
 from athena.state.tool_repairs import ToolRepairStore
+from athena.state.context_blocks import ContextBlockStore
+from athena.packs.store import PackStore
+from athena.state.delegate_sessions import DelegateSessionStore
+from athena.project.index.store import ProjectIndexStore
+from athena.project.index.builder import ProjectIndexBuilder
+from athena.project.index.coordinator import ProjectIndexCoordinator
+from athena.state.failure_memory import FailureMemory
+from athena.delegates.registry import DelegateRegistry
 from athena.tasks.budgets import BudgetTracker
 from athena.tasks.cancellation import CancellationManager
 from athena.tasks.delegation import DelegationManager
@@ -117,8 +131,12 @@ class AthenaService:
     # ------------------------------------------------------------------ #
     # Construction / factories
     # ------------------------------------------------------------------ #
-    def __init__(self, *, config: AthenaConfig | None = None) -> None:
+    def __init__(self, *, config: AthenaConfig | None = None, device_provider=None) -> None:
         self.config = config or AthenaConfig()
+        # Optional OI/device adapter surface.  Reflection must receive the
+        # configured provider at registration time instead of silently
+        # reporting "unsupported" for a provider owned by the host.
+        self._device_provider = device_provider
         self._started = False
         cfg_ws = config.workspace_root if config is not None else None
         self._default_workspace: WorkspaceSpec = WorkspaceSpec(
@@ -137,7 +155,19 @@ class AthenaService:
         self._store_runtime_sessions: RuntimeSessionStore | None = None
         self._store_executions: ExecutionStore | None = None
         self._tool_repair_store: ToolRepairStore | None = None
+        self._context_block_store: ContextBlockStore | None = None
+        self._pack_store: PackStore | None = None
+        self._pack_manager: Any = None
+        self._delegate_session_store: DelegateSessionStore | None = None
+        self._delegate_registry = DelegateRegistry()
+        self._external_delegate_manager: Any = None
+        self._capability_health_store: Any = None
+        self._capability_health: Any = None
         self._world_state_store: Any = None
+        self._project_index_store: ProjectIndexStore | None = None
+        self._project_index_builder: ProjectIndexBuilder | None = None
+        self._project_index_coordinator: ProjectIndexCoordinator | None = None
+        self._failure_memory: FailureMemory | None = None
         self._generated_store: GeneratedCapabilityStore | None = None
         self._research_store: Any = None
         self._world_states: dict[str, Any] = {}
@@ -151,6 +181,7 @@ class AthenaService:
         self._fabric: CapabilityFabric | None = None
         self._dispatcher: CapabilityDispatcher | None = None
         self._reality_gate: Any = None
+        self._reality_coordinator: Any = None
         self._compiler: ContextCompiler | None = None
         self._model_registry: ProviderRegistry | None = None
         self._kernel: AgentKernel | None = None
@@ -165,11 +196,14 @@ class AthenaService:
         self._delegation: DelegationManager | None = None
         self._memory: MemoryStore | None = None
         self._skills: SkillStore | None = None
+        self._skill_lifecycle: SkillLifecycle | None = None
         self._scheduler: Scheduler | None = None
         self._artifacts: ArtifactStore | None = None
         self._mcp: MCPAdapter | None = None
         self._workflow_store: Any = None
+        self._workflow_run_store: Any = None
         self._synthesis: Any = None
+        self._synthesis_event_observer: Any = None
         self._scratch = ScratchManager()
 
         self._mcp_clients: list[MCPClient] = []
@@ -215,8 +249,7 @@ class AthenaService:
             try:
                 await asyncio.shield(self.stop())
             except BaseException as cleanup_error:
-                _logger.error(
-                    "startup unwind failed: %s", cleanup_error, exc_info=True)
+                _logger.error("startup unwind failed: %s", cleanup_error, exc_info=True)
             raise
 
     async def _start_impl(self) -> None:
@@ -257,17 +290,32 @@ class AthenaService:
         self._store_messages = messages
         self._store_approvals = approvals
         self._store_mutations = mutations
+        self._external_effect_store = ExternalEffectStore(db)
         self._store_schedules = schedules
         self._store_continuations = continuations
         from athena.worldstate import WorldStateStore
+
         self._world_state_store = WorldStateStore(db)
         from athena.workflows import WorkflowStore
+
         self._workflow_store = WorkflowStore(db)
+        from athena.workflows import WorkflowRunStore
+
+        self._workflow_run_store = WorkflowRunStore(db)
         self._generated_store = GeneratedCapabilityStore(db)
         from athena.research import ResearchStore
+
         self._research_store = ResearchStore(db)
         from athena.state.provider_usage import ProviderUsageStore
+
         self._provider_usage_store = ProviderUsageStore(db)
+        self._project_index_store = ProjectIndexStore(db)
+        self._project_index_builder = ProjectIndexBuilder()
+        self._project_index_coordinator = ProjectIndexCoordinator(
+            self._project_index_store,
+            self._project_index_builder,
+        )
+        self._failure_memory = FailureMemory(db)
 
         # 2. Credentials (SecretManager owns resolution + leases).
         self._secrets = SecretManager(
@@ -282,6 +330,10 @@ class AthenaService:
             execution_store=execution_store,
             event_sink=self._forward_events(events),
         )
+        # Keep container execution optional, but register the real backend so
+        # a workspace selecting ``execution_backend="container"`` reaches the
+        # same canonical execution authority as local execution.
+        execution.register_backend(ContainerBackend())
         execution.register_runtime(PythonRuntime())
         execution.register_runtime(ShellRuntime())
         if PowerShellRuntime.available():
@@ -292,6 +344,25 @@ class AthenaService:
         self._store_runtime_sessions = runtime_sessions
         self._store_executions = execution_store
         self._tool_repair_store = ToolRepairStore(db)
+        self._context_block_store = ContextBlockStore(db)
+        self._pack_store = PackStore(db)
+        from athena.packs.manager import PackManager
+
+        self._pack_manager = PackManager(
+            self._pack_store,
+            install_root=os.path.join(self._runtime_state_root, "packs"),
+        )
+        self._delegate_session_store = DelegateSessionStore(db)
+        from athena.state.capability_health import CapabilityHealthStore
+
+        self._capability_health_store = CapabilityHealthStore(db)
+        from athena.capabilities.health import CapabilityHealth
+
+        self._capability_health = CapabilityHealth(store=self._capability_health_store)
+        try:
+            await self._capability_health.load(await self._capability_health_store.list())
+        except Exception as exc:
+            _logger.warning("capability health rehydration failed: %s", exc)
 
         # 4. Memory + skills.
         memory = MemoryStore(db)
@@ -300,6 +371,7 @@ class AthenaService:
         skill_lifecycle = SkillLifecycle(db, events=events)
         skills_store = SkillStore(loader=skill_loader, lifecycle=skill_lifecycle)
         self._skills = skills_store
+        self._skill_lifecycle = skill_lifecycle
         try:
             discovered = await skill_loader.load()
             await self._sync_skills(skill_lifecycle, discovered)
@@ -332,9 +404,12 @@ class AthenaService:
             artifact_store=self._artifacts,
             mutation_observer=self._on_mutation_completed,
             fabric=fabric,
+            health=self._capability_health,
+            failure_memory=self._failure_memory,
         )
         self._dispatcher = dispatcher
         from athena.reality import RealityGate
+
         self._reality_gate = RealityGate(self.shadow_engine())
         dispatcher.set_reality_gate(self._reality_gate)
 
@@ -364,6 +439,7 @@ class AthenaService:
             messages=messages,
             memory_store=memory,
             skill_lifecycle=skill_lifecycle,
+            workflow_store=self._workflow_store,
             events=events,
         )
         task_manager.add_finalize_observer(self._knowledge)
@@ -379,7 +455,9 @@ class AthenaService:
         self._register_providers(model_registry)
         self._model_registry = model_registry
         router = ModelRouter(
-            model_registry, role_policies=self._role_policies(cfg.model_roles)
+            model_registry,
+            role_policies=self._role_policies(cfg.model_roles),
+            usage_provider=self._provider_usage_store,
         )
         self._router = router
 
@@ -392,6 +470,7 @@ class AthenaService:
             capability_registry=fabric,
             artifact_store=self._artifacts,
             research_store=self._research_store,
+            context_block_store=self._context_block_store,
             summarizer=self._make_model_summarizer(model_registry),
             context_window=cfg.context_window,
             reserve_output=cfg.reserve_output,
@@ -400,6 +479,26 @@ class AthenaService:
         self._compiler = compiler
 
         # 10. Kernel.
+        verifier = self._build_verifier(
+            execution=execution,
+            dispatcher=self._dispatcher,
+            artifact_store=self._artifacts,
+            capability_registry=fabric,
+            model_registry=router,  # ModelRouter: judge role routing
+            evidence_provider=self._verification_evidence,
+            inference_broker=self._make_judge_broker(),
+        )
+        from athena.reality import RealityCoordinator, ShadowCandidateVerifier
+
+        coordinator = RealityCoordinator(
+            shadow_engine=self.shadow_engine(),
+            reality_gate=self._reality_gate,
+            candidate_verifier=ShadowCandidateVerifier(verifier),
+            event_sink=self._forward_events(events),
+            default_criteria_source=self._project_profile_for_completion,
+            project_index_provider=self._project_index_for_completion,
+        )
+        self._reality_coordinator = coordinator
         kernel = AgentKernel(
             task_store=tasks,
             events=events,
@@ -409,31 +508,23 @@ class AthenaService:
             router=router,
             context_compiler=compiler,
             termination=TerminationEvaluator(
-                acceptance_verifier=self._build_verifier(
-                    execution=execution,
-                    dispatcher=self._dispatcher,
-                    artifact_store=self._artifacts,
-                    capability_registry=fabric,
-                    model_registry=router,   # ModelRouter: judge role routing
-                    evidence_provider=self._verification_evidence,
-                    inference_broker=self._make_judge_broker(),
-                ),
+                acceptance_verifier=verifier,
             ),
             dispatch_factory=self._dispatch_factory,
             continuation_store=continuations,
+            workflow_run_store=self._workflow_run_store,
             provider_usage_store=self._provider_usage_store,
             interpreter=self._make_interpreter(),
+            reality_coordinator=coordinator,
         )
         self._kernel = kernel
 
         # 11. Delegation (needs kernel).
-        delegation = DelegationManager(
-            task_manager=task_manager, kernel=kernel, budgets=budgets
-        )
+        delegation = DelegationManager(task_manager=task_manager, kernel=kernel, budgets=budgets)
         self._delegation = delegation
 
         # 12. Register core capabilities (bind executors to current handles).
-        self._register_core_capabilities(
+        await self._register_core_capabilities(
             registry=registry,
             workspace=workspace,
             execution=execution,
@@ -447,7 +538,43 @@ class AthenaService:
         # never survive terminal cleanup or a process restart.
         from athena.capabilities.synthesis import SynthesisCapability
 
-        registry.register(SynthesisCapability(self._synthesis, fabric))
+        registry.register(
+            SynthesisCapability(
+                self._synthesis,
+                fabric,
+                research_store=self._research_store,
+                scratch=self._scratch,
+            )
+        )
+
+        async def _current_generated_evidence(generated):
+            status = await self._synthesis.evidence_status(
+                generated,
+                self._research_store,
+            )
+            if status["status"] == "CURRENT":
+                return True
+            owner = (
+                generated.project_scope
+                if generated.scope.value == "project"
+                else generated.user_scope
+            ) or str(generated.provenance.get("owner") or "")
+            if owner and self._generated_store is not None:
+                try:
+                    await self._generated_store.transition(
+                        generated.id,
+                        "STALE",
+                        owner=owner,
+                        reason=json.dumps(status, sort_keys=True),
+                    )
+                except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                    _logger.warning(
+                        "could not persist stale generated capability %s: %s",
+                        generated.id,
+                        exc,
+                    )
+            return False
+
         await fabric.load_persisted(
             lambda generated: self._synthesis.restore_executor(
                 generated,
@@ -456,7 +583,14 @@ class AthenaService:
             ),
             project_id=workspace.id,
             user_id="athena",
+            record_validator=_current_generated_evidence,
         )
+        # Generated proof metrics are rebuilt from canonical events and then
+        # kept current by the same append-only event stream.  This makes a
+        # verification count evidence, not caller-supplied promotion metadata.
+        await self._synthesis.replay_event_metrics(events)
+        self._synthesis_event_observer = self._synthesis.observe_event
+        events.subscribe(self._synthesis_event_observer)
 
         # 12b. Register schedule capability AFTER the scheduler is constructed
         # (P1-25: ScheduleAPI must capture a live scheduler, not None).
@@ -468,10 +602,47 @@ class AthenaService:
         )
         self._scheduler = scheduler
         events.subscribe(scheduler.notify_event)
-        registry.register(ScheduleCapability(ScheduleAPI(scheduler, task_manager)))
+        schedule_api = ScheduleAPI(scheduler, task_manager)
+        registry.register(ScheduleCapability(schedule_api))
+        # Maintenance contracts are rehydrated before the core capability
+        # bundle finishes registering. Create the live watcher owner first so
+        # durable contracts can reconnect to the same observer surface rather
+        # than silently degrading to scheduler-only polling.
+        from athena.capabilities.watch import WatchRegistry
+
+        if getattr(self, "_watch_registry", None) is None:
+            self._watch_registry = WatchRegistry(
+                observer_runner=self._run_watch_observer,
+            )
+        from athena.capabilities.maintain import MaintenanceCapability
+
+        maintenance = MaintenanceCapability(
+            schedule_api,
+            watch_registry=getattr(self, "_watch_registry", None),
+            workspace=workspace,
+            execution_manager=self._execution,
+            fabric=self._fabric,
+        )
+        registry.register(maintenance)
+        try:
+            restored = await maintenance.rehydrate()
+            if restored:
+                _logger.info("rehydrated %d maintenance observers", restored)
+        except Exception as exc:
+            _logger.warning("maintenance observer rehydration failed: %s", exc)
 
         # 12.5 Crash recovery: reconcile orphaned state before claiming new work.
         from athena.recovery.manager import RecoveryManager
+
+        # A proven reality commit may have completed just before a process
+        # stopped, leaving the task row non-terminal. Finish that saga before
+        # generic RUNNING -> INTERRUPTED recovery can hide the proven result.
+        completion_recovered = await coordinator.reconcile_startup(task_manager)
+        if completion_recovered:
+            _logger.info(
+                "recovered proven reality completions: %d",
+                completion_recovered,
+            )
 
         recovery = RecoveryManager(
             task_store=tasks,
@@ -487,19 +658,45 @@ class AthenaService:
         except Exception as exc:
             _logger.warning("crash recovery failed: %s", exc)
 
+        # Reconcile transaction ownership after the mutation ledger has
+        # classified any in-flight effects, but before workers can route new
+        # calls into a durable in-place candidate.
+        transaction_recovered = await self._reality_gate.reconcile_startup()
+        if transaction_recovered:
+            _logger.warning(
+                "transactional work requires operator reconciliation: %d",
+                transaction_recovered,
+            )
+
         # Fusion branches have a separate durable batch boundary. A branch
         # interrupted while applying real-workspace mutations must be marked
         # recovery-required before workers can claim fresh work; never replay
         # or infer a partially applied speculative commit at startup.
-        try:
-            shadow_recovered = await self.shadow_engine().reconcile_startup(events)
-            if shadow_recovered:
-                _logger.warning(
-                    "shadow branches require operator reconciliation: %d",
-                    shadow_recovered,
+        shadow_recovered = await self.shadow_engine().reconcile_startup(events)
+        if shadow_recovered:
+            _logger.warning(
+                "shadow branches require operator reconciliation: %d",
+                shadow_recovered,
+            )
+
+        # External systems sit beyond Athena's transaction boundary.  Any
+        # receipt left in APPLYING/VERIFYING/COMPENSATING belongs to an
+        # interrupted operation whose remote outcome is unknown; reconcile it
+        # before workers can issue another request.  Unlike an observational
+        # startup metric, failure here must abort startup fail-closed.
+        external_recovered = await self._external_effect_store.reconcile_startup()
+        if external_recovered:
+            _logger.warning(
+                "external effects require operator reconciliation: %d",
+                len(external_recovered),
+            )
+            for receipt in external_recovered:
+                recovery_evidence = dict((receipt.get("response") or {}).get("recovery") or {})
+                await events.append_event(
+                    "ExternalEffectRecoveryRequired",
+                    recovery_evidence,
+                    task_id=receipt.get("task_id"),
                 )
-        except Exception as exc:
-            _logger.warning("shadow branch recovery failed: %s", exc)
 
         # 12.75 Durable approval recovery: a resolved continuation is not
         # ordinary queued work. It belongs to a task that was already parked
@@ -525,6 +722,24 @@ class AthenaService:
         # 14. MCP (best-effort).
         self._mcp = MCPAdapter(registry)
         await self._connect_mcp()
+
+        # Packs are rehydrated only after every native capability, durable
+        # generated overlay, and configured MCP surface is available. This
+        # lets declarative aliases and MCP contributions enter the same live
+        # fabric on startup as they do during runtime installation.
+        if self._pack_manager is not None:
+            self._pack_manager.bind_integrations(
+                skill_lifecycle=skill_lifecycle,
+                workflow_store=self._workflow_store,
+                fabric=self._fabric,
+                dispatcher=self._dispatcher,
+                mcp_adapter=self._mcp,
+                mcp_client_sink=self._mcp_clients.append,
+            )
+            try:
+                await self._pack_manager.rehydrate_enabled()
+            except Exception as exc:
+                _logger.warning("enabled capability-pack rehydration failed: %s", exc)
 
         # 15. Start background scheduler loop.
         await scheduler.start()
@@ -567,6 +782,10 @@ class AthenaService:
             if self._store_events is not None:
                 self._store_events.unsubscribe(self._scheduler.notify_event)
             self._scheduler = None
+
+        if self._store_events is not None and self._synthesis_event_observer is not None:
+            self._store_events.unsubscribe(self._synthesis_event_observer)
+            self._synthesis_event_observer = None
 
         # 3. INTERRUPT active tasks (recoverable), never CANCEL (P0-23).
         #    Graceful shutdown parks in-flight work as INTERRUPTED so it can be
@@ -652,9 +871,22 @@ class AthenaService:
 
         self._cancellations = None
         self._world_state_store = None
+        self._project_index_store = None
+        self._project_index_builder = None
+        self._project_index_coordinator = None
+        self._failure_memory = None
         self._generated_store = None
         self._workflow_store = None
+        self._workflow_run_store = None
         self._research_store = None
+        self._context_block_store = None
+        self._pack_store = None
+        self._pack_manager = None
+        self._skill_lifecycle = None
+        self._delegate_session_store = None
+        self._external_delegate_manager = None
+        self._capability_health_store = None
+        self._capability_health = None
         self._synthesis = None
         self._world_states = {}
         self._started = False
@@ -693,9 +925,7 @@ class AthenaService:
                     cause=exc,
                 ) from exc
             if row is None:
-                _logger.error(
-                    "approval continuation %s references missing task", task_id
-                )
+                _logger.error("approval continuation %s references missing task", task_id)
                 continue
 
             try:
@@ -710,20 +940,20 @@ class AthenaService:
             # WAITING_APPROVAL is the normal hard-crash state. Both are safe to
             # move back to RUNNING for this exact durable continuation.
             if status in (TaskStatus.WAITING_APPROVAL, TaskStatus.INTERRUPTED):
-                await task_manager.transition(task_id, TaskStatus.RUNNING,
-                                              reason="resume approved continuation")
+                await task_manager.transition(
+                    task_id, TaskStatus.RUNNING, reason="resume approved continuation"
+                )
             elif status is not TaskStatus.RUNNING:
                 _logger.error(
                     "not resuming approved continuation for task %s in status %s",
-                    task_id, status.value,
+                    task_id,
+                    status.value,
                 )
                 continue
 
             recovery = asyncio.create_task(kernel.run_task(task_id))
             self._approval_recovery_tasks.add(recovery)
-            recovery.add_done_callback(
-                self._track_approval_recovery(task_id, recovery)
-            )
+            recovery.add_done_callback(self._track_approval_recovery(task_id, recovery))
 
     def _track_approval_recovery(self, task_id: str, recovery: asyncio.Task):
         def _done(task: asyncio.Task) -> None:
@@ -746,6 +976,14 @@ class AthenaService:
         if wait:
             await self.wait_for(created.id)
         return created
+
+    def register_external_delegate(self, spec, *, connector=None) -> None:
+        """Register a host-configured ACP/A2A/OpenAI delegate.
+
+        Registration is host-side configuration; model input can select only
+        specialists already present in this registry.
+        """
+        self._delegate_registry.register(spec, connector=connector)
 
     async def execute_direct(
         self,
@@ -961,7 +1199,8 @@ class AthenaService:
                     remaining = max(deadline - time.monotonic(), 0.0)
                     try:
                         await manager.wait_for_finalization(
-                            task_id, timeout=remaining,
+                            task_id,
+                            timeout=remaining,
                         )
                     except TimeoutError:
                         # The durable result is still authoritative. A slow
@@ -1048,9 +1287,7 @@ class AthenaService:
     async def interrupt(self, task_id: str, reason: str = "externally interrupted") -> TaskStatus:
         return await self._require_cancellations().interrupt(task_id, reason)
 
-    async def approve(
-        self, approval_id: str, *, granted: bool, scope: str | None = None
-    ) -> None:
+    async def approve(self, approval_id: str, *, granted: bool, scope: str | None = None) -> None:
         """Resolve a pending approval and wake the parked task, if any.
 
         The persisted resolution (ApprovalStore) and the runtime grant
@@ -1084,9 +1321,7 @@ class AthenaService:
                 except Exception as exc:
                     _logger.warning("record_grant failed for %s: %s", approval_id, exc)
             if effective_scope is not None:
-                self._install_grant(
-                    approval_id, task_id, metadata, first=effective_scope
-                )
+                self._install_grant(approval_id, task_id, metadata, first=effective_scope)
         elif self._store_approvals is not None:
             try:
                 await self._store_approvals.record_deny(
@@ -1112,22 +1347,19 @@ class AthenaService:
 
         kernel = self._kernel
         active = bool(
-            task_id is not None
-            and kernel is not None
-            and task_id in getattr(kernel, "_runs", {})
+            task_id is not None and kernel is not None and task_id in getattr(kernel, "_runs", {})
         )
         if active and kernel is not None and task_id is not None:
-            await kernel.notify_approval_resolved(
-                task_id, "granted" if granted else "denied"
-            )
+            await kernel.notify_approval_resolved(task_id, "granted" if granted else "denied")
         elif task_id is not None and kernel is not None and self._task_manager is not None:
             try:
                 row = await self._store_tasks.get(task_id) if self._store_tasks else None
                 if row and row.get("status") == TaskStatus.WAITING_APPROVAL.value:
                     await self._task_manager.transition(task_id, TaskStatus.RUNNING)
                     recovery = asyncio.create_task(kernel.run_task(task_id))
-                    recovery.add_done_callback(self._log_background_failure(
-                        f"approval recovery {task_id}"))
+                    recovery.add_done_callback(
+                        self._log_background_failure(f"approval recovery {task_id}")
+                    )
             except Exception as exc:
                 _logger.warning("approval recovery failed for %s: %s", approval_id, exc)
 
@@ -1186,7 +1418,9 @@ class AthenaService:
             pass
 
     async def _rehydrate_approval_grants(
-        self, approvals: ApprovalStore, continuations: ContinuationStore,
+        self,
+        approvals: ApprovalStore,
+        continuations: ContinuationStore,
     ) -> None:
         """Restore only persisted grants that are still safe to use.
 
@@ -1213,7 +1447,8 @@ class AthenaService:
             except (TypeError, ValueError):
                 _logger.warning(
                     "skipping granted approval %s with invalid scope %r",
-                    record.get("id"), scope_raw,
+                    record.get("id"),
+                    scope_raw,
                 )
                 continue
 
@@ -1224,7 +1459,8 @@ class AthenaService:
                 except Exception as exc:
                     _logger.warning(
                         "cannot check approval continuation %s: %s",
-                        approval_id, exc,
+                        approval_id,
+                        exc,
                     )
                     continue
                 if not pending:
@@ -1236,8 +1472,7 @@ class AthenaService:
                 try:
                     expiry = datetime.fromisoformat(str(raw_expiry))
                 except ValueError:
-                    _logger.warning(
-                        "ignoring invalid expiry on approval %s", approval_id)
+                    _logger.warning("ignoring invalid expiry on approval %s", approval_id)
             self._install_grant(
                 approval_id,
                 record.get("task_id"),
@@ -1246,9 +1481,7 @@ class AthenaService:
                 expires_at=expiry,
             )
 
-    def _clamp_approval_scope(
-        self, choice: str | None, metadata: dict
-    ) -> ApprovalScope | None:
+    def _clamp_approval_scope(self, choice: str | None, metadata: dict) -> ApprovalScope | None:
         """Resolve the effective approval scope.
 
         A caller-provided ``choice`` is clamped to the scopes the approval
@@ -1374,18 +1607,29 @@ class AthenaService:
             for event in gathered
         ]
         categories = {
-            "models": [e for e in details if str(e["type"]).startswith("Model")
-                       or str(e["type"]).startswith("Inference")],
-            "capabilities": [e for e in details if "Capability" in str(e["type"])
-                             or str(e["type"]).startswith("Tool")],
-            "policy": [e for e in details if "Policy" in str(e["type"])
-                       or "Approval" in str(e["type"])],
-            "execution": [e for e in details if "Execution" in str(e["type"])
-                          or str(e["type"]).startswith("Std")],
+            "models": [
+                e
+                for e in details
+                if str(e["type"]).startswith("Model") or str(e["type"]).startswith("Inference")
+            ],
+            "capabilities": [
+                e
+                for e in details
+                if "Capability" in str(e["type"]) or str(e["type"]).startswith("Tool")
+            ],
+            "policy": [
+                e for e in details if "Policy" in str(e["type"]) or "Approval" in str(e["type"])
+            ],
+            "execution": [
+                e
+                for e in details
+                if "Execution" in str(e["type"]) or str(e["type"]).startswith("Std")
+            ],
             "mutations": [e for e in details if "Mutation" in str(e["type"])],
             "artifacts": [e for e in details if "Artifact" in str(e["type"])],
-            "children": [e for e in details if "Child" in str(e["type"])
-                         or "Delegat" in str(e["type"])],
+            "children": [
+                e for e in details if "Child" in str(e["type"]) or "Delegat" in str(e["type"])
+            ],
         }
         return {
             "task_id": task_id,
@@ -1418,9 +1662,7 @@ class AthenaService:
                             "resource_pattern": g.resource_pattern,
                             "task_id": g.task_id,
                             "session_id": g.session_id,
-                            "expires_at": (
-                                g.expires_at.isoformat() if g.expires_at else None
-                            ),
+                            "expires_at": (g.expires_at.isoformat() if g.expires_at else None),
                         }
                     )
             except Exception as exc:
@@ -1587,12 +1829,14 @@ class AthenaService:
                         type=VerificationType.MODEL_JUDGMENT,
                         predicate=text,
                     )
-                criteria.append(Criterion(
-                    id=f"ac_{i+1}",
-                    description=text,
-                    verification=verification,
-                    required=True,
-                ))
+                criteria.append(
+                    Criterion(
+                        id=f"ac_{i + 1}",
+                        description=text,
+                        verification=verification,
+                        required=True,
+                    )
+                )
         # Normalize requested_capabilities into the task's capability policy
         cap_policy = None
         if request.requested_capabilities:
@@ -1605,21 +1849,25 @@ class AthenaService:
             elif hasattr(att, "uri") and hasattr(att, "mime_type"):
                 # ArtifactRef attachments need to survive the request boundary
                 # as canonical context refs, including their media type.
-                context_refs.append(ContextRef(
-                    kind="artifact",
-                    ref=str(att.uri),
-                    source_id=getattr(att, "id", None),
-                    summary=getattr(att, "producer", None),
-                    mime_type=getattr(att, "mime_type", None),
-                ))
+                context_refs.append(
+                    ContextRef(
+                        kind="artifact",
+                        ref=str(att.uri),
+                        source_id=getattr(att, "id", None),
+                        summary=getattr(att, "producer", None),
+                        mime_type=getattr(att, "mime_type", None),
+                    )
+                )
             elif isinstance(att, dict):
-                context_refs.append(ContextRef(
-                    kind=att.get("kind", "artifact"),
-                    ref=str(att.get("ref", att.get("uri", "")) or ""),
-                    source_id=att.get("source_id"),
-                    summary=att.get("summary"),
-                    mime_type=att.get("mime_type"),
-                ))
+                context_refs.append(
+                    ContextRef(
+                        kind=att.get("kind", "artifact"),
+                        ref=str(att.get("ref", att.get("uri", "")) or ""),
+                        source_id=att.get("source_id"),
+                        summary=att.get("summary"),
+                        mime_type=att.get("mime_type"),
+                    )
+                )
         spec_kwargs: dict = dict(
             id=request.task_id or new_id("task"),
             objective=request.prompt,
@@ -1645,8 +1893,7 @@ class AthenaService:
         from athena.context.instructions import hierarchical_agents_md
 
         root_value = (
-            getattr(self._default_workspace, "root", None)
-            if self._default_workspace else None
+            getattr(self._default_workspace, "root", None) if self._default_workspace else None
         )
         if not isinstance(root_value, str) or not root_value:
             return None
@@ -1662,11 +1909,19 @@ class AthenaService:
         return _Reader()
 
     def _build_verifier(
-        self, *, execution, dispatcher, artifact_store, capability_registry,
-        model_registry, evidence_provider=None, inference_broker=None,
+        self,
+        *,
+        execution,
+        dispatcher,
+        artifact_store,
+        capability_registry,
+        model_registry,
+        evidence_provider=None,
+        inference_broker=None,
     ):
         """Build the acceptance verifier for the kernel."""
         from athena.kernel.verifiers import CompositeVerifier
+
         return CompositeVerifier(
             execution=execution,
             dispatcher=dispatcher,
@@ -1679,6 +1934,7 @@ class AthenaService:
 
     def _make_judge_broker(self):
         """Return a late-bound broker for task-scoped judge inference."""
+
         async def _broker(*, task, system_prompt, user_prompt):
             kernel = self._kernel
             if kernel is None:
@@ -1690,6 +1946,24 @@ class AthenaService:
             )
 
         return _broker
+
+    async def _project_index_for_completion(self, root: str):
+        """Read a source-verified index for completion planning."""
+        coordinator = self._project_index_coordinator
+        if coordinator is None:
+            return None
+        return await coordinator.current(root, freshness="source_verified")
+
+    async def _project_profile_for_completion(self, task: TaskSpec):
+        """Use the service-owned index as the completion profile source."""
+        workspace = getattr(task, "workspace", None)
+        root = getattr(workspace, "root", None)
+        if not root:
+            return None
+        index = await self._project_index_for_completion(root)
+        if index is None:
+            return None
+        return dict(getattr(index, "profile", {}) or {})
 
     async def _verification_evidence(self, task: TaskSpec) -> dict[str, Any]:
         """Collect a bounded projection of durable task observations for a judge."""
@@ -1706,13 +1980,11 @@ class AthenaService:
             ]
         if self._store_executions is not None:
             evidence["executions"] = [
-                dict(row) for row in
-                (await self._store_executions.list_for_task(task.id))[-25:]
+                dict(row) for row in (await self._store_executions.list_for_task(task.id))[-25:]
             ]
         if self._store_mutations is not None:
             evidence["mutations"] = [
-                dict(row) for row in
-                (await self._store_mutations.list_for_task(task.id))[-25:]
+                dict(row) for row in (await self._store_mutations.list_for_task(task.id))[-25:]
             ]
         result = await self.get_result(task.id)
         if result is not None:
@@ -1720,21 +1992,25 @@ class AthenaService:
                 "status": result.status.value,
                 "summary": result.summary,
                 "unresolved": list(result.unresolved),
-                "artifacts": [getattr(ref, "uri", str(ref))
-                              for ref in result.artifacts],
+                "artifacts": [getattr(ref, "uri", str(ref)) for ref in result.artifacts],
             }
         result_data = evidence.get("result", {})
         if self._research_store is not None:
             try:
                 workspace_id = task.workspace.id if task.workspace else None
                 sources = await self._research_store.list_sources(
-                    task_id=task.id, project_id=workspace_id, limit=50,
+                    task_id=task.id,
+                    project_id=workspace_id,
+                    limit=50,
                 )
                 research_evidence = await self._research_store.list_evidence(
-                    task_id=task.id, project_id=workspace_id, limit=75,
+                    task_id=task.id,
+                    project_id=workspace_id,
+                    limit=75,
                 )
                 gaps = await self._research_store.list_gaps(
-                    task_id=task.id, limit=100,
+                    task_id=task.id,
+                    limit=100,
                 )
                 evidence["research"] = {
                     "sources": [source.to_record() for source in sources],
@@ -1743,8 +2019,16 @@ class AthenaService:
                 }
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 _logger.warning("research evidence lookup failed: %s", exc)
+        try:
+            world_state = await self.world_state(task.id).snapshot(
+                workspace_root=task.workspace.root if task.workspace else None,
+            )
+            evidence["world_state"] = world_state
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            _logger.warning("world-state evidence lookup failed: %s", exc)
         return {
             "evidence": evidence,
+            "world_state": evidence.get("world_state", {}),
             "artifacts": result_data.get("artifacts", []),
             "unresolved_failures": result_data.get("unresolved", []),
         }
@@ -1759,6 +2043,7 @@ class AthenaService:
     @staticmethod
     def _log_background_failure(label: str):
         """Consume detached task exceptions instead of losing recovery truth."""
+
         def _done(task: asyncio.Task) -> None:
             try:
                 task.result()
@@ -1773,6 +2058,7 @@ class AthenaService:
     def _forward_events(events: EventStore):
         async def sink(event: Event) -> None:
             await events.append(event)
+
         return sink
 
     def _role_policies(self, raw: Any) -> dict:
@@ -1797,9 +2083,7 @@ class AthenaService:
                 try:
                     max_cost = Decimal(str(raw_cost))
                 except (InvalidOperation, ValueError):
-                    _logger.warning(
-                        "model_roles[%r].max_cost_usd invalid: %r", role, raw_cost
-                    )
+                    _logger.warning("model_roles[%r].max_cost_usd invalid: %r", role, raw_cost)
             out[str(role)] = ModelPolicy(
                 role=str(role),
                 allowed=allowed,
@@ -1831,7 +2115,9 @@ class AthenaService:
                 "and unresolved issues. Output ONLY the summary.\n\n" + text[-8000:]
             )
             return await kernel.utility_inference(
-                system_prompt="", user_prompt=prompt, role="summarizer",
+                system_prompt="",
+                user_prompt=prompt,
+                role="summarizer",
             )
 
         return _summarize
@@ -1845,12 +2131,14 @@ class AthenaService:
         if the kernel never lands (construction failure), the broker raises
         and fusion is skipped (the primary loop is unaffected).
         """
+
         async def _broker(*, context, system_prompt, user_prompt):
             kernel = self._kernel
             if kernel is None:
                 raise RuntimeError("interpreter broker: kernel not constructed")
             return await kernel.interpreter_subturn(
-                context=context, system_prompt=system_prompt,
+                context=context,
+                system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
 
@@ -1880,28 +2168,68 @@ class AthenaService:
                 _logger.warning("skill install failed for %s: %s", skill.name, exc)
                 continue
 
-    def _register_core_capabilities(
-        self, *, registry, workspace, execution, memory, skills_store,
-        research_store=None
+    async def _register_core_capabilities(
+        self, *, registry, workspace, execution, memory, skills_store, research_store=None
     ) -> None:
         from athena.capabilities.artifacts import ArtifactCapability
 
         registry.register(FilesystemCapability(workspace))
         from athena.capabilities.git import GitCapability
+
         registry.register(GitCapability())
         if self._artifacts is not None:
             registry.register(ArtifactCapability(self._artifacts))
-        registry.register(ExecuteCapability(execution, workspace, artifact_store=self._artifacts))
+        registry.register(
+            ExecuteCapability(
+                execution,
+                workspace,
+                artifact_store=self._artifacts,
+                failure_memory=self._failure_memory,
+            )
+        )
+        from athena.capabilities.diagnostics import DiagnosticsCapability
+
+        if self._failure_memory is not None:
+            registry.register(DiagnosticsCapability(self._failure_memory))
         registry.register(MemoryCapability(memory))
         registry.register(SkillsCapability(skills_store))
         registry.register(DelegateCapability(self._delegation))
+        from athena.capabilities.external_delegate import ExternalDelegateCapability
+        from athena.delegates.sessions import ExternalDelegateManager
+
+        if self._delegate_session_store is not None:
+            self._external_delegate_manager = ExternalDelegateManager(
+                self._delegate_registry,
+                self._delegate_session_store,
+                dispatcher=self._dispatcher,
+            )
+            registry.register(ExternalDelegateCapability(self._external_delegate_manager))
+            self.register_shutdown_hook(
+                "external_delegate_sessions",
+                self._external_delegate_manager.close_all,
+            )
+        from athena.capabilities.context_blocks import ContextBlocksCapability
+
+        if self._context_block_store is not None:
+            registry.register(ContextBlocksCapability(self._context_block_store))
+        from athena.capabilities.packs import PacksCapability
+
+        if self._pack_manager is not None:
+            registry.register(PacksCapability(self._pack_manager))
+        from athena.capabilities.health import CapabilityHealthCapability
+
+        if self._capability_health is not None:
+            registry.register(CapabilityHealthCapability(self._capability_health))
         # Computational-body capabilities (P0 roadmap).
         from athena.capabilities.system import MachineCapability, ProcessCapability
         from athena.capabilities.terminal_session import TerminalSessionCapability
         from athena.capabilities.dependency import DependencyCapability
         from athena.capabilities.reflection import CapabilityReflection
+        from athena.capabilities.truth import TruthCapability
         from athena.capabilities.research import ResearchCapability
         from athena.capabilities.scratch import ScratchCapability
+        from athena.capabilities.observer import ObserverCapability
+        from athena.capabilities.capsule import ProcedureCapsuleCapability
         from athena.capabilities.workflow import WorkflowCapability
         from athena.research.policy import SourcePolicy
 
@@ -1909,8 +2237,36 @@ class AthenaService:
         # helper can be promoted without losing source/provenance.
         if self._synthesis is None:
             from athena.synthesis.engine import SynthesisEngine
-            self._synthesis = SynthesisEngine()
-        registry.register(ScratchCapability(self._synthesis, self._scratch))
+
+            self._synthesis = SynthesisEngine(
+                dispatcher=self._dispatcher,
+                research_store=self._research_store,
+            )
+        elif self._dispatcher is not None:
+            self._synthesis.bind_dispatcher(self._dispatcher)
+            self._synthesis.bind_research_store(self._research_store)
+        fabric = self._fabric
+        if fabric is None:
+            raise RuntimeError("capability fabric is not constructed")
+        self._synthesis.bind_proof_sink(fabric.update_generated_proof)
+        registry.register(
+            ScratchCapability(
+                self._synthesis,
+                self._scratch,
+                self._fabric,
+            )
+        )
+        registry.register(
+            ObserverCapability(
+                self._synthesis,
+                self._fabric,
+                dispatcher=self._dispatcher,
+            )
+        )
+        self.register_shutdown_hook(
+            "generated_persistent_sessions",
+            self._synthesis.close_persistent_sessions,
+        )
 
         if TerminalSessionCapability.available():
             self._terminals = TerminalSessionCapability(
@@ -1922,55 +2278,94 @@ class AthenaService:
         self._processes = ProcessCapability(execution)
         registry.register(self._processes)
         registry.register(MachineCapability())
-        registry.register(CapabilityReflection(
-            self._fabric,
-            workflow_store=self._workflow_store,
-            skills_store=skills_store,
-            execution_manager=execution,
-            policy_engine=self._policy,
-            approval_store=self._store_approvals,
-        ))
+        registry.register(
+            CapabilityReflection(
+                self._fabric,
+                workflow_store=self._workflow_store,
+                skills_store=skills_store,
+                execution_manager=execution,
+                device_provider=self._device_provider,
+                policy_engine=self._policy,
+                approval_store=self._store_approvals,
+                health_provider=self._capability_health,
+            )
+        )
+        registry.register(TruthCapability(self))
         registry.register(DependencyCapability(execution))
         if research_store is not None:
-            registry.register(ResearchCapability(
-                research_store,
-                artifact_store=self._artifacts,
-                source_policy=SourcePolicy(
-                    allowed_domains=tuple(self.config.research_allowed_domains),
-                    denied_domains=tuple(self.config.research_denied_domains),
-                    allow_private_network=self.config.research_allow_private_network,
-                ),
-            ))
+            registry.register(
+                ResearchCapability(
+                    research_store,
+                    artifact_store=self._artifacts,
+                    source_policy=SourcePolicy(
+                        allowed_domains=tuple(self.config.research_allowed_domains),
+                        denied_domains=tuple(self.config.research_denied_domains),
+                        allow_private_network=self.config.research_allow_private_network,
+                    ),
+                )
+            )
         if self._workflow_store is not None and self._fabric is not None:
-            registry.register(WorkflowCapability(
-                self._workflow_store, self._dispatcher, self._fabric))
+            workflow_capability = WorkflowCapability(
+                self._workflow_store,
+                self._dispatcher,
+                self._fabric,
+                run_store=self._workflow_run_store,
+                external_store=self._external_effect_store,
+                workflow_observer=self._knowledge.observe_workflow_execution,
+            )
+            registry.register(workflow_capability)
+            registry.register(
+                ProcedureCapsuleCapability(
+                    self._workflow_store,
+                    self._fabric,
+                    self._synthesis,
+                    workflow_capability,
+                    research_store=self._research_store,
+                    dispatcher=self._dispatcher,
+                )
+            )
         try:
             from athena.capabilities.debugger import DebuggerCapability
 
             if DebuggerCapability.available():
-                self._debugger = DebuggerCapability()
+                self._debugger = DebuggerCapability(
+                    execution_manager=self._execution,
+                )
                 registry.register(self._debugger)
             else:
-                _logger.info(
-                    "debugger capability unavailable: debugpy is not installed")
+                _logger.info("debugger capability unavailable: debugpy is not installed")
         except Exception as exc:  # debugpy optional
             _logger.info("debugger capability unavailable: %s", exc)
 
         # P1/P2 environment families.
         from athena.capabilities.environment import (
-            DatabaseCapability, NetworkCapability, ServiceCapability,
+            DatabaseCapability,
+            NetworkCapability,
+            ServiceCapability,
             WorkspaceCapability,
         )
         from athena.capabilities.watch import WatchCapability, WatchRegistry
 
-        registry.register(ServiceCapability())
-        registry.register(NetworkCapability())
+        registry.register(
+            ServiceCapability(
+                external_store=self._external_effect_store,
+            )
+        )
+        registry.register(
+            NetworkCapability(
+                external_store=self._external_effect_store,
+            )
+        )
         self._database = DatabaseCapability(
             mutation_store=self._store_mutations,
             artifact_store=self._artifacts,
+            external_store=self._external_effect_store,
         )
         registry.register(self._database)
-        self._watch_registry = WatchRegistry()
+        if getattr(self, "_watch_registry", None) is None:
+            self._watch_registry = WatchRegistry(
+                observer_runner=self._run_watch_observer,
+            )
         self._watches = WatchCapability(
             registry=self._watch_registry,
             execution_manager=self._execution,
@@ -1981,26 +2376,98 @@ class AthenaService:
             self._task_manager.add_finalize_observer(self._cleanup_task_affordances)
         from athena.causal.checkpoint import CheckpointManager
 
-        self._checkpoints = CheckpointManager()
-        registry.register(WorkspaceCapability(
-            checkpoint_manager=self._checkpoints,
-            mutation_store=self._store_mutations,
-            mutation_observer=self._on_mutation_completed,
-        ))
+        # Checkpoints are part of Athena's durable recovery state.  They must
+        # survive a service restart and cannot live in the process-global
+        # temporary directory, which may be cleaned independently of the
+        # transaction ledger.
+        checkpoint_root = (
+            os.path.join(
+                self._runtime_state_root,
+                "checkpoints",
+            )
+            if self._runtime_state_root
+            else None
+        )
+        self._checkpoints = CheckpointManager(root=checkpoint_root or "/tmp/athena-checkpoints")
+        self._reality_gate.bind_checkpoint_manager(self._checkpoints)
+        registry.register(
+            WorkspaceCapability(
+                checkpoint_manager=self._checkpoints,
+                mutation_store=self._store_mutations,
+                mutation_observer=self._on_mutation_completed,
+                project_index_store=self._project_index_store,
+                project_index_coordinator=self._project_index_coordinator,
+            )
+        )
         from athena.capabilities.fusion import FusionCapability
 
         registry.register(FusionCapability(self))
 
         # Capability-owned resource teardown (P1-32).
         if hasattr(self, "_terminals"):
-            self.register_shutdown_hook(
-                "terminal_sessions", self._terminals.close_all)
+            self.register_shutdown_hook("terminal_sessions", self._terminals.close_all)
         if hasattr(self, "_debugger"):
-            self.register_shutdown_hook(
-                "debugger_sessions", self._debugger.close_all)
+            self.register_shutdown_hook("debugger_sessions", self._debugger.close_all)
         if hasattr(self, "_watch_registry"):
-            self.register_shutdown_hook(
-                "watch_registry", self._watch_registry.close)
+            self.register_shutdown_hook("watch_registry", self._watch_registry.close)
+
+    async def _run_watch_observer(
+        self,
+        task_id: str | None,
+        observer_id: str,
+        input_value: Mapping[str, Any],
+        workspace,
+        *,
+        profile=None,
+        task_policy=None,
+        task_budget=None,
+    ) -> dict[str, Any]:
+        """Run a generated sensor through the canonical dispatcher.
+
+        Watches are event producers, not a second execution path.  The
+        observer call therefore gets the same capability lookup, policy,
+        budgets, sandbox, and proof handling as a model-requested call.
+        """
+        from athena.protocol.capabilities import (
+            CapabilityRequest,
+            CapabilityRequestOrigin,
+            CapabilityResult,
+            CapabilityResultStatus,
+        )
+
+        if self._dispatcher is None:
+            return {"status": "failed", "error": "dispatcher unavailable"}
+        result = await self._dispatcher.dispatch(
+            CapabilityRequest(
+                capability_id=observer_id,
+                arguments={"input": dict(input_value)},
+                task_id=task_id,
+                call_id=new_id("watch-observer"),
+                origin=CapabilityRequestOrigin.GENERATED,
+            ),
+            workspace=workspace,
+            profile=profile,
+            task_policy=task_policy,
+            task_budget=task_budget,
+        )
+        if not isinstance(result, CapabilityResult):
+            return {"status": "failed", "error": "observer call suspended"}
+        status = result.status
+        if status is not CapabilityResultStatus.OK:
+            return {
+                "status": getattr(status, "value", "failed"),
+                "error": getattr(result, "error", None) or "observer failed",
+            }
+        try:
+            value = json.loads(result.output or "null")
+        except (TypeError, ValueError):
+            value = result.output
+        return {
+            "status": "ok",
+            "observer_id": observer_id,
+            "value": value,
+            "proof": dict(getattr(result, "metadata", {}) or {}),
+        }
 
     def register_shutdown_hook(self, name: str, hook) -> None:
         """Register a capability-owned resource teardown (P1-32)."""
@@ -2028,8 +2495,7 @@ class AthenaService:
         while True:
             await asyncio.sleep(2.0)
             registry = getattr(self, "_watch_registry", None)
-            if registry is None or not (registry.file_watches
-                                        or registry.process_watches):
+            if registry is None or not (registry.file_watches or registry.process_watches):
                 continue
             if events is None:
                 try:
@@ -2038,12 +2504,61 @@ class AthenaService:
                     continue
 
             async def sink(type_, payload, task_id=None):
+                if type_ == "WatchObserved":
+                    # External reality changes are proof invalidators too.
+                    # Apply this before EventStore subscribers wake the
+                    # maintenance task, so its first verification sees stale
+                    # claims rather than a transiently trusted snapshot.
+                    await self._invalidate_watch_claims(payload)
                 await events.append_event(type_, payload, task_id=task_id)
 
             try:
                 await registry.poll_all(sink)
             except Exception as exc:
                 _logger.debug("watch poll error: %s", exc)
+
+    async def _invalidate_watch_claims(self, payload: Mapping[str, Any]) -> None:
+        """Invalidate claims affected by an observed external change."""
+        raw_changes = payload.get("changes")
+        if isinstance(raw_changes, list):
+            changes = [str(item).removesuffix(" (removed)") for item in raw_changes if str(item)]
+        else:
+            changes = []
+        if payload.get("kind") == "process":
+            # A process exit has no file path boundary; claims without an
+            # explicit scope are conservatively invalidated.
+            changes = ["*"]
+        if not changes:
+            return
+        root = os.path.realpath(str(payload.get("root") or ""))
+        workspace_root = os.path.realpath(str(getattr(self._default_workspace, "root", "")))
+        if root and workspace_root and root != workspace_root:
+            if root.startswith(workspace_root + os.sep):
+                prefix = os.path.relpath(root, workspace_root)
+                changes = [os.path.join(prefix, path) for path in changes]
+            else:
+                # A watcher should already be workspace-scoped. Fail closed
+                # if stale metadata says otherwise instead of invalidating
+                # unrelated claim paths.
+                return
+        cache = getattr(self, "_world_states", {})
+        for world_state in list(cache.values()):
+            world_state.claims.invalidate_for_paths(changes)
+        index_coordinator = getattr(self, "_project_index_coordinator", None)
+        if index_coordinator is not None:
+            absolute_changes = [
+                os.path.join(root or workspace_root, path)
+                if path != "*"
+                else (root or workspace_root)
+                for path in changes
+            ]
+            index_coordinator.mark_stale_for_paths(absolute_changes)
+        store = getattr(self, "_world_state_store", None)
+        if store is not None:
+            try:
+                await store.invalidate_for_paths(None, changes)
+            except Exception as exc:
+                _logger.warning("durable watch claim invalidation failed: %s", exc)
 
     async def _cleanup_task_watches(self, task, result) -> None:
         registry = getattr(self, "_watch_registry", None)
@@ -2052,6 +2567,24 @@ class AthenaService:
 
     async def _cleanup_task_affordances(self, task, result) -> None:
         task_id = getattr(task, "id", None)
+        if task_id and self._external_delegate_manager is not None:
+            try:
+                await self._external_delegate_manager.close_task(task_id)
+            except Exception as exc:
+                _logger.warning(
+                    "task external delegate cleanup failed for %s: %s",
+                    task_id,
+                    exc,
+                )
+        if task_id and self._synthesis is not None:
+            try:
+                await self._synthesis.close_persistent_sessions_for_task(task_id)
+            except Exception as exc:
+                _logger.warning(
+                    "task generated runtime cleanup failed for %s: %s",
+                    task_id,
+                    exc,
+                )
         if task_id and self._fabric is not None:
             self._fabric.unregister_task(task_id)
         if task_id:
@@ -2081,20 +2614,28 @@ class AthenaService:
         """
         if not resource:
             return
+        coordinator = getattr(self, "_project_index_coordinator", None)
+        if coordinator is not None:
+            coordinator.mark_stale_for_paths([resource])
         cache = getattr(self, "_world_states", {})
         for world_state in list(cache.values()):
             if task_id is None or world_state.task_id == task_id:
                 world_state.claims.invalidate_for_paths(
-                    [resource], mutation_id=mutation_id,
+                    [resource],
+                    mutation_id=mutation_id,
                     mutation_sequence=mutation_sequence,
-                    mutation_event_sequence=mutation_event_sequence)
+                    mutation_event_sequence=mutation_event_sequence,
+                )
         store = getattr(self, "_world_state_store", None)
         if store is not None and task_id is not None:
             try:
                 await store.invalidate_for_paths(
-                    task_id, [resource], mutation_id=mutation_id,
+                    task_id,
+                    [resource],
+                    mutation_id=mutation_id,
                     mutation_sequence=mutation_sequence,
-                    mutation_event_sequence=mutation_event_sequence)
+                    mutation_event_sequence=mutation_event_sequence,
+                )
             except Exception as exc:
                 _logger.warning("durable claim invalidation failed: %s", exc)
 
@@ -2104,9 +2645,7 @@ class AthenaService:
 
         if getattr(self, "_shadow", None) is None:
             state_root = getattr(self, "_runtime_state_root", None)
-            roots_parent = (
-                os.path.join(state_root, "shadows") if state_root else None
-            )
+            roots_parent = os.path.join(state_root, "shadows") if state_root else None
             self._shadow = ShadowEngine(
                 roots_parent=roots_parent,
                 state_root=state_root,
@@ -2142,16 +2681,21 @@ class AthenaService:
     def _register_providers(self, registry: ProviderRegistry) -> None:
         pcs = tuple(self.config.providers)
         if not pcs:
-            registry.register("fake", FakeModelProvider(
-                # Keep the dependency-free default useful for local CLI smoke
-                # runs and packaged installs.  Explicit provider entries still
-                # control their own scripts; this only covers an otherwise
-                # unconfigured service.
-                scripts=list(_DEFAULT_ANSWER_SCRIPTS),
-                tool_calling=True, model="fake-1", provider="fake"))
+            registry.register(
+                "fake",
+                FakeModelProvider(
+                    # Keep the dependency-free default useful for local CLI smoke
+                    # runs and packaged installs.  Explicit provider entries still
+                    # control their own scripts; this only covers an otherwise
+                    # unconfigured service.
+                    scripts=list(_DEFAULT_ANSWER_SCRIPTS),
+                    tool_calling=True,
+                    model="fake-1",
+                    provider="fake",
+                ),
+            )
             registry.set_profile("fake", resolve_profile("fake", model_id="fake-1"))
-            registry.set_model_profile(
-                "fake", "fake-1", ModelProfile(model_pattern="fake-1"))
+            registry.set_model_profile("fake", "fake-1", ModelProfile(model_pattern="fake-1"))
             return
         provider: Any = None
         for pc in pcs:
@@ -2163,9 +2707,7 @@ class AthenaService:
                     scripts=list(pc.extra.get("scripts") or []),
                 )
                 registry.register(pc.name, provider)
-                registry.set_profile(
-                    pc.name, resolve_profile("fake", model_id=pc.model)
-                )
+                registry.set_profile(pc.name, resolve_profile("fake", model_id=pc.model))
                 registry.set_model_profile(
                     pc.name,
                     pc.model,
@@ -2179,9 +2721,7 @@ class AthenaService:
             )
             if profile.protocol in {"openai", "openai-compat"}:
                 if not profile.base_url:
-                    raise ValueError(
-                        f"provider {pc.name!r} needs an explicit base_url"
-                    )
+                    raise ValueError(f"provider {pc.name!r} needs an explicit base_url")
                 provider = OpenAICompatProvider(
                     base_url=profile.base_url,
                     api_key=self._resolve_api_key(pc),
@@ -2232,13 +2772,11 @@ class AthenaService:
                 await client.connect()
                 self._mcp_clients.append(client)
                 if self._mcp is not None:
-                    await self._mcp.collect_and_register(
-                        client, server_alias=server.name
-                    )
+                    await self._mcp.collect_and_register(client, server_alias=server.name)
             except Exception as exc:
                 _logger.warning("MCP server %s failed to connect: %s", server.name, exc)
                 # Track failed connections for visibility
-                self._mcp_connection_status = getattr(self, '_mcp_connection_status', {})
+                self._mcp_connection_status = getattr(self, "_mcp_connection_status", {})
                 self._mcp_connection_status[server.name] = f"failed: {exc}"
                 continue
 
@@ -2291,7 +2829,8 @@ def _default_model_policy():
 
 
 def _model_profile_from_config(
-    model_id: str, raw: Any,
+    model_id: str,
+    raw: Any,
 ) -> ModelProfile:
     """Build a behavioral model profile from optional provider config.
 
@@ -2304,15 +2843,20 @@ def _model_profile_from_config(
     if not isinstance(raw, Mapping):
         raise ValueError("provider model_profile must be a mapping")
     allowed = {
-        "tools_structured", "tools_parallel", "tools_textual_fallback",
-        "reasoning_native", "empty_content_with_tools",
-        "requires_tool_result_name", "requires_assistant_replay_fields",
-        "malformed_json_tendency", "context_window", "output_limit",
+        "tools_structured",
+        "tools_parallel",
+        "tools_textual_fallback",
+        "reasoning_native",
+        "empty_content_with_tools",
+        "requires_tool_result_name",
+        "requires_assistant_replay_fields",
+        "malformed_json_tendency",
+        "context_window",
+        "output_limit",
     }
     unknown = set(raw) - allowed
     if unknown:
-        raise ValueError(
-            "unknown model_profile fields: " + ", ".join(sorted(unknown)))
+        raise ValueError("unknown model_profile fields: " + ", ".join(sorted(unknown)))
     return ModelProfile(model_pattern=model_id, **dict(raw))
 
 
@@ -2367,24 +2911,40 @@ def _decode_map_rows(raw, kind: str):
 
     if kind == "ContextRef":
         return tuple(
-            ContextRef(kind=i.get("kind", "session"), ref=i.get("ref", ""),
-                       source_id=i.get("source_id"), summary=i.get("summary"),
-                       mime_type=i.get("mime_type"))
-            for i in items if isinstance(i, dict)
+            ContextRef(
+                kind=i.get("kind", "session"),
+                ref=i.get("ref", ""),
+                source_id=i.get("source_id"),
+                summary=i.get("summary"),
+                mime_type=i.get("mime_type"),
+            )
+            for i in items
+            if isinstance(i, dict)
         )
     if kind == "ArtifactRef":
         return tuple(
-            ArtifactRef(id=i.get("id", ""), uri=i.get("uri", ""), hash=i.get("hash"),
-                        mime_type=i.get("mime_type"), size=i.get("size"),
-                        producer=i.get("producer"), task_id=i.get("task_id"),
-                        metadata=i.get("metadata") or {})
-            for i in items if isinstance(i, dict)
+            ArtifactRef(
+                id=i.get("id", ""),
+                uri=i.get("uri", ""),
+                hash=i.get("hash"),
+                mime_type=i.get("mime_type"),
+                size=i.get("size"),
+                producer=i.get("producer"),
+                task_id=i.get("task_id"),
+                metadata=i.get("metadata") or {},
+            )
+            for i in items
+            if isinstance(i, dict)
         )
     if kind == "MutationRef":
         return tuple(
-            MutationRef(id=i.get("id", ""), resource=i.get("resource", ""),
-                        operation=i.get("operation", ""),
-                        reversible=bool(i.get("reversible", False)))
-            for i in items if isinstance(i, dict)
+            MutationRef(
+                id=i.get("id", ""),
+                resource=i.get("resource", ""),
+                operation=i.get("operation", ""),
+                reversible=bool(i.get("reversible", False)),
+            )
+            for i in items
+            if isinstance(i, dict)
         )
     return ()

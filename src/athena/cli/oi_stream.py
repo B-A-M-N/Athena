@@ -34,6 +34,7 @@ _DIM = "\x1b[2m"
 _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
 
+
 class OIStreamViewer:
     """Full-pane OI window: raw stream + mascot header + inline approvals."""
 
@@ -58,14 +59,14 @@ class OIStreamViewer:
         self._input_fn = input_fn
         character = resolve_mascot_name(mascot)
         self.mascot_enabled = character not in _MASCOT_OFF
-        self.mascot = Mascot(
-            character=character if self.mascot_enabled else "owl"
-        )
+        self.mascot = Mascot(character=character if self.mascot_enabled else "owl")
         self._handled_approvals: set[str] = set()
         self._last_policy_reason = ""
         self._last_target = ""
         self.projection = ProjectionState(stream=deque(maxlen=max_lines))
-        self.scene = build_oi_scene(self.projection, Rect(0, 0, 80, 24))
+        self.scene = build_oi_scene(
+            self.projection, Rect(0, 0, 80, 24), character=self.mascot.character
+        )
         self.prompt = PromptController(input_fn=input_fn, output=self.output)
         self._renderer = CellGridDiffRenderer(self.output)
         self._terminal_session = TerminalSession(
@@ -132,7 +133,12 @@ class OIStreamViewer:
         scopes = [str(s) for s in payload.get("scopes") or ()] or ["call"]
         aid = payload.get("approval_id")
         cap = payload.get("capability_id") or "capability"
-        target = payload.get("target") or payload.get("resource") or payload.get("path") or self._last_target
+        target = (
+            payload.get("target")
+            or payload.get("resource")
+            or payload.get("path")
+            or self._last_target
+        )
         reason = payload.get("reason") or payload.get("policy_reason") or self._last_policy_reason
         self._write(f"\n{_BOLD}APPROVAL REQUIRED{_RESET}  capability={cap}  id={aid}")
         if target:
@@ -165,7 +171,11 @@ class OIStreamViewer:
             _, height = shutil.get_terminal_size((80, 24))
         width, _ = shutil.get_terminal_size((80, max(height, 1)))
         width = max(width, 40)
-        self.scene = build_oi_scene(self.projection, Rect(0, 0, width, max(height, 1)))
+        self.scene = build_oi_scene(
+            self.projection,
+            Rect(0, 0, width, max(height, 1)),
+            character=self.mascot.character,
+        )
         m = self.mascot.render(max_width=30) if self.mascot_enabled else []
         state = self.projection.status
         lines = [f"{_BOLD}╭─ OI LIVE ─ state: {state} ─ {'─' * 20}{_RESET}"]
@@ -268,9 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     async def _runner():
         await service.start()
         try:
-            return await run_viewer(
-                service, task_id, mascot=getattr(config, "mascot", None)
-            )
+            return await run_viewer(service, task_id, mascot=getattr(config, "mascot", None))
         finally:
             await service.stop()
 

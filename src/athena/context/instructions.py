@@ -22,13 +22,13 @@ from athena.context.provenance import prov
 
 # Highest authority first (BHV-031, §57, RESEARCHSPEC "Context precedence").
 INSTRUCTION_ORDER: tuple[str, ...] = (
-    "runtime_safety_policy",      # authority
+    "runtime_safety_policy",  # authority
     "explicit_user_instruction",  # user_content
-    "project_instruction",        # configured_instruction (AGENTS.md)
+    "project_instruction",  # configured_instruction (AGENTS.md)
     "established_session_instruction",  # user_content, session scope
-    "activated_skill",            # agent_curated
-    "retrieved_context",          # external_content
-    "untrusted_text",             # untrusted
+    "activated_skill",  # agent_curated
+    "retrieved_context",  # external_content
+    "untrusted_text",  # untrusted
 )
 
 # Instruction source -> StrEnum trust class.

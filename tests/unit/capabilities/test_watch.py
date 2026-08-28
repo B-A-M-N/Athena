@@ -29,8 +29,12 @@ def test_file_watch_reports_bounded_scan_degradation(tmp_path):
     (tmp_path / "a.txt").write_text("a", encoding="utf-8")
     (tmp_path / "b.txt").write_text("b", encoding="utf-8")
     watcher = _FileWatch(
-        "watch-1", str(tmp_path), "*.txt", "task-1",
-        max_files=1, max_bytes_per_poll=1,
+        "watch-1",
+        str(tmp_path),
+        "*.txt",
+        "task-1",
+        max_files=1,
+        max_bytes_per_poll=1,
     )
 
     assert watcher.degraded is True
@@ -57,27 +61,55 @@ async def test_process_exit_observation_is_one_shot_and_truthful(monkeypatch):
         observations.append((event_type, payload, task_id))
 
     assert await registry.poll_all(sink) == 1
-    assert observations == [(
-        "WatchObserved",
-        {
-            "watch": "watch-1",
-            "kind": "process",
-            "pid": 123,
-            "exited": True,
-            "exit_code": None,
-        },
-        "task-1",
-    )]
+    assert observations == [
+        (
+            "WatchObserved",
+            {
+                "watch": "watch-1",
+                "kind": "process",
+                "pid": 123,
+                "exited": True,
+                "exit_code": None,
+            },
+            "task-1",
+        )
+    ]
     assert await registry.poll_all(sink) == 0
+
+
+@pytest.mark.asyncio
+async def test_file_watch_observation_includes_root_for_relative_changes(tmp_path):
+    path = tmp_path / "state.txt"
+    path.write_text("before", encoding="utf-8")
+    registry = WatchRegistry()
+    watch_id = registry.add_file(
+        root=str(tmp_path),
+        pattern="*.txt",
+        task_id="task-1",
+    )
+    path.write_text("after", encoding="utf-8")
+    observations = []
+
+    async def sink(event_type, payload, *, task_id):
+        observations.append((event_type, payload, task_id))
+
+    assert await registry.poll_all(sink) == 1
+    assert observations[0][1]["watch"] == watch_id
+    assert observations[0][1]["root"] == str(tmp_path)
+    assert observations[0][1]["changes"] == ["state.txt"]
 
 
 @pytest.mark.asyncio
 async def test_watch_path_pattern_and_task_cleanup(tmp_path):
     registry = WatchRegistry()
     capability = WatchCapability(registry)
-    context = type("Context", (), {
-        "workspace": WorkspaceSpec(id="workspace", root=str(tmp_path)),
-    })()
+    context = type(
+        "Context",
+        (),
+        {
+            "workspace": WorkspaceSpec(id="workspace", root=str(tmp_path)),
+        },
+    )()
     request = CapabilityRequest(
         capability_id="watch",
         arguments={"operation": "file", "pattern": "*.json"},
@@ -118,21 +150,25 @@ async def test_process_watch_requires_execution_ownership(monkeypatch):
 @pytest.mark.asyncio
 async def test_stopping_unknown_watch_is_a_failure():
     capability = WatchCapability()
-    result = await capability.invoke(CapabilityRequest(
-        capability_id="watch", task_id="task-1", call_id="watch-stop",
-        arguments={"operation": "stop", "watch_id": "missing"},
-    ))
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="watch",
+            task_id="task-1",
+            call_id="watch-stop",
+            arguments={"operation": "stop", "watch_id": "missing"},
+        )
+    )
 
     assert result.status is CapabilityResultStatus.FAILED
 
 
 def test_watch_registry_close_drops_all_subscriptions(tmp_path):
     registry = WatchRegistry()
-    registry.file_watches["file"] = _FileWatch(
-        "file", str(tmp_path), "*", "task-1"
-    )
+    registry.file_watches["file"] = _FileWatch("file", str(tmp_path), "*", "task-1")
     registry.process_watches["process"] = {
-        "id": "process", "task_id": "task-1", "pid": 1,
+        "id": "process",
+        "task_id": "task-1",
+        "pid": 1,
         "start_identity": "1",
     }
 

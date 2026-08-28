@@ -27,12 +27,15 @@ from athena.protocol.tasks import TaskSpec
 
 def _response():
     return ModelResponse(
-        request_id="turn-1", model="model-1", provider="provider-1",
+        request_id="turn-1",
+        model="model-1",
+        provider="provider-1",
         blocks=(
             ReasoningBlock(text="I need to inspect the file."),
             TextBlock(text="I'll inspect that."),
             CapabilityCallBlock(
-                call_id="tool-1", capability_id="fs.read",
+                call_id="tool-1",
+                capability_id="fs.read",
                 arguments={"path": "README.md"},
             ),
         ),
@@ -45,7 +48,9 @@ def test_assistant_message_preserves_reasoning_text_and_calls():
         _response(),
     )
     assert [type(block) for block in message.blocks] == [
-        ReasoningBlock, TextBlock, CapabilityCallBlock,
+        ReasoningBlock,
+        TextBlock,
+        CapabilityCallBlock,
     ]
     assert message.blocks[-1].call_id == "tool-1"
 
@@ -57,14 +62,23 @@ def test_openai_and_anthropic_replay_preserve_mixed_assistant_turn():
         _response(),
     )
     result = Message(
-        id="result-1", role=Role.CAPABILITY,
-        blocks=(CapabilityResultBlock(
-            call_id="tool-1", capability_id="fs.read", output="184 passed, 2 failed",
-        ),),
-        created_at=None, provenance=None,
+        id="result-1",
+        role=Role.CAPABILITY,
+        blocks=(
+            CapabilityResultBlock(
+                call_id="tool-1",
+                capability_id="fs.read",
+                output="184 passed, 2 failed",
+            ),
+        ),
+        created_at=None,
+        provenance=None,
     )
     openai = OpenAICompatProvider(
-        base_url="https://fake.invalid", api_key="key", model="m", provider="oai",
+        base_url="https://fake.invalid",
+        api_key="key",
+        model="m",
+        provider="oai",
     )
     oai_assistant = openai._translate_message(assistant)
     oai_result = openai._translate_message(result)
@@ -75,19 +89,21 @@ def test_openai_and_anthropic_replay_preserve_mixed_assistant_turn():
     anthropic = AnthropicProvider(api_key="key", use_sdk=False)
     anthropic_messages = anthropic._translate_messages(
         ModelRequest(
-            messages=(assistant, result), model="m", provider="anthropic",
+            messages=(assistant, result),
+            model="m",
+            provider="anthropic",
             request_id="request-1",
         )
     )
     assert anthropic_messages[0]["role"] == "assistant"
     assert [part["type"] for part in anthropic_messages[0]["content"]] == [
-        "text", "text", "tool_use",
+        "text",
+        "text",
+        "tool_use",
     ]
     assert anthropic_messages[0]["content"][-1]["id"] == "tool-1"
     assert anthropic_messages[1]["content"][0]["tool_use_id"] == "tool-1"
-    assert anthropic_messages[1]["content"][0]["content"][0]["text"] == (
-        "184 passed, 2 failed"
-    )
+    assert anthropic_messages[1]["content"][0]["content"][0]["text"] == ("184 passed, 2 failed")
 
 
 @pytest.mark.asyncio
@@ -95,23 +111,28 @@ async def test_kernel_stream_assembly_keeps_text_and_tool_delta():
     class Provider:
         async def complete(self, request):
             yield ModelEvent(
-                type=ModelEventType.DELTA, request_id=request.request_id,
+                type=ModelEventType.DELTA,
+                request_id=request.request_id,
                 delta=ModelDelta(request_id=request.request_id, text="I'll inspect that."),
             )
             yield ModelEvent(
-                type=ModelEventType.DELTA, request_id=request.request_id,
+                type=ModelEventType.DELTA,
+                request_id=request.request_id,
                 delta=ModelDelta(
                     request_id=request.request_id,
                     block=CapabilityCallBlock(
-                        call_id="tool-2", capability_id="fs.read",
+                        call_id="tool-2",
+                        capability_id="fs.read",
                         arguments={"path": "README.md"},
                     ),
                 ),
             )
             yield ModelEvent(
-                type=ModelEventType.DONE, request_id=request.request_id,
+                type=ModelEventType.DONE,
+                request_id=request.request_id,
                 response=ModelResponse(
-                    request_id=request.request_id, model=request.model,
+                    request_id=request.request_id,
+                    model=request.model,
                     provider=request.provider,
                     blocks=(TextBlock(text="I'll inspect that."),),
                 ),
@@ -123,11 +144,16 @@ async def test_kernel_stream_assembly_keeps_text_and_tool_delta():
     kernel._events = None
     task = TaskSpec(id="task-1", objective="inspect")
     state = SimpleNamespace(
-        cancel=__import__("asyncio").Event(), input_tokens=0,
-        output_tokens=0, cost=0,
+        cancel=__import__("asyncio").Event(),
+        input_tokens=0,
+        output_tokens=0,
+        cost=0,
     )
     request = ModelRequest(
-        messages=(), model="m", provider="p", request_id="request-1",
+        messages=(),
+        model="m",
+        provider="p",
+        request_id="request-1",
     )
     response = await kernel._consume(task, state, Provider(), request)
     assert any(isinstance(block, TextBlock) for block in response.blocks)

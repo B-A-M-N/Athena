@@ -36,7 +36,8 @@ class DependencyCapability:
             "free-form package manager command. Operations: inspect/resolve/install."
         ),
         input_schema={
-            "type": "object", "required": ["operation", "name"],
+            "type": "object",
+            "required": ["operation", "name"],
             "properties": {
                 "operation": {"type": "string", "enum": ["inspect", "resolve", "install"]},
                 "name": {"type": "string", "minLength": 1, "maxLength": 128},
@@ -45,11 +46,15 @@ class DependencyCapability:
             },
             "additionalProperties": False,
         },
-        effects=frozenset({
-            EffectClass.READ_LOCAL, EffectClass.EXECUTE,
-            EffectClass.SPAWN_PROCESS, EffectClass.WRITE_LOCAL,
-            EffectClass.NETWORK_WRITE,
-        }),
+        effects=frozenset(
+            {
+                EffectClass.READ_LOCAL,
+                EffectClass.EXECUTE,
+                EffectClass.SPAWN_PROCESS,
+                EffectClass.WRITE_LOCAL,
+                EffectClass.NETWORK_WRITE,
+            }
+        ),
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -68,7 +73,9 @@ class DependencyCapability:
         if operation in {"inspect", "resolve"}:
             lock = _read_lock(context)
             record = lock.get("packages", {}).get(name) if lock else None
-            found = record is not None or importlib.util.find_spec(name.replace("-", "_")) is not None
+            found = (
+                record is not None or importlib.util.find_spec(name.replace("-", "_")) is not None
+            )
             metadata = {"name": name, "installed": found}
             if record:
                 metadata["lock"] = record
@@ -79,7 +86,9 @@ class DependencyCapability:
         if operation != "install":
             return _result(request, ok=False, error=f"unknown operation: {operation}")
         if self._execution is None or context is None:
-            return _result(request, ok=False, error="dependency install requires execution workspace")
+            return _result(
+                request, ok=False, error="dependency install requires execution workspace"
+            )
         root = context.workspace.root
         target = f"{root}/.athena/dependencies"
         version = str(args.get("version") or "")
@@ -91,20 +100,28 @@ class DependencyCapability:
             f"python -m pip install --disable-pip-version-check --no-input "
             f"--target {target!r} {package!r}"
         )
-        result = await self._execution.execute(ExecutionRequest(
-            runtime="shell", source=source, task_id=request.task_id or "dependency",
-            workspace_id=context.workspace.id, cwd=root,
-            network_policy=context.workspace.network_policy,
-            workspace_root=root,
-        ))
+        result = await self._execution.execute(
+            ExecutionRequest(
+                runtime="shell",
+                source=source,
+                task_id=request.task_id or "dependency",
+                workspace_id=context.workspace.id,
+                cwd=root,
+                network_policy=context.workspace.network_policy,
+                workspace_root=root,
+            )
+        )
         ok = result.exit_code == 0
         lock_record = None
         lock_error = None
         if ok:
             try:
                 lock_record = _record_installed_package(
-                    target, name=name, requested_version=version,
-                    task_id=request.task_id or "dependency", call_id=request.call_id,
+                    target,
+                    name=name,
+                    requested_version=version,
+                    task_id=request.task_id or "dependency",
+                    call_id=request.call_id,
                 )
                 _write_lock(context, lock_record)
             except (OSError, TypeError, ValueError) as exc:
@@ -113,10 +130,18 @@ class DependencyCapability:
                 # successful Athena dependency operation.
                 lock_error = f"dependency installed but lock recording failed: {exc}"
                 ok = False
-        return _result(request, ok=ok, output=result.stdout,
-                       error=None if ok else lock_error or result.stderr or "dependency install failed",
-                       metadata={"exit_code": result.exit_code, "package": package,
-                                 "target": target, **({"lock": lock_record} if lock_record else {})})
+        return _result(
+            request,
+            ok=ok,
+            output=result.stdout,
+            error=None if ok else lock_error or result.stderr or "dependency install failed",
+            metadata={
+                "exit_code": result.exit_code,
+                "package": package,
+                "target": target,
+                **({"lock": lock_record} if lock_record else {}),
+            },
+        )
 
 
 def _lock_path(context) -> Path:
@@ -135,16 +160,20 @@ def _read_lock(context) -> dict:
 
 
 def _record_installed_package(
-    target: str, *, name: str, requested_version: str,
-    task_id: str, call_id: str,
+    target: str,
+    *,
+    name: str,
+    requested_version: str,
+    task_id: str,
+    call_id: str,
 ) -> dict:
     """Build a lock record from the installed distribution's own metadata."""
     normalized = name.replace("-", "_").casefold()
     distribution = next(
         (
-            candidate for candidate in importlib.metadata.distributions(path=[target])
-            if str(candidate.metadata.get("Name") or "")
-            .replace("-", "_").casefold() == normalized
+            candidate
+            for candidate in importlib.metadata.distributions(path=[target])
+            if str(candidate.metadata.get("Name") or "").replace("-", "_").casefold() == normalized
         ),
         None,
     )
@@ -171,11 +200,15 @@ def _record_installed_package(
         "owner": {"task_id": task_id, "call_id": call_id},
         "recorded_at": utcnow().isoformat(),
     }
-    record["environment_fingerprint"] = environment_fingerprint(({
-        "name": name,
-        "resolved_version": resolved_version,
-        "record_hashes": hashes,
-    },))
+    record["environment_fingerprint"] = environment_fingerprint(
+        (
+            {
+                "name": name,
+                "resolved_version": resolved_version,
+                "record_hashes": hashes,
+            },
+        )
+    )
     return record
 
 
@@ -203,9 +236,12 @@ def _write_lock(context, record: dict) -> None:
 
 def _result(request, *, ok=True, output="", error=None, metadata=None):
     return CapabilityResult(
-        request.call_id, request.capability_id,
+        request.call_id,
+        request.capability_id,
         CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED,
-        output=output, error=error, metadata=dict(metadata or {}),
+        output=output,
+        error=error,
+        metadata=dict(metadata or {}),
     )
 
 

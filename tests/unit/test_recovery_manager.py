@@ -27,14 +27,16 @@ async def test_runtime_restart_emits_explicit_state_loss_event():
     )
 
     assert await manager._recover_runtime_sessions() == 1
-    assert events.calls == [(
+    assert events.calls == [
         (
-            "RuntimeStateLost",
-            {
-                "runtime_session_id": "runtime-1",
-                "backend": "python",
-                "reason": "Athena restarted without a reattachable runtime process",
-            },
-        ),
-        {"task_id": "task-1"},
-    )]
+            (
+                "RuntimeStateLost",
+                {
+                    "runtime_session_id": "runtime-1",
+                    "backend": "python",
+                    "reason": "Athena restarted without a reattachable runtime process",
+                },
+            ),
+            {"task_id": "task-1"},
+        )
+    ]

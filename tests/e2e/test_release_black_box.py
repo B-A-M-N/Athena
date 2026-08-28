@@ -6,6 +6,7 @@ installed CLI, and runs the same canonical Task through the service, HTTP/SSE,
 ACP, approval, cancellation, persistence, policy, execution, and artifact
 paths.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -52,18 +53,27 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
         subprocess.run(
             [
                 sys.executable,
-                "-m", "venv", str(prefix),
+                "-m",
+                "venv",
+                str(prefix),
             ],
             cwd=tmp_path,
             check=True,
         )
         venv_python = prefix / "bin" / "python"
+        install_env = os.environ.copy()
+        install_env.pop("PYTHONPATH", None)
+        install_env.pop("PYTHONHOME", None)
         subprocess.run(
             [
                 str(venv_python),
-                "-m", "pip", "install", f"{artifact}[api,cli]",
+                "-m",
+                "pip",
+                "install",
+                f"{artifact}[api,cli]",
             ],
             cwd=tmp_path,
+            env=install_env,
             check=True,
         )
         purelib = _installed_purelib(prefix)
@@ -90,7 +100,14 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
         cli_workspace = tmp_path / f"{artifact.stem}.cli-workspace"
         cli_workspace.mkdir()
         cli_sessions = subprocess.run(
-            [str(cli), "--db", str(tmp_path / f"{artifact.stem}.cli.db"), "--workspace", str(cli_workspace), "sessions"],
+            [
+                str(cli),
+                "--db",
+                str(tmp_path / f"{artifact.stem}.cli.db"),
+                "--workspace",
+                str(cli_workspace),
+                "sessions",
+            ],
             cwd=tmp_path,
             env=env,
             check=False,
@@ -102,9 +119,12 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
         cli_task = subprocess.run(
             [
                 str(cli),
-                "--db", str(tmp_path / f"{artifact.stem}.cli-task.db"),
-                "--workspace", str(cli_workspace),
-                "run", "2+2",
+                "--db",
+                str(tmp_path / f"{artifact.stem}.cli-task.db"),
+                "--workspace",
+                str(cli_workspace),
+                "run",
+                "2+2",
             ],
             cwd=tmp_path,
             env=env,
@@ -556,7 +576,7 @@ def _installed_acceptance_program() -> str:
 def _installed_api_server_program() -> str:
     """Return a child process that serves the installed API over uvicorn."""
     return textwrap.dedent(
-        r'''
+        r"""
         import asyncio
         import sys
 
@@ -586,5 +606,5 @@ def _installed_api_server_program() -> str:
                 await service.stop()
 
         asyncio.run(main())
-        '''
+        """
     )

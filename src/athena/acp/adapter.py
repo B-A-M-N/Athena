@@ -197,14 +197,18 @@ class ACPAdapter:
         )
         await self.task_manager.create(spec)
         await self.task_manager.enqueue(spec.id)
-        return self._event(EV_TASK_ACCEPTED, spec.id, {"task_id": spec.id, "session_id": session_id})
+        return self._event(
+            EV_TASK_ACCEPTED, spec.id, {"task_id": spec.id, "session_id": session_id}
+        )
 
     # ------------------------------------------------------------------ #
     # Outbound: Athena Task/Event -> ACP envelope
     # ------------------------------------------------------------------ #
     def task_event_to_acp(self, task: Any, status: Any) -> ACPEvent:
         """Map an Athena task/event to an ACP event envelope."""
-        status_str = getattr(status, "value", getattr(status, "name", None)) if status is not None else None
+        status_str = (
+            getattr(status, "value", getattr(status, "name", None)) if status is not None else None
+        )
         type_ = _STATUS_TO_ACP_ENV.get(status_str or "", EV_TASK_STARTED)
         task_id = _task_id_of(task)
         payload: dict[str, Any] = {"task_id": task_id}
@@ -279,7 +283,9 @@ class ACPAdapter:
         if self.sessions is None:
             raise RuntimeError("no session service configured for ACP")
         session_id = new_id("session")
-        await self.sessions.create(session_id, parent_id=request.parent_session_id, metadata={"origin": "acp"})
+        await self.sessions.create(
+            session_id, parent_id=request.parent_session_id, metadata={"origin": "acp"}
+        )
         return session_id
 
     async def _session_id_for_task(self, task_id: str) -> str | None:
@@ -356,11 +362,7 @@ def _event_from_athena_event(ev: Any, task_id: str) -> ACPEvent:
     """Map an Athena Event onto an ACP lifecycle envelope."""
     ev_type = str(getattr(ev, "type", "") or "")
     if ev_type in _TERMINAL_EVENT_TYPES:
-        type_ = (
-            EV_TASK_FINISHED
-            if ev_type in ("TaskCompleted", "TaskPartial")
-            else EV_TASK_ERROR
-        )
+        type_ = EV_TASK_FINISHED if ev_type in ("TaskCompleted", "TaskPartial") else EV_TASK_ERROR
     elif ev_type in ("TaskStarted", "TaskQueued"):
         type_ = EV_TASK_STARTED
     else:

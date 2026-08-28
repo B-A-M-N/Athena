@@ -23,9 +23,7 @@ _EXECUTION_MARKERS = (
 )
 
 _OBJECTIVE_TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{1,}")
-_PROCESS_RE = re.compile(
-    r"(?is)(^|\n)\s*(steps?|procedure|recipe|how to|reusable|repeat)\b"
-)
+_PROCESS_RE = re.compile(r"(?is)(^|\n)\s*(steps?|procedure|recipe|how to|reusable|repeat)\b")
 
 
 def _transcript_text(items: Sequence[Any]) -> str:

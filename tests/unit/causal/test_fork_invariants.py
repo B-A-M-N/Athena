@@ -95,8 +95,7 @@ async def test_fork_prefix_digest_binds_to_event_prefix(svc):
     assert _digest(row1) == _digest(row2)
 
     # Parent timeline grows after the forks were taken...
-    await svc._store_events.append_event(
-        "TASK_NOTE", {"note": "post-fork"}, task_id=task.id)
+    await svc._store_events.append_event("TASK_NOTE", {"note": "post-fork"}, task_id=task.id)
     # ...but the digest at the OLD boundary is unchanged (prefix, not tip).
     fork3 = await forker.fork(task_id=task.id, after_event_sequence=last)
     row3 = await svc._store_tasks.get(fork3["fork_id"])
@@ -114,8 +113,7 @@ async def test_fork_never_mutates_parent_task_or_event_log(svc):
     parent_before = await svc._store_tasks.get(task.id)
     last = await svc._store_events.last_sequence(task.id)
 
-    fork = await TaskForker(service=svc).fork(
-        task_id=task.id, after_event_sequence=last)
+    fork = await TaskForker(service=svc).fork(task_id=task.id, after_event_sequence=last)
 
     assert await svc._store_events.list_for_task(task.id) == events_before
     assert await svc._store_tasks.get(task.id) == parent_before
@@ -139,12 +137,15 @@ async def test_fork_transcript_excludes_messages_after_boundary(svc):
 
     def _message(text, when):
         return Message(
-            id=new_id("msg"), role=Role.USER,
-            blocks=(TextBlock(text=text),), created_at=when,
+            id=new_id("msg"),
+            role=Role.USER,
+            blocks=(TextBlock(text=text),),
+            created_at=when,
             # NOTE: ``trust`` must stay the default TrustClass member. The
             # serializer (state/sessions.py:187) calls ``.value`` on it, so
             # a plain str value would crash the append (see report).
-            provenance=Provenance(source_type=SourceType.USER))
+            provenance=Provenance(source_type=SourceType.USER),
+        )
 
     boundary_ts = first.timestamp
     early = _message("early-message", boundary_ts - timedelta(seconds=1))
@@ -152,20 +153,18 @@ async def test_fork_transcript_excludes_messages_after_boundary(svc):
     await svc._store_messages.append_to_session(parent_session, early)
     await svc._store_messages.append_to_session(parent_session, late)
 
-    fork = await TaskForker(service=svc).fork(
-        task_id=task.id, after_event_sequence=first.sequence)
-    fork_session = (await svc._store_tasks.get(fork["fork_id"]))[
-        "metadata"]["fork_session_id"]
+    fork = await TaskForker(service=svc).fork(task_id=task.id, after_event_sequence=first.sequence)
+    fork_session = (await svc._store_tasks.get(fork["fork_id"]))["metadata"]["fork_session_id"]
     msgs = await svc._store_messages.list_session_messages(fork_session)
     texts = [b.text for m in msgs for b in m.blocks if hasattr(b, "text")]
 
     assert "early-message" in texts, "message before the boundary is copied"
     assert "late-message" not in texts, (
-        "message created after the boundary event must never be copied")
+        "message created after the boundary event must never be copied"
+    )
 
     # The copy is auditable: new id, source message linked.
-    cloned = next(m for m in msgs if "early-message" in getattr(
-        m.blocks[0], "text", ""))
+    cloned = next(m for m in msgs if "early-message" in getattr(m.blocks[0], "text", ""))
     assert cloned.id != early.id
     assert cloned.metadata["causal_fork_source_message"] == early.id
     assert cloned.metadata["causal_fork_source_session"] == parent_session
@@ -180,22 +179,30 @@ async def test_consumed_call_approval_does_not_transfer_to_fork(svc):
     principal = Principal("agent", "athena")
     arguments = {"operation": "read", "path": "a.txt"}
     approval_id = manager.create_request(
-        principal, ApprovalScope.CALL, capability="fs",
-        task_id=task.id, args_digest=args_digest(arguments),
-        call_id="call-parent")
+        principal,
+        ApprovalScope.CALL,
+        capability="fs",
+        task_id=task.id,
+        args_digest=args_digest(arguments),
+        call_id="call-parent",
+    )
     manager.grant(approval_id)
 
     last = await svc._store_events.last_sequence(task.id)
-    fork = await TaskForker(service=svc).fork(
-        task_id=task.id, after_event_sequence=last)
+    fork = await TaskForker(service=svc).fork(task_id=task.id, after_event_sequence=last)
     fork_id = fork["fork_id"]
 
     def _request(task_id, call_id):
         return PolicyRequest(
-            principal=principal, task_id=task_id, capability_id="fs",
-            arguments=dict(arguments), workspace=WorkspaceSpec(id="w", root="/tmp"),
+            principal=principal,
+            task_id=task_id,
+            capability_id="fs",
+            arguments=dict(arguments),
+            workspace=WorkspaceSpec(id="w", root="/tmp"),
             execution_backend="local",
-            effects=frozenset({EffectClass.READ_LOCAL}), call_id=call_id)
+            effects=frozenset({EffectClass.READ_LOCAL}),
+            call_id=call_id,
+        )
 
     # The fork task cannot use the parent's (still unconsumed) grant:
     # grant task binding refuses the transfer.
@@ -211,7 +218,8 @@ async def test_consumed_call_approval_does_not_transfer_to_fork(svc):
     # the fork starts with a clean approval ledger.
     durable = svc._store_approvals
     dur_id = await durable.create_request(
-        task_id=task.id, capability_id="fs", arguments=dict(arguments))
+        task_id=task.id, capability_id="fs", arguments=dict(arguments)
+    )
     await durable.record_grant(dur_id, resolver="user", scope="call")
     assert await durable.list_for_task(fork_id) == []
     parent_rows = await durable.list_for_task(task.id)
@@ -220,12 +228,10 @@ async def test_consumed_call_approval_does_not_transfer_to_fork(svc):
     assert granted[0]["status"] == "GRANTED"
 
 
-async def test_fork_checkpoint_materialize_failure_leaves_no_trace(
-        svc, tmp_path, monkeypatch):
+async def test_fork_checkpoint_materialize_failure_leaves_no_trace(svc, tmp_path, monkeypatch):
     ws = WorkspaceSpec(id="w", root=str(tmp_path / "ws"))
     (Path(ws.root)).mkdir(parents=True, exist_ok=True)
-    task = await svc.submit(AgentRequest(prompt="ckpt-fail", workspace=ws),
-                            wait=True)
+    task = await svc.submit(AgentRequest(prompt="ckpt-fail", workspace=ws), wait=True)
 
     created_dirs: list[str] = []
     original_mkdtemp = tempfile.mkdtemp
@@ -250,7 +256,8 @@ async def test_fork_checkpoint_materialize_failure_leaves_no_trace(
         await TaskForker(service=svc, checkpoint_manager=mgr).fork(
             task_id=task.id,
             after_event_sequence=await svc._store_events.last_sequence(task.id),
-            workspace_checkpoint_id="ckpt_broken")
+            workspace_checkpoint_id="ckpt_broken",
+        )
 
     # The speculative fork workspace was removed...
     assert created_dirs, "fork attempted to create a fork workspace"

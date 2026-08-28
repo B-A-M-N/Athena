@@ -24,6 +24,7 @@ from collections import deque
 from typing import Any, Mapping
 
 from athena.cli.animation import AnimationClock, OIAnimator
+from athena.cli.activity import VisualActionKind, classify_event
 from athena.cli.framebuffer import OIFrameBuffer, pillow_available
 from athena.cli.input import PromptController
 from athena.cli.layout import compute_layout
@@ -112,10 +113,24 @@ class Mascot:
     # otherwise the nearest built-in frame is used while the textual state
     # remains truthful.
     STATES = (
-        "idle", "listening", "thinking", "responding", "inspecting",
-        "searching", "reading", "coding", "tools", "executing", "waiting",
-        "approval", "delegated", "success", "warning", "failure",
-        "interrupted", "recovering",
+        "idle",
+        "listening",
+        "thinking",
+        "responding",
+        "inspecting",
+        "searching",
+        "reading",
+        "coding",
+        "tools",
+        "executing",
+        "waiting",
+        "approval",
+        "delegated",
+        "success",
+        "warning",
+        "failure",
+        "interrupted",
+        "recovering",
     )
     _FRAME_FALLBACKS = {
         "listening": "idle",
@@ -167,7 +182,7 @@ class Mascot:
       ║ ◎ ≈ ◎║ ~ ∿∿
       ║  ‗‗  ║  ∿∿∿  forming…
       ╚══════╝   ⚡
-      """
+      """,
         ),
         "executing": (
             r"""
@@ -382,8 +397,8 @@ class Mascot:
             self._register_characters()
         self.character = character if character in self.CHARACTERS else "owl"
         self.state = "idle"
-        self.object = ""       # carried activity object, e.g. "[>]"
-        self.speech = ""       # short deterministic operational line
+        self.object = ""  # carried activity object, e.g. "[>]"
+        self.speech = ""  # short deterministic operational line
         self._frame = 0
         self._phase = 0.0
 
@@ -410,13 +425,21 @@ class Mascot:
         elif event_type in {"ContextBuildStarted", "ContextBuilt"}:
             self.state, self.object = "inspecting", "[?]"
         elif event_type == "ContextCompressed":
-            self.state, self.object, self.speech = "inspecting", "[?]", "Keeping the thread compact."
+            self.state, self.object, self.speech = (
+                "inspecting",
+                "[?]",
+                "Keeping the thread compact.",
+            )
         elif event_type in {"ModelRequestStarted", "ModelReasoningDelta"}:
             self.state, self.object, self.speech = "thinking", "", "Thinking…"
         elif event_type == "ModelDelta":
             self.state, self.object, self.speech = "responding", "", ""
         elif event_type == "ModelRequestFailed":
-            self.state, self.object, self.speech = "failure", self.OBJ_FAIL, "The model needs attention."
+            self.state, self.object, self.speech = (
+                "failure",
+                self.OBJ_FAIL,
+                "The model needs attention.",
+            )
         elif event_type == "ModelResponseCompleted":
             self.state, self.speech = "tools" if payload.get("tool_calls") else "responding", ""
         elif event_type in {"SearchStarted", "ResearchStarted"}:
@@ -424,9 +447,34 @@ class Mascot:
         elif event_type in {"FileRead", "InspectionStarted"}:
             self.state, self.object = "reading", self.OBJ_ARTIFACT
         elif event_type == "CapabilityRequested":
-            capability = str(payload.get("capability_id") or "")
-            self.state = "coding" if capability in {"execute", "tools.execute", "computer.execute"} else "tools"
-            self.object = self.OBJ_CODE
+            action = classify_event(event_type, payload)
+            state_by_action = {
+                VisualActionKind.CODE: "coding",
+                # Keep direct execution's established mascot choreography,
+                # while the shared classifier distinguishes tests/verification
+                # for the OI and native surfaces.
+                VisualActionKind.EXECUTE: "coding",
+                VisualActionKind.TEST: "executing",
+                VisualActionKind.VERIFY: "tools",
+                VisualActionKind.READ: "reading",
+                VisualActionKind.INSPECT: "inspecting",
+                VisualActionKind.SEARCH: "searching",
+                VisualActionKind.GENERATE: "tools",
+                VisualActionKind.APPROVAL: "approval",
+                VisualActionKind.FAILURE: "failure",
+                VisualActionKind.RECOVER: "recovering",
+            }
+            self.state = state_by_action.get(action, "tools")
+            self.object = (
+                self.OBJ_TERMINAL
+                if action in {VisualActionKind.EXECUTE, VisualActionKind.TEST}
+                else self.OBJ_VERIFY
+                if action is VisualActionKind.VERIFY
+                else self.OBJ_ARTIFACT
+                if action
+                in {VisualActionKind.READ, VisualActionKind.INSPECT, VisualActionKind.SEARCH}
+                else self.OBJ_CODE
+            )
             self.speech = ""
         elif event_type == "CapabilityValidated":
             self.state, self.object = "tools", self.OBJ_CODE
@@ -436,7 +484,13 @@ class Mascot:
                 self.state, self.object = "warning", self.OBJ_FAIL
             else:
                 self.state, self.object = "tools", self.OBJ_CODE
-        elif event_type in {"CapabilityStarted", "CapabilityProgress", "ExecutionStarted", "StdoutChunk", "StderrChunk"}:
+        elif event_type in {
+            "CapabilityStarted",
+            "CapabilityProgress",
+            "ExecutionStarted",
+            "StdoutChunk",
+            "StderrChunk",
+        }:
             self.state, self.object, self.speech = "executing", self.OBJ_TERMINAL, ""
         elif event_type == "ApprovalRequested":
             self.state, self.object, self.speech = "approval", self.OBJ_APPROVAL, "Waiting on you."
@@ -446,25 +500,89 @@ class Mascot:
                 self.state, self.object, self.speech = "warning", self.OBJ_FAIL, "Approval denied."
             else:
                 self.state, self.object, self.speech = "executing", self.OBJ_TERMINAL, ""
+        elif event_type == "VerificationStarted":
+            self.state, self.object, self.speech = (
+                "executing",
+                self.OBJ_VERIFY,
+                "Checking the candidate.",
+            )
+        elif event_type == "VerificationCheckCompleted":
+            status = str(payload.get("status") or "").casefold()
+            if status in {"failed", "failure", "error"}:
+                self.state, self.object, self.speech = (
+                    "failure",
+                    self.OBJ_FAIL,
+                    "Verification found a mismatch.",
+                )
+            else:
+                self.state, self.object, self.speech = (
+                    "executing",
+                    self.OBJ_VERIFY,
+                    "Checking the candidate.",
+                )
+        elif event_type == "VerificationCompleted":
+            status = str(payload.get("status") or "").casefold()
+            if status in {"passed", "complete", "completed"}:
+                self.state, self.object, self.speech = (
+                    "success",
+                    self.OBJ_VERIFY,
+                    "Candidate verified.",
+                )
+            else:
+                self.state, self.object, self.speech = (
+                    "failure",
+                    self.OBJ_FAIL,
+                    "Candidate verification failed.",
+                )
+        elif event_type == "DiagnosticsProduced":
+            self.state, self.object, self.speech = (
+                "failure",
+                self.OBJ_FAIL,
+                "Diagnostics need attention.",
+            )
         elif event_type == "ArtifactCreated":
             self.state, self.object, self.speech = "success", self.OBJ_ARTIFACT, "Artifact ready."
         elif event_type in {
-            "ChildTaskCreated", "DelegationStarted", "BackgroundTaskStarted",
+            "ChildTaskCreated",
+            "DelegationStarted",
+            "BackgroundTaskStarted",
         }:
-            self.state, self.object, self.speech = "delegated", self.OBJ_PROCESS, "Delegated work is active."
+            self.state, self.object, self.speech = (
+                "delegated",
+                self.OBJ_PROCESS,
+                "Delegated work is active.",
+            )
         elif event_type in {"ChildTaskCompleted", "BackgroundTaskCompleted"}:
-            self.state, self.object, self.speech = "success", self.OBJ_VERIFY, "Delegated work returned."
+            self.state, self.object, self.speech = (
+                "success",
+                self.OBJ_VERIFY,
+                "Delegated work returned.",
+            )
         elif event_type == "BackgroundTaskFailed":
-            self.state, self.object, self.speech = "failure", self.OBJ_FAIL, "Background work needs attention."
+            self.state, self.object, self.speech = (
+                "failure",
+                self.OBJ_FAIL,
+                "Background work needs attention.",
+            )
         elif event_type in {"ToolRepaired", "MutationRecorded", "MemoryWritten", "SkillActivated"}:
-            self.state, self.object, self.speech = "tools", self.OBJ_CODE, "Recording the next step."
+            self.state, self.object, self.speech = (
+                "tools",
+                self.OBJ_CODE,
+                "Recording the next step.",
+            )
         elif event_type in {"MutationRecordFailed", "ToolInputCorrectionExhausted"}:
             self.state, self.object, self.speech = "failure", self.OBJ_FAIL, "That needs attention."
         elif event_type in {
-            "MemoryCandidateCreated", "SkillCandidateCreated",
-            "InterpreterProposalDispatched", "RuntimeSessionCreated",
+            "MemoryCandidateCreated",
+            "SkillCandidateCreated",
+            "InterpreterProposalDispatched",
+            "RuntimeSessionCreated",
         }:
-            self.state, self.object, self.speech = "tools", self.OBJ_CODE, "Recording the next step."
+            self.state, self.object, self.speech = (
+                "tools",
+                self.OBJ_CODE,
+                "Recording the next step.",
+            )
         elif event_type == "TaskStateChanged":
             state = str(payload.get("status") or payload.get("to") or "").upper()
             mapping = {
@@ -476,9 +594,18 @@ class Mascot:
             }
             if state in mapping:
                 self.state, self.object, self.speech = mapping[state]
-        elif event_type in {"ExecutionExited", "CapabilityCompleted", "TaskCompleted", "TaskPartial"}:
+        elif event_type in {
+            "ExecutionExited",
+            "CapabilityCompleted",
+            "TaskCompleted",
+            "TaskPartial",
+        }:
             if event_type == "TaskPartial":
-                self.state, self.object, self.speech = "warning", self.OBJ_FAIL, "Needs a follow-up."
+                self.state, self.object, self.speech = (
+                    "warning",
+                    self.OBJ_FAIL,
+                    "Needs a follow-up.",
+                )
             else:
                 ok = event_type != "ExecutionExited" or payload.get("exit_code") in {None, 0}
                 self.state = "success" if ok else "failure"
@@ -489,21 +616,29 @@ class Mascot:
         elif event_type in {"ExecutionInterrupted", "TaskCancelled", "TaskInterrupted"}:
             self.state, self.object, self.speech = "interrupted", self.OBJ_FAIL, "Stopped safely."
         elif event_type == "RecoveryStarted":
-            self.state, self.object, self.speech = "recovering", self.OBJ_PROCESS, "Restoring the run."
+            self.state, self.object, self.speech = (
+                "recovering",
+                self.OBJ_PROCESS,
+                "Restoring the run.",
+            )
         elif event_type == "RecoveryCompleted":
-            self.state, self.object, self.speech = "listening", self.OBJ_VERIFY, "Recovery complete."
+            self.state, self.object, self.speech = (
+                "listening",
+                self.OBJ_VERIFY,
+                "Recovery complete.",
+            )
 
     def render(self, max_width: int = 24) -> list[str]:
         if not Mascot.CHARACTERS:
             Mascot._register_characters()
         frames = self.CHARACTERS[self.character]["frames"]
-        frame_state = self.state if self.state in frames else self._FRAME_FALLBACKS.get(self.state, "idle")
+        frame_state = (
+            self.state if self.state in frames else self._FRAME_FALLBACKS.get(self.state, "idle")
+        )
         art = frames.get(frame_state, frames["idle"])[self._frame % 2]
         # Every emitted line is hard-bounded to max_width so the mascot can
         # never overflow its column and break the pane layout.
-        lines = [
-            ln.rstrip()[:max_width] for ln in art.strip("\n").splitlines()
-        ]
+        lines = [ln.rstrip()[:max_width] for ln in art.strip("\n").splitlines()]
         width = max((len(ln) for ln in lines), default=0)
         pad = max(max_width - width, 0)
         left = " " * (pad // 2)
@@ -523,9 +658,7 @@ class Mascot:
         return True
 
     @classmethod
-    def register_character(
-        cls, name: str, label: str, frames: Mapping[str, Any]
-    ) -> bool:
+    def register_character(cls, name: str, label: str, frames: Mapping[str, Any]) -> bool:
         """Register (or replace) a custom character; False on invalid input.
 
         ``frames`` maps a state name (idle, thinking, executing, waiting,
@@ -649,12 +782,12 @@ class DualPaneSurface(OperatorSurface):
         self.set_mascot(resolve_mascot_name(mascot))
         self._term_cols, self._term_rows = self._terminal_size()
         self.display_requested = str(display or os.environ.get("ATHENA_DISPLAY") or "auto").lower()
-        self.model_label = model_label or os.environ.get(
-            "OPENROUTER_MODEL", "local / fake-1"
-        )
+        self.model_label = model_label or os.environ.get("OPENROUTER_MODEL", "local / fake-1")
         self.layout = compute_layout(self._term_cols, self._term_rows, self.display_requested)
         self._kitty_confirmed = os.environ.get("ATHENA_KITTY_CONFIRMED", "").lower() in {
-            "1", "true", "yes"
+            "1",
+            "true",
+            "yes",
         }
         self.display = select_renderer(
             self.display_requested,
@@ -663,7 +796,9 @@ class DualPaneSurface(OperatorSurface):
         self.dual = self.layout.mode.value != "plain"
         self._full_screen = self._supports_full_screen()
         self.projection = ProjectionState()
-        self.scene = build_oi_scene(self.projection, self.layout.oi)
+        self.scene = build_oi_scene(
+            self.projection, self.layout.oi, character=self.mascot.character
+        )
         self.animator = OIAnimator(reduced_motion=reduced_motion)
         self.animation_clock = AnimationClock(
             self._animation_tick,
@@ -676,6 +811,7 @@ class DualPaneSurface(OperatorSurface):
         self.kitty = KittyGraphicsProtocol()
         self._glass_frame_id = 40
         self._glass_overlay_id = 41
+        self._glass_motion_id = 42
         self._glass_base_key: tuple[Any, ...] | None = None
         self._prompt_text = ""
         self.prompt = PromptController(
@@ -733,13 +869,8 @@ class DualPaneSurface(OperatorSurface):
         """Enter the composed terminal surface once for the REPL lifetime."""
         if self._full_screen:
             self.terminal_session.open()
-            if (
-                self.display_requested in {"auto", "glass"}
-                and not self._kitty_confirmed
-            ):
-                self._kitty_confirmed = KittyCapabilityProbe.probe(
-                    self.output, self.prompt.stdin
-                )
+            if self.display_requested in {"auto", "glass"} and not self._kitty_confirmed:
+                self._kitty_confirmed = KittyCapabilityProbe.probe(self.output, self.prompt.stdin)
                 self.display = select_renderer(
                     self.display_requested,
                     capability_confirmed=self._kitty_confirmed and pillow_available(),
@@ -819,7 +950,9 @@ class DualPaneSurface(OperatorSurface):
         self.layout = compute_layout(self._term_cols, self._term_rows, self.display_requested)
         self.dual = self.layout.mode.value != "plain"
         self._full_screen = self._supports_full_screen()
-        self.scene = build_oi_scene(self.projection, self.layout.oi)
+        self.scene = build_oi_scene(
+            self.projection, self.layout.oi, character=self.mascot.character
+        )
 
     def _left_width(self) -> int:
         if not self.dual:
@@ -945,15 +1078,11 @@ class DualPaneSurface(OperatorSurface):
         self.projection.reduce(etype, payload)
         self.mascot.observe(etype, payload)
         if etype == "ExecutionStarted":
-            self.window.feed(
-                f"$ {_terminal_text(payload.get('runtime') or 'runtime')}\n"
-            )
+            self.window.feed(f"$ {_terminal_text(payload.get('runtime') or 'runtime')}\n")
         elif etype in {"StdoutChunk", "StderrChunk"}:
             data = _terminal_text(payload.get("data"))
             if data:
-                self.window.feed(
-                    ("[err] " if etype == "StderrChunk" else "") + data
-                )
+                self.window.feed(("[err] " if etype == "StderrChunk" else "") + data)
 
     async def render_event(self, event: Any) -> None:
         etype = str(getattr(event, "type", ""))
@@ -1002,14 +1131,17 @@ class DualPaneSurface(OperatorSurface):
             if not raw:
                 result.append("")
                 continue
-            result.extend(textwrap.wrap(
-                raw,
-                width=width,
-                replace_whitespace=False,
-                drop_whitespace=True,
-                break_long_words=True,
-                break_on_hyphens=False,
-            ) or [""])
+            result.extend(
+                textwrap.wrap(
+                    raw,
+                    width=width,
+                    replace_whitespace=False,
+                    drop_whitespace=True,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+                or [""]
+            )
         return result or [""]
 
     def _left_lines(self, height: int, width: int) -> list[str]:
@@ -1027,22 +1159,31 @@ class DualPaneSurface(OperatorSurface):
         elif self._thinking:
             lines.append("ATHENA  thinking…")
             if self.details:
-                lines.extend([
-                    "         ┌ reasoning ─────────────────",
-                    "         │ provider reasoning is active",
-                    "         └───────────────────────────",
-                ])
+                lines.extend(
+                    [
+                        "         ┌ reasoning ─────────────────",
+                        "         │ provider reasoning is active",
+                        "         └───────────────────────────",
+                    ]
+                )
             else:
                 lines.append("         (details hidden · /details to expand)")
         stop = len(lines) - self._left_scroll if self._left_scroll else len(lines)
-        visible = lines[max(0, stop - height):stop]
-        return [self._fit(line, width) for line in visible] + ["" for _ in range(max(0, height - len(visible)))]
+        visible = lines[max(0, stop - height) : stop]
+        return [self._fit(line, width) for line in visible] + [
+            "" for _ in range(max(0, height - len(visible)))
+        ]
 
     @staticmethod
     def _glyph(state: str) -> str:
         return {
-            "complete": "✓", "success": "✓", "failed": "!", "failure": "!",
-            "approval": "?", "running": "●", "interrupted": "!",
+            "complete": "✓",
+            "success": "✓",
+            "failed": "!",
+            "failure": "!",
+            "approval": "?",
+            "running": "●",
+            "interrupted": "!",
         }.get(state, "·")
 
     def _operation_history_lines(self) -> list[str]:
@@ -1074,10 +1215,12 @@ class DualPaneSurface(OperatorSurface):
         active_lines: list[str] = []
         active = self._operations.get(self._active_operation_id or "")
         if active:
-            active_lines.extend([
-                "ACTIVE OPERATION",
-                f"{self._glyph(active.state)} {active.label}  {active.state.upper()}",
-            ])
+            active_lines.extend(
+                [
+                    "ACTIVE OPERATION",
+                    f"{self._glyph(active.state)} {active.label}  {active.state.upper()}",
+                ]
+            )
             if active.target:
                 active_lines.append(f"target  {active.target}")
             if active.command:
@@ -1098,12 +1241,20 @@ class DualPaneSurface(OperatorSurface):
             label = active.label if active else approval.get("capability_id") or "capability"
             approval_lines.append(f"? {label}  PAUSED")
             target = (
-                active.target if active
-                else approval.get("target") or approval.get("resource") or approval.get("path") or ""
+                active.target
+                if active
+                else approval.get("target")
+                or approval.get("resource")
+                or approval.get("path")
+                or ""
             )
             if target:
                 approval_lines.append(f"target  {target}")
-            reason = approval.get("reason") or approval.get("policy_reason") or (active.detail if active else "")
+            reason = (
+                approval.get("reason")
+                or approval.get("policy_reason")
+                or (active.detail if active else "")
+            )
             if reason:
                 approval_lines.append(f"reason  {reason}")
             scopes = [str(scope) for scope in approval.get("scopes") or ()]
@@ -1133,15 +1284,17 @@ class DualPaneSurface(OperatorSurface):
             # projection, including older active/history sections.
             all_lines = critical + tail
             stop = len(all_lines) - self._right_scroll
-            visible = all_lines[max(0, stop - height):stop]
+            visible = all_lines[max(0, stop - height) : stop]
         else:
             # At the live edge, keep the current operation and approval in
             # view.  Only lower-priority history/stream detail is trimmed.
             if len(critical) >= height:
                 visible = critical[:height]
             else:
-                visible = critical + tail[-(height - len(critical)):]
-        return [self._fit(line, width) for line in visible] + ["" for _ in range(max(0, height - len(visible)))]
+                visible = critical + tail[-(height - len(critical)) :]
+        return [self._fit(line, width) for line in visible] + [
+            "" for _ in range(max(0, height - len(visible)))
+        ]
 
     def _scene_lines(self, height: int, width: int) -> list[str]:
         """Render the live OI as a bounded scene, not a second dashboard.
@@ -1183,8 +1336,13 @@ class DualPaneSurface(OperatorSurface):
         if layout.mode.value == "plain":
             return [self._fit(f"ATHENA  {self.projection.status_message}", cols)]
 
-        self.scene = build_oi_scene(self.projection, layout.oi)
-        self.animator.set_state(self.mascot.state, self.scene.buddy_anchor)
+        self.scene = build_oi_scene(self.projection, layout.oi, character=self.mascot.character)
+        self.animator.set_state(
+            self.mascot.state,
+            self.scene.buddy_anchor,
+            action_kind=self.scene.mode.value,
+            code_lines=(len(self.scene.code_view.lines) if self.scene.code_view else 0),
+        )
         lines = [" " * cols for _ in range(rows)]
         left_w, right_w = layout.operator.width, layout.oi.width
         lines[0] = self._fit("ATHENA  //  OPERATOR INSTRUMENT", cols)
@@ -1199,7 +1357,9 @@ class DualPaneSurface(OperatorSurface):
         op_inner_w, oi_inner_w = max(left_w - 2, 1), max(right_w - 2, 1)
         left = self._left_lines(op_inner_h, op_inner_w)
         right = self._right_lines(oi_inner_h, oi_inner_w)
-        left_title = "CONVERSATION  ·  history" if self._left_scroll else "CONVERSATION  ·  calm transcript"
+        left_title = (
+            "CONVERSATION  ·  history" if self._left_scroll else "CONVERSATION  ·  calm transcript"
+        )
         right_title = "OI // HISTORY" if self._right_scroll else "ATHENA OI // GLASS COMPUTE"
         cabinet_x = max(layout.operator.x - 1, 0)
         seam = max(self.PANE_GAP - 2, 0)
@@ -1216,12 +1376,8 @@ class DualPaneSurface(OperatorSurface):
             right_panel = "▐" + self._fit(right_value, oi_inner_w) + "▌"
             return prefix + "│" + left_panel + seam_fill + right_panel + "│"
 
-        top = (
-            prefix + "╭" + "─" * (left_w + len(seam_fill) + right_w + 2) + "╮"
-        )
-        bottom = (
-            prefix + "╰" + "─" * (left_w + len(seam_fill) + right_w + 2) + "╯"
-        )
+        top = prefix + "╭" + "─" * (left_w + len(seam_fill) + right_w + 2) + "╮"
+        bottom = prefix + "╰" + "─" * (left_w + len(seam_fill) + right_w + 2) + "╯"
         lines[op_y] = self._fit(top, cols)
         lines[op_y + 1] = self._fit(cabinet_row(left_title, right_title), cols)
         for index in range(op_inner_h):
@@ -1236,7 +1392,11 @@ class DualPaneSurface(OperatorSurface):
         lines[op_y + op_h - 1] = self._fit(bottom, cols)
 
         controls_y = layout.controls.y
-        lamps = "SYS ●   NET ●   IO ●   MODEL " + self._fit(self.model_label, 20) + f"   TASK {self.projection.status}"
+        lamps = (
+            "SYS ●   NET ●   IO ●   MODEL "
+            + self._fit(self.model_label, 20)
+            + f"   TASK {self.projection.status}"
+        )
         lines[controls_y] = self._fit("─" * max(cols - 4, 1), cols)
         lines[controls_y + 1] = self._fit(lamps, cols)
         prompt_y = layout.prompt.y
@@ -1267,13 +1427,14 @@ class DualPaneSurface(OperatorSurface):
         viewport = self.layout.oi
         pixel_width = max(viewport.width * 10, 80)
         pixel_height = max((viewport.height - 2) * 20, 60)
-        base = self.oi_framebuffer.render_base(
-            self.scene, pixel_width, pixel_height
+        base = self.oi_framebuffer.render_base(self.scene, pixel_width, pixel_height)
+        motion = self.oi_framebuffer.render_motion_overlay(
+            self.scene, self.animator.visual, pixel_width, pixel_height
         )
         overlay = self.oi_framebuffer.render_overlay(
             self.scene, self.animator.visual, pixel_width, pixel_height
         )
-        if base is None or overlay is None:
+        if base is None or motion is None or overlay is None:
             return
         command = ""
         if base.base_key != self._glass_base_key:
@@ -1287,6 +1448,18 @@ class DualPaneSurface(OperatorSurface):
                 rows=max(viewport.height - 2, 1),
             )
             self._glass_base_key = base.base_key
+
+        if motion.png and motion.dirty_region:
+            left, top, region_width, region_height = motion.dirty_region
+            command += self.kitty.present(
+                KittyAsset(self._glass_motion_id, motion.png),
+                x=viewport.x + 1 + left // 10,
+                y=viewport.y + 1 + top // 20,
+                columns=max((region_width + 9) // 10, 1),
+                rows=max((region_height + 19) // 20, 1),
+            )
+        else:
+            command += self.kitty.delete(self._glass_motion_id)
 
         if overlay.png and overlay.dirty_region:
             left, top, region_width, region_height = overlay.dirty_region
@@ -1346,19 +1519,19 @@ class DualPaneSurface(OperatorSurface):
                 self.window.feed("[err] " + stderr)
             ok = result.get("status") == "completed" and result.get("exit_code") in (0, None)
             if stdout:
-                self.projection.reduce(
-                    "StdoutChunk", {"call_id": call_id, "data": stdout}
-                )
+                self.projection.reduce("StdoutChunk", {"call_id": call_id, "data": stdout})
             if stderr:
-                self.projection.reduce(
-                    "StderrChunk", {"call_id": call_id, "data": stderr}
-                )
+                self.projection.reduce("StderrChunk", {"call_id": call_id, "data": stderr})
             self.projection.reduce(
                 "ExecutionExited",
                 {"call_id": call_id, "exit_code": result.get("exit_code")},
             )
-            self.mascot.observe("TaskCompleted" if ok else "TaskFailed", {"exit_code": result.get("exit_code")})
+            self.mascot.observe(
+                "TaskCompleted" if ok else "TaskFailed", {"exit_code": result.get("exit_code")}
+            )
             self.projection.status = "SUCCESS" if ok else "FAILURE"
-            self.projection.status_message = "Direct command complete." if ok else "Direct command failed."
+            self.projection.status_message = (
+                "Direct command complete." if ok else "Direct command failed."
+            )
             if self._full_screen:
                 self.repaint_oi(force=True)

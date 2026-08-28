@@ -48,9 +48,7 @@ class _Dispatcher:
 @pytest.mark.asyncio
 @pytest.mark.athena_scenario("FUSE-003")
 async def test_direct_execution_routes_through_dispatcher_and_records_audit(tmp_path):
-    service = AthenaService(
-        config=AthenaConfig(db_path=":memory:", workspace_root=str(tmp_path))
-    )
+    service = AthenaService(config=AthenaConfig(db_path=":memory:", workspace_root=str(tmp_path)))
     dispatcher = _Dispatcher()
     sessions = _Sessions([])
     messages = _Messages([])

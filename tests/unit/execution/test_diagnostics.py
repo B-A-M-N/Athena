@@ -1,6 +1,6 @@
 """Structured diagnostic normalization tests."""
 
-from athena.execution.diagnostics import normalize_diagnostics
+from athena.execution.diagnostics import normalize_diagnostics, normalize_diagnostics_payload
 
 
 def test_normalize_compiler_linter_and_cargo_shapes():
@@ -37,3 +37,32 @@ ValueError: invalid configuration
     assert diagnostics[0].file == "src/main.py"
     assert diagnostics[0].line == 9
     assert diagnostics[0].message == "ValueError: invalid configuration"
+
+
+def test_json_diagnostics_have_occurrence_and_semantic_signatures():
+    first = normalize_diagnostics_payload(
+        {
+            "diagnostics": [
+                {
+                    "severity": "error",
+                    "code": "E001",
+                    "path": "/tmp/a.py",
+                    "line": 3,
+                    "message": "cannot open '/tmp/a.py'",
+                    "related": [{"message": "context"}],
+                }
+            ],
+        },
+        tool="compiler",
+        source_tool_version="1.2",
+    )
+    second = normalize_diagnostics(
+        "error[E001]: cannot open '/tmp/b.py'",
+        tool="compiler",
+        source_tool_version="1.2",
+    )
+
+    assert first[0].occurrence_fingerprint
+    assert first[0].signature_fingerprint
+    assert first[0].signature_fingerprint == second[0].signature_fingerprint
+    assert first[0].to_dict()["source_tool_version"] == "1.2"

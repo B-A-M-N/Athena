@@ -31,12 +31,18 @@ def test_native_worker_command_forwards_scope_without_credentials():
 
 
 def test_native_session_parser_matches_worker_contract():
-    options = parse_args([
-        "--db", "/tmp/athena.db",
-        "--workspace", "/tmp/project",
-        "--autonomy", "coding",
-        "--criteria", "tests pass",
-    ])
+    options = parse_args(
+        [
+            "--db",
+            "/tmp/athena.db",
+            "--workspace",
+            "/tmp/project",
+            "--autonomy",
+            "coding",
+            "--criteria",
+            "tests pass",
+        ]
+    )
 
     assert options.command == "native"
     assert options.db_path == "/tmp/athena.db"

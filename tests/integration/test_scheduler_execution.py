@@ -1,4 +1,5 @@
 """Scheduler -> Task -> Worker -> COMPLETE, with the occurrence marked FIRED."""
+
 from __future__ import annotations
 import pytest
 
@@ -13,6 +14,7 @@ async def _wait_terminal(svc, task_id, target=TaskStatus.COMPLETE.value, tries=2
         if (await svc.get_task_status(task_id)) == target:
             return target
         from asyncio import sleep
+
         await sleep(delay)
     return await svc.get_task_status(task_id)
 
@@ -33,8 +35,12 @@ async def test_scheduled_job_fires_and_runs_to_complete(make_service):
     }
     trigger_spec = {"type": "once", "at": due}
     await svc._store_schedules.upsert_job(
-        job_id, "once-due", payload=payload, trigger_spec=trigger_spec,
-        enabled=True, next_run=due,
+        job_id,
+        "once-due",
+        payload=payload,
+        trigger_spec=trigger_spec,
+        enabled=True,
+        next_run=due,
     )
 
     # Deterministic single tick (no waiting on the background loop interval).
@@ -42,7 +48,8 @@ async def test_scheduled_job_fires_and_runs_to_complete(make_service):
     assert fired == 1
 
     runs = await svc._db.fetch_all(
-        "SELECT status, task_id FROM job_runs WHERE job_id = ?", (job_id,))
+        "SELECT status, task_id FROM job_runs WHERE job_id = ?", (job_id,)
+    )
     assert len(runs) == 1
     assert runs[0]["status"] == "FIRED"
     task_id = runs[0]["task_id"]

@@ -71,9 +71,7 @@ class MCPToolExecutor:
         """
         if not self._client.connected:
             return _fail(request, "MCP server is not connected")
-        result = await self._client.call_tool(
-            self._tool_name, dict(request.arguments or {})
-        )
+        result = await self._client.call_tool(self._tool_name, dict(request.arguments or {}))
         metadata = {"mcp": True}
         if result.structured is not None:
             metadata["structured"] = result.structured
@@ -81,9 +79,7 @@ class MCPToolExecutor:
         return CapabilityResult(
             call_id,
             request.capability_id,
-            CapabilityResultStatus.FAILED
-            if result.is_error
-            else CapabilityResultStatus.OK,
+            CapabilityResultStatus.FAILED if result.is_error else CapabilityResultStatus.OK,
             output=result.content,
             error=result.content if result.is_error else None,
             metadata=metadata,
@@ -118,14 +114,11 @@ class MCPAdapter:
         capability_id = canonical_capability_id(connection_id, tool.name)
         if capability_id in self._executors:
             raise MCPError(f"capability already registered: {capability_id}")
-        effects = infer_effects(
-            tool.name, tool.annotations, tool.input_schema, remote=True
-        )
+        effects = infer_effects(tool.name, tool.annotations, tool.input_schema, remote=True)
         alias = friendly_alias(server_alias or connection_id, tool.name)
         note = effect_note(tool.annotations)
-        description = (
-            f"[MCP {alias}] {tool.description or tool.name}"
-            + (f" ({note})" if note else "")
+        description = f"[MCP {alias}] {tool.description or tool.name}" + (
+            f" ({note})" if note else ""
         )
         tags = {"mcp", "external", "untrusted"}
         if server_alias:
@@ -156,9 +149,7 @@ class MCPAdapter:
         executor = MCPToolExecutor(descriptor, client, tool.name)
         self.registry.register(executor)
         self._executors[descriptor.id] = executor
-        self._aliases[friendly_alias(server_alias or connection_id, tool.name)] = (
-            descriptor.id
-        )
+        self._aliases[friendly_alias(server_alias or connection_id, tool.name)] = descriptor.id
         return descriptor
 
     def register_all(
@@ -203,6 +194,21 @@ class MCPAdapter:
 
     def capability_ids(self) -> list[str]:
         return sorted(self._executors)
+
+    def unregister_connection(self, connection_id: str) -> list[str]:
+        """Remove every tool registered from one MCP connection."""
+        wanted = str(connection_id)
+        removed: list[str] = []
+        for capability_id, executor in list(self._executors.items()):
+            if executor._client.connection_id != wanted:  # noqa: SLF001
+                continue
+            self.registry.unregister(capability_id)
+            self._executors.pop(capability_id, None)
+            for alias, target in list(self._aliases.items()):
+                if target == capability_id:
+                    self._aliases.pop(alias, None)
+            removed.append(capability_id)
+        return removed
 
 
 def _fail(request: CapabilityRequest, message: str) -> CapabilityResult:

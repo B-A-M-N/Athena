@@ -43,7 +43,9 @@ class TriggerSpec:
                 # attr is typed as datetime but total_seconds belongs to
                 # timedelta. Leaving runtime behavior unchanged for now.
                 object.__setattr__(
-                    self, "interval_seconds", self.at.total_seconds()  # type: ignore[attr-defined]
+                    self,
+                    "interval_seconds",
+                    self.at.total_seconds(),  # type: ignore[attr-defined]
                 )
             assert self.interval_seconds is not None
             if self.interval_seconds <= 0:
@@ -125,6 +127,7 @@ def _load_tz(name: str | None):
     if name is None or name in ("UTC", "utc", "GMT"):
         return timezone.utc
     from zoneinfo import ZoneInfo
+
     return ZoneInfo(name)
 
 
@@ -137,9 +140,7 @@ def _local_to_utc(naive: datetime, tz) -> datetime:
     return naive.replace(tzinfo=tz, fold=1).astimezone(timezone.utc)
 
 
-def _cron_matches(
-    dt: datetime, minute: str, hour: str, dom: str, month: str, dow: str
-) -> bool:
+def _cron_matches(dt: datetime, minute: str, hour: str, dom: str, month: str, dow: str) -> bool:
     if not _field_matches(dt.minute, minute, 0, 59):
         return False
     if not _field_matches(dt.hour, hour, 0, 23):

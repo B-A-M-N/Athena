@@ -50,8 +50,7 @@ PRIMARY_TEXT = "done"
 
 
 def _scripts(*texts: str) -> list[dict]:
-    return [{"match": {"user_contains": "Observation kind"}, "respond": {"text": t}}
-            for t in texts]
+    return [{"match": {"user_contains": "Observation kind"}, "respond": {"text": t}} for t in texts]
 
 
 async def _make_stack(*, interpreter) -> Stack:
@@ -63,7 +62,9 @@ async def _make_stack(*, interpreter) -> Stack:
     messages = MessageStore(db)
     manager = TaskManager(task_store=tasks, events=events, sessions=sessions)
     provider = FakeModelProvider(
-        scripts=_scripts(INTERPRETER_TEXT), model="fake-1", provider="fake",
+        scripts=_scripts(INTERPRETER_TEXT),
+        model="fake-1",
+        provider="fake",
         tool_calling=True,
     )
     registry = ProviderRegistry()
@@ -83,8 +84,12 @@ async def _make_stack(*, interpreter) -> Stack:
         interpreter=interpreter,
     )
     return Stack(
-        db=db, tasks=tasks, events=events, messages=messages,
-        provider=provider, kernel=kernel,
+        db=db,
+        tasks=tasks,
+        events=events,
+        messages=messages,
+        provider=provider,
+        kernel=kernel,
     )
 
 
@@ -93,12 +98,15 @@ def _extension_for(kernel: AgentKernel) -> InterpreterExtension:
         return await kernel.interpreter_subturn(
             context=context, system_prompt=system_prompt, user_prompt=user_prompt
         )
+
     return InterpreterExtension(inference_broker=broker)
 
 
 async def _persisted_task(stack: Stack) -> TaskSpec:
     task = TaskSpec(
-        id=new_id("task"), objective="fusion wiring", session_id="s-fusion",
+        id=new_id("task"),
+        objective="fusion wiring",
+        session_id="s-fusion",
     )
     await stack.db.execute(
         "INSERT OR IGNORE INTO sessions(id, parent_id, created_at, updated_at, metadata) "
@@ -128,11 +136,15 @@ class _RecordingShim:
             ok = True
             if self._fail_first and self._calls <= self._fail_count:
                 ok = False
-            results.append(CapabilityResultBlock(
-                call_id=c.call_id, capability_id=c.capability_id,
-                ok=ok, output="ok" if ok else "",
-                error=None if ok else "TypeError: boom",
-            ))
+            results.append(
+                CapabilityResultBlock(
+                    call_id=c.call_id,
+                    capability_id=c.capability_id,
+                    ok=ok,
+                    output="ok" if ok else "",
+                    error=None if ok else "TypeError: boom",
+                )
+            )
         return DispatchResult(results=tuple(results))
 
 
@@ -183,8 +195,7 @@ async def test_failed_result_triggers_interpreter_subturn_and_dispatch():
     assert dispatched[1].capability_id == "runtime.evaluate"
     assert dispatched[1].arguments == {"code": "repr(obj)"}
     rows = await stack.events.list_for_task(task.id)
-    roles = [e.payload.get("role") for e in rows
-             if e.type == "ModelRequestStarted"]
+    roles = [e.payload.get("role") for e in rows if e.type == "ModelRequestStarted"]
     assert "interpreter" in roles
     proposal_events = [e for e in rows if e.type == "InterpreterProposalDispatched"]
     assert proposal_events, "canonical dispatch must be inspectable"
@@ -284,7 +295,9 @@ async def test_budget_exhausted_skips_fusion():
 
     stack = await _make_stack(interpreter="wired-marker")
     task = TaskSpec(
-        id=new_id("task"), objective="budget cap", session_id="s-fusion",
+        id=new_id("task"),
+        objective="budget cap",
+        session_id="s-fusion",
         resource_budget=ResourceBudget(max_input_tokens=100),
     )
     await stack.db.execute(

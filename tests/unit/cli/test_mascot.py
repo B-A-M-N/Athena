@@ -32,9 +32,7 @@ def test_default_character_is_owl():
 
 
 @pytest.mark.parametrize("character", ["owl", "cat", "bot"])
-@pytest.mark.parametrize(
-    "state", ["idle", "thinking", "executing", "waiting", "done", "failed"]
-)
+@pytest.mark.parametrize("state", ["idle", "thinking", "executing", "waiting", "done", "failed"])
 def test_render_never_exceeds_max_width(character, state):
     mascot = Mascot(character=character)
     mascot.state = state
@@ -126,14 +124,10 @@ def test_surface_mascot_switching():
 
 def test_surface_constructor_accepts_mascot_choice(monkeypatch):
     monkeypatch.delenv("ATHENA_MASCOT", raising=False)
-    surface = DualPaneSurface(
-        output=StringIO(), interactive=False, mascot="bot"
-    )
+    surface = DualPaneSurface(output=StringIO(), interactive=False, mascot="bot")
     assert surface.mascot.character == "bot"
 
-    hidden = DualPaneSurface(
-        output=StringIO(), interactive=False, mascot="off"
-    )
+    hidden = DualPaneSurface(output=StringIO(), interactive=False, mascot="off")
     assert hidden.mascot_enabled is False
 
 
@@ -152,9 +146,7 @@ def test_config_roundtrip_mascot_fields():
 
     config = AthenaConfig(
         mascot="cat",
-        mascots={
-            "tux": {"label": "Tiny penguin", "frames": {"idle": ["(p)", "(p~)"]}}
-        },
+        mascots={"tux": {"label": "Tiny penguin", "frames": {"idle": ["(p)", "(p~)"]}}},
     )
     restored = config_from_dict(config_to_dict(config))
     assert restored.mascot == "cat"

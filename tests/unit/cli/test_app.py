@@ -41,11 +41,15 @@ def test_build_config_rejects_paid_openrouter_override(monkeypatch):
 
 
 def test_argparse_oi_stream_preserves_task_and_db_options():
-    options = _arg_parse([
-        "oi-stream",
-        "--db", "/tmp/athena-events.db",
-        "--task", "task-42",
-    ])
+    options = _arg_parse(
+        [
+            "oi-stream",
+            "--db",
+            "/tmp/athena-events.db",
+            "--task",
+            "task-42",
+        ]
+    )
 
     assert options.command == "oi-stream"
     assert options.db_path == "/tmp/athena-events.db"

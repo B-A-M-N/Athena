@@ -27,18 +27,17 @@ from athena.worldstate import ClaimRegistry, ClaimStatus, WorldStateStore
 # Registry-level truthfulness invariants (in-memory + durable)
 # ---------------------------------------------------------------------------
 
+
 async def test_contradicted_and_stale_claims_are_terminal():
     """Once disproven or invalidated, a claim never returns to VERIFIED."""
     reg = ClaimRegistry()
     contradicted = reg.record(
-        text="v1 is correct", evidence={"exit_code": 0},
-        depends_on_paths=("src/v1.py",))
+        text="v1 is correct", evidence={"exit_code": 0}, depends_on_paths=("src/v1.py",)
+    )
     stale = reg.record(
-        text="docs are current", evidence={"exit_code": 0},
-        depends_on_paths=("docs/",))
-    other = reg.record(
-        text="unrelated", evidence={"exit_code": 0},
-        depends_on_paths=("other.txt",))
+        text="docs are current", evidence={"exit_code": 0}, depends_on_paths=("docs/",)
+    )
+    other = reg.record(text="unrelated", evidence={"exit_code": 0}, depends_on_paths=("other.txt",))
 
     assert reg.contradict(contradicted.id, "falsified by rerun") is not None
     # Contradicting an unknown claim is a no-op, not an error.
@@ -60,17 +59,20 @@ async def test_contradicted_and_stale_claims_are_terminal():
 async def test_reverification_creates_new_claim_and_does_not_resurrect_old():
     reg = ClaimRegistry()
     old = reg.record(
-        text="tests pass", evidence={"exit_code": 0},
-        depends_on_paths=("src/auth.py",))
+        text="tests pass", evidence={"exit_code": 0}, depends_on_paths=("src/auth.py",)
+    )
     reg.invalidate_for_paths(["src/auth.py"])
 
     fresh = reg.record(
-        text="tests pass (re-verified)", evidence={"exit_code": 0},
-        depends_on_paths=("src/auth.py",))
+        text="tests pass (re-verified)",
+        evidence={"exit_code": 0},
+        depends_on_paths=("src/auth.py",),
+    )
 
     assert fresh.status == ClaimStatus.VERIFIED
     assert old.status == ClaimStatus.STALE, (
-        "recording new evidence must not restore trust in the stale claim")
+        "recording new evidence must not restore trust in the stale claim"
+    )
 
 
 async def test_unscoped_claim_goes_stale_on_any_path_and_reason_carries_mutation():
@@ -78,7 +80,10 @@ async def test_unscoped_claim_goes_stale_on_any_path_and_reason_carries_mutation
     claim = reg.record(text="workspace is healthy", evidence={})
     flipped = reg.invalidate_for_paths(
         ["somewhere/else.txt"],
-        mutation_id="mut-42", mutation_sequence=7, mutation_event_sequence=99)
+        mutation_id="mut-42",
+        mutation_sequence=7,
+        mutation_event_sequence=99,
+    )
     assert [c.id for c in flipped] == [claim.id]
     reason = claim.invalidated_by[0]
     assert reason["paths"] == ["somewhere/else.txt"]
@@ -91,18 +96,22 @@ async def test_unscoped_claim_goes_stale_on_any_path_and_reason_carries_mutation
 # Durability: flips and their reasons survive a restart (file-backed DB)
 # ---------------------------------------------------------------------------
 
+
 async def test_flip_reasons_survive_restart(durable_db_path):
     db1 = Database(durable_db_path)
     reg1 = ClaimRegistry(store=WorldStateStore(db1))
     # Disjoint scopes keep the backgrounded persistence writes disjoint:
     # the invalidation write touches only `a`, the contradiction only `b`
     # (their relative scheduling is otherwise nondeterministic).
-    a = reg1.record(text="scoped", evidence={"rc": 0}, task_id="t-claims",
-                    depends_on_paths=("src/",))
-    b = reg1.record(text="wrong", evidence={"rc": 0}, task_id="t-claims",
-                    depends_on_paths=("docs/",))
-    reg1.invalidate_for_paths(["src/a.py"], mutation_id="mut-flip",
-                              mutation_sequence=3, mutation_event_sequence=12)
+    a = reg1.record(
+        text="scoped", evidence={"rc": 0}, task_id="t-claims", depends_on_paths=("src/",)
+    )
+    b = reg1.record(
+        text="wrong", evidence={"rc": 0}, task_id="t-claims", depends_on_paths=("docs/",)
+    )
+    reg1.invalidate_for_paths(
+        ["src/a.py"], mutation_id="mut-flip", mutation_sequence=3, mutation_event_sequence=12
+    )
     reg1.contradict(b.id, "falsified on rerun")
     await reg1.flush()
     await db1.close()
@@ -157,8 +166,8 @@ async def test_snapshot_counts_only_mutations_after_verified_boundary(svc):
     wstate = svc.world_state("t-proj")
     # Claim whose evidence pins the ledger at mutation sequence 2.
     wstate.claims.record(
-        text="state verified at seq 2", evidence={"mutation_sequence": 2},
-        task_id="t-proj")
+        text="state verified at seq 2", evidence={"mutation_sequence": 2}, task_id="t-proj"
+    )
     await ledger.record("t-proj", "src/three.py", "write", after_state="3")
 
     snap = await wstate.snapshot()
@@ -179,8 +188,8 @@ async def test_snapshot_legacy_claim_without_boundary_counts_all_mutations(svc):
     wstate = svc.world_state("t-legacy")
     # Legacy claim: no durable verification boundary in its evidence.
     wstate.claims.record(
-        text="asserted without boundary", evidence={"exit_code": 0},
-        task_id="t-legacy")
+        text="asserted without boundary", evidence={"exit_code": 0}, task_id="t-legacy"
+    )
 
     snap = await wstate.snapshot()
     assert snap["mutations_since_verified_claim"] == 2
@@ -198,9 +207,7 @@ async def test_snapshot_reflects_ledger_not_assertions(svc):
     assert before["mutations_since_verified_claim"] == 1
 
     # The model asserts "everything is verified" -- projection must not care.
-    wstate.claims.record(
-        text="all mutations accounted for", evidence={},
-        task_id="t-ground")
+    wstate.claims.record(text="all mutations accounted for", evidence={}, task_id="t-ground")
     after_assertion = await wstate.snapshot()
     assert after_assertion["mutations_since_verified_claim"] == 1
     assert len(after_assertion["claims"]) == 1
@@ -215,11 +222,11 @@ async def test_snapshot_separates_unknowns_from_contradictions(svc):
     wstate = svc.world_state("t-view")
     # Disjoint scopes: the path mutation can only stale `stale`, never `wrong`.
     stale = wstate.claims.record(
-        text="maybe still true", evidence={}, task_id="t-view",
-        depends_on_paths=("src/",))
+        text="maybe still true", evidence={}, task_id="t-view", depends_on_paths=("src/",)
+    )
     wrong = wstate.claims.record(
-        text="definitely false", evidence={}, task_id="t-view",
-        depends_on_paths=("docs/",))
+        text="definitely false", evidence={}, task_id="t-view", depends_on_paths=("docs/",)
+    )
     wstate.claims.invalidate_for_paths(["src/x.py"])
     wstate.claims.contradict(wrong.id, "contradicted by evidence")
 

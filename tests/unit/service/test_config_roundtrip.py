@@ -59,9 +59,7 @@ def test_roundtrip_providers_mcp_model_roles():
     assert m.secret_env == {"TOKEN": "t"}
     assert m.connect_timeout == 5.0
 
-    assert restored.model_roles == {
-        "coder": {"allowed": ["gpt-4o"], "max_cost_usd": "0.01"}
-    }
+    assert restored.model_roles == {"coder": {"allowed": ["gpt-4o"], "max_cost_usd": "0.01"}}
 
 
 def test_project_config_paths_root_most_first(tmp_path: Path):

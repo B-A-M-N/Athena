@@ -4,6 +4,7 @@ A follow-up submitted to the same ``session_id`` after the service restarted
 must see the prior transcript — the context compiler includes the session's
 history, so the resumed task models over the earlier exchange.
 """
+
 from __future__ import annotations
 import pytest
 
@@ -18,13 +19,16 @@ from athena.protocol.ids import new_id
 
 _MARKER = "SENRESUME_MARKER_123"
 _FIRST_SCRIPTS = (
-    {"match": {"capability_result_ok": True},
-     "respond": {"text": "", "done": True}},
-    {"match": {"user_contains": "SEED_TASK"},
-     "respond": {"capability_call": {
-         "capability_id": "execute",
-         "arguments": {"language": "python", "code": f"print('{_MARKER}')"},
-     }}},
+    {"match": {"capability_result_ok": True}, "respond": {"text": "", "done": True}},
+    {
+        "match": {"user_contains": "SEED_TASK"},
+        "respond": {
+            "capability_call": {
+                "capability_id": "execute",
+                "arguments": {"language": "python", "code": f"print('{_MARKER}')"},
+            }
+        },
+    },
 )
 
 
@@ -44,8 +48,11 @@ async def test_resume_session_sees_prior_transcript(make_durable_service, durabl
     # --- Phase 1: create and complete a task that records a transcript. --- #
     svc1 = await make_durable_service(durable_db_path, scripts=_FIRST_SCRIPTS)
     first = await svc1.submit(
-        AgentRequest(prompt="SEED_TASK run the marker",
-                     session_id=new_id("session"), autonomy=AutonomyLevel.AUTONOMOUS),
+        AgentRequest(
+            prompt="SEED_TASK run the marker",
+            session_id=new_id("session"),
+            autonomy=AutonomyLevel.AUTONOMOUS,
+        ),
         wait=False,
     )
     session_id = first.session_id
@@ -78,8 +85,7 @@ async def test_resume_session_sees_prior_transcript(make_durable_service, durabl
 
     # --- Phase 3: the resumed task saw the prior transcript in context. --- #
     body = "\n".join(captured)
-    assert _MARKER in body, (
-        f"prior capability output not compiled into resumed context:\n{body}")
+    assert _MARKER in body, f"prior capability output not compiled into resumed context:\n{body}"
 
     # Both tasks and the prior capability output are persisted.
     rows = await svc2._db.fetch_all(

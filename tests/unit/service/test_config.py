@@ -1,4 +1,5 @@
 """Tests for config layering (P11)."""
+
 from __future__ import annotations
 
 import os
@@ -101,7 +102,7 @@ def test_save_and_load_roundtrip():
         )
         save_config(config, path)
         assert path.exists()
-        
+
         loaded = load_config(explicit_path=path)
         # db_path gets ~ expanded
         assert "test.db" in (loaded.db_path or "")
@@ -110,4 +111,5 @@ def test_save_and_load_roundtrip():
 
 if __name__ == "__main__":
     import pytest
+
     pytest.main([__file__, "-v"])

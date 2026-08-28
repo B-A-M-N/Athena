@@ -8,6 +8,7 @@ model never sees a runtime that doesn't exist.
 from __future__ import annotations
 
 import queue
+import secrets
 import shutil
 import subprocess
 import threading
@@ -41,12 +42,17 @@ class PowerShellRuntime(BaseRuntime):
     def available() -> bool:
         return shutil.which("pwsh") is not None or shutil.which("powershell") is not None
 
-    def _make_session(self, *, env=None, cwd=None, sandbox_root=None,
-                      network_policy=None) -> "_PSSession":
+    def _make_session(
+        self, *, env=None, cwd=None, sandbox_root=None, network_policy=None
+    ) -> "_PSSession":
         cmd = "pwsh" if shutil.which("pwsh") else "powershell"
         sess = _PSSession(
-            env=env, cwd=cwd, start_cmd=[cmd, "-NoProfile", "-NoLogo"],
-            sandbox_root=sandbox_root, network_policy=network_policy)
+            env=env,
+            cwd=cwd,
+            start_cmd=[cmd, "-NoProfile", "-NoLogo"],
+            sandbox_root=sandbox_root,
+            network_policy=network_policy,
+        )
         sess.start()
         return sess
 
@@ -63,8 +69,7 @@ class PowerShellRuntime(BaseRuntime):
 class _PSSession:
     """One long-lived PowerShell process speaking the marker protocol."""
 
-    def __init__(self, env=None, cwd=None, start_cmd=None, sandbox_root=None,
-                 network_policy=None):
+    def __init__(self, env=None, cwd=None, start_cmd=None, sandbox_root=None, network_policy=None):
         self.env = env or {}
         self.cwd = cwd
         self.start_cmd = start_cmd
@@ -75,6 +80,7 @@ class _PSSession:
         self.done = threading.Event()
         self.exit_code: int | None = 0
         self._exit_lock = threading.Lock()
+        self._marker: str | None = None
 
     def start(self) -> None:
         self.process = spawn_owned(
@@ -117,10 +123,11 @@ class _PSSession:
     def _handle_stream(self, stream, is_error):
         try:
             for line in iter(stream.readline, ""):
-                if detect_end_of_execution(line):
-                    marker, _, rest = line.partition("##end_of_execution##")
-                    if marker:
-                        self.output_queue.put({"err": is_error, "text": strip_active_line(marker)})
+                marker_token = self._marker
+                if marker_token and detect_end_of_execution(line, marker_token):
+                    output, _, rest = line.partition(marker_token)
+                    if output:
+                        self.output_queue.put({"err": is_error, "text": strip_active_line(output)})
                     code = _parse_marker_exit_code(rest)
                     if code is not None:
                         with self._exit_lock:
@@ -149,6 +156,7 @@ class _PSSession:
             return
 
         self.done.clear()
+        self._marker = f"##athena_end_{secrets.token_hex(16)}##"
         with self._exit_lock:
             self.exit_code = 0
         try:
@@ -157,7 +165,7 @@ class _PSSession:
                 "{\n"
                 f"{code}\n"
                 "} ; $athena_rc = $LASTEXITCODE\n"
-                "Write-Output \"##end_of_execution##$athena_rc\"\n"
+                f'Write-Output "{self._marker}$athena_rc"\n'
             )
             if process.stdin is None:
                 raise BrokenPipeError("PowerShell stdin is unavailable")

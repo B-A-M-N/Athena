@@ -4,7 +4,9 @@ import json
 
 import pytest
 
+from athena.affordances import CapabilityFabric
 from athena.affordances.scratch import ScratchManager
+from athena.capabilities.registry import CapabilityRegistry
 from athena.capabilities.scratch import ScratchCapability
 from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus
 from athena.protocol.tasks import WorkspaceSpec
@@ -41,22 +43,21 @@ async def test_scratch_runs_once_without_registering_or_promoting():
 async def test_scratch_rejects_host_escape_before_execution():
     scratch = ScratchManager()
     capability = ScratchCapability(SynthesisEngine(), scratch)
-    result = await capability.invoke(CapabilityRequest(
-        capability_id="scratch",
-        task_id="task-2",
-        call_id="scratch-2",
-        arguments={
-            "operation": "run",
-            "code": "import subprocess\ndef run(args):\n return subprocess.run(args)\n",
-            "args": {},
-        },
-    ))
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="scratch",
+            task_id="task-2",
+            call_id="scratch-2",
+            arguments={
+                "operation": "run",
+                "code": "import subprocess\ndef run(args):\n return subprocess.run(args)\n",
+                "args": {},
+            },
+        )
+    )
 
     assert result.status is CapabilityResultStatus.FAILED
-    assert (
-        "security" in (result.error or "")
-        or "host/process" in (result.error or "")
-    )
+    assert "security" in (result.error or "") or "host/process" in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -79,10 +80,54 @@ async def test_scratch_can_read_task_workspace_without_host_path_access(tmp_path
                 "args": {"path": "/workspace/input.txt"},
             },
         ),
-        context=type("Context", (), {
-            "workspace": WorkspaceSpec(id="repo", root=str(tmp_path)),
-        })(),
+        context=type(
+            "Context",
+            (),
+            {
+                "workspace": WorkspaceSpec(id="repo", root=str(tmp_path)),
+            },
+        )(),
     )
 
     assert result.status is CapabilityResultStatus.OK
     assert json.loads(result.output) == {"text": "alpha"}
+
+
+@pytest.mark.asyncio
+async def test_repeated_scratch_inputs_auto_elevate_to_task_capability():
+    scratch = ScratchManager()
+    fabric = CapabilityFabric(CapabilityRegistry())
+    capability = ScratchCapability(SynthesisEngine(), scratch, fabric)
+    code = "def run(args):\n    return {'double': args['value'] * 2}\n"
+
+    first = await capability.invoke(
+        CapabilityRequest(
+            capability_id="scratch",
+            task_id="task-elevate",
+            call_id="scratch-4",
+            arguments={
+                "operation": "run",
+                "code": code,
+                "args": {"value": 2},
+            },
+        )
+    )
+    scratch_id = first.metadata["scratch_id"]
+    assert "promotion" not in first.metadata
+
+    second = await capability.invoke(
+        CapabilityRequest(
+            capability_id="scratch",
+            task_id="task-elevate",
+            call_id="scratch-5",
+            arguments={
+                "operation": "run",
+                "scratch_id": scratch_id,
+                "args": {"value": 3},
+            },
+        )
+    )
+
+    assert second.status is CapabilityResultStatus.OK
+    assert second.metadata["promotion"]["status"] == "task_reusable"
+    assert fabric.has(scratch_id, task_id="task-elevate")

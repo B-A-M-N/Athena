@@ -73,17 +73,14 @@ class KittyGraphicsProtocol:
         self._asset_ids.add(asset.asset_id)
         encoded = base64.b64encode(asset.data).decode("ascii")
         chunks = [
-            encoded[index:index + self.MAX_CHUNK]
+            encoded[index : index + self.MAX_CHUNK]
             for index in range(0, len(encoded), self.MAX_CHUNK)
         ] or [""]
         commands: list[str] = []
         for index, chunk in enumerate(chunks):
             more = 1 if index < len(chunks) - 1 else 0
             if index == 0:
-                control = (
-                    f"a=t,f={self._format(asset)},i={asset.asset_id},"
-                    f"q=2,m={more}"
-                )
+                control = f"a=t,f={self._format(asset)},i={asset.asset_id},q=2,m={more}"
             else:
                 control = f"q=2,m={more}"
             commands.append(self._escape(control, chunk))
@@ -96,8 +93,7 @@ class KittyGraphicsProtocol:
             self.encode(asset)
             + f"\x1b[{max(y, 0) + 1};{max(x, 0) + 1}H"
             + self._escape(
-                f"a=p,i={asset.asset_id},c={max(columns, 1)},"
-                f"r={max(rows, 1)},C=1,z=-1,q=2"
+                f"a=p,i={asset.asset_id},c={max(columns, 1)},r={max(rows, 1)},C=1,z=-1,q=2"
             )
         )
 
@@ -119,18 +115,13 @@ class KittyGraphicsProtocol:
         distinguish a graphics response from a terminal that merely echoes or
         ignores APC sequences.
         """
-        return (
-            f"\x1b_Ga=q,i={cls.QUERY_ID},s=1,v=1,t=d,f=24,q=0;AAAA\x1b\\"
-            "\x1b[c"
-        )
+        return f"\x1b_Ga=q,i={cls.QUERY_ID},s=1,v=1,t=d,f=24,q=0;AAAA\x1b\\\x1b[c"
 
 
 class KittyCapabilityProbe:
     """Probe and parse an actual Kitty graphics response."""
 
-    _RESPONSE = re.compile(
-        r"\x1b_G(?P<control>[^;]*)?;(?P<body>[^\x1b]*)\x1b\\"
-    )
+    _RESPONSE = re.compile(r"\x1b_G(?P<control>[^;]*)?;(?P<body>[^\x1b]*)\x1b\\")
 
     @classmethod
     def confirmed(cls, response: str | bytes | None) -> bool:

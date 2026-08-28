@@ -47,10 +47,19 @@ class EventCategory(str, enum.Enum):
     POLICY_DECISION_MADE = "PolicyDecisionMade"
     APPROVAL_REQUESTED = "ApprovalRequested"
     APPROVAL_RESOLVED = "ApprovalResolved"
+    EXTERNAL_EFFECT_RECOVERY_REQUIRED = "ExternalEffectRecoveryRequired"
     CAPABILITY_STARTED = "CapabilityStarted"
     CAPABILITY_PROGRESS = "CapabilityProgress"
     CAPABILITY_COMPLETED = "CapabilityCompleted"
     CAPABILITY_FAILED = "CapabilityFailed"
+    MUTATION_PREPARED = "MutationPrepared"
+    MUTATION_RECORDED = "MutationRecorded"
+    MUTATION_ROLLED_BACK = "MutationRolledBack"
+    DIAGNOSTICS_PRODUCED = "DiagnosticsProduced"
+    INSTRUMENT_PRODUCED = "InstrumentProduced"
+    VERIFICATION_STARTED = "VerificationStarted"
+    VERIFICATION_CHECK_COMPLETED = "VerificationCheckCompleted"
+    VERIFICATION_COMPLETED = "VerificationCompleted"
     RUNTIME_SESSION_CREATED = "RuntimeSessionCreated"
     RUNTIME_STATE_LOST = "RuntimeStateLost"
     EXECUTION_STARTED = "ExecutionStarted"
@@ -60,7 +69,6 @@ class EventCategory(str, enum.Enum):
     EXECUTION_INTERRUPTED = "ExecutionInterrupted"
     EXECUTION_TIMED_OUT = "ExecutionTimedOut"
     ARTIFACT_CREATED = "ArtifactCreated"
-    MUTATION_RECORDED = "MutationRecorded"
     MUTATION_RECORD_FAILED = "MutationRecordFailed"
     MEMORY_CANDIDATE_CREATED = "MemoryCandidateCreated"
     MEMORY_WRITTEN = "MemoryWritten"
@@ -94,6 +102,7 @@ def make_event(
     causal_id: str | None = None,
 ) -> Event:
     from athena.protocol.ids import new_id
+
     return Event(
         id=id or new_id("evt"),
         type=type,

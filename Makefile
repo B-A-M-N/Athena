@@ -1,4 +1,4 @@
-.PHONY: format format-check lint typecheck compile test check scenarios arch-lint native-check native-test native-smoke
+.PHONY: format format-check lint typecheck compile test check scenarios arch-lint native-check native-test native-smoke release-check
 
 UV ?= uv
 RUFF := $(UV) run ruff
@@ -47,6 +47,13 @@ native-test:
 
 native-smoke:
 	scripts/native-smoke
+
+# Resolve RELEASE_SHA once, build a clean detached worktree at that commit,
+# and run the complete release gate there.  A dirty developer checkout is
+# intentionally not treated as release evidence.
+release-check:
+	$(if $(RELEASE_SHA),scripts/release-check --sha "$(RELEASE_SHA)",scripts/release-check) \
+		$(if $(RELEASE_EVIDENCE_DIR),--evidence-dir "$(RELEASE_EVIDENCE_DIR)",)
 
 # The default merge gate is deterministic and does not mutate the checkout.
 # Use `make format` to apply the formatter and `make test` for the full suite.

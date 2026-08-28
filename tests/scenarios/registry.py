@@ -45,6 +45,7 @@ Family               Meaning
 ``WORLD-*``          TaskWorldState projection correctness
 ``CLAIM-*``          claim/evidence binding and staleness
 ``TX-*``             shadow execution, commit/discard, effect truthfulness
+``REALITY-*``        exact-base commit, mutation CAS, retained recovery state
 ``FORK-*``           causal task branching
 ``ENV-*``            environment discovery and project adaptation
 ``RECOVERY-*``       hard-kill/restart truthfulness
@@ -75,9 +76,7 @@ class Scenario:
         if self.status == "MISSING":
             # A declared gap must not carry evidence that could fake a pass.
             if self.nodeids or self.probe:
-                raise ValueError(
-                    f"{self.id}: MISSING scenarios must not bind evidence"
-                )
+                raise ValueError(f"{self.id}: MISSING scenarios must not bind evidence")
         elif not self.nodeids and not self.probe:
             raise ValueError(f"{self.id}: READY scenarios need nodeids or probe")
 
@@ -133,6 +132,38 @@ FUSE = (
             "tests/unit/kernel/test_kernel_loop.py::test_scripted_capability_then_answer_runs_two_iterations",
         ),
     ),
+    Scenario(
+        id="FUSE-005",
+        family="FUSE",
+        title="Durable workflow resume reuses completed receipts and rejects drift",
+        nodeids=(
+            "tests/unit/workflows/test_executor.py::test_workflow_resume_is_bound_to_definition_inputs_and_owner",
+            "tests/unit/workflows/test_executor.py::test_workflow_inflight_step_requires_recovery_instead_of_redispatch",
+            "tests/unit/workflows/test_executor.py::test_workflow_reconciles_applied_receipt_without_redispatch",
+            "tests/unit/workflows/test_executor.py::test_workflow_item_receipt_is_normalized_and_call_indexed",
+            "tests/unit/workflows/test_executor.py::test_same_process_approval_replay_keeps_workflow_identity",
+        ),
+        notes=(
+            "Workflow composition remains a dispatcher-bound execution path: "
+            "completed call receipts are replayed, immutable run identity is "
+            "checked, and an in-flight effect fails closed for recovery."
+        ),
+    ),
+    Scenario(
+        id="FUSE-006",
+        family="FUSE",
+        title="Verified external outcomes resume workflows without redispatch",
+        nodeids=(
+            "tests/unit/workflows/test_executor.py::test_external_failure_keeps_workflow_item_recoverable",
+            "tests/unit/workflows/test_executor.py::test_verified_external_receipt_resumes_workflow_without_redispatch",
+            "tests/unit/capabilities/test_workflow_promotion.py::test_workflow_recovery_uses_durable_external_receipt",
+        ),
+        notes=(
+            "An unknown external result remains APPLYING until a durable receipt "
+            "is verified; recovery then resumes the exact workflow item without "
+            "issuing the external mutation again."
+        ),
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -172,7 +203,7 @@ SYNTH = (
         title="Generated machinery reuse: proof stats and skill promotion after two uses",
         nodeids=(
             "tests/unit/synthesis/test_synthesis.py::test_proof_for_returns_usage_stats",
-            "tests/unit/synthesis/test_synthesis.py::test_to_skill_candidate_requires_two_uses",
+            "tests/unit/synthesis/test_synthesis.py::test_to_skill_candidate_requires_diverse_repeated_success",
         ),
     ),
     Scenario(
@@ -183,6 +214,39 @@ SYNTH = (
             "tests/unit/capabilities/test_synthesis_capability.py::test_model_can_create_task_local_tool",
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_generates_strict_input_schema_from_fixtures",
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_output_schema_inference_distinguishes_booleans",
+        ),
+    ),
+    Scenario(
+        id="SYNTH-006",
+        family="SYNTH",
+        title="Generated tools compose declared native capabilities through the dispatcher",
+        nodeids=(
+            "tests/unit/synthesis/test_synthesis.py::test_generated_host_calls_reenter_dispatcher_from_child",
+            "tests/unit/synthesis/test_synthesis.py::test_generated_host_can_use_declared_native_write_ceiling",
+            "tests/unit/synthesis/test_synthesis.py::test_generated_validation_rejects_undeclared_native_write",
+        ),
+        notes=(
+            "Generated Python remains sandboxed; athena.call crosses a framed "
+            "parent boundary and is re-authorized by the canonical dispatcher."
+        ),
+    ),
+    Scenario(
+        id="SYNTH-007",
+        family="SYNTH",
+        title="Successful workflow execution feeds the governed learning lifecycle",
+        nodeids=(
+            "tests/unit/knowledge/test_pipeline.py::test_successful_workflow_execution_enters_same_learning_store",
+            "tests/unit/knowledge/test_pipeline.py::test_repeated_workflow_observations_merge_through_learning_store",
+            "tests/unit/knowledge/test_pipeline.py::test_procedure_learning_excludes_capsule_transport_calls",
+            "tests/unit/knowledge/test_pipeline.py::test_partial_task_does_not_create_workflow_candidate",
+            "tests/unit/knowledge/test_pipeline.py::test_recovery_workflow_does_not_enter_learning_store",
+            "tests/unit/capabilities/test_workflow_promotion.py::test_failed_workflow_does_not_notify_learning_observer",
+            "tests/unit/capabilities/test_workflow_promotion.py::test_workflow_promotion_requires_distinct_observations",
+        ),
+        notes=(
+            "Completed executions become reviewable workflow candidates with "
+            "verification provenance; recovery and single-observation candidates "
+            "cannot become reusable automation."
         ),
     ),
 )
@@ -197,6 +261,7 @@ AUTH = (
         title="Generated-capability promotion is policy checked and task scoped",
         nodeids=(
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_promotion_is_policy_checked",
+            "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_promotion_requires_diverse_live_proof",
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_requires_task_scope",
         ),
     ),
@@ -330,6 +395,7 @@ BODY = (
             "tests/e2e/test_real_execution.py::test_shell_execution_runs_real_runtime",
             "tests/e2e/test_real_execution.py::test_python_execution_prints_4",
             "tests/e2e/test_real_execution.py::test_persistent_python_session_keeps_state",
+            "tests/unit/execution/test_shell_runtime.py::test_shell_completion_marker_is_invocation_specific_and_exact",
         ),
     ),
     Scenario(
@@ -345,25 +411,22 @@ BODY = (
     Scenario(
         id="BODY-005",
         family="BODY",
-        title="Debugger capability is honestly unavailable; refuses all operations",
+        title="Debugger capability uses governed DAP execution",
         nodeids=tuple(
-            f"tests/unit/capabilities/test_debugger.py::{t}" for t in (
-                "test_descriptor_is_unavailable",
-                "test_launch_refused_while_unavailable",
-                "test_all_operations_refused",
+            f"tests/unit/capabilities/test_debugger.py::{t}"
+            for t in (
+                "test_descriptor_tracks_optional_debugpy_installation",
+                "test_launch_requires_execution_manager",
+                "test_launch_and_breakpoint_use_governed_runtime",
                 "test_close_all_is_safe_with_no_sessions",
                 "test_session_ownership_is_enforced",
             )
         ),
         notes=(
-            "FIXED (was declared gap): debugger.py deliberately keeps itself "
-            "off the model surface (Availability.UNAVAILABLE) because its "
-            "launch helper would create a raw host subprocess outside "
-            "ExecutionManager and it has no DAP client. These tests pin the "
-            "honesty contract: every op refuses with the documented reason, "
-            "no session is created, no process spawns, and cleanup is safe. "
-            "Full DAP attach/stepping remains future work (documented in the "
-            "descriptor)."
+            "FIXED: debugpy is optional, but when installed the capability "
+            "launches the debuggee through ExecutionManager and owns a "
+            "localhost DAP client. Workspace scope, task ownership, and "
+            "loopback network policy remain enforced."
         ),
     ),
     Scenario(
@@ -492,6 +555,180 @@ TX = (
             "tests/unit/fusion/test_orchestrator.py::test_invariant_violation_blocks_commit",
         ),
     ),
+    Scenario(
+        id="TX-006",
+        family="TX",
+        title="Service control uses durable prepare/apply/verify/compensate receipts",
+        nodeids=(
+            "tests/unit/capabilities/test_environment.py::test_service_external_transaction_is_idempotent_verifiable_and_reversible",
+            "tests/unit/capabilities/test_environment.py::test_reconstructed_service_capability_refuses_apply_after_crash",
+            "tests/unit/capabilities/test_effect_routing.py::test_service_transaction_phases_have_exact_external_effect_contracts",
+        ),
+        notes=(
+            "Systemd is outside the filesystem shadow. The explicit transaction "
+            "protocol records identity, prevents duplicate apply, verifies state, "
+            "and requires the prepared inverse for compensation."
+        ),
+    ),
+    Scenario(
+        id="TX-007",
+        family="TX",
+        title="Database writes use durable idempotent reversible receipts",
+        nodeids=(
+            "tests/unit/capabilities/test_environment.py::test_database_external_transaction_is_idempotent_verifiable_and_reversible",
+            "tests/unit/capabilities/test_environment.py::test_reconstructed_database_capability_refuses_apply_after_crash",
+            "tests/unit/capabilities/test_environment.py::test_database_external_apply_is_approval_gated_by_canonical_dispatcher",
+            "tests/unit/capabilities/test_effect_routing.py::test_database_transaction_phases_have_exact_external_effect_contracts",
+        ),
+        notes=(
+            "SQLite commits outside the shadow workspace are represented by a "
+            "pre-image receipt, stable idempotency key, verification hash/query, "
+            "and compensation restore."
+        ),
+    ),
+    Scenario(
+        id="TX-008",
+        family="TX",
+        title="HTTP external effects distinguish apply, recovery, and compensation proof",
+        nodeids=(
+            "tests/unit/capabilities/test_environment.py::test_http_external_transaction_has_receipts_idempotency_and_compensation",
+            "tests/unit/capabilities/test_environment.py::test_http_external_transaction_marks_uncertain_apply_recovery",
+            "tests/unit/capabilities/test_environment.py::test_http_external_transaction_rejects_non_success_apply",
+            "tests/unit/capabilities/test_environment.py::test_reconstructed_http_capability_refuses_apply_after_crash",
+        ),
+        notes=(
+            "A remote response is not treated as generic success: unknown apply "
+            "outcomes require verification, and compensation remains SENT until "
+            "a separate verification produces COMPENSATION_VERIFIED."
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# REALITY — reality-bound commit and restart integrity
+# ---------------------------------------------------------------------------
+REALITY = (
+    Scenario(
+        id="REALITY-001",
+        family="REALITY",
+        title="Reality classification is deterministic and explainable",
+        nodeids=(
+            "tests/unit/reality/test_beta_contracts.py::test_reality_classifier_is_deterministic_and_explainable",
+        ),
+    ),
+    Scenario(
+        id="REALITY-002",
+        family="REALITY",
+        title="Verified candidate completion commits through the canonical path",
+        nodeids=(
+            "tests/unit/capabilities/test_reality_coordinator.py::test_simple_patch_reaches_real_workspace_only_after_verification",
+            "tests/unit/capabilities/test_reality_integrity.py::test_internal_preimage_cas_refuses_stale_write",
+        ),
+    ),
+    Scenario(
+        id="REALITY-003",
+        family="REALITY",
+        title="Verification failure cannot complete or leak a candidate",
+        nodeids=(
+            "tests/unit/capabilities/test_reality_coordinator.py::test_unverified_candidate_yields_partial_not_complete",
+        ),
+    ),
+    Scenario(
+        id="REALITY-004",
+        family="REALITY",
+        title="Stale verification certificates fail closed",
+        nodeids=(
+            "tests/unit/shadow/test_commit_discard.py::test_commit_through_ask_profile_suspends_instead_of_auto_approving",
+        ),
+    ),
+    Scenario(
+        id="REALITY-005",
+        family="REALITY",
+        title="Complete-base drift retains the candidate and preserves reality",
+        nodeids=(
+            "tests/unit/shadow/test_commit_discard.py::test_commit_returns_conflict_when_reality_drifted",
+        ),
+    ),
+    Scenario(
+        id="REALITY-006",
+        family="REALITY",
+        title="Active candidate branches rehydrate after restart",
+        nodeids=(
+            "tests/unit/shadow/test_shadow_manifest.py::test_shadow_branch_metadata_survives_engine_restart",
+        ),
+    ),
+    Scenario(
+        id="REALITY-007",
+        family="REALITY",
+        title="Interrupted commits become explicit recovery state",
+        nodeids=(
+            "tests/unit/shadow/test_shadow_manifest.py::test_interrupted_commit_reconciles_without_guessing_outcome",
+        ),
+    ),
+    Scenario(
+        id="REALITY-008",
+        family="REALITY",
+        title="Restart refuses finalization after proven workspace drift",
+        nodeids=(
+            "tests/unit/reality/test_beta_contracts.py::test_restart_completion_refuses_final_workspace_drift",
+        ),
+    ),
+    Scenario(
+        id="REALITY-009",
+        family="REALITY",
+        title="Transactional compensation restores the owned checkpoint",
+        nodeids=(
+            "tests/unit/capabilities/test_reality_gate_escalation.py::test_transactional_checkpoints_real_workspace_and_compensates",
+        ),
+    ),
+    Scenario(
+        id="REALITY-010",
+        family="REALITY",
+        title="Transactional compensation refuses unrelated drift",
+        nodeids=(
+            "tests/unit/capabilities/test_reality_integrity.py::test_transaction_compensation_refuses_unrelated_drift_after_owned_write",
+        ),
+    ),
+    Scenario(
+        id="REALITY-011",
+        family="REALITY",
+        title="Rollback refuses to overwrite externally changed reality",
+        nodeids=(
+            "tests/unit/capabilities/test_reality_integrity.py::test_rollback_refuses_to_overwrite_external_edit",
+        ),
+    ),
+    Scenario(
+        id="REALITY-012",
+        family="REALITY",
+        title="Unsupported resource types are rejected before commit",
+        nodeids=(
+            "tests/unit/shadow/test_commit_discard.py::test_commit_retains_and_reports_unsupported_symlink",
+        ),
+    ),
+    Scenario(
+        id="REALITY-013",
+        family="REALITY",
+        title="Opaque execution is isolated from the real workspace",
+        nodeids=(
+            "tests/unit/capabilities/test_reality_gate.py::test_opaque_execution_cannot_write_the_real_workspace",
+        ),
+    ),
+    Scenario(
+        id="REALITY-014",
+        family="REALITY",
+        title="Transactional verification uses compare-and-swap ownership",
+        nodeids=(
+            "tests/unit/capabilities/test_reality_integrity.py::test_transactional_verification_uses_cas_against_verified_revision",
+        ),
+    ),
+    Scenario(
+        id="REALITY-015",
+        family="REALITY",
+        title="Completion recovery fails closed without final reality identity",
+        nodeids=(
+            "tests/unit/capabilities/test_reality_integrity.py::test_completion_recovery_requires_fingerprint_and_final_identity",
+        ),
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -592,6 +829,16 @@ RECOVERY = (
             "tests/crash/test_scheduler_recovery.py::test_job_not_fired_before_stop_fires_after_restart",
         ),
     ),
+    Scenario(
+        id="RECOVERY-004",
+        family="RECOVERY",
+        title="External effects fail closed on restart and remain explicitly recoverable",
+        nodeids=(
+            "tests/unit/state/test_external_effects.py::test_startup_reconciles_inflight_external_effect",
+            "tests/unit/state/test_external_effects.py::test_prepared_external_effect_remains_actionable_after_startup_reconcile",
+            "tests/unit/state/test_external_effects.py::test_recovery_provenance_survives_durable_restart",
+        ),
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -686,13 +933,37 @@ VHS = (
 )
 
 SCENARIOS: tuple[Scenario, ...] = (
-    *FUSE, *SYNTH, *AUTH, *COMPAT, *BODY, *WORLD, *CLAIM, *TX,
-    *FORK, *ENV, *RECOVERY, *PROJECTION, *VHS,
+    *FUSE,
+    *SYNTH,
+    *AUTH,
+    *COMPAT,
+    *BODY,
+    *WORLD,
+    *CLAIM,
+    *TX,
+    *FORK,
+    *ENV,
+    *RECOVERY,
+    *PROJECTION,
+    *VHS,
+    *REALITY,
 )
 
 FAMILY_ORDER: tuple[str, ...] = (
-    "FUSE", "SYNTH", "AUTH", "COMPAT", "BODY", "WORLD", "CLAIM", "TX",
-    "FORK", "ENV", "RECOVERY", "PROJECTION", "VHS",
+    "FUSE",
+    "SYNTH",
+    "AUTH",
+    "COMPAT",
+    "BODY",
+    "WORLD",
+    "CLAIM",
+    "TX",
+    "FORK",
+    "ENV",
+    "RECOVERY",
+    "PROJECTION",
+    "VHS",
+    "REALITY",
 )
 
 FAMILY_DESCRIPTIONS: dict[str, str] = {
@@ -709,6 +980,7 @@ FAMILY_DESCRIPTIONS: dict[str, str] = {
     "RECOVERY": "hard-kill/restart truthfulness",
     "PROJECTION": "consistent CLI/OI/raw/body/API views",
     "VHS": "deterministic demo rendering and artifact validation",
+    "REALITY": "exact-base commit, mutation CAS, retained recovery state",
 }
 
 # Audit-mandated families that have no registered scenarios at all would be a

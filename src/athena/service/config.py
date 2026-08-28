@@ -16,16 +16,22 @@ Config layering (deterministic precedence, lowest to highest):
 5. Environment variables (``ATHENA_*`` prefix)
 6. Explicit CLI flags (highest precedence)
 """
+
 from __future__ import annotations
 
 import json
+from importlib import import_module
 import os
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from athena.protocol.tasks import AutonomyLevel
+
+try:
+    tomllib = import_module("tomllib")
+except ModuleNotFoundError:  # pragma: no cover - legacy/minimal Python builds
+    tomllib = import_module("tomli")
 
 __all__ = [
     "AthenaConfig",
@@ -141,7 +147,7 @@ class AthenaConfig:
     mcp_servers: tuple[MCPConfig, ...] = ()
     context_window: int = 128_000
     reserve_output: int = 4096
-    worker_max_parallel: int = 4
+    worker_max_parallel: int = 16
     scheduler_interval_seconds: float = 1.0
     scheduler_max_concurrent: int = 0
     profile: str | None = None
@@ -187,11 +193,7 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     """
     result = dict(base)
     for key, value in override.items():
-        if (
-            key in result
-            and isinstance(result[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = deep_merge(result[key], value)
         else:
             result[key] = value
@@ -270,9 +272,7 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
     if config.workspace_root is not None:
         d["workspace_root"] = config.workspace_root
     d["autonomy"] = (
-        config.autonomy.value
-        if isinstance(config.autonomy, AutonomyLevel)
-        else config.autonomy
+        config.autonomy.value if isinstance(config.autonomy, AutonomyLevel) else config.autonomy
     )
     if config.artifact_root is not None:
         d["artifact_root"] = config.artifact_root
@@ -292,16 +292,28 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["profile"] = config.profile
     if config.providers:
         d["providers"] = [
-            {"kind": p.kind, "name": p.name, "model": p.model,
-             "credential_id": p.credential_id, "api_key": p.api_key,
-             "base_url": p.base_url, **dict(p.extra)}
+            {
+                "kind": p.kind,
+                "name": p.name,
+                "model": p.model,
+                "credential_id": p.credential_id,
+                "api_key": p.api_key,
+                "base_url": p.base_url,
+                **dict(p.extra),
+            }
             for p in config.providers
         ]
     if config.mcp_servers:
         d["mcp_servers"] = [
-            {"name": m.name, "command": m.command, "args": list(m.args),
-             "url": m.url, "env": dict(m.env), "secret_env": dict(m.secret_env),
-             "connect_timeout": m.connect_timeout}
+            {
+                "name": m.name,
+                "command": m.command,
+                "args": list(m.args),
+                "url": m.url,
+                "env": dict(m.env),
+                "secret_env": dict(m.secret_env),
+                "connect_timeout": m.connect_timeout,
+            }
             for m in config.mcp_servers
         ]
     if config.model_roles:
@@ -330,12 +342,8 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
 def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
     """Build an ``AthenaConfig`` from a plain dict (e.g. parsed from TOML)."""
     # Handle nested sub-configs
-    providers = tuple(
-        _parse_provider(p) for p in data.get("providers", ()) if isinstance(p, dict)
-    )
-    mcp_servers = tuple(
-        _parse_mcp(m) for m in data.get("mcp_servers", ()) if isinstance(m, dict)
-    )
+    providers = tuple(_parse_provider(p) for p in data.get("providers", ()) if isinstance(p, dict))
+    mcp_servers = tuple(_parse_mcp(m) for m in data.get("mcp_servers", ()) if isinstance(m, dict))
     # skills_paths may be a list in TOML
     skills = data.get("skills_paths", ())
     if isinstance(skills, list):
@@ -369,13 +377,10 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         model_roles=dict(data.get("model_roles") or {}),
         research_allowed_domains=_domains(data.get("research_allowed_domains")),
         research_denied_domains=_domains(data.get("research_denied_domains")),
-        research_allow_private_network=bool(
-            data.get("research_allow_private_network", False)),
+        research_allow_private_network=bool(data.get("research_allow_private_network", False)),
         mascot=data.get("mascot"),
         mascots={
-            str(k): dict(v)
-            for k, v in (data.get("mascots") or {}).items()
-            if isinstance(v, dict)
+            str(k): dict(v) for k, v in (data.get("mascots") or {}).items() if isinstance(v, dict)
         },
         display=display,
         animations=bool(data.get("animations", True)),
@@ -428,7 +433,10 @@ def _env_map() -> dict[str, Any]:
             "model_roles",
             lambda v: json.loads(v) if isinstance(v, str) else v,
         ),
-        "ATHENA_SKILLS_PATHS": ("skills_paths", lambda v: tuple(p.strip() for p in v.split(",") if p.strip())),
+        "ATHENA_SKILLS_PATHS": (
+            "skills_paths",
+            lambda v: tuple(p.strip() for p in v.split(",") if p.strip()),
+        ),
         "ATHENA_RESEARCH_ALLOWED_DOMAINS": (
             "research_allowed_domains",
             lambda v: tuple(p.strip() for p in v.split(",") if p.strip()),
@@ -520,9 +528,7 @@ def load_config(
         if key in merged and isinstance(merged[key], str):
             merged[key] = _expand_user(merged[key])
     if "skills_paths" in merged and isinstance(merged["skills_paths"], (list, tuple)):
-        merged["skills_paths"] = tuple(
-            _expand_user(p) for p in merged["skills_paths"]
-        )
+        merged["skills_paths"] = tuple(_expand_user(p) for p in merged["skills_paths"])
 
     return config_from_dict(merged)
 
@@ -544,14 +550,12 @@ def _extract_profile(data: dict[str, Any], name: str) -> dict[str, Any]:
 def save_config(config: AthenaConfig, path: str | Path) -> None:
     """Save an ``AthenaConfig`` to a TOML file."""
     try:
-        import tomllib  # noqa: F401  # verify tomllib is available
         import tomli_w
     except ImportError as exc:
-        raise RuntimeError(
-            "Saving config requires tomli_w (pip install tomli_w)"
-        ) from exc
+        raise RuntimeError("Saving config requires tomli_w (pip install tomli_w)") from exc
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("wb") as f:
         import tomli_w
+
         tomli_w.dump(config_to_dict(config), f)

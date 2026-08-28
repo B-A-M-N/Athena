@@ -82,9 +82,7 @@ class TaskForker:
             # A file snapshot is intentionally not implied by an event prefix.
             # Fusion supplies a checkpoint when it needs workspace rollback;
             # ordinary forks retain the current workspace explicitly.
-            "workspace_state": (
-                "checkpoint" if workspace_checkpoint_id else "current_at_fork"
-            ),
+            "workspace_state": ("checkpoint" if workspace_checkpoint_id else "current_at_fork"),
             "workspace_checkpoint_id": workspace_checkpoint_id,
         }
 
@@ -93,15 +91,12 @@ class TaskForker:
         fork_root: str | None = None
         if workspace_checkpoint_id is not None:
             if self._checkpoint_manager is None:
-                raise RuntimeError(
-                    "workspace_checkpoint_id requires a CheckpointManager")
+                raise RuntimeError("workspace_checkpoint_id requires a CheckpointManager")
             if workspace is None:
-                raise ValueError(
-                    "workspace_checkpoint_id requires a task workspace")
+                raise ValueError("workspace_checkpoint_id requires a task workspace")
             fork_root = tempfile.mkdtemp(prefix=f"athena-fork-{fork_id}-")
             try:
-                await self._checkpoint_manager.materialize(
-                    workspace_checkpoint_id, fork_root)
+                await self._checkpoint_manager.materialize(workspace_checkpoint_id, fork_root)
             except Exception:
                 # A failed materialization must not leave a task pointing at
                 # an empty partial fork workspace.
@@ -155,18 +150,14 @@ class TaskForker:
             try:
                 task_exists = await store_tasks.get(fork_id) is not None
             except Exception:
-                _logger.exception(
-                    "could not determine ownership of failed fork %s", fork_id
-                )
+                _logger.exception("could not determine ownership of failed fork %s", fork_id)
             if not task_exists:
                 sessions = getattr(self._service, "_sessions", None)
                 if session_id is not None and sessions is not None:
                     try:
                         await sessions.delete_if_orphaned(session_id)
                     except Exception:
-                        _logger.exception(
-                            "failed to remove orphaned fork session %s", session_id
-                        )
+                        _logger.exception("failed to remove orphaned fork session %s", session_id)
                 if fork_root is not None:
                     shutil.rmtree(fork_root, ignore_errors=True)
             raise
@@ -205,10 +196,13 @@ class TaskForker:
 
         count = await messages.count_session_messages(session_id)
         source = await messages.list_session_messages(
-            session_id, limit=max(count, 1), offset=0,
+            session_id,
+            limit=max(count, 1),
+            offset=0,
         )
         selected = [
-            message for message in source
+            message
+            for message in source
             if boundary_timestamp is None or message.created_at <= boundary_timestamp
         ]
         fork_session_id = new_id("session")
@@ -243,9 +237,7 @@ class TaskForker:
             try:
                 await sessions.delete_if_orphaned(fork_session_id)
             except Exception:
-                _logger.exception(
-                    "failed to remove partial fork session %s", fork_session_id
-                )
+                _logger.exception("failed to remove partial fork session %s", fork_session_id)
             raise
         return fork_session_id
 
@@ -259,18 +251,30 @@ class TaskForker:
         out: list[dict] = []
         for ev in await events.list_for_task(task_id):
             payload = dict(ev.payload or {})
-            summary_keys = ("summary", "status", "objective", "reason", "result",
-                            "message", "artifact", "path", "command", "error")
+            summary_keys = (
+                "summary",
+                "status",
+                "objective",
+                "reason",
+                "result",
+                "message",
+                "artifact",
+                "path",
+                "command",
+                "error",
+            )
             bits = {k: payload[k] for k in summary_keys if k in payload}
             if not bits:
                 bits = {k: payload[k] for k in list(payload)[:3]}
-            out.append({
-                "sequence": ev.sequence,
-                "type": ev.type,
-                "timestamp": ev.timestamp.isoformat(),
-                "event_id": ev.id,
-                "payload_bits": bits,
-            })
+            out.append(
+                {
+                    "sequence": ev.sequence,
+                    "type": ev.type,
+                    "timestamp": ev.timestamp.isoformat(),
+                    "event_id": ev.id,
+                    "payload_bits": bits,
+                }
+            )
         return out
 
 

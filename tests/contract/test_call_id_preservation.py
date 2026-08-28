@@ -22,19 +22,23 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.tasks import WorkspaceSpec
 
+
 class _AllowEngine:
     approvals = None
 
     def evaluate(self, request, *, autonomy=None):
         return PolicyDecision(PolicyVerdict.ALLOW, "allow", "stub.allow", ())
 
+
 def _dispatcher(executor):
     reg = CapabilityRegistry()
     reg.register(executor)
     return CapabilityDispatcher(reg, _AllowEngine())
 
+
 def _ws(tmp_path) -> WorkspaceSpec:
     return WorkspaceSpec(id="ws", root=str(tmp_path))
+
 
 @pytest.mark.athena_claim("BHV-116")
 @pytest.mark.athena_evidence("test", "invariant")
@@ -72,7 +76,5 @@ class TestCallIdPreservation:
         cap = FilesystemCapability()
         request = CapabilityRequest("fs", {"operation": "read", "path": "inv.txt"}, "task-1")
         object.__setattr__(request, "call_id", "invoke-call")
-        result = await cap.invoke(
-            request, context=InvocationContext(workspace=_ws(tmp_path))
-        )
+        result = await cap.invoke(request, context=InvocationContext(workspace=_ws(tmp_path)))
         assert result.call_id == "invoke-call"

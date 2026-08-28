@@ -41,9 +41,7 @@ async def test_decision_constructs_terminal_and_nonterminal():
 async def test_final_text_with_no_criteria_is_terminal(evaluator):
     task = TaskSpec(id="t1", objective="hello")
     block = TextBlock(type="text", text="hi")
-    decision = await evaluator.evaluate(
-        task, _response([block]), iterations=1
-    )
+    decision = await evaluator.evaluate(task, _response([block]), iterations=1)
     assert decision.terminal is True
     assert decision.status is not None and decision.status.value == "COMPLETE"
     assert decision.reason == "objective satisfied"
