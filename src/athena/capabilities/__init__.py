@@ -30,6 +30,7 @@ from athena.capabilities.workflow import WorkflowCapability
 from athena.capabilities.synthesis import SynthesisCapability
 from athena.capabilities.scratch import ScratchCapability
 from athena.capabilities.research import ResearchCapability
+from athena.capabilities.git import GitCapability
 
 __all__ = [
     "CapabilityRegistry",
@@ -49,4 +50,5 @@ __all__ = [
     "SynthesisCapability",
     "ScratchCapability",
     "ResearchCapability",
+    "GitCapability",
 ]

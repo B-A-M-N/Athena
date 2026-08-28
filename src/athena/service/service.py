@@ -1887,6 +1887,8 @@ class AthenaService:
         from athena.capabilities.artifacts import ArtifactCapability
 
         registry.register(FilesystemCapability(workspace))
+        from athena.capabilities.git import GitCapability
+        registry.register(GitCapability())
         if self._artifacts is not None:
             registry.register(ArtifactCapability(self._artifacts))
         registry.register(ExecuteCapability(execution, workspace, artifact_store=self._artifacts))

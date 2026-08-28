@@ -100,6 +100,16 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "snapshot": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "restore": frozenset({EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
     },
+    "git": {
+        "status": frozenset({EffectClass.READ_LOCAL}),
+        "diff": frozenset({EffectClass.READ_LOCAL}),
+        "log": frozenset({EffectClass.READ_LOCAL}),
+        "show": frozenset({EffectClass.READ_LOCAL}),
+        "blame": frozenset({EffectClass.READ_LOCAL}),
+        "branch": frozenset({EffectClass.READ_LOCAL}),
+        "merge_base": frozenset({EffectClass.READ_LOCAL}),
+        "baseline": frozenset({EffectClass.READ_LOCAL}),
+    },
     "fs": {
         "read": frozenset({EffectClass.READ_LOCAL}),
         "list": frozenset({EffectClass.READ_LOCAL}),
