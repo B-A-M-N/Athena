@@ -18,10 +18,13 @@ single capability path — no bypass (INV-004).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta
+import time
 from typing import Any
 
 from athena.capabilities.registry import CapabilityRegistry, validate_schema
@@ -71,6 +74,8 @@ WAITING_APPROVAL = "WAITING_APPROVAL"
 class CapabilityDispatcher:
     """Owns the capability invocation lifecycle and the single policy path."""
 
+    _RESULT_CACHE_TTL = 2.0
+
     def __init__(
         self,
         registry: CapabilityRegistry,
@@ -113,6 +118,10 @@ class CapabilityDispatcher:
         self._reality_gate = None
         self._execution_semaphores: dict[str, asyncio.Semaphore] = {}
         self._resource_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._result_cache: dict[
+            tuple[str | None, str, str, str, str | None],
+            tuple[float, CapabilityResult],
+        ] = {}
 
     def set_reality_gate(self, gate) -> None:
         """Bind the execution authority that resolves speculative workspaces."""
@@ -396,6 +405,29 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
             routed_workspace = route.workspace
             reality_metadata = route.metadata()
 
+        cache_key = _result_cache_key(
+            request, routed_workspace, effects, profile=profile
+        )
+        if cache_key is not None:
+            cached = self._cached_result(cache_key)
+            if cached is not None:
+                await self._emit(EV["CAPABILITY_STARTED"], {
+                    "call_id": request.call_id,
+                    "capability_id": request.capability_id,
+                    "cache": "hit",
+                }, request.task_id, causal_id=request.call_id)
+                result = replace(
+                    cached,
+                    call_id=request.call_id,
+                    metadata={**dict(cached.metadata), "cache_hit": True},
+                )
+                await self._emit(EV["CAPABILITY_COMPLETED"], {
+                    "call_id": request.call_id,
+                    "capability_id": request.capability_id,
+                    "cache": "hit",
+                }, request.task_id, causal_id=request.call_id)
+                return result
+
         await self._emit(EV["CAPABILITY_STARTED"], {
             "call_id": request.call_id, "capability_id": request.capability_id,
         }, request.task_id, causal_id=request.call_id)
@@ -414,6 +446,13 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
             object.__setattr__(result, "metadata", metadata)
         if result.status == CapabilityResultStatus.OK:
             await self._record_mutation(request, result)
+            if _cacheable_effects(effects):
+                if cache_key is not None:
+                    self._result_cache[cache_key] = (
+                        time.monotonic() + self._RESULT_CACHE_TTL, result
+                    )
+            else:
+                self._invalidate_result_cache(routed_workspace.root)
             await self._emit(EV["CAPABILITY_COMPLETED"], {
                 "call_id": request.call_id, "capability_id": request.capability_id,
             }, request.task_id, causal_id=request.call_id)
@@ -423,6 +462,25 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
                 "reason": result.error,
             }, request.task_id, causal_id=request.call_id)
         return result
+
+    def _cached_result(
+        self,
+        key: tuple[str | None, str, str, str, str | None],
+    ) -> CapabilityResult | None:
+        entry = self._result_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, result = entry
+        if time.monotonic() >= expires_at:
+            self._result_cache.pop(key, None)
+            return None
+        return result
+
+    def _invalidate_result_cache(self, workspace_root: str) -> None:
+        root = os.path.realpath(os.path.abspath(workspace_root))
+        for key in list(self._result_cache):
+            if key[1] == root:
+                self._result_cache.pop(key, None)
 
     async def dispatch_many(
         self,
@@ -1062,6 +1120,43 @@ def _resource_key(workspace: WorkspaceSpec, value: str) -> str:
     except ValueError:
         inside = False
     return target if inside else f"external:{target}"
+
+
+def _cacheable_effects(effects: tuple[EffectClass, ...]) -> bool:
+    return bool(effects) and set(effects).issubset({
+        EffectClass.READ_LOCAL, EffectClass.NETWORK_READ,
+    })
+
+
+def _result_cache_key(
+    request: CapabilityRequest,
+    workspace: WorkspaceSpec,
+    effects: tuple[EffectClass, ...],
+    *,
+    profile: str | None,
+) -> tuple[str | None, str, str, str, str | None] | None:
+    if not _cacheable_effects(effects):
+        return None
+    try:
+        arguments = json.dumps(
+            {
+                "workspace_id": workspace.id,
+                "session_id": request.session_id,
+                "arguments": dict(request.arguments or {}),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return None
+    return (
+        request.task_id,
+        os.path.realpath(os.path.abspath(workspace.root)),
+        request.capability_id,
+        arguments,
+        getattr(profile, "value", profile),
+    )
 
 
 _SECRET_VALUE = re.compile(

@@ -22,6 +22,7 @@ from athena.protocol.tasks import ResourceBudget, WorkspaceSpec
 class _SlowExecutor:
     def __init__(self, descriptor: CapabilityDescriptor) -> None:
         self.descriptor = descriptor
+        self.invocations = []
         self.active = 0
         self.max_active = 0
         self.active_by_path: defaultdict[str, int] = defaultdict(int)
@@ -29,6 +30,7 @@ class _SlowExecutor:
         self.seen_budgets: list[ResourceBudget | None] = []
 
     async def invoke(self, request, *, context: InvocationContext | None = None, **_):
+        self.invocations.append(request)
         self.seen_budgets.append(getattr(context, "resource_budget", None))
         path = str(request.arguments.get("path") or "")
         self.active += 1
@@ -125,3 +127,65 @@ async def test_dispatch_many_serializes_conflicting_paths_but_allows_independent
     assert executor.max_by_path["same.txt"] == 1
     assert executor.max_active == 2
 
+
+async def test_successful_reads_are_cached_until_a_mutation_invalidates_them(tmp_path):
+    read_executor = _SlowExecutor(CapabilityDescriptor(
+        id="cached-read",
+        description="test read capability",
+        input_schema={
+            "type": "object",
+            "required": ["path"],
+            "properties": {"path": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        effects=frozenset({EffectClass.READ_LOCAL}),
+    ))
+    write_executor = _SlowExecutor(CapabilityDescriptor(
+        id="cached-write",
+        description="test write capability",
+        input_schema={
+            "type": "object",
+            "required": ["operation", "path"],
+            "properties": {
+                "operation": {"const": "write"},
+                "path": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        effects=frozenset({EffectClass.WRITE_LOCAL}),
+    ))
+    registry = CapabilityRegistry()
+    registry.register(read_executor)
+    registry.register(write_executor)
+    dispatcher = CapabilityDispatcher(registry, PolicyEngine("autonomous"))
+    workspace = _workspace(tmp_path)
+
+    first = await dispatcher.dispatch(
+        _request("cached-read", "read-1", path="state.json"),
+        workspace=workspace,
+        profile="supervised",
+    )
+    second = await dispatcher.dispatch(
+        _request("cached-read", "read-2", path="state.json"),
+        workspace=workspace,
+        profile="supervised",
+    )
+    await dispatcher.dispatch(
+        _request(
+            "cached-write", "write-1", operation="write", path="state.json"
+        ),
+        workspace=workspace,
+        profile="autonomous",
+    )
+    third = await dispatcher.dispatch(
+        _request("cached-read", "read-3", path="state.json"),
+        workspace=workspace,
+        profile="supervised",
+    )
+
+    assert first.status is CapabilityResultStatus.OK
+    assert second.status is CapabilityResultStatus.OK
+    assert second.metadata["cache_hit"] is True
+    assert third.status is CapabilityResultStatus.OK
+    assert "cache_hit" not in third.metadata
+    assert len(read_executor.invocations) == 2
