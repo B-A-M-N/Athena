@@ -97,6 +97,7 @@ class CapabilityDispatchShim:
             workspace=workspace,
             profile=self._profile,
             task_policy=task.capability_policy,
+            task_budget=task.resource_budget,
         )
 
         results: list[CapabilityResultBlock] = []

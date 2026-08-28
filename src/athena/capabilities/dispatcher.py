@@ -18,6 +18,7 @@ single capability path — no bypass (INV-004).
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta
@@ -43,7 +44,7 @@ from athena.protocol.policy import (
     PolicyVerdict,
     Principal,
 )
-from athena.protocol.tasks import CapabilityPolicy, WorkspaceSpec
+from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
 from athena.state.approvals import ApprovalStore
 from athena.state.mutations import MutationStore
 
@@ -110,6 +111,8 @@ class CapabilityDispatcher:
         self._model_id: str | None = None
         self._repair_mode: str | None = None
         self._reality_gate = None
+        self._execution_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._resource_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     def set_reality_gate(self, gate) -> None:
         """Bind the execution authority that resolves speculative workspaces."""
@@ -146,6 +149,7 @@ class CapabilityDispatcher:
         workspace: WorkspaceSpec,
         profile: str | None = None,
         task_policy: CapabilityPolicy | None = None,
+        task_budget: ResourceBudget | None = None,
         _prepared: bool = False,
     ) -> CapabilityResult | SuspendedCall:
         """Execute one capability call through the full lifecycle.
@@ -401,6 +405,7 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
             workspace=routed_workspace,
             execution_backend=routed_workspace.execution_backend,
             capability_policy=task_policy,
+            resource_budget=task_budget,
         )
         result = await executor.invoke(request, context=context)
         if reality_metadata:
@@ -426,6 +431,7 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
         workspace: WorkspaceSpec,
         profile: str | None = None,
         task_policy: CapabilityPolicy | None = None,
+        task_budget: ResourceBudget | None = None,
         preflight: bool = True,
     ) -> list[CapabilityResult | SuspendedCall]:
         """Dispatch multiple independent capability calls in parallel (BHV-041).
@@ -462,13 +468,97 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
                 return [result]
 
         results = await asyncio.gather(
-            *[self.dispatch(r, workspace=workspace, profile=profile,
-                            task_policy=task_policy, _prepared=preflight)
-              for r in requests],
+            *[self._dispatch_with_controls(
+                r, workspace=workspace, profile=profile,
+                task_policy=task_policy, task_budget=task_budget,
+                prepared=preflight,
+            ) for r in requests],
             return_exceptions=True,
         )
         return [_wrap_exception(r, requests[i]) if isinstance(r, BaseException) else r
                 for i, r in enumerate(results)]
+
+    async def _dispatch_with_controls(
+        self,
+        request: CapabilityRequest,
+        *,
+        workspace: WorkspaceSpec,
+        profile: str | None,
+        task_policy: CapabilityPolicy | None,
+        task_budget: ResourceBudget | None,
+        prepared: bool,
+    ):
+        """Apply task concurrency and resource conflict controls.
+
+        The capability itself remains the authority for effects.  This helper
+        only uses the already-declared contract to prevent an unbounded batch
+        from exceeding the task budget or racing requests targeting the same
+        resource.
+        """
+        effects: tuple[EffectClass, ...] = ()
+        try:
+            executor = self._executor_for(request, workspace)
+            effects = self._resolve_effects_for(
+                executor.descriptor, request.arguments or {}
+            )
+        except (CapabilityUnavailable, KeyError, TypeError, ValueError):
+            # dispatch() will return the canonical validation/effect error.
+            pass
+
+        semaphore = None
+        if task_budget is not None and request.task_id and _is_execution(effects):
+            semaphore = self._execution_semaphores.get(request.task_id)
+            if semaphore is None:
+                limit = max(1, int(task_budget.max_parallel_executions))
+                semaphore = asyncio.Semaphore(limit)
+                self._execution_semaphores[request.task_id] = semaphore
+
+        locks = self._locks_for_request(request, workspace, effects)
+        if semaphore is not None:
+            await semaphore.acquire()
+        try:
+            for lock in locks:
+                await lock.acquire()
+            try:
+                return await self.dispatch(
+                    request,
+                    workspace=workspace,
+                    profile=profile,
+                    task_policy=task_policy,
+                    task_budget=task_budget,
+                    _prepared=prepared,
+                )
+            finally:
+                for lock in reversed(locks):
+                    lock.release()
+        finally:
+            if semaphore is not None:
+                semaphore.release()
+
+    def _locks_for_request(
+        self,
+        request: CapabilityRequest,
+        workspace: WorkspaceSpec,
+        effects: tuple[EffectClass, ...],
+    ) -> list[asyncio.Lock]:
+        if not set(effects) & {
+            EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL, EffectClass.DELETE,
+        }:
+            return []
+        args = request.arguments or {}
+        raw_resources = [args.get("path"), args.get("destination")]
+        resources = {
+            _resource_key(workspace, value)
+            for value in raw_resources
+            if isinstance(value, str) and value
+        }
+        if not resources:
+            return []
+        locks: list[asyncio.Lock] = []
+        for resource in sorted(resources):
+            key = (workspace.id or workspace.root, resource)
+            locks.append(self._resource_locks.setdefault(key, asyncio.Lock()))
+        return locks
 
     def _executor_for(self, request: CapabilityRequest,
                       workspace: WorkspaceSpec):
@@ -686,6 +776,7 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
         if fallback is not None:
             return (fallback,)
         return tuple(sorted(available, key=lambda e: e.value))
+
 
     @staticmethod
     def _eval_task_policy(
@@ -951,6 +1042,26 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
         metadata["mutation_event_sequence"] = event_sequence
         metadata["mutation_sequence"] = mutation_sequence
         object.__setattr__(result, "metadata", metadata)
+
+
+def _is_execution(effects: tuple[EffectClass, ...]) -> bool:
+    return bool(set(effects) & {
+        EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS,
+    })
+
+
+def _resource_key(workspace: WorkspaceSpec, value: str) -> str:
+    """Normalize a capability path for conflict locking."""
+    raw = os.path.expanduser(value)
+    root = os.path.realpath(os.path.abspath(workspace.root))
+    target = os.path.realpath(
+        os.path.abspath(raw if os.path.isabs(raw) else os.path.join(root, raw))
+    )
+    try:
+        inside = os.path.commonpath((root, target)) == root
+    except ValueError:
+        inside = False
+    return target if inside else f"external:{target}"
 
 
 _SECRET_VALUE = re.compile(

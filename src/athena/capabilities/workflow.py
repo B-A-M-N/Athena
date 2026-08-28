@@ -145,6 +145,7 @@ class WorkflowCapability:
             workspace=context.workspace, inputs=args.get("inputs"),
             session_id=request.session_id,
             task_policy=getattr(context, "capability_policy", None),
+            task_budget=getattr(context, "resource_budget", None),
         )
         ok = outcome.status == "completed"
         return _result(request, ok=ok, output=json.dumps({

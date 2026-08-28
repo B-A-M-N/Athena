@@ -14,7 +14,7 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
 )
 from athena.protocol.ids import new_id
-from athena.protocol.tasks import CapabilityPolicy, WorkspaceSpec
+from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
 from athena.workflows.models import Workflow
 from athena.workflows.validation import WorkflowValidator
 
@@ -41,6 +41,7 @@ class WorkflowExecutor:
         session_id: str | None = None,
         inputs: Mapping[str, Any] | None = None,
         task_policy: CapabilityPolicy | None = None,
+        task_budget: ResourceBudget | None = None,
     ) -> WorkflowResult:
         validation = WorkflowValidator(self._resolver).validate(workflow)
         if not validation.ok:
@@ -93,6 +94,7 @@ class WorkflowExecutor:
                         nested, task_id=task_id, workspace=workspace,
                         profile=profile, session_id=session_id,
                             inputs=nested_inputs, task_policy=task_policy,
+                            task_budget=task_budget,
                         )
                         step_results.append(dict(nested_result.outputs))
                         if nested_result.status == "suspended":
@@ -117,7 +119,7 @@ class WorkflowExecutor:
                     )
                     result = await self._dispatcher.dispatch(
                         request, workspace=workspace, profile=profile,
-                        task_policy=task_policy)
+                        task_policy=task_policy, task_budget=task_budget)
                     if isinstance(result, SuspendedCall):
                         return WorkflowResult(
                             workflow.id, "suspended", outputs,

@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from athena.protocol.tasks import CapabilityPolicy, WorkspaceSpec
+from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
 
 
 class EffectClass(str, enum.Enum):
@@ -173,6 +173,7 @@ class InvocationContext:
     credentials: Mapping[str, Any] = field(default_factory=dict)
     execution_backend: str = "local"
     capability_policy: CapabilityPolicy | None = None
+    resource_budget: ResourceBudget | None = None
 
 
 class CapabilityResultStatus(str, enum.Enum):
