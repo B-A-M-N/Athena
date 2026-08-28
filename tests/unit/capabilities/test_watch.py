@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,19 @@ def test_file_watch_detects_same_size_edit_with_preserved_timestamp(tmp_path):
     os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
 
     assert watcher.poll() == ["state.txt"]
+
+
+def test_file_watch_reports_bounded_scan_degradation(tmp_path):
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+    watcher = _FileWatch(
+        "watch-1", str(tmp_path), "*.txt", "task-1",
+        max_files=1, max_bytes_per_poll=1,
+    )
+
+    assert watcher.degraded is True
+    assert watcher.scanned_files == 1
+    assert watcher.hashed_bytes == 1
 
 
 @pytest.mark.asyncio
@@ -79,6 +93,37 @@ async def test_watch_path_pattern_and_task_cleanup(tmp_path):
     assert watcher.pattern == "*.json"
     registry.remove_task("task-1")
     assert registry.file_watches == {}
+
+
+@pytest.mark.asyncio
+async def test_process_watch_requires_execution_ownership(monkeypatch):
+    manager = SimpleNamespace(
+        owns_process=lambda task_id, pid, identity: False,
+    )
+    capability = WatchCapability(execution_manager=manager)
+    monkeypatch.setattr("athena.capabilities.watch._process_identity", lambda pid: "start")
+    request = CapabilityRequest(
+        capability_id="watch",
+        arguments={"operation": "process", "pid": os.getpid()},
+        task_id="task-1",
+        call_id="watch-process",
+    )
+
+    result = await capability.invoke(request)
+
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "Athena-owned" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_stopping_unknown_watch_is_a_failure():
+    capability = WatchCapability()
+    result = await capability.invoke(CapabilityRequest(
+        capability_id="watch", task_id="task-1", call_id="watch-stop",
+        arguments={"operation": "stop", "watch_id": "missing"},
+    ))
+
+    assert result.status is CapabilityResultStatus.FAILED
 
 
 def test_watch_registry_close_drops_all_subscriptions(tmp_path):

@@ -36,6 +36,8 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     EffectClass,
 )
+from athena.protocol.events import EV, make_event
+from athena.protocol.ids import new_id
 
 try:
     import pexpect  # type: ignore[import-untyped]
@@ -84,6 +86,10 @@ def _tail_text(data, limit: int = 4000) -> str:
     """Render a screen result (str or list of lines) as a tail-limited string."""
     text = data if isinstance(data, str) else "\n".join(data)
     return text[-limit:]
+
+
+def _screen_text(data: str | list[str]) -> str:
+    return data if isinstance(data, str) else "\n".join(data)
 
 
 def _terminal_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
@@ -208,12 +214,15 @@ class TerminalSessionCapability:
                 "command": {"type": "string"},
                 "text": {"type": "string"},
                 "keys": {"type": "string"},
-                "pattern": {"type": "string"},
-                "timeout": {"type": "number"},
-                "rows": {"type": "integer"},
-                "cols": {"type": "integer"},
+                "pattern": {"type": "string", "maxLength": 512},
+                "timeout": {"type": "number", "exclusiveMinimum": 0,
+                             "maximum": 60},
+                "match": {"type": "string", "enum": ["literal", "regex"]},
+                "rows": {"type": "integer", "minimum": 2, "maximum": 200},
+                "cols": {"type": "integer", "minimum": 10, "maximum": 300},
                 "cwd": {"type": "string"},
             },
+            "additionalProperties": False,
         },
         effects=frozenset({
             EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS,
@@ -223,8 +232,18 @@ class TerminalSessionCapability:
         availability=_TERMINAL_AVAILABILITY,
     )
 
-    def __init__(self) -> None:
+    def __init__(self, event_sink=None) -> None:
         self._sessions: dict[str, _Session] = {}
+        self._event_sink = event_sink
+
+    async def _emit_runtime(self, event_type: str, session: _Session, **payload) -> None:
+        if self._event_sink is None:
+            return
+        await self._event_sink(make_event(
+            event_type,
+            {"session": session.id, **payload},
+            task_id=session.task_id,
+        ))
 
     @staticmethod
     def available() -> bool:
@@ -241,13 +260,23 @@ class TerminalSessionCapability:
     def _escape_keys(self, keys: str):
         """Map friendly names to pexpect escapes; pass through unknown."""
         named = {
-            "enter": "\n", "esc": "\x1b", "tab": "\t",
+            "enter": "\n", "return": "\n", "esc": "\x1b", "tab": "\t",
             "C-c": "\x03", "C-d": "\x04", "C-z": "\x1a",
             "C-l": "\x0c", "backspace": "\x7f",
+            "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C",
+            "left": "\x1b[D", "home": "\x1b[H", "end": "\x1b[F",
+            "pgup": "\x1b[5~", "pageup": "\x1b[5~",
+            "pgdn": "\x1b[6~", "pagedown": "\x1b[6~",
+            "delete": "\x1b[3~", "insert": "\x1b[2~",
+            "f1": "\x1bOP", "f2": "\x1bOQ", "f3": "\x1bOR", "f4": "\x1bOS",
+            "f5": "\x1b[15~", "f6": "\x1b[17~", "f7": "\x1b[18~",
+            "f8": "\x1b[19~", "f9": "\x1b[20~", "f10": "\x1b[21~",
+            "f11": "\x1b[23~", "f12": "\x1b[24~",
         }
         low = keys.strip()
-        if low in named:
-            return named[low]
+        for key, value in named.items():
+            if key.casefold() == low.casefold():
+                return value
         return keys
 
     async def invoke(self, request: CapabilityRequest, **kwargs) -> CapabilityResult:
@@ -271,9 +300,11 @@ class TerminalSessionCapability:
             if len(existing_sessions) >= _MAX_SESSIONS_PER_TASK:
                 return _result(request, ok=False,
                                error=f"session limit reached ({_MAX_SESSIONS_PER_TASK})")
-            sid = f"tty_{len(self._sessions) + 1}_{os.getpid()}"
+            sid = new_id("tty")
             rows = int(args.get("rows") or 24)
             cols = int(args.get("cols") or 80)
+            if not 2 <= rows <= 200 or not 10 <= cols <= 300:
+                return _result(request, ok=False, error="rows/cols outside safe bounds")
             cwd = args.get("cwd")
             ctx = kwargs.get("context")
             workspace = getattr(ctx, "workspace", None) if ctx is not None else None
@@ -302,13 +333,18 @@ class TerminalSessionCapability:
                 "value",
                 getattr(workspace, "network_policy", None),
             )
-            created_session = await loop.run_in_executor(
-                None, lambda: _Session(
-                    sid, request.task_id, cmd, rows, cols, cwd=cwd,
-                    workspace_root=workspace_root,
-                    network_policy=network_policy,
-                ))
+            try:
+                created_session = await loop.run_in_executor(
+                    None, lambda: _Session(
+                        sid, request.task_id, cmd, rows, cols, cwd=cwd,
+                        workspace_root=workspace_root,
+                        network_policy=network_policy,
+                    ))
+            except (OSError, ValueError, pexpect.exceptions.ExceptionPexpect) as exc:
+                return _result(request, ok=False, error=f"session create failed: {exc}")
             self._sessions[sid] = created_session
+            await self._emit_runtime(EV["RUNTIME_SESSION_CREATED"], created_session,
+                                     command=cmd, rows=rows, cols=cols)
             return _result(request, output=f"created {sid} ({cmd})",
                            meta={"session": sid})
 
@@ -366,6 +402,13 @@ class TerminalSessionCapability:
                 return _result(request, ok=False, error="pattern required")
             timeout = min(float(args.get("timeout") or _DEFAULT_WAIT_TIMEOUT),
                           _MAX_WAIT_TIMEOUT)
+            match_mode = str(args.get("match") or "literal")
+            matcher = None
+            if match_mode == "regex":
+                try:
+                    matcher = re.compile(pattern)
+                except re.error as exc:
+                    return _result(request, ok=False, error=f"invalid wait regex: {exc}")
 
             def _wait():
                 """Poll the session's own buffer for the pattern.
@@ -378,7 +421,8 @@ class TerminalSessionCapability:
                 deadline = _time.monotonic() + timeout
                 while _time.monotonic() < deadline:
                     session.drain(quiet_seconds=0.1)
-                    if pattern in "\n".join(session.screen()):
+                    screen = _screen_text(session.screen())
+                    if matcher.search(screen) if matcher is not None else pattern in screen:
                         return True
                     if not session.alive():
                         return False
@@ -398,6 +442,8 @@ class TerminalSessionCapability:
         if op == "resize":
             rows = max(int(args.get("rows") or 24), 2)
             cols = max(int(args.get("cols") or 80), 10)
+            if rows > 200 or cols > 300:
+                return _result(request, ok=False, error="rows/cols outside safe bounds")
             await loop.run_in_executor(
                 None, session.child.setwinsize, rows, cols)
             session.rows, session.cols = rows, cols
@@ -411,14 +457,26 @@ class TerminalSessionCapability:
         if op == "kill":
             await loop.run_in_executor(None, session.child.terminate, True)
             self._sessions.pop(session.id, None)
+            await self._emit_runtime(EV["RUNTIME_STATE_LOST"], session, reason="closed")
             return _result(request, output=f"terminated {session.id}")
 
         return _result(request, ok=False, error=f"unknown operation: {op}")
 
     def close_all(self) -> None:
+        sessions = list(self._sessions.values())
         for s in self._sessions.values():
             try:
                 s.child.terminate(force=True)
             except (OSError, pexpect.exceptions.ExceptionPexpect) as exc:
                 _logger.debug("terminal session cleanup failed: %s", exc)
         self._sessions.clear()
+        if self._event_sink is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                for session in sessions:
+                    loop.create_task(self._emit_runtime(
+                        EV["RUNTIME_STATE_LOST"], session, reason="service_shutdown"
+                    ))

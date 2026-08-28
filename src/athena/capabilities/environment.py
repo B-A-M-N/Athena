@@ -19,9 +19,11 @@ executor path; effect envelopes are conservative (mutations gated).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
+from pathlib import Path
 import socket
 import subprocess
 from typing import Any
@@ -49,6 +51,26 @@ def _result(request, ok=True, output="", error="", meta=None):
         error=None if ok else error,
         metadata=dict(meta or {}),
     )
+
+
+def _has_symlink_component(path: str, root: str) -> bool:
+    """Return whether an existing component between root and path is a link."""
+    root_real = os.path.realpath(root)
+    candidate = os.path.abspath(path)
+    try:
+        relative = os.path.relpath(candidate, root_real)
+    except ValueError:
+        return True
+    current = root_real
+    for component in relative.split(os.sep):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            return True
+        current = os.path.join(current, component)
+        if os.path.lexists(current) and os.path.islink(current):
+            return True
+    return False
 
 
 def _run(cmd: list[str] | str, timeout: float = 15.0, shell=False):
@@ -465,10 +487,10 @@ class DatabaseCapability:
     descriptor = CapabilityDescriptor(
         id="database",
         description=(
-            "Database access: connect to a SQLite file (or Postgres via "
-            "[db] extra), inspect schema/tables, run queries, EXPLAIN, and "
+            "Database access: connect to a SQLite file, inspect schema/tables, "
+            "run queries, EXPLAIN, and "
             "execute writes (WRITE_LOCAL, policy-gated). Operations: "
-            "tables/schema/query/explain/execute."
+            "tables/schema/query/explain/execute. Results are paginated."
         ),
         input_schema={
             "type": "object",
@@ -479,6 +501,8 @@ class DatabaseCapability:
                 "path": {"type": "string"},
                 "sql": {"type": "string"},
                 "params": {"type": "array"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
             },
         },
         effects=frozenset({
@@ -487,6 +511,10 @@ class DatabaseCapability:
         effect_resolver=_database_effects,
         origin=CapabilityOrigin.NATIVE,
     )
+
+    def __init__(self, *, mutation_store=None, artifact_store=None) -> None:
+        self._mutations = mutation_store
+        self._artifacts = artifact_store
 
     @staticmethod
     def _read_only_authorizer(action, arg1, arg2, database, source):
@@ -539,7 +567,31 @@ class DatabaseCapability:
             root = os.path.realpath(root)
             if candidate != root and not candidate.startswith(root + os.sep):
                 raise ValueError("database path outside workspace")
+            original = path if os.path.isabs(path) else os.path.join(root, path)
+            if _has_symlink_component(original, root):
+                raise ValueError("database path cannot traverse a symlink")
         return candidate
+
+    async def _snapshot(
+        self, path: str, task_id: str | None, *, persist: bool = True
+    ):
+        if not os.path.isfile(path):
+            return None, None
+        data = Path(path).read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        ref = None
+        if persist and self._artifacts is not None:
+            try:
+                saved = await self._artifacts.save(
+                    task_id=task_id,
+                    content=data,
+                    mime_type="application/x-sqlite3",
+                    producer="database",
+                )
+                ref = saved.uri
+            except Exception:
+                ref = None
+        return ref, digest
 
     async def invoke(self, request: CapabilityRequest, context=None, **kw) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -547,6 +599,8 @@ class DatabaseCapability:
         path = str(args.get("path") or "")
         sql = str(args.get("sql") or "")
         params = list(args.get("params") or [])
+        offset = int(args.get("offset") or 0)
+        limit = min(int(args.get("limit") or 200), 1000)
         loop = asyncio.get_running_loop()
 
         workspace = getattr(context, "workspace", None) if context is not None else None
@@ -572,11 +626,15 @@ class DatabaseCapability:
         if os.path.isfile(path) and not os.access(path, os.R_OK):
             return _result(request, ok=False, error=f"unreadable: {path}")
 
-        def _rows(cur, limit=200):
+        def _rows(cur):
             cols = [d[0] for d in cur.description] if cur.description else []
-            rows = cur.fetchmany(limit)
+            rows = cur.fetchmany(offset + limit + 1)
+            truncated = len(rows) > offset + limit
+            rows = rows[offset:offset + limit]
             return json.dumps({"columns": cols,
-                               "rows": [[str(v) for v in r] for r in rows]},
+                               "rows": [[str(v) for v in r] for r in rows],
+                               "offset": offset, "limit": limit,
+                               "truncated": truncated},
                               default=str)
 
         def _tables():
@@ -585,8 +643,14 @@ class DatabaseCapability:
             try:
                 cur = conn.execute(
                     "SELECT name, type FROM sqlite_master "
-                    "WHERE type IN ('table','view') ORDER BY name")
-                return "\n".join(f"{r[1]:8} {r[0]}" for r in cur.fetchall())
+                    "WHERE type IN ('table','view') ORDER BY name "
+                    "LIMIT ? OFFSET ?", (limit + 1, offset))
+                rows = cur.fetchall()
+                return json.dumps({
+                    "rows": [[r[1], r[0]] for r in rows[:limit]],
+                    "offset": offset, "limit": limit,
+                    "truncated": len(rows) > limit,
+                })
             finally:
                 conn.close()
 
@@ -596,8 +660,13 @@ class DatabaseCapability:
             try:
                 cur = conn.execute(
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL "
-                    "ORDER BY name")
-                return "\n\n".join(r[0] for r in cur.fetchall())
+                    "ORDER BY name LIMIT ? OFFSET ?", (limit + 1, offset))
+                rows = cur.fetchall()
+                return json.dumps({
+                    "statements": [r[0] for r in rows[:limit]],
+                    "offset": offset, "limit": limit,
+                    "truncated": len(rows) > limit,
+                })
             finally:
                 conn.close()
 
@@ -632,10 +701,55 @@ class DatabaseCapability:
                     "explain": _explain, "execute": _execute}
         if op not in handlers:
             return _result(request, ok=False, error=f"unknown operation: {op}")
+        mutation_id = None
+        before_ref = None
+        before_hash = None
+        if op == "execute":
+            before_ref, before_hash = await self._snapshot(path, request.task_id)
+            if self._mutations is not None:
+                mutation_id = await self._mutations.record_intent(
+                    request.task_id,
+                    path,
+                    "database.execute",
+                    before_ref=before_ref,
+                    inverse=(
+                        {"op": "restore_from_ref", "target": path, "ref": before_ref}
+                        if before_ref else {"op": "delete", "target": path}
+                    ),
+                )
+                await self._mutations.mark_started(mutation_id)
         try:
             out = await loop.run_in_executor(None, handlers[op])
         except Exception as exc:  # noqa: BLE001 - report database failure truthfully
+            if mutation_id is not None:
+                await self._mutations.mark_failed(mutation_id, str(exc))
             return _result(request, ok=False, error=str(exc))
+        if mutation_id is not None:
+            _after_ref, after_hash = await self._snapshot(
+                path, request.task_id, persist=False
+            )
+            reversible = before_ref is not None or before_hash is None
+            await self._mutations.complete(
+                mutation_id,
+                after_hash=after_hash,
+                reversible=reversible,
+                inverse=(
+                    {"op": "restore_from_ref", "target": path, "ref": before_ref}
+                    if before_ref else {"op": "delete", "target": path}
+                ),
+            )
+            out_meta = {
+                "mutation": {
+                    "resource": path,
+                    "operation": "database.execute",
+                    "before_hash": before_hash,
+                    "after_hash": after_hash,
+                    "before_ref": before_ref,
+                    "reversible": reversible,
+                    "mutation_id": mutation_id,
+                }
+            }
+            return _result(request, output=out, meta=out_meta)
         return _result(request, output=out)
 
 

@@ -1890,7 +1890,9 @@ class AthenaService:
         registry.register(ScratchCapability(self._synthesis, self._scratch))
 
         if TerminalSessionCapability.available():
-            self._terminals = TerminalSessionCapability()
+            self._terminals = TerminalSessionCapability(
+                event_sink=self._forward_events(self._require_events()),
+            )
             registry.register(self._terminals)
         else:
             _logger.info("terminal_session capability unavailable: install pexpect and pyte")
@@ -1938,10 +1940,16 @@ class AthenaService:
 
         registry.register(ServiceCapability())
         registry.register(NetworkCapability())
-        self._database = DatabaseCapability()
+        self._database = DatabaseCapability(
+            mutation_store=self._store_mutations,
+            artifact_store=self._artifacts,
+        )
         registry.register(self._database)
         self._watch_registry = WatchRegistry()
-        self._watches = WatchCapability(registry=self._watch_registry)
+        self._watches = WatchCapability(
+            registry=self._watch_registry,
+            execution_manager=self._execution,
+        )
         registry.register(self._watches)
         if self._task_manager is not None:
             self._task_manager.add_finalize_observer(self._cleanup_task_watches)

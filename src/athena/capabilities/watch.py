@@ -13,6 +13,7 @@ import fnmatch
 import hashlib
 import logging
 import os
+import time
 from typing import Any
 
 from athena.protocol.capabilities import (
@@ -31,15 +32,38 @@ _logger = logging.getLogger("athena.watch")
 
 
 class _FileWatch:
-    def __init__(self, wid: str, root: str, pattern: str, task_id):
+    def __init__(
+        self,
+        wid: str,
+        root: str,
+        pattern: str,
+        task_id,
+        *,
+        max_files: int = 10_000,
+        max_bytes_per_poll: int = 10 * 1024 * 1024,
+        ignore_patterns: tuple[str, ...] = (),
+        interval: float = 0.0,
+        debounce: float = 0.0,
+    ):
         self.id = wid
         self.root = os.path.realpath(root)
         self.pattern = pattern or "*"
         self.task_id = task_id
+        self.max_files = max(1, max_files)
+        self.max_bytes_per_poll = max(1, max_bytes_per_poll)
+        self.ignore_patterns = tuple(ignore_patterns)
+        self.interval = max(0.0, interval)
+        self.debounce = max(0.0, debounce)
+        self.degraded = False
+        self.scanned_files = 0
+        self.hashed_bytes = 0
+        self._next_poll = 0.0
+        self._pending: list[str] = []
+        self._last_emit = 0.0
         self._snapshot = self._scan()
 
     @staticmethod
-    def _fingerprint(path: str) -> tuple[str, int, int, str]:
+    def _fingerprint(path: str, *, hash_content: bool = True) -> tuple[str, int, int, str]:
         """Return a content-aware fingerprint without following symlinks.
 
         mtime/size polling misses an edit when a program preserves timestamps
@@ -53,10 +77,13 @@ class _FileWatch:
             kind = "symlink"
         elif os.path.isfile(path):
             digest_obj = hashlib.sha256()
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest_obj.update(chunk)
-            digest = digest_obj.hexdigest()
+            if hash_content:
+                with open(path, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest_obj.update(chunk)
+                digest = digest_obj.hexdigest()
+            else:
+                digest = "unhashed"
             kind = "file"
         else:
             digest = ""
@@ -65,6 +92,10 @@ class _FileWatch:
 
     def _scan(self) -> dict[str, tuple[str, int, int, str]]:
         out: dict[str, tuple[str, int, int, str]] = {}
+        self.degraded = False
+        self.scanned_files = 0
+        self.hashed_bytes = 0
+        remaining = self.max_bytes_per_poll
         for d, _, fs in os.walk(self.root):
             if any(part in (".git", "__pycache__", "node_modules")
                    for part in d.split(os.sep)):
@@ -73,23 +104,51 @@ class _FileWatch:
                 p = os.path.join(d, f)
                 try:
                     rel = os.path.relpath(p, self.root)
-                    if fnmatch.fnmatch(rel, self.pattern):
-                        out[rel] = self._fingerprint(p)
+                    if any(fnmatch.fnmatch(rel, ignored) for ignored in self.ignore_patterns):
+                        continue
+                    if not fnmatch.fnmatch(rel, self.pattern):
+                        continue
+                    if self.scanned_files >= self.max_files:
+                        self.degraded = True
+                        break
+                    size = os.path.getsize(p)
+                    hash_content = size <= remaining
+                    out[rel] = self._fingerprint(p, hash_content=hash_content)
+                    self.scanned_files += 1
+                    if hash_content:
+                        remaining -= size
+                        self.hashed_bytes += size
+                    else:
+                        self.degraded = True
                 except OSError:
                     # A file can disappear between os.walk and lstat. That is
                     # a normal polling race; the next snapshot will report a
                     # deletion if it remains absent.
                     continue
+            if self.scanned_files >= self.max_files:
+                break
         return out
 
     def poll(self) -> list[str]:
         """Return relative paths changed/added/removed since last poll."""
-        now = self._scan()
-        changed = [p for p, fingerprint in now.items()
+        now = time.monotonic()
+        if now < self._next_poll:
+            return []
+        self._next_poll = now + self.interval
+        snapshot = self._scan()
+        changed = [p for p, fingerprint in snapshot.items()
                    if self._snapshot.get(p) != fingerprint]
-        removed = [p for p in self._snapshot if p not in now]
-        self._snapshot = now
-        return changed + [f"{p} (removed)" for p in removed]
+        removed = [p for p in self._snapshot if p not in snapshot]
+        self._snapshot = snapshot
+        self._pending.extend(changed + [f"{p} (removed)" for p in removed])
+        if not self._pending:
+            return []
+        if self.debounce and time.monotonic() - self._last_emit < self.debounce:
+            return []
+        emitted = self._pending[:]
+        self._pending.clear()
+        self._last_emit = time.monotonic()
+        return emitted
 
 
 class WatchRegistry:
@@ -110,11 +169,18 @@ class WatchRegistry:
             except (OSError, RuntimeError) as exc:
                 _logger.warning("file watch %s poll failed: %s", w.id, exc)
                 continue
-            if changed:
+            if changed or w.degraded:
                 emitted += 1
                 await sink(
                     "WatchObserved",
-                    {"watch": w.id, "kind": "files", "changes": changed[:20]},
+                    {
+                        "watch": w.id,
+                        "kind": "files",
+                        "changes": changed[:20],
+                        "degraded": w.degraded,
+                        "scanned_files": w.scanned_files,
+                        "hashed_bytes": w.hashed_bytes,
+                    },
                     task_id=w.task_id)
         for watch_id, info in list(self.process_watches.items()):
             pid = info["pid"]
@@ -151,7 +217,8 @@ class WatchCapability:
             "Subscribe to reality: watch files/directories for changes and "
             "watch processes for exit. Observations are pushed into the "
             "durable event stream as WatchObserved events rather than polled "
-            "by the model. Operations: file/process/list/stop."
+            "by the model. File polling is bounded and subscriptions are "
+            "volatile across service restart. Operations: file/process/list/stop."
         ),
         input_schema={
             "type": "object",
@@ -162,15 +229,22 @@ class WatchCapability:
                 "path": {"type": "string"},
                 "pid": {"type": "integer"},
                 "watch_id": {"type": "string"},
-                "pattern": {"type": "string"},
+                "pattern": {"type": "string", "maxLength": 512},
+                "max_files": {"type": "integer", "minimum": 1, "maximum": 100_000},
+                "max_bytes_per_poll": {"type": "integer", "minimum": 1, "maximum": 100_000_000},
+                "ignore": {"type": "array", "maxItems": 50, "items": {"type": "string", "maxLength": 512}},
+                "interval": {"type": "number", "minimum": 0, "maximum": 3600},
+                "debounce": {"type": "number", "minimum": 0, "maximum": 60},
             },
+            "additionalProperties": False,
         },
         effects=frozenset({EffectClass.READ_LOCAL}),
         origin=CapabilityOrigin.NATIVE,
     )
 
-    def __init__(self, registry: WatchRegistry | None = None) -> None:
+    def __init__(self, registry: WatchRegistry | None = None, execution_manager=None) -> None:
         self.registry = registry or WatchRegistry()
+        self.execution_manager = execution_manager
 
     def bind_sink(self, sink) -> None:
         self.registry.sink = sink
@@ -198,7 +272,13 @@ class WatchCapability:
             wid = new_id("watch")
             self.registry.file_watches[wid] = _FileWatch(
                 wid, path, str(args.get("pattern") or ""),
-                request.task_id)
+                request.task_id,
+                max_files=int(args.get("max_files") or 10_000),
+                max_bytes_per_poll=int(args.get("max_bytes_per_poll") or 10 * 1024 * 1024),
+                ignore_patterns=tuple(str(item) for item in (args.get("ignore") or ())),
+                interval=float(args.get("interval") or 0.0),
+                debounce=float(args.get("debounce") or 0.0),
+            )
             return _result(request, output=f"watching {path}",
                            meta={"watch_id": wid})
 
@@ -215,6 +295,11 @@ class WatchCapability:
             if self.registry.process_watches[wid].get("start_identity") is None:
                 self.registry.process_watches.pop(wid, None)
                 return _result(request, ok=False, error=f"cannot identify pid {pid}")
+            if self.execution_manager is not None and not self.execution_manager.owns_process(
+                request.task_id, pid, self.registry.process_watches[wid]["start_identity"]
+            ):
+                self.registry.process_watches.pop(wid, None)
+                return _result(request, ok=False, error="process is not Athena-owned")
             return _result(request, output=f"watching pid {pid}",
                            meta={"watch_id": wid})
 
@@ -237,8 +322,9 @@ class WatchCapability:
                 return _result(request, ok=False, error=f"unowned watch {wid}")
             removed = self.registry.file_watches.pop(wid, None) is not None
             removed = self.registry.process_watches.pop(wid, None) is not None or removed
-            return _result(request, output="stopped" if removed
-                           else f"unknown watch {wid}")
+            if not removed:
+                return _result(request, ok=False, error=f"unknown watch {wid}")
+            return _result(request, output="stopped")
 
         return _result(request, ok=False, error=f"unknown operation: {op}")
 

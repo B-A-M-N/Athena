@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from athena.capabilities.environment import DatabaseCapability, NetworkCapability
+from athena.artifacts.store import ArtifactStore
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResultStatus,
 )
 from athena.protocol.tasks import NetworkPolicy, WorkspaceSpec
+from athena.state.database import Database
+from athena.state.mutations import COMPLETED, MutationStore
 
 
 def _request(**arguments):
@@ -146,3 +150,79 @@ async def test_network_policy_deny_blocks_all_outbound_operations():
         )
         assert result.status is CapabilityResultStatus.FAILED
         assert "network denied" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_database_execute_records_snapshot_and_queries_are_paginated(tmp_path):
+    db = Database(":memory:")
+    await db.execute(
+        "INSERT INTO tasks(id, status, autonomy, objective, created_at, updated_at) "
+        "VALUES ('task-db', 'RUNNING', 'supervised', 'database test', "
+        "'2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"
+    )
+    mutation_store = MutationStore(db)
+    capability = DatabaseCapability(
+        mutation_store=mutation_store,
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+    )
+    context = SimpleNamespace(
+        workspace=WorkspaceSpec(id="workspace", root=str(tmp_path)),
+    )
+    path = str(tmp_path / "records.db")
+
+    created = await capability.invoke(
+        _request(operation="execute", path=path,
+                 sql="CREATE TABLE records (value TEXT)"),
+        context=context,
+    )
+    assert created.status is CapabilityResultStatus.OK
+    rows = await mutation_store.list_for_task("task-db")
+    assert len(rows) == 1
+    assert rows[0]["status"] == COMPLETED
+    assert rows[0]["reversible"] is True
+    assert rows[0]["operation"] == "database.execute"
+
+    for value in ("one", "two", "three"):
+        result = await capability.invoke(
+            _request(operation="execute", path=path,
+                     sql="INSERT INTO records VALUES (?)", params=[value]),
+            context=context,
+        )
+        assert result.status is CapabilityResultStatus.OK
+
+    page = await capability.invoke(
+        _request(operation="query", path=path,
+                 sql="SELECT value FROM records ORDER BY rowid",
+                 offset=1, limit=1),
+        context=context,
+    )
+    assert page.status is CapabilityResultStatus.OK
+    payload = json.loads(page.output)
+    assert payload["rows"] == [["two"]]
+    assert payload["offset"] == 1
+    assert payload["limit"] == 1
+    assert payload["truncated"] is True
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_symlinked_path_components(tmp_path):
+    outside = tmp_path.parent / "outside-db"
+    outside.mkdir(exist_ok=True)
+    link = tmp_path / "linked"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks not permitted")
+    capability = DatabaseCapability()
+    context = SimpleNamespace(
+        workspace=WorkspaceSpec(id="workspace", root=str(tmp_path)),
+    )
+
+    result = await capability.invoke(
+        _request(operation="execute", path="linked/data.db", sql="SELECT 1"),
+        context=context,
+    )
+
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "symlink" in (result.error or "") or "outside workspace" in (result.error or "")

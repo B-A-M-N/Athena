@@ -17,6 +17,15 @@ def _req(op: str, task_id=None, **args):
     )
 
 
+def test_key_aliases_cover_navigation_and_function_keys():
+    capability = TerminalSessionCapability()
+
+    assert capability._escape_keys("up") == "\x1b[A"
+    assert capability._escape_keys("PageDown") == "\x1b[6~"
+    assert capability._escape_keys("F12") == "\x1b[24~"
+    assert capability._escape_keys("C-c") == "\x03"
+
+
 @pytest.fixture
 def term():
     cap = TerminalSessionCapability()
