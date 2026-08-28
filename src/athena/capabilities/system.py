@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 from typing import Any, ClassVar
@@ -50,6 +51,13 @@ def _run(cmd: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
         return 124, "", "timeout"
     except FileNotFoundError:
         return 127, "", f"not found: {cmd[0]}"
+
+
+_UNIT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:%\\-]{0,254}$")
+
+
+def _valid_unit_name(value: str) -> bool:
+    return _UNIT_NAME.fullmatch(value) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +319,11 @@ class MachineCapability:
                 "operation": {"type": "string", "enum": [
                     "overview", "cpu", "memory", "disk", "network", "ports",
                     "toolchain", "services", "gpu", "env"]},
-                "name": {"type": "string"},
-                "unit": {"type": "string"},
+                "name": {"type": "string", "maxLength": 256},
+                "unit": {"type": "string", "maxLength": 255,
+                         "pattern": r"^[A-Za-z0-9][A-Za-z0-9_.@:%\\-]{0,254}$"},
             },
+            "additionalProperties": False,
         },
         effects=frozenset({EffectClass.READ_LOCAL}),
         origin=CapabilityOrigin.NATIVE,
@@ -404,6 +414,8 @@ class MachineCapability:
 
         if op == "services":
             unit = str(args.get("unit") or "").strip()
+            if unit and not _valid_unit_name(unit):
+                return _result(request, ok=False, error="invalid systemd unit name")
 
             def _svc():
                 if unit:

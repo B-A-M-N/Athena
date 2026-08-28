@@ -24,6 +24,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 from typing import Any
@@ -90,6 +91,26 @@ def _run(cmd: list[str] | str, timeout: float = 15.0, shell=False):
 
 _MUTATIONS = {"start", "stop", "restart", "reload", "enable", "disable",
               "mask", "unmask"}
+_UNIT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:%\\-]{0,254}$")
+
+
+def _service_state(scope: list[str], unit: str) -> dict[str, Any]:
+    """Read machine-parseable service state without invoking a shell."""
+    rc, out, err = _run([
+        "systemctl", *scope, "show", unit,
+        "--no-pager", "--property=LoadState,ActiveState,SubState,UnitFileState",
+    ])
+    state: dict[str, Any] = {
+        "ok": rc == 0,
+        "returncode": rc,
+    }
+    for line in out.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            state[key.casefold()] = value
+    if rc != 0:
+        state["error"] = (err or out).strip()[:1000]
+    return state
 
 
 class ServiceCapability:
@@ -107,11 +128,16 @@ class ServiceCapability:
             "type": "object",
             "required": ["operation"],
             "properties": {
-                "operation": {"type": "string"},
-                "unit": {"type": "string"},
-                "lines": {"type": "integer"},
+                "operation": {"type": "string", "enum": [
+                    "list", "status", "logs", "start", "stop", "restart",
+                    "reload", "enable", "disable", "mask", "unmask",
+                ]},
+                "unit": {"type": "string", "maxLength": 255,
+                         "pattern": r"^[A-Za-z0-9][A-Za-z0-9_.@:%\\-]{0,254}$"},
+                "lines": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "user_scope": {"type": "boolean"},
             },
+            "additionalProperties": False,
         },
         effects=frozenset({
             EffectClass.READ_LOCAL, EffectClass.EXECUTE,
@@ -140,14 +166,22 @@ class ServiceCapability:
 
         if not unit:
             return _result(request, ok=False, error="unit required")
+        if not _UNIT_NAME.fullmatch(unit):
+            return _result(request, ok=False, error="invalid systemd unit name")
 
         if op == "status":
             def _st():
                 return _run(["systemctl", *scope, "status", unit,
                              "--no-pager", "-l"])
             rc, out, err = await loop.run_in_executor(None, _st)
-            return _result(request, ok=rc == 0, output=(out or err)[:6000],
-                           error=err if rc else None, meta={"rc": rc})
+            state = await loop.run_in_executor(
+                None, lambda: _service_state(scope, unit))
+            payload = {
+                "unit": unit, "scope": "user" if scope else "system",
+                "state": state, "detail": (out or err)[:6000],
+            }
+            return _result(request, ok=rc == 0, output=json.dumps(payload),
+                           error=err if rc else None, meta=payload)
 
         if op == "logs":
             lines = max(int(args.get("lines") or 50), 1)
@@ -163,12 +197,34 @@ class ServiceCapability:
             # Only ever via systemctl with explicit unit; PRIVILEGED effect
             # forces supervised approval under default profiles.
             def _mut():
-                return _run(["systemctl", *scope, op, unit], timeout=30)
-            rc, out, err = await loop.run_in_executor(None, _mut)
+                before = _service_state(scope, unit)
+                rc, out, err = _run(["systemctl", *scope, op, unit], timeout=30)
+                after = _service_state(scope, unit)
+                rollback = {
+                    "operation": {
+                        "start": "stop", "stop": "start",
+                        "restart": "restart", "reload": "reload",
+                        "enable": "disable", "disable": "enable",
+                        "mask": "unmask", "unmask": "mask",
+                    }[op],
+                    "unit": unit,
+                    "user_scope": bool(scope),
+                }
+                return rc, out, err, before, after, rollback
+            rc, out, err, before, after, rollback = await loop.run_in_executor(
+                None, _mut)
+            payload = {
+                "operation": op, "unit": unit,
+                "scope": "user" if scope else "system",
+                "before": before, "after": after,
+                "returncode": rc,
+                "rollback": rollback,
+                "detail": (out or err).strip()[:4000],
+            }
             return _result(request, ok=rc == 0,
-                           output=out or f"{op} {unit}: ok",
+                           output=json.dumps(payload),
                            error=err if rc else None,
-                           meta={"rc": rc})
+                           meta=payload)
 
         return _result(request, ok=False, error=f"unknown operation: {op}")
 

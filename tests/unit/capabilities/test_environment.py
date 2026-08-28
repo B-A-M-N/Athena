@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from athena.capabilities.environment import DatabaseCapability, NetworkCapability
+from athena.capabilities.environment import (
+    DatabaseCapability,
+    NetworkCapability,
+    ServiceCapability,
+)
 from athena.artifacts.store import ArtifactStore
 from athena.protocol.capabilities import (
     CapabilityRequest,
@@ -226,3 +230,34 @@ async def test_database_rejects_symlinked_path_components(tmp_path):
 
     assert result.status is CapabilityResultStatus.FAILED
     assert "symlink" in (result.error or "") or "outside workspace" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_service_status_is_structured_and_unit_names_are_constrained(monkeypatch):
+    calls = []
+
+    def fake_run(command, timeout=15.0, shell=False):
+        calls.append(command)
+        if "show" in command:
+            return 0, "LoadState=loaded\nActiveState=active\nSubState=running\n", ""
+        return 0, "● athena.service - Athena\n", ""
+
+    monkeypatch.setattr("athena.capabilities.environment._run", fake_run)
+    capability = ServiceCapability()
+    result = await capability.invoke(CapabilityRequest(
+        capability_id="service", task_id="task-1", call_id="service-1",
+        arguments={"operation": "status", "unit": "athena.service"},
+    ))
+
+    assert result.status is CapabilityResultStatus.OK
+    payload = json.loads(result.output)
+    assert payload["state"]["activestate"] == "active"
+    assert payload["state"]["substate"] == "running"
+
+    rejected = await capability.invoke(CapabilityRequest(
+        capability_id="service", task_id="task-1", call_id="service-2",
+        arguments={"operation": "status", "unit": "--user"},
+    ))
+    assert rejected.status is CapabilityResultStatus.FAILED
+    assert "invalid systemd unit" in (rejected.error or "")
+    assert all("--user" not in command[3:] for command in calls)
