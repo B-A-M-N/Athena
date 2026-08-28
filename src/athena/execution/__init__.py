@@ -15,6 +15,7 @@ from athena.execution.backend import (
 from athena.execution.container import ContainerBackend
 from athena.execution.local import LocalBackend
 from athena.execution.manager import ExecutionManager, Sink
+from athena.execution.diagnostics import Diagnostic, normalize_diagnostics
 
 __all__ = [
     "ExecutionManager",
@@ -26,4 +27,6 @@ __all__ = [
     "LocalBackend",
     "ContainerBackend",
     "process_tree",
+    "Diagnostic",
+    "normalize_diagnostics",
 ]

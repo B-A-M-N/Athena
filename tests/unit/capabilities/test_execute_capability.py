@@ -21,7 +21,9 @@ class _ExecutionManager:
 
     async def stream(self, request, execution_id):
         yield ExecutionEvent(ExecutionEventType.STDOUT, execution_id, data="hello")
-        yield ExecutionEvent(ExecutionEventType.STDERR, execution_id, data="warning")
+        yield ExecutionEvent(
+            ExecutionEventType.STDERR, execution_id, data="warning: degraded"
+        )
         yield ExecutionEvent(
             ExecutionEventType.EXITED,
             execution_id,
@@ -51,7 +53,9 @@ async def test_execute_forwards_live_output_to_accumulator(tmp_path):
     )
 
     assert result.status is CapabilityResultStatus.OK
-    assert sink.chunks == [("stdout", "hello"), ("stderr", "warning")]
+    assert sink.chunks == [("stdout", "hello"), ("stderr", "warning: degraded")]
+    assert result.metadata["diagnostic_count"] == 1
+    assert result.metadata["diagnostics"][0]["severity"] == "warning"
 
 
 async def test_execute_rejects_unknown_language_without_falling_back(tmp_path):
@@ -66,4 +70,3 @@ async def test_execute_rejects_unknown_language_without_falling_back(tmp_path):
 
     assert result.status is CapabilityResultStatus.FAILED
     assert "unsupported language" in (result.error or "")
-

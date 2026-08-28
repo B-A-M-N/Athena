@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from datetime import timedelta
 
+from athena.execution.diagnostics import normalize_diagnostics
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
@@ -192,11 +193,15 @@ class ExecuteCapability:
             )
 
         combined = stdout + ("\n" + stderr if stderr else "")
+        diagnostics = normalize_diagnostics(combined, tool=language, cwd=cwd)
 
         # Artifactize large output: bounded preview inline, full in artifact
         max_inline = 8 * 1024  # 8KB inline preview
         ref_uri = None
-        result_metadata: dict[str, object] = {}
+        result_metadata: dict[str, object] = {
+            "diagnostics": [diagnostic.to_dict() for diagnostic in diagnostics],
+            "diagnostic_count": len(diagnostics),
+        }
         if len(combined) > max_inline and self._artifact_store is not None:
             try:
                 artifact = await self._artifact_store.save(
