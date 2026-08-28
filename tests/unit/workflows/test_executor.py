@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 from athena.protocol.capabilities import (
@@ -8,7 +9,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
 )
-from athena.protocol.tasks import CapabilityPolicy, WorkspaceSpec
+from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
 from athena.workflows import Workflow, WorkflowExecutor, WorkflowStep
 
 
@@ -25,6 +26,22 @@ class _Dispatcher:
             CapabilityResultStatus.OK,
             output=json.dumps(request.arguments),
         )
+
+
+class _SlowDispatcher(_Dispatcher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = 0
+        self.max_active = 0
+
+    async def dispatch(self, request, **kwargs):
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0.02)
+            return await super().dispatch(request, **kwargs)
+        finally:
+            self.active -= 1
 
 
 def _resolver(identifier):
@@ -66,6 +83,41 @@ async def test_workflow_supports_conditions_and_bounded_foreach(tmp_path):
         '{"value": "a"}', '{"value": "b"}',
     ]
     assert {call.session_id for call in dispatcher.requests} == {None}
+
+
+async def test_workflow_parallel_foreach_is_bounded_and_keeps_output_order(tmp_path):
+    dispatcher = _SlowDispatcher()
+    workflow = Workflow.create(
+        name="parallel-batch",
+        description="parallel batch echo",
+        steps=(WorkflowStep(
+            id="echoes",
+            capability_id="echo",
+            arguments={"value": "$item"},
+            foreach="$items",
+            parallel=True,
+            max_parallel=2,
+        ),),
+    )
+
+    result = await WorkflowExecutor(dispatcher, resolver=_resolver).run(
+        workflow,
+        task_id="task-1",
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
+        task_budget=ResourceBudget(max_parallel_executions=3),
+        inputs={"items": ["a", "b", "c", "d"]},
+    )
+
+    assert result.status == "completed"
+    assert dispatcher.max_active == 2
+    assert [json.loads(value)["value"] for value in result.outputs["echoes"]] == [
+        "a", "b", "c", "d",
+    ]
+    assert dispatcher.dispatch_kwargs
+    assert all(
+        kwargs["task_budget"] == ResourceBudget(max_parallel_executions=3)
+        for kwargs in dispatcher.dispatch_kwargs
+    )
 
 
 async def test_workflow_propagates_session_scope_to_capability_calls(tmp_path):

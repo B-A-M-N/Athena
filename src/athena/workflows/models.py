@@ -24,6 +24,8 @@ class WorkflowStep:
     if_condition: str | None = None
     foreach: str | None = None
     max_iterations: int = 100
+    parallel: bool = False
+    max_parallel: int = 4
     continue_on_error: bool = False
 
     def __post_init__(self) -> None:
@@ -31,6 +33,8 @@ class WorkflowStep:
             raise ValueError("workflow step must name exactly one capability or workflow")
         if self.max_iterations < 1 or self.max_iterations > 10_000:
             raise ValueError("workflow step max_iterations must be between 1 and 10000")
+        if self.max_parallel < 1 or self.max_parallel > 1_000:
+            raise ValueError("workflow step max_parallel must be between 1 and 1000")
 
     @classmethod
     def from_record(cls, data: Mapping[str, Any], index: int = 0) -> WorkflowStep:
@@ -45,6 +49,8 @@ class WorkflowStep:
             foreach=(str(data["foreach"]) if data.get("foreach") is not None
                      else None),
             max_iterations=int(data.get("max_iterations") or 100),
+            parallel=bool(data.get("parallel", False)),
+            max_parallel=int(data.get("max_parallel") or 4),
             continue_on_error=bool(data.get("continue_on_error", False)),
         )
 
@@ -57,6 +63,8 @@ class WorkflowStep:
             **({"if": self.if_condition} if self.if_condition is not None else {}),
             **({"foreach": self.foreach} if self.foreach is not None else {}),
             "max_iterations": self.max_iterations,
+            "parallel": self.parallel,
+            "max_parallel": self.max_parallel,
             "continue_on_error": self.continue_on_error,
         }
 

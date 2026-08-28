@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,6 +29,13 @@ class WorkflowResult:
     suspended: SuspendedCall | None = None
 
 
+@dataclass(frozen=True)
+class _StepItemOutcome:
+    value: Any = None
+    failures: tuple[str, ...] = ()
+    suspended: SuspendedCall | None = None
+
+
 class WorkflowExecutor:
     """Run workflow steps without introducing a second reasoning loop."""
 
@@ -42,6 +50,7 @@ class WorkflowExecutor:
         inputs: Mapping[str, Any] | None = None,
         task_policy: CapabilityPolicy | None = None,
         task_budget: ResourceBudget | None = None,
+        _execution_limiter: asyncio.Semaphore | None = None,
     ) -> WorkflowResult:
         validation = WorkflowValidator(self._resolver).validate(workflow)
         if not validation.ok:
@@ -55,6 +64,11 @@ class WorkflowExecutor:
         outputs: dict[str, Any] = {}
         failures: list[str] = []
         inputs = dict(inputs or {})
+        execution_limiter = _execution_limiter
+        if execution_limiter is None and task_budget is not None:
+            execution_limiter = asyncio.Semaphore(
+                max(1, int(task_budget.max_parallel_executions))
+            )
         for step in workflow.steps:
             try:
                 if step.if_condition is not None and not _evaluate_condition(
@@ -81,55 +95,109 @@ class WorkflowExecutor:
                             f"{step.max_iterations}")
                     items = collection
 
-                step_results: list[Any] = []
-                for item in items:
-                    if step.workflow_id:
-                        if self._resolver is None:
-                            raise ValueError(
-                                f"{step.id}: nested workflow resolver unavailable")
-                        nested = self._resolver(step.workflow_id)
-                        nested_inputs = _resolve_values(
+                async def _run_item(item: Any) -> _StepItemOutcome:
+                    try:
+                        if step.workflow_id:
+                            if self._resolver is None:
+                                raise ValueError(
+                                    f"{step.id}: nested workflow resolver unavailable")
+                            nested = self._resolver(step.workflow_id)
+                            nested_inputs = _resolve_values(
+                                dict(step.arguments), inputs, outputs, item)
+                            nested_result = await self.run(
+                                nested, task_id=task_id, workspace=workspace,
+                                profile=profile, session_id=session_id,
+                                inputs=nested_inputs, task_policy=task_policy,
+                                task_budget=task_budget,
+                                _execution_limiter=execution_limiter,
+                            )
+                            return _StepItemOutcome(
+                                value=dict(nested_result.outputs),
+                                failures=(
+                                    tuple(nested_result.failures)
+                                    if nested_result.status != "completed"
+                                    and nested_result.status != "suspended"
+                                    else ()
+                                ),
+                                suspended=nested_result.suspended,
+                            )
+
+                        arguments = _resolve_values(
                             dict(step.arguments), inputs, outputs, item)
-                        nested_result = await self.run(
-                        nested, task_id=task_id, workspace=workspace,
-                        profile=profile, session_id=session_id,
-                            inputs=nested_inputs, task_policy=task_policy,
-                            task_budget=task_budget,
+                        request = CapabilityRequest(
+                            capability_id=step.capability_id or "",
+                            arguments=arguments,
+                            task_id=task_id,
+                            session_id=session_id,
+                            call_id=new_id("workflow-call"),
+                            origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
                         )
-                        step_results.append(dict(nested_result.outputs))
-                        if nested_result.status == "suspended":
+
+                        async def _dispatch():
+                            return await self._dispatcher.dispatch(
+                                request, workspace=workspace, profile=profile,
+                                task_policy=task_policy, task_budget=task_budget)
+
+                        if execution_limiter is None:
+                            result = await _dispatch()
+                        else:
+                            async with execution_limiter:
+                                result = await _dispatch()
+                        if isinstance(result, SuspendedCall):
+                            return _StepItemOutcome(suspended=result)
+                        if result.status is not CapabilityResultStatus.OK:
+                            return _StepItemOutcome(
+                                value=result.output,
+                                failures=(
+                                    f"{step.id}: {result.error or 'failed'}",
+                                ),
+                            )
+                        return _StepItemOutcome(value=result.output)
+                    except Exception as exc:  # noqa: BLE001 - item failure is data
+                        return _StepItemOutcome(failures=(f"{step.id}: {exc}",))
+
+                item_outcomes: list[_StepItemOutcome]
+                if step.parallel and step.foreach is not None and len(items) > 1:
+                    parallel_limit = step.max_parallel
+                    if task_budget is not None:
+                        parallel_limit = min(
+                            parallel_limit,
+                            max(1, int(task_budget.max_parallel_executions)),
+                        )
+                    step_limiter = asyncio.Semaphore(max(1, parallel_limit))
+
+                    async def _bounded(item: Any) -> _StepItemOutcome:
+                        async with step_limiter:
+                            return await _run_item(item)
+
+                    item_outcomes = list(await asyncio.gather(
+                        *(_bounded(item) for item in items)
+                    ))
+                else:
+                    item_outcomes = []
+                    for item in items:
+                        outcome = await _run_item(item)
+                        item_outcomes.append(outcome)
+                        if outcome.suspended is not None:
                             return WorkflowResult(
                                 workflow.id, "suspended", outputs,
-                                tuple(failures), nested_result.suspended)
-                        if nested_result.status != "completed":
-                            failures.extend(nested_result.failures)
+                                tuple(failures), outcome.suspended)
+                        if outcome.failures:
                             if not step.continue_on_error:
                                 break
-                        continue
 
-                    arguments = _resolve_values(
-                        dict(step.arguments), inputs, outputs, item)
-                    request = CapabilityRequest(
-                        capability_id=step.capability_id or "",
-                        arguments=arguments,
-                        task_id=task_id,
-                        session_id=session_id,
-                        call_id=new_id("workflow-call"),
-                        origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
-                    )
-                    result = await self._dispatcher.dispatch(
-                        request, workspace=workspace, profile=profile,
-                        task_policy=task_policy, task_budget=task_budget)
-                    if isinstance(result, SuspendedCall):
-                        return WorkflowResult(
-                            workflow.id, "suspended", outputs,
-                            tuple(failures), result)
-                    step_results.append(result.output)
-                    if result.status is not CapabilityResultStatus.OK:
-                        failures.append(
-                            f"{step.id}: {result.error or 'failed'}")
-                        if not step.continue_on_error:
-                            break
+                step_results: list[Any] = []
+                suspended: SuspendedCall | None = None
+                for outcome in item_outcomes:
+                    step_results.append(outcome.value)
+                    if outcome.failures:
+                        failures.extend(outcome.failures)
+                    if suspended is None and outcome.suspended is not None:
+                        suspended = outcome.suspended
+                if suspended is not None:
+                    return WorkflowResult(
+                        workflow.id, "suspended", outputs,
+                        tuple(failures), suspended)
                 outputs[step.id] = (
                     step_results if step.foreach is not None else step_results[0]
                     if step_results else None
