@@ -361,6 +361,7 @@ def _serialize_workspace(ws: WorkspaceSpec | None) -> str | None:
         "temp_root": ws.temp_root,
         "execution_backend": ws.execution_backend,
         "network_policy": ws.network_policy.value,
+        "mutation_mode": ws.mutation_mode.value,
     })
 
 

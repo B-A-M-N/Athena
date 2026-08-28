@@ -130,6 +130,21 @@ class NetworkPolicy(str, enum.Enum):
     RESTRICTED = "restricted"
 
 
+class MutationMode(str, enum.Enum):
+    """Where project mutations are allowed to land.
+
+    ``DIRECT`` preserves the ordinary workspace contract for callers that
+    explicitly opt into immediate mutations.  ``SPECULATIVE`` makes the
+    execution authority lazily create a task-local candidate workspace before
+    the first project-sensitive mutation.  ``READ_ONLY`` rejects project
+    mutations at that same authority boundary.
+    """
+
+    DIRECT = "direct"
+    SPECULATIVE = "speculative"
+    READ_ONLY = "read_only"
+
+
 @dataclass(frozen=True)
 class WorkspaceSpec:
     id: str
@@ -139,6 +154,7 @@ class WorkspaceSpec:
     temp_root: str | None = None
     execution_backend: str = "local"
     network_policy: NetworkPolicy = NetworkPolicy.ALLOW
+    mutation_mode: MutationMode = MutationMode.DIRECT
 
 
 @dataclass(frozen=True)
@@ -268,7 +284,7 @@ __all__ = [
     "TaskStatus", "TERMINAL_STATUSES", "FINAL_STATUSES", "PAUSED_STATUSES",
     "AutonomyLevel", "VerificationType",
     "VerificationSpec", "Criterion", "ContextRef", "PathRule", "NetworkPolicy",
-    "WorkspaceSpec", "ResourceBudget", "ModelPolicy", "CapabilityPolicy",
+    "WorkspaceSpec", "MutationMode", "ResourceBudget", "ModelPolicy", "CapabilityPolicy",
     "DeliverySpec", "TaskSpec", "UsageSummary", "MutationRef", "TaskResult",
     "AgentRequest",
 ]

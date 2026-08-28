@@ -22,6 +22,7 @@ from athena.protocol.tasks import (
     Criterion,
     DeliverySpec,
     ModelPolicy,
+    MutationMode,
     NetworkPolicy,
     PathRule,
     ResourceBudget,
@@ -196,6 +197,9 @@ def _decode_workspace(raw: Any) -> WorkspaceSpec | None:
         temp_root=data.get("temp_root"),
         execution_backend=data.get("execution_backend", "local"),
         network_policy=NetworkPolicy(data.get("network_policy", "allow")),
+        mutation_mode=MutationMode(
+            data.get("mutation_mode", MutationMode.DIRECT.value)
+        ),
     )
 
 

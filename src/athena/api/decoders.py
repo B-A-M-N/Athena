@@ -18,6 +18,7 @@ from typing import Any, Mapping
 from athena.protocol.tasks import (
     CapabilityPolicy,
     ModelPolicy,
+    MutationMode,
     NetworkPolicy,
     PathRule,
     ResourceBudget,
@@ -92,6 +93,14 @@ def decode_workspace(
             net = NetworkPolicy(str(net))
         except ValueError as exc:
             raise DecodeError(f"field 'network_policy' must be one of {[p.value for p in NetworkPolicy]}") from exc
+    mutation_mode = data.get("mutation_mode", MutationMode.DIRECT)
+    if not isinstance(mutation_mode, MutationMode):
+        try:
+            mutation_mode = MutationMode(str(mutation_mode))
+        except ValueError as exc:
+            raise DecodeError(
+                f"field 'mutation_mode' must be one of {[m.value for m in MutationMode]}"
+            ) from exc
     return WorkspaceSpec(
         id=workspace_id,
         root=root,
@@ -100,6 +109,7 @@ def decode_workspace(
         temp_root=data.get("temp_root"),
         execution_backend=str(data.get("execution_backend", "local")),
         network_policy=net,
+        mutation_mode=mutation_mode,
     )
 
 

@@ -115,6 +115,7 @@ class TaskForker:
                 temp_root=workspace.temp_root,
                 execution_backend=workspace.execution_backend,
                 network_policy=workspace.network_policy,
+                mutation_mode=workspace.mutation_mode,
             )
             metadata["fork_workspace_root"] = fork_root
 

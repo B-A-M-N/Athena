@@ -280,6 +280,10 @@ class CapabilityReflection:
                 getattr(workspace, "network_policy", None), "value",
                 getattr(workspace, "network_policy", None),
             ),
+            "mutation_mode": getattr(
+                getattr(workspace, "mutation_mode", None), "value",
+                getattr(workspace, "mutation_mode", None),
+            ),
             "task_policy": task_policy_record,
             "pending_approvals": pending,
             "active_grants": grants,

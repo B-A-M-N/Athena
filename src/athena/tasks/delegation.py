@@ -393,7 +393,7 @@ def _scope_workspace(parent: TaskSpec, child):
     Readable/writable path rules are canonicalized relative to the child root
     and intersected with the parent's real canonical paths.
     """
-    from athena.protocol.tasks import WorkspaceSpec
+    from athena.protocol.tasks import MutationMode, WorkspaceSpec
 
     parent_ws = parent.workspace
     if parent_ws is None:
@@ -428,6 +428,11 @@ def _scope_workspace(parent: TaskSpec, child):
         temp_root=child_ws.temp_root or parent_ws.temp_root,
         execution_backend=child_ws.execution_backend or parent_ws.execution_backend,
         network_policy=network,
+        mutation_mode=(
+            child_ws.mutation_mode
+            if child_ws.mutation_mode is not MutationMode.DIRECT
+            else parent_ws.mutation_mode
+        ),
     )
 
 

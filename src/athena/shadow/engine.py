@@ -33,7 +33,7 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
-from athena.protocol.tasks import NetworkPolicy, PathRule, WorkspaceSpec
+from athena.protocol.tasks import MutationMode, NetworkPolicy, PathRule, WorkspaceSpec
 
 __all__ = ["BranchStatus", "ShadowBranch", "ShadowEngine"]
 
@@ -159,14 +159,15 @@ class ShadowEngine:
         return WorkspaceSpec(
             id=f"{base.id}-shadow-{branch_id[-6:]}",
             root=root,
-            readable=base.readable,
-            writable=base.writable,
+            readable=_rebase_rules(base.readable, base.root, root),
+            writable=_rebase_rules(base.writable, base.root, root),
             # A copied directory is not an isolation boundary.  The branch
             # therefore requests the sandbox backend and denies outbound
             # networking; execution must fail closed if that backend is not
             # available.
             network_policy=NetworkPolicy.DENY,
-                execution_backend="shadow",
+            execution_backend="shadow",
+            mutation_mode=MutationMode.DIRECT,
         ), base_manifest
 
     async def open_branch(
@@ -358,9 +359,23 @@ class ShadowEngine:
                 raise RuntimeError("ShadowEngine not bound to a dispatcher")
             branch.commit_state = "APPLYING"
             self._persist_branches()
+            # A verified branch is the trusted commit controller.  Its
+            # canonical fs requests must cross the reality boundary once,
+            # against the real base workspace, rather than opening a fresh
+            # speculative branch because the parent task is speculative.
+            commit_workspace = WorkspaceSpec(
+                id=branch.base_workspace.id,
+                root=branch.base_workspace.root,
+                readable=branch.base_workspace.readable,
+                writable=branch.base_workspace.writable,
+                temp_root=branch.base_workspace.temp_root,
+                execution_backend=branch.base_workspace.execution_backend,
+                network_policy=branch.base_workspace.network_policy,
+                mutation_mode=MutationMode.DIRECT,
+            )
             outcomes = await self._dispatcher.dispatch_many(
                 requests,
-                workspace=branch.base_workspace,
+                workspace=commit_workspace,
                 profile=branch.policy_profile,
                 preflight=True,
             )
@@ -690,6 +705,7 @@ def _workspace_record(workspace: WorkspaceSpec) -> dict:
         "temp_root": workspace.temp_root,
         "execution_backend": workspace.execution_backend,
         "network_policy": workspace.network_policy.value,
+        "mutation_mode": workspace.mutation_mode.value,
     }
 
 
@@ -702,7 +718,29 @@ def _workspace_from_record(record: dict) -> WorkspaceSpec:
         temp_root=record.get("temp_root"),
         execution_backend=str(record.get("execution_backend") or "local"),
         network_policy=NetworkPolicy(str(record.get("network_policy") or "allow")),
+        mutation_mode=MutationMode(
+            str(record.get("mutation_mode") or MutationMode.DIRECT.value)
+        ),
     )
+
+
+def _rebase_rules(
+    rules: tuple[PathRule, ...], base_root: str, shadow_root: str,
+) -> tuple[PathRule, ...]:
+    """Move workspace-local path rules from the base tree to its clone."""
+    base = os.path.realpath(os.path.abspath(base_root))
+    shadow = os.path.realpath(os.path.abspath(shadow_root))
+    rebased: list[PathRule] = []
+    for rule in rules:
+        raw = str(rule.path)
+        if os.path.isabs(raw):
+            normalized = os.path.realpath(os.path.abspath(raw))
+            if normalized == base or normalized.startswith(base + os.sep):
+                raw = shadow + normalized[len(base):]
+        else:
+            raw = os.path.join(shadow, raw)
+        rebased.append(PathRule(path=raw, allow=rule.allow))
+    return tuple(rebased)
 
 
 def _branch_record(branch: ShadowBranch) -> dict:

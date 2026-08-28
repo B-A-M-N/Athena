@@ -25,6 +25,7 @@ import inspect
 import logging
 import os
 import tempfile
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -88,9 +89,11 @@ from athena.protocol.errors import PersistenceError
 from athena.protocol.policy import ApprovalScope, Principal
 from athena.protocol.tasks import (
     AgentRequest,
+    AutonomyLevel,
     CapabilityPolicy,
     ContextRef,
     ResourceBudget,
+    MutationMode,
     TaskSpec,
     TaskStatus,
     TERMINAL_STATUSES,
@@ -147,6 +150,7 @@ class AthenaService:
         self._registry: CapabilityRegistry | None = None
         self._fabric: CapabilityFabric | None = None
         self._dispatcher: CapabilityDispatcher | None = None
+        self._reality_gate: Any = None
         self._compiler: ContextCompiler | None = None
         self._model_registry: ProviderRegistry | None = None
         self._kernel: AgentKernel | None = None
@@ -330,6 +334,9 @@ class AthenaService:
             fabric=fabric,
         )
         self._dispatcher = dispatcher
+        from athena.reality import RealityGate
+        self._reality_gate = RealityGate(self.shadow_engine())
+        dispatcher.set_reality_gate(self._reality_gate)
 
         # 7. TaskManager (needs budgets/cancellations, built a bit later).
         budgets = BudgetTracker(task_store=tasks)
@@ -1542,6 +1549,20 @@ class AthenaService:
         meta = {"autonomy": autonomy.value}
         if request.metadata:
             meta.update(request.metadata)
+        raw_mutation_mode = meta.pop("mutation_mode", None)
+        if raw_mutation_mode is not None:
+            try:
+                mutation_mode = MutationMode(str(raw_mutation_mode))
+            except ValueError as exc:
+                raise ValueError(
+                    "mutation_mode must be one of: "
+                    + ", ".join(mode.value for mode in MutationMode)
+                ) from exc
+            ws = replace(ws, mutation_mode=mutation_mode)
+        elif autonomy is AutonomyLevel.CODING:
+            # Coding tasks are protected by default.  The escape hatch is
+            # explicit metadata (mutation_mode=direct), never a model choice.
+            ws = replace(ws, mutation_mode=MutationMode.SPECULATIVE)
         # Acceptance criteria (BHV-005): ``metadata["acceptance_criteria"]``
         # carries human-specified checks. Each entry becomes a required
         # Criterion so the termination evaluator audits claimed completion.

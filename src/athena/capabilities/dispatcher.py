@@ -109,6 +109,11 @@ class CapabilityDispatcher:
         self._provider_profile_id: str | None = None
         self._model_id: str | None = None
         self._repair_mode: str | None = None
+        self._reality_gate = None
+
+    def set_reality_gate(self, gate) -> None:
+        """Bind the execution authority that resolves speculative workspaces."""
+        self._reality_gate = gate
 
     def set_inference_provenance(
         self, *, provider_profile_id: str | None, model_id: str | None,
@@ -359,17 +364,49 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
             }, request.task_id, causal_id=request.call_id)
             return suspended
 
+        routed_workspace = workspace
+        reality_metadata: dict[str, Any] = {}
+        if self._reality_gate is not None:
+            try:
+                route = await self._reality_gate.route(
+                    request,
+                    workspace,
+                    frozenset(effects),
+                    executor.descriptor,
+                )
+            except PermissionError as exc:
+                result = CapabilityResult(
+                    request.call_id,
+                    request.capability_id,
+                    CapabilityResultStatus.FAILED,
+                    error=str(exc),
+                    metadata={"decision": "reality_boundary"},
+                )
+                await self._emit(EV["CAPABILITY_FAILED"], {
+                    "call_id": request.call_id,
+                    "capability_id": request.capability_id,
+                    "reason": "reality_boundary",
+                    "error": result.error,
+                }, request.task_id, causal_id=request.call_id)
+                return result
+            routed_workspace = route.workspace
+            reality_metadata = route.metadata()
+
         await self._emit(EV["CAPABILITY_STARTED"], {
             "call_id": request.call_id, "capability_id": request.capability_id,
         }, request.task_id, causal_id=request.call_id)
 
         context = InvocationContext(
             task_id=request.task_id,
-            workspace=workspace,
-            execution_backend=workspace.execution_backend,
+            workspace=routed_workspace,
+            execution_backend=routed_workspace.execution_backend,
             capability_policy=task_policy,
         )
         result = await executor.invoke(request, context=context)
+        if reality_metadata:
+            metadata = dict(result.metadata or {})
+            metadata["reality"] = reality_metadata
+            object.__setattr__(result, "metadata", metadata)
         if result.status == CapabilityResultStatus.OK:
             await self._record_mutation(request, result)
             await self._emit(EV["CAPABILITY_COMPLETED"], {
