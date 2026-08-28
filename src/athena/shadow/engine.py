@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,6 +71,7 @@ class ShadowBranch:
     rejected_requests: list[CapabilityRequest] = field(default_factory=list)
     mutations: list[dict] = field(default_factory=list)
     verification: list[dict] = field(default_factory=list)
+    verification_certificate: dict = field(default_factory=dict)
     # Immutable snapshot of the real workspace at branch creation. Commit
     # conflict checks must compare reality with this, never with a manifest
     # freshly captured after the branch has already run.
@@ -277,6 +279,23 @@ class ShadowEngine:
         if not all_ok and not branch.error:
             failed = [c.get("id") for c in criteria_results if not c.get("passed")]
             branch.error = f"criteria unverified: {failed}"
+        if all_ok:
+            branch.verification_certificate = {
+                "version": 1,
+                "branch_id": branch.id,
+                "task_id": branch.task_id,
+                "base_fingerprint": _manifest_fingerprint(branch.base_manifest),
+                "candidate_fingerprint": _manifest_fingerprint(
+                    self._manifest(branch.shadow_workspace.root)
+                ),
+                "environment_fingerprint": _environment_fingerprint(
+                    branch.shadow_workspace
+                ),
+                "criteria": list(criteria_results),
+                "issued_at": utcnow().isoformat(),
+            }
+        else:
+            branch.verification_certificate = {}
         self._persist_branches()
 
     # ------------------------------------------------------------------
@@ -294,6 +313,39 @@ class ShadowEngine:
         if branch.status != BranchStatus.VERIFIED:
             raise RuntimeError(
                 f"cannot commit branch {branch.id} in status {branch.status}")
+
+        certificate = branch.verification_certificate
+        if not certificate:
+            branch.status = BranchStatus.FAILED
+            branch.error = "verification certificate missing"
+            self._persist_branches()
+            await self._cleanup(branch)
+            return {
+                "status": "FAILED",
+                "branch": branch.id,
+                "error": branch.error,
+            }
+        candidate_fingerprint = _manifest_fingerprint(
+            self._manifest(branch.shadow_workspace.root)
+        )
+        environment_fingerprint = _environment_fingerprint(
+            branch.shadow_workspace
+        )
+        if (
+            certificate.get("candidate_fingerprint") != candidate_fingerprint
+            or certificate.get("environment_fingerprint") != environment_fingerprint
+        ):
+            branch.status = BranchStatus.FAILED
+            branch.error = (
+                "verification certificate stale: candidate or environment changed"
+            )
+            self._persist_branches()
+            await self._cleanup(branch)
+            return {
+                "status": "STALE_CERTIFICATE",
+                "branch": branch.id,
+                "error": branch.error,
+            }
 
         loop = asyncio.get_running_loop()
         changes = await loop.run_in_executor(None, self._diff_trees, branch)
@@ -676,6 +728,9 @@ class ShadowEngine:
                     proposal=[dict(item) for item in record.get("proposal") or ()],
                     status=status,
                     verification=[dict(item) for item in record.get("verification") or ()],
+                    verification_certificate=dict(
+                        record.get("verification_certificate") or {}
+                    ),
                     mutations=[dict(item) for item in record.get("mutations") or ()],
                     base_manifest=dict(record.get("base_manifest") or {}),
                     error=record.get("error"),
@@ -743,6 +798,28 @@ def _rebase_rules(
     return tuple(rebased)
 
 
+def _manifest_fingerprint(manifest: dict[str, str]) -> str:
+    encoded = json.dumps(
+        sorted(manifest.items()),
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _environment_fingerprint(workspace: WorkspaceSpec) -> str:
+    payload = {
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+        "system": platform.system(),
+        "release": platform.release(),
+        "execution_backend": workspace.execution_backend,
+        "network_policy": workspace.network_policy.value,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _branch_record(branch: ShadowBranch) -> dict:
     return {
         "id": branch.id,
@@ -752,6 +829,7 @@ def _branch_record(branch: ShadowBranch) -> dict:
         "proposal": branch.proposal,
         "status": branch.status,
         "verification": branch.verification,
+        "verification_certificate": branch.verification_certificate,
         "mutations": branch.mutations,
         "base_manifest": branch.base_manifest,
         "error": branch.error,

@@ -217,15 +217,15 @@ async def test_commit_deletion_requires_approval_and_never_lands_unapproved(
     os.unlink(os.path.join(branch.shadow_workspace.root, "stale.txt"))
 
     outcome = await engine.commit(branch)
-    assert outcome["status"] == "FAILED"
-    assert outcome["error"] == "commit not applied: commit requires approval"
+    assert outcome["status"] == "STALE_CERTIFICATE"
+    assert "verification certificate stale" in outcome["error"]
     # The irreversible effect never landed.
     assert (Path(ws.root) / "stale.txt").read_text() == "to be removed\n"
     # No delete mutation was recorded against reality.
     rows = await svc._store_mutations.list_for_task(task_id)
     assert not any(r["operation"] == "delete" for r in rows)
-    # The deletion parks as a PENDING approval; nothing is auto-granted.
+    # The stale certificate is rejected before an unverified delete can reach
+    # policy, so no approval is created.
     assert svc._policy.approvals.list_active() == []
     pend = await svc._store_approvals.list_pending(task_id)
-    assert any(r["capability_id"] == "fs" for r in pend), (
-        "the parked fs delete must be visible for a human decision")
+    assert not any(r["capability_id"] == "fs" for r in pend)

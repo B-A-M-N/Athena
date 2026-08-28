@@ -53,6 +53,11 @@ async def test_shadow_commit_applies_proven_changes(service, tmp_path):
     assert not os.path.exists(os.path.join(ws.root, "lib.py"))
 
     await engine.record_verification(branch, [{"id": "ac_1", "passed": True}])
+    assert branch.verification_certificate["candidate_fingerprint"]
+    assert branch.verification_certificate["environment_fingerprint"]
+    assert branch.verification_certificate["criteria"] == [
+        {"id": "ac_1", "passed": True}
+    ]
     outcome = await engine.commit(branch)
     assert outcome["status"] == "committed"
     assert "lib.py" in outcome["written"]
