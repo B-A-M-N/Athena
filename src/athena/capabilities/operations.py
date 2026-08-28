@@ -97,6 +97,8 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
     "workspace": {
         "status": frozenset({EffectClass.READ_LOCAL}),
         "changed_files": frozenset({EffectClass.READ_LOCAL}),
+        "profile": frozenset({EffectClass.READ_LOCAL}),
+        "impact": frozenset({EffectClass.READ_LOCAL}),
         "snapshot": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "restore": frozenset({EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
     },

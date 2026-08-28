@@ -818,27 +818,36 @@ class WorkspaceCapability:
 
     def __init__(self, checkpoint_manager=None, *, mutation_store=None,
                  mutation_observer=None) -> None:
+        from athena.project import ProjectInspector
+
         self._checkpoints = checkpoint_manager
         self._mutations = mutation_store
         self._mutation_observer = mutation_observer
+        self._project_inspector = ProjectInspector()
 
     descriptor = CapabilityDescriptor(
         id="workspace",
         description=(
             "Workspace lifecycle: status summary, snapshot (via checkpoint "
             "manager), restore, changed-file listing (git when available, "
-            "mtime scan otherwise), and generated-artifact cleanup hints. "
-            "Operations: status/changed_files/snapshot/restore."
+            "mtime scan otherwise), project profile, and bounded impact hints. "
+            "Operations: status/changed_files/profile/impact/snapshot/restore."
         ),
         input_schema={
             "type": "object",
             "required": ["operation"],
             "properties": {
                 "operation": {"type": "string", "enum": [
-                    "status", "changed_files", "snapshot", "restore"]},
+                    "status", "changed_files", "profile", "impact",
+                    "snapshot", "restore"]},
                 "label": {"type": "string"},
                 "checkpoint_id": {"type": "string"},
                 "expected_fingerprint": {"type": "string", "minLength": 1},
+                "paths": {
+                    "type": "array", "minItems": 1, "maxItems": 100,
+                    "items": {"type": "string", "maxLength": 4096},
+                },
+                "path": {"type": "string", "maxLength": 4096},
             },
         },
         effects=frozenset({
@@ -892,6 +901,37 @@ class WorkspaceCapability:
                 return "\n".join(f"{e[1]}" for e in entries[:25])
             return _result(request, output=await loop.run_in_executor(
                 None, _changed))
+
+        if op == "profile":
+            profile = await loop.run_in_executor(
+                None, self._project_inspector.inspect, root
+            )
+            return _result(
+                request,
+                output=json.dumps(profile.to_dict(), sort_keys=True),
+                meta={"profile": profile.to_dict()},
+            )
+
+        if op == "impact":
+            raw_paths = args.get("paths")
+            if raw_paths is None and args.get("path") is not None:
+                raw_paths = [args["path"]]
+            if not isinstance(raw_paths, list) or not raw_paths:
+                return _result(
+                    request, ok=False,
+                    error="impact requires a non-empty paths list",
+                )
+            try:
+                impact = await loop.run_in_executor(
+                    None, self._project_inspector.impact, root, raw_paths
+                )
+            except ValueError as exc:
+                return _result(request, ok=False, error=str(exc))
+            return _result(
+                request,
+                output=json.dumps(impact, sort_keys=True),
+                meta={"impact": impact},
+            )
 
         if op == "snapshot":
             mgr = self._checkpoints
