@@ -139,3 +139,37 @@ async def test_reflection_permissions_reports_effective_task_authority():
         "status": "PENDING", "created_at": "2026-01-01T00:00:00Z",
     }]
     assert permissions[1]["task_allowed"] is True
+
+
+def test_reflection_makes_unsupported_devices_explicit():
+    reflection = CapabilityReflection(CapabilityFabric(CapabilityRegistry()))
+
+    assert reflection._list_devices() == [{
+        "kind": "device_provider",
+        "status": "unsupported",
+        "reason": "no device provider is configured",
+    }]
+
+
+def test_execution_manager_reports_runtime_health_and_aliases():
+    from athena.execution.manager import ExecutionManager
+
+    class _Runtime:
+        name = "python"
+        aliases = ("py",)
+        persistence = "persistent"
+
+    manager = ExecutionManager()
+    runtime = _Runtime()
+    manager.register_runtime(runtime)
+
+    assert manager.runtime_status() == [{
+        "id": "python",
+        "aliases": ["py"],
+        "available": True,
+        "healthy": True,
+        "persistence": "persistent",
+        "active_sessions": 0,
+        "active_executions": 0,
+        "implementation": "_Runtime",
+    }]

@@ -185,6 +185,9 @@ class CapabilityReflection:
     def _list_runtimes(self) -> list[dict]:
         if self._execution is None:
             return []
+        status = getattr(self._execution, "runtime_status", None)
+        if callable(status):
+            return list(status())
         names = self._execution.available_runtimes()
         return [{"kind": "runtime", "id": name, "available": True}
                 for name in names]
@@ -285,9 +288,18 @@ class CapabilityReflection:
     def _list_devices(self) -> list[dict]:
         """Return registered device adapters without inventing support."""
         if self._devices is None:
-            return []
+            return [{
+                "kind": "device_provider",
+                "status": "unsupported",
+                "reason": "no device provider is configured",
+            }]
         value = self._devices() if callable(self._devices) else self._devices
-        return list(value or ())
+        devices = list(value or ())
+        return devices or [{
+            "kind": "device_provider",
+            "status": "unsupported",
+            "reason": "configured device provider returned no adapters",
+        }]
 
     async def _describe_workflow(self, workflow_id: str, *, task_id,
                                  project_id, user_id) -> dict:
