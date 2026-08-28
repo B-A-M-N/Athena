@@ -40,13 +40,16 @@ class CapabilityReflection:
 
     def __init__(
         self, fabric, *, workflow_store=None, skills_store=None,
-        execution_manager=None, device_provider=None,
+        execution_manager=None, device_provider=None, policy_engine=None,
+        approval_store=None,
     ) -> None:
         self._fabric = fabric
         self._workflows = workflow_store
         self._skills = skills_store
         self._execution = execution_manager
         self._devices = device_provider
+        self._policy = policy_engine
+        self._approvals = approval_store
 
     async def invoke(self, request: CapabilityRequest, **kw) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -100,9 +103,10 @@ class CapabilityReflection:
             elif operation == "runtimes":
                 value = self._list_runtimes()
             elif operation == "permissions":
-                value = self._list_permissions(
+                value = await self._list_permissions(
                     capability_id=str(args.get("capability_id") or ""),
                     task_id=task_id, project_id=project_id, user_id=user_id,
+                    context=context,
                 )
             elif operation == "devices":
                 value = self._list_devices()
@@ -185,25 +189,98 @@ class CapabilityReflection:
         return [{"kind": "runtime", "id": name, "available": True}
                 for name in names]
 
-    def _list_permissions(
+    async def _list_permissions(
         self, *, capability_id: str, task_id: str | None,
-        project_id: str | None, user_id: str,
+        project_id: str | None, user_id: str, context=None,
     ) -> list[dict]:
         descriptors = self._fabric.list_descriptors(
             task_id=task_id, project_id=project_id, user_id=user_id,
         )
         if capability_id:
             descriptors = [item for item in descriptors if item.id == capability_id]
-        return [
+
+        task_policy = getattr(context, "capability_policy", None)
+        task_policy_record = None
+        if task_policy is not None:
+            task_policy_record = {
+                "allow": list(task_policy.allow),
+                "ask": list(task_policy.ask),
+                "deny": list(task_policy.deny),
+                "effects": sorted(
+                    getattr(effect, "value", str(effect))
+                    for effect in task_policy.effects
+                ),
+            }
+
+        pending: list[dict] = []
+        if self._approvals is not None and task_id is not None:
+            for record in await self._approvals.list_pending(task_id):
+                # Approval arguments are intentionally omitted: reflection is
+                # model-visible and arguments may contain credentials or data.
+                pending.append({
+                    "approval_id": record.get("id"),
+                    "capability_id": record.get("capability_id"),
+                    "status": record.get("status"),
+                    "created_at": record.get("created_at"),
+                })
+
+        grants: list[dict] = []
+        manager = getattr(self._policy, "approvals", None)
+        if manager is not None:
+            for grant in manager.list_active():
+                if grant.task_id not in (None, task_id):
+                    continue
+                grants.append({
+                    "approval_id": grant.id,
+                    "capability_id": grant.capability,
+                    "effect": getattr(grant.effect, "value", grant.effect),
+                    "scope": getattr(grant.scope, "value", grant.scope),
+                    "resource_pattern": grant.resource_pattern,
+                    "task_id": grant.task_id,
+                    "session_id": grant.session_id,
+                    "expires_at": (
+                        grant.expires_at.isoformat() if grant.expires_at else None
+                    ),
+                })
+
+        workspace = getattr(context, "workspace", None)
+        raw_profile = getattr(self._policy, "profile", None)
+        profile = getattr(raw_profile, "value", raw_profile)
+        permissions = [
             {
                 "kind": "permission",
                 "capability_id": descriptor.id,
                 "declared_effects": sorted(
                     effect.value for effect in descriptor.effects),
                 "availability": descriptor.availability.value,
+                "task_allowed": not (
+                    task_policy is not None
+                    and (
+                        descriptor.id in task_policy.deny
+                        or (bool(task_policy.allow)
+                            and descriptor.id not in task_policy.allow)
+                    )
+                ),
+                "task_requires_approval": bool(
+                    task_policy is not None and descriptor.id in task_policy.ask
+                ),
+                "task_effect_ceiling": task_policy_record["effects"]
+                if task_policy_record is not None else [],
             }
             for descriptor in descriptors
         ]
+        return [{
+            "kind": "policy_context",
+            "profile": profile,
+            "workspace_id": getattr(workspace, "id", None),
+            "network_policy": getattr(
+                getattr(workspace, "network_policy", None), "value",
+                getattr(workspace, "network_policy", None),
+            ),
+            "task_policy": task_policy_record,
+            "pending_approvals": pending,
+            "active_grants": grants,
+        }, *permissions]
 
     def _list_devices(self) -> list[dict]:
         """Return registered device adapters without inventing support."""

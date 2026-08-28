@@ -8,16 +8,18 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
 )
-from athena.protocol.tasks import WorkspaceSpec
+from athena.protocol.tasks import CapabilityPolicy, WorkspaceSpec
 from athena.workflows import Workflow, WorkflowExecutor, WorkflowStep
 
 
 class _Dispatcher:
     def __init__(self) -> None:
         self.requests: list[CapabilityRequest] = []
+        self.dispatch_kwargs: list[dict] = []
 
     async def dispatch(self, request, **kwargs):
         self.requests.append(request)
+        self.dispatch_kwargs.append(kwargs)
         return CapabilityResult(
             request.call_id, request.capability_id,
             CapabilityResultStatus.OK,
@@ -82,6 +84,25 @@ async def test_workflow_propagates_session_scope_to_capability_calls(tmp_path):
 
     assert result.status == "completed"
     assert dispatcher.requests[0].session_id == "session-1"
+
+
+async def test_workflow_propagates_task_capability_policy_to_steps(tmp_path):
+    dispatcher = _Dispatcher()
+    workflow = Workflow.create(
+        name="policy-aware", description="policy-aware",
+        steps=(WorkflowStep(id="echo", capability_id="echo"),),
+    )
+    policy = CapabilityPolicy(allow=("echo",))
+
+    result = await WorkflowExecutor(dispatcher, resolver=_resolver).run(
+        workflow,
+        task_id="task-1",
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
+        task_policy=policy,
+    )
+
+    assert result.status == "completed"
+    assert dispatcher.dispatch_kwargs[0]["task_policy"] == policy
 
 
 async def test_workflow_rejects_unbounded_foreach(tmp_path):

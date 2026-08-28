@@ -15,7 +15,7 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     EffectClass,
 )
-from athena.protocol.tasks import WorkspaceSpec
+from athena.protocol.tasks import AutonomyLevel, CapabilityPolicy, WorkspaceSpec
 from athena.skills.models import Skill
 from athena.workflows.models import Workflow, WorkflowStep
 
@@ -57,6 +57,15 @@ class _Skills:
         return await self.search()
 
 
+class _Approvals:
+    async def list_pending(self, task_id):
+        return [{
+            "id": "approval-1", "capability_id": "execute",
+            "status": "PENDING", "created_at": "2026-01-01T00:00:00Z",
+            "arguments": {"secret": "must-not-leak"},
+        }]
+
+
 @pytest.mark.asyncio
 async def test_reflection_searches_capabilities_workflows_and_skills():
     registry = CapabilityRegistry()
@@ -95,3 +104,38 @@ async def test_reflection_describes_workflow_without_exposing_skill_body():
     described = json.loads(result.output)
     assert described["kind"] == "workflow"
     assert described["steps"][0]["capability"] == "project.inspect"
+
+
+@pytest.mark.asyncio
+async def test_reflection_permissions_reports_effective_task_authority():
+    registry = CapabilityRegistry()
+    registry.register(_Capability())
+    policy = SimpleNamespace(
+        profile=AutonomyLevel.CODING,
+        approvals=SimpleNamespace(list_active=lambda: []),
+    )
+    reflection = CapabilityReflection(
+        CapabilityFabric(registry),
+        policy_engine=policy,
+        approval_store=_Approvals(),
+    )
+    result = await reflection.invoke(
+        CapabilityRequest(
+            capability_id="capabilities", task_id="task-1", call_id="call-3",
+            arguments={"operation": "permissions"},
+        ),
+        context=SimpleNamespace(
+            workspace=WorkspaceSpec(id="repo", root="/tmp"),
+            capability_policy=CapabilityPolicy(allow=("project.inspect",)),
+        ),
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    permissions = json.loads(result.output)
+    assert permissions[0]["kind"] == "policy_context"
+    assert permissions[0]["profile"] == "coding"
+    assert permissions[0]["pending_approvals"] == [{
+        "approval_id": "approval-1", "capability_id": "execute",
+        "status": "PENDING", "created_at": "2026-01-01T00:00:00Z",
+    }]
+    assert permissions[1]["task_allowed"] is True

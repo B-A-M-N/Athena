@@ -144,6 +144,7 @@ class WorkflowCapability:
             graph[workflow.id], task_id=request.task_id,
             workspace=context.workspace, inputs=args.get("inputs"),
             session_id=request.session_id,
+            task_policy=getattr(context, "capability_policy", None),
         )
         ok = outcome.status == "completed"
         return _result(request, ok=ok, output=json.dumps({

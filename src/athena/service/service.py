@@ -1904,6 +1904,8 @@ class AthenaService:
             workflow_store=self._workflow_store,
             skills_store=skills_store,
             execution_manager=execution,
+            policy_engine=self._policy,
+            approval_store=self._store_approvals,
         ))
         registry.register(DependencyCapability(execution))
         if research_store is not None:

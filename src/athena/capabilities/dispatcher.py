@@ -367,6 +367,7 @@ metadata={"decision": "deny", "matched_rule": decision.matched_rule},
             task_id=request.task_id,
             workspace=workspace,
             execution_backend=workspace.execution_backend,
+            capability_policy=task_policy,
         )
         result = await executor.invoke(request, context=context)
         if result.status == CapabilityResultStatus.OK:

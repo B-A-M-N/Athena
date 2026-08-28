@@ -14,7 +14,7 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
 )
 from athena.protocol.ids import new_id
-from athena.protocol.tasks import WorkspaceSpec
+from athena.protocol.tasks import CapabilityPolicy, WorkspaceSpec
 from athena.workflows.models import Workflow
 from athena.workflows.validation import WorkflowValidator
 
@@ -40,6 +40,7 @@ class WorkflowExecutor:
         workspace: WorkspaceSpec, profile: str | None = None,
         session_id: str | None = None,
         inputs: Mapping[str, Any] | None = None,
+        task_policy: CapabilityPolicy | None = None,
     ) -> WorkflowResult:
         validation = WorkflowValidator(self._resolver).validate(workflow)
         if not validation.ok:
@@ -89,9 +90,9 @@ class WorkflowExecutor:
                         nested_inputs = _resolve_values(
                             dict(step.arguments), inputs, outputs, item)
                         nested_result = await self.run(
-                            nested, task_id=task_id, workspace=workspace,
-                            profile=profile, session_id=session_id,
-                            inputs=nested_inputs,
+                        nested, task_id=task_id, workspace=workspace,
+                        profile=profile, session_id=session_id,
+                            inputs=nested_inputs, task_policy=task_policy,
                         )
                         step_results.append(dict(nested_result.outputs))
                         if nested_result.status == "suspended":
@@ -115,7 +116,8 @@ class WorkflowExecutor:
                         origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
                     )
                     result = await self._dispatcher.dispatch(
-                        request, workspace=workspace, profile=profile)
+                        request, workspace=workspace, profile=profile,
+                        task_policy=task_policy)
                     if isinstance(result, SuspendedCall):
                         return WorkflowResult(
                             workflow.id, "suspended", outputs,
