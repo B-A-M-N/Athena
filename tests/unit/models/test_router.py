@@ -1,8 +1,11 @@
+from decimal import Decimal
+
 from athena.models.fake import FakeModelProvider
 import pytest
 from athena.models.registry import ProviderRegistry
 from athena.models.router import CAP_TOOLS, ModelRequirements, ModelRouter
-from athena.protocol.models import PrivacyClass
+from athena.protocol.errors import ModelUnavailable
+from athena.protocol.models import CostInfo, PrivacyClass
 from athena.protocol.tasks import ModelPolicy
 
 
@@ -51,6 +54,17 @@ async def test_offline_policy_selects_only_local_models():
     assert sel.info.privacy_class is PrivacyClass.LOCAL
     # The remote model must have been filtered out.
     assert sel.provider == "local"
+
+
+async def test_strict_cost_policy_rejects_partial_or_non_usd_pricing():
+    partial = _fake("partial", privacy=PrivacyClass.LOCAL)
+    partial._info_kwargs["cost"] = CostInfo(per_1m_input=0.0, per_1m_output=None)
+    non_usd = _fake("non-usd", privacy=PrivacyClass.LOCAL)
+    non_usd._info_kwargs["cost"] = CostInfo(per_1m_input=0.0, per_1m_output=0.0, currency="EUR")
+    registry = _registry({"partial": partial, "non-usd": non_usd})
+
+    with pytest.raises(ModelUnavailable):
+        await ModelRouter(registry).select(policy=ModelPolicy(max_cost_usd=Decimal("1.00")))
 
 
 @pytest.mark.athena_claim("BHV-035")

@@ -329,8 +329,16 @@ class ModelRouter:
             # Under a strict cost ceiling, unknown pricing is NOT equivalent to free.
             # Treat as unavailable if the policy has a max_cost_usd constraint.
             return False
+        if (
+            cost.currency.upper() != "USD"
+            or cost.per_1m_input is None
+            or cost.per_1m_output is None
+        ):
+            # A partial rate card, or a currency we cannot compare to the USD
+            # policy ceiling, is unknown rather than free.
+            return False
         # Estimate based on typical request sizes (conservative: assume 10k input, 4k output)
-        estimate = (cost.per_1m_input or 0.0) * 0.01 + (cost.per_1m_output or 0.0) * 0.004
+        estimate = cost.per_1m_input * 0.01 + cost.per_1m_output * 0.004
         return estimate <= float(policy.max_cost_usd)
 
     def _rationale(
