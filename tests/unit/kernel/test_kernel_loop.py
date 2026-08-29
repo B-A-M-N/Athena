@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from decimal import Decimal
 
 import pytest
 
@@ -15,7 +16,9 @@ from athena.models.fake import FakeModelProvider
 from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
 from athena.protocol.ids import new_id
+from athena.protocol.models import CostInfo
 from athena.protocol.tasks import ResourceBudget, TaskSpec, TaskStatus
+from athena.tasks.budgets import BudgetTracker
 from athena.state.database import Database
 from athena.state.events import EventStore
 from athena.state.messages import MessageStore
@@ -122,7 +125,7 @@ async def test_end_to_end_simple_completes(stack):
     ]
     spec = await _create(stack, "hello world")
     result = await stack.kernel.run_task(spec.id)
-    assert result.status == TaskStatus.COMPLETE
+    assert result.status == TaskStatus.COMPLETE, result
     events = await stack.events.list_for_task(spec.id)
     types = {e.type for e in events}
     assert "TaskCreated" in types
@@ -180,6 +183,48 @@ async def test_budget_exhaustion_is_partial_not_failed(stack):
     assert result.status == TaskStatus.PARTIAL
     assert result.status != TaskStatus.FAILED
     assert "budget" in result.summary.lower()
+
+
+async def test_successful_model_calls_reconcile_cost_before_next_reservation(stack):
+    """A completed call cannot leave its worst-case reservation behind."""
+    stack.provider._info_kwargs["cost"] = CostInfo(per_1m_input=1.0, per_1m_output=100.0)
+    stack.provider._info_kwargs["max_output_tokens"] = 4096
+    stack.provider._response_cost_usd = 0.001
+    stack.provider._scripts = [
+        {
+            "match": {"capability_result_ok": True},
+            "respond": {"text": "priced complete", "done": True, "cost_usd": 0.001},
+        },
+        {
+            "match": {"user_contains": "priced"},
+            "respond": {
+                "capability_call": {
+                    "capability_id": "tools.think",
+                    "arguments": {},
+                },
+                "done": False,
+                "cost_usd": 0.001,
+            },
+        },
+    ]
+    dispatched: list = []
+    stack.kernel._dispatch_factory = lambda task: StubDispatchIface(dispatched)
+    budgets = BudgetTracker(task_store=stack.tasks)
+    stack.manager.set_budget_tracker(budgets)
+    stack.kernel.set_budget_tracker(budgets)
+
+    spec = await _create(
+        stack,
+        "priced model call",
+        budget=ResourceBudget(max_cost_usd=Decimal("0.015"), max_output_tokens=100),
+    )
+    result = await stack.kernel.run_task(spec.id)
+    usage = await budgets.total(spec.id)
+
+    assert result.status == TaskStatus.COMPLETE
+    assert usage.model_calls == 2
+    assert usage.cost == Decimal("0.002")
+    assert budgets._model_cost_reservations.get(spec.id, Decimal("0")) == Decimal("0")
 
 
 @pytest.mark.athena_claim("BHV-076", "BHV-078")

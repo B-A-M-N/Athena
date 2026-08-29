@@ -113,8 +113,12 @@ def _commands(uv: str, *, skip_e2e: bool) -> list[tuple[str, list[str]]]:
                                 "--require-clean", "--exclude-family", "VHS",
                                 "--output", "release-scenarios.json"]),
         ("architecture-lint", [*prefix, "python", "scripts/architecture-lint"]),
-        ("native-check", ["cargo", "check", "--manifest-path", "native/Cargo.toml", "--offline"]),
-        ("native-test", ["cargo", "test", "--manifest-path", "native/Cargo.toml", "--offline"]),
+        # The native crate pins a git dependency. Fetch it explicitly in the
+        # cold CI environment, then keep the actual checks locked and
+        # reproducible rather than relying on a pre-warmed Cargo cache.
+        ("native-fetch", ["cargo", "fetch", "--manifest-path", "native/Cargo.toml", "--locked"]),
+        ("native-check", ["cargo", "check", "--manifest-path", "native/Cargo.toml", "--locked"]),
+        ("native-test", ["cargo", "test", "--manifest-path", "native/Cargo.toml", "--locked"]),
         ("native-smoke", ["scripts/native-smoke"]),
     ]
     if not skip_e2e:

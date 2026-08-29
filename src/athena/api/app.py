@@ -447,7 +447,11 @@ def _health_handler(service: Any) -> Any:
         worker = getattr(service, "_worker", None)
         worker_health = worker.health() if worker is not None and hasattr(worker, "health") else {}
         startup = service.startup_health() if hasattr(service, "startup_health") else None
-        startup_ok = startup is None or startup.get("status") == "ok"
+        # Optional startup integrations may be degraded while the core
+        # service remains ready.  Their state is returned below for operators;
+        # only service/database/worker/scheduler/provider/recovery checks gate
+        # readiness.
+        startup_ok = startup is None or startup.get("status") in {"ok", "degraded"}
         checks = {
             "service": started,
             "database": database_ok,

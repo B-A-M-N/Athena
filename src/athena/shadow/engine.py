@@ -40,6 +40,7 @@ from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
 from athena.protocol.tasks import MutationMode, NetworkPolicy, PathRule, WorkspaceSpec
 from athena.execution.environment import ProjectEnvironmentFingerprint
+from athena.workspace_manifest import IGNORED_DIRECTORY_NAMES, copy_ignore
 from athena.verification.certificate import (
     VerificationCertificate,
     certificate_digest as _certificate_digest,
@@ -125,6 +126,12 @@ class ShadowBranch:
     created_at: str = field(default_factory=lambda: utcnow().isoformat())
 
 
+@dataclass(frozen=True)
+class DiscardDecision:
+    allowed: bool
+    reason: str
+
+
 class ShadowEngine:
     """Creates isolated workspace clones, runs proposals, commits or discards."""
 
@@ -197,9 +204,7 @@ class ShadowEngine:
                 src,
                 root,
                 dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(
-                    ".git", "__pycache__", "node_modules", ".venv", "*.pyc"
-                ),
+                ignore=copy_ignore,
             )
         return self._workspace_for_branch(base, branch_id), base_manifest
 
@@ -507,6 +512,30 @@ class ShadowEngine:
                 "error": branch.error,
             }
 
+        # A verified deletion still crosses the normal fs ASK boundary.  The
+        # beta review command has no resumable approval continuation for a
+        # multi-operation commit yet, so retain the proven candidate instead
+        # of converting it into a failed/cleaned-up commit or applying an
+        # unapproved destructive operation.
+        if changes["deleted"]:
+            branch.commit_state = "DELETE_APPLY_UNSUPPORTED"
+            branch.commit_outcome = {
+                "status": "approval_required",
+                "deleted": list(changes["deleted"]),
+                "message": "verified deletion apply is not supported in beta; candidate retained",
+            }
+            branch.error = (
+                "verified deletion apply is not supported in beta; "
+                "candidate retained for the existing explicit approval path"
+            )
+            self._persist_branches()
+            return {
+                "status": "APPROVAL_REQUIRED",
+                "branch": branch.id,
+                "deleted": list(changes["deleted"]),
+                "error": branch.error,
+            }
+
         base_root = branch.base_workspace.root
 
         requests: list[CapabilityRequest] = []
@@ -804,12 +833,51 @@ class ShadowEngine:
         return {"rolled_back": rolled_back, "errors": errors}
 
     async def discard(self, branch: ShadowBranch, reason: str = "") -> dict:
+        decision = self.can_discard(branch)
+        if not decision.allowed:
+            return {
+                "status": "RECOVERY_REQUIRED",
+                "branch": branch.id,
+                "error": decision.reason,
+            }
         branch.status = BranchStatus.DISCARDED
         branch.commit_state = "DISCARDED"
         branch.error = branch.error or reason or None
         self._persist_branches()
         await self._cleanup(branch)
         return {"status": "discarded", "branch": branch.id, "reason": reason}
+
+    @staticmethod
+    def can_discard(branch: ShadowBranch) -> "DiscardDecision":
+        """Classify whether deleting a branch would destroy recovery evidence."""
+        blocked = {
+            "PLANNED",
+            "APPLYING",
+            "COMMIT_PROVEN",
+            "FINALIZED",
+        }
+        state = str(branch.commit_state or "NOT_STARTED")
+        # A certificate that became stale before any real mutation is still
+        # safe to discard.  A recovery-required branch with any other state
+        # may contain the only evidence needed to reconcile the checkout.
+        if branch.status == BranchStatus.RECOVERY_REQUIRED and state == "STALE_CERTIFICATE":
+            return DiscardDecision(True, "stale certificate can be safely discarded")
+        if state in blocked:
+            return DiscardDecision(
+                False,
+                f"cannot discard branch {branch.id}: commit state {state} retains recovery evidence",
+            )
+        if branch.status == BranchStatus.RECOVERY_REQUIRED:
+            return DiscardDecision(
+                False,
+                f"cannot discard branch {branch.id}: recovery-required branch retains evidence",
+            )
+        if branch.status == BranchStatus.COMMITTING:
+            return DiscardDecision(
+                False,
+                f"cannot discard branch {branch.id}: commit is still in flight",
+            )
+        return DiscardDecision(True, "discard is safe for this branch state")
 
     async def finalize_proven(self, branch: ShadowBranch) -> None:
         """Finish cleanup for a commit proven before a process stopped."""
@@ -916,7 +984,7 @@ class ShadowEngine:
         """
         import hashlib
 
-        ignore = {".git", "__pycache__", "node_modules", ".venv"}
+        ignore = IGNORED_DIRECTORY_NAMES
 
         def resource_hash(path: str) -> str:
             try:
@@ -952,6 +1020,8 @@ class ShadowEngine:
                     kept_dirs.append(name)
             dirnames[:] = kept_dirs
             for name in filenames:
+                if name.endswith(".pyc") or name == ".coverage":
+                    continue
                 full = os.path.join(dirpath, name)
                 manifest[os.path.relpath(full, root)] = resource_hash(full)
         return manifest

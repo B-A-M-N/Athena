@@ -54,6 +54,7 @@ def spawn_owned(
     sandbox_writable: bool = True,
     writable_paths: tuple[str, ...] | None = None,
     read_only_paths: tuple[str, ...] = (),
+    toolchain_paths: tuple[str, ...] = (),
     **popen_kwargs: object,
 ) -> "subprocess.Popen[str]":
     """Spawn ``argv`` in its own process group so the whole tree can be killed.
@@ -79,6 +80,15 @@ def spawn_owned(
     if env:
         my_env.update({k: str(v) for k, v in env.items()})
     my_env.setdefault("PYTHONIOENCODING", "utf-8")
+    if toolchain_paths:
+        toolchain_bins = []
+        for raw_path in toolchain_paths:
+            path = os.path.realpath(os.path.abspath(raw_path))
+            parent = path if os.path.isdir(path) else os.path.dirname(path)
+            if os.path.basename(parent) == "bin":
+                toolchain_bins.append(parent)
+        if toolchain_bins:
+            my_env["PATH"] = ":".join(dict.fromkeys([*toolchain_bins, my_env.get("PATH", "")]))
     if sandbox_root is not None:
         # Some locked-down hosts already apply an inherited seccomp filter
         # which rejects AF_INET/AF_INET6 sockets.  Bubblewrap cannot create a
@@ -99,6 +109,7 @@ def spawn_owned(
             writable=sandbox_writable,
             writable_paths=writable_paths,
             read_only_paths=read_only_paths,
+            toolchain_paths=toolchain_paths,
         )
         root_abs = os.path.realpath(os.path.abspath(sandbox_root))
         my_env["PATH"] = _namespace_path(my_env.get("PATH", ""), root_abs)
@@ -125,6 +136,7 @@ def sandbox_argv(
     writable: bool = True,
     writable_paths: tuple[str, ...] | None = None,
     read_only_paths: tuple[str, ...] = (),
+    toolchain_paths: tuple[str, ...] = (),
 ) -> list[str]:
     """Build a fail-closed Linux Bubblewrap command line.
 
@@ -205,6 +217,25 @@ def sandbox_argv(
                 if directory not in ("/", "/usr", "/bin", "/lib", "/lib64"):
                     command.extend(("--dir", directory))
             command.extend(("--ro-bind", parent, parent))
+
+    for raw_path in toolchain_paths:
+        path = os.path.realpath(os.path.abspath(raw_path))
+        if not os.path.exists(path):
+            raise RuntimeError(f"trusted toolchain path does not exist: {raw_path}")
+        bind_path = path
+        if os.path.isfile(path):
+            parent = os.path.dirname(path)
+        else:
+            parent = path
+        toolchain_ancestors: list[str] = []
+        ancestor = parent
+        while ancestor not in ("", os.path.dirname(ancestor)):
+            toolchain_ancestors.append(ancestor)
+            ancestor = os.path.dirname(ancestor)
+        for directory in reversed(toolchain_ancestors):
+            if directory not in ("/", "/usr", "/bin", "/lib", "/lib64"):
+                command.extend(("--dir", directory))
+        command.extend(("--ro-bind", bind_path, bind_path))
 
     # Mount the workspace read-only first whenever an explicit writable policy
     # is supplied, then overlay only the allowed canonical subtrees. Denied

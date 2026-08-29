@@ -129,4 +129,6 @@ async def test_execute_adds_candidate_src_without_inheriting_host_pythonpath(tmp
     )
 
     assert result.status is CapabilityResultStatus.OK
-    assert execution.requests[0].env == {"PYTHONPATH": str(tmp_path / "src")}
+    assert execution.requests[0].env["PYTHONPATH"] == str(tmp_path / "src")
+    assert execution.requests[0].env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert "host/pythonpath" not in execution.requests[0].env

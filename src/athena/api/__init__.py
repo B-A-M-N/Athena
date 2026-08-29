@@ -2,9 +2,9 @@
 
 The HTTP API is a thin, interface-neutral transport (INV-007) over
 :class:`~athena.service.service.AthenaService`. HTTP requests become Tasks
-(BHV-002) and events stream out over SSE. Importing this package does NOT
-require starlette/uvicorn (optional ``api`` extra) — those are lazily imported
-by the factory and runner.
+(BHV-002) and events stream out over SSE. Starlette and Uvicorn are core
+Athena dependencies; they are imported lazily so importing this package does
+not start a server.
 """
 
 from __future__ import annotations

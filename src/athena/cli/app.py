@@ -263,6 +263,7 @@ class Options:
     reduced_motion: bool = False
     criteria: str | None = None
     deny: bool = False
+    review_task_id: str | None = None
     artifact_root: str | None = None
     _providers: tuple[Any, ...] = ()
 
@@ -457,6 +458,8 @@ def _athena_checkout_root() -> str:
 
 
 async def _cmd_self(o: Options, service: Any) -> int:
+    if o.review_task_id:
+        return await _cmd_self_review(o.review_task_id, service)
     objective = o.args[0] if o.args else None
     if not objective:
         print("athena self: missing objective", file=sys.stderr)
@@ -468,11 +471,11 @@ async def _cmd_self(o: Options, service: Any) -> int:
         return 2
 
     criteria = [
-        "command:uv run --frozen ruff format --check src tests",
-        "command:uv run --frozen ruff check src tests",
-        "command:uv run --frozen mypy src",
-        "command:uv run --frozen pytest -q",
-        "command:uv run --frozen python scripts/architecture-lint",
+        "command:uv run --frozen --no-sync ruff format --check --no-cache src tests",
+        "command:uv run --frozen --no-sync ruff check --no-cache src tests",
+        "command:uv run --frozen --no-sync mypy --cache-dir /tmp/athena-mypy-cache src",
+        "command:uv run --frozen --no-sync pytest -p no:cacheprovider -q",
+        "command:uv run --frozen --no-sync python scripts/architecture-lint",
     ]
     request = AgentRequest(
         prompt=objective,
@@ -520,11 +523,19 @@ async def _cmd_self(o: Options, service: Any) -> int:
             f"{len(candidate['changed_resources'])} changed resource(s), "
             f"certificate {candidate.get('certificate_hash', 'missing')}"
         )
+        _print_candidate_proof(candidate)
         print("[a] Apply  [d] Discard  [l] Later")
+        # Full-screen terminal sessions own stdin/stdout modes.  Return the
+        # terminal to normal cooked mode before collecting the operator's
+        # decision, then restore the surface for the final status line.
+        if callable(closer):
+            closer()
         try:
             choice = input("choice> ").strip().lower()[:1]
         except EOFError:
             choice = "l"
+        if callable(opener):
+            opener()
         if choice == "a":
             outcome = await service.apply_candidate(task_id)
             print(f"candidate: {outcome.get('status', 'unknown')}")
@@ -540,6 +551,50 @@ async def _cmd_self(o: Options, service: Any) -> int:
             await async_closer()
         elif callable(closer):
             closer()
+
+
+async def _cmd_self_review(task_id: str, service: Any) -> int:
+    """Reopen a durable candidate retained by a prior ``athena self`` run."""
+    candidate = await service.operator_candidate(task_id)
+    if candidate is None:
+        print(f"athena self: no retained candidate for task {task_id}", file=sys.stderr)
+        return 1
+    print("ATHENA SELF\n\nPATCH  ✓\nPROVE  ✓\nAPPLY  ?")
+    print(f"\nCandidate: {candidate.get('branch_id')}")
+    print("Changed:")
+    for resource in candidate.get("changed_resources") or ():
+        print(f"  {resource.get('path', resource) if isinstance(resource, dict) else resource}")
+    _print_candidate_proof(candidate)
+    print("\n[a] Apply  [d] Discard  [l] Later")
+    try:
+        choice = input("choice> ").strip().lower()[:1]
+    except EOFError:
+        choice = "l"
+    if choice == "a":
+        outcome = await service.apply_candidate(task_id)
+    elif choice == "d":
+        outcome = await service.discard_candidate(task_id)
+    else:
+        print("candidate retained for later review")
+        return 0
+    print(f"candidate: {outcome.get('status', 'unknown')}")
+    return 0 if outcome.get("status") in {"committed", "discarded"} else 1
+
+
+def _print_candidate_proof(candidate: dict[str, Any]) -> None:
+    """Render the durable verification evidence in the operator bundle."""
+    checks = candidate.get("verification") or ()
+    if not checks:
+        return
+    print("\nVerification:")
+    for check in checks:
+        if isinstance(check, dict):
+            label = check.get("id") or check.get("criterion") or "check"
+            passed = bool(check.get("passed"))
+        else:
+            label = str(check)
+            passed = False
+        print(f"  {label:<14} {'PASS' if passed else 'FAIL'}")
 
 
 async def _cmd_sessions(service: Any) -> int:
@@ -732,11 +787,16 @@ def _click_cli(click: Any):
         sys.exit(dispatch(o))
 
     @cli.command()
-    @click.argument("objective")
+    @click.argument("objective", required=False)
+    @click.option(
+        "--review", "review_task_id", default=None, help="Review a retained candidate task."
+    )
     @click.pass_context
-    def self(ctx, objective):
+    def self(ctx, objective, review_task_id):
         """Improve this Athena checkout in a verified candidate workspace."""
-        sys.exit(dispatch(base_options(ctx, "self", [objective])))
+        o = base_options(ctx, "self", [objective] if objective else [])
+        o.review_task_id = review_task_id
+        sys.exit(dispatch(o))
 
     @cli.command()
     @click.argument("task_id")
@@ -842,7 +902,11 @@ def _arg_parse(argv: list[str]) -> Options:
     ):
         sp = sub.add_parser(name, help=help_)
         globals_(sp)
-        sp.add_argument(pos)
+        if name == "self":
+            sp.add_argument(pos, nargs="?")
+            sp.add_argument("--review", dest="review_task_id", default=None)
+        else:
+            sp.add_argument(pos)
         if name == "approve":
             sp.add_argument("--deny", action="store_true", help="Deny the approval.")
 
@@ -877,13 +941,16 @@ def _arg_parse(argv: list[str]) -> Options:
         details=getattr(ns, "details", False),
         criteria=getattr(ns, "criteria", None),
         deny=getattr(ns, "deny", False) if command == "approve" else False,
+        review_task_id=getattr(ns, "review_task_id", None),
     )
     if command == "doctor":
         o.args = [ns.target]
     if command == "oi-stream":
         o.args = [ns.task_id] if ns.task_id else []
-    elif command in ("run", "self"):
+    elif command == "run":
         o.args = [ns.objective]
+    elif command == "self":
+        o.args = [ns.objective] if ns.objective else []
     elif command in ("inspect", "resume", "cancel", "approve"):
         o.args = [
             getattr(
@@ -897,7 +964,7 @@ def _arg_parse(argv: list[str]) -> Options:
     elif command == "chat" and getattr(ns, "objective", None):
         o.command = "run"
         o.args = [ns.objective]
-    if (o.command in ("run", "self", "inspect", "resume", "approve", "cancel")) and (
+    if (o.command in ("run", "inspect", "resume", "approve", "cancel")) and (
         not o.args or not o.args[0]
     ):
         print(f"athena {o.command}: missing required argument", file=sys.stderr)

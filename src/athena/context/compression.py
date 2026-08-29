@@ -149,10 +149,15 @@ class ContextCompressor:
         self.max_summary_chars = max_summary_chars
         self._summarizer = summarizer
 
-    async def _summarize(self, text: str) -> str:
+    async def _summarize(self, text: str, *, task=None) -> str:
         if self._summarizer is not None:
             try:
-                result = await self._summarizer(text)
+                try:
+                    result = await self._summarizer(text, task=task)
+                except TypeError:
+                    # Preserve the small public ``text -> str`` callback
+                    # contract used by standalone compiler clients.
+                    result = await self._summarizer(text)
                 if result:
                     return str(result)[: self.max_summary_chars]
             except Exception:
@@ -167,6 +172,7 @@ class ContextCompressor:
         *,
         recent_turns: int | None = None,
         actor: str = "context_compiler",
+        task=None,
     ) -> tuple[list[Selection], CompressionRecord]:
         """Compress a selection list down to what fits.
 
@@ -193,7 +199,7 @@ class ContextCompressor:
             if idx < recent_turns:
                 result.append(sel)
                 continue
-            summarized = await self._summarize(sel.text)
+            summarized = await self._summarize(sel.text, task=task)
             marker = CompressionMarker(
                 selection_ids=(sel.name,),
                 message_ids=tuple(sel.provenance_meta.get("message_ids", ())),
@@ -211,7 +217,7 @@ class ContextCompressor:
 
         if summarized_sels:
             summary_text = await self._summarize(
-                "\n".join(s.text for s in summarized_sels if s.text)
+                "\n".join(s.text for s in summarized_sels if s.text), task=task
             )
             merged = _merged_provenance(summarized_sels)
             result.append(

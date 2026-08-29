@@ -48,6 +48,9 @@ class ExecutionRequest:
     # model-controlled capability arguments.
     writable_paths: tuple[str, ...] | None = None
     read_only_paths: tuple[str, ...] = ()
+    # Trusted, operator-selected toolchain paths mounted read-only for
+    # verification. This is deliberately separate from model-controlled env.
+    toolchain_paths: tuple[str, ...] = ()
     resource_limits: ExecutionLimits | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 

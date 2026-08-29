@@ -440,6 +440,7 @@ class AthenaService:
         # 7. TaskManager (needs budgets/cancellations, built a bit later).
         budgets = BudgetTracker(task_store=tasks)
         self._budgets = budgets
+        dispatcher.set_budget_tracker(budgets)
         self._artifacts.set_budget_tracker(budgets)
         task_manager = TaskManager(
             task_store=tasks,
@@ -531,6 +532,7 @@ class AthenaService:
             messages=messages,
             registry=model_registry,
             router=router,
+            budgets=budgets,
             context_compiler=compiler,
             termination=TerminationEvaluator(
                 acceptance_verifier=verifier,
@@ -1746,6 +1748,10 @@ class AthenaService:
             return {"status": "missing", "error": "no retained candidate"}
         if branch.status != "VERIFIED":
             return {"status": "refused", "error": branch.error or f"candidate is {branch.status}"}
+        review = await self.operator_candidate(task_id) or {}
+        await self._candidate_review_event(
+            "CANDIDATE_APPLY_REQUESTED", task_id, review, {"operator": "local"}
+        )
         # A retained candidate is normally active so reads remain coherent
         # while it is under review.  Detach it for the canonical commit call:
         # otherwise RealityGate correctly routes the commit's direct fs
@@ -1756,13 +1762,27 @@ class AthenaService:
             await self._reality_gate.deactivate_branch(task_id)
         try:
             outcome = await self.shadow_engine().commit(branch)
-        except Exception:
+        except Exception as exc:
+            await self._candidate_review_event(
+                "CANDIDATE_APPLY_FAILED",
+                task_id,
+                review,
+                {"status": "exception", "error": str(exc)},
+            )
             if self._reality_gate is not None and branch.status == "VERIFIED":
                 self._reality_gate.activate_branch(branch)
             raise
         if outcome.get("status") != "committed" and self._reality_gate is not None:
             if branch.status in {"VERIFIED", "CONFLICTED", "RECOVERY_REQUIRED"}:
                 self._reality_gate.activate_branch(branch)
+        await self._candidate_review_event(
+            "CANDIDATE_APPLIED"
+            if outcome.get("status") == "committed"
+            else "CANDIDATE_APPLY_FAILED",
+            task_id,
+            review,
+            outcome,
+        )
         return outcome
 
     async def discard_candidate(self, task_id: str) -> dict:
@@ -1770,10 +1790,37 @@ class AthenaService:
         branch = self._candidate_branch(task_id)
         if branch is None:
             return {"status": "missing", "error": "no retained candidate"}
+        review = await self.operator_candidate(task_id) or {}
         outcome = await self.shadow_engine().discard(branch, reason="discarded by operator")
-        if self._reality_gate is not None:
+        if outcome.get("status") == "discarded" and self._reality_gate is not None:
             await self._reality_gate.deactivate_branch(task_id)
+        if outcome.get("status") == "discarded":
+            await self._candidate_review_event("CANDIDATE_DISCARDED", task_id, review, outcome)
         return outcome
+
+    async def _candidate_review_event(
+        self, event_key: str, task_id: str, review: Mapping[str, Any], outcome: Mapping[str, Any]
+    ) -> None:
+        """Persist operator review decisions alongside candidate evidence."""
+        events = self._store_events
+        if events is None:
+            return
+        payload = {
+            "task_id": task_id,
+            "branch_id": review.get("branch_id"),
+            "base_fingerprint": review.get("base_fingerprint"),
+            "candidate_fingerprint": review.get("candidate_fingerprint"),
+            "certificate_hash": review.get("certificate_hash"),
+            "changed_resources": list(review.get("changed_resources") or []),
+            "outcome": dict(outcome),
+        }
+        from athena.protocol.events import EV
+
+        await events.append_event(
+            EV[event_key],
+            payload,
+            task_id=task_id,
+        )
 
     # ------------------------------------------------------------------ #
     # Operator projections (stable views over canonical durable state)
@@ -2318,7 +2365,7 @@ class AthenaService:
         if model_registry is None:
             return None
 
-        async def _summarize(text: str) -> str | None:
+        async def _summarize(text: str, *, task=None) -> str | None:
             kernel = self._kernel
             if kernel is None:
                 return None
@@ -2327,10 +2374,15 @@ class AthenaService:
                 "at most 6 sentences, preserving decisions, file changes, "
                 "and unresolved issues. Output ONLY the summary.\n\n" + text[-8000:]
             )
+            if task is not None:
+                return await kernel.task_utility_inference(
+                    task=task,
+                    system_prompt="",
+                    user_prompt=prompt,
+                    role="summarizer",
+                )
             return await kernel.utility_inference(
-                system_prompt="",
-                user_prompt=prompt,
-                role="summarizer",
+                system_prompt="", user_prompt=prompt, role="summarizer"
             )
 
         return _summarize
@@ -2939,6 +2991,7 @@ class AthenaService:
                     model=pc.model,
                     provider=pc.name,
                     scripts=list(pc.extra.get("scripts") or []),
+                    cost=pc.extra.get("cost"),
                 )
                 registry.register(pc.name, provider)
                 registry.set_profile(pc.name, resolve_profile("fake", model_id=pc.model))
@@ -2964,6 +3017,7 @@ class AthenaService:
                     headers=pc.extra.get("headers"),
                     timeout=float(pc.extra.get("timeout", 60.0)),
                     http2=bool(pc.extra.get("http2", False)),
+                    cost=pc.extra.get("cost"),
                 )
             elif profile.protocol == "anthropic":
                 provider = AnthropicProvider(
@@ -2974,6 +3028,7 @@ class AthenaService:
                     headers=pc.extra.get("headers"),
                     timeout=float(pc.extra.get("timeout", 60.0)),
                     use_sdk=bool(pc.extra.get("use_sdk", True)),
+                    cost=pc.extra.get("cost"),
                 )
             else:
                 raise ValueError(f"unsupported provider protocol: {profile.protocol!r}")

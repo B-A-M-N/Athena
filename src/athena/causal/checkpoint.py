@@ -21,9 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from athena.protocol.ids import new_id
+from athena.workspace_manifest import copy_ignore, tree_paths
 
 _logger = logging.getLogger(__name__)
-_IGNORE_PATTERNS = shutil.ignore_patterns(".git", "__pycache__", "node_modules", ".venv")
+_IGNORE_PATTERNS = copy_ignore
 
 
 class CheckpointConflict(RuntimeError):
@@ -380,7 +381,7 @@ class CheckpointManager:
 
 def _tree_paths(root: Path) -> list[Path]:
     """List files and symlinks without traversing symlinked directories."""
-    return sorted(path for path in root.rglob("*") if path.is_symlink() or path.is_file())
+    return tree_paths(root)
 
 
 def _tree_manifest(root: Path) -> dict[str, dict[str, object]]:

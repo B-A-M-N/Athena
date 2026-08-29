@@ -159,6 +159,24 @@ async def test_checkpoint_restore_rejects_concurrent_workspace_change(tmp_path: 
     assert (ws / "value.txt").read_text() == "concurrent"
 
 
+async def test_checkpoint_fingerprint_ignores_runtime_caches_consistently(tmp_path: Path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "value.txt").write_text("before")
+    (ws / ".mypy_cache").mkdir()
+    (ws / ".mypy_cache" / "noise").write_text("ignored")
+    mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
+
+    before = await mgr.fingerprint(str(ws))
+    manifest = await mgr.capture(task_id="task_1", workspace_root=str(ws), label="consistent")
+    assert manifest["workspace_fingerprint"] == before
+
+    (ws / ".mypy_cache" / "noise").write_text("changed")
+    assert await mgr.fingerprint(str(ws)) == before
+    (ws / "value.txt").write_text("after")
+    assert await mgr.fingerprint(str(ws)) != before
+
+
 async def test_checkpoint_materialize_creates_independent_workspace(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()

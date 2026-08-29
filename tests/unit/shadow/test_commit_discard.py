@@ -247,6 +247,11 @@ async def test_operator_can_review_and_apply_retained_candidate(service):
     assert outcome["status"] == "committed"
     assert (Path(ws.root) / "reviewed.py").read_text() == "candidate\n"
     assert await svc.operator_candidate(task_id) is None
+    event_types = {event.type for event in await svc._store_events.list_for_task(task_id)}
+    assert {
+        "CandidateApplyRequested",
+        "CandidateApplied",
+    }.issubset(event_types)
 
 
 async def test_operator_cannot_apply_failed_candidate(service):
@@ -285,6 +290,55 @@ async def test_operator_can_discard_unapplied_candidate(service):
     assert discarded["status"] == "discarded"
     assert not Path(branch.shadow_workspace.root).exists()
     assert await svc.operator_candidate(task_id) is None
+
+
+async def test_discard_refuses_recovery_required_branch_and_preserves_evidence(service):
+    svc, ws = service
+    task_id = await _real_task(svc, ws)
+    engine = svc.shadow_engine()
+    branch = await engine.open_branch(
+        task_id=task_id,
+        base_workspace=ws,
+        proposal=[_write_prop("recovery.py", "candidate\n")],
+    )
+    branch = await engine.execute_branch(branch, profile="autonomous")
+    branch.status = BranchStatus.RECOVERY_REQUIRED
+    branch.commit_state = "RECOVERY_REQUIRED"
+    branch.error = "commit outcome is ambiguous"
+    engine._persist_branches()
+    svc._reality_gate.activate_branch(branch)
+
+    outcome = await svc.discard_candidate(task_id)
+
+    assert outcome["status"] == "RECOVERY_REQUIRED"
+    assert branch.status == BranchStatus.RECOVERY_REQUIRED
+    assert Path(branch.shadow_workspace.root).is_dir()
+    assert svc._reality_gate.active_branch(task_id) is branch
+    assert await svc.operator_candidate(task_id) is not None
+
+
+async def test_verified_delete_apply_retains_candidate_for_explicit_path(service):
+    svc, ws = service
+    task_id = await _real_task(svc, ws)
+    engine = svc.shadow_engine()
+    live = Path(ws.root) / "remove-me.txt"
+    live.write_text("keep until explicitly approved\n")
+    branch = await engine.open_branch(task_id=task_id, base_workspace=ws, proposal=[])
+    branch = await engine.execute_branch(branch, profile="autonomous")
+    shadow_file = Path(branch.shadow_workspace.root) / "remove-me.txt"
+    shadow_file.unlink()
+    await engine.record_verification(branch, [{"id": "ac", "passed": True}])
+    svc._reality_gate.activate_branch(branch)
+
+    outcome = await svc.apply_candidate(task_id)
+
+    assert outcome["status"] == "APPROVAL_REQUIRED"
+    assert live.read_text() == "keep until explicitly approved\n"
+    assert branch.status == BranchStatus.VERIFIED
+    assert Path(branch.shadow_workspace.root).is_dir()
+    event_types = {event.type for event in await svc._store_events.list_for_task(task_id)}
+    assert "CandidateApplyRequested" in event_types
+    assert "CandidateApplyFailed" in event_types
 
 
 async def test_commit_deletion_requires_approval_and_never_lands_unapproved(service):

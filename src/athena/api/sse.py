@@ -166,8 +166,8 @@ def run(
     """Serve the HTTP API with uvicorn.
 
     Both ``service``/``app`` resolution and uvicorn itself are lazy so importing
-    this module never requires the ``api`` extra. If uvicorn is missing a clear
-    error is raised.
+    this module never starts a server. If uvicorn is missing a clear error is
+    raised.
     """
     try:
         import uvicorn

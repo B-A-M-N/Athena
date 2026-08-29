@@ -49,6 +49,7 @@ from athena.protocol.models import (
     ModelInfo,
     ModelRequest,
     ModelResponse,
+    CostInfo,
     PrivacyClass,
     UsageInfo,
 )
@@ -177,11 +178,19 @@ class OpenAICompatProvider:
         headers: Mapping[str, str] | None = None,
         timeout: float = 60.0,
         http2: bool = False,
+        cost: CostInfo | Mapping[str, object] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.provider = provider
         self._privacy_class = privacy_class
+        if isinstance(cost, Mapping):
+            cost = CostInfo(
+                per_1m_input=_optional_float(cost.get("per_1m_input")),
+                per_1m_output=_optional_float(cost.get("per_1m_output")),
+                currency=str(cost.get("currency", "USD")),
+            )
+        self._cost = cost
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             http2=http2,
@@ -199,6 +208,7 @@ class OpenAICompatProvider:
                 streaming=True,
                 tool_calling=True,
                 privacy_class=self._privacy_class,
+                cost=self._cost,
             )
         ]
 
@@ -550,6 +560,15 @@ class OpenAICompatProvider:
         if 500 <= code < 600:
             return ProviderUnavailable(message)
         return ProviderProtocolError(message)
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 __all__ = ["OpenAICompatProvider", "parse_tool_arguments", "serialize_tool_result"]

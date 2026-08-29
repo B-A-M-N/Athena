@@ -6,7 +6,7 @@ backward compatibility so both import paths reference the SAME class.
 
 from __future__ import annotations
 
-from typing import AsyncIterator, TypedDict
+from typing import AsyncIterator, Mapping, TypedDict
 
 from athena.protocol.ids import new_id
 from athena.protocol.messages import (
@@ -22,6 +22,7 @@ from athena.protocol.models import (
     ModelInfo,
     ModelRequest,
     ModelResponse,
+    CostInfo,
     PrivacyClass,
     UsageInfo,
 )
@@ -36,6 +37,7 @@ class _InfoKwargs(TypedDict, total=False):
     structured_output: bool
     privacy_class: PrivacyClass
     streaming: bool
+    cost: CostInfo | None
 
 
 class FakeModelProvider:
@@ -55,10 +57,19 @@ class FakeModelProvider:
         structured_output: bool = False,
         privacy_class: PrivacyClass = PrivacyClass.UNKNOWN,
         streaming: bool = True,
+        cost: CostInfo | Mapping[str, object] | None = None,
+        response_cost_usd: float | None = None,
     ) -> None:
         self._scripts = list(scripts) if scripts else []
         self._model = model
         self._provider = provider
+        if isinstance(cost, Mapping):
+            cost = CostInfo(
+                per_1m_input=_optional_float(cost.get("per_1m_input")),
+                per_1m_output=_optional_float(cost.get("per_1m_output")),
+                currency=str(cost.get("currency", "USD")),
+            )
+        self._response_cost_usd = response_cost_usd
         self._info_kwargs: _InfoKwargs = {
             "tool_calling": tool_calling,
             "vision": vision,
@@ -68,6 +79,7 @@ class FakeModelProvider:
             "structured_output": structured_output,
             "privacy_class": privacy_class,
             "streaming": streaming,
+            "cost": cost,
         }
 
     async def list_models(self) -> list[ModelInfo]:
@@ -122,7 +134,12 @@ class FakeModelProvider:
 
         output_tokens = len(text) if text else 0
         input_tokens = sum(len(msg.text() or "") for msg in request.messages)
-        usage = UsageInfo(input_tokens=input_tokens, output_tokens=output_tokens)
+        response_cost = respond.get("cost_usd", self._response_cost_usd)
+        usage = UsageInfo(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=float(response_cost) if response_cost is not None else None,
+        )
 
         response = ModelResponse(
             request_id=request.request_id,
@@ -167,6 +184,15 @@ class FakeModelProvider:
             return script
 
         return {"respond": {"text": "", "done": True}}
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 __all__ = ["FakeModelProvider"]

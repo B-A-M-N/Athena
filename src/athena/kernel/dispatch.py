@@ -77,7 +77,9 @@ class CapabilityDispatchShim:
         self._workspace = workspace
         self._profile = profile
 
-    async def dispatch(self, task: TaskSpec, calls) -> DispatchResult:
+    async def dispatch(
+        self, task: TaskSpec, calls, *, runtime_remaining_s: float | None = None
+    ) -> DispatchResult:
         """Dispatch all capability calls for one assistant turn.
 
         Every call is translated into a ``CapabilityRequest`` and run through
@@ -98,6 +100,8 @@ class CapabilityDispatchShim:
             profile=self._profile,
             task_policy=task.capability_policy,
             task_budget=task.resource_budget,
+            task_deadline=task.deadline,
+            runtime_remaining_s=runtime_remaining_s,
         )
 
         results: list[CapabilityResultBlock] = []

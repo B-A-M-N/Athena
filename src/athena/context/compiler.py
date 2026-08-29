@@ -246,7 +246,7 @@ class ContextCompiler:
         required.append(_strategy_entry(strategy))
 
         final_entries, record, omitted = await self._bound_and_compress(
-            required, corpus, input_budget
+            required, corpus, input_budget, task=task
         )
 
         messages = tuple(_render_entry(e) for e in final_entries)
@@ -722,6 +722,8 @@ class ContextCompiler:
         required: list[_Entry],
         corpus: list[_Entry],
         budget: int,
+        *,
+        task: TaskSpec | None = None,
     ) -> tuple[list[_Entry], CompressionRecord, list[str]]:
         """Keep required + recent/capability verbatim; summarize older; drop rest.
 
@@ -789,7 +791,7 @@ class ContextCompiler:
         if summarized_subject:
             merged = _merged_provenance(summarized_subject)
             summary_text = await self._compressor._summarize(
-                "\n".join(e.text for e in summarized_subject if e.text)
+                "\n".join(e.text for e in summarized_subject if e.text), task=task
             )
             markers.append(
                 CompressionMarker(

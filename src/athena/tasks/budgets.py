@@ -46,6 +46,7 @@ class Usage:
         self.mutations += _int(u, "mutations")
         self.children += _int(u, "children")
         self.artifact_bytes += _int(u, "artifact_bytes")
+        self.wall_time_s += _float(u, "wall_time_s")
 
     def as_usage_summary(self) -> UsageSummary:
         return UsageSummary(
@@ -68,6 +69,17 @@ def _int(u: Any, key: str) -> int:
         return int(val or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _float(u: Any, key: str) -> float:
+    try:
+        val = u.get(key) if hasattr(u, "get") else getattr(u, key)
+    except AttributeError:
+        val = None
+    try:
+        return max(0.0, float(val or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _dec(u: Any, *keys: str) -> Decimal:
@@ -150,6 +162,8 @@ class BudgetTracker:
         self._usage_hydrated: set[str] = set()
         self._model_semaphores: dict[str, Any] = {}
         self._model_limits: dict[str, int] = {}
+        self._execution_semaphores: dict[str, Any] = {}
+        self._execution_limits: dict[str, int] = {}
         import asyncio
 
         self._artifact_lock = asyncio.Lock()
@@ -304,28 +318,50 @@ class BudgetTracker:
         agg.add(own)
         children = await self.descendants(task_id)
         for child in children:
+            # A fresh tracker only knows the task hierarchy from the store.
+            # Restore every descendant before reading its own ledger, or a
+            # root query immediately after restart silently forgets child use.
+            await self._hydrate_usage(child)
             agg.add(self.own(child))
         agg.children = len(children)
         return agg
 
     async def remaining(self, task_id: str) -> Mapping[str, Any]:
-        budget = await self.budget_of_async(task_id)
-        total = await self.total(task_id)
-        artifact_reserved = self._artifact_reservations.get(task_id, 0)
-        model_reserved = self._model_cost_reservations.get(task_id, Decimal("0"))
-        cost_remaining = _cap_remaining_dec(
-            budget.max_cost_usd if budget.max_cost_usd is not None else None,
-            total.cost + model_reserved,
-        )
+        # Every reported ceiling is hierarchical.  A child must see the
+        # smallest remaining capacity across its own and all ancestor ledgers;
+        # otherwise preflight checks can admit a call that exceeds the root.
+        limits: dict[str, Any] = {
+            "iterations": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "cost_usd": None,
+            "children": None,
+            "artifact_bytes": None,
+        }
+        for ancestor in await self._ancestor_ids(task_id):
+            budget = await self.budget_of_async(ancestor)
+            total = await self.total(ancestor)
+            artifact_reserved = self._artifact_reservations.get(ancestor, 0)
+            model_reserved = self._model_cost_reservations.get(ancestor, Decimal("0"))
+            values = {
+                "iterations": _cap_remaining(budget.max_agent_iterations, total.iterations),
+                "input_tokens": _cap_remaining(budget.max_input_tokens, total.input_tokens),
+                "output_tokens": _cap_remaining(budget.max_output_tokens, total.output_tokens),
+                "cost_usd": _cap_remaining_dec(
+                    budget.max_cost_usd,
+                    total.cost + model_reserved,
+                ),
+                "children": _cap_remaining(budget.max_children, total.children),
+                "artifact_bytes": _cap_remaining(
+                    budget.max_artifact_bytes, total.artifact_bytes + artifact_reserved
+                ),
+            }
+            for key, value in values.items():
+                if value is None:
+                    continue
+                limits[key] = value if limits[key] is None else min(limits[key], value)
         return {
-            "iterations": _cap_remaining(budget.max_agent_iterations, total.iterations),
-            "input_tokens": _cap_remaining(budget.max_input_tokens, total.input_tokens),
-            "output_tokens": _cap_remaining(budget.max_output_tokens, total.output_tokens),
-            "cost_usd": cost_remaining,
-            "children": _cap_remaining(budget.max_children, total.children),
-            "artifact_bytes": _cap_remaining(
-                budget.max_artifact_bytes, total.artifact_bytes + artifact_reserved
-            ),
+            **limits,
         }
 
     async def exhausted(self, task_id: str) -> bool:
@@ -508,6 +544,33 @@ class BudgetTracker:
         finally:
             semaphore.release()
 
+    @asynccontextmanager
+    async def execution_lease(self, task_id: str):
+        """Gate sibling executions through the shared root budget."""
+        ancestors = await self._ancestor_ids(task_id)
+        root = ancestors[-1] if ancestors else task_id
+        limits = [
+            (await self.budget_of_async(ancestor)).max_parallel_executions for ancestor in ancestors
+        ]
+        limit = max(1, min(limits or [ResourceBudget().max_parallel_executions]))
+        async with self._artifact_lock:
+            semaphore = self._execution_semaphores.get(root)
+            if semaphore is None:
+                import asyncio
+
+                semaphore = asyncio.Semaphore(limit)
+                self._execution_semaphores[root] = semaphore
+                self._execution_limits[root] = limit
+            elif self._execution_limits[root] != limit:
+                raise ValueError(
+                    f"execution concurrency limit changed for root task {root}; restart required"
+                )
+        await semaphore.acquire()
+        try:
+            yield
+        finally:
+            semaphore.release()
+
     async def _ancestor_ids(self, task_id: str) -> list[str]:
         chain: list[str] = []
         seen: set[str] = set()
@@ -560,6 +623,7 @@ class BudgetTracker:
             mutations=_int(checkpoint, "mutations"),
             children=_int(checkpoint, "children"),
             artifact_bytes=_int(checkpoint, "artifact_bytes"),
+            wall_time_s=_float(checkpoint, "wall_time_s"),
         )
         reserved_artifact = _int(checkpoint, "reserved_artifact_bytes")
         reserved_model = _dec(checkpoint, "reserved_model_cost")
@@ -586,6 +650,13 @@ class BudgetTracker:
         persist = getattr(store, "persist_budget_usage", None)
         if persist is None:
             return
+        with self._lock:
+            entry = self._ledger.get(task_id)
+            if entry is not None:
+                entry.wall_time_s = max(
+                    entry.wall_time_s,
+                    (utcnow() - entry.started).total_seconds(),
+                )
         current = self.own(task_id)
         await persist(
             task_id,
@@ -599,6 +670,7 @@ class BudgetTracker:
                 "mutations": current.mutations,
                 "children": current.children,
                 "artifact_bytes": current.artifact_bytes,
+                "wall_time_s": current.wall_time_s,
                 "reserved_artifact_bytes": self._artifact_reservations.get(task_id, 0),
                 "reserved_model_cost": str(
                     self._model_cost_reservations.get(task_id, Decimal("0"))

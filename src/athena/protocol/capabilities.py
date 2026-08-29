@@ -13,6 +13,7 @@ import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
@@ -423,6 +424,8 @@ class InvocationContext:
     execution_backend: str = "local"
     capability_policy: CapabilityPolicy | None = None
     resource_budget: ResourceBudget | None = None
+    deadline: datetime | None = None
+    runtime_remaining_s: float | None = None
     # Internal execution context only. This deliberately does not belong on
     # CapabilityRequest, where model-visible fields could be mistaken for
     # authority controls.

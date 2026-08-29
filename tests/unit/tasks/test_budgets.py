@@ -136,6 +136,32 @@ async def test_sibling_reservations_share_root_ceiling():
         await tracker.reserve_artifact("child-b", 100)
 
 
+async def test_sibling_execution_leases_share_root_concurrency_limit():
+    import asyncio
+
+    root = _task("root", budget=ResourceBudget(max_parallel_executions=1))
+    child_a = _task("child-a", parent="root")
+    child_b = _task("child-b", parent="root")
+    tracker = BudgetTracker(task_store=_TreeStore([root, child_a, child_b]))
+    for task in (root, child_a, child_b):
+        tracker.register(task)
+
+    active = 0
+    maximum = 0
+
+    async def run(task_id: str) -> None:
+        nonlocal active, maximum
+        async with tracker.execution_lease(task_id):
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+
+    await asyncio.gather(run(child_a.id), run(child_b.id))
+
+    assert maximum == 1
+
+
 async def test_model_reconciliation_releases_phantom_reservation_immediately():
     root = _task("root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
     child = _task("child", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
@@ -225,3 +251,47 @@ async def test_model_reservation_survives_restart_as_reservation_not_spend():
     await restored.reconcile_model_cost("child", reserved=Decimal("0.40"), actual=Decimal("0.20"))
     assert (await restored.total("root")).cost == Decimal("0.20")
     assert (await restored.remaining("root"))["cost_usd"] == Decimal("0.80")
+
+
+async def test_fresh_tracker_hydrates_every_descendant_before_root_total():
+    root = _task(
+        "root",
+        budget=ResourceBudget(
+            max_input_tokens=1_000,
+            max_output_tokens=1_000,
+            max_cost_usd=Decimal("2.00"),
+            max_artifact_bytes=1_000,
+        ),
+    )
+    child = _task("child", parent="root")
+    grandchild = _task("grandchild", parent="child")
+    sibling = _task("sibling", parent="root")
+    store = _TreeStore([root, child, grandchild, sibling])
+    first = BudgetTracker(task_store=store)
+    for task in (root, child, grandchild, sibling):
+        first.register(task)
+
+    first.consume(
+        "grandchild", input_tokens=120, output_tokens=80, model_calls=1, cost=Decimal("0.40")
+    )
+    await first._persist_usage("grandchild")
+    first.consume("sibling", input_tokens=30, output_tokens=20, model_calls=1, cost=Decimal("0.10"))
+    await first._persist_usage("sibling")
+    await first.reserve_artifact("grandchild", 250)
+    await first.commit_artifact("grandchild", 250)
+
+    restored = BudgetTracker(task_store=store)
+    for task in (root, child, grandchild, sibling):
+        restored.register(task)
+
+    total = await restored.total("root")
+    assert total.input_tokens == 150
+    assert total.output_tokens == 100
+    assert total.model_calls == 2
+    assert total.cost == Decimal("0.50")
+    assert total.artifact_bytes == 250
+    remaining = await restored.remaining("root")
+    assert remaining["input_tokens"] == 850
+    assert remaining["output_tokens"] == 900
+    assert remaining["cost_usd"] == Decimal("1.50")
+    assert remaining["artifact_bytes"] == 750

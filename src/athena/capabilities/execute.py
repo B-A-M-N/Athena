@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import os
 import hashlib
+import pathlib
+import shutil
 from collections.abc import Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from athena.execution.diagnostics import normalize_diagnostics
 from athena.protocol.capabilities import (
@@ -139,6 +141,29 @@ class ExecuteCapability:
                 )
             timeout = timedelta(seconds=timeout_sec)
 
+        # A capability call cannot outlive its task.  The kernel supplies the
+        # cumulative remaining runtime; direct callers still get an absolute
+        # deadline/resource ceiling from the invocation context.
+        hard_remaining = context.runtime_remaining_s if context else None
+        if hard_remaining is None and context is not None and context.deadline is not None:
+            now = datetime.now(context.deadline.tzinfo or timezone.utc)
+            hard_remaining = (context.deadline - now).total_seconds()
+        if hard_remaining is None and context is not None:
+            max_wall = getattr(context.resource_budget, "max_wall_time", None)
+            if max_wall is not None:
+                hard_remaining = max_wall.total_seconds()
+        if hard_remaining is not None:
+            if hard_remaining <= 0:
+                return CapabilityResult(
+                    request.call_id,
+                    request.capability_id,
+                    CapabilityResultStatus.FAILED,
+                    error="task deadline or wall-time budget exceeded",
+                )
+            hard_timeout = timedelta(seconds=hard_remaining)
+            if timeout is None or hard_timeout < timeout:
+                timeout = hard_timeout
+
         # session (runtime_session_id) must be validated for task ownership
         runtime_session_id = args.get("session")
         if runtime_session_id is not None:
@@ -191,6 +216,7 @@ class ExecuteCapability:
                 else _canonical_workspace_rules(ws, workspace_root, allow=True)
             ),
             read_only_paths=_canonical_workspace_rules(ws, workspace_root, allow=False),
+            toolchain_paths=_trusted_toolchain_paths(ws),
         )
         execution_id = _new_id()
 
@@ -449,9 +475,33 @@ def _canonical_workspace_rules(ws, root: str, *, allow: bool) -> tuple[str, ...]
 def _candidate_python_environment(workspace_root: str) -> dict[str, str]:
     """Return the minimal project import environment for a routed workspace."""
     source_root = os.path.join(workspace_root, "src")
+    env = {"PYTHONDONTWRITEBYTECODE": "1"}
     if os.path.isdir(source_root):
-        return {"PYTHONPATH": source_root}
-    return {}
+        env["PYTHONPATH"] = source_root
+    # ``uv run`` must use the already-bootstrapped, mounted environment during
+    # candidate proof.  It must never create/sync an environment in the
+    # candidate or reach the network to acquire dependencies.
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    venv = repo_root / ".venv"
+    if venv.is_dir():
+        env["UV_PROJECT_ENVIRONMENT"] = str(venv)
+    return env
+
+
+def _trusted_toolchain_paths(workspace) -> tuple[str, ...]:
+    """Select exact read-only verification tools, never an arbitrary HOME."""
+    backend = getattr(workspace, "execution_backend", None) or "local"
+    if backend not in {"shadow", "verification", "sandbox"}:
+        return ()
+    paths: list[str] = []
+    uv = shutil.which("uv")
+    if uv:
+        paths.append(os.path.realpath(uv))
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    venv = repo_root / ".venv"
+    if venv.is_dir():
+        paths.append(str(venv))
+    return tuple(dict.fromkeys(paths))
 
 
 def _new_id() -> str:

@@ -111,15 +111,21 @@ class DependencyCapability:
         if operation in {"inspect", "resolve"}:
             lock = _read_lock(context)
             record = _lock_record(lock, name) if lock else None
-            found = (
-                record is not None or importlib.util.find_spec(name.replace("-", "_")) is not None
+            host_installed = importlib.util.find_spec(name.replace("-", "_")) is not None
+            task_runtime_available = await self._runtime_probe(
+                request, context=context, name=name, record=record
             )
             metadata = {
                 "name": name,
-                "installed": found,
+                "installed": host_installed,
+                "host_installed": host_installed,
+                "task_runtime_available": task_runtime_available,
+                "workspace_locked": record is not None,
                 "environment": {
                     "task_execution_backend": backend,
-                    "task_runtime": "host-python",
+                    "task_runtime": "host-python"
+                    if backend in _HOST_INTERPRETER_BACKENDS
+                    else backend,
                     "host_interpreter": sys.executable,
                 },
             }
@@ -127,7 +133,14 @@ class DependencyCapability:
                 metadata["lock"] = record
                 output = f"{name}: installed ({record.get('resolved_version', 'unknown')})"
             else:
-                output = f"{name}: {'installed' if found else 'missing'}"
+                runtime_state = (
+                    "available"
+                    if task_runtime_available is True
+                    else "missing"
+                    if task_runtime_available is False
+                    else "unknown"
+                )
+                output = f"{name}: host={'installed' if host_installed else 'missing'}; task-runtime={runtime_state}"
             return _result(request, output=output, metadata=metadata)
         if operation != "install":
             if operation == "replay":
@@ -205,6 +218,35 @@ class DependencyCapability:
                 **({"lock": lock_record} if lock_record else {}),
             },
         )
+
+    async def _runtime_probe(self, request, *, context, name: str, record: dict | None):
+        """Probe the actual task Python, rather than reporting host imports."""
+        if self._execution is None or context is None:
+            return None
+        backend = getattr(context.workspace, "execution_backend", None) or "local"
+        if backend not in _HOST_INTERPRETER_BACKENDS:
+            return None
+        target = PythonDependencyManager.target(context.workspace.root)
+        source = (
+            "import importlib.util; "
+            f"print('1' if importlib.util.find_spec({name.replace('-', '_')!r}) else '0')"
+        )
+        result = await self._execution.execute(
+            ExecutionRequest(
+                runtime="python",
+                source=source,
+                task_id=request.task_id or "dependency-inspect",
+                workspace_id=context.workspace.id,
+                backend=context.workspace.execution_backend or "local",
+                cwd=context.workspace.root,
+                network_policy=context.workspace.network_policy,
+                workspace_root=context.workspace.root,
+                env={"PYTHONPATH": target} if os.path.isdir(target) else {},
+            )
+        )
+        if result.exit_code != 0:
+            return False
+        return result.stdout.strip().splitlines()[-1:] == ["1"]
 
     async def _replay(
         self,

@@ -396,6 +396,7 @@ class AgentKernel:
 
     def set_budget_tracker(self, budgets) -> None:
         # Late-bind the budget authority (construction-order tolerant, §19).
+        self._budgets = budgets
         self._lifecycle.set_budget_tracker(budgets)
 
     def set_cancellation_manager(self, cancellations) -> None:
@@ -515,6 +516,8 @@ class AgentKernel:
                 return await self._finalize(task, state, TaskStatus.CANCELLED, "task cancelled")
             except TaskDeadlineExceeded:
                 return await self._finalize(task, state, TaskStatus.PARTIAL, "deadline exceeded")
+            except TaskBudgetExceeded as exc:
+                return await self._finalize(task, state, TaskStatus.PARTIAL, str(exc))
             except ProviderError:
                 return await self._finalize(task, state, TaskStatus.FAILED, "model unavailable")
             except Exception as exc:  # kernel never crashes; truthful terminal.
@@ -656,8 +659,51 @@ class AgentKernel:
             state.provider = selection_for_attempt.provider
             effective_policy = self._router.effective_policy(task.model_policy)
             worst_cost = _worst_case_cost(selection_for_attempt.info, request)
+            remaining = None
+            if self._budgets is not None:
+                remaining = await self._budgets.remaining(task.id)
+                input_estimate = _estimate_input_tokens(request)
+                input_remaining = remaining.get("input_tokens")
+                if input_remaining is not None and input_estimate > input_remaining:
+                    raise TaskBudgetExceeded(
+                        f"model request needs about {input_estimate} input tokens but only "
+                        f"{input_remaining} remain"
+                    )
+                output_remaining = remaining.get("output_tokens")
+                if output_remaining is not None and output_remaining <= 0:
+                    raise TaskBudgetExceeded(
+                        "model output-token budget exhausted before provider call"
+                    )
+                if output_remaining is not None:
+                    request = replace(
+                        request,
+                        max_tokens=(
+                            output_remaining
+                            if request.max_tokens is None
+                            else min(request.max_tokens, output_remaining)
+                        ),
+                    )
+                    worst_cost = _worst_case_cost(selection_for_attempt.info, request)
+            if worst_cost is None and (
+                (remaining is not None and remaining.get("cost_usd") is not None)
+                or effective_policy.max_cost_usd is not None
+            ):
+                raise TaskBudgetExceeded(
+                    "model pricing unknown under hard monetary budget; provider call refused"
+                )
             if (
-                effective_policy.max_cost_usd is not None
+                worst_cost is not None
+                and remaining is not None
+                and remaining.get("cost_usd") is not None
+                and worst_cost > remaining["cost_usd"]
+            ):
+                raise TaskBudgetExceeded(
+                    f"bounded model call cost {worst_cost} exceeds remaining "
+                    f"budget {remaining['cost_usd']} USD"
+                )
+            if (
+                worst_cost is not None
+                and effective_policy.max_cost_usd is not None
                 and worst_cost > effective_policy.max_cost_usd
             ):
                 raise TaskBudgetExceeded(
@@ -665,7 +711,7 @@ class AgentKernel:
                     f"ceiling {effective_policy.max_cost_usd} USD"
                 )
             reservation = False
-            if self._budgets is not None:
+            if self._budgets is not None and worst_cost is not None:
                 await self._budgets.reserve_model_cost(task.id, worst_cost)
                 reservation = True
             # One durable row and one inspectable event per actual provider /
@@ -722,17 +768,28 @@ class AgentKernel:
                     # Persist actual usage at the model boundary. The final
                     # TaskResult is an aggregate and BudgetTracker consumes
                     # only any execution/mutation delta during finalization.
-                    self._budgets.consume(
-                        task.id,
-                        input_tokens=_input_tokens_of(response, request),
-                        output_tokens=_output_tokens_of(response),
-                        model_calls=1,
-                    )
-                    await self._budgets.reconcile_model_cost(
-                        task.id,
-                        reserved=worst_cost,
-                        actual=_cost_of(response),
-                    )
+                    actual_cost = _actual_model_cost(selection_for_attempt.info, response, request)
+                    usage_kwargs: dict[str, Any] = {
+                        "input_tokens": _input_tokens_of(response, request),
+                        "output_tokens": _output_tokens_of(response),
+                        "model_calls": 1,
+                    }
+                    # Reconciliation owns the actual charge when a reservation
+                    # was held.  Supplying cost to both paths would double the
+                    # charge in the owner ledger.
+                    if actual_cost is not None and not reservation:
+                        usage_kwargs["cost"] = actual_cost
+                    self._budgets.consume(task.id, **usage_kwargs)
+                    if reservation and worst_cost is not None:
+                        if actual_cost is None:
+                            await self._budgets.release_model_cost(task.id, worst_cost)
+                        else:
+                            await self._budgets.reconcile_model_cost(
+                                task.id,
+                                reserved=worst_cost,
+                                actual=actual_cost,
+                            )
+                    state.cost += actual_cost or Decimal("0")
                     persist_budget = getattr(self._budgets, "_persist_usage", None)
                     if persist_budget is not None:
                         await persist_budget(task.id)
@@ -745,6 +802,7 @@ class AgentKernel:
                             attempt_usage_id,
                             input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
                             output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+                            cost_usd=(str(actual_cost) if actual_cost is not None else None),
                             metadata={
                                 "inference": dict(self._inference_metadata(selection_for_attempt)),
                                 "usage": dict(vars(usage)) if usage is not None else {},
@@ -760,7 +818,7 @@ class AgentKernel:
                         pass
                 return response
             except ProviderError as exc:
-                if self._budgets is not None and reservation:
+                if self._budgets is not None and reservation and worst_cost is not None:
                     await self._budgets.release_model_cost(task.id, worst_cost)
                 last_err = exc
                 state.request_id = None
@@ -794,7 +852,7 @@ class AgentKernel:
                     task, compiled, exclude=frozenset(attempted)
                 )
             except BaseException:
-                if self._budgets is not None and reservation:
+                if self._budgets is not None and reservation and worst_cost is not None:
                     await self._budgets.release_model_cost(task.id, worst_cost)
                 raise
         raise last_err or ModelUnavailable("no model available")
@@ -929,7 +987,12 @@ class AgentKernel:
                 model_id=None,
                 repair_mode=None,
             )
-        return await shim.dispatch(task, [call])
+        dispatch_kwargs = {}
+        if "runtime_remaining_s" in inspect.signature(shim.dispatch).parameters:
+            dispatch_kwargs["runtime_remaining_s"] = self._remaining_runtime_seconds(
+                task, context.run_state
+            )
+        return await shim.dispatch(task, [call], **dispatch_kwargs)
 
     async def _offer_observation(self, task, state, observation) -> None:
         """Offer one observation to the interpreter extension and dispatch
@@ -976,6 +1039,7 @@ class AgentKernel:
         """
         if self._provider_usage_store is None or self._registry is None:
             return None
+
         usage_id: str | None = None
         try:
             from athena.protocol.messages import Role, TextBlock
@@ -1074,6 +1138,36 @@ class AgentKernel:
                     pass
             _logger.debug("utility_inference failed; deterministic fallback", exc_info=True)
             return None
+
+    async def task_utility_inference(
+        self,
+        *,
+        task: TaskSpec,
+        system_prompt: str,
+        user_prompt: str,
+        role: str = "summarizer",
+    ) -> str | None:
+        """Run auxiliary inference through the active task's budget path."""
+        state = self._runs.get(task.id)
+        if state is None:
+            return None
+        role_policy = replace(task.model_policy, role=role, require_tools=False)
+        scoped_task = replace(task, model_policy=role_policy)
+        compiled = await self._compile_for_prompts(
+            scoped_task, system=system_prompt, user_prompt=user_prompt
+        )
+        selection = await self._select_model(scoped_task, compiled)
+        response = await self._invoke(scoped_task, state, selection, compiled)
+        from athena.protocol.messages import TextBlock
+
+        return (
+            " ".join(
+                block.text
+                for block in response.blocks
+                if isinstance(block, TextBlock) and block.text
+            ).strip()
+            or None
+        )
 
     async def _compile_for_prompts(
         self, task: TaskSpec, *, system: str, user_prompt: str
@@ -1234,18 +1328,35 @@ class AgentKernel:
     ) -> ModelResponse:
         accumulator = ModelResponseAccumulator(request)
 
-        async for event in provider.complete(request):
-            if state.cancel.is_set():
-                raise RequestCancelled("task cancelled")
-            accumulator.ingest(event)
-            if event.type.value == "delta" and event.delta is not None:
-                await self._relay_delta(task, event.delta)
-            elif event.type.value == "reasoning" and event.delta is not None:
-                await self._emit("ModelReasoningDelta", {}, task)
-                if self._model_sink is not None and event.delta.reasoning:
-                    await self._maybe_await(self._model_sink(event.delta.reasoning))
-            elif event.type.value == "failed":
-                raise ProviderError(event.error or "provider failed", code=event.code)
+        async def consume_stream() -> None:
+            async for event in provider.complete(request):
+                if state.cancel.is_set():
+                    raise RequestCancelled("task cancelled")
+                accumulator.ingest(event)
+                if event.type.value == "delta" and event.delta is not None:
+                    await self._relay_delta(task, event.delta)
+                elif event.type.value == "reasoning" and event.delta is not None:
+                    await self._emit("ModelReasoningDelta", {}, task)
+                    if self._model_sink is not None and event.delta.reasoning:
+                        await self._maybe_await(self._model_sink(event.delta.reasoning))
+                elif event.type.value == "failed":
+                    raise ProviderError(event.error or "provider failed", code=event.code)
+
+        remaining = self._remaining_runtime_seconds(task, state)
+        if remaining is not None and remaining <= 0:
+            raise TaskDeadlineExceeded("task runtime budget exhausted before provider call")
+        try:
+            if remaining is None:
+                await consume_stream()
+            else:
+                async with asyncio.timeout(remaining):
+                    await consume_stream()
+        except TimeoutError as exc:
+            try:
+                await provider.cancel(request.request_id)
+            except Exception:
+                _logger.debug("provider cancellation after deadline failed", exc_info=True)
+            raise TaskDeadlineExceeded("task deadline or wall-time budget exceeded") from exc
 
         # The accumulator is the only owner of final mixed-content assembly.
         final = accumulator.finish()
@@ -1300,7 +1411,6 @@ class AgentKernel:
         final = replace(final, usage=usage, metadata=response_metadata)
         state.input_tokens += _input_tokens_of(final, request)
         state.output_tokens += _output_tokens_of(final)
-        state.cost += _cost_of(final)
         return final
 
     async def _relay_delta(self, task: TaskSpec, delta: ModelDelta) -> None:
@@ -1338,7 +1448,10 @@ class AgentKernel:
                 model_id=response.metadata.get("model_id", response.model),
                 repair_mode=response.metadata.get("tool_repair_mode"),
             )
-        outcome = await shim.dispatch(task, calls)
+        dispatch_kwargs = {}
+        if "runtime_remaining_s" in inspect.signature(shim.dispatch).parameters:
+            dispatch_kwargs["runtime_remaining_s"] = self._remaining_runtime_seconds(task, state)
+        outcome = await shim.dispatch(task, calls, **dispatch_kwargs)
 
         if outcome.suspended:
             return await self._approval_path(task, state, outcome)
@@ -1481,6 +1594,9 @@ class AgentKernel:
                 workspace=shim._workspace,
                 profile=shim._profile,
                 task_policy=task.capability_policy,
+                task_budget=task.resource_budget,
+                task_deadline=task.deadline,
+                runtime_remaining_s=self._remaining_runtime_seconds(task, state),
                 _directives_by_call_id={
                     suspended_call.call_id: suspended_call.directives
                     for suspended_call in suspended
@@ -1945,6 +2061,17 @@ class AgentKernel:
         deadline = task.deadline
         return deadline is not None and utcnow() >= deadline
 
+    @staticmethod
+    def _remaining_runtime_seconds(task: TaskSpec, state: RunState) -> float | None:
+        limits: list[float] = []
+        if task.deadline is not None:
+            limits.append((task.deadline - utcnow()).total_seconds())
+        if task.resource_budget.max_wall_time is not None:
+            limits.append(
+                task.resource_budget.max_wall_time.total_seconds() - state.elapsed_ms / 1000
+            )
+        return min(limits) if limits else None
+
     async def _append_response(self, task: TaskSpec, response: ModelResponse) -> None:
         if response.request_id and response.request_id in self._stored_responses:
             return
@@ -1993,6 +2120,11 @@ def _input_tokens_of(response: ModelResponse, request: ModelRequest) -> int:
     return sum(len(m.text() or "") for m in request.messages) // 4
 
 
+def _estimate_input_tokens(request: ModelRequest) -> int:
+    """Use the same conservative estimate for preflight and pricing."""
+    return max(1, (sum(len(m.text() or "") for m in request.messages) + 3) // 4)
+
+
 def _output_tokens_of(response: ModelResponse) -> int:
     """Return real output-token count when reported; else a chars/4 estimate.
 
@@ -2008,31 +2140,42 @@ def _output_tokens_of(response: ModelResponse) -> int:
     return sum(len(getattr(b, "text", None) or "") for b in response.blocks) // 4
 
 
-def _cost_of(response: ModelResponse) -> Decimal:
-    try:
-        usage = response.usage
-    except AttributeError:
-        return Decimal("0")
-    if usage is None or not hasattr(usage, "cost_usd"):
-        return Decimal("0")
-    try:
-        return Decimal(str(usage.cost_usd or "0"))
-    except Exception:
-        return Decimal("0")
+def _actual_model_cost(info, response: ModelResponse, request: ModelRequest) -> Decimal | None:
+    """Prefer provider cost, then declared model pricing, else unknown."""
+    usage = getattr(response, "usage", None)
+    reported = getattr(usage, "cost_usd", None)
+    if reported is not None:
+        try:
+            return Decimal(str(reported))
+        except (TypeError, ValueError):
+            pass
+    pricing = getattr(info, "cost", None)
+    if pricing is None:
+        return None
+    # A zero-token response legitimately costs zero when pricing is known.
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0) or _estimate_input_tokens(request)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0) or _output_tokens_of(response)
+    if pricing.per_1m_input is None and input_tokens:
+        return None
+    if pricing.per_1m_output is None and output_tokens:
+        return None
+    return (
+        Decimal(str(pricing.per_1m_input or 0)) * input_tokens
+        + Decimal(str(pricing.per_1m_output or 0)) * output_tokens
+    ) / Decimal(1_000_000)
 
 
-def _worst_case_cost(info, request: ModelRequest) -> Decimal:
+def _worst_case_cost(info, request: ModelRequest) -> Decimal | None:
     """Estimate the bounded maximum cost from the actual compiled request."""
-    input_tokens = max(
-        1,
-        (sum(len(message.text() or "") for message in request.messages) + 3) // 4,
-    )
+    input_tokens = _estimate_input_tokens(request)
     output_tokens = request.max_tokens or getattr(info, "max_output_tokens", None) or 4096
     pricing = getattr(info, "cost", None)
     if pricing is None:
-        return Decimal("0")
-    input_rate = Decimal(str(pricing.per_1m_input or 0))
-    output_rate = Decimal(str(pricing.per_1m_output or 0))
+        return None
+    if pricing.per_1m_input is None or pricing.per_1m_output is None:
+        return None
+    input_rate = Decimal(str(pricing.per_1m_input))
+    output_rate = Decimal(str(pricing.per_1m_output))
     return (input_rate * input_tokens + output_rate * output_tokens) / Decimal(1_000_000)
 
 

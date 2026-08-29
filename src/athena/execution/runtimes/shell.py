@@ -47,6 +47,7 @@ class ShellRuntime(BaseRuntime):
         network_policy=None,
         writable_paths=None,
         read_only_paths=(),
+        toolchain_paths=(),
     ) -> "_SubprocessSession":
         sess = _SubprocessSession(
             env=env,
@@ -56,6 +57,7 @@ class ShellRuntime(BaseRuntime):
             network_policy=network_policy,
             writable_paths=writable_paths,
             read_only_paths=read_only_paths,
+            toolchain_paths=toolchain_paths,
         )
         sess.start()
         return sess
@@ -82,6 +84,7 @@ class _SubprocessSession:
         network_policy=None,
         writable_paths=None,
         read_only_paths=(),
+        toolchain_paths=(),
     ):
         self.env = env or {}
         self.cwd = cwd
@@ -90,6 +93,7 @@ class _SubprocessSession:
         self.network_policy = network_policy
         self.writable_paths = writable_paths
         self.read_only_paths = read_only_paths
+        self.toolchain_paths = toolchain_paths
         self.process: subprocess.Popen | None = None
         self.output_queue: queue.Queue = queue.Queue()
         self.done = threading.Event()
@@ -113,6 +117,7 @@ class _SubprocessSession:
             network_policy=self.network_policy,
             writable_paths=self.writable_paths,
             read_only_paths=self.read_only_paths,
+            toolchain_paths=self.toolchain_paths,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

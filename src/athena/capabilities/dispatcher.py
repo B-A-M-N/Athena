@@ -156,6 +156,7 @@ class CapabilityDispatcher:
         self._fabric = fabric
         self._health = health
         self._failure_memory = failure_memory
+        self._budgets = None
         self._suspended: dict[str, SuspendedCall] = {}
         self._resume_expiry: dict[str, datetime] = {}
         self._provider_profile_id: str | None = None
@@ -172,6 +173,10 @@ class CapabilityDispatcher:
     def set_reality_gate(self, gate) -> None:
         """Bind the execution authority that resolves speculative workspaces."""
         self._reality_gate = gate
+
+    def set_budget_tracker(self, budgets) -> None:
+        """Bind the hierarchical execution-budget authority."""
+        self._budgets = budgets
 
     def set_health(self, health) -> None:
         """Bind the runtime health registry used for circuit breaking."""
@@ -246,6 +251,8 @@ class CapabilityDispatcher:
         profile: str | None = None,
         task_policy: CapabilityPolicy | None = None,
         task_budget: ResourceBudget | None = None,
+        task_deadline: datetime | None = None,
+        runtime_remaining_s: float | None = None,
         _generated_call_depth: int = 0,
         _generated_call_chain: tuple[str, ...] = (),
         _directives: DispatchDirectives | None = None,
@@ -721,6 +728,8 @@ class CapabilityDispatcher:
                 execution_backend=routed_workspace.execution_backend or "local",
                 capability_policy=task_policy,
                 resource_budget=task_budget,
+                deadline=task_deadline,
+                runtime_remaining_s=runtime_remaining_s,
                 autonomy=profile,
                 generated_call_depth=_generated_call_depth,
                 generated_call_chain=tuple(_generated_call_chain),
@@ -968,6 +977,8 @@ class CapabilityDispatcher:
         profile: str | None = None,
         task_policy: CapabilityPolicy | None = None,
         task_budget: ResourceBudget | None = None,
+        task_deadline: datetime | None = None,
+        runtime_remaining_s: float | None = None,
         preflight: bool = True,
         _directives_by_call_id: Mapping[str, DispatchDirectives] | None = None,
     ) -> list[CapabilityResult | SuspendedCall]:
@@ -1017,6 +1028,8 @@ class CapabilityDispatcher:
                     profile=profile,
                     task_policy=task_policy,
                     task_budget=task_budget,
+                    task_deadline=task_deadline,
+                    runtime_remaining_s=runtime_remaining_s,
                     directives=(_directives_by_call_id or {}).get(r.call_id),
                     prepared=preflight,
                 )
@@ -1037,6 +1050,8 @@ class CapabilityDispatcher:
         profile: str | None,
         task_policy: CapabilityPolicy | None,
         task_budget: ResourceBudget | None,
+        task_deadline: datetime | None,
+        runtime_remaining_s: float | None,
         directives: DispatchDirectives | None,
         prepared: bool,
     ):
@@ -1055,18 +1070,9 @@ class CapabilityDispatcher:
             # dispatch() will return the canonical validation/effect error.
             pass
 
-        semaphore = None
-        if task_budget is not None and request.task_id and _is_execution(effects):
-            semaphore = self._execution_semaphores.get(request.task_id)
-            if semaphore is None:
-                limit = max(1, int(task_budget.max_parallel_executions))
-                semaphore = asyncio.Semaphore(limit)
-                self._execution_semaphores[request.task_id] = semaphore
-
         locks = self._locks_for_request(request, workspace, effects)
-        if semaphore is not None:
-            await semaphore.acquire()
-        try:
+
+        async def invoke_with_locks():
             for lock in locks:
                 await lock.acquire()
             try:
@@ -1076,15 +1082,36 @@ class CapabilityDispatcher:
                     profile=profile,
                     task_policy=task_policy,
                     task_budget=task_budget,
+                    task_deadline=task_deadline,
+                    runtime_remaining_s=runtime_remaining_s,
                     _directives=directives,
                     _prepared=prepared,
                 )
             finally:
                 for lock in reversed(locks):
                     lock.release()
-        finally:
-            if semaphore is not None:
-                semaphore.release()
+
+        lease = None
+        if request.task_id and _is_execution(effects):
+            if self._budgets is not None:
+                lease = self._budgets.execution_lease(request.task_id)
+            elif task_budget is not None:
+                # Compatibility for standalone dispatcher users that have not
+                # composed a BudgetTracker yet.  Service wiring always binds
+                # the hierarchical authority above.
+                semaphore = self._execution_semaphores.get(request.task_id)
+                if semaphore is None:
+                    semaphore = asyncio.Semaphore(max(1, int(task_budget.max_parallel_executions)))
+                    self._execution_semaphores[request.task_id] = semaphore
+                await semaphore.acquire()
+                try:
+                    return await invoke_with_locks()
+                finally:
+                    semaphore.release()
+        if lease is None:
+            return await invoke_with_locks()
+        async with lease:
+            return await invoke_with_locks()
 
     def _locks_for_request(
         self,
