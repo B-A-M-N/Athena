@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -32,7 +34,58 @@ def ignored_name(name: str, *, is_directory: bool) -> bool:
 
 def copy_ignore(_directory: str, names: list[str]) -> list[str]:
     """Ignore callback suitable for :func:`shutil.copytree`."""
-    return [name for name in names if ignored_name(name, is_directory=False)]
+    directory = Path(_directory).resolve()
+    git_root = _git_root(directory)
+    tracked = _tracked_paths(git_root) if git_root is not None else frozenset()
+    ignored: list[str] = []
+    for name in names:
+        path = directory / name
+        is_directory = path.is_dir() and not path.is_symlink()
+        if not ignored_name(name, is_directory=is_directory):
+            continue
+        if git_root is not None and _has_tracked_path(path, git_root, tracked):
+            continue
+        ignored.append(name)
+    return ignored
+
+
+def _git_root(directory: Path) -> Path | None:
+    """Find the containing checkout without trusting Git's work-tree state."""
+    for candidate in (directory, *directory.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+@lru_cache(maxsize=32)
+def _tracked_paths(git_root: Path) -> frozenset[str]:
+    """Return indexed paths once per checkout for copytree callbacks."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(git_root), "ls-files", "--cached", "-z"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    if result.returncode != 0:
+        return frozenset()
+    return frozenset(
+        item.decode("utf-8", errors="surrogateescape")
+        for item in result.stdout.split(b"\0")
+        if item
+    )
+
+
+def _has_tracked_path(path: Path, git_root: Path, tracked: frozenset[str]) -> bool:
+    """Keep an ignored entry when it is or contains an indexed path."""
+    try:
+        relative = path.resolve().relative_to(git_root.resolve()).as_posix()
+    except ValueError:
+        return False
+    prefix = relative + "/"
+    return any(item == relative or item.startswith(prefix) for item in tracked)
 
 
 def tree_paths(root: Path) -> list[Path]:
