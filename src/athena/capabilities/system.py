@@ -231,7 +231,7 @@ class ProcessCapability:
                 head = f"{root[0]} {root[3]}" if root else f"(root {pid} gone)"
                 return "\n".join([head] + collected)
 
-            tree = await loop.run_in_executor(None, _tree)
+            tree = _tree()
             return _result(request, output=tree or f"(no children of {pid})")
 
         if op == "usage":
@@ -240,7 +240,7 @@ class ProcessCapability:
                 _rc, out, _ = _run(["ps", "-p", str(pid), "-o", "pid,pcpu,pmem,rss,vsz,etime,comm"])
                 return out.strip()
 
-            out = await loop.run_in_executor(None, _usage)
+            out = _usage()
             return _result(request, output=out)
 
         if op == "write_stdin":
@@ -465,7 +465,11 @@ class MachineCapability:
                         found.append(f"{t}: {p}")
                 return "\n".join(found)
 
-            text = await loop.run_in_executor(None, _tc)
+            # Tool lookup is a bounded in-process metadata query.  Avoid the
+            # default executor here as well; some hosts leave its worker
+            # blocked during interpreter teardown even after ``which`` has
+            # returned.
+            text = _tc()
             return _result(request, output=text)
 
         if op == "services":
