@@ -397,7 +397,11 @@ class MachineCapability:
                     f"\nmem avail {int(mem.get('MemAvailable', 0)) // 1024} MB"
                 )
 
-            text = await loop.run_in_executor(None, _ov)
+            # ``os.getloadavg()`` is a tiny, local kernel read.  Keeping this
+            # summary on the event-loop thread avoids a host-specific libc
+            # deadlock observed when that call is dispatched through the
+            # default executor during clean release-test startup.
+            text = _ov()
             return _result(request, output=text)
 
         if op == "cpu":
