@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from athena.tasks.manager import TaskManager, Task, Decision, TaskNotRunnable
-from athena.tasks.budgets import BudgetTracker, Usage, DefaultBudget, exceeded_by_budget
+from athena.tasks.budgets import (
+    BudgetStateUnavailable,
+    BudgetTracker,
+    DefaultBudget,
+    Usage,
+    exceeded_by_budget,
+)
 from athena.tasks.cancellation import CancellationManager
 from athena.tasks.delegation import (
     DelegationManager,
@@ -17,6 +23,7 @@ __all__ = [
     "TaskNotRunnable",
     "Decision",
     "BudgetTracker",
+    "BudgetStateUnavailable",
     "Usage",
     "DefaultBudget",
     "exceeded_by_budget",

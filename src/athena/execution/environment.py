@@ -10,10 +10,110 @@ import platform
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 from athena.protocol.tasks import WorkspaceSpec
+
+
+@dataclass(frozen=True)
+class VerificationEnvironment:
+    """Trusted, operator-selected toolchain for candidate verification.
+
+    The project workspace remains the candidate's source of truth.  This
+    object only binds the already-bootstrapped environment used to prove it;
+    its paths are resolved by the host service, never by model input.
+    """
+
+    project_root: str
+    python: str
+    uv: str | None
+    environment_root: str | None
+    environment: Mapping[str, str] = field(default_factory=dict)
+    readonly_mounts: tuple[str, ...] = ()
+
+    @classmethod
+    def from_project(cls, root: str, *, require_sandbox: bool = True) -> "VerificationEnvironment":
+        project_root = str(Path(root).resolve())
+        environment_root = Path(project_root) / ".venv"
+        python = environment_root / "bin" / "python"
+        uv = shutil.which("uv")
+        required = {
+            "python": python,
+            "ruff": environment_root / "bin" / "ruff",
+            "mypy": environment_root / "bin" / "mypy",
+            "pytest": environment_root / "bin" / "pytest",
+        }
+        missing = [name for name, path in required.items() if not path.is_file()]
+        if uv is None:
+            missing.append("uv")
+        if require_sandbox and os.name == "posix" and shutil.which("bwrap") is None:
+            missing.append("bubblewrap")
+        if missing:
+            raise ValueError(
+                "development verification environment is not bootstrapped "
+                f"(missing: {', '.join(missing)})"
+            )
+        mounts = [str(environment_root)]
+        if uv is not None:
+            mounts.insert(0, os.path.realpath(uv))
+        return cls(
+            project_root=project_root,
+            python=str(python),
+            uv=os.path.realpath(uv) if uv else None,
+            environment_root=str(environment_root),
+            environment={
+                "UV_PROJECT_ENVIRONMENT": str(environment_root),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            readonly_mounts=tuple(dict.fromkeys(mounts)),
+        )
+
+    def for_workspace(self, workspace_root: str) -> dict[str, str]:
+        """Return candidate-local imports plus this trusted environment."""
+        root = str(Path(workspace_root).resolve())
+        env = {str(key): str(value) for key, value in self.environment.items()}
+        source_root = Path(root) / "src"
+        if source_root.is_dir():
+            env["PYTHONPATH"] = str(source_root)
+        return env
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "project_root": self.project_root,
+            "python": self.python,
+            "uv": self.uv,
+            "environment_root": self.environment_root,
+            "environment": dict(self.environment),
+            "readonly_mounts": list(self.readonly_mounts),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "VerificationEnvironment":
+        if not isinstance(record, Mapping):
+            raise ValueError("verification environment record must be a mapping")
+        project_root = str(record.get("project_root") or "")
+        if not project_root:
+            raise ValueError("verification environment has no project root")
+        environment_root = record.get("environment_root")
+        if environment_root is not None:
+            expected = str(Path(project_root).resolve() / ".venv")
+            if str(Path(str(environment_root)).resolve()) != expected:
+                raise ValueError("verification environment is not bound to project .venv")
+        mounts = tuple(str(path) for path in (record.get("readonly_mounts") or ()))
+        if not mounts or any(not os.path.isabs(path) for path in mounts):
+            raise ValueError("verification environment has invalid read-only mounts")
+        return cls(
+            project_root=project_root,
+            python=str(record.get("python") or ""),
+            uv=str(record["uv"]) if record.get("uv") else None,
+            environment_root=str(environment_root) if environment_root else None,
+            environment={
+                str(key): str(value) for key, value in dict(record.get("environment") or {}).items()
+            },
+            readonly_mounts=mounts,
+        )
 
 
 class ProjectEnvironmentFingerprint:

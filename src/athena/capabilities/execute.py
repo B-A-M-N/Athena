@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import hashlib
-import pathlib
 import shutil
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -208,15 +207,25 @@ class ExecuteCapability:
             workspace_root=workspace_root,
             # Candidate verification must import the candidate tree, while
             # never inheriting a host PYTHONPATH that could leak unrelated
-            # code into the proof environment.
-            env=_candidate_python_environment(workspace_root),
+            # code into the proof environment. A self-host task additionally
+            # supplies its trusted, host-resolved frozen environment.
+            env=(
+                verification_environment.for_workspace(workspace_root)
+                if (verification_environment := getattr(context, "verification_environment", None))
+                is not None
+                else _candidate_python_environment(workspace_root)
+            ),
             writable_paths=(
                 None
                 if not writable_rules
                 else _canonical_workspace_rules(ws, workspace_root, allow=True)
             ),
             read_only_paths=_canonical_workspace_rules(ws, workspace_root, allow=False),
-            toolchain_paths=_trusted_toolchain_paths(ws),
+            toolchain_paths=(
+                verification_environment.readonly_mounts
+                if verification_environment is not None
+                else _trusted_toolchain_paths(ws)
+            ),
         )
         execution_id = _new_id()
 
@@ -478,13 +487,6 @@ def _candidate_python_environment(workspace_root: str) -> dict[str, str]:
     env = {"PYTHONDONTWRITEBYTECODE": "1"}
     if os.path.isdir(source_root):
         env["PYTHONPATH"] = source_root
-    # ``uv run`` must use the already-bootstrapped, mounted environment during
-    # candidate proof.  It must never create/sync an environment in the
-    # candidate or reach the network to acquire dependencies.
-    repo_root = pathlib.Path(__file__).resolve().parents[2]
-    venv = repo_root / ".venv"
-    if venv.is_dir():
-        env["UV_PROJECT_ENVIRONMENT"] = str(venv)
     return env
 
 
@@ -497,10 +499,6 @@ def _trusted_toolchain_paths(workspace) -> tuple[str, ...]:
     uv = shutil.which("uv")
     if uv:
         paths.append(os.path.realpath(uv))
-    repo_root = pathlib.Path(__file__).resolve().parents[2]
-    venv = repo_root / ".venv"
-    if venv.is_dir():
-        paths.append(str(venv))
     return tuple(dict.fromkeys(paths))
 
 

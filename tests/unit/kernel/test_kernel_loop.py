@@ -18,7 +18,7 @@ from athena.models.router import ModelRouter
 from athena.protocol.ids import new_id
 from athena.protocol.models import CostInfo
 from athena.protocol.tasks import ResourceBudget, TaskSpec, TaskStatus
-from athena.tasks.budgets import BudgetTracker
+from athena.tasks.budgets import BudgetStateUnavailable, BudgetTracker
 from athena.state.database import Database
 from athena.state.events import EventStore
 from athena.state.messages import MessageStore
@@ -183,6 +183,30 @@ async def test_budget_exhaustion_is_partial_not_failed(stack):
     assert result.status == TaskStatus.PARTIAL
     assert result.status != TaskStatus.FAILED
     assert "budget" in result.summary.lower()
+
+
+async def test_budget_failure_during_bootstrap_is_recovery_required_and_not_leaked(stack):
+    budgets = BudgetTracker(task_store=stack.tasks)
+    calls: list[str] = []
+
+    async def fail_begin(task_id: str) -> None:
+        calls.append(f"begin:{task_id}")
+        raise BudgetStateUnavailable("durable budget read failed")
+
+    async def record_end(task_id: str) -> None:
+        calls.append(f"end:{task_id}")
+
+    budgets.begin_compute = fail_begin  # type: ignore[method-assign]
+    budgets.end_compute = record_end  # type: ignore[method-assign]
+    stack.manager.set_budget_tracker(budgets)
+    stack.kernel.set_budget_tracker(budgets)
+
+    spec = await _create(stack, "bootstrap budget failure")
+    result = await stack.kernel.run_task(spec.id)
+
+    assert result.status == TaskStatus.RECOVERY_REQUIRED
+    assert calls == [f"begin:{spec.id}"]
+    assert (await stack.tasks.get(spec.id))["status"] == TaskStatus.RECOVERY_REQUIRED.value
 
 
 async def test_successful_model_calls_reconcile_cost_before_next_reservation(stack):

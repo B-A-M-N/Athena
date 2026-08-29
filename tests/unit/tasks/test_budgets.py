@@ -8,7 +8,7 @@ from datetime import timedelta
 
 
 from athena.protocol.tasks import ResourceBudget, TaskSpec
-from athena.tasks.budgets import BudgetTracker
+from athena.tasks.budgets import BudgetStateUnavailable, BudgetTracker
 
 
 def _task(task_id, *, budget=None, parent=None):
@@ -50,6 +50,25 @@ class _TreeStore:
 
     async def persist_budget_usage(self, task_id, usage):
         self.metadata[task_id]["_budget_usage"] = dict(usage)
+
+
+class _FailingStore(_TreeStore):
+    def __init__(self, tasks):
+        super().__init__(tasks)
+        self.fail_reads = True
+
+    async def get(self, task_id):
+        if self.fail_reads:
+            raise OSError("database unavailable")
+        return await super().get(task_id)
+
+
+class _MalformedBudgetStore(_TreeStore):
+    async def get(self, task_id):
+        row = await super().get(task_id)
+        if row is not None:
+            row["resource_budget"] = "not-a-budget"
+        return row
 
 
 @pytest.mark.athena_claim("BHV-083")
@@ -330,3 +349,88 @@ async def test_inflight_compute_is_not_reset_by_tracker_restart():
     assert total.wall_time_s < 1
 
     await first.end_compute("root")
+
+
+async def test_fresh_tracker_reconstructs_parent_chain_before_authorizing_child():
+    import asyncio
+
+    root = _task(
+        "root",
+        budget=ResourceBudget(
+            max_input_tokens=10,
+            max_cost_usd=Decimal("1.00"),
+            max_artifact_bytes=100,
+            max_parallel_model_calls=1,
+            max_parallel_executions=1,
+        ),
+    )
+    child = _task("child", parent="root")
+    grandchild = _task("grandchild", parent="child")
+    store = _TreeStore([root, child, grandchild])
+    first = BudgetTracker(task_store=store)
+    first.register(root)
+    first.register(child)
+    first.register(grandchild)
+    first.consume("root", input_tokens=10)
+    await first._persist_usage("root")
+
+    restored = BudgetTracker(task_store=store)
+
+    assert (await restored.remaining("grandchild"))["input_tokens"] == 0
+    assert await restored.exhausted("grandchild") is True
+    with pytest.raises(ValueError, match="model cost budget exceeded.*root"):
+        await restored.reserve_model_cost("grandchild", Decimal("1.01"))
+    with pytest.raises(ValueError, match="artifact budget exceeded.*root"):
+        await restored.reserve_artifact("grandchild", 101)
+
+    async def hold_model_lease():
+        async with restored.model_call_lease("grandchild"):
+            await model_release.wait()
+
+    async def acquire_model_lease():
+        async with restored.model_call_lease("grandchild"):
+            return
+
+    model_release = asyncio.Event()
+    holder = asyncio.create_task(hold_model_lease())
+    await asyncio.sleep(0)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(acquire_model_lease(), timeout=0.01)
+    model_release.set()
+    await holder
+
+    async def hold_execution_lease():
+        async with restored.execution_lease("grandchild"):
+            await execution_release.wait()
+
+    async def acquire_execution_lease():
+        async with restored.execution_lease("grandchild"):
+            return
+
+    execution_release = asyncio.Event()
+    holder = asyncio.create_task(hold_execution_lease())
+    await asyncio.sleep(0)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(acquire_execution_lease(), timeout=0.01)
+    execution_release.set()
+    await holder
+
+
+async def test_budget_storage_failure_never_falls_back_to_default_or_poison_hydration():
+    root = _task("root", budget=ResourceBudget(max_input_tokens=10))
+    store = _FailingStore([root])
+    tracker = BudgetTracker(task_store=store)
+
+    with pytest.raises(BudgetStateUnavailable, match="durable budget"):
+        await tracker.remaining("root")
+    assert "root" not in tracker._usage_hydrated
+
+    store.fail_reads = False
+    assert (await tracker.remaining("root"))["input_tokens"] == 10
+
+
+async def test_malformed_durable_budget_fails_closed():
+    root = _task("root")
+    store = _MalformedBudgetStore([root])
+    with pytest.raises(BudgetStateUnavailable, match="malformed durable budget"):
+        await BudgetTracker(task_store=store).budget_of_async("root")

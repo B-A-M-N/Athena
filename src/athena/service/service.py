@@ -29,6 +29,7 @@ import os
 import tempfile
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping
 
 from athena.artifacts.store import ArtifactStore
@@ -48,6 +49,7 @@ from athena.capabilities.skills import SkillsCapability
 from athena.context.compiler import ContextCompiler
 from athena.execution.manager import ExecutionManager
 from athena.execution.container import ContainerBackend
+from athena.execution.environment import VerificationEnvironment
 from athena.knowledge.pipeline import KnowledgePipeline
 from athena.models.router import ModelRouter
 from athena.interpreter import InterpreterExtension
@@ -73,7 +75,7 @@ from athena.skills.loader import SkillLoader
 from athena.kernel.continuations import ContinuationStore
 from athena.state.approvals import ApprovalStore
 from athena.state.database import Database
-from athena.state.events import EventStore
+from athena.state.events import FAST_EVENT_TYPES, EventStore
 from athena.state.external_effects import ExternalEffectStore
 from athena.state.executions import ExecutionStore
 from athena.state.messages import MessageStore
@@ -631,7 +633,10 @@ class AthenaService:
         # verification count evidence, not caller-supplied promotion metadata.
         await self._synthesis.replay_event_metrics(events)
         self._synthesis_event_observer = self._synthesis.observe_event
-        events.subscribe(self._synthesis_event_observer)
+        events.subscribe(
+            self._synthesis_event_observer,
+            event_types={"CapabilityCompleted", "VerificationCompleted"},
+        )
 
         # 12b. Register schedule capability AFTER the scheduler is constructed
         # (P1-25: ScheduleAPI must capture a live scheduler, not None).
@@ -642,7 +647,7 @@ class AthenaService:
             loop_interval_seconds=cfg.scheduler_interval_seconds,
         )
         self._scheduler = scheduler
-        events.subscribe(scheduler.notify_event)
+        events.subscribe(scheduler.notify_event, exclude_event_types=FAST_EVENT_TYPES)
         schedule_api = ScheduleAPI(scheduler, task_manager)
         registry.register(ScheduleCapability(schedule_api))
         # Maintenance contracts are rehydrated before the core capability
@@ -764,6 +769,7 @@ class AthenaService:
             config=WorkerConfig(max_parallel=cfg.worker_max_parallel),
         )
         self._worker = worker
+        task_manager.set_wakeup_callback(worker.notify)
         self._worker_task = asyncio.create_task(self._worker.run_forever())
 
         # 14. MCP (best-effort).
@@ -1052,11 +1058,37 @@ class AthenaService:
         tm = self._require_task_manager()
         session_id = request.session_id or new_id("session")
         spec = self._build_task_spec(request, session_id)
+        if spec.metadata.get("self_host"):
+            verification = self._self_host_verification_environment(spec.workspace)
+            metadata = dict(spec.metadata)
+            metadata["_verification_environment"] = verification.to_record()
+            spec = replace(spec, metadata=metadata)
         created = await tm.create(spec)
         await tm.enqueue(created.id)
         if wait:
             await self.wait_for(created.id)
         return created
+
+    @staticmethod
+    def _self_host_verification_environment(workspace) -> VerificationEnvironment:
+        """Validate the only supported self-host target and its proof tools."""
+        if workspace is None:
+            raise ValueError("athena self requires an Athena source checkout")
+        root = Path(workspace.root).resolve()
+        if not (root / "src" / "athena" / "__init__.py").is_file():
+            raise ValueError("athena self must target an Athena source checkout")
+        try:
+            import tomllib
+
+            project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        except (OSError, ValueError, KeyError) as exc:
+            raise ValueError("Athena pyproject.toml could not be validated") from exc
+        if project.get("project", {}).get("name") != "athena-agent":
+            raise ValueError("athena self must target the athena-agent checkout")
+        try:
+            return VerificationEnvironment.from_project(str(root))
+        except ValueError as exc:
+            raise ValueError(f"athena self: {exc}") from exc
 
     def register_external_delegate(self, spec, *, connector=None) -> None:
         """Register a host-configured ACP/A2A/OpenAI delegate.
@@ -1325,7 +1357,11 @@ class AthenaService:
             current = await self.get_task_status(task_id)
             if _is_terminal_status(current):
                 return
-            await asyncio.sleep(0.1)
+            generation = events.append_generation
+            try:
+                await asyncio.wait_for(events.wait_for_append(generation), timeout=0.1)
+            except TimeoutError:
+                pass
 
     async def stream_all(self, after_rowid: int = 0, limit: int = 200):
         """Yield events across ALL tasks in insertion order (live tail).
@@ -1342,7 +1378,11 @@ class AthenaService:
                 if isinstance(rid, int) and rid > cursor:
                     cursor = rid
                 yield ev
-            await asyncio.sleep(0.15)
+            generation = events.append_generation
+            try:
+                await asyncio.wait_for(events.wait_for_append(generation), timeout=0.15)
+            except TimeoutError:
+                pass
 
     async def get_task_status(self, task_id: str) -> str | None:
         """Return the task's status string (from ``metadata["status"]``), or None."""

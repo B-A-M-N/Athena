@@ -13,10 +13,19 @@ from athena.protocol.tasks import ResourceBudget, TaskSpec, UsageSummary
 
 __all__ = [
     "BudgetTracker",
+    "BudgetStateUnavailable",
     "Usage",
     "DefaultBudget",
     "exceeded_by_budget",
 ]
+
+
+class BudgetStateUnavailable(RuntimeError):
+    """Durable budget authority could not be read or decoded.
+
+    A missing task remains a ``KeyError``. This exception identifies an
+    existing task whose restrictive budget cannot be established safely.
+    """
 
 
 @dataclass
@@ -260,19 +269,9 @@ class BudgetTracker:
     # Budget resolution
     # ------------------------------------------------------------------ #
     async def budget_of_async(self, task_id: str) -> ResourceBudget:
+        await self._ensure_task_budget_metadata(task_id)
         with self._lock:
-            if task_id in self._budgets:
-                return self._budgets[task_id]
-        spec = self._resolve_spec(task_id)
-        if spec is not None:
-            with self._lock:
-                self._budgets[task_id] = spec.resource_budget or ResourceBudget()
-                self._parent[task_id] = spec.parent_task_id
             return self._budgets[task_id]
-        if await self._load_from_store_async(task_id):
-            with self._lock:
-                return self._budgets[task_id]
-        return ResourceBudget()
 
     def budget_of(self, task_id: str) -> ResourceBudget:
         with self._lock:
@@ -284,7 +283,11 @@ class BudgetTracker:
                 self._budgets[task_id] = spec.resource_budget or ResourceBudget()
                 self._parent[task_id] = spec.parent_task_id
             return self._budgets[task_id]
-        return ResourceBudget()
+        if self._store is not None:
+            raise BudgetStateUnavailable(
+                f"budget state for {task_id} requires asynchronous durable loading"
+            )
+        raise KeyError(f"task not found: {task_id}")
 
     def _resolve_spec(self, task_id: str):
         if self._budget_resolver is not None:
@@ -293,22 +296,41 @@ class BudgetTracker:
 
     async def _load_from_store_async(self, task_id: str) -> bool:
         if self._store is None:
-            return False
+            raise BudgetStateUnavailable(f"durable budget store unavailable for task {task_id}")
         try:
             row = await self._store.get(task_id)
-        except Exception:
-            return False
+        except Exception as exc:  # noqa: BLE001 - authority failure must propagate
+            raise BudgetStateUnavailable(
+                f"could not read durable budget state for task {task_id}"
+            ) from exc
         if not row:
             return False
-        rb = (
-            _deserialize_budget(row.get("resource_budget"))
-            if row.get("resource_budget")
-            else ResourceBudget()
-        )
+        try:
+            raw_budget = row.get("resource_budget")
+            rb = _deserialize_budget(raw_budget, strict=True) if raw_budget else ResourceBudget()
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise BudgetStateUnavailable(
+                f"malformed durable budget state for task {task_id}"
+            ) from exc
         with self._lock:
             self._budgets[task_id] = rb
             self._parent[task_id] = row.get("parent_task_id")
         return True
+
+    async def _ensure_task_budget_metadata(self, task_id: str) -> None:
+        """Load one task's budget and parent link before using its lineage."""
+        with self._lock:
+            if task_id in self._budgets and task_id in self._parent:
+                return
+        spec = self._resolve_spec(task_id)
+        if spec is not None:
+            with self._lock:
+                self._budgets[task_id] = spec.resource_budget or ResourceBudget()
+                self._parent[task_id] = spec.parent_task_id
+            return
+        if await self._load_from_store_async(task_id):
+            return
+        raise KeyError(f"task not found: {task_id}")
 
     # ------------------------------------------------------------------ #
     # Aggregation (async; reads the store via parent links)
@@ -599,26 +621,16 @@ class BudgetTracker:
     async def _ancestor_ids(self, task_id: str) -> list[str]:
         chain: list[str] = []
         seen: set[str] = set()
-        cur = task_id
-        while cur and cur not in seen:
+        cur: str | None = task_id
+        while cur:
+            if cur in seen:
+                raise BudgetStateUnavailable(f"cyclic task budget lineage at {cur}")
             seen.add(cur)
+            await self._ensure_task_budget_metadata(cur)
             chain.append(cur)
             with self._lock:
                 parent = self._parent.get(cur)
-            if parent:
-                cur = parent
-                continue
-            with self._lock:
-                budgets_have = cur in self._budgets
-            if budgets_have:
-                break
-            spec = self._resolve_spec(cur)
-            if spec is None:
-                break
-            with self._lock:
-                self._parent[cur] = spec.parent_task_id
-                self._budgets[cur] = spec.resource_budget or ResourceBudget()
-            cur = spec.parent_task_id
+            cur = parent
         return chain
 
     async def _hydrate_usage(self, task_id: str) -> None:
@@ -626,34 +638,45 @@ class BudgetTracker:
         with self._lock:
             if task_id in self._usage_hydrated:
                 return
-            self._usage_hydrated.add(task_id)
         if self._store is None or not hasattr(self._store, "get"):
             return
-        row = await self._store.get(task_id)
+        try:
+            row = await self._store.get(task_id)
+        except Exception as exc:  # noqa: BLE001 - authority failure must propagate
+            raise BudgetStateUnavailable(
+                f"could not read durable usage state for task {task_id}"
+            ) from exc
         if not row:
-            return
+            raise KeyError(f"task not found: {task_id}")
         metadata = row.get("metadata") if isinstance(row, Mapping) else None
         checkpoint = metadata.get("_budget_usage") if isinstance(metadata, Mapping) else None
         if not isinstance(checkpoint, Mapping):
             checkpoint = row.get("usage") if isinstance(row, Mapping) else None
         if not isinstance(checkpoint, Mapping):
+            with self._lock:
+                self._usage_hydrated.add(task_id)
             return
-        restored = Usage(
-            iterations=_int(checkpoint, "iterations"),
-            model_calls=_int(checkpoint, "model_calls"),
-            input_tokens=_int(checkpoint, "input_tokens"),
-            output_tokens=_int(checkpoint, "output_tokens"),
-            cost=_dec(checkpoint, "cost", "cost_usd"),
-            executions=_int(checkpoint, "executions"),
-            mutations=_int(checkpoint, "mutations"),
-            children=_int(checkpoint, "children"),
-            artifact_bytes=_int(checkpoint, "artifact_bytes"),
-            wall_time_s=_float(checkpoint, "wall_time_s"),
-        )
-        reserved_artifact = _int(checkpoint, "reserved_artifact_bytes")
-        reserved_model = _dec(checkpoint, "reserved_model_cost")
-        outstanding_model = _dec(checkpoint, "outstanding_model_cost")
-        active_started = _parse_datetime(checkpoint.get("active_compute_started_at"))
+        try:
+            restored = Usage(
+                iterations=_int(checkpoint, "iterations"),
+                model_calls=_int(checkpoint, "model_calls"),
+                input_tokens=_int(checkpoint, "input_tokens"),
+                output_tokens=_int(checkpoint, "output_tokens"),
+                cost=_dec(checkpoint, "cost", "cost_usd"),
+                executions=_int(checkpoint, "executions"),
+                mutations=_int(checkpoint, "mutations"),
+                children=_int(checkpoint, "children"),
+                artifact_bytes=_int(checkpoint, "artifact_bytes"),
+                wall_time_s=_float(checkpoint, "wall_time_s"),
+            )
+            reserved_artifact = _int(checkpoint, "reserved_artifact_bytes")
+            reserved_model = _dec(checkpoint, "reserved_model_cost")
+            outstanding_model = _dec(checkpoint, "outstanding_model_cost")
+            active_started = _parse_datetime(checkpoint.get("active_compute_started_at"))
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise BudgetStateUnavailable(
+                f"malformed durable usage state for task {task_id}"
+            ) from exc
         if active_started is not None:
             # A hard stop may interrupt an active interval between checkpoints.
             # Count it conservatively through recovery instead of resetting the
@@ -675,6 +698,7 @@ class BudgetTracker:
                 self._model_cost_by_task[task_id] = max(
                     self._model_cost_by_task.get(task_id, Decimal("0")), outstanding_model
                 )
+            self._usage_hydrated.add(task_id)
 
     async def _persist_usage(self, task_id: str) -> None:
         store = self._store
@@ -721,35 +745,74 @@ class BudgetTracker:
             self._active_compute[task_id] = (now_monotonic, utcnow())
 
 
-def _deserialize_budget(data: Any) -> ResourceBudget:
+def _deserialize_budget(data: Any, *, strict: bool = False) -> ResourceBudget:
     if isinstance(data, ResourceBudget):
         return data
     if not isinstance(data, Mapping):
+        if strict:
+            raise ValueError("resource budget must be a mapping")
         return ResourceBudget()
     max_cost = data.get("max_cost_usd")
     max_time = data.get("max_wall_time")
     from decimal import Decimal as _Decimal
 
     defaults = ResourceBudget()
+
+    def integer(key: str, default: int) -> int:
+        value = data.get(key)
+        if value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            if strict:
+                raise ValueError(f"invalid {key}") from exc
+            return default
+
+    def optional_integer(key: str) -> int | None:
+        value = data.get(key)
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            if strict:
+                raise ValueError(f"invalid {key}") from exc
+            return None
+
+    if max_cost is not None:
+        try:
+            max_cost = _Decimal(str(max_cost))
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            if strict:
+                raise ValueError("invalid max_cost_usd") from exc
+            max_cost = None
+    if max_time is not None and max_time != "":
+        try:
+            max_time = _timedelta_or_none(max_time)
+            if max_time is None and strict:
+                raise ValueError("invalid max_wall_time")
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            if strict:
+                raise ValueError("invalid max_wall_time") from exc
+            max_time = None
+    else:
+        max_time = None
     return ResourceBudget(
-        max_agent_iterations=_int_or_default(
-            data.get("max_agent_iterations"), defaults.max_agent_iterations
+        max_agent_iterations=integer("max_agent_iterations", defaults.max_agent_iterations),
+        max_input_tokens=optional_integer("max_input_tokens"),
+        max_output_tokens=optional_integer("max_output_tokens"),
+        max_cost_usd=max_cost,
+        max_wall_time=max_time,
+        max_children=integer("max_children", defaults.max_children),
+        max_child_depth=integer("max_child_depth", defaults.max_child_depth),
+        max_parallel_model_calls=integer(
+            "max_parallel_model_calls", defaults.max_parallel_model_calls
         ),
-        max_input_tokens=_int_or_none(data.get("max_input_tokens")),
-        max_output_tokens=_int_or_none(data.get("max_output_tokens")),
-        max_cost_usd=_Decimal(str(max_cost)) if max_cost is not None else None,
-        max_wall_time=_timedelta_or_none(max_time),
-        max_children=_int_or_default(data.get("max_children"), defaults.max_children),
-        max_child_depth=_int_or_default(data.get("max_child_depth"), defaults.max_child_depth),
-        max_parallel_model_calls=_int_or_default(
-            data.get("max_parallel_model_calls"), defaults.max_parallel_model_calls
+        max_parallel_executions=integer(
+            "max_parallel_executions", defaults.max_parallel_executions
         ),
-        max_parallel_executions=_int_or_default(
-            data.get("max_parallel_executions"), defaults.max_parallel_executions
-        ),
-        max_artifact_bytes=_int_or_default(
-            data.get("max_artifact_bytes"), defaults.max_artifact_bytes
-        ),
+        max_artifact_bytes=integer("max_artifact_bytes", defaults.max_artifact_bytes),
     )
 
 

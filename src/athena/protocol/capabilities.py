@@ -426,6 +426,9 @@ class InvocationContext:
     resource_budget: ResourceBudget | None = None
     deadline: datetime | None = None
     runtime_remaining_s: float | None = None
+    # Host-resolved candidate verification toolchain. This is internal
+    # execution context, never model-controlled request data.
+    verification_environment: Any = None
     # Internal execution context only. This deliberately does not belong on
     # CapabilityRequest, where model-visible fields could be mistaken for
     # authority controls.

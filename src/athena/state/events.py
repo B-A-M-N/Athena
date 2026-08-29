@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import inspect
 import logging
 from datetime import datetime
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from aiosqlite import IntegrityError
@@ -12,6 +14,30 @@ from athena.protocol.events import Event, make_event
 from athena.state.database import Database
 
 _logger = logging.getLogger("athena.events")
+
+FAST_EVENT_TYPES = frozenset(
+    {
+        "ModelDelta",
+        "ModelReasoningDelta",
+        "StdoutChunk",
+        "StderrChunk",
+        "CapabilityProgress",
+    }
+)
+
+
+@dataclass
+class _Subscription:
+    callback: Any
+    event_types: frozenset[str] | None = None
+    excluded_types: frozenset[str] = frozenset()
+    queue: asyncio.Queue | None = None
+    worker: asyncio.Task | None = None
+
+    def accepts(self, event_type: str) -> bool:
+        return event_type not in self.excluded_types and (
+            self.event_types is None or event_type in self.event_types
+        )
 
 
 class EventStore:
@@ -32,19 +58,67 @@ class EventStore:
 
     def __init__(self, db: Database) -> None:
         self._db = db
-        self._subscribers: list[Any] = []
+        self._subscribers: list[_Subscription] = []
+        self._append_condition = asyncio.Condition()
+        self._append_generation = 0
 
-    def subscribe(self, callback: Any) -> None:
-        """Register an event observer after durable append succeeds."""
-        if callback not in self._subscribers:
-            self._subscribers.append(callback)
+    def subscribe(
+        self,
+        callback: Any,
+        *,
+        event_types: set[str] | frozenset[str] | tuple[str, ...] | None = None,
+        exclude_event_types: set[str] | frozenset[str] | tuple[str, ...] = (),
+    ) -> None:
+        """Register an event observer after durable append succeeds.
+
+        Stream events are delivered through a bounded, coalescing queue so a
+        slow projection cannot backpressure provider output. Control/evidence
+        events retain the awaited subscriber semantics used by durable
+        projections. ``event_types`` and ``exclude_event_types`` keep broad
+        observers from receiving noise they cannot act on.
+        """
+        selected = None if event_types is None else frozenset(map(str, event_types))
+        excluded = frozenset(map(str, exclude_event_types))
+        for subscription in self._subscribers:
+            if subscription.callback == callback:
+                subscription.event_types = selected
+                subscription.excluded_types = excluded
+                return
+        self._subscribers.append(
+            _Subscription(
+                callback=callback,
+                event_types=selected,
+                excluded_types=excluded,
+            )
+        )
 
     def unsubscribe(self, callback: Any) -> None:
         """Remove an event observer without affecting the event log."""
-        try:
-            self._subscribers.remove(callback)
-        except ValueError:
-            pass
+        remaining: list[_Subscription] = []
+        for subscription in self._subscribers:
+            if subscription.callback == callback:
+                if subscription.worker is not None:
+                    subscription.worker.cancel()
+                continue
+            remaining.append(subscription)
+        self._subscribers = remaining
+
+    @property
+    def append_generation(self) -> int:
+        """Return a process-local generation for same-process live streams."""
+        return self._append_generation
+
+    async def wait_for_append(self, after_generation: int) -> int:
+        """Wake when a same-process append occurs.
+
+        Callers still use a bounded timeout around this method because another
+        Athena process may append to the same database without sharing this
+        in-process condition.
+        """
+        async with self._append_condition:
+            while self._append_generation <= after_generation:
+                await self._append_condition.wait()
+            return self._append_generation
 
     async def append_event(
         self,
@@ -78,20 +152,13 @@ class EventStore:
                         f"INSERT INTO events({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         self._values(event),
                     )
+                await self._notify_append()
                 for callback in tuple(self._subscribers):
-                    try:
-                        outcome = callback(event)
-                        if inspect.isawaitable(outcome):
-                            await outcome
-                    except Exception:
-                        # Observers are projections. A broken observer must
-                        # never turn a committed canonical event into a failed
-                        # write or cause a producer to retry it.
-                        _logger.warning(
-                            "event subscriber failed for %s",
-                            event.type,
-                            exc_info=True,
-                        )
+                    if callback.accepts(event.type):
+                        if event.type in FAST_EVENT_TYPES:
+                            self._enqueue_fast(callback, event)
+                        else:
+                            await self._deliver(callback, event)
                 return event
             except IntegrityError as exc:
                 # Retry only on a genuine (task_id, sequence) UNIQUE collision
@@ -111,6 +178,57 @@ class EventStore:
             causal_id=event.causal_id,
             id=event.id,
         )
+
+    async def _notify_append(self) -> None:
+        async with self._append_condition:
+            self._append_generation += 1
+            self._append_condition.notify_all()
+
+    async def _deliver(self, subscription: _Subscription, event: Event) -> None:
+        try:
+            outcome = subscription.callback(event)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception:
+            # Observers are projections. A broken observer must never turn a
+            # committed canonical event into a failed write or cause a
+            # producer to retry it.
+            _logger.warning(
+                "event subscriber failed for %s",
+                event.type,
+                exc_info=True,
+            )
+
+    def _enqueue_fast(self, subscription: _Subscription, event: Event) -> None:
+        if subscription.queue is None:
+            subscription.queue = asyncio.Queue(maxsize=64)
+        queue = subscription.queue
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            pending: list[Event] = []
+            while True:
+                try:
+                    pending.append(queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            pending.append(event)
+            pending = _coalesce_fast_events(pending)
+            for item in pending[-queue.maxsize :]:
+                queue.put_nowait(item)
+        if subscription.worker is None or subscription.worker.done():
+            subscription.worker = asyncio.create_task(self._drain_fast(subscription))
+
+    async def _drain_fast(self, subscription: _Subscription) -> None:
+        queue = subscription.queue
+        if queue is None:
+            return
+        while True:
+            event = await queue.get()
+            try:
+                await self._deliver(subscription, event)
+            finally:
+                queue.task_done()
 
     @staticmethod
     def _values(event: Event) -> tuple:
@@ -194,4 +312,30 @@ def _row_to_event(row: dict | Any) -> Event:
     )
 
 
-__all__ = ["EventStore"]
+def _coalesce_fast_events(events: list[Event]) -> list[Event]:
+    """Coalesce adjacent presentation chunks while retaining control order."""
+    output: list[Event] = []
+    keys = {
+        "ModelDelta": "text",
+        "StdoutChunk": "data",
+        "StderrChunk": "data",
+    }
+    for event in events:
+        if output:
+            previous = output[-1]
+            key = keys.get(event.type)
+            if (
+                key is not None
+                and previous.type == event.type
+                and previous.task_id == event.task_id
+                and previous.session_id == event.session_id
+            ):
+                payload = dict(previous.payload)
+                payload[key] = str(payload.get(key) or "") + str(event.payload.get(key) or "")
+                output[-1] = replace(event, payload=payload)
+                continue
+        output.append(event)
+    return output
+
+
+__all__ = ["EventStore", "FAST_EVENT_TYPES"]

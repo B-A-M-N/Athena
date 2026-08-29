@@ -3,6 +3,9 @@ P0-21 (persist causal_id)."""
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from athena.protocol.events import make_event
@@ -93,3 +96,38 @@ async def test_causal_id_none_by_default(db):
     await events.append_event("Plain", {}, task_id=task.id)
     [event] = [e for e in await events.list_for_task(task.id) if e.type == "Plain"]
     assert event.causal_id is None
+
+
+async def test_same_process_append_wakes_waiter(db):
+    events = EventStore(db)
+    generation = events.append_generation
+    waiter = asyncio.create_task(events.wait_for_append(generation))
+    await asyncio.sleep(0)
+
+    await events.append_event("TaskStarted")
+
+    assert await asyncio.wait_for(waiter, timeout=0.25) > generation
+
+
+async def test_fast_stream_subscriber_is_filtered_and_does_not_backpressure_append(db):
+    events = EventStore(db)
+    received: list[str] = []
+
+    async def slow(event):
+        received.append(event.type)
+        await asyncio.sleep(0.01)
+
+    events.subscribe(slow, event_types={"ModelDelta"})
+    started = time.monotonic()
+    for index in range(500):
+        await events.append_event("ModelDelta", {"text": str(index)})
+    elapsed = time.monotonic() - started
+
+    # The durable append path must not wait for 500 * 10 ms of presentation
+    # work. The bounded queue may coalesce/drop intermediate stream frames.
+    assert elapsed < 2.0
+    await asyncio.sleep(0.2)
+    assert received
+    assert all(item == "ModelDelta" for item in received)
+
+    events.unsubscribe(slow)

@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from athena.execution.environment import VerificationEnvironment
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, WorkspaceSpec
 
 OPENROUTER_DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
@@ -466,9 +467,19 @@ async def _cmd_self(o: Options, service: Any) -> int:
         return 2
     try:
         root = _athena_checkout_root()
+        verification = VerificationEnvironment.from_project(root)
     except ValueError as exc:
         print(f"athena self: {exc}", file=sys.stderr)
         return 2
+
+    print("SELF PREFLIGHT")
+    print("  ✓ Athena source checkout")
+    print(f"  ✓ uv ({verification.uv})")
+    print(f"  ✓ Python ({verification.python})")
+    print(f"  ✓ .venv ({verification.environment_root})")
+    print("  ✓ ruff / mypy / pytest")
+    if os.name == "posix":
+        print("  ✓ bubblewrap")
 
     criteria = [
         "command:uv run --frozen --no-sync ruff format --check --no-cache src tests",
@@ -485,6 +496,7 @@ async def _cmd_self(o: Options, service: Any) -> int:
             "self_host": True,
             "review_before_commit": True,
             "acceptance_criteria": criteria,
+            "_verification_environment": verification.to_record(),
         },
     )
     from athena.cli.chat import _make_surface, _model_label, render_summary, stream_task

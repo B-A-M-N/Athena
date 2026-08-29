@@ -111,6 +111,9 @@ class ModelProfile:
     malformed_json_tendency: bool = False  # benefit from repair pass
     context_window: int | None = None
     output_limit: int | None = None
+    # Conservative hard-admission bound. ``None`` means this model profile
+    # cannot safely bound tokens and finite hard input budgets must refuse it.
+    token_upper_bound_per_byte: int | None = 1
 
 
 @dataclass(frozen=True)

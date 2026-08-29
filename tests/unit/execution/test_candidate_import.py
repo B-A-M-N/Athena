@@ -11,6 +11,7 @@ from athena.capabilities.execute import (
     _candidate_python_environment,
     _trusted_toolchain_paths,
 )
+from athena.execution.environment import VerificationEnvironment
 from athena.capabilities.registry import CapabilityRegistry
 from athena.policy.engine import PolicyDecision, PolicyVerdict
 from athena.protocol.capabilities import CapabilityRequest
@@ -126,6 +127,14 @@ async def test_candidate_proof_uses_execute_dispatcher_sandbox_and_uv(tmp_path):
     source = candidate / "src" / "example"
     source.mkdir(parents=True)
     (source / "__init__.py").write_text("VALUE = 'CANDIDATE'\n", encoding="utf-8")
+    project_root = Path(__file__).resolve().parents[3]
+    (candidate / "pyproject.toml").write_text(
+        (project_root / "pyproject.toml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (candidate / "uv.lock").write_text(
+        (project_root / "uv.lock").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    verification = VerificationEnvironment.from_project(str(project_root))
     workspace = WorkspaceSpec(
         id="candidate",
         root=str(candidate),
@@ -149,6 +158,7 @@ async def test_candidate_proof_uses_execute_dispatcher_sandbox_and_uv(tmp_path):
             task_id="candidate-proof",
         ),
         workspace=workspace,
+        verification_environment=verification,
     )
     toolchain = await dispatcher.dispatch(
         CapabilityRequest(
@@ -157,6 +167,7 @@ async def test_candidate_proof_uses_execute_dispatcher_sandbox_and_uv(tmp_path):
             task_id="candidate-proof",
         ),
         workspace=workspace,
+        verification_environment=verification,
     )
 
     assert imported.status.value == "ok"
@@ -164,3 +175,4 @@ async def test_candidate_proof_uses_execute_dispatcher_sandbox_and_uv(tmp_path):
     assert imported.output.splitlines()[1] == "/workspace/src/example/__init__.py"
     assert toolchain.status.value == "ok"
     assert toolchain.output.startswith("uv ")
+    assert not (candidate / ".venv").exists()

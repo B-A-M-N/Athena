@@ -102,6 +102,7 @@ class TaskManager:
         # that visibility window and fork/cross-interface snapshots remain
         # stable.
         self._finalization_events: dict[str, asyncio.Event] = {}
+        self._wakeup_callback: Any = None
 
     def add_finalize_observer(self, observer: Any) -> None:
         """Register an async ``(task, result)`` post-finalization hook."""
@@ -114,6 +115,10 @@ class TaskManager:
     def set_cancellation_manager(self, cancellations: Any) -> None:
         """Late-bind the cancellation authority (construction-order tolerant, §20)."""
         self._cancellations = cancellations
+
+    def set_wakeup_callback(self, callback: Any) -> None:
+        """Bind the local worker wakeup without making it task authority."""
+        self._wakeup_callback = callback
 
     @property
     def budgets(self) -> Any:
@@ -161,6 +166,14 @@ class TaskManager:
 
     async def enqueue(self, task_id: str) -> Task:
         await self.transition(task_id, TaskStatus.QUEUED)
+        callback = self._wakeup_callback
+        if callback is not None:
+            try:
+                outcome = callback()
+                if asyncio.iscoroutine(outcome):
+                    await outcome
+            except Exception as exc:
+                _logger.warning("worker wakeup failed after enqueue: %s", exc)
         return await self.get(task_id)
 
     async def get(self, task_id: str) -> Task:

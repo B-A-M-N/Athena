@@ -53,6 +53,7 @@ class TaskWorker:
             TaskStatus.INTERRUPTED,
         )
         self._stop = asyncio.Event()
+        self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._worker_tasks: list[asyncio.Task] | None = None
         self._consecutive_store_failures = 0
@@ -66,6 +67,7 @@ class TaskWorker:
     async def stop(self) -> None:
         """Signal the background loop to stop and await its graceful exit."""
         self._stop.set()
+        self._wake.set()
         tasks = getattr(self, "_worker_tasks", None) or ([] if self._task is None else [self._task])
         for t in tasks:
             try:
@@ -74,6 +76,10 @@ class TaskWorker:
                 t.cancel()
         self._task = None
         self._worker_tasks = None
+
+    def notify(self) -> None:
+        """Wake same-process workers after durable work is enqueued."""
+        self._wake.set()
 
     # ------------------------------------------------------------------ #
     async def run_once(self) -> TaskResult | None:
@@ -126,9 +132,13 @@ class TaskWorker:
     async def _worker_loop(self, *, worker_id: int) -> None:
         wid = f"worker-{worker_id}-{os.getpid()}"
         while not self._stop.is_set():
+            self._wake.clear()
             task_id = await self._claim(worker_id=wid)
             if task_id is None:
-                await asyncio.sleep(self._config.poll_wait_s)
+                try:
+                    await asyncio.wait_for(self._wake.wait(), self._config.poll_wait_s)
+                except TimeoutError:
+                    pass
                 continue
             current = asyncio.current_task()
             if current is not None:

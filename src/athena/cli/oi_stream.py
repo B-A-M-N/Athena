@@ -240,17 +240,14 @@ async def run_viewer(
             # frame is missed, then exit cleanly instead of looping forever.
             viewer.render()
             return 0
-        # Global tail: cursor-poll list_recent forever.
-        while True:
-            items = await service._require_events().list_recent(after_rowid=cursor)
-            for ev in items:
-                rid = getattr(ev, "_rowid", None)
-                if isinstance(rid, int):
-                    cursor = max(cursor, rid)
-                await viewer.handle_event(ev)
-            if items:
-                viewer.render()
-            await asyncio.sleep(0.15)
+        # Global tail: use the service's same-process append notification with
+        # a bounded database-poll fallback for other Athena processes.
+        async for ev in service.stream_all(after_rowid=cursor):
+            rid = getattr(ev, "_rowid", None)
+            if isinstance(rid, int):
+                cursor = max(cursor, rid)
+            await viewer.handle_event(ev)
+            viewer.render()
     finally:
         viewer.close()
 

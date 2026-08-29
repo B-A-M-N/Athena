@@ -34,7 +34,13 @@ _logger = logging.getLogger("athena.verifier")
 class _TypeVerifier(Protocol):
     """Verifier for a single verification type."""
 
-    async def verify_one(self, task: TaskSpec, spec: VerificationSpec) -> bool:
+    async def verify_one(
+        self,
+        task: TaskSpec,
+        spec: VerificationSpec,
+        *,
+        verification_environment: Any = None,
+    ) -> bool:
         """Return True if the criterion is satisfied."""
         ...
 
@@ -52,7 +58,13 @@ class _CommandVerifier:
     def __init__(self, dispatcher: Any = None) -> None:
         self._dispatcher = dispatcher
 
-    async def verify_one(self, task: TaskSpec, spec: VerificationSpec) -> bool:
+    async def verify_one(
+        self,
+        task: TaskSpec,
+        spec: VerificationSpec,
+        *,
+        verification_environment: Any = None,
+    ) -> bool:
         if not spec.command:
             return False
         if self._dispatcher is None:
@@ -75,6 +87,7 @@ class _CommandVerifier:
                 workspace=task.workspace,
                 profile=(task.metadata or {}).get("autonomy"),
                 task_policy=task.capability_policy,
+                verification_environment=verification_environment,
             )
             # An approval request cannot be resolved by a verifier.  Treat it
             # as unresolved instead of turning it into an implicit grant.
@@ -353,17 +366,31 @@ class CompositeVerifier:
         )
         self._manual = _ManualVerifier()
 
-    async def verify(self, task: TaskSpec, criteria: tuple[Criterion, ...]) -> list[bool]:
+    async def verify(
+        self,
+        task: TaskSpec,
+        criteria: tuple[Criterion, ...],
+        *,
+        verification_environment: Any = None,
+    ) -> list[bool]:
         """Return, in order, whether each criterion is satisfied."""
+        if verification_environment is None:
+            verification_environment = _task_verification_environment(task)
         async with _verification_view(
             task, enabled=self._command._dispatcher is not None
         ) as view_task:
-            return await self._verify_in_view(view_task, criteria)
+            return await self._verify_in_view(
+                view_task,
+                criteria,
+                verification_environment=verification_environment,
+            )
 
     async def _verify_in_view(
         self,
         task: TaskSpec,
         criteria: tuple[Criterion, ...],
+        *,
+        verification_environment: Any = None,
     ) -> list[bool]:
         """Evaluate a plan against the disposable workspace view."""
         results: list[bool] = []
@@ -376,7 +403,11 @@ class CompositeVerifier:
                 continue
             vtype = spec.type
             if vtype == VerificationType.COMMAND:
-                ok = await self._command.verify_one(task, spec)
+                ok = await self._command.verify_one(
+                    task,
+                    spec,
+                    verification_environment=verification_environment,
+                )
             elif vtype == VerificationType.FILE:
                 ok = await self._file.verify_one(task, spec)
             elif vtype == VerificationType.ARTIFACT_PREDICATE:
@@ -405,6 +436,20 @@ class CompositeVerifier:
                 return results
             results.append(ok)
         return results
+
+
+def _task_verification_environment(task: TaskSpec) -> Any:
+    """Rebuild a host-approved verification environment from task metadata."""
+    record = (task.metadata or {}).get("_verification_environment")
+    if not isinstance(record, dict):
+        return None
+    try:
+        from athena.execution.environment import VerificationEnvironment
+
+        return VerificationEnvironment.from_record(record)
+    except (TypeError, ValueError, OSError) as exc:
+        _logger.warning("invalid task verification environment: %s", exc)
+        return None
 
 
 async def _verification_manifest(workspace: Any) -> dict[str, str]:

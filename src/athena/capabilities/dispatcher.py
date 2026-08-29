@@ -253,6 +253,7 @@ class CapabilityDispatcher:
         task_budget: ResourceBudget | None = None,
         task_deadline: datetime | None = None,
         runtime_remaining_s: float | None = None,
+        verification_environment: Any = None,
         _generated_call_depth: int = 0,
         _generated_call_chain: tuple[str, ...] = (),
         _directives: DispatchDirectives | None = None,
@@ -730,6 +731,7 @@ class CapabilityDispatcher:
                 resource_budget=task_budget,
                 deadline=task_deadline,
                 runtime_remaining_s=runtime_remaining_s,
+                verification_environment=verification_environment,
                 autonomy=profile,
                 generated_call_depth=_generated_call_depth,
                 generated_call_chain=tuple(_generated_call_chain),
@@ -979,6 +981,7 @@ class CapabilityDispatcher:
         task_budget: ResourceBudget | None = None,
         task_deadline: datetime | None = None,
         runtime_remaining_s: float | None = None,
+        verification_environment: Any = None,
         preflight: bool = True,
         _directives_by_call_id: Mapping[str, DispatchDirectives] | None = None,
     ) -> list[CapabilityResult | SuspendedCall]:
@@ -1030,6 +1033,7 @@ class CapabilityDispatcher:
                     task_budget=task_budget,
                     task_deadline=task_deadline,
                     runtime_remaining_s=runtime_remaining_s,
+                    verification_environment=verification_environment,
                     directives=(_directives_by_call_id or {}).get(r.call_id),
                     prepared=preflight,
                 )
@@ -1052,6 +1056,7 @@ class CapabilityDispatcher:
         task_budget: ResourceBudget | None,
         task_deadline: datetime | None,
         runtime_remaining_s: float | None,
+        verification_environment: Any,
         directives: DispatchDirectives | None,
         prepared: bool,
     ):
@@ -1084,6 +1089,7 @@ class CapabilityDispatcher:
                     task_budget=task_budget,
                     task_deadline=task_deadline,
                     runtime_remaining_s=runtime_remaining_s,
+                    verification_environment=verification_environment,
                     _directives=directives,
                     _prepared=prepared,
                 )

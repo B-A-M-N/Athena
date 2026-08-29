@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from athena.context.compiler import CompiledContext, ContextCompiler
 from athena.models.registry import ProviderRegistry
+from athena.models.tokens import ModelTokenEstimator
 from athena.models.router import (
     CAP_AUDIO_INPUT,
     CAP_REASONING,
@@ -79,6 +80,7 @@ from athena.state.events import EventStore
 from athena.state.messages import MessageStore
 from athena.state.tasks import TaskStore
 
+from athena.tasks.budgets import BudgetStateUnavailable
 from athena.kernel.dispatch import DispatchResult, SuspendedCall
 from athena.kernel.lifecycle import TaskLifecycle
 from athena.kernel.termination import TerminationDecision, TerminationEvaluator
@@ -418,13 +420,22 @@ class AgentKernel:
         self._runs[task_id] = state
         begin_compute = getattr(self._budgets, "begin_compute", None)
         end_compute = getattr(self._budgets, "end_compute", None)
-        if begin_compute is not None:
-            await begin_compute(task.id)
-        await self._bootstrap(task, state)
+        compute_started = False
         try:
+            if begin_compute is not None:
+                await begin_compute(task.id)
+                compute_started = True
+            await self._bootstrap(task, state)
             return await self._loop(task, state)
+        except BudgetStateUnavailable as exc:
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.RECOVERY_REQUIRED,
+                f"budget state unavailable; recovery required: {exc}",
+            )
         finally:
-            if end_compute is not None:
+            if end_compute is not None and compute_started:
                 await end_compute(task.id)
             self._runs.pop(task_id, None)
 
@@ -667,13 +678,27 @@ class AgentKernel:
             state.request_id = request.request_id
             state.provider = selection_for_attempt.provider
             effective_policy = self._router.effective_policy(task.model_policy)
-            worst_cost = _worst_case_cost(selection_for_attempt.info, request)
+            model_profile = self._registry.model_profile_for(
+                selection_for_attempt.provider, selection_for_attempt.model
+            )
+            token_estimator = ModelTokenEstimator.from_profile(model_profile)
+            worst_cost = _worst_case_cost(
+                selection_for_attempt.info, request, estimator=token_estimator
+            )
             remaining = None
             if self._budgets is not None:
                 remaining = await self._budgets.remaining(task.id)
-                input_estimate = _estimate_input_tokens(request)
+                input_estimate = _estimate_input_tokens(request, estimator=token_estimator)
                 input_remaining = remaining.get("input_tokens")
-                if input_remaining is not None and input_estimate > input_remaining:
+                if input_remaining is not None and input_estimate is None:
+                    raise TaskBudgetExceeded(
+                        "model tokenization cannot be bounded safely under hard input budget"
+                    )
+                if (
+                    input_remaining is not None
+                    and input_estimate is not None
+                    and input_estimate > input_remaining
+                ):
                     raise TaskBudgetExceeded(
                         f"model request needs about {input_estimate} input tokens but only "
                         f"{input_remaining} remain"
@@ -692,7 +717,9 @@ class AgentKernel:
                             else min(request.max_tokens, output_remaining)
                         ),
                     )
-                    worst_cost = _worst_case_cost(selection_for_attempt.info, request)
+                    worst_cost = _worst_case_cost(
+                        selection_for_attempt.info, request, estimator=token_estimator
+                    )
             if worst_cost is None and (
                 (remaining is not None and remaining.get("cost_usd") is not None)
                 or effective_policy.max_cost_usd is not None
@@ -759,9 +786,13 @@ class AgentKernel:
             try:
                 if self._budgets is not None:
                     async with self._budgets.model_call_lease(task.id):
-                        response = await self._consume(task, state, provider, request)
+                        response = await self._consume(
+                            task, state, provider, request, estimator=token_estimator
+                        )
                 else:
-                    response = await self._consume(task, state, provider, request)
+                    response = await self._consume(
+                        task, state, provider, request, estimator=token_estimator
+                    )
                 await self._emit(
                     "ModelResponseCompleted",
                     {
@@ -777,9 +808,16 @@ class AgentKernel:
                     # Persist actual usage at the model boundary. The final
                     # TaskResult is an aggregate and BudgetTracker consumes
                     # only any execution/mutation delta during finalization.
-                    actual_cost = _actual_model_cost(selection_for_attempt.info, response, request)
+                    actual_cost = _actual_model_cost(
+                        selection_for_attempt.info,
+                        response,
+                        request,
+                        estimator=token_estimator,
+                    )
                     usage_kwargs: dict[str, Any] = {
-                        "input_tokens": _input_tokens_of(response, request),
+                        "input_tokens": _input_tokens_of(
+                            response, request, estimator=token_estimator
+                        ),
                         "output_tokens": _output_tokens_of(response),
                         "model_calls": 1,
                     }
@@ -1333,7 +1371,13 @@ class AgentKernel:
         }
 
     async def _consume(
-        self, task: TaskSpec, state: RunState, provider, request: ModelRequest
+        self,
+        task: TaskSpec,
+        state: RunState,
+        provider,
+        request: ModelRequest,
+        *,
+        estimator: ModelTokenEstimator | None = None,
     ) -> ModelResponse:
         accumulator = ModelResponseAccumulator(request)
 
@@ -1418,7 +1462,7 @@ class AgentKernel:
             provider_metadata={**usage_metadata, "normalized": normalized.to_dict()},
         )
         final = replace(final, usage=usage, metadata=response_metadata)
-        state.input_tokens += _input_tokens_of(final, request)
+        state.input_tokens += _input_tokens_of(final, request, estimator=estimator)
         state.output_tokens += _output_tokens_of(final)
         return final
 
@@ -2137,8 +2181,13 @@ class AgentKernel:
 # --------------------------------------------------------------------------- #
 # Module helpers
 # --------------------------------------------------------------------------- #
-def _input_tokens_of(response: ModelResponse, request: ModelRequest) -> int:
-    """Return real input-token count when reported; else a chars/4 estimate."""
+def _input_tokens_of(
+    response: ModelResponse,
+    request: ModelRequest,
+    *,
+    estimator: ModelTokenEstimator | None = None,
+) -> int:
+    """Return reported input tokens or a conservative fallback ledger value."""
     try:
         usage = response.usage
     except AttributeError:
@@ -2146,12 +2195,27 @@ def _input_tokens_of(response: ModelResponse, request: ModelRequest) -> int:
     count = int(getattr(usage, "input_tokens", None) or 0)
     if count > 0:
         return count
-    return sum(len(m.text() or "") for m in request.messages) // 4
+    estimate = _estimate_input_tokens(request, estimator=estimator)
+    return estimate if estimate is not None else _display_input_estimate(request)
 
 
-def _estimate_input_tokens(request: ModelRequest) -> int:
-    """Use the same conservative estimate for preflight and pricing."""
-    return max(1, (sum(len(m.text() or "") for m in request.messages) + 3) // 4)
+def _estimate_input_tokens(
+    request: ModelRequest,
+    *,
+    estimator: ModelTokenEstimator | None = None,
+) -> int | None:
+    """Return the hard-admission bound for the complete request envelope."""
+    return (estimator or ModelTokenEstimator()).upper_bound(request)
+
+
+def _display_input_estimate(request: ModelRequest) -> int:
+    """Cheap fallback for usage display when a profile declares no bound."""
+    text = (
+        (request.system or "")
+        + "\n"
+        + "\n".join(message.text() or "" for message in request.messages)
+    )
+    return max(1, (len(text) + 3) // 4)
 
 
 def _output_tokens_of(response: ModelResponse) -> int:
@@ -2169,7 +2233,13 @@ def _output_tokens_of(response: ModelResponse) -> int:
     return sum(len(getattr(b, "text", None) or "") for b in response.blocks) // 4
 
 
-def _actual_model_cost(info, response: ModelResponse, request: ModelRequest) -> Decimal | None:
+def _actual_model_cost(
+    info,
+    response: ModelResponse,
+    request: ModelRequest,
+    *,
+    estimator: ModelTokenEstimator | None = None,
+) -> Decimal | None:
     """Prefer provider cost, then declared model pricing, else unknown."""
     usage = getattr(response, "usage", None)
     reported = getattr(usage, "cost_usd", None)
@@ -2182,8 +2252,12 @@ def _actual_model_cost(info, response: ModelResponse, request: ModelRequest) -> 
     if pricing is None:
         return None
     # A zero-token response legitimately costs zero when pricing is known.
-    input_tokens = int(getattr(usage, "input_tokens", 0) or 0) or _estimate_input_tokens(request)
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0) or _estimate_input_tokens(
+        request, estimator=estimator
+    )
     output_tokens = int(getattr(usage, "output_tokens", 0) or 0) or _output_tokens_of(response)
+    if input_tokens is None:
+        return None
     if pricing.per_1m_input is None and input_tokens:
         return None
     if pricing.per_1m_output is None and output_tokens:
@@ -2194,12 +2268,17 @@ def _actual_model_cost(info, response: ModelResponse, request: ModelRequest) -> 
     ) / Decimal(1_000_000)
 
 
-def _worst_case_cost(info, request: ModelRequest) -> Decimal | None:
+def _worst_case_cost(
+    info,
+    request: ModelRequest,
+    *,
+    estimator: ModelTokenEstimator | None = None,
+) -> Decimal | None:
     """Estimate the bounded maximum cost from the actual compiled request."""
-    input_tokens = _estimate_input_tokens(request)
+    input_tokens = _estimate_input_tokens(request, estimator=estimator)
     output_tokens = request.max_tokens or getattr(info, "max_output_tokens", None) or 4096
     pricing = getattr(info, "cost", None)
-    if pricing is None:
+    if pricing is None or input_tokens is None:
         return None
     if pricing.per_1m_input is None or pricing.per_1m_output is None:
         return None
