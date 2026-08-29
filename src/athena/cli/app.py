@@ -543,7 +543,9 @@ async def _cmd_self(o: Options, service: Any) -> int:
             outcome = await service.discard_candidate(task_id)
             print(f"candidate: {outcome.get('status', 'unknown')}")
         else:
-            print("candidate retained for later review")
+            print(
+                f"candidate retained for later review; reopen with athena self --review {task_id}"
+            )
         return 0
     finally:
         async_closer = getattr(surface, "aclose", None)
@@ -575,7 +577,7 @@ async def _cmd_self_review(task_id: str, service: Any) -> int:
     elif choice == "d":
         outcome = await service.discard_candidate(task_id)
     else:
-        print("candidate retained for later review")
+        print(f"candidate retained for later review; reopen with athena self --review {task_id}")
         return 0
     print(f"candidate: {outcome.get('status', 'unknown')}")
     return 0 if outcome.get("status") in {"committed", "discarded"} else 1

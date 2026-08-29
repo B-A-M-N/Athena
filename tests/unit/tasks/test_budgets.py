@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from decimal import Decimal
+from datetime import timedelta
 
 
 from athena.protocol.tasks import ResourceBudget, TaskSpec
@@ -295,3 +296,37 @@ async def test_fresh_tracker_hydrates_every_descendant_before_root_total():
     assert remaining["output_tokens"] == 900
     assert remaining["cost_usd"] == Decimal("1.50")
     assert remaining["artifact_bytes"] == 750
+
+
+async def test_wall_time_tracks_active_compute_and_is_root_aware():
+    import asyncio
+
+    root = _task("root", budget=ResourceBudget(max_wall_time=timedelta(seconds=1)))
+    child = _task("child", parent="root", budget=ResourceBudget())
+    tracker = BudgetTracker(task_store=_TreeStore([root, child]))
+    tracker.register(root)
+    tracker.register(child)
+
+    await tracker.begin_compute("child")
+    await asyncio.sleep(0.01)
+    remaining = await tracker.remaining("child")
+    await tracker.end_compute("child")
+
+    assert (await tracker.total("child")).wall_time_s > 0
+    assert 0 < remaining["wall_time_s"] < 1
+
+
+async def test_inflight_compute_is_not_reset_by_tracker_restart():
+    root = _task("root", budget=ResourceBudget(max_wall_time=timedelta(seconds=1)))
+    store = _TreeStore([root])
+    first = BudgetTracker(task_store=store)
+    first.register(root)
+    await first.begin_compute("root")
+
+    restored = BudgetTracker(task_store=store)
+    restored.register(root)
+    total = await restored.total("root")
+    assert total.wall_time_s > 0
+    assert total.wall_time_s < 1
+
+    await first.end_compute("root")

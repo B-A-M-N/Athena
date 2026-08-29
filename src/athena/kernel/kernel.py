@@ -183,6 +183,8 @@ class RunState:
     cost: Decimal = field(default_factory=Decimal)
     request_id: str | None = None
     provider: str | None = None
+    budget_wall_time_remaining_s: float | None = None
+    budget_wall_time_checkpoint_s: float = 0.0
     tool_correction_counts: dict[str, int] = field(default_factory=dict)
 
     @property
@@ -414,10 +416,16 @@ class AgentKernel:
         task = await self._lifecycle.acquire(task_id)
         state = self._runs.get(task_id) or RunState(task)
         self._runs[task_id] = state
+        begin_compute = getattr(self._budgets, "begin_compute", None)
+        end_compute = getattr(self._budgets, "end_compute", None)
+        if begin_compute is not None:
+            await begin_compute(task.id)
         await self._bootstrap(task, state)
         try:
             return await self._loop(task, state)
         finally:
+            if end_compute is not None:
+                await end_compute(task.id)
             self._runs.pop(task_id, None)
 
     async def _bootstrap(self, task: TaskSpec, state: RunState) -> None:
@@ -475,6 +483,7 @@ class AgentKernel:
                 return await self._finalize(
                     task, state, TaskStatus.PARTIAL, "resource budget exhausted"
                 )
+            await self._refresh_runtime_budget(task, state)
             state.iterations += 1
             if self._budgets is not None:
                 # Iteration usage is checkpointed before any model/provider
@@ -2068,10 +2077,29 @@ class AgentKernel:
         if deadline is not None:
             limits.append((deadline - utcnow()).total_seconds())
         budget = getattr(task, "resource_budget", None)
-        max_wall_time = getattr(budget, "max_wall_time", None)
-        if max_wall_time is not None:
-            limits.append(max_wall_time.total_seconds() - state.elapsed_ms / 1000)
+        wall_remaining = getattr(state, "budget_wall_time_remaining_s", None)
+        if wall_remaining is not None:
+            elapsed_since_checkpoint = max(
+                0.0,
+                state.elapsed_ms / 1000 - getattr(state, "budget_wall_time_checkpoint_s", 0.0),
+            )
+            limits.append(wall_remaining - elapsed_since_checkpoint)
+        else:
+            max_wall_time = getattr(budget, "max_wall_time", None)
+            if max_wall_time is not None:
+                limits.append(max_wall_time.total_seconds() - state.elapsed_ms / 1000)
         return min(limits) if limits else None
+
+    async def _refresh_runtime_budget(self, task: TaskSpec, state: RunState) -> None:
+        """Refresh the root-aware active-compute ceiling before each turn."""
+        if self._budgets is None:
+            return
+        remaining = await self._budgets.remaining(task.id)
+        wall_remaining = remaining.get("wall_time_s")
+        state.budget_wall_time_remaining_s = (
+            float(wall_remaining) if wall_remaining is not None else None
+        )
+        state.budget_wall_time_checkpoint_s = state.elapsed_ms / 1000
 
     async def _append_response(self, task: TaskSpec, response: ModelResponse) -> None:
         if response.request_id and response.request_id in self._stored_responses:
@@ -2189,7 +2217,11 @@ def _budget_exhausted(state: RunState, budget: ResourceBudget) -> bool:
         return True
     if budget.max_cost_usd is not None and state.cost >= budget.max_cost_usd:
         return True
-    if budget.max_wall_time is not None:
+    wall_remaining = getattr(state, "budget_wall_time_remaining_s", None)
+    if wall_remaining is not None:
+        if wall_remaining <= 0:
+            return True
+    elif budget.max_wall_time is not None:
         if state.elapsed_ms >= int(budget.max_wall_time.total_seconds() * 1000):
             return True
     return False

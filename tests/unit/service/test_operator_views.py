@@ -31,6 +31,15 @@ async def test_operator_permissions_empty(service):
     assert view == {"active_grants": [], "pending": []}
 
 
+async def test_startup_health_exposes_optional_degradation_boundary(service):
+    health = service.startup_health()
+
+    assert health["status"] == "ok"
+    assert health["blocking_failures"] == []
+    assert health["checks"]
+    assert all("blocking" in check for check in health["checks"].values())
+
+
 async def test_operator_diff_empty(service):
     assert await service.operator_diff() == []
 

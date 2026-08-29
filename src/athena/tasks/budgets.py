@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from contextlib import asynccontextmanager
 from threading import Lock
+import time
 from typing import Any, Mapping
 
 from athena.protocol.messages import utcnow
@@ -96,9 +97,7 @@ def _dec(u: Any, *keys: str) -> Decimal:
 
 
 def _duration_ms(u: Usage) -> int:
-    if u.wall_time_s > 0:
-        return int(u.wall_time_s * 1000)
-    return int((utcnow() - u.started).total_seconds() * 1000)
+    return int(u.wall_time_s * 1000)
 
 
 @dataclass(frozen=True)
@@ -129,7 +128,9 @@ def exceeded_by_budget(budget: ResourceBudget | None, u: Usage) -> bool:
 
 
 def _elapsed_s(u: Usage) -> float:
-    return u.wall_time_s if u.wall_time_s > 0 else (utcnow() - u.started).total_seconds()
+    # This is active compute time, not time spent waiting for an operator or
+    # with the service stopped.
+    return u.wall_time_s
 
 
 class BudgetTracker:
@@ -164,6 +165,8 @@ class BudgetTracker:
         self._model_limits: dict[str, int] = {}
         self._execution_semaphores: dict[str, Any] = {}
         self._execution_limits: dict[str, int] = {}
+        # task_id -> (process-local monotonic checkpoint, durable UTC marker)
+        self._active_compute: dict[str, tuple[float, datetime]] = {}
         import asyncio
 
         self._artifact_lock = asyncio.Lock()
@@ -215,6 +218,20 @@ class BudgetTracker:
         with self._lock:
             self._ledger.setdefault(parent_id, Usage())
             self._ledger[parent_id].children += 1
+
+    async def begin_compute(self, task_id: str) -> None:
+        """Start a durable active-compute interval for a running task."""
+        await self._hydrate_usage(task_id)
+        with self._lock:
+            self._active_compute.setdefault(task_id, (time.monotonic(), utcnow()))
+        await self._persist_usage(task_id)
+
+    async def end_compute(self, task_id: str) -> None:
+        """Checkpoint and close the task's active-compute interval."""
+        await self._persist_usage(task_id)
+        with self._lock:
+            self._active_compute.pop(task_id, None)
+        await self._persist_usage(task_id)
 
     def current(self, task_id: str) -> UsageSummary:
         with self._lock:
@@ -313,6 +330,7 @@ class BudgetTracker:
 
     async def total(self, task_id: str) -> Usage:
         await self._hydrate_usage(task_id)
+        self._checkpoint_active(task_id)
         own = self.own(task_id)
         agg = Usage()
         agg.add(own)
@@ -322,6 +340,7 @@ class BudgetTracker:
             # Restore every descendant before reading its own ledger, or a
             # root query immediately after restart silently forgets child use.
             await self._hydrate_usage(child)
+            self._checkpoint_active(child)
             agg.add(self.own(child))
         agg.children = len(children)
         return agg
@@ -335,6 +354,7 @@ class BudgetTracker:
             "input_tokens": None,
             "output_tokens": None,
             "cost_usd": None,
+            "wall_time_s": None,
             "children": None,
             "artifact_bytes": None,
         }
@@ -350,6 +370,11 @@ class BudgetTracker:
                 "cost_usd": _cap_remaining_dec(
                     budget.max_cost_usd,
                     total.cost + model_reserved,
+                ),
+                "wall_time_s": (
+                    None
+                    if budget.max_wall_time is None
+                    else max(0.0, budget.max_wall_time.total_seconds() - total.wall_time_s)
                 ),
                 "children": _cap_remaining(budget.max_children, total.children),
                 "artifact_bytes": _cap_remaining(
@@ -628,6 +653,12 @@ class BudgetTracker:
         reserved_artifact = _int(checkpoint, "reserved_artifact_bytes")
         reserved_model = _dec(checkpoint, "reserved_model_cost")
         outstanding_model = _dec(checkpoint, "outstanding_model_cost")
+        active_started = _parse_datetime(checkpoint.get("active_compute_started_at"))
+        if active_started is not None:
+            # A hard stop may interrupt an active interval between checkpoints.
+            # Count it conservatively through recovery instead of resetting the
+            # wall-time budget.
+            restored.wall_time_s += max(0.0, (utcnow() - active_started).total_seconds())
         with self._lock:
             current = self._ledger.setdefault(task_id, Usage())
             if _all_zero(current):
@@ -648,15 +679,12 @@ class BudgetTracker:
     async def _persist_usage(self, task_id: str) -> None:
         store = self._store
         persist = getattr(store, "persist_budget_usage", None)
+        self._checkpoint_active(task_id)
+        with self._lock:
+            active = self._active_compute.get(task_id)
+            active_started = active[1].isoformat() if active is not None else None
         if persist is None:
             return
-        with self._lock:
-            entry = self._ledger.get(task_id)
-            if entry is not None:
-                entry.wall_time_s = max(
-                    entry.wall_time_s,
-                    (utcnow() - entry.started).total_seconds(),
-                )
         current = self.own(task_id)
         await persist(
             task_id,
@@ -671,6 +699,7 @@ class BudgetTracker:
                 "children": current.children,
                 "artifact_bytes": current.artifact_bytes,
                 "wall_time_s": current.wall_time_s,
+                "active_compute_started_at": active_started,
                 "reserved_artifact_bytes": self._artifact_reservations.get(task_id, 0),
                 "reserved_model_cost": str(
                     self._model_cost_reservations.get(task_id, Decimal("0"))
@@ -678,6 +707,18 @@ class BudgetTracker:
                 "outstanding_model_cost": str(self._model_cost_by_task.get(task_id, Decimal("0"))),
             },
         )
+
+    def _checkpoint_active(self, task_id: str) -> None:
+        """Move the current process-local active interval into the ledger."""
+        with self._lock:
+            active = self._active_compute.get(task_id)
+            if active is None:
+                return
+            started_monotonic, _started_utc = active
+            now_monotonic = time.monotonic()
+            entry = self._ledger.setdefault(task_id, Usage())
+            entry.wall_time_s += max(0.0, now_monotonic - started_monotonic)
+            self._active_compute[task_id] = (now_monotonic, utcnow())
 
 
 def _deserialize_budget(data: Any) -> ResourceBudget:
@@ -739,6 +780,18 @@ def _timedelta_or_none(val: Any):
         return timedelta(seconds=float(val))
     except (TypeError, ValueError):
         return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=utcnow().tzinfo)
+    return parsed
 
 
 def _cap_remaining(cap: int | None, used: int) -> int | None:

@@ -142,7 +142,11 @@ class AthenaService:
         self._recovery_status = "not_started"
         self._recovery_summary: dict[str, int] = {}
         self._recovery_error: str | None = None
-        self._startup_health: dict[str, Any] = {"status": "not_started", "checks": {}}
+        self._startup_health: dict[str, Any] = {
+            "status": "not_started",
+            "checks": {},
+            "blocking_failures": [],
+        }
         cfg_ws = config.workspace_root if config is not None else None
         self._default_workspace: WorkspaceSpec = WorkspaceSpec(
             id="root",
@@ -248,7 +252,11 @@ class AthenaService:
         try:
             await self._start_impl()
         except BaseException:
-            self._startup_health = {**self._startup_health, "status": "failed"}
+            self._startup_health = {
+                **self._startup_health,
+                "status": "failed",
+                "blocking_failures": ["service_startup"],
+            }
             # Startup is a transaction over resources acquired in order. The
             # service must not leak a DB, worker, poller, scheduler, client, or
             # runtime when a later stage fails.
@@ -266,7 +274,7 @@ class AthenaService:
         """
 
         cfg = self.config
-        self._startup_health = {"status": "starting", "checks": {}}
+        self._startup_health = {"status": "starting", "checks": {}, "blocking_failures": []}
         self._recovery_status = "starting"
         self._recovery_summary = {}
         self._recovery_error = None
@@ -371,11 +379,15 @@ class AthenaService:
         self._capability_health = CapabilityHealth(store=self._capability_health_store)
         try:
             await self._capability_health.load(await self._capability_health_store.list())
-            self._startup_health["checks"]["capability_health"] = {"status": "ok"}
+            self._startup_health["checks"]["capability_health"] = {
+                "status": "ok",
+                "blocking": False,
+            }
         except Exception as exc:
             _logger.warning("capability health rehydration failed: %s", exc)
             self._startup_health["checks"]["capability_health"] = {
                 "status": "degraded",
+                "blocking": False,
                 "error": str(exc),
             }
 
@@ -393,6 +405,7 @@ class AthenaService:
             self._skill_discovery_status = "ok"
             self._startup_health["checks"]["skills"] = {
                 "status": "ok",
+                "blocking": False,
                 "discovered": len(discovered),
             }
         except Exception as exc:
@@ -401,6 +414,7 @@ class AthenaService:
             self._skill_discovery_status = f"failed: {exc}"
             self._startup_health["checks"]["skills"] = {
                 "status": "degraded",
+                "blocking": False,
                 "error": str(exc),
             }
 
@@ -773,12 +787,14 @@ class AthenaService:
                 activated = await self._pack_manager.rehydrate_enabled()
                 self._startup_health["checks"]["enabled_packs"] = {
                     "status": "ok",
+                    "blocking": False,
                     "activated": activated,
                 }
             except Exception as exc:
                 _logger.warning("enabled capability-pack rehydration failed: %s", exc)
                 self._startup_health["checks"]["enabled_packs"] = {
                     "status": "degraded",
+                    "blocking": False,
                     "error": str(exc),
                 }
 
@@ -791,6 +807,11 @@ class AthenaService:
             if isinstance(value, dict)
         )
         self._startup_health["status"] = "degraded" if degraded else "ok"
+        self._startup_health["blocking_failures"] = [
+            name
+            for name, value in self._startup_health["checks"].items()
+            if isinstance(value, dict) and value.get("blocking") and value.get("status") != "ok"
+        ]
 
     async def stop(self) -> None:
         if not self._started and self._db is None:
@@ -940,13 +961,15 @@ class AthenaService:
 
     def startup_health(self) -> dict[str, Any]:
         """Return startup checks for readiness and operator diagnostics."""
+        checks = {
+            str(name): dict(value)
+            for name, value in (self._startup_health.get("checks") or {}).items()
+            if isinstance(value, dict)
+        }
         return {
             "status": self._startup_health.get("status", "not_started"),
-            "checks": {
-                str(name): dict(value)
-                for name, value in (self._startup_health.get("checks") or {}).items()
-                if isinstance(value, dict)
-            },
+            "checks": checks,
+            "blocking_failures": list(self._startup_health.get("blocking_failures") or ()),
         }
 
     async def _recover_approved_continuations(
