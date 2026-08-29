@@ -248,6 +248,7 @@ async def run_viewer(
                 cursor = max(cursor, rid)
             await viewer.handle_event(ev)
             viewer.render()
+        return 0
     finally:
         viewer.close()
 
