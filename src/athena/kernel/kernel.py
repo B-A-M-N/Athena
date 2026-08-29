@@ -1594,9 +1594,9 @@ class AgentKernel:
                 workspace=shim._workspace,
                 profile=shim._profile,
                 task_policy=task.capability_policy,
-                task_budget=task.resource_budget,
-                task_deadline=task.deadline,
-                runtime_remaining_s=self._remaining_runtime_seconds(task, state),
+                task_budget=getattr(task, "resource_budget", None),
+                task_deadline=getattr(task, "deadline", None),
+                runtime_remaining_s=AgentKernel._remaining_runtime_seconds(task, state),
                 _directives_by_call_id={
                     suspended_call.call_id: suspended_call.directives
                     for suspended_call in suspended
@@ -2064,12 +2064,13 @@ class AgentKernel:
     @staticmethod
     def _remaining_runtime_seconds(task: TaskSpec, state: RunState) -> float | None:
         limits: list[float] = []
-        if task.deadline is not None:
-            limits.append((task.deadline - utcnow()).total_seconds())
-        if task.resource_budget.max_wall_time is not None:
-            limits.append(
-                task.resource_budget.max_wall_time.total_seconds() - state.elapsed_ms / 1000
-            )
+        deadline = getattr(task, "deadline", None)
+        if deadline is not None:
+            limits.append((deadline - utcnow()).total_seconds())
+        budget = getattr(task, "resource_budget", None)
+        max_wall_time = getattr(budget, "max_wall_time", None)
+        if max_wall_time is not None:
+            limits.append(max_wall_time.total_seconds() - state.elapsed_ms / 1000)
         return min(limits) if limits else None
 
     async def _append_response(self, task: TaskSpec, response: ModelResponse) -> None:
