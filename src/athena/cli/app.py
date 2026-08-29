@@ -28,6 +28,7 @@ import shutil
 import sys
 import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, WorkspaceSpec
@@ -183,6 +184,33 @@ def _doctor_display(o: "Options", config: Any) -> int:
     return 0
 
 
+def _doctor_startup(o: "Options", config: Any) -> int:
+    """Start the service briefly and report readiness-owned checks."""
+    try:
+        service = build_service(config)
+    except ServiceUnavailable as exc:
+        print(f"startup health: failed ({exc})")
+        return 1
+
+    async def probe() -> dict[str, Any]:
+        try:
+            await service.start()
+            return service.startup_health()
+        finally:
+            await service.stop()
+
+    try:
+        health = asyncio.run(probe())
+    except Exception as exc:  # pragma: no cover - environment-specific startup failure
+        print(f"startup health: failed ({exc})")
+        return 1
+    print(f"startup health: {health.get('status', 'unknown')}")
+    for name, check in (health.get("checks") or {}).items():
+        status = check.get("status", "unknown") if isinstance(check, dict) else "unknown"
+        print(f"  {name}: {status}")
+    return 0 if health.get("status") == "ok" else 1
+
+
 class ServiceUnavailable(Exception):
     pass
 
@@ -256,8 +284,14 @@ def dispatch(o: Options) -> int:
         o.reduced_motion = bool(getattr(config, "reduced_motion", False))
     _register_config_mascots(config)
     if o.command == "doctor":
-        if o.args and o.args[0] != "display":
-            print("athena doctor: supported target is 'display'", file=sys.stderr)
+        target = o.args[0] if o.args else "startup"
+        if target == "startup":
+            return _doctor_startup(o, config)
+        if target != "display":
+            print(
+                "athena doctor: supported targets are 'startup' and 'display'",
+                file=sys.stderr,
+            )
             return 2
         return _doctor_display(o, config)
     if o.command == "native":
@@ -306,6 +340,8 @@ async def _run(o: Options, service: Any) -> int:
         return await repl.run_forever()
     if cmd == "run":
         return await _cmd_run(o, service)
+    if cmd == "self":
+        return await _cmd_self(o, service)
     if cmd == "inspect":
         from athena.cli.inspect import run_inspect
 
@@ -389,6 +425,114 @@ async def _cmd_run(o: Options, service: Any) -> int:
             return 0
         # No result available: expose status anyway.
         surface.render_notice(f"[task {task_id} has no result yet]", status="PENDING")
+        return 0
+    finally:
+        async_closer = getattr(surface, "aclose", None)
+        if callable(async_closer):
+            await async_closer()
+        elif callable(closer):
+            closer()
+
+
+def _athena_checkout_root() -> str:
+    """Resolve and validate the checkout targeted by ``athena self``."""
+    root = None
+    for candidate in (Path.cwd(), *Path.cwd().parents):
+        if (candidate / ".git").exists():
+            root = candidate.resolve()
+            break
+    if root is None:
+        raise ValueError("athena self must run inside the Athena Git checkout")
+    if not (root / "src" / "athena" / "__init__.py").is_file():
+        raise ValueError("current Git checkout is not the Athena source tree")
+    try:
+        import tomllib
+
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError, KeyError) as exc:
+        raise ValueError("Athena pyproject.toml could not be validated") from exc
+    if project.get("project", {}).get("name") != "athena-agent":
+        raise ValueError("current checkout does not identify as athena-agent")
+    return str(root)
+
+
+async def _cmd_self(o: Options, service: Any) -> int:
+    objective = o.args[0] if o.args else None
+    if not objective:
+        print("athena self: missing objective", file=sys.stderr)
+        return 2
+    try:
+        root = _athena_checkout_root()
+    except ValueError as exc:
+        print(f"athena self: {exc}", file=sys.stderr)
+        return 2
+
+    criteria = [
+        "command:uv run --frozen ruff format --check src tests",
+        "command:uv run --frozen ruff check src tests",
+        "command:uv run --frozen mypy src",
+        "command:uv run --frozen pytest -q",
+        "command:uv run --frozen python scripts/architecture-lint",
+    ]
+    request = AgentRequest(
+        prompt=objective,
+        autonomy=AutonomyLevel.CODING,
+        workspace=WorkspaceSpec(id="athena-self", root=root),
+        metadata={
+            "self_host": True,
+            "review_before_commit": True,
+            "acceptance_criteria": criteria,
+        },
+    )
+    from athena.cli.chat import _make_surface, _model_label, render_summary, stream_task
+
+    surface = _make_surface(
+        details=o.details,
+        mascot=o.mascot,
+        display=o.display,
+        model_label=_model_label(getattr(service, "config", None)),
+        animations=True if o.animations is None else o.animations,
+        reduced_motion=o.reduced_motion,
+    )
+    opener = getattr(surface, "open", None)
+    closer = getattr(surface, "close", None)
+    if callable(opener):
+        opener()
+    try:
+        surface.render_user_message(objective)
+        task = await service.submit(request, wait=False)
+        task_id = getattr(task, "id", task)
+        result = await stream_task(service, task_id, autonomy=AutonomyLevel.CODING, surface=surface)
+        if result is not None:
+            extra = render_summary(result)
+            if extra:
+                surface.render_notice(extra)
+            status = getattr(result, "status", None)
+            status_str = getattr(status, "value", str(status))
+            surface.render_result(getattr(result, "summary", "") or "", status=status_str)
+
+        candidate = await service.operator_candidate(task_id)
+        if candidate is None:
+            surface.render_notice("no retained candidate is available", status="NOT_READY")
+            return 0
+        print(
+            "\nCandidate ready for review: "
+            f"{len(candidate['changed_resources'])} changed resource(s), "
+            f"certificate {candidate.get('certificate_hash', 'missing')}"
+        )
+        print("[a] Apply  [d] Discard  [l] Later")
+        try:
+            choice = input("choice> ").strip().lower()[:1]
+        except EOFError:
+            choice = "l"
+        if choice == "a":
+            outcome = await service.apply_candidate(task_id)
+            print(f"candidate: {outcome.get('status', 'unknown')}")
+        elif choice == "d":
+            outcome = await service.discard_candidate(task_id)
+            print(f"candidate: {outcome.get('status', 'unknown')}")
+        else:
+            print("candidate retained for later review")
         return 0
     finally:
         async_closer = getattr(surface, "aclose", None)
@@ -530,15 +674,25 @@ def _click_cli(click: Any):
             details=bool(b.get("details")),
         )
 
-    @cli.group()
-    def doctor():
+    @cli.group(invoke_without_command=True)
+    @click.pass_context
+    def doctor(ctx):
         """Diagnose local runtime and display capabilities."""
+
+        if ctx.invoked_subcommand is None:
+            sys.exit(dispatch(base_options(ctx, "doctor", ["startup"])))
 
     @doctor.command("display")
     @click.pass_context
     def doctor_display(ctx):
         """Check terminal geometry, Pillow, and Kitty transport support."""
         sys.exit(dispatch(base_options(ctx, "doctor", ["display"])))
+
+    @doctor.command("startup")
+    @click.pass_context
+    def doctor_startup(ctx):
+        """Check service startup health and readiness dependencies."""
+        sys.exit(dispatch(base_options(ctx, "doctor", ["startup"])))
 
     @cli.command()
     @click.argument("objective", required=False)
@@ -576,6 +730,13 @@ def _click_cli(click: Any):
         o.details = bool(kw.get("r_details")) or o.details
         o.criteria = kw.get("r_criteria") or o.criteria
         sys.exit(dispatch(o))
+
+    @cli.command()
+    @click.argument("objective")
+    @click.pass_context
+    def self(ctx, objective):
+        """Improve this Athena checkout in a verified candidate workspace."""
+        sys.exit(dispatch(base_options(ctx, "self", [objective])))
 
     @cli.command()
     @click.argument("task_id")
@@ -673,6 +834,7 @@ def _arg_parse(argv: list[str]) -> Options:
 
     for name, help_, pos in (
         ("run", "Submit a one-shot objective.", "objective"),
+        ("self", "Self-host a verified improvement to Athena.", "objective"),
         ("inspect", "Inspect a task.", "task_id"),
         ("resume", "Resume a session.", "session_id"),
         ("approve", "Approve/deny a pending approval.", "approval_id"),
@@ -689,9 +851,9 @@ def _arg_parse(argv: list[str]) -> Options:
     sp.add_argument("objective", nargs="?", default=None)
     sp = sub.add_parser("sessions", help="List sessions.")
     globals_(sp)
-    sp = sub.add_parser("doctor", help="Diagnose local runtime/display support.")
+    sp = sub.add_parser("doctor", help="Diagnose service startup and display support.")
     globals_(sp)
-    sp.add_argument("target", nargs="?", choices=["display"], default="display")
+    sp.add_argument("target", nargs="?", choices=["startup", "display"], default="startup")
     sp = sub.add_parser("oi-stream", help="Stream the live OI projection.")
     globals_(sp)
     sp.add_argument("--task", dest="task_id", default=None)
@@ -720,7 +882,7 @@ def _arg_parse(argv: list[str]) -> Options:
         o.args = [ns.target]
     if command == "oi-stream":
         o.args = [ns.task_id] if ns.task_id else []
-    elif command == "run":
+    elif command in ("run", "self"):
         o.args = [ns.objective]
     elif command in ("inspect", "resume", "cancel", "approve"):
         o.args = [
@@ -735,7 +897,7 @@ def _arg_parse(argv: list[str]) -> Options:
     elif command == "chat" and getattr(ns, "objective", None):
         o.command = "run"
         o.args = [ns.objective]
-    if (o.command in ("run", "inspect", "resume", "approve", "cancel")) and (
+    if (o.command in ("run", "self", "inspect", "resume", "approve", "cancel")) and (
         not o.args or not o.args[0]
     ):
         print(f"athena {o.command}: missing required argument", file=sys.stderr)

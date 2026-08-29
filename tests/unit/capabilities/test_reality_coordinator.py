@@ -9,6 +9,7 @@ their candidate.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from athena.capabilities.dispatcher import CapabilityDispatcher
@@ -288,6 +289,70 @@ async def test_file_criterion_reads_candidate_not_base(tmp_path):
     assert (project / "new_file.py").exists()
 
 
+async def test_self_host_retains_verified_candidate_until_operator_apply(tmp_path):
+    project = _project(tmp_path)
+    ws = _workspace(project)
+    gate, engine, dispatcher = _gate_engine(tmp_path)
+    events = []
+
+    async def sink(event):
+        events.append(event)
+
+    class _PassingVerifier:
+        async def verify_against(self, task, criteria, workspace):
+            return [{"id": criterion.id, "passed": True} for criterion in criteria]
+
+    coordinator = RealityCoordinator(
+        shadow_engine=engine,
+        reality_gate=gate,
+        candidate_verifier=_PassingVerifier(),
+        event_sink=sink,
+    )
+    await gate.route(
+        __import__(
+            "athena.protocol.capabilities", fromlist=["CapabilityRequest"]
+        ).CapabilityRequest(
+            capability_id="fs",
+            arguments={"operation": "write", "path": "README.txt", "content": "self-hosted\n"},
+            task_id="task-lifecycle",
+            call_id="write-self",
+        ),
+        ws,
+        {EffectClass.WRITE_LOCAL},
+        FilesystemCapability().descriptor,
+    )
+    branch = gate.active_branch("task-lifecycle")
+    assert branch is not None
+    criteria = [
+        Criterion(
+            id="readme_patched",
+            description="README contains self-hosted",
+            verification=VerificationSpec(
+                type=VerificationType.FILE,
+                path="README.txt",
+                predicate="contains:self-hosted",
+            ),
+        )
+    ]
+    spec = replace(
+        _spec(ws, criteria), metadata={"autonomy": "coding", "review_before_commit": True}
+    )
+    (Path(branch.shadow_workspace.root) / "README.txt").write_text(
+        "self-hosted\n", encoding="utf-8"
+    )
+
+    result = await coordinator.prepare_completion(
+        spec,
+        TerminationDecision(terminal=True, status=TaskStatus.COMPLETE, reason="ready"),
+    )
+
+    assert result.committed is False
+    assert result.branch_id == branch.id
+    assert gate.active_branch("task-lifecycle") is branch
+    assert (project / "README.txt").read_text(encoding="utf-8") == "base\n"
+    assert any(event.type == "CandidateReadyForReview" for event in events)
+
+
 async def test_unverified_candidate_yields_partial_not_complete(tmp_path):
     project = _project(tmp_path)
     ws = _workspace(project)
@@ -428,3 +493,25 @@ def test_coding_tasks_default_to_speculative_workspace():
     )
     assert spec.workspace is not None
     assert spec.workspace.mutation_mode is MutationMode.SPECULATIVE
+
+
+def test_self_host_forces_candidate_boundary_even_for_direct_request():
+    service = AthenaService.in_memory()
+    spec = service._build_task_spec(
+        AgentRequest(
+            prompt="improve Athena",
+            autonomy=AutonomyLevel.SUPERVISED,
+            workspace=WorkspaceSpec(
+                id="repo",
+                root="/tmp/repo",
+                mutation_mode=MutationMode.DIRECT,
+            ),
+            metadata={"self_host": True, "mutation_mode": "direct"},
+        ),
+        "session-self",
+    )
+    assert spec.metadata["autonomy"] == AutonomyLevel.CODING.value
+    assert spec.metadata["review_before_commit"] is True
+    assert spec.workspace is not None
+    assert spec.workspace.mutation_mode is MutationMode.SPECULATIVE
+    assert spec.workspace.network_policy.value == "deny"

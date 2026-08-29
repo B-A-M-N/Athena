@@ -8,12 +8,12 @@ does not own task state and it never lets Buddy overwrite scene text.
 from __future__ import annotations
 
 import textwrap
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 from athena.cli.activity import VisualActionKind
 from athena.cli.projection import OperationNode, ProjectionState
 from athena.cli.render.ansi import cell_width, fit_cells
-from athena.cli.scene import OIScene
+from athena.cli.scene import OIScene, TreeNode, tree_rows
 from athena.cli.terminal import sanitize_terminal_text
 
 
@@ -55,6 +55,49 @@ def _wrap(value: object, width: int) -> list[str]:
             or [""]
         )
     return result or [""]
+
+
+def format_progress(value: object, width: int) -> str:
+    """Format determinate progress as a dense, width-safe instrument trace."""
+    width = max(int(width), 1)
+    try:
+        ratio = min(max(float(str(value)), 0.0), 1.0)
+        if ratio != ratio:  # NaN guard
+            ratio = 0.0
+    except (TypeError, ValueError, OverflowError):
+        ratio = 0.0
+    if width < 4:
+        return fit_cells("█", width)
+    percent = int(ratio * 100)
+    suffix = f" {percent}%"
+    bar_width = max(width - cell_width(suffix) - 1, 1)
+    filled = min(bar_width, int(bar_width * ratio + 0.5))
+    return fit_cells("█" * filled + "▒" * (bar_width - filled) + suffix, width)
+
+
+def _diagnostic_lines(diagnostic: Mapping[str, object]) -> list[str]:
+    """Render only diagnostic fields that the canonical payload supplied."""
+    lines: list[str] = []
+    for key in ("expected", "actual", "path", "file", "location", "line", "severity", "message"):
+        value = diagnostic.get(key)
+        if value is None or value == "":
+            continue
+        output_key = "path" if key in {"file", "location"} else key
+        if output_key == "path" and any(line.startswith("path:") for line in lines):
+            continue
+        lines.append(f"{output_key}: {value}")
+    if not lines:
+        detail = diagnostic.get("detail") or diagnostic.get("error")
+        if detail:
+            lines.append(f"message: {detail}")
+    return lines
+
+
+def _tree_lines(nodes: Sequence[TreeNode]) -> list[str]:
+    rows: list[str] = []
+    for prefix, node in tree_rows(tuple(nodes)):
+        rows.append(f"{prefix}{_entity_marker(node.status)} {node.label}")
+    return rows
 
 
 class _CellCanvas:
@@ -188,48 +231,47 @@ def _action_lines(
         VisualActionKind.CODE: f"CODE // {label}",
         VisualActionKind.TEST: f"TESTING // {label}",
         VisualActionKind.VERIFY: f"VERIFYING // {label}",
-        VisualActionKind.FAILURE: "RESULT // MISMATCH DETECTED",
+        VisualActionKind.FAILURE: "> RESULT: MISMATCH DETECTED",
         VisualActionKind.SEARCH: "SEARCHING // SYMBOL GRAPH",
         VisualActionKind.APPROVAL: "APPROVAL // OPERATION SCOPE",
         VisualActionKind.RECOVER: "RECOVERING // RETAINED EVIDENCE",
         VisualActionKind.GENERATE: "GENERATING // CAPABILITY",
     }
-    canvas.put(0, 0, titles[scene.mode])
+    model_label = scene.model_request_label
+    canvas.put(0, 0, f"> MODEL REQUEST · {model_label}")
+    canvas.put(
+        1,
+        0,
+        "> MODEL REQUEST ACTIVE" if scene.model_request_status == "active" else "> IDLE",
+    )
+    canvas.put(2, 0, titles[scene.mode])
     if scene.mode is VisualActionKind.TEST and operation is not None:
         canvas.put(
-            1,
+            3,
             0,
             f"ACTIVE OPERATION  {operation.label}  {operation.state.upper()}",
         )
-    canvas.put(0, max(width // 2, 1), f"{state.status} · {scene.mode.value.upper()}")
+    canvas.put(2, max(width // 2, 1), f"{state.status} · {scene.mode.value.upper()}")
 
     if scene.mode is VisualActionKind.CODE and scene.code_view is not None:
         view = scene.code_view
-        canvas.put(1, 0, f"{view.language}  {view.mutation_state.upper() or 'PROPOSED'}")
+        canvas.put(3, 0, f"{view.language}  {view.mutation_state.upper() or 'PROPOSED'}")
         source = view.diff_hunks or tuple(view.lines)
-        available = max(height - 5, 1)
-        for row, line in enumerate(source[:available], 2):
+        available = max(height - 7, 1)
+        for row, line in enumerate(source[:available], 4):
             marker = "" if line.startswith(("+", "-", "@")) else " "
             canvas.put(row, 0, f"{marker}{row - 1:>4} {line}")
         if view.preview_truncated:
-            canvas.put(min(height - 2, available + 2), 0, "… preview bounded for display")
+            canvas.put(min(height - 2, available + 4), 0, "… preview bounded for display")
     elif scene.mode is VisualActionKind.FAILURE:
-        row = 2
+        row = 4
         for diagnostic in scene.diagnostics[: max(height - 4, 1)]:
-            message = (
-                diagnostic.get("message")
-                or diagnostic.get("detail")
-                or diagnostic.get("error")
-                or str(diagnostic)
-            )
-            location = (
-                diagnostic.get("path") or diagnostic.get("file") or diagnostic.get("location") or ""
-            )
-            canvas.put(row, 0, f"! {location} {message}".strip())
-            row += 1
+            for line in _diagnostic_lines(diagnostic):
+                canvas.put(row, 0, line)
+                row += 1
     elif scene.mode is VisualActionKind.VERIFY:
         checks = scene.verification_checks
-        for row, check in enumerate(checks[: max(height - 4, 1)], 2):
+        for row, check in enumerate(checks[: max(height - 6, 1)], 4):
             status = str(check.get("status") or "running").casefold()
             glyph = (
                 "✓"
@@ -241,53 +283,52 @@ def _action_lines(
             label = check.get("criterion") or check.get("check_id") or "check"
             canvas.put(row, 0, f"{glyph} {label}  {status}")
         if not checks:
-            canvas.put(2, 0, "● waiting for verification checks")
+            canvas.put(4, 0, "● waiting for verification checks")
     elif scene.mode is VisualActionKind.TEST:
-        canvas.put(2, 0, "· impacted tests")
+        canvas.put(4, 0, "· impacted tests")
         progress = scene.progress
         if progress.get("determinate") and progress.get("value") is not None:
-            total_cells = max(width - 4, 8)
-            filled = int(total_cells * min(max(float(progress["value"]), 0.0), 1.0))
-            canvas.put(3, 0, "[" + "█" * filled + "░" * (total_cells - filled) + "]")
-            canvas.put(4, 0, str(progress.get("label") or ""))
+            canvas.put(5, 0, format_progress(progress["value"], width))
+            if progress.get("label"):
+                canvas.put(6, 0, str(progress["label"]))
         else:
-            canvas.put(3, 0, str(progress.get("label") or "● running tests"))
+            canvas.put(5, 0, str(progress.get("label") or "● running tests"))
     elif scene.mode is VisualActionKind.SEARCH:
-        for row, entity in enumerate(scene.entities[: max(height - 3, 1)], 2):
+        for row, entity in enumerate(scene.entities[: max(height - 5, 1)], 4):
             canvas.put(row, 0, f"· {entity.label}")
     elif scene.mode is VisualActionKind.APPROVAL:
         approval = state.pending_approval or {}
         # Keep the operator-facing sentence readable in both the ANSI and
         # retained renderers.  The scene title already carries the all-caps
         # machine label; this line is the actionable human message.
-        canvas.put(2, 0, "Approval required")
+        canvas.put(4, 0, "Approval required")
         label = operation.label if operation else approval.get("capability_id") or "capability"
-        canvas.put(3, 0, f"? {label}  PAUSED")
+        canvas.put(5, 0, f"? {label}  PAUSED")
         target = (
             operation.target if operation else approval.get("target") or approval.get("path") or ""
         )
         if target:
-            canvas.put(4, 0, f"target  {target}")
+            canvas.put(6, 0, f"target  {target}")
         reason = (
             approval.get("reason")
             or approval.get("policy_reason")
             or (operation.detail if operation else "")
         )
         if reason:
-            canvas.put(5, 0, f"reason  {reason}")
+            canvas.put(7, 0, f"reason  {reason}")
         scopes = [str(scope) for scope in approval.get("scopes") or ()]
         canvas.put(
-            6,
+            8,
             0,
             f"keys  {' '.join(f'{i}:{scope}' for i, scope in enumerate(scopes, 1)) or '1:allow'} d:deny",
         )
     elif scene.mode is VisualActionKind.RECOVER:
-        canvas.put(2, 0, state.status_message)
-        canvas.put(3, 0, "· no speculative evidence is promoted during recovery")
+        canvas.put(4, 0, state.status_message)
+        canvas.put(5, 0, "· no speculative evidence is promoted during recovery")
     elif scene.mode is VisualActionKind.GENERATE:
-        canvas.put(2, 0, "· constructing a bounded generated capability")
+        canvas.put(4, 0, "· constructing a bounded generated capability")
         if operation:
-            canvas.put(3, 0, f"{operation.label}  {operation.state.upper()}")
+            canvas.put(5, 0, f"{operation.label}  {operation.state.upper()}")
 
     recent_items = list(state.recent)
     if recent_items and height >= 3:
@@ -346,40 +387,46 @@ def render_scene_lines(
         return action
     canvas = _CellCanvas(width, height)
     split = max(width // 2, 18)
-    canvas.put(0, 0, "WORKSPACE MAP")
-    if split < width:
-        canvas.put(0, split, "RUNTIME GRAPH")
-
-    resources = [
-        entity for entity in scene.entities if entity.kind in {"resource", "research", "artifact"}
-    ]
-    tree = tuple(f"{_entity_marker(entity.status)} {entity.label}" for entity in resources[:8]) or (
-        "· no workspace resources observed",
+    canvas.put(0, 0, f"> MODEL REQUEST · {scene.model_request_label}")
+    canvas.put(
+        1, 0, "> MODEL REQUEST ACTIVE" if scene.model_request_status == "active" else "> IDLE"
     )
-    for row, line in enumerate(tree, 1):
-        canvas.put(row, 0, line)
+    canvas.put(2, 0, "WORKSPACE MAP")
+    if split < width:
+        canvas.put(2, split, "RUNTIME TREE")
+
+    tree = _tree_lines(scene.workspace_tree) or ["· no workspace resources observed"]
+    tree_available_rows = height - 3  # rows 0-2 taken by headers
+    tree_truncated = len(tree) > tree_available_rows
+    for row, line in enumerate(tree[: max(tree_available_rows, 1)]):
+        canvas.put(row + 3, 0, fit_cells(line, max(split - 1, 1)))
+    if tree_truncated and tree_available_rows > 0 and split - 1 > 3:
+        # Stable scroll affordance at the tree's bottom row.
+        # Let fit_cells handle width clamping with a built-in ellipsis so
+        # users always see a truthful overflow cue (e.g. "[100 nodes]")
+        # when the label exceeds the tree column width.
+        scroll_label = f"[{len(tree)} nodes]"
+        canvas.put(
+            2 + tree_available_rows,
+            0,
+            fit_cells(scroll_label, split - 1),
+        )
 
     graph_x = min(max(split + 4, 21), max(width - 1, 0))
-    runtime_entities = [
-        entity
-        for entity in scene.entities
-        if entity.kind in {"operation", "child_task", "workflow", "verification", "generated_tool"}
-    ]
-    if runtime_entities:
-        for index, entity in enumerate(runtime_entities[:6]):
-            row = 1 + index * 2
-            offset = 2 if index % 2 == 0 else -2
-            canvas.put(row, graph_x + offset, f"{_entity_marker(entity.status)} {entity.label}")
-            if index and not entity.metadata.get("parent_id"):
-                canvas.put(row - 1, graph_x, "│")
+    runtime_lines = _tree_lines(scene.runtime_tree)
+    if runtime_lines:
+        for row, line in enumerate(runtime_lines[: max(height - 3, 1)], 3):
+            canvas.put(row, graph_x, fit_cells(line, max(width - graph_x, 1)))
     else:
-        canvas.put(1, graph_x, "· no runtime operations observed")
+        canvas.put(3, graph_x, "· no runtime operations observed")
 
     # Very small stream windows are useful for ``oi-stream`` and PTY smoke
     # tests; prioritize the live data instead of stacking a dashboard into
     # six rows.
     if height <= 11:
-        canvas.put(1, 0, f"{state.status} · {state.status_message}")
+        canvas.put(
+            1, 0, "> MODEL REQUEST ACTIVE" if scene.model_request_status == "active" else "> IDLE"
+        )
         stream = list(state.stream)[-3:]
         if state.stream_partial:
             stream.append(state.stream_partial)
@@ -456,8 +503,29 @@ def render_scene_lines(
         if stream and height >= 4:
             trace_y = max(height - 3, 0)
             canvas.put(trace_y, 0, "LIVE TRACE", overwrite=False)
+            # Determine if trace content will exceed the right edge of the
+            # aperture so we can render a deterministic overflow cue.
+            trace_overflow = False
+            for idx, line in enumerate(stream[-2:]):
+                check_y = trace_y + 1 + idx
+                if check_y < height and canvas.width > 4:
+                    test_line = f"│ {line}"
+                    if cell_width(test_line) > canvas.width - 1:
+                        trace_overflow = True
             for row, line in enumerate(stream[-2:], trace_y + 1):
-                canvas.put(row, 0, f"│ {line}", overwrite=False)
+                display = f"│ {line}"
+                if trace_overflow and row + 1 < height:
+                    display = fit_cells(display, canvas.width)
+                canvas.put(row, 0, display, overwrite=False)
+            if trace_overflow:
+                cue_row = min(trace_y + 3, height - 1)
+                canvas.put(cue_row, canvas.width - 1, "…", overwrite=True)
+
+        if scene.trace and height >= 6:
+            trace_y = max(3, min(height - 5, history_y + 1))
+            for row, line in enumerate(scene.trace[-2:], trace_y):
+                if row < height:
+                    canvas.put(row, 0, line, overwrite=False)
 
     art = [sanitize_terminal_text(line) for line in buddy_lines]
     art = [fit_cells(line, min(width, 20)).rstrip() for line in art if line]
@@ -465,18 +533,37 @@ def render_scene_lines(
         fx, fy = scene.anchors.get(scene.buddy_anchor, scene.anchors["center"])
         target_x = int((width - 1) * fx) - 5
         target_y = int((height - 1) * fy) - 1
-        candidates = [
-            (target_y + dy, target_x + dx)
-            for distance in range(0, max(width, height))
-            for dy, dx in ((0, distance), (0, -distance), (distance, 0), (-distance, 0))
-        ]
-        for row, column in candidates:
-            row, column = max(0, row), max(0, column)
-            if canvas.can_put(row, column, art):
-                for offset, line in enumerate(art):
-                    canvas.put(row + offset, column, line, overwrite=False)
-                break
+        art_height = len(art)
+        # First try the precise anchor position for atomic stability — same
+        # content always yields the same placement, eliminating the jump.
+        if target_y >= 0 and canvas.can_put(target_y, target_x, art):
+            for offset, line in enumerate(art):
+                canvas.put(target_y + offset, target_x, line, overwrite=False)
+        else:
+            # Expanding-ring fallback with deterministic tie-break: prefer
+            # smaller row (top) then smaller column (left) so the search
+            # converges to a single position every time.
+            ring_size = max(width, height)
+            for distance in range(1, ring_size + 1):
+                placed = False
+                # Horizontal offsets at this distance, sorted by column then row
+                offsets = sorted(
+                    [(0, distance), (0, -distance), (distance, 0), (-distance, 0)],
+                    key=lambda p: (max(0, target_y + p[0]), max(0, target_x + p[1])),
+                )
+                for dy, dx in offsets:
+                    row = max(0, target_y + dy)
+                    column = max(0, target_x + dx)
+                    # Sanity: the placed block must fit within the canvas.
+                    if row + art_height <= height and column >= 0:
+                        if canvas.can_put(row, column, art):
+                            for offset, line in enumerate(art):
+                                canvas.put(row + offset, column, line, overwrite=False)
+                            placed = True
+                            break
+                if placed:
+                    break
     return canvas.lines()
 
 
-__all__ = ["render_scene_lines"]
+__all__ = ["format_progress", "render_scene_lines"]

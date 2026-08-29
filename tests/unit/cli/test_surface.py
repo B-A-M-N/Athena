@@ -109,6 +109,74 @@ async def test_direct_shell_escape_uses_the_same_execution_surface():
 
 
 @pytest.mark.asyncio
+async def test_generated_candidate_commands_route_through_service():
+    class OperatorService:
+        def __init__(self):
+            self.candidates_task = None
+            self.inspect_args = None
+            self.promote_args = None
+            self.deprecate_args = None
+
+        async def operator_generated_capabilities(self, task_id):
+            self.candidates_task = task_id
+            return [
+                {
+                    "capability_id": "synth_1",
+                    "lifecycle_state": "CANDIDATE",
+                    "description": "reviewable helper",
+                    "proof": {"usage": {"uses": 3, "successes": 3}},
+                }
+            ]
+
+        async def operator_generated_capability(self, capability_id, task_id):
+            self.inspect_args = (capability_id, task_id)
+            return {
+                "id": capability_id,
+                "scope": "candidate",
+                "lifecycle_state": "CANDIDATE",
+                "description": "reviewable helper",
+                "code_hash": "code-hash",
+                "schema_hash": "schema-hash",
+                "proof_record": {
+                    "usage": {"uses": 3, "successes": 3},
+                    "quality_score": 0.75,
+                },
+                "required_dependencies": [],
+            }
+
+        async def operator_promote_generated_capability(self, capability_id, scope, task_id):
+            self.promote_args = (capability_id, scope, task_id)
+            return {"value": {"capability_id": capability_id, "project_id": "root"}}
+
+        async def operator_deprecate_generated_capability(self, capability_id, task_id):
+            self.deprecate_args = (capability_id, task_id)
+            return {"value": {"status": "deprecated"}}
+
+    service = OperatorService()
+    output = StringIO()
+    repl = ChatREPL(service)
+    repl.surface = OperatorSurface(output=output, error=output, interactive=False)
+    repl._last_task_id = "task-1"
+
+    assert await repl._dispatch_meta("/candidates")
+    assert service.candidates_task == "task-1"
+    assert "synth_1" in output.getvalue()
+    assert "3/3 successful" in output.getvalue()
+
+    assert await repl._dispatch_meta("/candidate synth_1")
+    assert service.inspect_args == ("synth_1", "task-1")
+    assert "quality: 0.75" in output.getvalue()
+
+    assert await repl._dispatch_meta("/promote synth_1 project")
+    assert service.promote_args == ("synth_1", "project", "task-1")
+    assert "promoted synth_1 to project root" in output.getvalue()
+
+    assert await repl._dispatch_meta("/deprecate synth_1")
+    assert service.deprecate_args == ("synth_1", "task-1")
+    assert "deprecated synth_1" in output.getvalue()
+
+
+@pytest.mark.asyncio
 async def test_stream_flushes_buffered_text_when_event_source_fails():
     class BrokenService:
         async def stream_events(self, task_id, after_sequence=0):

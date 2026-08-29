@@ -260,6 +260,14 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
                 EffectClass.NETWORK_WRITE,
             }
         ),
+        "replay": frozenset(
+            {
+                EffectClass.EXECUTE,
+                EffectClass.SPAWN_PROCESS,
+                EffectClass.WRITE_LOCAL,
+                EffectClass.NETWORK_WRITE,
+            }
+        ),
     },
     "synthesis": {
         "create": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
@@ -303,6 +311,9 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "read": frozenset({EffectClass.READ_LOCAL}),
         "slice": frozenset({EffectClass.READ_LOCAL}),
         "search": frozenset({EffectClass.READ_LOCAL}),
+        # Extraction reads the source and persists a derived immutable
+        # occurrence, so the dispatcher must expose both effects.
+        "extract": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
     },
     "workflow": {
         "list": frozenset({EffectClass.READ_LOCAL}),

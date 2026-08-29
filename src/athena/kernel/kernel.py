@@ -37,8 +37,6 @@ from athena.models.router import (
     CAP_TOOLS,
     CAP_VISION,
     ModelSelection,
-    _candidate_key,
-    _OFFLINE_PRIVACY,
 )
 from athena.protocol.errors import (
     ModelUnavailable,
@@ -69,7 +67,6 @@ from athena.protocol.models import (
     ModelRequest,
     ModelResponse,
     ModelResponseAccumulator,
-    PrivacyClass,
 )
 from athena.protocol.tasks import (
     ResourceBudget,
@@ -383,6 +380,8 @@ class AgentKernel:
         # kernel's own inference/dispatch paths. Opt-in: producers only
         # offer observations when the service wires the extension in.
         self._interpreter = interpreter
+        self._budgets = budgets
+        self._utility_model_semaphore = asyncio.Semaphore(4)
         self._lifecycle = TaskLifecycle(manager=task_manager)
         if budgets is not None:
             self._lifecycle.set_budget_tracker(budgets)
@@ -476,6 +475,14 @@ class AgentKernel:
                     task, state, TaskStatus.PARTIAL, "resource budget exhausted"
                 )
             state.iterations += 1
+            if self._budgets is not None:
+                # Iteration usage is checkpointed before any model/provider
+                # work. A process restart therefore cannot make a previously
+                # admitted loop look unused to recovery or budget checks.
+                self._budgets.consume(task.id, iterations=1)
+                persist_budget = getattr(self._budgets, "_persist_usage", None)
+                if persist_budget is not None:
+                    await persist_budget(task.id)
             await self._emit("TaskIterationStarted", {"iteration": state.iterations}, task)
 
             if self._deadline_passed(task):
@@ -595,60 +602,11 @@ class AgentKernel:
             minimum_context_tokens=getattr(compiled.requirements, "min_context_window", None),
             max_output_tokens=getattr(compiled.requirements, "reserved_output", None),
         )
-        selection = await self._router.select(
+        return await self._router.select(
             policy=task.model_policy,
             requirements=requirements,
+            exclude=exclude,
         )
-        if selection.provider not in exclude:
-            return selection
-
-        # The router does not accept exclusions; if it re-chose a failed
-        # provider, fall back to a registry scan honouring the same policy gate.
-        policy = task.model_policy
-        allowed = tuple(policy.allowed or ())
-        offline = policy.privacy in _OFFLINE_PRIVACY
-        models = list(await self._registry.list_models())
-        field = {
-            CAP_TOOLS: "tool_calling",
-            CAP_VISION: "vision",
-            CAP_AUDIO_INPUT: "audio_input",
-            CAP_REASONING: "reasoning",
-        }
-        candidates: list = []
-        for info in models:
-            if info.provider in exclude:
-                continue
-            if allowed and info.id not in allowed and f"{info.provider}/{info.id}" not in allowed:
-                continue
-            for cap in caps:
-                attr = field.get(cap)
-                if attr is not None and not getattr(info, attr, False):
-                    break
-            else:
-                if (
-                    info.context_limit is not None
-                    and requirements.minimum_context_tokens is not None
-                    and info.context_limit < requirements.minimum_context_tokens
-                ):
-                    continue
-                if (
-                    info.max_output_tokens is not None
-                    and requirements.max_output_tokens is not None
-                    and info.max_output_tokens < requirements.max_output_tokens
-                ):
-                    continue
-                if policy.require_tools and not info.tool_calling:
-                    continue
-                if offline and info.privacy_class is not PrivacyClass.LOCAL:
-                    continue
-                candidates.append(info)
-
-        if not candidates:
-            raise ModelUnavailable(
-                f"no candidate model excludes failed providers {sorted(exclude)}"
-            )
-        best = min(candidates, key=_candidate_key)
-        return ModelSelection(provider=best.provider, model=best.id, info=best)
 
     async def _invoke(
         self, task: TaskSpec, state: RunState, selection: ModelSelection, compiled: CompiledContext
@@ -696,6 +654,20 @@ class AgentKernel:
             )
             state.request_id = request.request_id
             state.provider = selection_for_attempt.provider
+            effective_policy = self._router.effective_policy(task.model_policy)
+            worst_cost = _worst_case_cost(selection_for_attempt.info, request)
+            if (
+                effective_policy.max_cost_usd is not None
+                and worst_cost > effective_policy.max_cost_usd
+            ):
+                raise TaskBudgetExceeded(
+                    f"bounded model call cost {worst_cost} exceeds "
+                    f"ceiling {effective_policy.max_cost_usd} USD"
+                )
+            reservation = False
+            if self._budgets is not None:
+                await self._budgets.reserve_model_cost(task.id, worst_cost)
+                reservation = True
             # One durable row and one inspectable event per actual provider /
             # model attempt. Fallbacks must never overwrite the first row.
             attempt_usage_id: str | None = None
@@ -730,7 +702,11 @@ class AgentKernel:
                 except Exception:
                     pass
             try:
-                response = await self._consume(task, state, provider, request)
+                if self._budgets is not None:
+                    async with self._budgets.model_call_lease(task.id):
+                        response = await self._consume(task, state, provider, request)
+                else:
+                    response = await self._consume(task, state, provider, request)
                 await self._emit(
                     "ModelResponseCompleted",
                     {
@@ -742,6 +718,25 @@ class AgentKernel:
                     task,
                 )
                 state.model_calls += 1
+                if self._budgets is not None:
+                    # Persist actual usage at the model boundary. The final
+                    # TaskResult is an aggregate and BudgetTracker consumes
+                    # only any execution/mutation delta during finalization.
+                    self._budgets.consume(
+                        task.id,
+                        input_tokens=_input_tokens_of(response, request),
+                        output_tokens=_output_tokens_of(response),
+                        model_calls=1,
+                    )
+                    await self._budgets.reconcile_model_cost(
+                        task.id,
+                        reserved=worst_cost,
+                        actual=_cost_of(response),
+                    )
+                    persist_budget = getattr(self._budgets, "_persist_usage", None)
+                    if persist_budget is not None:
+                        await persist_budget(task.id)
+                reservation = False
                 # Record final usage
                 if self._provider_usage_store is not None and attempt_usage_id is not None:
                     try:
@@ -765,6 +760,8 @@ class AgentKernel:
                         pass
                 return response
             except ProviderError as exc:
+                if self._budgets is not None and reservation:
+                    await self._budgets.release_model_cost(task.id, worst_cost)
                 last_err = exc
                 state.request_id = None
                 if self._provider_usage_store is not None and attempt_usage_id is not None:
@@ -796,6 +793,10 @@ class AgentKernel:
                 selection_for_attempt = await self._select_model(
                     task, compiled, exclude=frozenset(attempted)
                 )
+            except BaseException:
+                if self._budgets is not None and reservation:
+                    await self._budgets.release_model_cost(task.id, worst_cost)
+                raise
         raise last_err or ModelUnavailable("no model available")
 
     # ------------------------------------------------------------------ #
@@ -1022,24 +1023,25 @@ class AgentKernel:
                 request_id=new_id("sum"),
             )
             parts: list[str] = []
-            async for event in provider.complete(request):
-                if getattr(event, "type", None) is not None and event.type.value == "done":
-                    resp = event.response
-                    if resp is None:
-                        continue
-                    for block in resp.blocks:
-                        if isinstance(block, TextBlock) and block.text:
-                            parts.append(block.text)
-                    usage = getattr(resp, "usage", None)
-                    try:
-                        await self._provider_usage_store.record_completion(
-                            usage_id,
-                            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
-                            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
-                        )
-                        usage_id = None
-                    except Exception:
-                        pass
+            async with self._utility_model_semaphore:
+                async for event in provider.complete(request):
+                    if getattr(event, "type", None) is not None and event.type.value == "done":
+                        resp = event.response
+                        if resp is None:
+                            continue
+                        for block in resp.blocks:
+                            if isinstance(block, TextBlock) and block.text:
+                                parts.append(block.text)
+                        usage = getattr(resp, "usage", None)
+                        try:
+                            await self._provider_usage_store.record_completion(
+                                usage_id,
+                                input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+                                output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+                            )
+                            usage_id = None
+                        except Exception:
+                            pass
             if usage_id is not None:
                 # started but never completed (stream ended without done);
                 # keep role metadata — record_completion REPLACES it
@@ -2017,6 +2019,21 @@ def _cost_of(response: ModelResponse) -> Decimal:
         return Decimal(str(usage.cost_usd or "0"))
     except Exception:
         return Decimal("0")
+
+
+def _worst_case_cost(info, request: ModelRequest) -> Decimal:
+    """Estimate the bounded maximum cost from the actual compiled request."""
+    input_tokens = max(
+        1,
+        (sum(len(message.text() or "") for message in request.messages) + 3) // 4,
+    )
+    output_tokens = request.max_tokens or getattr(info, "max_output_tokens", None) or 4096
+    pricing = getattr(info, "cost", None)
+    if pricing is None:
+        return Decimal("0")
+    input_rate = Decimal(str(pricing.per_1m_input or 0))
+    output_rate = Decimal(str(pricing.per_1m_output or 0))
+    return (input_rate * input_tokens + output_rate * output_tokens) / Decimal(1_000_000)
 
 
 def _budget_exhausted(state: RunState, budget: ResourceBudget) -> bool:

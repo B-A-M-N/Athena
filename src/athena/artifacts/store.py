@@ -10,6 +10,7 @@ is the source of truth for listing and retention.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import hashlib
 import json
 import os
@@ -37,7 +38,7 @@ SHA256_ALGO = "sha256"
 class ArtifactStore:
     """Content-addressed, immutable artifact store backed by a local directory."""
 
-    def __init__(self, root: str | Path | None = None) -> None:
+    def __init__(self, root: str | Path | None = None, budget_tracker=None) -> None:
         self._root = Path(root) if root else _default_root()
         self._blobs = self._root / BLOBS_DIR
         self._meta = self._root / META_DIR
@@ -46,6 +47,10 @@ class ArtifactStore:
         # Per-digest lock for sidecar metadata updates (race-prone without lock).
         self._meta_locks: dict[str, asyncio.Lock] = {}
         self._meta_locks_lock = asyncio.Lock()
+        self._budget_tracker = budget_tracker
+
+    def set_budget_tracker(self, budget_tracker) -> None:
+        self._budget_tracker = budget_tracker
 
     async def _meta_lock(self, digest: str) -> asyncio.Lock:
         """Get or create a per-digest lock for sidecar updates."""
@@ -65,26 +70,45 @@ class ArtifactStore:
         producer: Provenance | str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> ArtifactRef:
-        """Content-address the blob, write it immutably, persist metadata."""
+        """Content-address the blob, write it immutably, persist metadata.
+
+        The artifact budget charges the logical task-owned occurrence size,
+        even when the immutable blob is physically deduplicated with another
+        occurrence. This keeps task accounting from being bypassed by
+        repeated identical outputs.
+        """
         data = content.encode("utf-8") if isinstance(content, str) else content
         digest = hashlib.sha256(data).hexdigest()
         uri = f"artifact://{SHA256_ALGO}/{digest}"
-        self._write_if_absent(digest, data)
+        reserved = False
+        committed = False
+        if task_id and self._budget_tracker is not None:
+            await self._budget_tracker.reserve_artifact(task_id, len(data))
+            reserved = True
+        try:
+            self._write_if_absent(digest, data)
 
-        ref = ArtifactRef(
-            id=uri,
-            uri=uri,
-            hash=digest,
-            mime_type=mime_type,
-            size=len(data),
-            storage_path=str(self._blob_path(digest)),
-            created_at=utcnow(),
-            producer=_producer_str(producer),
-            task_id=task_id,
-            metadata=dict(metadata or {}),
-        )
-        await self._persist_meta(ref)
-        return ref
+            ref = ArtifactRef(
+                id=uri,
+                uri=uri,
+                hash=digest,
+                mime_type=mime_type,
+                size=len(data),
+                storage_path=str(self._blob_path(digest)),
+                created_at=utcnow(),
+                producer=_producer_str(producer),
+                task_id=task_id,
+                metadata=dict(metadata or {}),
+            )
+            await self._persist_meta(ref)
+            if reserved:
+                await self._budget_tracker.commit_artifact(task_id, len(data))
+                committed = True
+            return ref
+        except BaseException:
+            if reserved and not committed:
+                await self._budget_tracker.release_artifact(task_id, len(data))
+            raise
 
     async def _persist_meta(self, ref: ArtifactRef) -> None:
         """Append this occurrence's provenance to the digest sidecar (BHV-067).
@@ -109,7 +133,8 @@ class ArtifactStore:
         lock = await self._meta_lock(ref.hash)
         async with lock:
             # Re-read inside lock to get latest state
-            previous = _read_meta_sync(sidecar) if sidecar.exists() else None
+            sidecar_exists = sidecar.exists()
+            previous = _read_meta_sync(sidecar) if sidecar_exists else None
             if isinstance(previous, dict) and isinstance(previous.get("provenances"), list):
                 existing = previous["provenances"]
                 # Remove duplicate entry (same task_id + created_at)
@@ -141,14 +166,12 @@ class ArtifactStore:
         path = self._path_for(ref)
         if path is None or not path.exists():
             raise FileNotFoundError(f"artifact blob not found: {ref}")
-        with path.open("rb") as fh:
-            fh.seek(offset)
-            return fh.read(limit)
+        return _read_range_sync(path, offset, limit)
 
     @asynccontextmanager
     async def open_stream(
         self, ref: ArtifactRef | str, chunk_size: int = 65536
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncIterator[AsyncIterator[bytes]]:
         path = self._path_for(ref)
         if path is None or not path.exists():
             raise FileNotFoundError(f"artifact blob not found: {ref}")
@@ -165,8 +188,10 @@ class ArtifactStore:
                 fh.close()
 
         try:
-            async for chunk in _gen():
-                yield chunk
+            # The context manager yields a single async iterator. Consumers
+            # can then iterate bounded chunks without confusing a chunk with
+            # the context-manager's one required yield point.
+            yield _gen()
         finally:
             if not fh.closed:
                 fh.close()
@@ -177,8 +202,42 @@ class ArtifactStore:
         mime_type: str | None = None,
         task_id: str | None = None,
         producer: str | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[ArtifactRef]:
+        return self._list_sync(mime_type=mime_type, task_id=task_id, producer=producer, limit=limit)
+
+    async def find_occurrence(self, *, task_id: str, uri: str) -> ArtifactRef | None:
+        """Look up one task-owned occurrence by digest-sidecar index.
+
+        Authorization must not depend on scanning an arbitrary first page of
+        the task's artifacts. The content-addressed URI identifies exactly
+        one sidecar, whose provenance list is the ownership index.
+        """
+        digest = _ref_digest(uri)
+        if not task_id or digest is None:
+            return None
+        sidecar = self._meta / f"{digest}.json"
+        if not sidecar.exists():
+            return None
+        meta = _read_meta_sync(sidecar)
+        if meta is None:
+            return None
+        return next(
+            (ref for ref in _occurrences(meta) if ref.task_id == task_id and ref.uri == uri),
+            None,
+        )
+
+    async def is_visible(self, *, task_id: str, uri: str) -> bool:
+        return await self.find_occurrence(task_id=task_id, uri=uri) is not None
+
+    def _list_sync(
+        self,
+        *,
+        mime_type: str | None,
+        task_id: str | None,
+        producer: str | None,
+        limit: int | None,
+    ) -> builtins.list[ArtifactRef]:
         refs: list[ArtifactRef] = []
         for sidecar in sorted(self._meta.glob("*.json")):
             meta = _read_meta_sync(sidecar)
@@ -192,7 +251,7 @@ class ArtifactStore:
                 if producer and ref.producer != producer:
                     continue
                 refs.append(ref)
-                if len(refs) >= limit:
+                if limit is not None and len(refs) >= limit:
                     return refs
         return refs
 
@@ -213,26 +272,7 @@ class ArtifactStore:
         if sidecar is not None and sidecar.exists():
             lock = await self._meta_lock(digest)
             async with lock:
-                # Remove only this occurrence's provenance
-                meta = _read_meta_sync(sidecar)
-                if isinstance(meta, dict):
-                    provenances = meta.get("provenances", [])
-                    occurrence_id = getattr(ref, "id", None)
-                    new_provenances = [
-                        p
-                        for p in provenances
-                        if p.get("id") != occurrence_id
-                        and p.get("uri") != getattr(ref, "uri", None)
-                    ]
-                    if len(new_provenances) < len(provenances):
-                        removed = True
-                    if new_provenances:
-                        meta["provenances"] = new_provenances
-                        _atomic_write_bytes(sidecar, json.dumps(meta).encode("utf-8"))
-                    else:
-                        # No occurrences left — remove entire sidecar
-                        sidecar.unlink()
-                        removed = True
+                removed = _remove_occurrence_sync(sidecar, ref)
         return removed
 
     async def delete_blob(self, ref: ArtifactRef | str) -> bool:
@@ -410,6 +450,33 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             raise
 
     _write()
+
+
+def _read_range_sync(path: Path, offset: int, limit: int) -> bytes:
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        return handle.read(limit)
+
+
+def _remove_occurrence_sync(path: Path, ref: ArtifactRef | str) -> bool:
+    """Remove one provenance entry without blocking the event loop."""
+    meta = _read_meta_sync(path)
+    if not isinstance(meta, dict):
+        return False
+    provenances = meta.get("provenances", [])
+    occurrence_id = getattr(ref, "id", None)
+    uri = getattr(ref, "uri", ref if isinstance(ref, str) else None)
+    new_provenances = [
+        p for p in provenances if p.get("id") != occurrence_id and p.get("uri") != uri
+    ]
+    if len(new_provenances) == len(provenances):
+        return False
+    if new_provenances:
+        meta["provenances"] = new_provenances
+        _atomic_write_bytes(path, json.dumps(meta).encode("utf-8"))
+    else:
+        path.unlink()
+    return True
 
 
 def _read_meta_sync(path: Path) -> dict[str, Any] | None:

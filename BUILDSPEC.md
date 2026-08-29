@@ -8,7 +8,10 @@
 **Upstream documents:** `SPEC.md`, `RESEARCHSPEC.md`
 **Audience:** Core maintainers, implementers, reviewers, security engineers, plugin/runtime authors
 **Implementation target:** Python 3.12+
-**Primary platforms:** Linux, macOS, Windows
+**Platform target:** Linux is the verified development host; macOS and Windows
+are compatibility targets whose optional sandbox, PTY, native-window, and
+provider integrations are backend-specific and must be reported as available
+only after platform checks pass.
 **Primary operating mode:** Local-first, headless-first, asynchronous
 **Primary interface:** CLI
 **Secondary interfaces:** HTTP/SSE, ACP

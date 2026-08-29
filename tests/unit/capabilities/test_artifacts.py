@@ -6,6 +6,7 @@ import hashlib
 
 import pytest
 
+from athena.artifacts.store import ArtifactStore
 from athena.capabilities.artifacts import ArtifactCapability
 from athena.protocol.artifacts import ArtifactRef
 from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus
@@ -134,3 +135,74 @@ async def test_artifact_uri_does_not_bypass_task_ownership(tmp_path):
 
     assert result.status is CapabilityResultStatus.FAILED
     assert "not visible" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_extract_is_bounded_and_retains_source_provenance(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    ref = await store.save(
+        task_id="task-1",
+        content="0123456789abcdef",
+        mime_type="text/plain",
+        producer="execute",
+    )
+    result = await ArtifactCapability(store).invoke(
+        CapabilityRequest(
+            capability_id="artifacts",
+            task_id="task-1",
+            call_id="extract",
+            arguments={"operation": "extract", "artifact_uri": ref.uri, "max_bytes": 5},
+        )
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    extracted = json.loads(result.output)
+    assert extracted["text"] == "01234"
+    assert extracted["truncated"] is True
+    assert extracted["metadata"]["source_uri"] == ref.uri
+    assert extracted["metadata"]["source_hash"] == ref.hash
+    assert extracted["derived_artifact"]["metadata"]["source_uri"] == ref.uri
+    assert extracted["derived_artifact"]["task_id"] == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_extract_json_is_deterministic(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    ref = await store.save(
+        task_id="task-json",
+        content='{"z": 1, "a": [true, false]}',
+        mime_type="application/json",
+    )
+    result = await ArtifactCapability(store).invoke(
+        CapabilityRequest(
+            capability_id="artifacts",
+            task_id="task-json",
+            call_id="extract-json",
+            arguments={"operation": "extract", "artifact_uri": ref.uri},
+        )
+    )
+
+    extracted = json.loads(result.output)
+    assert extracted["text"] == '{"a":[true,false],"z":1}'
+    assert extracted["metadata"]["parse_status"] == "parsed"
+    assert extracted["derived_artifact"]["mime_type"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_extract_binary_is_opaque_and_does_not_create_text_artifact(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    ref = await store.save(task_id="task-bin", content=b"\x00\xff\x01", mime_type="image/png")
+    result = await ArtifactCapability(store).invoke(
+        CapabilityRequest(
+            capability_id="artifacts",
+            task_id="task-bin",
+            call_id="extract-bin",
+            arguments={"operation": "extract", "artifact_uri": ref.uri},
+        )
+    )
+
+    extracted = json.loads(result.output)
+    assert extracted["text"] == ""
+    assert extracted["derived_artifact"] is None
+    assert extracted["metadata"]["binary"] is True
+    assert extracted["metadata"]["bytes"] == 3

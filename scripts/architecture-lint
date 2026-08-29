@@ -26,8 +26,9 @@ provider-invocation-outside-authority
 subprocess-outside-approved-backends
     ``subprocess`` / ``os.system`` usage is legal only inside
     src/athena/execution/, src/athena/capabilities/, src/athena/affordances/
-    plus the file-level allow-list below (modules that legitimately spawn
-    owned workers or validate generated code).  Allow-listed hits are INFO.
+    plus exact call-site annotations (modules that legitimately spawn owned
+    workers or validate generated code).  Annotated hits are INFO; a new call
+    in an already-reviewed file is a violation until reviewed explicitly.
 
 raw-db-outside-state
     ``aiosqlite.connect`` / ``sqlite3.connect`` may appear only inside
@@ -42,10 +43,9 @@ scheduler-watcher-inference
 
 kernel-router-construction
     ``self._router = ... ModelRouter(`` inside src/athena/kernel/ — the
-    kernel must receive an injected router.  The current
-    ``router or ModelRouter(registry)`` fallback in kernel.py is a KNOWN
-    OPEN DEFECT (P1-23 residual): the lint flags it; the fix belongs to the
-    kernel slice, not the lint.
+    kernel must receive an injected router.  This rule remains active even
+    when the current tree is clean, so a future fallback cannot silently add a
+    second routing authority.
 
 Adding a rule is a one-line addition to the RULES table below plus (option
 ally) a checker entry in CHECKERS.
@@ -82,7 +82,7 @@ class Rule:
     pattern: re.Pattern          # matched against each physical line
     include: tuple[str, ...]     # path prefixes (relative to src/athena/) scanned
     exclude: tuple[str, ...]     # path prefixes exempt from VIOLATION reporting
-    allow: tuple[str, ...]       # path prefixes reported as INFO, not violations
+    allow: tuple[str, ...]       # retained for rules with narrow path exceptions
     receiver_filter: str | None = None  # optional regex the text before the
                                         # match must also match (noise gating)
 
@@ -122,16 +122,7 @@ RULES: tuple[Rule, ...] = (
                    r"|os\.system\s*\()"),
         include=("",),
         exclude=("execution/", "capabilities/", "affordances/"),
-        allow=(
-            # owned short-lived workers / generated-code validation:
-            "causal/checkpoint.py",       # checkpoint worker child process
-            "synthesis/engine.py",        # sandboxed generated-code validation
-            "synthesis/runtime.py",       # persistent sandboxed generated runtime
-            "worldstate/core.py",         # read-only `git status` projection
-            "fusion/orchestrator.py",     # comment-only mention (no call)
-            "cli/native.py",              # owned native terminal frontend
-            "delegates/sessions.py",      # host-configured specialist transport
-        ),
+        allow=(),
     ),
     Rule(
         id="raw-db-outside-state",
@@ -139,9 +130,7 @@ RULES: tuple[Rule, ...] = (
         pattern=_r(r"\b(?:aiosqlite|sqlite3)\.connect\s*\("),
         include=("",),
         exclude=("state/",),
-        allow=(
-            "capabilities/environment.py",  # read-only task DB view w/ authorizer
-        ),
+        allow=(),
     ),
     Rule(
         id="scheduler-watcher-inference",
@@ -156,8 +145,7 @@ RULES: tuple[Rule, ...] = (
     Rule(
         id="kernel-router-construction",
         description="kernel constructs its own ModelRouter instead of "
-                    "receiving an injected one (KNOWN OPEN DEFECT in "
-                    "kernel.py: `router or ModelRouter(registry)`)",
+                    "receiving an injected one",
         pattern=_r(r"self\._router\s*=[^=].*\bModelRouter\s*\("),
         include=("kernel/",),
         exclude=(),
@@ -189,6 +177,17 @@ def _classify(rule: Rule, rel: str) -> str | None:
     if any(rel.startswith(p) for p in rule.allow):
         return "info"
     return "violation"
+
+
+def _annotated_allow(rule: Rule, line: str) -> bool:
+    """Allow one reviewed physical call site, never an entire file."""
+    return bool(
+        re.search(
+            rf"#\s*architecture-lint:\s*allow\s+{re.escape(rule.id)}\b",
+            line,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
@@ -225,8 +224,9 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
                     window = line[max(0, m.start() - 60):m.end() + 1]
                     if not rule.receiver_filter.search(window):
                         continue
+                severity = "info" if sev == "info" or _annotated_allow(rule, line) else sev
                 hits.append(Hit(rule.id, f"{SRC}/{rel}", lineno,
-                                line.strip(), sev))
+                                line.strip(), severity))
     return hits
 
 

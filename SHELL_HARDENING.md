@@ -1,6 +1,13 @@
 # SHELL_HARDENING.md
 ## Athena Visual Shell — Audit & Implementation Notes
 
+> **Document status (2026-08-29): historical visual audit.** This file records
+> the reference-image gaps and proposed implementation notes captured during
+> an earlier shell review. It is not the current release checklist. Current
+> implementation truth is in `README.md` and `docs/ARCHITECTURE.md`: the ANSI
+> surface is the portable fallback, the hosted Glass surface owns the active
+> animation layer, and the native frontend remains a development preview.
+
 > **Reference images**
 > - **DA GOAL** — defines the desired animation style and visual detail level (scan-line CRT Glass window, dot-matrix Buddy figure, perspective grid, multi-panel OI layout with live viewport marker, progress bars, diagnostic cards, status lamps, knob-row, bottom status rail).
 > - **Athenabox** — defines the correct physical *shape* of the shell (a single instrument chassis rendered as a physical control surface / vintage CRT cabinet; two inset rounded-rectangle apertures sitting inside a darker outer bezel; physical speaker grille, knob row, status LED rail all below the screens; top header bar with logo, subtitle, and toggle chip).
@@ -37,14 +44,30 @@
 | ANSI scene renderer with collision-safe Buddy placement | `render/scene.py` |
 | ASCII mascot (owl / cat / bot) with frame animation | `dual_pane.py:160-700` |
 | Model-request label in header | `dual_pane.py:1348-1351` |
-| Status rail with SYS / NET / IO / MODEL lamps | `dual_pane.py:1395-1401` |
+| Measured status rail with task/surface/OI/model state; unavailable hardware controls stay neutral | `dual_pane.py:_frame_lines()` |
 | Reduced-motion / `--no-animations` flags | `animation.py:51` |
 | Event-truthful state machine (no synthetic progress) | throughout |
 | OI scene animations extended to: APPROVAL, RECOVER, GENERATE, SEARCH, TEST, VERIFY, CODE, FAILURE | `framebuffer.py:605-688` |
 
 ---
 
-## Part 2 — Gaps: What Is Missing vs. the Reference Images
+## Part 2 — Historical Gaps: What Was Missing vs. the Reference Images
+
+## Current implementation matrix (2026-08-29)
+
+The sections below intentionally retain the original visual critique. The
+following matrix is the authoritative status for this beta and points to the
+current code paths:
+
+| Surface | Current truth | Evidence |
+|---|---|---|
+| ANSI fallback | Static, event-truthful operator/OI projection with measured rail; no scan animation | `src/athena/cli/dual_pane.py`, `tests/unit/cli/test_dual_pane.py` |
+| Hosted Glass | Pillow/Kitty compositor with scan, pulse, grid, and Buddy animation | `src/athena/cli/framebuffer.py`, `src/athena/cli/animation.py` |
+| Native frontend | Alacritty PTY/core plus serialized recursive workspace/runtime projection; development preview | `native/src/main.rs`, `native/src/x11.rs`, `scripts/native-smoke` |
+| Hardware telemetry | Not implemented; BRIGHTNESS/FOCUS render unavailable and VIEW reports frontend state | `src/athena/cli/dual_pane.py:_frame_lines()` |
+
+Reference-image fidelity items not listed as implemented remain deliberately
+deferred visual work; they are not release claims.
 
 ### GAP-01 — Shell Outer Bezel / Physical Cabinet Shape ❌
 
@@ -956,14 +979,13 @@ _ACTIVE_STATES = frozenset({
 
 ---
 
-## Part 5 — Summary Assessment
+## Part 5 — Current Release-Truth Note
 
-The Athena codebase has a **solid and well-structured foundation** for both the Glass CRT viewport and the ANSI fallback. The animation system, Kitty layering, scene graph, and event-truthful state machine are production-ready.
-
-The primary gaps against the reference images are:
-
-1. **Shell shape** — The chassis needs a true nested bezel structure (outer `╔═╗` box + per-aperture `╓─╖` rim) to achieve the physical instrument cabinet look of Athenabox.
-2. **Bottom row** — The hardware controls panel (speaker grille, knobs, LED cluster, model serial panel) needs to be composed from distinct labelled sections rather than a single status text line.
-3. **Buddy pixel style** — The procedural vector Buddy needs to be quantized to a discrete pixel grid to achieve the dithered dot-matrix CRT character look shown in DA GOAL.
-4. **OI content structure** — The MODEL REQUEST header row, `├─`/`└─` file tree with status badges, structured top-down RUNTIME TREE with parent-child lines, and diagnostic `expected/actual/severity` card need to be added to both the Glass and ANSI renderers.
-5. **ANSI animation** — The animation clock currently only drives Glass repaints; it should also drive ANSI cursor-blink, scanning dot, and progress indicators to match the animation intent across all display modes.
+The historical gaps above should not be read as claims that the current code
+still lacks every listed element. The shared scene model now carries the model
+request row, bounded workspace/runtime trees, structured diagnostics, and
+action-specific progress into ANSI, Glass, and the native bridge. The ANSI
+surface intentionally remains event-driven and static between state changes;
+continuous animation is limited to the hosted Glass path, with reduced-motion
+controls available. Hardware labels that have no telemetry backing are rendered
+as application state or unavailable values rather than fabricated sensor data.

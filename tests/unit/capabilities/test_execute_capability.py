@@ -13,10 +13,13 @@ from athena.protocol.execution import (
     ExecutionEventType,
     ExecutionExitStatus,
 )
-from athena.protocol.tasks import WorkspaceSpec
+from athena.protocol.tasks import PathRule, WorkspaceSpec
 
 
 class _ExecutionManager:
+    def __init__(self):
+        self.requests = []
+
     def available_runtimes(self):
         return ["python"]
 
@@ -24,6 +27,7 @@ class _ExecutionManager:
         return session_id == "session-a" and task_id == "task-a"
 
     async def stream(self, request, execution_id):
+        self.requests.append(request)
         yield ExecutionEvent(ExecutionEventType.STDOUT, execution_id, data="hello")
         yield ExecutionEvent(ExecutionEventType.STDERR, execution_id, data="warning: degraded")
         yield ExecutionEvent(
@@ -76,3 +80,53 @@ async def test_execute_rejects_unknown_language_without_falling_back(tmp_path):
 
     assert result.status is CapabilityResultStatus.FAILED
     assert "unsupported language" in (result.error or "")
+
+
+async def test_execute_canonicalizes_relative_workspace_mount_rules(tmp_path):
+    execution = _ExecutionManager()
+    capability = ExecuteCapability(execution)
+    workspace = WorkspaceSpec(
+        id="repo",
+        root=str(tmp_path),
+        writable=(
+            # Relative paths must become host paths before a sandbox mount is
+            # assembled; passing these strings to bwrap would resolve them
+            # against Athena's process cwd instead of this workspace.
+            PathRule(path="src", allow=True),
+            PathRule(path="secrets", allow=False),
+        ),
+    )
+
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="execute",
+            task_id="task-a",
+            call_id="exec-rules",
+            arguments={"language": "python", "code": "print('ok')"},
+        ),
+        context=InvocationContext(workspace=workspace),
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    request = execution.requests[0]
+    assert request.writable_paths == (str(tmp_path / "src"),)
+    assert request.read_only_paths == (str(tmp_path / "secrets"),)
+
+
+async def test_execute_adds_candidate_src_without_inheriting_host_pythonpath(tmp_path):
+    execution = _ExecutionManager()
+    (tmp_path / "src").mkdir()
+    capability = ExecuteCapability(execution)
+
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="execute",
+            task_id="task-a",
+            call_id="exec-candidate-import",
+            arguments={"language": "python", "code": "import athena"},
+        ),
+        context=InvocationContext(workspace=WorkspaceSpec(id="candidate", root=str(tmp_path))),
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    assert execution.requests[0].env == {"PYTHONPATH": str(tmp_path / "src")}

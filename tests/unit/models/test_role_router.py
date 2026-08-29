@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from athena.models.registry import ProviderRegistry
-from athena.models.router import ModelRouter
+from athena.models.router import ModelRouter, ModelUnavailable
 from athena.protocol.models import (
     CostInfo,
     ModelEvent,
@@ -76,13 +76,13 @@ async def test_no_roles_uses_cost_ordering(registry):
     assert sel.model == "cheap"
 
 
-async def test_caller_allowlist_wins_over_role(registry):
+async def test_caller_allowlist_intersects_role_policy(registry):
     router = ModelRouter(
         registry,
         role_policies={"summarizer": ModelPolicy(role="summarizer", allowed=("prov/cheap",))},
     )
-    sel = await router.select(policy=ModelPolicy(role="summarizer", allowed=("prov/pricey",)))
-    assert sel.model == "pricey"
+    with pytest.raises(ModelUnavailable):
+        await router.select(policy=ModelPolicy(role="summarizer", allowed=("prov/pricey",)))
 
 
 @pytest.mark.athena_scenario("FUSE-001")

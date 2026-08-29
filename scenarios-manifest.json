@@ -1,12 +1,12 @@
 {
-  "generated_at": "2026-08-28T22:05:28.834807+00:00",
+  "generated_at": "2026-08-29T14:56:06.522076+00:00",
   "repo_root": "/home/bamn/Athena",
   "source_identity": {
-    "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-    "dirty": false,
-    "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "python": "/tmp/athena-manifest-env-7413781/bin/python",
-    "python_version": "3.13.13",
+    "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+    "dirty": true,
+    "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+    "python": "/home/bamn/Athena/.venv/bin/python3",
+    "python_version": "3.12.13",
     "platform": "linux"
   },
   "resumed": false,
@@ -21,7 +21,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -33,17 +33,17 @@
             "tests/unit/models/test_role_router.py::test_router_exposes_selected_provider_without_second_authority"
           ],
           "exit_code": 0,
-          "duration_s": 1.223,
+          "duration_s": 0.472,
           "tail": ".                                                                        [100%]\n1 passed in 0.01s\n"
         }
       ],
-      "duration_s": 1.223,
+      "duration_s": 0.472,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "RoleRouter exposes the selected provider without building a second authority. The single sanctioned ModelRouter construction site is src/athena/service/service.py; see FUSE-002 and scripts/architecture-lint."
@@ -58,7 +58,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -72,17 +72,17 @@
             "tests/unit/models/test_router_authority.py::test_kernel_holds_the_injected_router_instance"
           ],
           "exit_code": 0,
-          "duration_s": 0.414,
-          "tail": "..                                                                       [100%]\n2 passed in 0.01s\n"
+          "duration_s": 0.523,
+          "tail": "..                                                                       [100%]\n2 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.414,
+      "duration_s": 0.523,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "FIXED (was P1-23 residual): the kernel REQUIRES an injected ModelRouter \u2014 no `router or ModelRouter(registry)` fallback exists. scripts/architecture-lint rule kernel-router-construction is green; these tests pin the contract."
@@ -97,7 +97,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -109,17 +109,17 @@
             "tests/unit/service/test_direct_execution.py::test_direct_execution_routes_through_dispatcher_and_records_audit"
           ],
           "exit_code": 0,
-          "duration_s": 0.391,
-          "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
+          "duration_s": 0.539,
+          "tail": ".                                                                        [100%]\n1 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.391,
+      "duration_s": 0.539,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "Direct shell path uses the same dispatch/audit authority as the kernel loop."
@@ -134,7 +134,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -148,17 +148,17 @@
             "tests/unit/kernel/test_kernel_loop.py::test_scripted_capability_then_answer_runs_two_iterations"
           ],
           "exit_code": 0,
-          "duration_s": 0.409,
-          "tail": "..                                                                       [100%]\n2 passed in 0.06s\n"
+          "duration_s": 0.601,
+          "tail": "..                                                                       [100%]\n2 passed in 0.08s\n"
         }
       ],
-      "duration_s": 0.409,
+      "duration_s": 0.601,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -172,7 +172,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -192,17 +192,17 @@
             "tests/unit/workflows/test_executor.py::test_same_process_approval_replay_keeps_workflow_identity"
           ],
           "exit_code": 0,
-          "duration_s": 0.631,
-          "tail": ".....                                                                    [100%]\n5 passed in 0.23s\n"
+          "duration_s": 0.722,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.21s\n"
         }
       ],
-      "duration_s": 0.631,
+      "duration_s": 0.722,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "Workflow composition remains a dispatcher-bound execution path: completed call receipts are replayed, immutable run identity is checked, and an in-flight effect fails closed for recovery."
@@ -217,7 +217,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -233,17 +233,17 @@
             "tests/unit/capabilities/test_workflow_promotion.py::test_workflow_recovery_uses_durable_external_receipt"
           ],
           "exit_code": 0,
-          "duration_s": 0.557,
-          "tail": "...                                                                      [100%]\n3 passed in 0.14s\n"
+          "duration_s": 0.748,
+          "tail": "...                                                                      [100%]\n3 passed in 0.18s\n"
         }
       ],
-      "duration_s": 0.557,
+      "duration_s": 0.748,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "An unknown external result remains APPLYING until a durable receipt is verified; recovery then resumes the exact workflow item without issuing the external mutation again."
@@ -258,7 +258,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -274,17 +274,17 @@
             "tests/unit/synthesis/test_synthesis.py::test_validate_reports_invalid_generated_schema_as_admission_failure"
           ],
           "exit_code": 0,
-          "duration_s": 0.616,
-          "tail": "...                                                                      [100%]\n3 passed in 0.22s\n"
+          "duration_s": 0.763,
+          "tail": "...                                                                      [100%]\n3 passed in 0.20s\n"
         }
       ],
-      "duration_s": 0.616,
+      "duration_s": 0.763,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -298,7 +298,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -312,17 +312,17 @@
             "tests/unit/synthesis/test_synthesis.py::test_register_ephemeral_registers_validated_and_invokes"
           ],
           "exit_code": 0,
-          "duration_s": 0.52,
-          "tail": "..                                                                       [100%]\n2 passed in 0.14s\n"
+          "duration_s": 0.709,
+          "tail": "..                                                                       [100%]\n2 passed in 0.16s\n"
         }
       ],
-      "duration_s": 0.52,
+      "duration_s": 0.709,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -336,7 +336,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -348,17 +348,17 @@
             "tests/unit/synthesis/test_synthesis.py::test_generated_authority_is_sandbox_profile_not_declared_effects"
           ],
           "exit_code": 0,
-          "duration_s": 0.368,
+          "duration_s": 0.532,
           "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.368,
+      "duration_s": 0.532,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -372,7 +372,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -386,17 +386,17 @@
             "tests/unit/synthesis/test_synthesis.py::test_to_skill_candidate_requires_diverse_repeated_success"
           ],
           "exit_code": 0,
-          "duration_s": 0.749,
-          "tail": "..                                                                       [100%]\n2 passed in 0.36s\n"
+          "duration_s": 1.027,
+          "tail": "..                                                                       [100%]\n2 passed in 0.42s\n"
         }
       ],
-      "duration_s": 0.749,
+      "duration_s": 1.027,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -410,7 +410,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -426,17 +426,17 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_output_schema_inference_distinguishes_booleans"
           ],
           "exit_code": 0,
-          "duration_s": 2.16,
-          "tail": "...                                                                      [100%]\n3 passed in 1.69s\n"
+          "duration_s": 2.703,
+          "tail": "...                                                                      [100%]\n3 passed in 2.12s\n"
         }
       ],
-      "duration_s": 2.16,
+      "duration_s": 2.703,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -450,7 +450,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -466,17 +466,17 @@
             "tests/unit/synthesis/test_synthesis.py::test_generated_validation_rejects_undeclared_native_write"
           ],
           "exit_code": 0,
-          "duration_s": 0.879,
-          "tail": "...                                                                      [100%]\n3 passed in 0.33s\n"
+          "duration_s": 0.808,
+          "tail": "...                                                                      [100%]\n3 passed in 0.28s\n"
         }
       ],
-      "duration_s": 0.879,
+      "duration_s": 0.808,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "Generated Python remains sandboxed; athena.call crosses a framed parent boundary and is re-authorized by the canonical dispatcher."
@@ -491,7 +491,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -515,17 +515,17 @@
             "tests/unit/capabilities/test_workflow_promotion.py::test_workflow_promotion_requires_distinct_observations"
           ],
           "exit_code": 0,
-          "duration_s": 0.608,
+          "duration_s": 0.609,
           "tail": ".......                                                                  [100%]\n7 passed in 0.09s\n"
         }
       ],
-      "duration_s": 0.608,
+      "duration_s": 0.609,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "Completed executions become reviewable workflow candidates with verification provenance; recovery and single-observation candidates cannot become reusable automation."
@@ -540,7 +540,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -556,17 +556,17 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_requires_task_scope"
           ],
           "exit_code": 0,
-          "duration_s": 3.295,
-          "tail": "...                                                                      [100%]\n3 passed in 2.78s\n"
+          "duration_s": 3.246,
+          "tail": "...                                                                      [100%]\n3 passed in 2.71s\n"
         }
       ],
-      "duration_s": 3.295,
+      "duration_s": 3.246,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -580,7 +580,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -596,17 +596,17 @@
             "tests/unit/affordances/test_fabric.py::test_restore_executor_rejects_persisted_authority_outside_profile"
           ],
           "exit_code": 0,
-          "duration_s": 2.127,
-          "tail": "...                                                                      [100%]\n3 passed in 1.61s\n"
+          "duration_s": 2.154,
+          "tail": "...                                                                      [100%]\n3 passed in 1.64s\n"
         }
       ],
-      "duration_s": 2.127,
+      "duration_s": 2.154,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -620,7 +620,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -634,17 +634,17 @@
             "tests/unit/affordances/test_validation.py::test_source_validation_rejects_host_escape_primitives_before_execution"
           ],
           "exit_code": 0,
-          "duration_s": 0.525,
-          "tail": "..                                                                       [100%]\n2 passed in 0.04s\n"
+          "duration_s": 0.541,
+          "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.525,
+      "duration_s": 0.541,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -658,7 +658,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -672,17 +672,17 @@
             "tests/contract/test_capability_policy_enforcement.py::TestPolicyEnforcement::test_task_deny_never_calls_executor"
           ],
           "exit_code": 0,
-          "duration_s": 0.576,
-          "tail": "..                                                                       [100%]\n2 passed in 0.07s\n"
+          "duration_s": 0.586,
+          "tail": "..                                                                       [100%]\n2 passed in 0.05s\n"
         }
       ],
-      "duration_s": 0.576,
+      "duration_s": 0.586,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -696,7 +696,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -714,17 +714,17 @@
             "tests/unit/models/test_response_accumulator.py::test_registry_invoke_uses_the_same_accumulator"
           ],
           "exit_code": 0,
-          "duration_s": 0.621,
-          "tail": "....                                                                     [100%]\n4 passed in 0.12s\n"
+          "duration_s": 0.564,
+          "tail": "....                                                                     [100%]\n4 passed in 0.07s\n"
         }
       ],
-      "duration_s": 0.621,
+      "duration_s": 0.564,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -738,7 +738,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -752,17 +752,17 @@
             "tests/unit/kernel/test_model_tool_history.py::test_kernel_stream_assembly_keeps_text_and_tool_delta"
           ],
           "exit_code": 0,
-          "duration_s": 0.546,
-          "tail": "..                                                                       [100%]\n2 passed in 0.05s\n"
+          "duration_s": 0.615,
+          "tail": "..                                                                       [100%]\n2 passed in 0.08s\n"
         }
       ],
-      "duration_s": 0.546,
+      "duration_s": 0.615,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -776,7 +776,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -794,17 +794,17 @@
             "tests/unit/models/test_compat_kernel.py::test_repair_is_idempotent"
           ],
           "exit_code": 0,
-          "duration_s": 0.587,
-          "tail": "....                                                                     [100%]\n4 passed in 0.09s\n"
+          "duration_s": 0.585,
+          "tail": "....                                                                     [100%]\n4 passed in 0.07s\n"
         }
       ],
-      "duration_s": 0.587,
+      "duration_s": 0.585,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -818,7 +818,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -836,17 +836,17 @@
             "tests/unit/models/test_toolcall_candidates.py::test_empty_candidate_is_not_rewritten_as_an_empty_object"
           ],
           "exit_code": 0,
-          "duration_s": 0.62,
-          "tail": "....                                                                     [100%]\n4 passed in 0.08s\n"
+          "duration_s": 0.573,
+          "tail": "....                                                                     [100%]\n4 passed in 0.07s\n"
         }
       ],
-      "duration_s": 0.62,
+      "duration_s": 0.573,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -860,7 +860,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -880,17 +880,17 @@
             "tests/unit/models/test_compat_kernel.py::test_no_cache_hit_inferred_without_telemetry"
           ],
           "exit_code": 0,
-          "duration_s": 0.536,
+          "duration_s": 0.543,
           "tail": ".....                                                                    [100%]\n5 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.536,
+      "duration_s": 0.544,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -904,7 +904,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -918,17 +918,17 @@
             "tests/unit/capabilities/test_tool_repair_store.py::test_parallel_repair_receipt_is_durable_and_replayable"
           ],
           "exit_code": 0,
-          "duration_s": 0.641,
+          "duration_s": 0.648,
           "tail": "..                                                                       [100%]\n2 passed in 0.12s\n"
         }
       ],
-      "duration_s": 0.641,
+      "duration_s": 0.648,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -942,7 +942,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -956,17 +956,17 @@
             "tests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced"
           ],
           "exit_code": 0,
-          "duration_s": 1.966,
-          "tail": "..                                                                       [100%]\n=============================== warnings summary ===============================\ntests/unit/capabilities/test_terminal_session.py::test_create_send_screen_kill\ntests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced\n  /home/bamn/miniconda3/lib/python3.13/pty.py:95: DeprecationWarning: This process (pid=532342) is multi-threaded, use of forkpty() may lead to deadlocks in the child.\n    pid, fd = os.forkpty()\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n2 passed, 2 warnings in 1.48s\n"
+          "duration_s": 1.905,
+          "tail": "..                                                                       [100%]\n=============================== warnings summary ===============================\ntests/unit/capabilities/test_terminal_session.py::test_create_send_screen_kill\ntests/unit/capabilities/test_terminal_session.py::test_task_ownership_enforced\n  /usr/lib/python3.12/pty.py:95: DeprecationWarning: This process (pid=3211225) is multi-threaded, use of forkpty() may lead to deadlocks in the child.\n    pid, fd = os.forkpty()\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n2 passed, 2 warnings in 1.40s\n"
         }
       ],
-      "duration_s": 1.966,
+      "duration_s": 1.905,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -980,7 +980,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -996,17 +996,17 @@
             "tests/unit/capabilities/test_screen_emulator.py::test_alternate_screen_overwrite_via_cursor_reposition"
           ],
           "exit_code": 0,
-          "duration_s": 0.433,
+          "duration_s": 0.464,
           "tail": "...                                                                      [100%]\n3 passed in 0.04s\n"
         }
       ],
-      "duration_s": 0.433,
+      "duration_s": 0.464,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1020,7 +1020,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1038,17 +1038,17 @@
             "tests/unit/execution/test_shell_runtime.py::test_shell_completion_marker_is_invocation_specific_and_exact"
           ],
           "exit_code": 0,
-          "duration_s": 4.619,
-          "tail": "....                                                                     [100%]\n4 passed in 4.18s\n"
+          "duration_s": 4.564,
+          "tail": "....                                                                     [100%]\n4 passed in 4.16s\n"
         }
       ],
-      "duration_s": 4.619,
+      "duration_s": 4.564,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1062,7 +1062,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1078,17 +1078,17 @@
             "tests/unit/capabilities/test_system.py::test_process_tree_and_usage"
           ],
           "exit_code": 0,
-          "duration_s": 0.411,
-          "tail": "...                                                                      [100%]\n3 passed in 0.05s\n"
+          "duration_s": 0.494,
+          "tail": "...                                                                      [100%]\n3 passed in 0.06s\n"
         }
       ],
-      "duration_s": 0.411,
+      "duration_s": 0.494,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1102,7 +1102,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1122,17 +1122,17 @@
             "tests/unit/capabilities/test_debugger.py::test_session_ownership_is_enforced"
           ],
           "exit_code": 0,
-          "duration_s": 0.399,
-          "tail": ".ss.s                                                                    [100%]\n2 passed, 3 skipped in 0.03s\n"
+          "duration_s": 0.5,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.04s\n"
         }
       ],
-      "duration_s": 0.399,
+      "duration_s": 0.5,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "FIXED: debugpy is optional, but when installed the capability launches the debuggee through ExecutionManager and owns a localhost DAP client. Workspace scope, task ownership, and loopback network policy remain enforced."
@@ -1147,7 +1147,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1161,17 +1161,17 @@
             "tests/unit/capabilities/test_system.py::test_machine_env_redacts_secrets"
           ],
           "exit_code": 0,
-          "duration_s": 0.392,
+          "duration_s": 0.493,
           "tail": "..                                                                       [100%]\n2 passed in 0.02s\n"
         }
       ],
-      "duration_s": 0.392,
+      "duration_s": 0.493,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1185,7 +1185,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1199,17 +1199,17 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_invariant_envelope_detects_violation"
           ],
           "exit_code": 0,
-          "duration_s": 1.731,
-          "tail": "..                                                                       [100%]\n2 passed in 1.29s\n"
+          "duration_s": 1.769,
+          "tail": "..                                                                       [100%]\n2 passed in 1.28s\n"
         }
       ],
-      "duration_s": 1.731,
+      "duration_s": 1.769,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1223,7 +1223,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1239,17 +1239,17 @@
             "tests/unit/worldstate/test_store.py::test_mutations_get_durable_task_sequences"
           ],
           "exit_code": 0,
-          "duration_s": 1.985,
-          "tail": "...                                                                      [100%]\n3 passed in 1.59s\n"
+          "duration_s": 0.74,
+          "tail": "...                                                                      [100%]\n3 passed in 0.33s\n"
         }
       ],
-      "duration_s": 1.985,
+      "duration_s": 0.74,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1263,7 +1263,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1277,17 +1277,17 @@
             "tests/unit/worldstate/test_store.py::test_mark_contradicted"
           ],
           "exit_code": 0,
-          "duration_s": 1.962,
-          "tail": "..                                                                       [100%]\n2 passed in 1.53s\n"
+          "duration_s": 0.883,
+          "tail": "..                                                                       [100%]\n2 passed in 0.35s\n"
         }
       ],
-      "duration_s": 1.962,
+      "duration_s": 0.883,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1301,7 +1301,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1313,17 +1313,17 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_claims_go_stale_after_dependent_mutation"
           ],
           "exit_code": 0,
-          "duration_s": 1.25,
-          "tail": ".                                                                        [100%]\n1 passed in 0.76s\n"
+          "duration_s": 1.341,
+          "tail": ".                                                                        [100%]\n1 passed in 0.79s\n"
         }
       ],
-      "duration_s": 1.25,
+      "duration_s": 1.341,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1337,7 +1337,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1349,17 +1349,17 @@
             "tests/unit/fusion/test_orchestrator.py::test_experiment_commit_binds_claim_and_invalidates"
           ],
           "exit_code": 0,
-          "duration_s": 3.72,
-          "tail": ".                                                                        [100%]\n1 passed in 3.29s\n"
+          "duration_s": 4.255,
+          "tail": ".                                                                        [100%]\n1 passed in 3.80s\n"
         }
       ],
-      "duration_s": 3.72,
+      "duration_s": 4.255,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1373,7 +1373,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1387,17 +1387,17 @@
             "tests/unit/kernel/test_continuation_store.py::test_restart_releases_claims_and_lists_recoverable_tasks"
           ],
           "exit_code": 0,
-          "duration_s": 2.178,
-          "tail": "..                                                                       [100%]\n2 passed in 1.70s\n"
+          "duration_s": 0.776,
+          "tail": "..                                                                       [100%]\n2 passed in 0.34s\n"
         }
       ],
-      "duration_s": 2.178,
+      "duration_s": 0.776,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1411,7 +1411,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1423,17 +1423,17 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_shadow_commit_applies_proven_changes"
           ],
           "exit_code": 0,
-          "duration_s": 3.172,
-          "tail": ".                                                                        [100%]\n1 passed in 2.74s\n"
+          "duration_s": 3.846,
+          "tail": ".                                                                        [100%]\n1 passed in 3.32s\n"
         }
       ],
-      "duration_s": 3.172,
+      "duration_s": 3.846,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1447,7 +1447,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1461,17 +1461,17 @@
             "tests/unit/shadow/test_shadow_and_worldstate.py::test_commit_requires_verified_branch"
           ],
           "exit_code": 0,
-          "duration_s": 2.901,
-          "tail": "..                                                                       [100%]\n2 passed in 2.44s\n"
+          "duration_s": 2.885,
+          "tail": "..                                                                       [100%]\n2 passed in 2.43s\n"
         }
       ],
-      "duration_s": 2.901,
+      "duration_s": 2.885,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1485,7 +1485,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1499,17 +1499,17 @@
             "tests/unit/shadow/test_shadow_manifest.py::test_shadow_conflict_rejects_same_size_concurrent_edit"
           ],
           "exit_code": 0,
-          "duration_s": 0.453,
+          "duration_s": 0.518,
           "tail": "..                                                                       [100%]\n2 passed in 0.04s\n"
         }
       ],
-      "duration_s": 0.453,
+      "duration_s": 0.518,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1523,7 +1523,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1541,17 +1541,17 @@
             "tests/unit/capabilities/test_fs_mutations.py::test_delete_snapshot_failure_is_not_reversible"
           ],
           "exit_code": 0,
-          "duration_s": 0.553,
-          "tail": "....                                                                     [100%]\n4 passed in 0.12s\n"
+          "duration_s": 0.641,
+          "tail": "....                                                                     [100%]\n4 passed in 0.11s\n"
         }
       ],
-      "duration_s": 0.553,
+      "duration_s": 0.641,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1565,7 +1565,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1579,17 +1579,17 @@
             "tests/unit/fusion/test_orchestrator.py::test_invariant_violation_blocks_commit"
           ],
           "exit_code": 0,
-          "duration_s": 5.074,
-          "tail": "..                                                                       [100%]\n2 passed in 4.54s\n"
+          "duration_s": 4.709,
+          "tail": "..                                                                       [100%]\n2 passed in 4.13s\n"
         }
       ],
-      "duration_s": 5.074,
+      "duration_s": 4.709,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1603,7 +1603,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1619,17 +1619,17 @@
             "tests/unit/capabilities/test_effect_routing.py::test_service_transaction_phases_have_exact_external_effect_contracts"
           ],
           "exit_code": 0,
-          "duration_s": 0.981,
-          "tail": "...                                                                      [100%]\n3 passed in 0.14s\n"
+          "duration_s": 0.428,
+          "tail": "...                                                                      [100%]\n3 passed in 0.04s\n"
         }
       ],
-      "duration_s": 0.981,
+      "duration_s": 0.428,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "Systemd is outside the filesystem shadow. The explicit transaction protocol records identity, prevents duplicate apply, verifies state, and requires the prepared inverse for compensation."
@@ -1644,7 +1644,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1662,17 +1662,17 @@
             "tests/unit/capabilities/test_effect_routing.py::test_database_transaction_phases_have_exact_external_effect_contracts"
           ],
           "exit_code": 0,
-          "duration_s": 1.181,
-          "tail": "....                                                                     [100%]\n4 passed in 0.24s\n"
+          "duration_s": 0.604,
+          "tail": "....                                                                     [100%]\n4 passed in 0.11s\n"
         }
       ],
-      "duration_s": 1.181,
+      "duration_s": 0.604,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "SQLite commits outside the shadow workspace are represented by a pre-image receipt, stable idempotency key, verification hash/query, and compensation restore."
@@ -1687,7 +1687,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1705,17 +1705,17 @@
             "tests/unit/capabilities/test_environment.py::test_reconstructed_http_capability_refuses_apply_after_crash"
           ],
           "exit_code": 0,
-          "duration_s": 1.595,
-          "tail": "....                                                                     [100%]\n4 passed in 0.08s\n"
+          "duration_s": 0.557,
+          "tail": "....                                                                     [100%]\n4 passed in 0.03s\n"
         }
       ],
-      "duration_s": 1.595,
+      "duration_s": 0.557,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "A remote response is not treated as generic success: unknown apply outcomes require verification, and compensation remains SENT until a separate verification produces COMPENSATION_VERIFIED."
@@ -1730,7 +1730,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1744,17 +1744,17 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_fork_unknown_task_raises"
           ],
           "exit_code": 0,
-          "duration_s": 3.412,
-          "tail": "..                                                                       [100%]\n2 passed in 2.68s\n"
+          "duration_s": 2.529,
+          "tail": "..                                                                       [100%]\n2 passed in 2.00s\n"
         }
       ],
-      "duration_s": 3.413,
+      "duration_s": 2.529,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1768,7 +1768,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1784,17 +1784,17 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_checkpoint_materialize_creates_independent_workspace"
           ],
           "exit_code": 0,
-          "duration_s": 1.806,
-          "tail": "...                                                                      [100%]\n3 passed in 1.08s\n"
+          "duration_s": 1.11,
+          "tail": "...                                                                      [100%]\n3 passed in 0.68s\n"
         }
       ],
-      "duration_s": 1.806,
+      "duration_s": 1.11,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1808,7 +1808,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1822,17 +1822,17 @@
             "tests/unit/causal/test_fork_checkpoint.py::test_fork_task_creation_failure_removes_speculative_session"
           ],
           "exit_code": 0,
-          "duration_s": 3.003,
-          "tail": "..                                                                       [100%]\n2 passed in 2.48s\n"
+          "duration_s": 2.937,
+          "tail": "..                                                                       [100%]\n2 passed in 2.45s\n"
         }
       ],
-      "duration_s": 3.003,
+      "duration_s": 2.937,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1846,7 +1846,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1860,17 +1860,17 @@
             "tests/unit/capabilities/test_environment.py::test_database_read_connection_cannot_attach_or_mutate"
           ],
           "exit_code": 0,
-          "duration_s": 0.441,
-          "tail": "..                                                                       [100%]\n2 passed in 0.06s\n"
+          "duration_s": 0.451,
+          "tail": "..                                                                       [100%]\n2 passed in 0.04s\n"
         }
       ],
-      "duration_s": 0.441,
+      "duration_s": 0.451,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1884,7 +1884,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1896,17 +1896,17 @@
             "tests/integration/test_skill_injection.py::test_skill_injected_when_trigger_in_objective"
           ],
           "exit_code": 0,
-          "duration_s": 1.207,
-          "tail": ".                                                                        [100%]\n1 passed in 0.74s\n"
+          "duration_s": 1.163,
+          "tail": ".                                                                        [100%]\n1 passed in 0.73s\n"
         }
       ],
-      "duration_s": 1.207,
+      "duration_s": 1.163,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1920,7 +1920,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1934,17 +1934,17 @@
             "tests/unit/capabilities/test_watch.py::test_process_exit_observation_is_one_shot_and_truthful"
           ],
           "exit_code": 0,
-          "duration_s": 0.46,
+          "duration_s": 0.489,
           "tail": "..                                                                       [100%]\n2 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.46,
+      "duration_s": 0.489,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1958,7 +1958,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -1972,17 +1972,17 @@
             "tests/crash/test_hard_crash_recovery.py::test_worker_parallelism_real"
           ],
           "exit_code": 0,
-          "duration_s": 6.466,
-          "tail": "..                                                                       [100%]\n2 passed in 5.99s\n"
+          "duration_s": 5.124,
+          "tail": "..                                                                       [100%]\n2 passed in 4.64s\n"
         }
       ],
-      "duration_s": 6.466,
+      "duration_s": 5.124,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -1996,7 +1996,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2012,17 +2012,17 @@
             "tests/crash/test_task_recovery.py::test_mutation_intent_wal_survives_crash"
           ],
           "exit_code": 0,
-          "duration_s": 12.353,
-          "tail": "...                                                                      [100%]\n3 passed in 11.94s\n"
+          "duration_s": 9.906,
+          "tail": "...                                                                      [100%]\n3 passed in 9.48s\n"
         }
       ],
-      "duration_s": 12.353,
+      "duration_s": 9.907,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2036,7 +2036,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2050,17 +2050,17 @@
             "tests/crash/test_scheduler_recovery.py::test_job_not_fired_before_stop_fires_after_restart"
           ],
           "exit_code": 0,
-          "duration_s": 5.285,
-          "tail": "..                                                                       [100%]\n2 passed in 4.85s\n"
+          "duration_s": 3.982,
+          "tail": "..                                                                       [100%]\n2 passed in 3.60s\n"
         }
       ],
-      "duration_s": 5.285,
+      "duration_s": 3.982,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2074,7 +2074,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2090,17 +2090,17 @@
             "tests/unit/state/test_external_effects.py::test_recovery_provenance_survives_durable_restart"
           ],
           "exit_code": 0,
-          "duration_s": 0.697,
-          "tail": ".....                                                                    [100%]\n5 passed in 0.05s\n"
+          "duration_s": 0.445,
+          "tail": ".....                                                                    [100%]\n5 passed in 0.04s\n"
         }
       ],
-      "duration_s": 0.697,
+      "duration_s": 0.445,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2114,7 +2114,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2128,17 +2128,17 @@
             "tests/unit/cli/test_oi_stream.py::test_oi_viewer_does_not_write_to_process_stdout"
           ],
           "exit_code": 0,
-          "duration_s": 1.694,
-          "tail": "..                                                                       [100%]\n2 passed in 0.23s\n"
+          "duration_s": 0.492,
+          "tail": "..                                                                       [100%]\n2 passed in 0.06s\n"
         }
       ],
-      "duration_s": 1.694,
+      "duration_s": 0.492,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2152,7 +2152,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2166,17 +2166,17 @@
             "tests/unit/cli/test_surface.py::test_direct_shell_escape_uses_the_same_execution_surface"
           ],
           "exit_code": 0,
-          "duration_s": 1.914,
-          "tail": "..                                                                       [100%]\n2 passed in 0.07s\n"
+          "duration_s": 0.42,
+          "tail": "..                                                                       [100%]\n2 passed in 0.05s\n"
         }
       ],
-      "duration_s": 1.914,
+      "duration_s": 0.42,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2190,7 +2190,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2206,17 +2206,17 @@
             "tests/unit/service/test_operator_views.py::test_operator_artifacts_empty"
           ],
           "exit_code": 0,
-          "duration_s": 2.794,
-          "tail": "...                                                                      [100%]\n3 passed in 2.25s\n"
+          "duration_s": 2.445,
+          "tail": "...                                                                      [100%]\n3 passed in 2.02s\n"
         }
       ],
-      "duration_s": 2.794,
+      "duration_s": 2.445,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2234,18 +2234,18 @@
             "capability_fabric"
           ],
           "exit_code": 0,
-          "duration_s": 357.08,
-          "tail": "render-demo: tape=demos/capability_fabric.tape timeout=420s temp=demos/.capability_fabric.HwBJ5S.gif\nrender-demo: vhs exited rc=0 after 355s\nrender-demo: validated demos/.capability_fabric.HwBJ5S.gif \u2014 1280x720, 93.840s, 2346 frames\nrender-demo: published demos/capability_fabric.gif\n",
+          "duration_s": 299.293,
+          "tail": "render-demo: tape=demos/capability_fabric.tape timeout=420s temp=demos/.capability_fabric.Z4gHWa.gif\nrender-demo: vhs exited rc=0 after 298s\nrender-demo: validated demos/.capability_fabric.Z4gHWa.gif \u2014 1280x720, 94.240s, 2356 frames\nrender-demo: published demos/capability_fabric.gif\n",
           "probe_exit": "success"
         }
       ],
-      "duration_s": 357.081,
+      "duration_s": 299.294,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "Probe contract (scripts/render-demo header): 0 success; 2 tool/argument error (e.g. vhs missing \u2014 treated as 'skipped', not a failure); 3 timeout; 4 vhs failure; 5 artifact validation failure. Artifact-existence alone is never accepted as completion. FIXED (2026-08-26): the width/height check previously read inside the ASCII 'GIF89a' header (bytes 2-3/3-4) instead of the Logical Screen Descriptor (bytes 6-9), and the frame count used `-c copy` which never decodes frames. Both repaired: dimensions read from offsets 6-7/8-9, frames decoded with the LAST frame=N progress value. Probe validates end-to-end: 1280x720, a readable ~90s recording, and a non-zero decoded frame count."
@@ -2260,7 +2260,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2272,17 +2272,17 @@
             "tests/unit/capabilities/test_synthesis_capability.py::test_synthesis_create_uses_canonical_dispatcher"
           ],
           "exit_code": 0,
-          "duration_s": 1.614,
-          "tail": ".                                                                        [100%]\n1 passed in 0.48s\n"
+          "duration_s": 1.447,
+          "tail": ".                                                                        [100%]\n1 passed in 0.50s\n"
         }
       ],
-      "duration_s": 1.615,
+      "duration_s": 1.448,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "demos/capability_fabric_demo.py drives the same capability-fabric path (fixtures in demos/fixtures/capability_fabric.jsonl) that this bound test pins; the tape renders that driver."
@@ -2297,7 +2297,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2315,17 +2315,17 @@
             "tests/unit/scripts/test_render_demo_validation.py::test_published_demo_gif_has_correct_header"
           ],
           "exit_code": 0,
-          "duration_s": 1.181,
-          "tail": "....                                                                     [100%]\n4 passed in 0.05s\n"
+          "duration_s": 1.459,
+          "tail": "....                                                                     [100%]\n4 passed in 0.07s\n"
         }
       ],
-      "duration_s": 1.181,
+      "duration_s": 1.459,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       },
       "notes": "FIXED (was declared gap): render-demo's header parsing is pinned at the byte level \u2014 Logical Screen Descriptor offsets 6-9 are the dimensions, the ASCII-header read that caused VHS-001's 14406x14648 failure is asserted to be wrong, and the exact od pipeline the script runs is executed against synthetic bytes."
@@ -2340,7 +2340,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2352,17 +2352,17 @@
             "tests/unit/reality/test_beta_contracts.py::test_reality_classifier_is_deterministic_and_explainable"
           ],
           "exit_code": 0,
-          "duration_s": 0.704,
-          "tail": ".                                                                        [100%]\n1 passed in 0.02s\n"
+          "duration_s": 1.312,
+          "tail": ".                                                                        [100%]\n1 passed in 0.04s\n"
         }
       ],
-      "duration_s": 0.704,
+      "duration_s": 1.312,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2376,7 +2376,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2390,17 +2390,17 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_internal_preimage_cas_refuses_stale_write"
           ],
           "exit_code": 0,
-          "duration_s": 5.085,
-          "tail": "..                                                                       [100%]\n2 passed in 4.39s\n"
+          "duration_s": 9.556,
+          "tail": "..                                                                       [100%]\n2 passed in 8.33s\n"
         }
       ],
-      "duration_s": 5.085,
+      "duration_s": 9.556,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2414,7 +2414,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2426,17 +2426,17 @@
             "tests/unit/capabilities/test_reality_coordinator.py::test_unverified_candidate_yields_partial_not_complete"
           ],
           "exit_code": 0,
-          "duration_s": 2.436,
-          "tail": ".                                                                        [100%]\n1 passed in 1.77s\n"
+          "duration_s": 3.068,
+          "tail": ".                                                                        [100%]\n1 passed in 2.11s\n"
         }
       ],
-      "duration_s": 2.436,
+      "duration_s": 3.068,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2450,7 +2450,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2462,17 +2462,17 @@
             "tests/unit/shadow/test_commit_discard.py::test_commit_through_ask_profile_suspends_instead_of_auto_approving"
           ],
           "exit_code": 0,
-          "duration_s": 4.528,
-          "tail": ".                                                                        [100%]\n1 passed in 3.82s\n"
+          "duration_s": 4.759,
+          "tail": ".                                                                        [100%]\n1 passed in 4.12s\n"
         }
       ],
-      "duration_s": 4.528,
+      "duration_s": 4.759,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2486,7 +2486,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2498,17 +2498,17 @@
             "tests/unit/shadow/test_commit_discard.py::test_commit_returns_conflict_when_reality_drifted"
           ],
           "exit_code": 0,
-          "duration_s": 2.853,
+          "duration_s": 2.832,
           "tail": ".                                                                        [100%]\n1 passed in 2.31s\n"
         }
       ],
-      "duration_s": 2.853,
+      "duration_s": 2.832,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2522,7 +2522,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2534,17 +2534,17 @@
             "tests/unit/shadow/test_shadow_manifest.py::test_shadow_branch_metadata_survives_engine_restart"
           ],
           "exit_code": 0,
-          "duration_s": 0.693,
-          "tail": ".                                                                        [100%]\n1 passed in 0.22s\n"
+          "duration_s": 0.701,
+          "tail": ".                                                                        [100%]\n1 passed in 0.24s\n"
         }
       ],
-      "duration_s": 0.693,
+      "duration_s": 0.701,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2558,7 +2558,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2570,17 +2570,17 @@
             "tests/unit/shadow/test_shadow_manifest.py::test_interrupted_commit_reconciles_without_guessing_outcome"
           ],
           "exit_code": 0,
-          "duration_s": 0.694,
-          "tail": ".                                                                        [100%]\n1 passed in 0.23s\n"
+          "duration_s": 0.703,
+          "tail": ".                                                                        [100%]\n1 passed in 0.21s\n"
         }
       ],
-      "duration_s": 0.694,
+      "duration_s": 0.703,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2594,7 +2594,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2606,17 +2606,17 @@
             "tests/unit/reality/test_beta_contracts.py::test_restart_completion_refuses_final_workspace_drift"
           ],
           "exit_code": 0,
-          "duration_s": 0.517,
-          "tail": ".                                                                        [100%]\n1 passed in 0.05s\n"
+          "duration_s": 0.498,
+          "tail": ".                                                                        [100%]\n1 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.517,
+      "duration_s": 0.498,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2630,7 +2630,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2642,17 +2642,17 @@
             "tests/unit/capabilities/test_reality_gate_escalation.py::test_transactional_checkpoints_real_workspace_and_compensates"
           ],
           "exit_code": 0,
-          "duration_s": 1.38,
-          "tail": ".                                                                        [100%]\n1 passed in 0.89s\n"
+          "duration_s": 1.304,
+          "tail": ".                                                                        [100%]\n1 passed in 0.81s\n"
         }
       ],
-      "duration_s": 1.38,
+      "duration_s": 1.304,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2666,7 +2666,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2678,17 +2678,17 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_transaction_compensation_refuses_unrelated_drift_after_owned_write"
           ],
           "exit_code": 0,
-          "duration_s": 1.096,
-          "tail": ".                                                                        [100%]\n1 passed in 0.59s\n"
+          "duration_s": 1.051,
+          "tail": ".                                                                        [100%]\n1 passed in 0.55s\n"
         }
       ],
-      "duration_s": 1.096,
+      "duration_s": 1.051,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2702,7 +2702,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2714,17 +2714,17 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_rollback_refuses_to_overwrite_external_edit"
           ],
           "exit_code": 0,
-          "duration_s": 0.526,
+          "duration_s": 0.567,
           "tail": ".                                                                        [100%]\n1 passed in 0.03s\n"
         }
       ],
-      "duration_s": 0.526,
+      "duration_s": 0.567,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2738,7 +2738,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2750,17 +2750,17 @@
             "tests/unit/shadow/test_commit_discard.py::test_commit_retains_and_reports_unsupported_symlink"
           ],
           "exit_code": 0,
-          "duration_s": 1.762,
-          "tail": ".                                                                        [100%]\n1 passed in 1.27s\n"
+          "duration_s": 1.872,
+          "tail": ".                                                                        [100%]\n1 passed in 1.33s\n"
         }
       ],
-      "duration_s": 1.762,
+      "duration_s": 1.872,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2774,7 +2774,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2786,17 +2786,17 @@
             "tests/unit/capabilities/test_reality_gate.py::test_opaque_execution_cannot_write_the_real_workspace"
           ],
           "exit_code": 0,
-          "duration_s": 0.94,
-          "tail": ".                                                                        [100%]\n1 passed in 0.44s\n"
+          "duration_s": 0.81,
+          "tail": ".                                                                        [100%]\n1 passed in 0.36s\n"
         }
       ],
-      "duration_s": 0.94,
+      "duration_s": 0.81,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2810,7 +2810,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2822,17 +2822,17 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_transactional_verification_uses_cas_against_verified_revision"
           ],
           "exit_code": 0,
-          "duration_s": 1.715,
-          "tail": ".                                                                        [100%]\n1 passed in 1.15s\n"
+          "duration_s": 1.24,
+          "tail": ".                                                                        [100%]\n1 passed in 0.78s\n"
         }
       ],
-      "duration_s": 1.715,
+      "duration_s": 1.24,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     },
@@ -2846,7 +2846,7 @@
         {
           "kind": "pytest",
           "command": [
-            "/tmp/athena-manifest-env-7413781/bin/python",
+            "/home/bamn/Athena/.venv/bin/python3",
             "-m",
             "pytest",
             "-q",
@@ -2858,17 +2858,17 @@
             "tests/unit/capabilities/test_reality_integrity.py::test_completion_recovery_requires_fingerprint_and_final_identity"
           ],
           "exit_code": 0,
-          "duration_s": 0.817,
-          "tail": ".                                                                        [100%]\n1 passed in 0.09s\n"
+          "duration_s": 0.499,
+          "tail": ".                                                                        [100%]\n1 passed in 0.04s\n"
         }
       ],
-      "duration_s": 0.817,
+      "duration_s": 0.499,
       "source_identity": {
-        "head_sha": "7413781bd86279a358e6b790fae2bd37f0a1ec67",
-        "dirty": false,
-        "status_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "python": "/tmp/athena-manifest-env-7413781/bin/python",
-        "python_version": "3.13.13",
+        "head_sha": "d9d93419fd1c680399f9b952ab1afa60af2f08fa",
+        "dirty": true,
+        "status_digest": "b059a2cb4433611e52d4209527e00e58e965dc6a9eabd2d8703e7952ab365409",
+        "python": "/home/bamn/Athena/.venv/bin/python3",
+        "python_version": "3.12.13",
         "platform": "linux"
       }
     }

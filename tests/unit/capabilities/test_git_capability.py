@@ -88,3 +88,30 @@ async def test_git_rejects_paths_outside_routed_workspace(tmp_path):
 
     assert result.status is CapabilityResultStatus.FAILED
     assert "outside" in (result.error or "")
+
+
+async def test_git_reads_candidate_worktree_with_base_git_metadata(tmp_path):
+    source = _repo(tmp_path)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "module.py").write_text("VALUE = 99\n", encoding="utf-8")
+
+    capability = GitCapability(
+        candidate_resolver=lambda task_id: {
+            "base_root": str(tmp_path),
+            "candidate_root": str(candidate),
+            "branch_id": "shadow-task",
+        }
+    )
+    result = await capability.invoke(
+        _request("diff", path="module.py"),
+        context=type(
+            "Context", (), {"workspace": WorkspaceSpec(id="candidate", root=str(candidate))}
+        )(),
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    assert "-VALUE = 1" in result.output
+    assert "+VALUE = 99" in result.output
+    assert result.metadata["candidate_view"] is True
+    assert source.read_text(encoding="utf-8") == "VALUE = 2\n"

@@ -172,76 +172,65 @@ class Mascot:
         ),
         "thinking": (
             r"""
-      ╔══════╗
-      ║ ◉ ▄ ◉║   ∿∿∿
-      ║  ‗‗  ║  ∿∿∿  ideas
-      ╚══════╝   ⚡
+       ,___,    ∿∿∿
+       (◉,◉)   ∿∿∿ forming…
+       /)_)   ⚡
       """,
             r"""
-      ╔══════╗
-      ║ ◎ ≈ ◎║ ~ ∿∿
-      ║  ‗‗  ║  ∿∿∿  forming…
-      ╚══════╝   ⚡
+       ,___,   ~∿∿
+       (◦,◦)   ∿∿∿ ideas
+       /)_)  ⚡
       """,
         ),
         "executing": (
             r"""
-        ▄▄▄▄▄
-       █ ◉_◉ █    ▤▤▓▒
-       █  ▽  █ ▧▤▓▒▒ running
-        ▀▀▀▀▀
+       ,___,   ▤▓▒
+       (◉‿◉)  ▤▓▒▒ running
+       /|_\   ▒▓▤ hacking
       """,
             r"""
-        ▄▄▄▄▄
-       █ ◉^◉ █    ▒▒▓▤
-       █  ≡  █ ▒▒▓▤▧ hacking
-        ▀▀▀▀▀
+       ,___,  ▒▓▤
+       (^,^)  ▒▓▒▒ pouncing
+       /|_\  ▤▓▧
       """,
         ),
         "waiting": (
             r"""
-        ▄▄▄▄▄
-       █ ⊙︵⊙ █
-       █  ▽  █   ⏸ awaiting permission
-        ‛‛‛‛‛
+       ,___,
+       (⊙,⊙)  ⏸ awaiting
+       /)_)  permission…
       """,
             r"""
-        ▄▄▄▄▄
-       █ ⊙‿⊙ █
-       █  ⌣  █   ⏸ may i?
-        ‛‛‛‛‛
+       ,___,
+       (•,•)  ⏸ may I?
+       /)_)  pretty please?
       """,
         ),
         "done": (
             r"""
-        ▄▄▄▄▄
-       █ ★‿★ █
-       █  ◡  █   ✓ complete
-        ▀▀▀▀▀
+       ,___,
+       (★,★)  ✓ caught it
+       /)_)  purr…
       """,
             r"""
-        ▄▄▄▄▄
-       █ ^‿^ █
-       █  ◡  █   ✓ done!
-        ▀▀▀▀▀
+       ,___,
+       (^,^)  ✓ done!
+       /)_)  ∿
       """,
         ),
         "failed": (
             r"""
-        ▄▄▄▄▄
-       █ ✕︵✕ █
-       █  ─  █   ✗ oops
-        ▀▀▀▀▀
+       ,___,  ✗ oops
+       (✕,✕)
+       /)_)  ears flat
       """,
             r"""
-        ▄▄▄▄▄
-       █ ✕﹏✕ █
-       █  ˘  █   ✗ failed
-        ▀▀▀▀▀
+       ,___,  ✗ mrow.
+       (✕,✕)
+       /)_)  ears flat
       """,
         ),
     }
-
     CAT_FRAMES = {
         "idle": (
             r"""
@@ -782,7 +771,7 @@ class DualPaneSurface(OperatorSurface):
         self.set_mascot(resolve_mascot_name(mascot))
         self._term_cols, self._term_rows = self._terminal_size()
         self.display_requested = str(display or os.environ.get("ATHENA_DISPLAY") or "auto").lower()
-        self.model_label = model_label or os.environ.get("OPENROUTER_MODEL", "local / fake-1")
+        self.model_label = (model_label or os.environ.get("OPENROUTER_MODEL") or "—").strip() or "—"
         self.layout = compute_layout(self._term_cols, self._term_rows, self.display_requested)
         self._kitty_confirmed = os.environ.get("ATHENA_KITTY_CONFIRMED", "").lower() in {
             "1",
@@ -1073,9 +1062,11 @@ class DualPaneSurface(OperatorSurface):
             super()._render_approval(payload)
 
     # -- canonical event projection -------------------------------------
-    def _ingest_event(self, etype: str, payload: dict[str, Any]) -> None:
+    def _ingest_event(
+        self, etype: str, payload: dict[str, Any], *, task_id: str | None = None
+    ) -> None:
         """Reduce canonical events once, then update presentation-only tails."""
-        self.projection.reduce(etype, payload)
+        self.projection.reduce(etype, payload, task_id=task_id)
         self.mascot.observe(etype, payload)
         if etype == "ExecutionStarted":
             self.window.feed(f"$ {_terminal_text(payload.get('runtime') or 'runtime')}\n")
@@ -1089,7 +1080,7 @@ class DualPaneSurface(OperatorSurface):
         payload = dict(getattr(event, "payload", {}) or {})
         if self._full_screen:
             self._refresh_terminal_size()
-        self._ingest_event(etype, payload)
+        self._ingest_event(etype, payload, task_id=getattr(event, "task_id", None))
 
         # In a composed TTY, details mode means expandable thinking content,
         # not raw token output.  Preserve the inherited buffer semantics.
@@ -1352,58 +1343,154 @@ class DualPaneSurface(OperatorSurface):
         )
         lines[2] = self._fit("─" * max(cols - 4, 1), cols)
 
-        op_y, op_h = layout.operator.y, layout.operator.height
-        op_inner_h, oi_inner_h = max(op_h - 3, 1), max(layout.oi.height - 2, 1)
-        op_inner_w, oi_inner_w = max(left_w - 2, 1), max(right_w - 2, 1)
-        left = self._left_lines(op_inner_h, op_inner_w)
-        right = self._right_lines(oi_inner_h, oi_inner_w)
-        left_title = (
-            "CONVERSATION  ·  history" if self._left_scroll else "CONVERSATION  ·  calm transcript"
-        )
+        # Outer aperture geometry drives the shared chassis box.
+        # outer_operator / outer_oi include the one-cell aperture rim on
+        # every side; inner content area = outer minus rim (2 cells total).
+        outer_op = layout.outer_operator
+        outer_oi = layout.outer_oi
+        chassis_top = outer_op.y
+        chassis_height = outer_op.height
+        chassis_bot = chassis_top + chassis_height - 1  # inclusive bottom row
+        inner_h = max(chassis_height - 2, 1)  # body rows between rim top/bottom
+        inner_w_left = max(left_w - 2, 1)  # rim removes │ on each side
+        inner_w_right = max(right_w - 2, 1)
+        left = self._left_lines(inner_h, inner_w_left)
+        right = self._right_lines(inner_h, inner_w_right)
         right_title = "OI // HISTORY" if self._right_scroll else "ATHENA OI // GLASS COMPUTE"
         cabinet_x = max(layout.operator.x - 1, 0)
         seam = max(self.PANE_GAP - 2, 0)
         prefix = " " * cabinet_x
-
-        # The two apertures are recesses in one instrument chassis.  Keep the
-        # seam deliberately quiet: a conventional TUI box around each side
-        # makes the surface read as two unrelated applications.  The block
-        # seam is cabinet relief, not a third pane.
         seam_fill = "░" * max(seam, 1)
+        chassis_total_width = outer_op.width + len(seam_fill) + outer_oi.width + 2
 
-        def cabinet_row(left_value: str, right_value: str) -> str:
-            left_panel = "▐" + self._fit(left_value, op_inner_w) + "▌"
-            right_panel = "▐" + self._fit(right_value, oi_inner_w) + "▌"
-            return prefix + "│" + left_panel + seam_fill + right_panel + "│"
+        # Asymmetric apertures — one recessed, one flush.
+        # Left (operator) is recessed/inset: ╓─╖ top, │ walls, ╙─╜ bottom.
+        #    The corner characters create visual depth — the panel appears
+        #    sunk into the chassis bezel.
+        # Right (OI) is flush/non-recessed: ── top, │ walls, ── bottom.
+        #    Straight borders with no corner curves; the panel sits flush
+        #    on the chassis surface.
+        # Both apertures share equal logical width/height; only visual framing
+        # differs.  Outer chassis box (╭─╮ / ╰─╯) still spans both.
+        #
+        # Row layout inside outer chassis (derived from outer_operator /
+        # outer_oi):
+        #   chassis_top      : ╭────────╮ outer chassis top (spans both)
+        #   chassis_top + 1  : ╓─╖ left recessed top  |  ──── right flush top
+        #   chassis_top + 2… : │ content │  |  │ content │ (body rows)
+        #   chassis_top+inner_h-1: ╙─╜ left recessed bottom |  ── right flush bottom
+        #   chassis_bot      : ╰────────╯ outer chassis bottom (spans both)
 
-        top = prefix + "╭" + "─" * (left_w + len(seam_fill) + right_w + 2) + "╮"
-        bottom = prefix + "╰" + "─" * (left_w + len(seam_fill) + right_w + 2) + "╯"
-        lines[op_y] = self._fit(top, cols)
-        lines[op_y + 1] = self._fit(cabinet_row(left_title, right_title), cols)
-        for index in range(op_inner_h):
-            row = op_y + 2 + index
+        def left_body_row(left_value: str) -> str:
+            """Recessed body row — │ walls, no corner characters."""
+            return prefix + "│" + self._fit(left_value, inner_w_left) + "│"
+
+        def right_body_row(right_value: str) -> str:
+            """Flush body row — │ walls, no bevels or inset corners."""
+            return prefix + "│" + self._fit(right_value, inner_w_right) + "│"
+
+        # Outer chassis top — spans both apertures
+        top_line = prefix + "╭" + "─" * chassis_total_width + "╮"
+        lines[chassis_top] = self._fit(top_line, cols)
+
+        # Title row: left recessed inset corners, right flush edge
+        lines[chassis_top + 1] = self._fit(
+            (prefix + "╓" + "─" * inner_w_left + "╖")
+            + " "
+            + seam_fill
+            + " "
+            + right_body_row(right_title),
+            cols,
+        )
+
+        # Content body rows: left recessed │, right flush │
+        for index in range(inner_h):
+            row = chassis_top + 2 + index
+            if row >= chassis_bot:
+                # Outer chassis bottom; skip
+                break
+            left_content = left[index] if index < len(left) else ""
+            right_content = right[index] if index < len(right) else ""
             lines[row] = self._fit(
-                cabinet_row(
-                    left[index] if index < len(left) else "",
-                    right[index] if index < len(right) else "",
-                ),
+                left_body_row(left_content) + " " + right_body_row(right_content),
                 cols,
             )
-        lines[op_y + op_h - 1] = self._fit(bottom, cols)
+
+        # Recessed bottom corner for left on the last inner content row
+        # (the row just before the outer chassis bottom)
+        last_inner_row = chassis_top + inner_h - 1
+        if last_inner_row > chassis_top + 1 and last_inner_row < chassis_bot:
+            left_bottom = prefix + "╙" + "─" * inner_w_left + "╜"
+            right_bottom = prefix + "│" + "─" * inner_w_right + "│"
+            lines[last_inner_row] = self._fit(left_bottom + " " + right_bottom, cols)
+
+        # Outer chassis bottom — spans both apertures
+        bottom_line = prefix + "╰" + "─" * chassis_total_width + "╯"
+        lines[chassis_bot] = self._fit(bottom_line, cols)
 
         controls_y = layout.controls.y
-        lamps = (
-            "SYS ●   NET ●   IO ●   MODEL "
-            + self._fit(self.model_label, 20)
-            + f"   TASK {self.projection.status}"
-        )
+        compact = cols < 120
+
+        # ── Hardware rail: 4 rows (2 when compact) ──────────────────────
+        # Row 0: top separator
         lines[controls_y] = self._fit("─" * max(cols - 4, 1), cols)
-        lines[controls_y + 1] = self._fit(lamps, cols)
-        prompt_y = layout.prompt.y
-        prompt = self._prompt_text or "type a request · /help for controls"
-        lines[prompt_y] = self._fit("─" * max(cols - 4, 1), cols)
-        if prompt_y + 1 < rows:
-            lines[prompt_y + 1] = self._fit(f"❯ {prompt}    Ctrl-C cancel · Ctrl-D exit", cols)
+
+        # Row 1: measured application state.  This is a terminal surface, not
+        # a hardware telemetry bus: never present display availability as a
+        # network/system sensor or imply that a configured model is active.
+        surface = "GLASS" if self._full_screen and self.display == "glass" else self.display.upper()
+        oi_state = "ON" if self.oi_enabled else "OFF"
+        model_state = self._fit(self.model_label, 18) if self.model_label else "unconfigured"
+        state_line = (
+            f"TASK {self.projection.status}  SURFACE {surface}  OI {oi_state}  MODEL {model_state}"
+        )
+        lines[controls_y + 1] = self._fit(state_line, cols)
+
+        # Row 2 (compact: skipped): activity + model area
+        # RUNNING indicator, unavailable hardware controls, and view identity.
+        if not compact:
+            running = self.projection.status in {
+                "EXECUTING",
+                "THINKING",
+                "RESPONDING",
+                "SEARCHING",
+                "READING",
+                "INSPECTING",
+                "TOOLS",
+                "APPROVAL",
+                "DELEGATED",
+            }
+            run_indicator = "●" if running else "◌"
+            status_short = self.projection.status[:6].ljust(6)
+            identity = f"ATHENA  {status_short}  {run_indicator}"
+            # BRIGHTNESS / FOCUS have no hardware backing in this context;
+            # render neutral unavailable labels rather than fake data. VIEW
+            # is the actual frontend state, not a fictional power sensor.
+            cluster = "BRIGHT —  FOCUS —"
+            view = (
+                "GLASS" if self._full_screen and self.display == "glass" else self.display.upper()
+            )
+            lines[controls_y + 2] = self._fit(f"{identity}  {cluster}  VIEW {view}", cols)
+
+            # Row 3: prompt separator + prompt text — write into the real
+            # prompt area from layout, not into rail slots.
+            prompt_y = layout.prompt.y
+            lines[prompt_y] = self._fit("─" * max(cols - 4, 1), cols)
+            if prompt_y + 1 < rows:
+                prompt_text = self._prompt_text or "type a request · /help for controls"
+                lines[prompt_y + 1] = self._fit(
+                    f"❯ {prompt_text}    Ctrl-C cancel · Ctrl-D exit", cols
+                )
+        else:
+            # Compact: 2-row rail — lamps on row 1, prompt separator + text
+            # into the real prompt area from layout (not into rail slots).
+            prompt_y = layout.prompt.y
+            if prompt_y < rows:
+                lines[prompt_y] = self._fit("─" * max(cols - 4, 1), cols)
+            if prompt_y + 1 < rows:
+                prompt_text = self._prompt_text or "type a request · /help for controls"
+                lines[prompt_y + 1] = self._fit(f"❯ {prompt_text}", cols)
+
         return lines
 
     def repaint_oi(self, *, force: bool = False) -> None:

@@ -7,7 +7,6 @@ the explicit read operations below are exposed to the model.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import subprocess
@@ -86,6 +85,10 @@ class GitCapability:
         origin=CapabilityOrigin.NATIVE,
     )
 
+    def __init__(self, candidate_resolver=None) -> None:
+        """Optionally resolve a task's base Git directory and candidate tree."""
+        self._candidate_resolver = candidate_resolver
+
     async def invoke(self, request: CapabilityRequest, *, context=None, **_) -> CapabilityResult:
         args = dict(request.arguments or {})
         operation = str(args.get("operation") or "")
@@ -94,17 +97,42 @@ class GitCapability:
         if not root or not os.path.isdir(root):
             return _result(request, ok=False, error="workspace root is unavailable")
 
+        git_dir = None
+        candidate = None
+        if self._candidate_resolver is not None and request.task_id:
+            candidate = self._candidate_resolver(request.task_id)
+        if candidate:
+            base_root = os.path.realpath(os.path.abspath(str(candidate["base_root"])))
+            candidate_root = os.path.realpath(os.path.abspath(str(candidate["candidate_root"])))
+            if not os.path.isdir(base_root) or not os.path.isdir(candidate_root):
+                return _result(request, ok=False, error="candidate Git view is unavailable")
+            git_dir = _git_dir(base_root)
+            if git_dir is None:
+                return _result(request, ok=False, error="candidate base is not a Git checkout")
+            root = candidate_root
+
         try:
-            command = self._command(operation, args, root)
+            command = self._command(operation, args, root, git_dir=git_dir)
         except ValueError as exc:
             return _result(request, ok=False, error=str(exc))
-        loop = asyncio.get_running_loop()
-        rc, stdout, stderr = await loop.run_in_executor(None, lambda: _run_git(command, root))
+        # Git is a bounded, read-only observation (15 seconds max). Keeping
+        # its process wait in this capability avoids inheriting the host's
+        # default executor/fork policy, which can deadlock on locked-down
+        # runtimes before Git ever starts.
+        rc, stdout, stderr = _run_git(command, root, candidate_view=git_dir is not None)
         metadata = {
             "operation": operation,
             "returncode": rc,
             "workspace_root": root,
         }
+        if candidate:
+            metadata.update(
+                {
+                    "candidate_view": True,
+                    "base_workspace_root": base_root,
+                    "branch_id": candidate.get("branch_id"),
+                }
+            )
         if rc != 0:
             return _result(
                 request,
@@ -116,7 +144,17 @@ class GitCapability:
         return _result(request, ok=True, output=stdout, metadata=metadata)
 
     @classmethod
-    def _command(cls, operation: str, args: dict[str, Any], root: str) -> list[str]:
+    def _command(
+        cls,
+        operation: str,
+        args: dict[str, Any],
+        root: str,
+        *,
+        git_dir: str | None = None,
+    ) -> list[str]:
+        prefix = ["git"]
+        if git_dir is not None:
+            prefix.extend(["--git-dir", git_dir, "--work-tree", root])
         path = args.get("path")
         if path is not None:
             path = cls._workspace_path(str(path), root)
@@ -125,9 +163,9 @@ class GitCapability:
             path_arg = None
 
         if operation == "status":
-            return ["git", "status", "--porcelain=v1", "--branch"]
+            return [*prefix, "status", "--porcelain=v1", "--branch"]
         if operation == "diff":
-            command = ["git", "diff"]
+            command = [*prefix, "diff"]
             if args.get("cached"):
                 command.append("--cached")
             if path_arg is not None:
@@ -135,7 +173,7 @@ class GitCapability:
             return command
         if operation == "log":
             command = [
-                "git",
+                *prefix,
                 "log",
                 f"-n{int(args.get('limit') or 20)}",
                 "--date=iso-strict",
@@ -146,7 +184,7 @@ class GitCapability:
             return command
         if operation == "show":
             ref = cls._ref(args.get("ref") or "HEAD")
-            command = ["git", "show", "--stat", "--oneline", ref]
+            command = [*prefix, "show", "--stat", "--oneline", ref]
             if path_arg is not None:
                 command.extend(["--", path_arg])
             return command
@@ -157,16 +195,16 @@ class GitCapability:
             end = int(args.get("end") or start + 99)
             if end < start:
                 raise ValueError("blame end must be greater than or equal to start")
-            return ["git", "blame", "-L", f"{start},{end}", "--", path_arg]
+            return [*prefix, "blame", "-L", f"{start},{end}", "--", path_arg]
         if operation == "branch":
-            return ["git", "branch", "--show-current"]
+            return [*prefix, "branch", "--show-current"]
         if operation == "merge_base":
             first = cls._ref(args.get("ref") or "HEAD")
             second = cls._ref(args.get("other_ref") or "HEAD~1")
-            return ["git", "merge-base", first, second]
+            return [*prefix, "merge-base", first, second]
         if operation == "baseline":
             return [
-                "git",
+                *prefix,
                 "rev-parse",
                 "--show-toplevel",
                 "HEAD",
@@ -192,8 +230,33 @@ class GitCapability:
         return candidate
 
 
-def _run_git(command: list[str], root: str) -> tuple[int, str, str]:
+def _git_dir(base_root: str) -> str | None:
+    dot_git = os.path.join(base_root, ".git")
+    if os.path.isdir(dot_git):
+        return dot_git
+    if os.path.isfile(dot_git):
+        try:
+            with open(dot_git, encoding="utf-8") as handle:
+                marker = handle.read().strip()
+        except OSError:
+            return None
+        if marker.startswith("gitdir:"):
+            value = marker.split(":", 1)[1].strip()
+            return os.path.realpath(os.path.join(base_root, value))
+    return None
+
+
+def _run_git(
+    command: list[str],
+    root: str,
+    *,
+    candidate_view: bool = False,
+) -> tuple[int, str, str]:
     try:
+        environment = None
+        if candidate_view:
+            environment = os.environ.copy()
+            environment["GIT_OPTIONAL_LOCKS"] = "0"
         completed = subprocess.run(
             command,
             cwd=root,
@@ -201,6 +264,7 @@ def _run_git(command: list[str], root: str) -> tuple[int, str, str]:
             text=True,
             timeout=15,
             check=False,
+            env=environment,
         )
         return completed.returncode, completed.stdout, completed.stderr
     except subprocess.TimeoutExpired:

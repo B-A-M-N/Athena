@@ -223,6 +223,70 @@ async def test_discard_and_commit_remove_shadow_workspace(service):
     assert any(r["operation"] == "write" and r["resource"].endswith("kept.py") for r in rows)
 
 
+async def test_operator_can_review_and_apply_retained_candidate(service):
+    svc, ws = service
+    task_id = await _real_task(svc, ws)
+    engine = svc.shadow_engine()
+
+    branch = await engine.open_branch(
+        task_id=task_id,
+        base_workspace=ws,
+        proposal=[_write_prop("reviewed.py", "candidate\n")],
+    )
+    branch = await engine.execute_branch(branch, profile="autonomous")
+    await engine.record_verification(branch, [{"id": "ac", "passed": True}])
+    svc._reality_gate.activate_branch(branch)
+
+    review = await svc.operator_candidate(task_id)
+    assert review is not None
+    assert review["status"] == BranchStatus.VERIFIED
+    assert review["changed_resources"][0]["path"] == "reviewed.py"
+    assert not (Path(ws.root) / "reviewed.py").exists()
+
+    outcome = await svc.apply_candidate(task_id)
+    assert outcome["status"] == "committed"
+    assert (Path(ws.root) / "reviewed.py").read_text() == "candidate\n"
+    assert await svc.operator_candidate(task_id) is None
+
+
+async def test_operator_cannot_apply_failed_candidate(service):
+    svc, ws = service
+    task_id = await _real_task(svc, ws)
+    engine = svc.shadow_engine()
+
+    branch = await engine.open_branch(
+        task_id=task_id,
+        base_workspace=ws,
+        proposal=[_write_prop("rejected.py", "candidate\n")],
+    )
+    branch = await engine.execute_branch(branch, profile="autonomous")
+    await engine.record_verification(branch, [{"id": "ac", "passed": False}])
+
+    refused = await svc.apply_candidate(task_id)
+    assert refused["status"] == "missing"
+    assert not (Path(ws.root) / "rejected.py").exists()
+
+
+async def test_operator_can_discard_unapplied_candidate(service):
+    svc, ws = service
+    task_id = await _real_task(svc, ws)
+    engine = svc.shadow_engine()
+
+    branch = await engine.open_branch(
+        task_id=task_id,
+        base_workspace=ws,
+        proposal=[_write_prop("discarded.py", "candidate\n")],
+    )
+    review = await svc.operator_candidate(task_id)
+    assert review is not None
+    assert review["status"] == BranchStatus.PROPOSED
+
+    discarded = await svc.discard_candidate(task_id)
+    assert discarded["status"] == "discarded"
+    assert not Path(branch.shadow_workspace.root).exists()
+    assert await svc.operator_candidate(task_id) is None
+
+
 async def test_commit_deletion_requires_approval_and_never_lands_unapproved(service):
     """Deletions are ASK under every autonomy profile: a shadow branch that
     removed a file can never silently delete it from reality at commit.

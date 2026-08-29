@@ -20,7 +20,10 @@ use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
 
 use athena_terminal::NativeTerminalCore;
 
-use crate::{Projection, ProjectionCodeView, ProjectionEntity, ProjectionFrame, apply_available};
+use crate::{
+    Projection, ProjectionCodeView, ProjectionEntity, ProjectionFrame, ProjectionOperation,
+    ProjectionTreeNode, apply_available,
+};
 
 type Display = c_void;
 type Window = c_ulong;
@@ -64,6 +67,8 @@ const CONTROL_MASK: CUint = 1 << 2;
 const BUTTON1_MASK: CUint = 1 << 8;
 const CURRENT_TIME: c_ulong = 0;
 const PROP_MODE_REPLACE: c_int = 0;
+const CELL_WIDTH: i32 = 9;
+const CELL_HEIGHT: i32 = 18;
 
 #[repr(C)]
 struct XVisualInfo {
@@ -358,6 +363,64 @@ struct Clipboard {
     atom: Atom,
     property: Atom,
     text: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameGeometry {
+    width: i32,
+    height: i32,
+    left_x: f32,
+    body_y: f32,
+    body_height: f32,
+    aperture_width: f32,
+}
+
+impl FrameGeometry {
+    fn new(width: i32, height: i32) -> Self {
+        let margin = 18.0_f32;
+        let gap = 18.0_f32;
+        let header = 48.0_f32;
+        let rail = 52.0_f32;
+        let body_y = header + 12.0;
+        let body_height = (height as f32 - body_y - rail).max(80.0);
+        let aperture_width = ((width as f32 - margin * 2.0 - gap) / 2.0).max(80.0);
+        Self {
+            width,
+            height,
+            left_x: margin,
+            body_y,
+            body_height,
+            aperture_width,
+        }
+    }
+
+    fn right_x(&self) -> f32 {
+        self.left_x + self.aperture_width + 18.0
+    }
+
+    fn operator_origin(&self) -> (i32, i32) {
+        (self.left_x as i32 + 12, self.body_y as i32 + 36)
+    }
+
+    fn cell_at(&self, x: i32, y: i32) -> Option<(usize, usize)> {
+        let (content_x, content_y) = self.operator_origin();
+        let max_x = self.left_x as i32 + self.aperture_width as i32 - 12;
+        let max_y = self.body_y as i32 + self.body_height as i32 - 12;
+        if x < content_x || x >= max_x || y < content_y || y >= max_y {
+            return None;
+        }
+        Some((
+            ((x - content_x) / CELL_WIDTH) as usize,
+            ((y - content_y) / CELL_HEIGHT) as usize,
+        ))
+    }
+
+    fn terminal_size(&self) -> (usize, usize) {
+        (
+            (self.width / CELL_WIDTH).max(1) as usize,
+            (self.height / CELL_HEIGHT).max(1) as usize,
+        )
+    }
 }
 
 impl Clipboard {
@@ -708,7 +771,9 @@ fn run_window(
                 BUTTON_PRESS => {
                     let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
                     if button.button == 1 {
-                        if let Some(cell) = cell_at(button.x, button.y, width, height) {
+                        if let Some(cell) =
+                            FrameGeometry::new(width, height).cell_at(button.x, button.y)
+                        {
                             selection = Some((cell, cell));
                         }
                     }
@@ -716,9 +781,10 @@ fn run_window(
                 MOTION_NOTIFY => {
                     let motion = unsafe { &*((&event as *const XEvent).cast::<XMotionEvent>()) };
                     if motion.state & BUTTON1_MASK != 0 {
-                        if let (Some((anchor, _)), Some(cell)) =
-                            (selection, cell_at(motion.x, motion.y, width, height))
-                        {
+                        if let (Some((anchor, _)), Some(cell)) = (
+                            selection,
+                            FrameGeometry::new(width, height).cell_at(motion.x, motion.y),
+                        ) {
                             selection = Some((anchor, cell));
                         }
                     }
@@ -726,9 +792,10 @@ fn run_window(
                 BUTTON_RELEASE => {
                     let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
                     if button.button == 1 {
-                        if let (Some((anchor, _)), Some(cell)) =
-                            (selection, cell_at(button.x, button.y, width, height))
-                        {
+                        if let (Some((anchor, _)), Some(cell)) = (
+                            selection,
+                            FrameGeometry::new(width, height).cell_at(button.x, button.y),
+                        ) {
                             selection = Some((anchor, cell));
                         }
                     }
@@ -770,37 +837,82 @@ fn run_window(
 }
 
 fn resize_terminal(core: &mut NativeTerminalCore, pty: &mut tty::Pty, width: i32, height: i32) {
-    let columns = (width / 9).max(1) as usize;
-    let rows = (height / 18).max(1) as usize;
+    let (columns, rows) = FrameGeometry::new(width, height).terminal_size();
     core.resize(columns, rows);
     pty.on_resize(WindowSize {
         num_cols: columns.min(u16::MAX as usize) as u16,
         num_lines: rows.min(u16::MAX as usize) as u16,
-        cell_width: 9,
-        cell_height: 18,
+        cell_width: CELL_WIDTH as u16,
+        cell_height: CELL_HEIGHT as u16,
     });
 }
-
-fn cell_at(x: c_int, y: c_int, width: i32, height: i32) -> Option<(usize, usize)> {
-    let margin = 18;
-    let gap = 18;
-    let header = 48;
-    let rail = 52;
-    let body_y = header + 12;
-    let body_h = (height - body_y - rail).max(80);
-    let aperture_w = ((width - margin * 2 - gap) / 2).max(80);
-    let left_x = margin;
-    let content_x = left_x + 12;
-    let content_y = body_y + 36;
-    let max_x = left_x + aperture_w - 12;
-    let max_y = body_y + body_h - 12;
-    if x < content_x || x >= max_x || y < content_y || y >= max_y {
-        return None;
+fn operation_progress(operation: &ProjectionOperation) -> String {
+    if !operation.progress_determinate {
+        return if operation.progress.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", operation.progress)
+        };
     }
-    Some((
-        ((x - content_x) / 9) as usize,
-        ((y - content_y) / 18) as usize,
-    ))
+    let Some(value) = operation.progress_value else {
+        return String::new();
+    };
+    let ratio = value.clamp(0.0, 1.0);
+    if ratio.is_nan() {
+        return String::new();
+    }
+    const BAR_WIDTH: usize = 12;
+    let filled = (BAR_WIDTH as f64 * ratio).round() as usize;
+    let filled = filled.min(BAR_WIDTH);
+    format!(
+        " [{}{}]{:.0}%",
+        "\u{2588}".repeat(filled),
+        "\u{2592}".repeat(BAR_WIDTH - filled),
+        ratio * 100.0
+    )
+}
+
+fn diagnostic_text(diagnostic: &crate::ProjectionDiagnostic, message: &str) -> String {
+    let location = if diagnostic.path.is_empty() {
+        diagnostic
+            .line
+            .map_or_else(String::new, |line| format!("line {line}"))
+    } else {
+        format!(
+            "{}{}",
+            diagnostic.path,
+            diagnostic
+                .line
+                .map_or_else(String::new, |line| format!(":{line}"))
+        )
+    };
+    let severity = if diagnostic.severity.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", diagnostic.severity)
+    };
+    let mut detail = Vec::new();
+    if !diagnostic.detail.is_empty() && diagnostic.detail != message {
+        detail.push(diagnostic.detail.clone());
+    }
+    if let Some(expected) = diagnostic.expected.as_ref() {
+        detail.push(format!("expected={expected}"));
+    }
+    if let Some(actual) = diagnostic.actual.as_ref() {
+        detail.push(format!("actual={actual}"));
+    }
+    let mut fields = vec!["!".to_owned()];
+    if !severity.is_empty() {
+        fields.push(severity);
+    }
+    if !location.is_empty() {
+        fields.push(location);
+    }
+    if !message.is_empty() {
+        fields.push(message.to_owned());
+    }
+    fields.extend(detail);
+    fields.join(" ")
 }
 
 fn draw_frame(
@@ -813,6 +925,15 @@ fn draw_frame(
     projection: &Projection,
     selection: Option<((usize, usize), (usize, usize))>,
 ) {
+    let geometry = FrameGeometry::new(width, height);
+    // ProjectionView.mode is the canonical view selector. semantic_state is
+    // retained as a compatibility fallback for older bridge frames, but the
+    // native renderer must not silently maintain a second mode machine.
+    let semantic_mode = if projection.view.mode.is_empty() {
+        projection.semantic_state.as_str()
+    } else {
+        projection.view.mode.as_str()
+    };
     unsafe {
         glViewport(0, 0, width, height);
         glMatrixMode(GL_PROJECTION);
@@ -823,15 +944,13 @@ fn draw_frame(
         glClearColor(0.025, 0.03, 0.07, 1.0);
         glClear(GL_COLOR_BUFFER_BIT);
     }
-    let margin = 18.0_f32;
-    let gap = 18.0_f32;
-    let header = 48.0_f32;
+    let margin = geometry.left_x;
+    let left_x = geometry.left_x;
+    let right_x = geometry.right_x();
+    let body_y = geometry.body_y;
+    let body_h = geometry.body_height;
+    let aperture_w = geometry.aperture_width;
     let rail = 52.0_f32;
-    let body_y = header + 12.0;
-    let body_h = (height as f32 - body_y - rail).max(80.0);
-    let aperture_w = ((width as f32 - margin * 2.0 - gap) / 2.0).max(80.0);
-    let left_x = margin;
-    let right_x = left_x + aperture_w + gap;
     draw_rect(0.0, 0.0, width as f32, height as f32, (0.025, 0.03, 0.07));
     draw_rect(
         margin,
@@ -887,18 +1006,7 @@ fn draw_frame(
     );
     if let Some(operation) = projection.active_operation.as_ref() {
         unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
-        let progress = if operation.progress_determinate {
-            operation
-                .progress_value
-                .map(|value| format!(" {:.0}%", value * 100.0))
-                .unwrap_or_default()
-        } else {
-            if operation.progress.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", operation.progress)
-            }
-        };
+        let progress = operation_progress(operation);
         draw_text(
             display,
             window,
@@ -930,20 +1038,25 @@ fn draw_frame(
             line.trim_end(),
         );
     }
-    if !projection.workspace_entities.is_empty() {
+    let mut workspace_tree_entities = Vec::new();
+    if !projection.workspace_tree.is_empty() {
+        flatten_tree(
+            &projection.workspace_tree,
+            None,
+            &mut workspace_tree_entities,
+        );
+    }
+    let workspace_source = if workspace_tree_entities.is_empty() {
+        &projection.workspace_entities
+    } else {
+        &workspace_tree_entities
+    };
+    if !workspace_source.is_empty() {
         unsafe { XSetForeground(display, gc, rgb(145, 181, 216)) };
-        let files = projection
-            .workspace_entities
+        let files = workspace_source
             .iter()
             .take(3)
-            .map(|entity| {
-                if entity.label.is_empty() {
-                    &entity.id
-                } else {
-                    &entity.label
-                }
-            })
-            .cloned()
+            .map(projection_entity_label)
             .collect::<Vec<_>>()
             .join(", ");
         draw_text(
@@ -956,7 +1069,7 @@ fn draw_frame(
         );
     }
     unsafe { XSetForeground(display, gc, rgb(183, 210, 236)) };
-    if projection.semantic_state.eq_ignore_ascii_case("code") {
+    if semantic_mode.eq_ignore_ascii_case("code") {
         if let Some(code) = projection.code_view.as_ref() {
             draw_code_view(
                 display,
@@ -968,9 +1081,7 @@ fn draw_frame(
                 code,
             );
         }
-    } else if projection.semantic_state.eq_ignore_ascii_case("failure")
-        && !projection.diagnostics.is_empty()
-    {
+    } else if semantic_mode.eq_ignore_ascii_case("failure") && !projection.diagnostics.is_empty() {
         for (row, diagnostic) in projection.diagnostics.iter().take(max_lines).enumerate() {
             unsafe { XSetForeground(display, gc, rgb(224, 119, 126)) };
             let message = if diagnostic.message.is_empty() {
@@ -984,15 +1095,10 @@ fn draw_frame(
                 gc,
                 right_x as c_int + 16,
                 body_y as c_int + 44 + row as c_int * line_height,
-                &format!(
-                    "! {}:{} {}",
-                    diagnostic.path,
-                    diagnostic.line.unwrap_or_default(),
-                    message,
-                ),
+                &diagnostic_text(diagnostic, message),
             );
         }
-    } else if projection.semantic_state.eq_ignore_ascii_case("verify") {
+    } else if semantic_mode.eq_ignore_ascii_case("verify") {
         unsafe { XSetForeground(display, gc, rgb(222, 176, 108)) };
         draw_text(
             display,
@@ -1023,7 +1129,7 @@ fn draw_frame(
                 &check.to_string(),
             );
         }
-    } else if projection.semantic_state.eq_ignore_ascii_case("test") {
+    } else if semantic_mode.eq_ignore_ascii_case("test") {
         unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
         draw_text(
             display,
@@ -1054,7 +1160,7 @@ fn draw_frame(
                 line,
             );
         }
-    } else if projection.semantic_state.eq_ignore_ascii_case("search") {
+    } else if semantic_mode.eq_ignore_ascii_case("search") {
         unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
         draw_text(
             display,
@@ -1076,17 +1182,10 @@ fn draw_frame(
                 gc,
                 right_x as c_int + 16,
                 body_y as c_int + 62 + row as c_int * line_height,
-                &format!(
-                    "· {}",
-                    if entity.label.is_empty() {
-                        &entity.id
-                    } else {
-                        &entity.label
-                    }
-                ),
+                &format!("· {}", projection_entity_label(entity)),
             );
         }
-    } else if projection.semantic_state.eq_ignore_ascii_case("approval") {
+    } else if semantic_mode.eq_ignore_ascii_case("approval") {
         unsafe { XSetForeground(display, gc, rgb(222, 176, 108)) };
         draw_text(
             display,
@@ -1114,7 +1213,7 @@ fn draw_frame(
                 &progress.to_string(),
             );
         }
-    } else if projection.semantic_state.eq_ignore_ascii_case("recover") {
+    } else if semantic_mode.eq_ignore_ascii_case("recover") {
         unsafe { XSetForeground(display, gc, rgb(222, 176, 108)) };
         draw_text(
             display,
@@ -1132,7 +1231,7 @@ fn draw_frame(
             body_y as c_int + 62,
             &projection.status,
         );
-    } else if projection.semantic_state.eq_ignore_ascii_case("generate") {
+    } else if semantic_mode.eq_ignore_ascii_case("generate") {
         unsafe { XSetForeground(display, gc, rgb(101, 183, 206)) };
         draw_text(
             display,
@@ -1167,12 +1266,8 @@ fn draw_frame(
     unsafe { XSetForeground(display, gc, rgb(145, 181, 216)) };
     for (index, entity) in projection.entities.iter().take(8).enumerate() {
         let y = body_y as c_int + 60 + index as c_int * 30;
-        let label = if entity.label.is_empty() {
-            &entity.id
-        } else {
-            &entity.label
-        };
-        draw_text(display, window, gc, right_x as c_int + 28, y, label);
+        let label = projection_entity_label(entity);
+        draw_text(display, window, gc, right_x as c_int + 28, y, &label);
     }
     if let Some(alert) = projection.alerts.first() {
         unsafe { XSetForeground(display, gc, rgb(224, 158, 118)) };
@@ -1270,17 +1365,31 @@ fn draw_oi_scene(x: f32, y: f32, width: f32, height: f32, projection: &Projectio
         glEnd();
     }
 
-    let runtime_source = if projection.runtime_entities.is_empty() {
-        &projection.entities
+    let mut tree_entities = Vec::new();
+    if !projection.runtime_tree.is_empty() {
+        flatten_tree(&projection.runtime_tree, None, &mut tree_entities);
+    }
+    let runtime_source = if tree_entities.is_empty() {
+        if projection.runtime_entities.is_empty() {
+            &projection.entities
+        } else {
+            &projection.runtime_entities
+        }
     } else {
-        &projection.runtime_entities
+        &tree_entities
     };
     let runtime: Vec<&ProjectionEntity> = runtime_source
         .iter()
         .filter(|entity| {
             matches!(
                 entity.kind.as_str(),
-                "operation" | "workflow" | "verification" | "child_task" | "generated_tool"
+                "operation"
+                    | "workflow"
+                    | "verification"
+                    | "child_task"
+                    | "task"
+                    | "execution"
+                    | "generated_tool"
             )
         })
         .take(6)
@@ -1325,18 +1434,23 @@ fn draw_oi_scene(x: f32, y: f32, width: f32, height: f32, projection: &Projectio
         };
         draw_node(*nx, *ny, 18.0, color);
     }
+    let semantic_mode = if projection.view.mode.is_empty() {
+        projection.semantic_state.as_str()
+    } else {
+        projection.view.mode.as_str()
+    };
     let action = if let Some(buddy) = projection.buddy.as_ref() {
         if !buddy.state.is_empty() {
             buddy.state.as_str()
         } else if buddy.anchor.is_empty() {
-            projection.semantic_state.as_str()
+            semantic_mode
         } else {
             buddy.anchor.as_str()
         }
     } else if projection.semantic_state.is_empty() {
         projection.status.as_str()
     } else {
-        projection.semantic_state.as_str()
+        semantic_mode
     };
     let (buddy_x, buddy_y) = match action.to_ascii_uppercase().as_str() {
         "READ" | "INSPECT" | "SEARCH" | "READING" | "SEARCHING" => {
@@ -1362,6 +1476,43 @@ fn draw_oi_scene(x: f32, y: f32, width: f32, height: f32, projection: &Projectio
         .filter(|character| !character.is_empty())
         .unwrap_or("owl");
     draw_buddy(buddy_x, buddy_y, buddy_status, buddy_character);
+}
+
+fn flatten_tree(
+    nodes: &[ProjectionTreeNode],
+    parent_id: Option<&str>,
+    output: &mut Vec<ProjectionEntity>,
+) {
+    for node in nodes {
+        let id = if node.id.is_empty() {
+            format!("{}:{}", node.kind, node.label)
+        } else {
+            node.id.clone()
+        };
+        output.push(ProjectionEntity {
+            id: id.clone(),
+            kind: node.kind.clone(),
+            label: node.label.clone(),
+            status: node.status.clone(),
+            parent_id: parent_id.map(str::to_owned),
+            metadata: node.metadata.clone(),
+        });
+        flatten_tree(&node.children, Some(&id), output);
+    }
+}
+
+fn projection_entity_label(entity: &ProjectionEntity) -> String {
+    if !entity.label.is_empty() {
+        return entity.label.clone();
+    }
+    for key in ["canonical_path", "path", "uri", "resource"] {
+        if let Some(value) = entity.metadata.get(key).and_then(serde_json::Value::as_str) {
+            if !value.is_empty() {
+                return value.to_owned();
+            }
+        }
+    }
+    entity.id.clone()
 }
 
 fn draw_code_view(
@@ -1502,6 +1653,44 @@ fn draw_text(
             value.as_ptr(),
             value.as_bytes().len().min(c_int::MAX as usize) as c_int,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CELL_HEIGHT, CELL_WIDTH, FrameGeometry};
+
+    #[test]
+    fn frame_geometry_keeps_apertures_equal() {
+        let geometry = FrameGeometry::new(1000, 700);
+        let left_end = geometry.left_x + geometry.aperture_width;
+        let right_start = left_end + 18.0;
+
+        assert_eq!(
+            left_end - geometry.left_x,
+            right_start + geometry.aperture_width - right_start
+        );
+        assert_eq!(geometry.aperture_width, 473.0);
+    }
+
+    #[test]
+    fn frame_geometry_maps_operator_cells_within_bounds() {
+        let geometry = FrameGeometry::new(1000, 700);
+        let (origin_x, origin_y) = geometry.operator_origin();
+
+        assert_eq!(geometry.cell_at(origin_x, origin_y), Some((0, 0)));
+        assert_eq!(
+            geometry.cell_at(origin_x + CELL_WIDTH, origin_y + CELL_HEIGHT),
+            Some((1, 1))
+        );
+        assert_eq!(geometry.cell_at(origin_x - 1, origin_y), None);
+        assert_eq!(geometry.cell_at(origin_x, origin_y - 1), None);
+    }
+
+    #[test]
+    fn frame_geometry_preserves_minimum_resize() {
+        assert_eq!(FrameGeometry::new(1, 1).terminal_size(), (1, 1));
+        assert_eq!(FrameGeometry::new(1000, 700).terminal_size(), (111, 38));
     }
 }
 

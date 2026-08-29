@@ -55,7 +55,10 @@ async def test_conversation_and_operations_have_separate_owners(tty_surface):
     assert "ATHENA  I am checking the repository now." in screen
     assert "ACTIVE OPERATION" in screen
     assert "execute  RUNNING" in screen
-    assert "RECENT ACTIVITY" in screen
+    # The recessed left aperture bottom corner (╙─╜) now occupies the last
+    # inner content row; the outer chassis ╰─╯ still spans both apertures.
+    assert "╙" in screen and "╜" in screen
+    assert "╰" in screen and "╯" in screen
     # Internal event names do not become a left-side firehose.
     assert "CapabilityRequested" not in screen
     # The surface is only a renderer: operation identity and lifecycle state
@@ -287,8 +290,8 @@ def test_frame_degrades_to_single_column_when_terminal_is_narrow(monkeypatch):
 def test_instrument_frame_is_one_chassis_with_inset_apertures(tty_surface):
     surface, _ = tty_surface
     lines = surface._frame_lines()
-    aperture_top = lines[surface.layout.operator.y]
-    aperture_bottom = lines[surface.layout.operator.bottom - 1]
+    aperture_top = lines[surface.layout.outer_operator.y]
+    aperture_bottom = lines[surface.layout.outer_operator.bottom - 1]
 
     assert aperture_top.count("╭") == 1
     assert aperture_top.count("╮") == 1
@@ -297,4 +300,4 @@ def test_instrument_frame_is_one_chassis_with_inset_apertures(tty_surface):
     assert "┬" not in aperture_top
     assert "┴" not in aperture_bottom
     # The inset seam is cabinet relief, not another boxed pane.
-    assert "░" in lines[surface.layout.operator.y + 1]
+    assert "░" in lines[surface.layout.outer_operator.y + 1]

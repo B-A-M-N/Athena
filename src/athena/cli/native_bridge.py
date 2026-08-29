@@ -10,15 +10,61 @@ It owns no task state and performs no inference.
 from __future__ import annotations
 
 import json
-from typing import Any, TextIO
+from typing import Any, Mapping, TextIO
 
+from athena.cli.activity import VisualActionKind
 from athena.cli.layout import Rect
 from athena.cli.projection import ProjectionState
 from athena.cli.render.scene import render_scene_lines
-from athena.cli.scene import build_oi_scene
+from athena.cli.scene import TreeNode, build_oi_scene
 from athena.cli.terminal import sanitize_terminal_text
 
 __all__ = ["native_projection_frame", "write_native_projection"]
+
+_ACTION_VIEW_MODES = frozenset(
+    {
+        VisualActionKind.CODE,
+        VisualActionKind.TEST,
+        VisualActionKind.VERIFY,
+        VisualActionKind.FAILURE,
+        VisualActionKind.SEARCH,
+        VisualActionKind.APPROVAL,
+        VisualActionKind.RECOVER,
+        VisualActionKind.GENERATE,
+    }
+)
+
+
+def _json_safe(value: Any, *, depth: int = 0) -> Any:
+    """Keep bridge metadata serializable without inventing semantic fields."""
+    if depth > 6:
+        return sanitize_terminal_text(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            sanitize_terminal_text(key): _json_safe(item, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, depth=depth + 1) for item in value[:128]]
+    return sanitize_terminal_text(value)
+
+
+def _tree_payload(nodes: tuple[TreeNode, ...]) -> list[dict[str, Any]]:
+    """Serialize the normalized forest without dropping parent structure."""
+
+    def encode(node: TreeNode) -> dict[str, Any]:
+        return {
+            "id": sanitize_terminal_text(node.id),
+            "kind": sanitize_terminal_text(node.kind),
+            "label": sanitize_terminal_text(node.label),
+            "status": sanitize_terminal_text(node.status),
+            "metadata": _json_safe(node.metadata),
+            "children": [encode(child) for child in node.children],
+        }
+
+    return [encode(node) for node in nodes]
 
 
 def native_projection_frame(
@@ -111,6 +157,38 @@ def native_projection_frame(
             "checks": [dict(item) for item in scene.verification_checks],
         },
         "progress": dict(scene.progress),
+        "model_request": {
+            "provider": sanitize_terminal_text(scene.model_provider or ""),
+            "model": sanitize_terminal_text(scene.model or ""),
+            "role": sanitize_terminal_text(scene.model_role or ""),
+            "request_id": sanitize_terminal_text(scene.model_request_id or ""),
+            "status": sanitize_terminal_text(scene.model_request_status),
+        },
+        "workspace_tree": _tree_payload(scene.workspace_tree),
+        "runtime_tree": _tree_payload(scene.runtime_tree),
+        "trace": [sanitize_terminal_text(item) for item in scene.trace],
+        "view": {
+            "label": "action" if scene.mode in _ACTION_VIEW_MODES else "overview",
+            "mode": sanitize_terminal_text(scene.mode.value),
+            "history": False,
+            "history_label": "OI // HISTORY",
+            "live_label": "OI // LIVE",
+        },
+        "layout": {
+            "viewport": {
+                "x": scene.viewport.x,
+                "y": scene.viewport.y,
+                "width": scene.viewport.width,
+                "height": scene.viewport.height,
+            },
+            "chrome": {
+                "pane_gap": 3,
+                "header_rows": 2,
+                "aperture_rim": 1,
+                "rail_rows": 4,
+                "prompt_rows": 2,
+            },
+        },
         "workspace_entities": workspace_entities,
         "runtime_entities": runtime_entities,
         "oi": [sanitize_terminal_text(line) for line in lines],

@@ -100,7 +100,7 @@ class OIStreamViewer:
     async def handle_event(self, event: Any) -> None:
         etype = str(getattr(event, "type", ""))
         payload = dict(getattr(event, "payload", {}) or {})
-        self.projection.reduce(etype, payload)
+        self.projection.reduce(etype, payload, task_id=getattr(event, "task_id", None))
         self.mascot.observe(etype, payload)
 
         if etype == "CapabilityRequested":
@@ -216,6 +216,12 @@ async def run_viewer(
         input_fn=input_fn,
         mascot=mascot,
     )
+    startup_health = getattr(service, "startup_health", lambda: None)()
+    if isinstance(startup_health, Mapping) and startup_health.get("status") != "ok":
+        viewer.projection.add_recent(
+            "!",
+            f"startup health: {startup_health.get('status', 'unknown')}",
+        )
     viewer.open()
     try:
         cursor = 0  # rowid for global tail

@@ -152,3 +152,18 @@ async def test_child_budget_derived_from_parent_cannot_exceed():
     )
     merged = _merged_budget(parent, child_spec.resource_budget, default_depth=1, default_children=4)
     assert merged.max_cost_usd == Decimal("1.0")
+
+
+def test_child_capability_allowlist_intersects_parent_ceiling():
+    parent = TaskSpec(
+        id="parent",
+        objective="p",
+        capability_policy=CapabilityPolicy(allow=("fs",), effects=frozenset({"read_local"})),
+    )
+    scoped = _scope_policy(
+        parent,
+        CapabilityPolicy(allow=("execute",), effects=frozenset({"network_read"})),
+    )
+    assert scoped.allow
+    assert "execute" in scoped.deny
+    assert "__athena_no_effect_intersection__" in scoped.effects

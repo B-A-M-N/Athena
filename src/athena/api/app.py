@@ -446,6 +446,8 @@ def _health_handler(service: Any) -> Any:
                 database_error = str(exc)
         worker = getattr(service, "_worker", None)
         worker_health = worker.health() if worker is not None and hasattr(worker, "health") else {}
+        startup = service.startup_health() if hasattr(service, "startup_health") else None
+        startup_ok = startup is None or startup.get("status") == "ok"
         checks = {
             "service": started,
             "database": database_ok,
@@ -459,9 +461,14 @@ def _health_handler(service: Any) -> Any:
             ),
             "providers": bool(getattr(service, "_model_registry", None)),
             "worker_persistence": worker_health.get("status", "ok") == "ok",
+            "recovery": getattr(service, "_recovery_status", "healthy") in {"healthy", "recovered"},
         }
+        if startup is not None:
+            checks["startup"] = startup_ok
         ready = all(checks.values())
         details = {"checks": checks, "worker": worker_health}
+        if startup is not None:
+            details["startup"] = startup
         if database_error is not None:
             details["database_error"] = database_error
         return json_response(
@@ -512,8 +519,8 @@ def create_app(service: Any = None) -> Any:
         from starlette.routing import Route
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
-            "Starlette is required to serve the HTTP API. Install it with "
-            "`pip install -e '.[api]'` (provides uvicorn + starlette)."
+            "Starlette is required to serve the HTTP API. Install Athena's "
+            "base dependencies before starting the API."
         ) from exc
 
     routes = [

@@ -91,7 +91,7 @@ class ExecutionManager:
         self._backends[name] = backend
 
     def available_backends(self) -> list[str]:
-        return ["local", *sorted(self._backends)]
+        return ["local", "sandboxed-local", *sorted(self._backends)]
 
     def backend_status(self) -> list[dict[str, Any]]:
         """Return availability for registered non-local backends."""
@@ -590,7 +590,7 @@ class ExecutionManager:
         return False
 
     def _selected_backend(self, name: str) -> ExecutionBackend | None:
-        if name in {"local", "shadow", "sandbox", "verification"}:
+        if name in {"local", "sandboxed-local", "shadow", "sandbox", "verification"}:
             return None
         backend = self._backends.get(name)
         if backend is None:

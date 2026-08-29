@@ -14,7 +14,8 @@ from typing import Any, TypeAlias
 
 from athena.cli.activity import VisualActionKind
 from athena.cli.animation import OIVisualState
-from athena.cli.scene import OIScene
+from athena.cli.scene import OIScene, tree_rows
+from athena.cli.render.scene import _diagnostic_lines, format_progress
 
 Image: Any = None
 ImageDraw: Any = None
@@ -122,6 +123,14 @@ class OIFrameBuffer:
             tuple(sorted((str(key), repr(value)) for key, value in scene.progress.items())),
             entities,
             tuple(scene.alerts),
+            repr(scene.workspace_tree),
+            repr(scene.runtime_tree),
+            tuple(scene.trace),
+            scene.model_provider,
+            scene.model,
+            scene.model_role,
+            scene.model_request_id,
+            scene.model_request_status,
         )
 
     def _base_image(self, scene: OIScene, width: int, height: int) -> tuple[Any, tuple[Any, ...]]:
@@ -208,11 +217,18 @@ class OIFrameBuffer:
         self._text(
             draw,
             (margin, top + 22),
-            f"MODE  {scene.status:<14}  VIEWPORT  {width}×{height}",
+            f"> MODEL REQUEST · {scene.model_request_label}",
             font_small,
             dim,
         )
-        draw.line((margin, top + 43, width - margin, top + 43), fill=(115, 154, 196, 95), width=1)
+        self._text(
+            draw,
+            (margin, top + 40),
+            "> MODEL REQUEST ACTIVE" if scene.model_request_status == "active" else "> IDLE",
+            font_small,
+            accent,
+        )
+        draw.line((margin, top + 60, width - margin, top + 60), fill=(115, 154, 196, 95), width=1)
 
         if scene.mode in {
             VisualActionKind.CODE,
@@ -230,7 +246,7 @@ class OIFrameBuffer:
                 width,
                 height,
                 margin,
-                top + 62,
+                top + 78,
                 font_small,
                 font,
                 ink,
@@ -245,61 +261,44 @@ class OIFrameBuffer:
 
         left = margin
         right = width // 2 + 4
-        body_top = top + 62
+        body_top = top + 78
         self._text(draw, (left, body_top), "WORKSPACE MAP", font_small, dim)
-        self._text(draw, (right, body_top), "RUNTIME GRAPH", font_small, dim)
+        self._text(draw, (right, body_top), "RUNTIME TREE", font_small, dim)
         draw.line(
             (width // 2, body_top - 4, width // 2, height - 52), fill=(92, 125, 165, 50), width=1
         )
 
-        resources = [
-            entity
-            for entity in scene.entities
-            if entity.kind in {"resource", "research", "artifact"}
-        ]
-        tree = [
-            (
-                f"{('✓' if entity.status in {'complete', 'success'} else '!' if entity.status in {'failed', 'failure'} else '·')} {entity.label}",
-                self._entity_color(entity, ink, accent, warn, bad),
+        workspace_rows = tree_rows(scene.workspace_tree)
+        if workspace_rows:
+            for idx, (prefix, node) in enumerate(workspace_rows[:8]):
+                label = f"{prefix}{_state_marker(node.status)} {node.label}"
+                self._text(
+                    draw,
+                    (left, body_top + 24 + idx * 20),
+                    label[: max(20, width // 18)],
+                    font,
+                    self._entity_color(node, ink, accent, warn, bad),
+                )
+        else:
+            self._text(
+                draw, (left, body_top + 42), "· no workspace resources observed", font_small, dim
             )
-            for entity in resources[:8]
-        ] or [("· no workspace resources observed", dim)]
-        for idx, (label, color) in enumerate(tree):
-            self._text(draw, (left, body_top + 24 + idx * 20), label, font, color)
 
-        runtime_entities = [
-            entity
-            for entity in scene.entities
-            if entity.kind
-            in {"operation", "child_task", "workflow", "verification", "generated_tool"}
-        ]
-        gx = right + (width - right) // 2
-        if not runtime_entities:
+        runtime_rows = tree_rows(scene.runtime_tree)
+        if runtime_rows:
+            for idx, (prefix, node) in enumerate(runtime_rows[:8]):
+                label = f"{prefix}{_state_marker(node.status)} {node.label}"
+                self._text(
+                    draw,
+                    (right, body_top + 24 + idx * 20),
+                    label[: max(20, width // 18)],
+                    font,
+                    self._entity_color(node, ink, accent, warn, bad),
+                )
+        else:
             self._text(
                 draw, (right, body_top + 42), "· no runtime operations observed", font_small, dim
             )
-        nodes = []
-        for idx, entity in enumerate(runtime_entities[:6]):
-            x = gx + ((-1 if idx % 2 else 1) * min(48, max(24, (width - right) // 6)))
-            y = body_top + 42 + (idx // 2) * 58
-            nodes.append((entity, x, y))
-        for entity, x, y in nodes:
-            parent_id = str(entity.metadata.get("parent_id") or "")
-            parent = next((item for item in nodes if item[0].id == parent_id), None)
-            if parent:
-                _, px, py = parent
-                draw.line((px, py + 12, x, y - 12), fill=(88, 145, 183, 150), width=1)
-        for entity, x, y in nodes:
-            color = self._entity_color(entity, ink, accent, warn, bad)
-            label = f"{entity.label} {_state_marker(entity.status)}"
-            draw.rounded_rectangle(
-                (x - 54, y - 12, x + 54, y + 12),
-                radius=4,
-                outline=color,
-                fill=(20, 35, 61, 175),
-                width=1,
-            )
-            self._text(draw, (x - 45, y - 7), label[:18], font_small, color)
 
         # Stream/alert band stays subordinate to the scene. It still exposes
         # live data, but the graphical OI is not just a firehose.
@@ -355,7 +354,7 @@ class OIFrameBuffer:
             VisualActionKind.CODE: f"CODE // {target}",
             VisualActionKind.TEST: f"TESTING // {target}",
             VisualActionKind.VERIFY: f"VERIFYING // {target}",
-            VisualActionKind.FAILURE: "RESULT // MISMATCH DETECTED",
+            VisualActionKind.FAILURE: "> RESULT: MISMATCH DETECTED",
             VisualActionKind.SEARCH: "SEARCHING // SYMBOL GRAPH",
             VisualActionKind.APPROVAL: "APPROVAL // OPERATION SCOPE",
             VisualActionKind.RECOVER: "RECOVERING // RETAINED EVIDENCE",
@@ -370,6 +369,15 @@ class OIFrameBuffer:
         available_width = max(width - margin * 2, 1)
         row = body_top + 38
         row_height = max(16, int(getattr(font, "size", 12)) + 4)
+
+        # Trace annotations: truthful, derived from canonical events.
+        if scene.trace:
+            for line in scene.trace[:3]:
+                self._text(
+                    draw, (margin, row), line[: max(1, available_width // 9)], font_small, dim
+                )
+                row += row_height
+            row += row_height // 2
 
         if scene.mode is VisualActionKind.CODE and code is not None:
             state = code.mutation_state.upper() or "PROPOSED"
@@ -397,26 +405,15 @@ class OIFrameBuffer:
                 )
         elif scene.mode is VisualActionKind.FAILURE:
             for diagnostic in scene.diagnostics[: max((height - row - 20) // row_height, 1)]:
-                message = (
-                    diagnostic.get("message")
-                    or diagnostic.get("detail")
-                    or diagnostic.get("error")
-                    or str(diagnostic)
-                )
-                location = (
-                    diagnostic.get("path")
-                    or diagnostic.get("file")
-                    or diagnostic.get("location")
-                    or ""
-                )
-                self._text(
-                    draw,
-                    (margin, row),
-                    f"! {location} {message}".strip()[: max(1, available_width // 9)],
-                    font,
-                    bad,
-                )
-                row += row_height
+                for line in _diagnostic_lines(diagnostic):
+                    self._text(
+                        draw,
+                        (margin, row),
+                        line[: max(1, available_width // 9)],
+                        font,
+                        bad,
+                    )
+                    row += row_height
             if not scene.diagnostics:
                 self._text(draw, (margin, row), "! no matching verification evidence", font, bad)
         elif scene.mode is VisualActionKind.VERIFY:
@@ -440,13 +437,11 @@ class OIFrameBuffer:
             self._text(draw, (margin, row), "· impacted tests", font, dim)
             progress = scene.progress
             if progress.get("determinate") and progress.get("value") is not None:
-                value = min(max(float(progress["value"]), 0.0), 1.0)
-                bar_width = max(12, available_width // 9)
-                filled = int(bar_width * value)
+                bar = format_progress(progress["value"], max(12, available_width // 9))
                 self._text(
                     draw,
                     (margin, row + row_height),
-                    "[" + "█" * filled + "░" * (bar_width - filled) + "]",
+                    bar,
                     font,
                     accent,
                 )
@@ -642,7 +637,7 @@ class OIFrameBuffer:
                 cursor_row = body_top + 58 + visible * 16
                 cursor_x = margin + 2
                 draw.line((cursor_x, cursor_row, width - margin, cursor_row), fill=accent, width=1)
-                if visual.cursor_phase < 0.55:
+                if visual.cursor_phase < 0.5:
                     draw.rectangle(
                         (cursor_x, cursor_row - 13, cursor_x + 8, cursor_row), fill=accent
                     )
@@ -784,264 +779,207 @@ class OIFrameBuffer:
         Buddy is deliberately an entity in the OI scene, not a second pane or
         a text dashboard.  The pose stays stable while the semantic state
         chooses the accent and a few bounded presentation details.
+
+        Geometry is quantized to a fixed logical sprite grid before scaling
+        so the silhouette reads as a discrete CRT/pixel-grid treatment rather
+        than a smooth vector graphic.
         """
         status = str(status).upper()
         color = (
             bad if status in {"FAILURE", "BLOCKED"} else warn if status == "APPROVAL" else accent
         )
-        stroke = max(1, scale // 6)
-        body_w = scale * 4
-        body_top = y - scale * 2
-        body_bottom = y + scale * 2
-        screen_top = y - scale
-        screen_bottom = y + scale // 2
-        draw.rounded_rectangle(
-            (x - body_w, body_top, x + body_w, body_bottom),
-            radius=max(2, scale // 2),
-            outline=color,
-            fill=(16, 28, 51, 238),
-            width=stroke,
-        )
-        # Monitor face and phosphor eyes.  A phase offset gives the eyes a
-        # tiny scan/breathing movement without changing scene semantics.
-        draw.rounded_rectangle(
-            (x - scale * 2, screen_top, x + scale * 2, screen_bottom),
-            radius=max(1, scale // 4),
-            outline=(100, 148, 191, 180),
-            fill=(9, 20, 39, 245),
-            width=stroke,
-        )
-        eye_y = y - scale // 3 + (1 if phase > 0.72 else 0)
-        eye_shift = 0
-        if status in {"READING", "SEARCHING", "INSPECTING"}:
-            eye_shift = int((phase - 0.5) * max(scale // 2, 1))
-        elif status in {"FAILURE", "BLOCKED"}:
-            eye_shift = -max(scale // 4, 1)
-        eye = bad if status in {"FAILURE", "BLOCKED"} else ink
-        eye_height = max(2, scale // 2)
-        draw.ellipse(
-            (
-                x - scale * 2 + stroke + eye_shift,
-                eye_y,
-                x - scale + stroke + eye_shift,
-                eye_y + eye_height,
-            ),
-            fill=eye,
-        )
-        draw.ellipse(
-            (
-                x + scale - stroke + eye_shift,
-                eye_y,
-                x + scale * 2 - stroke + eye_shift,
-                eye_y + eye_height,
-            ),
-            fill=eye,
-        )
-        # Antenna and feet make the silhouette readable at small CRT sizes.
-        antenna_x = x + (scale if phase > 0.5 else -scale)
-        draw.line((x, body_top, antenna_x, y - scale * 4), fill=color, width=stroke)
-        draw.ellipse(
-            (
-                antenna_x - stroke,
-                y - scale * 4 - stroke,
-                antenna_x + stroke,
-                y - scale * 4 + stroke,
-            ),
-            fill=color,
-        )
-        draw.line(
-            (x - scale * 2, body_bottom, x - scale * 3, body_bottom + scale),
-            fill=color,
-            width=stroke,
-        )
-        draw.line(
-            (x + scale * 2, body_bottom, x + scale * 3, body_bottom + scale),
-            fill=color,
-            width=stroke,
-        )
+        # Sprite grid: 16 wide x 12 tall logical cells.
+        grid_w, grid_h = 16, 12
+        cell = max(scale // 2, 4)
+        stroke = max(1, cell // 3)
+        body_w = grid_w * cell
+        body_h = grid_h * cell
+        # Quantize anchor to grid center.
+        gx, gy = x - body_w // 2, y - body_h // 2
 
-        # Character identity is shared with the ANSI mascot selection. Keep
-        # the silhouette procedural and tiny, but make Glass honor the chosen
-        # owl/cat/bot instead of rendering one robot for every choice.
+        def px(grid_x: int, grid_y: int) -> tuple[int, int]:
+            return (gx + grid_x * cell, gy + grid_y * cell)
+
+        def pixel_rect(gx0: int, gy0: int, gx1: int, gy1: int, fill: Color) -> None:
+            draw.rectangle(
+                (px(gx0, gy0), px(gx1, gy1)),
+                fill=fill,
+                outline=None,
+                width=0,
+            )
+
+        def pixel(gx0: int, gy0: int, gx1: int, gy1: int, fill: Color) -> None:
+            draw.line((px(gx0, gy0), px(gx1, gy1)), fill=fill, width=stroke)
+
         character = str(character or "owl").casefold()
-        if character == "cat":
-            draw.polygon(
-                [
-                    (x - scale * 2, screen_top),
-                    (x - scale, screen_top - scale),
-                    (x - scale // 2, screen_top),
-                ],
-                outline=color,
-            )
-            draw.polygon(
-                [
-                    (x + scale * 2, screen_top),
-                    (x + scale, screen_top - scale),
-                    (x + scale // 2, screen_top),
-                ],
-                outline=color,
-            )
-            draw.arc(
-                (x + body_w, y, x + body_w + scale * 3, y + scale * 3),
-                250,
-                80,
-                fill=color,
-                width=stroke,
-            )
-        elif character == "owl":
-            draw.line(
-                (x - scale * 2, body_top, x - scale, body_top - scale), fill=color, width=stroke
-            )
-            draw.line(
-                (x + scale * 2, body_top, x + scale, body_top - scale), fill=color, width=stroke
-            )
-            draw.polygon(
-                [
-                    (x, screen_bottom - stroke),
-                    (x - stroke, screen_bottom + scale // 2),
-                    (x + stroke, screen_bottom + scale // 2),
-                ],
-                fill=warn,
-            )
+        body_color = (16, 28, 51, 238)
 
+        # --- Character-specific body silhouette on the 16x12 grid ---
+        if character == "owl":
+            # Owl silhouette: rounded head with ear tufts, wide body,
+            # two eyes, small beak, wing folds, and small feet.
+            # No monitor face or antenna — a genuine owl shape.
+            # Head top (rows 2-3): narrower, rounded shape.
+            pixel_rect(2, 2, 6, 2, body_color)  # left head top
+            pixel_rect(9, 2, 13, 2, body_color)  # right head top
+            pixel_rect(1, 3, 7, 3, body_color)  # left head wide
+            pixel_rect(8, 3, 14, 3, body_color)  # right head wide
+            # Head-body (rows 4-10): wider body merging from head.
+            pixel_rect(2, 4, 7, 10, body_color)  # left body+head
+            pixel_rect(8, 4, 14, 10, body_color)  # right body+head
+            # Outline: perimeter lines for the owl silhouette.
+            pixel(2, 2, 1, 3, color)  # left head curve top
+            pixel(1, 3, 1, 10, color)  # left body side
+            pixel(1, 10, 2, 11, color)  # left foot up
+            pixel(2, 11, 3, 11, color)  # left foot
+            pixel(13, 2, 14, 3, color)  # right head curve top
+            pixel(14, 3, 14, 10, color)  # right body side
+            pixel(14, 10, 13, 11, color)  # right foot up
+            pixel(12, 11, 11, 11, color)  # right foot
+            # Ear tufts: upward-pointing triangles.
+            pixel(4, 2, 3, 0, color)  # left ear slope
+            pixel(5, 2, 3, 1, color)  # left ear inner
+            pixel_rect(3, 0, 3, 1, body_color)  # left ear tip
+            pixel(12, 2, 13, 0, color)  # right ear slope
+            pixel(11, 2, 13, 1, color)  # right ear inner
+            pixel_rect(12, 0, 12, 1, body_color)  # right ear tip
+            # Eyes: quantized to grid, shift with phase.
+            eye_y = 5
+            eye_shift = 0
+            if status in {"READING", "SEARCHING", "INSPECTING"}:
+                eye_shift = 1 if phase > 0.5 else -1
+            elif status in {"FAILURE", "BLOCKED"}:
+                eye_shift = -1
+            eye = bad if status in {"FAILURE", "BLOCKED"} else ink
+            pixel_rect(5 + eye_shift, eye_y, 6 + eye_shift, eye_y + 1, eye)
+            pixel_rect(9 - eye_shift, eye_y, 10 - eye_shift, eye_y + 1, eye)
+            # Beak: small triangle between eyes below face.
+            pixel_rect(7, 8, 8, 8, warn)
+            # Wing cues: subtle diagonal folds at body sides.
+            pixel(2, 4, 0, 6, color)  # left wing
+            pixel(14, 4, 16, 6, color)  # right wing
+            # Feet.
+            pixel(3, 11, 2, 11, color)
+            pixel(12, 11, 13, 11, color)
+        elif character == "cat":
+            # Original rectangular body with cat ears on top.
+            body_color = (16, 28, 51, 238)
+            pixel_rect(2, 2, 14, 10, body_color)
+            pixel(2, 2, 14, 2, color)
+            pixel(2, 10, 14, 10, color)
+            pixel(2, 2, 2, 10, color)
+            pixel(14, 2, 14, 10, color)
+            # Monitor face.
+            pixel_rect(4, 3, 12, 8, (9, 20, 39, 245))
+            pixel(4, 3, 12, 3, (100, 148, 191, 180))
+            pixel(4, 8, 12, 8, (100, 148, 191, 180))
+            pixel(4, 3, 4, 8, (100, 148, 191, 180))
+            pixel(12, 3, 12, 8, (100, 148, 191, 180))
+            # Eyes: quantized to grid, shift with phase.
+            eye_y = 5
+            eye_shift = 0
+            if status in {"READING", "SEARCHING", "INSPECTING"}:
+                eye_shift = 1 if phase > 0.5 else -1
+            elif status in {"FAILURE", "BLOCKED"}:
+                eye_shift = -1
+            eye = bad if status in {"FAILURE", "BLOCKED"} else ink
+            pixel_rect(6 + eye_shift, eye_y, 7 + eye_shift, eye_y + 1, eye)
+            pixel_rect(9 - eye_shift, eye_y, 10 - eye_shift, eye_y + 1, eye)
+            # Antenna.
+            antenna_x = 4 if phase > 0.5 else 12
+            pixel(8, 2, antenna_x, 0, color)
+            pixel_rect(antenna_x - 1, 0, antenna_x + 1, 1, color)
+            # Feet.
+            pixel(4, 10, 2, 11, color)
+            pixel(12, 10, 14, 11, color)
+            # Pointed cat ears.
+            pixel(4, 2, 3, 0, color)
+            pixel(12, 2, 13, 0, color)
+        else:
+            # Default rectangular body with monitor face for unknown/custom chars.
+            pixel_rect(2, 2, 14, 10, body_color)
+            pixel(2, 2, 14, 2, color)
+            pixel(2, 10, 14, 10, color)
+            pixel(2, 2, 2, 10, color)
+            pixel(14, 2, 14, 10, color)
+            pixel_rect(4, 3, 12, 8, (9, 20, 39, 245))
+            pixel(4, 3, 12, 3, (100, 148, 191, 180))
+            pixel(4, 8, 12, 8, (100, 148, 191, 180))
+            pixel(4, 3, 4, 8, (100, 148, 191, 180))
+            pixel(12, 3, 12, 8, (100, 148, 191, 180))
+            eye_y = 5
+            eye_shift = 0
+            if status in {"READING", "SEARCHING", "INSPECTING"}:
+                eye_shift = 1 if phase > 0.5 else -1
+            elif status in {"FAILURE", "BLOCKED"}:
+                eye_shift = -1
+            eye = bad if status in {"FAILURE", "BLOCKED"} else ink
+            pixel_rect(6 + eye_shift, eye_y, 7 + eye_shift, eye_y + 1, eye)
+            pixel_rect(9 - eye_shift, eye_y, 10 - eye_shift, eye_y + 1, eye)
+            antenna_x = 4 if phase > 0.5 else 12
+            pixel(8, 2, antenna_x, 0, color)
+            pixel_rect(antenna_x - 1, 0, antenna_x + 1, 1, color)
+            pixel(4, 10, 2, 11, color)
+            pixel(12, 10, 14, 11, color)
+        # Mode-specific pose.
         if mode is VisualActionKind.CODE:
-            # Typing pose: bounded arms/data blocks, not a fake write timer.
-            draw.line((x - body_w, y, x - body_w - scale * 2, y + scale), fill=color, width=stroke)
-            draw.line((x + body_w, y, x + body_w + scale * 2, y + scale), fill=color, width=stroke)
-            if phase < 0.65:
-                draw.rectangle(
-                    (x + body_w + scale * 2, y + scale, x + body_w + scale * 3, y + scale * 2),
-                    fill=accent,
-                )
+            pixel(2, 6, 0, 7, color)
+            pixel(14, 6, 16, 7, color)
         elif mode in {VisualActionKind.TEST, VisualActionKind.VERIFY}:
-            draw.line(
-                (x + body_w, y - scale, x + body_w + scale * 3, y - scale * 2),
-                fill=color,
-                width=stroke,
-            )
-
-        # State-specific clips stay inside the OI viewport. They are visual
-        # explanations of canonical state, never synthetic progress.
+            pixel(14, 4, 16, 3, color)
+        # State-specific cues.
         if status == "THINKING":
-            antenna_x = x + (scale * 2 if phase > 0.5 else -scale * 2)
-            draw.arc(
-                (x - scale * 5, y - scale * 5, x + scale * 5, y + scale * 5),
-                205,
-                335,
-                fill=color,
-                width=stroke,
-            )
+            # Arc around body.
+            pixel(1, 1, 2, 0, color)
+            pixel(14, 1, 15, 0, color)
         elif status in {"READING", "SEARCHING", "INSPECTING"}:
-            scan_y = screen_top + int((phase % 1.0) * max(screen_bottom - screen_top, 1))
-            draw.line((x - scale * 2, scan_y, x + scale * 2, scan_y), fill=color, width=stroke)
-            if status == "SEARCHING":
-                draw.arc(
-                    (x + body_w, y - scale, x + body_w + scale * 3, y + scale * 2),
-                    250,
-                    80,
-                    fill=color,
-                    width=stroke,
-                )
-            elif status == "INSPECTING":
-                draw.ellipse(
-                    (x + body_w, y - scale * 2, x + body_w + scale * 2, y),
-                    outline=color,
-                    width=stroke,
-                )
-                draw.line(
-                    (x + body_w + scale, y, x + body_w + scale * 2, y + scale),
-                    fill=color,
-                    width=stroke,
-                )
+            scan_y = 3 + int((phase % 1.0) * 5)
+            pixel(4, scan_y, 12, scan_y, color)
         elif status in {"EXECUTING", "DELEGATED"}:
-            pulse = int((phase % 1.0) * scale * 3)
-            draw.arc(
-                (
-                    x - body_w - pulse,
-                    y - scale * 3 - pulse,
-                    x + body_w + pulse,
-                    y + scale * 3 + pulse,
-                ),
-                200,
-                340,
-                fill=color,
-                width=stroke,
-            )
+            pulse = int((phase % 1.0) * 3)
+            pixel(2 - pulse, 2, 2 - pulse, 10, color)
+            pixel(14 + pulse, 2, 14 + pulse, 10, color)
             if status == "DELEGATED":
-                draw.line(
-                    (x + body_w, y, x + body_w + scale * 2, y - scale * 2), fill=color, width=stroke
-                )
-                draw.line(
-                    (x + body_w, y, x + body_w + scale * 2, y + scale * 2), fill=color, width=stroke
-                )
+                pixel(15, 6, 18, 3, color)
+                pixel(15, 6, 18, 9, color)
         elif status == "APPROVAL":
-            card_x = x + body_w + scale
-            draw.rounded_rectangle(
-                (card_x, y - scale, card_x + scale * 4, y + scale * 2),
-                radius=2,
-                outline=warn,
-                fill=(30, 35, 54, 245),
-                width=stroke,
-            )
-            draw.line((card_x + scale, y, card_x + scale * 3, y), fill=warn, width=stroke)
+            # The approval affordance shares the same logical sprite grid;
+            # avoid a smooth vector card that would make this one state look
+            # like a different visual system.
+            pixel_rect(16, 4, 20, 8, (30, 35, 54, 245))
+            pixel(16, 4, 20, 4, warn)
+            pixel(20, 4, 20, 8, warn)
+            pixel(20, 8, 16, 8, warn)
+            pixel(16, 8, 16, 4, warn)
+            pixel(17, 6, 19, 6, warn)
         elif status in {"FAILURE", "BLOCKED"}:
-            draw.line(
-                (x + body_w + scale, y - scale, x + body_w + scale * 2, y + scale),
-                fill=bad,
-                width=stroke,
-            )
-            draw.line(
-                (x + body_w + scale * 2, y - scale, x + body_w + scale, y + scale),
-                fill=bad,
-                width=stroke,
-            )
-            draw.line(
-                (x - body_w - scale, y + scale, x - body_w, y + scale * 2), fill=bad, width=stroke
-            )
+            pixel(16, 4, 19, 8, bad)
+            pixel(19, 4, 16, 8, bad)
+            pixel(-2, 8, 1, 10, bad)
         elif status == "RECOVERING":
-            draw.arc(
-                (x - body_w - scale * 2, y - scale * 2, x + body_w + scale * 2, y + scale * 2),
-                190,
-                350,
-                fill=color,
-                width=stroke,
-            )
-            draw.line(
-                (x - body_w - scale, y - scale, x - body_w - scale * 2, y), fill=color, width=stroke
-            )
+            pixel(-2, 5, -1, 3, color)
+            pixel(-1, 3, 2, 1, color)
+            pixel(2, 1, 6, 1, color)
+            pixel(6, 1, 8, 3, color)
+            pixel(-2, 5, -4, 5, color)
         elif status in {"SUCCESS", "COMPLETE"}:
-            draw.arc(
-                (x - body_w - scale, y - scale * 4, x + body_w + scale, y + scale * 4),
-                190,
-                350,
-                fill=color,
-                width=stroke,
-            )
-            draw.line(
-                (x + body_w + scale, y, x + body_w + scale * 2, y + scale), fill=color, width=stroke
-            )
-            draw.line(
-                (x + body_w + scale * 2, y + scale, x + body_w + scale * 4, y - scale),
-                fill=color,
-                width=stroke,
-            )
+            pixel(-1, 3, 1, 1, color)
+            pixel(1, 1, 5, 1, color)
+            pixel(5, 1, 7, 3, color)
+            pixel(16, 6, 18, 8, color)
+            pixel(18, 8, 22, 3, color)
         elif status in {"GENERATED", "GENERATED_TOOL", "CONSTRUCTING"}:
-            cube_x = x + body_w + scale
-            draw.polygon(
-                [
-                    (cube_x, y),
-                    (cube_x + scale, y - scale // 2),
-                    (cube_x + scale * 2, y),
-                    (cube_x + scale, y + scale // 2),
-                ],
-                outline=color,
-            )
+            pixel(16, 6, 18, 4, color)
+            pixel(18, 4, 20, 6, color)
+            pixel(20, 6, 18, 8, color)
+            pixel(18, 8, 16, 6, color)
+            pixel(18, 4, 18, 8, color)
 
         self._text(
             draw,
-            (x - body_w, body_bottom + scale + 1),
+            (gx + 2 * cell, gy + grid_h * cell + 1),
             status.lower(),
-            self._font(max(9, scale // 2)),
+            self._font(max(9, cell)),
             color,
         )
 

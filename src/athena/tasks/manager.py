@@ -299,7 +299,13 @@ class TaskManager:
             await self._emit(resolved, status)
 
             if self._budgets is not None:
+                release = getattr(self._budgets, "release_model_cost", None)
+                if release is not None:
+                    await release(task_id)
                 self._budgets.consume_result(task_id, usage)
+                persist_budget = getattr(self._budgets, "_persist_usage", None)
+                if persist_budget is not None:
+                    await persist_budget(task_id)
             if self._cancellations is not None:
                 self._cancellations.reset(task_id)
 
@@ -375,7 +381,13 @@ class TaskManager:
     async def apply_result(self, task_id: str, result: TaskResult) -> None:
         await self._persist_result(task_id, result)
         if self._budgets is not None:
+            release = getattr(self._budgets, "release_model_cost", None)
+            if release is not None:
+                await release(task_id)
             self._budgets.consume_result(task_id, result.usage)
+            persist_budget = getattr(self._budgets, "_persist_usage", None)
+            if persist_budget is not None:
+                await persist_budget(task_id)
 
     # ------------------------------------------------------------------ #
     # Persistence / events
@@ -420,6 +432,26 @@ class TaskManager:
             task_id=task.id,
             session_id=task.session_id,
         )
+        # Child lifecycle events are emitted on the parent's stream as well
+        # as the child's own TaskCreated/TaskCompleted stream.  This keeps
+        # delegation observable in production projections instead of relying
+        # on test-only manufactured events.
+        if task.parent_task_id and status == TaskStatus.CREATED:
+            child_payload = _child_lifecycle_payload(task, status)
+            await self._events.append_event(
+                "ChildTaskCreated",
+                child_payload,
+                task_id=task.parent_task_id,
+                session_id=task.session_id,
+            )
+        elif task.parent_task_id and status in TERMINAL_STATUSES:
+            child_payload = _child_lifecycle_payload(task, status)
+            await self._events.append_event(
+                "ChildTaskCompleted",
+                child_payload,
+                task_id=task.parent_task_id,
+                session_id=task.session_id,
+            )
 
 
 def _event_type(status: TaskStatus) -> str:
@@ -435,6 +467,18 @@ def _event_type(status: TaskStatus) -> str:
         TaskStatus.BLOCKED: "TaskBlocked",
         TaskStatus.QUEUED: "TaskQueued",
     }.get(status, "TaskStateChanged")
+
+
+def _child_lifecycle_payload(task: TaskSpec, status: TaskStatus) -> dict[str, str | None]:
+    """Build the bounded cross-stream child lifecycle contract."""
+    objective = str(task.objective or "")
+    return {
+        "child_task_id": task.id,
+        "parent_task_id": task.parent_task_id,
+        "session_id": task.session_id,
+        "status": status.value,
+        "objective": objective[:512] + ("…" if len(objective) > 512 else ""),
+    }
 
 
 def _autonomy(spec: TaskSpec) -> str:

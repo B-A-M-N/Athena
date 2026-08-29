@@ -100,6 +100,7 @@ async def test_health_ok_when_scheduler_running():
             "scheduler": True,
             "providers": True,
             "worker_persistence": True,
+            "recovery": True,
         }, body
         assert status == 200
         assert body["status"] == "ok"

@@ -72,7 +72,9 @@ def launch(options: Any) -> int:
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
         try:
-            process = subprocess.run(argv, env=env, check=False)
+            process = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned native frontend
+                argv, env=env, check=False
+            )
         except OSError as exc:
             print(f"athena native: could not launch {binary}: {exc}", file=sys.stderr)
             return 2

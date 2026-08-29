@@ -178,7 +178,7 @@ class PolicyEngine:
         if (
             req.workspace is not None
             and req.workspace.network_policy == NetworkPolicy.DENY
-            and req.execution_backend not in {"shadow", "sandbox"}
+            and req.execution_backend not in {"shadow", "sandbox", "sandboxed-local"}
         ):
             return _deny("execute denied: workspace network_policy is DENY")
         if self._out_of_workspace(req) and not _execute_granted(level, req):

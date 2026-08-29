@@ -39,7 +39,14 @@ class ShellRuntime(BaseRuntime):
     start_cmd: list[str] | None = None
 
     def _make_session(
-        self, *, env=None, cwd=None, sandbox_root=None, network_policy=None
+        self,
+        *,
+        env=None,
+        cwd=None,
+        sandbox_root=None,
+        network_policy=None,
+        writable_paths=None,
+        read_only_paths=(),
     ) -> "_SubprocessSession":
         sess = _SubprocessSession(
             env=env,
@@ -47,6 +54,8 @@ class ShellRuntime(BaseRuntime):
             start_cmd=self.start_cmd,
             sandbox_root=sandbox_root,
             network_policy=network_policy,
+            writable_paths=writable_paths,
+            read_only_paths=read_only_paths,
         )
         sess.start()
         return sess
@@ -64,12 +73,23 @@ class ShellRuntime(BaseRuntime):
 class _SubprocessSession:
     """One long-lived shell process speaking the OI marker protocol."""
 
-    def __init__(self, env=None, cwd=None, start_cmd=None, sandbox_root=None, network_policy=None):
+    def __init__(
+        self,
+        env=None,
+        cwd=None,
+        start_cmd=None,
+        sandbox_root=None,
+        network_policy=None,
+        writable_paths=None,
+        read_only_paths=(),
+    ):
         self.env = env or {}
         self.cwd = cwd
         self.start_cmd = start_cmd
         self.sandbox_root = sandbox_root
         self.network_policy = network_policy
+        self.writable_paths = writable_paths
+        self.read_only_paths = read_only_paths
         self.process: subprocess.Popen | None = None
         self.output_queue: queue.Queue = queue.Queue()
         self.done = threading.Event()
@@ -91,6 +111,8 @@ class _SubprocessSession:
             cwd=self.cwd,
             sandbox_root=self.sandbox_root,
             network_policy=self.network_policy,
+            writable_paths=self.writable_paths,
+            read_only_paths=self.read_only_paths,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

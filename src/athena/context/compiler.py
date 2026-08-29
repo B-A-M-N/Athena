@@ -17,6 +17,7 @@ into a bounded, provider-neutral model request.  It:
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -55,7 +56,7 @@ from athena.protocol.messages import (
 from athena.protocol.models import ModelRequest
 from athena.protocol.tasks import TaskSpec
 from athena.skills.selector import SkillSelector
-from athena.strategy import StrategyGuidance, select_strategy
+from athena.strategy import StrategyAffordance, StrategyGuidance, select_strategy
 
 __all__ = [
     "CompiledContext",
@@ -233,13 +234,15 @@ class ContextCompiler:
 
         corpus = await self._collect_entries(task, recent_messages)
 
-        capabilities = tuple(
-            await self._load_capabilities(
-                task=task,
-                require_tools=bool(task.model_policy.require_tools),
-            )
+        capabilities, strategy_evidence = await self._load_capabilities(
+            task=task,
+            require_tools=bool(task.model_policy.require_tools),
         )
-        strategy = select_strategy(task.objective, (d.id for d in capabilities))
+        capabilities = tuple(capabilities)
+        # Strategy sees the same fabric records used for progressive
+        # disclosure, including readiness and validation proof.  It remains
+        # advisory, but it no longer has to infer route quality from an id.
+        strategy = select_strategy(task.objective, strategy_evidence)
         required.append(_strategy_entry(strategy))
 
         final_entries, record, omitted = await self._bound_and_compress(
@@ -458,10 +461,10 @@ class ContextCompiler:
 
     async def _load_capabilities(
         self, *, task: TaskSpec | None = None, require_tools: bool = False
-    ) -> list[CapabilityDescriptor]:
+    ) -> tuple[tuple[CapabilityDescriptor, ...], tuple[StrategyAffordance, ...]]:
         reg = self._capability_registry
         if reg is None:
-            return []
+            return (), ()
         for name in ("list_descriptors", "list_available", "list_capabilities"):
             method = getattr(reg, name, None)
             if method is None:
@@ -479,31 +482,34 @@ class ContextCompiler:
             if inspect.isawaitable(result):
                 result = await result
             descriptors = [d for d in result if isinstance(d, CapabilityDescriptor)]
-            descriptors = await self._select_relevant_capabilities(
+            descriptors, records = await self._select_relevant_capabilities(
                 reg,
                 descriptors,
                 task,
             )
             if descriptors:
-                return descriptors
+                return tuple(descriptors), tuple(
+                    _strategy_affordance(descriptor, records.get(descriptor.id))
+                    for descriptor in descriptors
+                )
             if require_tools:
                 raise RuntimeError(
                     f"capability registry {name}() returned no descriptors while require_tools=True"
                 )
-            return []
+            return (), ()
         if require_tools:
             raise RuntimeError(
                 "capability_registry exposes no list_descriptors/list_available/"
                 "list_capabilities method while require_tools=True"
             )
-        return []
+        return (), ()
 
     async def _select_relevant_capabilities(
         self,
         registry: Any,
         descriptors: list[CapabilityDescriptor],
         task: TaskSpec | None,
-    ) -> list[CapabilityDescriptor]:
+    ) -> tuple[list[CapabilityDescriptor], dict[str, Mapping[str, Any]]]:
         """Progressively disclose relevant affordances when the fabric supports search.
 
         The universal and reflection/creation routes remain visible so the
@@ -514,7 +520,7 @@ class ContextCompiler:
         """
         search = getattr(registry, "search", None)
         if search is None or task is None or not task.objective:
-            return descriptors
+            return descriptors, {}
         try:
             result = search(
                 task.objective,
@@ -522,18 +528,20 @@ class ContextCompiler:
                 project_id=task.workspace.id if task.workspace else None,
                 user_id=self._principal_id,
                 limit=self.capability_limit,
+                workspace=task.workspace,
             )
             if inspect.isawaitable(result):
                 result = await result
-            ids = {
-                str(item.get("id"))
+            records = {
+                str(item.get("id")): item
                 for item in (result or ())
                 if isinstance(item, Mapping) and item.get("id")
             }
         except Exception:
-            return descriptors
+            return descriptors, {}
+        ids = set(records)
         if not ids:
-            return descriptors
+            return descriptors, {}
         foundational = {
             "execute",
             "capabilities",
@@ -546,7 +554,7 @@ class ContextCompiler:
             for descriptor in descriptors
             if descriptor.id in ids or descriptor.id in foundational
         ]
-        return selected or descriptors
+        return (selected or descriptors), records
 
     def _build_requirements(
         self, task: TaskSpec, attachments: Sequence[Any], compiled_tokens: int
@@ -841,6 +849,15 @@ def _system_entry(text: str) -> _Entry:
 
 def _task_entry(task: TaskSpec) -> _Entry:
     lines = [task.objective]
+    recovery_hint = (task.metadata or {}).get("_runtime_recovery_hint")
+    if isinstance(recovery_hint, Mapping):
+        lines.append(
+            "Runtime recovery hint: "
+            + str(
+                recovery_hint.get("message")
+                or "Runtime state was lost; re-establish session state explicitly."
+            )
+        )
     if task.acceptance_criteria:
         lines.append("Acceptance criteria:")
         for c in task.acceptance_criteria:
@@ -862,10 +879,27 @@ def _strategy_entry(strategy: StrategyGuidance) -> _Entry:
     candidates = ", ".join(strategy.candidates) or "none"
     text = (
         "Affordance strategy guidance (the model retains authority over actual calls): "
-        f"route={strategy.route}; candidates={candidates}; {strategy.rationale}"
+        f"route={strategy.route}; route_kind={strategy.route_kind}; "
+        f"candidates={candidates}; {strategy.rationale}"
     )
     if strategy.missing_affordance:
-        text += f" Missing affordance: {strategy.missing_affordance}."
+        text += (
+            f" Missing affordance: {strategy.missing_affordance}"
+            f" ({strategy.gap_kind or 'unknown gap'})."
+        )
+    evidence = "; ".join(
+        f"{item.id}:available={item.available},scope={item.scope},"
+        f"dependency_ready={item.dependency_ready},"
+        f"environment_compatible={item.environment_compatible},"
+        f"effects={','.join(item.effects) or 'none'},"
+        f"tags={','.join(item.tags) or 'none'},"
+        f"output={_bounded_json(item.output_schema)},"
+        f"proof={_bounded_json(item.proof)}"
+        for item in strategy.affordances[:16]
+        if item.id
+    )
+    if evidence:
+        text += f" Visible affordances: {evidence}."
     return _Entry(
         name="strategy:guidance",
         text=text,
@@ -878,6 +912,58 @@ def _strategy_entry(strategy: StrategyGuidance) -> _Entry:
             SourceType.SYSTEM, trust=TrustClass.CONFIGURED_INSTRUCTION, scope="strategy"
         ),
     )
+
+
+def _strategy_affordance(
+    descriptor: CapabilityDescriptor,
+    record: Mapping[str, Any] | None,
+) -> StrategyAffordance:
+    """Translate one fabric result into durable, typed route evidence."""
+    record = record or {}
+    optimizer = record.get("optimizer")
+    optimizer = optimizer if isinstance(optimizer, Mapping) else {}
+    availability = str(
+        record.get("availability")
+        or getattr(descriptor.availability, "value", descriptor.availability)
+    )
+    proof = record.get("proof")
+    proof = dict(proof) if isinstance(proof, Mapping) else {}
+    if optimizer:
+        proof["optimizer"] = dict(optimizer)
+    if record.get("validation_state"):
+        proof.setdefault("validation_state", record["validation_state"])
+    if record.get("lifecycle_state"):
+        proof.setdefault("lifecycle_state", record["lifecycle_state"])
+    return StrategyAffordance(
+        id=descriptor.id,
+        description=str(record.get("description") or descriptor.description),
+        available=availability == "available",
+        scope=str(record.get("scope") or getattr(descriptor.origin, "value", "system")),
+        dependency_ready=bool(
+            record.get("dependency_ready", optimizer.get("dependency_available", True))
+        ),
+        environment_compatible=bool(
+            record.get(
+                "environment_compatible",
+                optimizer.get("environment_compatible", True),
+            )
+        ),
+        proof=proof,
+        effects=tuple(
+            sorted(
+                str(getattr(effect, "value", effect)).casefold()
+                for effect in (record.get("effects") or descriptor.effects)
+            )
+        ),
+        tags=tuple(sorted(str(tag).casefold() for tag in (record.get("tags") or descriptor.tags))),
+        output_schema=dict(record.get("output_schema") or descriptor.output_schema or {}),
+    )
+
+
+def _bounded_json(value: Mapping[str, Any]) -> str:
+    """Keep proof visible in the bounded strategy entry without log injection."""
+    text = json.dumps(dict(value), sort_keys=True, default=str, separators=(",", ":"))
+    return text[:384] + ("…" if len(text) > 384 else "")
 
 
 def _project_entries(compiler: ContextCompiler, workspace: str | None) -> list[_Entry]:

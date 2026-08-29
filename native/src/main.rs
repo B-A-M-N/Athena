@@ -51,6 +51,18 @@ struct ProjectionFrame {
     progress: Option<serde_json::Value>,
     #[serde(default)]
     buddy: Option<ProjectionBuddy>,
+    #[serde(default)]
+    model_request: Option<ProjectionModelRequest>,
+    #[serde(default)]
+    workspace_tree: Option<Vec<ProjectionTreeNode>>,
+    #[serde(default)]
+    runtime_tree: Option<Vec<ProjectionTreeNode>>,
+    #[serde(default)]
+    trace: Option<Vec<String>>,
+    #[serde(default)]
+    layout: Option<serde_json::Value>,
+    #[serde(default)]
+    view: Option<ProjectionView>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -64,6 +76,8 @@ struct ProjectionEntity {
     status: String,
     #[serde(default)]
     parent_id: Option<String>,
+    #[serde(default)]
+    metadata: serde_json::Value,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -116,6 +130,56 @@ struct ProjectionDiagnostic {
     message: String,
     #[serde(default)]
     detail: String,
+    #[serde(default)]
+    expected: Option<serde_json::Value>,
+    #[serde(default)]
+    actual: Option<serde_json::Value>,
+    #[serde(default)]
+    severity: String,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionModelRequest {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    request_id: String,
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionTreeNode {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    children: Vec<ProjectionTreeNode>,
+    #[serde(default)]
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionView {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    history: bool,
+    #[serde(default)]
+    history_label: String,
+    #[serde(default)]
+    live_label: String,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -154,6 +218,12 @@ struct Projection {
     verification: ProjectionVerification,
     progress: Option<serde_json::Value>,
     buddy: Option<ProjectionBuddy>,
+    model_request: Option<ProjectionModelRequest>,
+    workspace_tree: Vec<ProjectionTreeNode>,
+    runtime_tree: Vec<ProjectionTreeNode>,
+    trace: Vec<String>,
+    layout: Option<serde_json::Value>,
+    view: ProjectionView,
 }
 
 impl Projection {
@@ -184,6 +254,12 @@ impl Projection {
         self.verification = frame.verification.unwrap_or_default();
         self.progress = frame.progress;
         self.buddy = frame.buddy;
+        self.model_request = frame.model_request;
+        self.workspace_tree = frame.workspace_tree.unwrap_or_default();
+        self.runtime_tree = frame.runtime_tree.unwrap_or_default();
+        self.trace = frame.trace.unwrap_or_default();
+        self.layout = frame.layout;
+        self.view = frame.view.unwrap_or_default();
     }
 }
 
@@ -451,8 +527,98 @@ fn run_headless(
         writeln!(stdout, "{line}")?;
     }
     writeln!(stdout, "-- OI PROJECTION --")?;
+    if let Some(request) = projection.model_request.as_ref() {
+        writeln!(
+            stdout,
+            "MODEL REQUEST · {}/{} [{} · {} · {}]",
+            if request.provider.is_empty() {
+                "—"
+            } else {
+                &request.provider
+            },
+            if request.model.is_empty() {
+                "—"
+            } else {
+                &request.model
+            },
+            if request.role.is_empty() {
+                "default"
+            } else {
+                &request.role
+            },
+            if request.status.is_empty() {
+                "idle"
+            } else {
+                &request.status
+            },
+            if request.request_id.is_empty() {
+                "—"
+            } else {
+                &request.request_id
+            },
+        )?;
+    }
+    write_projection_tree(&mut stdout, &projection.workspace_tree, 0)?;
+    write_projection_tree(&mut stdout, &projection.runtime_tree, 0)?;
+    for line in &projection.trace {
+        writeln!(stdout, "TRACE {line}")?;
+    }
+    if !projection.view.label.is_empty() {
+        writeln!(
+            stdout,
+            "VIEW {} [{}]",
+            projection.view.label.to_ascii_uppercase(),
+            if projection.view.history {
+                if projection.view.history_label.is_empty() {
+                    "HISTORY"
+                } else {
+                    &projection.view.history_label
+                }
+            } else if projection.view.live_label.is_empty() {
+                "LIVE"
+            } else {
+                &projection.view.live_label
+            }
+        )?;
+    }
     for line in projection.oi {
         writeln!(stdout, "{line}")?;
+    }
+    Ok(())
+}
+
+fn write_projection_tree(
+    stdout: &mut impl Write,
+    nodes: &[ProjectionTreeNode],
+    depth: usize,
+) -> io::Result<()> {
+    for tree in nodes {
+        let kind = if tree.kind.is_empty() {
+            "node"
+        } else {
+            &tree.kind
+        };
+        let status = if tree.status.is_empty() {
+            "idle"
+        } else {
+            &tree.status
+        };
+        let label = if tree.label.is_empty() {
+            &tree.id
+        } else {
+            &tree.label
+        };
+        let metadata = if tree.metadata.is_null() {
+            String::new()
+        } else {
+            format!(" {}", tree.metadata)
+        };
+        writeln!(
+            stdout,
+            "{}TREE {kind} [{status}] {label}{metadata}",
+            "  ".repeat(depth)
+        )?;
+        write_projection_tree(stdout, &tree.children, depth + 1)?;
     }
     Ok(())
 }
@@ -469,7 +635,12 @@ mod tests {
                 "entities":[
                     {"id":"call-1","kind":"operation","label":"executor","status":"active"}
                 ],
-                "alerts":["test pulse"]
+                "alerts":["test pulse"],
+                "model_request":{"provider":"openrouter","model":"configured/model","role":"planner","request_id":"req-1","status":"active"},
+                "workspace_tree":[{"id":"workspace:src","kind":"directory","label":"src","status":"active","children":[]}],
+                "runtime_tree":[{"id":"call-1","kind":"operation","label":"executor","status":"active","children":[]}],
+                "trace":["> NEXT STEP · executor"],
+                "view":{"label":"action","mode":"execute","history":false,"history_label":"OI // HISTORY","live_label":"OI // LIVE"}
             }"#,
         )
         .expect("projection JSON should decode");
@@ -480,5 +651,70 @@ mod tests {
         assert_eq!(projection.entities.len(), 1);
         assert_eq!(projection.entities[0].label, "executor");
         assert_eq!(projection.alerts, vec!["test pulse"]);
+        assert_eq!(
+            projection
+                .model_request
+                .as_ref()
+                .expect("model request")
+                .request_id,
+            "req-1"
+        );
+        assert_eq!(projection.workspace_tree[0].label, "src");
+        assert_eq!(projection.runtime_tree[0].label, "executor");
+        assert_eq!(projection.trace, vec!["> NEXT STEP · executor"]);
+        assert_eq!(projection.view.label, "action");
+        assert!(!projection.view.history);
     }
+}
+
+#[test]
+fn bridge_buddy_character_survives_deserialize_and_apply() {
+    let frame: ProjectionFrame = serde_json::from_str(
+        r#"{
+                "status":"IDLE",
+                "buddy":{"state":"IDLE","anchor":"center","status":"ready","character":"owl"}
+            }"#,
+    )
+    .expect("buddy JSON should decode");
+    let mut projection = Projection::default();
+    projection.apply(frame);
+
+    let buddy = projection.buddy.as_ref().expect("buddy should be present");
+    assert_eq!(buddy.character, "owl");
+    assert_eq!(buddy.state, "IDLE");
+    assert_eq!(buddy.anchor, "center");
+    assert_eq!(buddy.status, "ready");
+}
+
+#[test]
+fn bridge_buddy_character_fills_missing_default() {
+    let frame: ProjectionFrame =
+        serde_json::from_str(r#"{"status":"IDLE"}"#).expect("minimal JSON should decode");
+    let mut projection = Projection::default();
+    projection.apply(frame);
+
+    assert!(projection.buddy.is_none());
+}
+
+#[test]
+fn bridge_model_request_preserves_canonical_identity() {
+    let frame: ProjectionFrame = serde_json::from_str(
+        r#"{
+                "model_request":{
+                    "provider":"openrouter",
+                    "model":"qwen3.6-35b",
+                    "role":"planner",
+                    "request_id":"req-canon-1",
+                    "status":"active"
+                }
+            }"#,
+    )
+    .expect("model request JSON should decode");
+    let mut projection = Projection::default();
+    projection.apply(frame);
+
+    let mr = projection.model_request.as_ref().expect("model request");
+    assert_eq!(mr.provider, "openrouter");
+    assert_eq!(mr.model, "qwen3.6-35b");
+    assert_eq!(mr.request_id, "req-canon-1");
 }

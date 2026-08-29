@@ -495,7 +495,7 @@ async def _run_worker(operation: str, **kwargs) -> dict:
         if value is None:
             continue
         command.extend((f"--{key.replace('_', '-')}", str(value)))
-    process = await asyncio.create_subprocess_exec(
+    process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned checkpoint worker
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

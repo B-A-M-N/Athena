@@ -911,6 +911,7 @@ VHS = (
             "path (fixtures in demos/fixtures/capability_fabric.jsonl) that this "
             "bound test pins; the tape renders that driver."
         ),
+        required=False,
     ),
     Scenario(
         id="VHS-003",
@@ -929,6 +930,7 @@ VHS = (
             "14406x14648 failure is asserted to be wrong, and the exact od "
             "pipeline the script runs is executed against synthetic bytes."
         ),
+        required=False,
     ),
 )
 

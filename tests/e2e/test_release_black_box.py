@@ -70,7 +70,7 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
                 "-m",
                 "pip",
                 "install",
-                f"{artifact}[api,cli]",
+                f"{artifact}[cli]",
             ],
             cwd=tmp_path,
             env=install_env,

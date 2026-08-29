@@ -200,6 +200,12 @@ class RealityGate:
         """Return the task's sticky candidate branch, if one exists."""
         return self._active.get(task_id) if task_id else None
 
+    def activate_branch(self, branch: Any) -> None:
+        """Retain a verified candidate for operator review after proof."""
+        task_id = getattr(branch, "task_id", None)
+        if task_id:
+            self._active[task_id] = branch
+
     def active_branches(self) -> tuple[Any, ...]:
         return tuple(self._active.values())
 

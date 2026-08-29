@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import signal
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,6 +22,7 @@ from athena.protocol.capabilities import (
     EffectClass,
 )
 from athena.protocol.ids import new_id
+from athena.execution.process_tree import kill_tree_async
 from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
 
 __all__ = [
@@ -60,7 +59,7 @@ class PersistentGeneratedSession:
     async def start(self) -> None:
         if self._process is not None:
             return
-        self._process = await asyncio.create_subprocess_exec(
+        self._process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated runtime worker
             *self._argv,
             env=self._env,
             stdin=asyncio.subprocess.PIPE,
@@ -142,19 +141,7 @@ class PersistentGeneratedSession:
         process = self._process
         self._process = None
         if process is not None and process.returncode is None:
-            if os.name == "nt":
-                process.kill()
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except (OSError, ProcessLookupError):
-                    process.kill()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                if process.returncode is None:
-                    process.kill()
-                await process.wait()
+            await kill_tree_async(process, timeout=1.0)
         if self._stderr_task is not None:
             self._stderr_task.cancel()
             await asyncio.gather(self._stderr_task, return_exceptions=True)

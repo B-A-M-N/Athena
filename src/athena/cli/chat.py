@@ -38,6 +38,10 @@ _META_HELP = """\
 /criteria LIST   set acceptance criteria (';'-separated; 'command:' prefix = probe); bare to clear
 /interrupted     list tasks parked by shutdown or crash
 /resume [TASK]   re-queue an interrupted task (or the most recent one)
+/candidates      list generated-tool candidates from the last task
+/candidate ID    inspect one generated-tool candidate
+/promote ID project|user  explicitly promote a generated tool
+/deprecate ID    retire a generated tool
 /mascot [NAME]   list or switch the mascot/buddy ('off' hides it)
 !cmd             execute a shell command directly
 !!cmd            execute a shell command (output not injected into model context)
@@ -83,10 +87,12 @@ def _model_label(config: Any = None) -> str:
     providers = tuple(getattr(config, "providers", ()) or ())
     if providers:
         provider = providers[0]
-        return (f"{getattr(provider, 'name', 'model')} / {getattr(provider, 'model', '')}").rstrip(
-            " /"
-        )
-    return os.environ.get("OPENROUTER_MODEL", "local / fake-1")
+        identity = (
+            f"{getattr(provider, 'name', 'model')} / {getattr(provider, 'model', '')}"
+        ).rstrip(" /")
+        return f"configured / {identity}" if identity else "configured"
+    configured = os.environ.get("OPENROUTER_MODEL")
+    return f"configured / {configured}" if configured else ""
 
 
 async def _cmd_permissions(service: Any, surface: OperatorSurface) -> None:
@@ -186,6 +192,7 @@ class ChatREPL:
         )
         self.workspace = _workspace_spec(getattr(options, "workspace", None))
         self._active_task_id: str | None = None
+        self._last_task_id: str | None = None
         option_animations = getattr(options, "animations", None)
         config_animations = getattr(config, "animations", True)
         self.surface = _make_surface(
@@ -335,6 +342,84 @@ class ChatREPL:
         if name == "mascot":
             self._cmd_mascot(arg)
             return True
+        if name == "candidates":
+            task_id = self._last_task_id or self._active_task_id
+            if task_id is None:
+                self.surface.render_notice("(no task context for generated candidates)")
+                return True
+            rows = await self.service.operator_generated_capabilities(task_id)
+            if not rows:
+                self.surface.render_notice("(no generated candidates)")
+                return True
+            for row in rows:
+                usage = dict((row.get("proof") or {}).get("usage") or {})
+                evidence = f"{usage.get('successes', 0)}/{usage.get('uses', 0)} successful"
+                self.surface.render_notice(
+                    f"{row.get('capability_id')} · {row.get('lifecycle_state')} · {evidence}"
+                )
+                self.surface.render_notice(f"  {row.get('description') or ''}")
+            return True
+        if name == "candidate":
+            if not arg:
+                self.surface.render_notice("usage: /candidate <capability_id>")
+                return True
+            task_id = self._last_task_id or self._active_task_id
+            try:
+                record = await self.service.operator_generated_capability(arg, task_id)
+            except (RuntimeError, ValueError) as exc:
+                self.surface.render_notice(f"candidate unavailable: {exc}")
+                return True
+            proof = dict(record.get("proof_record") or {})
+            usage = dict(proof.get("usage") or {})
+            quality = proof.get("quality_score")
+            self.surface.render_notice(
+                f"{record.get('id')} · {record.get('scope')} · {record.get('lifecycle_state')}"
+            )
+            self.surface.render_notice(f"  {record.get('description') or ''}")
+            self.surface.render_notice(
+                f"  proof: {usage.get('successes', 0)}/{usage.get('uses', 0)} successful"
+            )
+            if quality is not None:
+                self.surface.render_notice(f"  quality: {quality}")
+            self.surface.render_notice(f"  code hash: {record.get('code_hash')}")
+            self.surface.render_notice(f"  schema hash: {record.get('schema_hash')}")
+            dependencies = ", ".join(
+                dependency.get("name", "?")
+                for dependency in record.get("required_dependencies") or ()
+            )
+            if dependencies:
+                self.surface.render_notice(f"  dependencies: {dependencies}")
+            return True
+        if name == "promote":
+            parts = arg.split()
+            if len(parts) != 2 or parts[1] not in {"project", "user"}:
+                self.surface.render_notice("usage: /promote <capability_id> project|user")
+                return True
+            capability_id, scope = parts
+            task_id = self._last_task_id or self._active_task_id
+            try:
+                outcome = await self.service.operator_promote_generated_capability(
+                    capability_id, scope, task_id
+                )
+            except (RuntimeError, ValueError) as exc:
+                self.surface.render_notice(f"promotion failed: {exc}")
+                return True
+            value = dict(outcome.get("value") or {})
+            owner = value.get("project_id") or value.get("user_id") or "?"
+            self.surface.render_notice(f"promoted {capability_id} to {scope} {owner}")
+            return True
+        if name == "deprecate":
+            if not arg:
+                self.surface.render_notice("usage: /deprecate <capability_id>")
+                return True
+            task_id = self._last_task_id or self._active_task_id
+            try:
+                await self.service.operator_deprecate_generated_capability(arg, task_id)
+            except (RuntimeError, ValueError) as exc:
+                self.surface.render_notice(f"deprecation failed: {exc}")
+                return True
+            self.surface.render_notice(f"deprecated {arg}")
+            return True
         if name == "permissions":
             await _cmd_permissions(self.service, self.surface)
             return True
@@ -398,13 +483,14 @@ class ChatREPL:
 
             spec = await self.service.resume_task(task_id)
             self._active_task_id = spec.id
+            self._last_task_id = spec.id
             result = await _stream(
                 self.service, spec.id, autonomy=self.autonomy, surface=self.surface
             )
             if result is not None:
                 status = getattr(result, "status", None)
-                value = getattr(status, "value", None)
-                s = str(value if value is not None else status)
+                status_value = getattr(status, "value", None)
+                s = str(status_value if status_value is not None else status)
                 summary = getattr(result, "summary", "") or ""
                 self.surface.render_result(summary, status=s)
             self._active_task_id = None
@@ -512,6 +598,7 @@ class ChatREPL:
         )
         spec = await self.service.submit(request, wait=False)
         self._active_task_id = spec.id
+        self._last_task_id = spec.id
         result = await stream_task(
             self.service,
             spec.id,

@@ -10,7 +10,7 @@
 #   6. on any failure: kill the process group, remove the temp, leave the
 #      previous known-good final gif untouched
 #
-# Required for stable-beta gate:
+# Optional manual demo contract:
 #   - no two VHS processes may write the same final output simultaneously
 #   - file existence alone is NEVER accepted as completion
 #   - VHS process exit 0 AND gif decode OK are both required

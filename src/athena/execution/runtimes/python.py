@@ -87,10 +87,22 @@ class PythonRuntime(BaseRuntime):
     aliases = ("py", "python3")
 
     def _make_session(
-        self, *, env=None, cwd=None, sandbox_root=None, network_policy=None
+        self,
+        *,
+        env=None,
+        cwd=None,
+        sandbox_root=None,
+        network_policy=None,
+        writable_paths=None,
+        read_only_paths=(),
     ) -> "_PythonSession":
         sess = _PythonSession(
-            env=env, cwd=cwd, sandbox_root=sandbox_root, network_policy=network_policy
+            env=env,
+            cwd=cwd,
+            sandbox_root=sandbox_root,
+            network_policy=network_policy,
+            writable_paths=writable_paths,
+            read_only_paths=read_only_paths,
         )
         sess.start()
         return sess
@@ -106,11 +118,21 @@ class PythonRuntime(BaseRuntime):
 
 
 class _PythonSession:
-    def __init__(self, env=None, cwd=None, sandbox_root=None, network_policy=None) -> None:
+    def __init__(
+        self,
+        env=None,
+        cwd=None,
+        sandbox_root=None,
+        network_policy=None,
+        writable_paths=None,
+        read_only_paths=(),
+    ) -> None:
         self.env = env or {}
         self.cwd = cwd
         self.sandbox_root = sandbox_root
         self.network_policy = network_policy
+        self.writable_paths = writable_paths
+        self.read_only_paths = read_only_paths
         self.process: subprocess.Popen | None = None
         self.frames: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
@@ -122,6 +144,8 @@ class _PythonSession:
             cwd=self.cwd,
             sandbox_root=self.sandbox_root,
             network_policy=self.network_policy,
+            writable_paths=self.writable_paths,
+            read_only_paths=self.read_only_paths,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

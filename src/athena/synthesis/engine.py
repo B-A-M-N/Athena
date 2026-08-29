@@ -36,7 +36,7 @@ from athena.affordances.models import (
     GeneratedCapability,
 )
 from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
-from athena.execution.process_tree import kill_tree, sandbox_argv, spawn_owned
+from athena.execution.process_tree import kill_tree, kill_tree_async, sandbox_argv, spawn_owned
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
@@ -534,7 +534,7 @@ class SynthesisEngine:
                 network_policy=network,
                 writable=writable,
             )
-            proc = await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated validation worker
                 *argv,
                 env=self._child_env(_namespace_python_paths(python_paths, root)),
                 stdin=asyncio.subprocess.PIPE,
@@ -565,7 +565,7 @@ class SynthesisEngine:
                         timeout=timeout,
                     )
             except TimeoutError:
-                proc.kill()
+                await kill_tree_async(proc)
                 stdout, stderr = await proc.communicate()
                 return (
                     stdout.decode("utf-8", errors="replace"),
@@ -579,8 +579,8 @@ class SynthesisEngine:
             )
         except asyncio.CancelledError:
             if proc is not None and proc.returncode is None:
-                proc.kill()
-                await proc.communicate()
+                await asyncio.shield(kill_tree_async(proc))
+                await asyncio.shield(proc.communicate())
             raise
         finally:
             if owned_root:

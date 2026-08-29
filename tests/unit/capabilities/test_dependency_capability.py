@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import shlex
+import sys
 
 import pytest
 
@@ -16,6 +18,15 @@ class _Execution:
             status=ExecutionExitStatus.EXITED,
             stdout="installed",
         )
+
+
+class _ReplayExecution(_Execution):
+    def __init__(self):
+        self.requests = []
+
+    async def execute(self, request):
+        self.requests.append(request)
+        return await super().execute(request)
 
 
 class _Distribution:
@@ -79,3 +90,69 @@ async def test_dependency_inspect_reports_locked_version(tmp_path):
     assert result.status is CapabilityResultStatus.OK
     assert "1.2.3" in result.output
     assert result.metadata["lock"]["resolved_version"] == "1.2.3"
+
+
+@pytest.mark.asyncio
+async def test_dependency_replay_uses_exact_lock_and_verifies_environment(tmp_path, monkeypatch):
+    lock_dir = tmp_path / ".athena"
+    lock_dir.mkdir()
+    (lock_dir / "dependencies.lock.json").write_text(
+        '{"format": 1, "packages": {"demo": {'
+        '"manager": "python", "resolved_version": "1.2.3", '
+        '"record_hashes": ["pkg/__init__.py:sha256=abc"]}}}'
+    )
+    context = SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path)))
+    execution = _ReplayExecution()
+    monkeypatch.setattr(
+        "athena.capabilities.dependency.resolve_dependency_environment",
+        lambda *args, **kwargs: SimpleNamespace(
+            to_metadata=lambda: {"environment_fingerprint": "verified"}
+        ),
+    )
+
+    result = await DependencyCapability(execution).invoke(
+        _request("replay", name="demo"), context=context
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    assert len(execution.requests) == 1
+    source = execution.requests[0].source
+    assert shlex.quote(sys.executable) in source
+    assert "demo==1.2.3" in source
+    assert "--no-deps" in source
+    assert result.metadata["provenance"]["lock_source"].endswith(".athena/dependencies.lock.json")
+
+
+@pytest.mark.asyncio
+async def test_dependency_replay_fails_closed_without_content_hashes(tmp_path):
+    lock_dir = tmp_path / ".athena"
+    lock_dir.mkdir()
+    (lock_dir / "dependencies.lock.json").write_text(
+        '{"format": 1, "packages": {"demo": {"manager": "python", "resolved_version": "1.2.3"}}}'
+    )
+    context = SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path)))
+    execution = _ReplayExecution()
+
+    result = await DependencyCapability(execution).invoke(
+        _request("replay", name="demo"), context=context
+    )
+
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "content hashes" in (result.error or "")
+    assert execution.requests == []
+
+
+@pytest.mark.asyncio
+async def test_dependency_install_rejects_container_without_host_interpreter(tmp_path):
+    context = SimpleNamespace(
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path), execution_backend="container")
+    )
+    execution = _ReplayExecution()
+
+    result = await DependencyCapability(execution).invoke(
+        _request("install", name="demo"), context=context
+    )
+
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "unsupported for execution backend 'container'" in (result.error or "")
+    assert execution.requests == []

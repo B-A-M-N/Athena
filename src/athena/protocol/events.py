@@ -60,6 +60,7 @@ class EventCategory(str, enum.Enum):
     VERIFICATION_STARTED = "VerificationStarted"
     VERIFICATION_CHECK_COMPLETED = "VerificationCheckCompleted"
     VERIFICATION_COMPLETED = "VerificationCompleted"
+    CANDIDATE_READY_FOR_REVIEW = "CandidateReadyForReview"
     RUNTIME_SESSION_CREATED = "RuntimeSessionCreated"
     RUNTIME_STATE_LOST = "RuntimeStateLost"
     EXECUTION_STARTED = "ExecutionStarted"

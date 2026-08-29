@@ -28,6 +28,7 @@ from athena.protocol.execution import (
     ExecutionExitStatus,
     ExecutionRequest,
 )
+from athena.protocol.tasks import NetworkPolicy
 
 _LANGUAGES = ("python", "shell", "bash", "sh", "zsh", "node", "powershell", "py")
 
@@ -151,17 +152,45 @@ class ExecuteCapability:
                     error=f"session {runtime_session_id} is not owned by task {request.task_id}",
                 )
 
+        task_policy = getattr(context, "capability_policy", None) if context else None
+        network_authorized = bool(
+            task_policy
+            and {
+                EffectClass.NETWORK_READ.value,
+                EffectClass.NETWORK_WRITE.value,
+                EffectClass.NETWORK_READ,
+                EffectClass.NETWORK_WRITE,
+            }.intersection(set(task_policy.effects or ()))
+        )
+        requested_network = getattr(ws.network_policy, "value", ws.network_policy)
+        effective_network = (
+            ws.network_policy
+            if network_authorized and requested_network != NetworkPolicy.DENY.value
+            else NetworkPolicy.DENY
+        )
+        writable_rules = tuple(getattr(ws, "writable", ()) or ())
+        workspace_root = os.path.realpath(os.path.abspath(ws.root))
         exec_req = ExecutionRequest(
             runtime=runtime_name,
             source=code,
             task_id=execution_task_id,
             workspace_id=ws.id,
-            backend=ws.execution_backend,
+            backend=ws.execution_backend or "local",
             cwd=cwd,
             runtime_session_id=runtime_session_id,
             timeout=timeout,
-            network_policy=ws.network_policy,
-            workspace_root=os.path.realpath(os.path.abspath(ws.root)),
+            network_policy=effective_network,
+            workspace_root=workspace_root,
+            # Candidate verification must import the candidate tree, while
+            # never inheriting a host PYTHONPATH that could leak unrelated
+            # code into the proof environment.
+            env=_candidate_python_environment(workspace_root),
+            writable_paths=(
+                None
+                if not writable_rules
+                else _canonical_workspace_rules(ws, workspace_root, allow=True)
+            ),
+            read_only_paths=_canonical_workspace_rules(ws, workspace_root, allow=False),
         )
         execution_id = _new_id()
 
@@ -256,6 +285,14 @@ class ExecuteCapability:
                 # large result because it makes later inspection impossible
                 # to diagnose.
                 result_metadata["artifactization_error"] = str(exc)
+                return CapabilityResult(
+                    request.call_id,
+                    request.capability_id,
+                    CapabilityResultStatus.FAILED,
+                    output=combined[:max_inline],
+                    error=f"required output artifact could not be saved: {exc}",
+                    metadata=result_metadata,
+                )
         elif len(combined) > max_inline:
             result_metadata["artifactization"] = "unavailable"
 
@@ -349,7 +386,9 @@ def _failure_environment(
     *,
     backend_metadata: Mapping[str, object] | None = None,
 ) -> str:
-    identity = f"{runtime}\x1f{workspace.execution_backend}\x1f{workspace.network_policy.value}"
+    identity = (
+        f"{runtime}\x1f{workspace.execution_backend or 'local'}\x1f{workspace.network_policy.value}"
+    )
     image_digest = str((backend_metadata or {}).get("image_digest") or "")
     if image_digest:
         identity += f"\x1f{image_digest}"
@@ -389,6 +428,30 @@ def _map_runtime(language: str) -> str:
 
 def _language_name(language: str) -> str:
     return _map_runtime(language)
+
+
+def _canonical_workspace_rules(ws, root: str, *, allow: bool) -> tuple[str, ...]:
+    """Convert workspace-relative rules to contained host mount paths."""
+    paths: list[str] = []
+    for rule in tuple(getattr(ws, "writable", ()) or ()):
+        if bool(rule.allow) is not allow:
+            continue
+        raw = os.fspath(rule.path)
+        candidate = os.path.realpath(
+            os.path.abspath(raw if os.path.isabs(raw) else os.path.join(root, raw))
+        )
+        if candidate == root or candidate.startswith(root + os.sep):
+            if candidate not in paths:
+                paths.append(candidate)
+    return tuple(paths)
+
+
+def _candidate_python_environment(workspace_root: str) -> dict[str, str]:
+    """Return the minimal project import environment for a routed workspace."""
+    source_root = os.path.join(workspace_root, "src")
+    if os.path.isdir(source_root):
+        return {"PYTHONPATH": source_root}
+    return {}
 
 
 def _new_id() -> str:

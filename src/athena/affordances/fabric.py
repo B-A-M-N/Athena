@@ -643,10 +643,17 @@ class CapabilityFabric:
                         "description": descriptor.description,
                         "origin": descriptor.origin.value,
                         "effects": sorted(effect.value for effect in descriptor.effects),
+                        "output_schema": dict(descriptor.output_schema or {}),
                         "scope": scope,
                         "score": optimized_score,
                         "optimizer": optimizer_metrics,
                         "availability": descriptor.availability.value,
+                        "tags": sorted(descriptor.tags),
+                        # Keep validation/usage receipts attached to search
+                        # results so strategy selection does not reconstruct
+                        # route quality from an id alone.
+                        "proof": dict(record.proof_record) if record is not None else {},
+                        "validation_state": (record.validation_state if record is not None else ""),
                         **(
                             {"lifecycle_state": record.lifecycle_state}
                             if record is not None

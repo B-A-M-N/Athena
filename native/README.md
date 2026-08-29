@@ -15,7 +15,8 @@ The first native vertical slice now exists as `athena-terminal`. It owns a PTY,
 feeds output through the pinned Alacritty terminal core, accepts keyboard input
 and resize events in its Linux/X11 window path, and consumes JSON projection
 frames without taking authority over Athena state. Projection frames can carry
-structured scene entities and alerts as well as terminal text; the OpenGL
+structured scene entities, model-request identity, workspace/runtime trees,
+diagnostics, and alerts as well as terminal text; the OpenGL
 compositor renders those as a sparse CRT graph with one Buddy. The Linux/X11
 proof path also supports mouse selection plus Ctrl-Shift-C/Ctrl-Shift-V
 clipboard round-trips. It remains a small proof surface, not the finished

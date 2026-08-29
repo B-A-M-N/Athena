@@ -311,13 +311,14 @@ class DebuggerCapability:
         if self._execution is None:
             return _result(request, ok=False, error="debugger requires ExecutionManager")
         workspace = getattr(context, "workspace", None) or self._workspace
+        backend = getattr(workspace, "execution_backend", None) or "local"
 
         if op == "launch":
             if workspace is None:
                 return _result(
                     request, ok=False, error="debugger launch requires workspace context"
                 )
-            if workspace.execution_backend not in {"local", "shadow", "sandbox", "verification"}:
+            if backend not in {"local", "shadow", "sandbox", "verification"}:
                 return _result(
                     request,
                     ok=False,
@@ -342,7 +343,7 @@ class DebuggerCapability:
             runtime_session_id = await self._execution.create_session(
                 task_id=task_id,
                 runtime="python",
-                backend=workspace.execution_backend,
+                backend=backend,
                 cwd=root,
                 workspace_root=root,
                 network_policy=workspace.network_policy.value,
@@ -360,7 +361,7 @@ class DebuggerCapability:
                 source=source,
                 task_id=task_id,
                 workspace_id=workspace.id,
-                backend=workspace.execution_backend,
+                backend=backend,
                 runtime_session_id=runtime_session_id,
                 cwd=root,
                 network_policy=workspace.network_policy,

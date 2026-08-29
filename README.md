@@ -74,7 +74,16 @@ athena native
 
 # inspect the host terminal and renderer decision
 athena doctor display
+
+# have Athena prepare a verified candidate for review
+athena self "improve the operator diagnostics"
 ```
+
+`athena self` uses the ordinary task path but forces a speculative workspace
+and review-before-commit boundary. Athena verifies the candidate while the
+live checkout remains unchanged, then offers Apply, Discard, or Later. Apply
+uses the same shadow commit path as other verified work; a failed or stale
+candidate cannot be applied.
 
 Inside the console, direct commands use the same policy and execution path as
 model-requested commands:
@@ -362,19 +371,22 @@ a correctly sized PTY.
 
 Direct `vhs demos/capability_fabric.tape` still works for ad-hoc local
 capture but does not provide the lock, timeout, or decode validation used by
-the stable-beta gate.
+the optional demo wrapper.
 
-### Termux / host-terminal smoke test
+### Optional host-terminal compatibility smoke test
 
-Termux is a supported host-terminal target for the ANSI surface. From a
-checkout, run the deterministic PTY visual smoke test:
+The Termux script is an optional ANSI/PTY compatibility probe, not an
+Athena stable-beta support target or release gate. Athena's supported terminal
+surfaces are hosted Glass over Kitty Graphics Protocol (Kitty and WezTerm),
+the ANSI fallback, and the native Alacritty-core development frontend. From a
+checkout, run the optional probe manually:
 
 ```bash
 scripts/termux-smoke
 ```
 
 It launches the fixture-backed demo in a 160×45 pseudo-terminal and checks
-that the conversation well, OI scene, workspace map, runtime graph, and Buddy
+that the conversation well, OI scene, workspace map, runtime tree, and Buddy
 all render before the process exits. To exercise an installed CLI instead,
 use `ATHENA_SMOKE_MODE=cli ATHENA_BIN=athena scripts/termux-smoke`; that path
 uses a temporary database/workspace and never inherits OpenRouter credentials.
@@ -419,7 +431,7 @@ durable task events. The two apertures are equal in logical size: the left is
 the readable `YOU`/`ATHENA` conversation well, and the right is the OI scene
 viewport. The buddy is an entity inside that viewport, never a permanent
 sidebar that steals OI content width. Approval, history, live stream, runtime
-graphs, failures, recovery, and delegated work are projections of the same
+trees, failures, recovery, and delegated work are projections of the same
 canonical events.
 
 The current hosted Glass path renders the right CRT as a bounded Pillow

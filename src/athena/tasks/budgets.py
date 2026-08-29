@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Any, Mapping
 
@@ -106,6 +107,8 @@ def exceeded_by_budget(budget: ResourceBudget | None, u: Usage) -> bool:
         return True
     if budget.max_cost_usd is not None and u.cost >= budget.max_cost_usd:
         return True
+    if budget.max_artifact_bytes is not None and u.artifact_bytes >= budget.max_artifact_bytes:
+        return True
     if budget.max_children and u.children >= budget.max_children:
         return True
     if budget.max_wall_time is not None and _elapsed_s(u) >= budget.max_wall_time.total_seconds():
@@ -141,6 +144,15 @@ class BudgetTracker:
         self._ledger: dict[str, Usage] = {}
         self._budgets: dict[str, ResourceBudget] = {}
         self._parent: dict[str, str | None] = {}
+        self._artifact_reservations: dict[str, int] = {}
+        self._model_cost_reservations: dict[str, Decimal] = {}
+        self._model_cost_by_task: dict[str, Decimal] = {}
+        self._usage_hydrated: set[str] = set()
+        self._model_semaphores: dict[str, Any] = {}
+        self._model_limits: dict[str, int] = {}
+        import asyncio
+
+        self._artifact_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
     # Registration / consumption
@@ -168,15 +180,20 @@ class BudgetTracker:
 
     def consume_result(self, task_id: str, summary: UsageSummary) -> None:
         if summary is not None:
+            # Live model turns checkpoint their usage before finalization so a
+            # restart cannot reset the ledger. Finalization may present the
+            # aggregate result again; consume only the delta so this remains
+            # idempotent for result attachment after a restart.
+            current = self.own(task_id)
             self.consume(
                 task_id,
                 dict(
-                    input_tokens=summary.input_tokens,
-                    output_tokens=summary.output_tokens,
-                    model_calls=summary.model_calls,
-                    cost=summary.cost_usd,
-                    executions=summary.executions,
-                    mutations=summary.mutations,
+                    input_tokens=max(0, summary.input_tokens - current.input_tokens),
+                    output_tokens=max(0, summary.output_tokens - current.output_tokens),
+                    model_calls=max(0, summary.model_calls - current.model_calls),
+                    cost=max(Decimal("0"), summary.cost_usd - current.cost),
+                    executions=max(0, summary.executions - current.executions),
+                    mutations=max(0, summary.mutations - current.mutations),
                 ),
             )
 
@@ -281,6 +298,7 @@ class BudgetTracker:
         return list(dict.fromkeys(out))
 
     async def total(self, task_id: str) -> Usage:
+        await self._hydrate_usage(task_id)
         own = self.own(task_id)
         agg = Usage()
         agg.add(own)
@@ -293,8 +311,11 @@ class BudgetTracker:
     async def remaining(self, task_id: str) -> Mapping[str, Any]:
         budget = await self.budget_of_async(task_id)
         total = await self.total(task_id)
+        artifact_reserved = self._artifact_reservations.get(task_id, 0)
+        model_reserved = self._model_cost_reservations.get(task_id, Decimal("0"))
         cost_remaining = _cap_remaining_dec(
-            budget.max_cost_usd if budget.max_cost_usd is not None else None, total.cost
+            budget.max_cost_usd if budget.max_cost_usd is not None else None,
+            total.cost + model_reserved,
         )
         return {
             "iterations": _cap_remaining(budget.max_agent_iterations, total.iterations),
@@ -302,6 +323,9 @@ class BudgetTracker:
             "output_tokens": _cap_remaining(budget.max_output_tokens, total.output_tokens),
             "cost_usd": cost_remaining,
             "children": _cap_remaining(budget.max_children, total.children),
+            "artifact_bytes": _cap_remaining(
+                budget.max_artifact_bytes, total.artifact_bytes + artifact_reserved
+            ),
         }
 
     async def exhausted(self, task_id: str) -> bool:
@@ -314,6 +338,175 @@ class BudgetTracker:
             if exceeded_by_budget(await self.budget_of_async(anc), await self.total(anc)):
                 return True
         return False
+
+    async def reserve_artifact(self, task_id: str, size: int) -> None:
+        """Reserve logical artifact bytes before an immutable blob is saved."""
+        if size < 0:
+            raise ValueError("artifact size must be non-negative")
+        ancestors = await self._ancestor_ids(task_id)
+        async with self._artifact_lock:
+            for ancestor in ancestors:
+                budget = await self.budget_of_async(ancestor)
+                if budget.max_artifact_bytes is None:
+                    continue
+                used = (await self.total(ancestor)).artifact_bytes
+                reserved = self._artifact_reservations.get(ancestor, 0)
+                if used + reserved + size > budget.max_artifact_bytes:
+                    raise ValueError(
+                        f"artifact budget exceeded for task {ancestor}: "
+                        f"{used + reserved + size} > {budget.max_artifact_bytes} bytes"
+                    )
+            for ancestor in ancestors:
+                self._artifact_reservations[ancestor] = (
+                    self._artifact_reservations.get(ancestor, 0) + size
+                )
+        for ancestor in ancestors:
+            await self._persist_usage(ancestor)
+
+    async def commit_artifact(self, task_id: str, size: int) -> None:
+        """Commit bytes to the owning task and remove lineage reservations.
+
+        Descendant consumption is aggregated by :meth:`total`, so copying
+        committed bytes into every ancestor would double-count the same
+        occurrence against the root budget.
+        """
+        ancestors = await self._ancestor_ids(task_id)
+        async with self._artifact_lock:
+            for ancestor in ancestors:
+                self._artifact_reservations[ancestor] = max(
+                    0, self._artifact_reservations.get(ancestor, 0) - size
+                )
+            self._ledger.setdefault(task_id, Usage()).artifact_bytes += size
+        for ancestor in ancestors:
+            await self._persist_usage(ancestor)
+
+    async def release_artifact(self, task_id: str, size: int) -> None:
+        ancestors = await self._ancestor_ids(task_id)
+        for ancestor in ancestors:
+            await self._hydrate_usage(ancestor)
+        async with self._artifact_lock:
+            for ancestor in ancestors:
+                self._artifact_reservations[ancestor] = max(
+                    0, self._artifact_reservations.get(ancestor, 0) - size
+                )
+        for ancestor in ancestors:
+            await self._persist_usage(ancestor)
+
+    async def reserve_model_cost(self, task_id: str, amount: Decimal) -> None:
+        """Reserve a bounded worst-case model cost across the root lineage."""
+        if amount < 0:
+            raise ValueError("model cost reservation must be non-negative")
+        ancestors = await self._ancestor_ids(task_id)
+        async with self._artifact_lock:
+            for ancestor in ancestors:
+                budget = await self.budget_of_async(ancestor)
+                if budget.max_cost_usd is None:
+                    continue
+                used = (await self.total(ancestor)).cost
+                reserved = self._model_cost_reservations.get(ancestor, Decimal("0"))
+                if used + reserved + amount > budget.max_cost_usd:
+                    raise ValueError(
+                        f"model cost budget exceeded for task {ancestor}: "
+                        f"{used + reserved + amount} > {budget.max_cost_usd} USD"
+                    )
+            for ancestor in ancestors:
+                self._model_cost_reservations[ancestor] = (
+                    self._model_cost_reservations.get(ancestor, Decimal("0")) + amount
+                )
+            self._model_cost_by_task[task_id] = (
+                self._model_cost_by_task.get(task_id, Decimal("0")) + amount
+            )
+        for ancestor in ancestors:
+            await self._persist_usage(ancestor)
+
+    async def release_model_cost(self, task_id: str, amount: Decimal | None = None) -> None:
+        """Release outstanding call reservations when a task is finalized."""
+        ancestors = await self._ancestor_ids(task_id)
+        for ancestor in ancestors:
+            await self._hydrate_usage(ancestor)
+        async with self._artifact_lock:
+            outstanding = self._model_cost_by_task.get(task_id, Decimal("0"))
+            release = outstanding if amount is None else min(outstanding, amount)
+            remaining = outstanding - release
+            if remaining:
+                self._model_cost_by_task[task_id] = remaining
+            else:
+                self._model_cost_by_task.pop(task_id, None)
+            for ancestor in ancestors:
+                self._model_cost_reservations[ancestor] = max(
+                    Decimal("0"),
+                    self._model_cost_reservations.get(ancestor, Decimal("0")) - release,
+                )
+        for ancestor in ancestors:
+            await self._persist_usage(ancestor)
+
+    async def reconcile_model_cost(
+        self,
+        task_id: str,
+        *,
+        reserved: Decimal,
+        actual: Decimal,
+    ) -> None:
+        """Replace one completed reservation with its actual owner charge.
+
+        Reservations protect every ancestor while a provider call is in
+        flight.  Once that call finishes, the reservation is removed
+        immediately and only the owner ledger receives the actual cost.  This
+        keeps sequential calls from accumulating phantom liability and keeps
+        descendant totals from double-counting.
+        """
+        if reserved < 0 or actual < 0:
+            raise ValueError("model cost values must be non-negative")
+        ancestors = await self._ancestor_ids(task_id)
+        for ancestor in ancestors:
+            await self._hydrate_usage(ancestor)
+        async with self._artifact_lock:
+            outstanding = self._model_cost_by_task.get(task_id, Decimal("0"))
+            if reserved > outstanding:
+                raise ValueError(
+                    f"model cost reconciliation exceeds outstanding reservation for {task_id}"
+                )
+            remaining = outstanding - reserved
+            if remaining:
+                self._model_cost_by_task[task_id] = remaining
+            else:
+                self._model_cost_by_task.pop(task_id, None)
+            for ancestor in ancestors:
+                self._model_cost_reservations[ancestor] = max(
+                    Decimal("0"),
+                    self._model_cost_reservations.get(ancestor, Decimal("0")) - reserved,
+                )
+            self._ledger.setdefault(task_id, Usage()).cost += actual
+        for ancestor in ancestors:
+            await self._persist_usage(ancestor)
+
+    @asynccontextmanager
+    async def model_call_lease(self, task_id: str):
+        """Gate concurrent provider calls with the root task's limit."""
+        ancestors = await self._ancestor_ids(task_id)
+        root = ancestors[-1] if ancestors else task_id
+        limits = [
+            (await self.budget_of_async(ancestor)).max_parallel_model_calls
+            for ancestor in ancestors
+        ]
+        limit = max(1, min(limits or [ResourceBudget().max_parallel_model_calls]))
+        async with self._artifact_lock:
+            semaphore = self._model_semaphores.get(root)
+            if semaphore is None:
+                import asyncio
+
+                semaphore = asyncio.Semaphore(limit)
+                self._model_semaphores[root] = semaphore
+                self._model_limits[root] = limit
+            elif self._model_limits[root] != limit:
+                raise ValueError(
+                    f"model concurrency limit changed for root task {root}; restart required"
+                )
+        await semaphore.acquire()
+        try:
+            yield
+        finally:
+            semaphore.release()
 
     async def _ancestor_ids(self, task_id: str) -> list[str]:
         chain: list[str] = []
@@ -340,6 +533,80 @@ class BudgetTracker:
             cur = spec.parent_task_id
         return chain
 
+    async def _hydrate_usage(self, task_id: str) -> None:
+        """Restore the last durable checkpoint after a process restart."""
+        with self._lock:
+            if task_id in self._usage_hydrated:
+                return
+            self._usage_hydrated.add(task_id)
+        if self._store is None or not hasattr(self._store, "get"):
+            return
+        row = await self._store.get(task_id)
+        if not row:
+            return
+        metadata = row.get("metadata") if isinstance(row, Mapping) else None
+        checkpoint = metadata.get("_budget_usage") if isinstance(metadata, Mapping) else None
+        if not isinstance(checkpoint, Mapping):
+            checkpoint = row.get("usage") if isinstance(row, Mapping) else None
+        if not isinstance(checkpoint, Mapping):
+            return
+        restored = Usage(
+            iterations=_int(checkpoint, "iterations"),
+            model_calls=_int(checkpoint, "model_calls"),
+            input_tokens=_int(checkpoint, "input_tokens"),
+            output_tokens=_int(checkpoint, "output_tokens"),
+            cost=_dec(checkpoint, "cost", "cost_usd"),
+            executions=_int(checkpoint, "executions"),
+            mutations=_int(checkpoint, "mutations"),
+            children=_int(checkpoint, "children"),
+            artifact_bytes=_int(checkpoint, "artifact_bytes"),
+        )
+        reserved_artifact = _int(checkpoint, "reserved_artifact_bytes")
+        reserved_model = _dec(checkpoint, "reserved_model_cost")
+        outstanding_model = _dec(checkpoint, "outstanding_model_cost")
+        with self._lock:
+            current = self._ledger.setdefault(task_id, Usage())
+            if _all_zero(current):
+                self._ledger[task_id] = restored
+            if reserved_artifact:
+                self._artifact_reservations[task_id] = max(
+                    self._artifact_reservations.get(task_id, 0), reserved_artifact
+                )
+            if reserved_model:
+                self._model_cost_reservations[task_id] = max(
+                    self._model_cost_reservations.get(task_id, Decimal("0")), reserved_model
+                )
+            if outstanding_model:
+                self._model_cost_by_task[task_id] = max(
+                    self._model_cost_by_task.get(task_id, Decimal("0")), outstanding_model
+                )
+
+    async def _persist_usage(self, task_id: str) -> None:
+        store = self._store
+        persist = getattr(store, "persist_budget_usage", None)
+        if persist is None:
+            return
+        current = self.own(task_id)
+        await persist(
+            task_id,
+            {
+                "iterations": current.iterations,
+                "model_calls": current.model_calls,
+                "input_tokens": current.input_tokens,
+                "output_tokens": current.output_tokens,
+                "cost": str(current.cost),
+                "executions": current.executions,
+                "mutations": current.mutations,
+                "children": current.children,
+                "artifact_bytes": current.artifact_bytes,
+                "reserved_artifact_bytes": self._artifact_reservations.get(task_id, 0),
+                "reserved_model_cost": str(
+                    self._model_cost_reservations.get(task_id, Decimal("0"))
+                ),
+                "outstanding_model_cost": str(self._model_cost_by_task.get(task_id, Decimal("0"))),
+            },
+        )
+
 
 def _deserialize_budget(data: Any) -> ResourceBudget:
     if isinstance(data, ResourceBudget):
@@ -350,17 +617,26 @@ def _deserialize_budget(data: Any) -> ResourceBudget:
     max_time = data.get("max_wall_time")
     from decimal import Decimal as _Decimal
 
+    defaults = ResourceBudget()
     return ResourceBudget(
-        max_agent_iterations=int(data.get("max_agent_iterations") or 0),
+        max_agent_iterations=_int_or_default(
+            data.get("max_agent_iterations"), defaults.max_agent_iterations
+        ),
         max_input_tokens=_int_or_none(data.get("max_input_tokens")),
         max_output_tokens=_int_or_none(data.get("max_output_tokens")),
         max_cost_usd=_Decimal(str(max_cost)) if max_cost is not None else None,
         max_wall_time=_timedelta_or_none(max_time),
-        max_children=int(data.get("max_children") or 0),
-        max_child_depth=int(data.get("max_child_depth") or 0),
-        max_parallel_model_calls=int(data.get("max_parallel_model_calls") or 0),
-        max_parallel_executions=int(data.get("max_parallel_executions") or 0),
-        max_artifact_bytes=int(data.get("max_artifact_bytes") or 0),
+        max_children=_int_or_default(data.get("max_children"), defaults.max_children),
+        max_child_depth=_int_or_default(data.get("max_child_depth"), defaults.max_child_depth),
+        max_parallel_model_calls=_int_or_default(
+            data.get("max_parallel_model_calls"), defaults.max_parallel_model_calls
+        ),
+        max_parallel_executions=_int_or_default(
+            data.get("max_parallel_executions"), defaults.max_parallel_executions
+        ),
+        max_artifact_bytes=_int_or_default(
+            data.get("max_artifact_bytes"), defaults.max_artifact_bytes
+        ),
     )
 
 
@@ -371,6 +647,15 @@ def _int_or_none(val: Any) -> int | None:
         return int(val)
     except (TypeError, ValueError):
         return None
+
+
+def _int_or_default(val: Any, default: int) -> int:
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
 
 
 def _timedelta_or_none(val: Any):

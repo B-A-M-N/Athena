@@ -109,7 +109,9 @@ def decode_workspace(
         readable=readable,
         writable=writable,
         temp_root=data.get("temp_root"),
-        execution_backend=str(data.get("execution_backend", "local")),
+        execution_backend=(
+            str(data["execution_backend"]) if data.get("execution_backend") is not None else None
+        ),
         network_policy=net,
         mutation_mode=mutation_mode,
     )

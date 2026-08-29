@@ -157,6 +157,7 @@ impl Rect {
 pub struct AthenaLayout {
     pub columns: u32,
     pub rows: u32,
+    pub plain: bool,
     pub chassis: Rect,
     pub header: Rect,
     pub operator: Rect,
@@ -172,15 +173,45 @@ impl AthenaLayout {
     pub fn for_terminal(columns: u32, rows: u32) -> Self {
         let columns = columns.max(1);
         let rows = rows.max(1);
-        let margin = if columns >= 100 { 2 } else { 1 };
-        let gap = 3;
-        let header_height = 3;
-        let rail_height = 4;
-        let aperture_height = rows.saturating_sub(header_height + rail_height).max(1);
-        let available = columns.saturating_sub(margin * 2 + gap).max(2);
-        let aperture_width = (available / 2).max(1);
-        let left_x = margin;
-        let right_x = left_x + aperture_width + gap;
+        if columns < 90 || rows < 20 {
+            let empty = Rect {
+                x: 0,
+                y: 0,
+                width: columns,
+                height: rows,
+            };
+            return Self {
+                columns,
+                rows,
+                plain: true,
+                chassis: empty,
+                header: empty,
+                operator: empty,
+                oi: empty,
+                controls: empty,
+                prompt: empty,
+            };
+        }
+        let exterior_margin = if columns >= 100 { 2 } else { 1 };
+        let pane_gap = 3;
+        let exterior_perimeter_rows = 2;
+        let header_rows = 2;
+        let aperture_rim = 1;
+        let rail_rows = 4;
+        let prompt_rows = 2;
+        let margin = exterior_margin;
+        let available = columns.saturating_sub(margin * 2 + pane_gap).max(2);
+        let outer_aperture_width = (available / 2).max(aperture_rim * 2 + 1);
+        let aperture_width = outer_aperture_width.saturating_sub(aperture_rim * 2).max(1);
+        let outer_aperture_height = rows
+            .saturating_sub(exterior_perimeter_rows + header_rows + rail_rows + prompt_rows)
+            .max(aperture_rim * 2 + 1);
+        let aperture_height = outer_aperture_height
+            .saturating_sub(aperture_rim * 2)
+            .max(1);
+        let left_x = margin + aperture_rim;
+        let right_x = margin + outer_aperture_width + pane_gap + aperture_rim;
+        let content_y = 1 + header_rows + aperture_rim;
         let chassis = Rect {
             x: 0,
             y: 0,
@@ -189,37 +220,38 @@ impl AthenaLayout {
         };
         let header = Rect {
             x: margin,
-            y: 0,
+            y: 1,
             width: columns.saturating_sub(margin * 2),
-            height: header_height,
+            height: header_rows,
         };
         let operator = Rect {
             x: left_x,
-            y: header_height,
+            y: content_y,
             width: aperture_width,
             height: aperture_height,
         };
         let oi = Rect {
             x: right_x,
-            y: header_height,
+            y: content_y,
             width: aperture_width,
             height: aperture_height,
         };
         let controls = Rect {
             x: margin,
-            y: header_height + aperture_height,
+            y: content_y + aperture_height + aperture_rim,
             width: columns.saturating_sub(margin * 2),
-            height: 2,
+            height: rail_rows,
         };
         let prompt = Rect {
             x: margin,
             y: controls.bottom(),
             width: columns.saturating_sub(margin * 2),
-            height: rows.saturating_sub(controls.bottom()).max(1),
+            height: rows.saturating_sub(controls.bottom() + 1).max(prompt_rows),
         };
         Self {
             columns,
             rows,
+            plain: false,
             chassis,
             header,
             operator,
@@ -261,17 +293,116 @@ mod tests {
     fn equal_surface_geometry_is_content_independent() {
         let layout = AthenaLayout::for_terminal(160, 45);
         assert!(layout.apertures_equal());
-        assert_eq!(layout.operator.width, 76);
-        assert_eq!(layout.operator.height, 38);
-        assert_eq!(layout.oi.x, 81);
+    }
+
+    fn margin(columns: u32) -> u32 {
+        if columns >= 100 { 2 } else { 1 }
     }
 
     #[test]
     fn narrow_terminal_keeps_both_apertures_symmetric() {
         let layout = AthenaLayout::for_terminal(90, 20);
         assert!(layout.apertures_equal());
-        assert_eq!(layout.operator.width, 42);
-        assert_eq!(layout.operator.height, 13);
+    }
+
+    #[test]
+    fn hosted_layout_vectors_match_native_geometry() {
+        let cases = [
+            (
+                160,
+                45,
+                (3, 4, 74, 33),
+                (82, 4, 74, 33),
+                (2, 38, 156, 4),
+                (2, 42, 156, 2),
+            ),
+            (
+                140,
+                40,
+                (3, 4, 64, 28),
+                (72, 4, 64, 28),
+                (2, 33, 136, 4),
+                (2, 37, 136, 2),
+            ),
+            (
+                120,
+                40,
+                (3, 4, 54, 28),
+                (62, 4, 54, 28),
+                (2, 33, 116, 4),
+                (2, 37, 116, 2),
+            ),
+            (
+                100,
+                24,
+                (3, 4, 44, 12),
+                (52, 4, 44, 12),
+                (2, 17, 96, 4),
+                (2, 21, 96, 2),
+            ),
+            (
+                90,
+                20,
+                (2, 4, 40, 8),
+                (47, 4, 40, 8),
+                (1, 13, 88, 4),
+                (1, 17, 88, 2),
+            ),
+        ];
+        for (columns, rows, operator, oi, controls, prompt) in cases {
+            let layout = AthenaLayout::for_terminal(columns, rows);
+            assert!(!layout.plain);
+            assert_eq!(
+                (
+                    layout.header.x,
+                    layout.header.y,
+                    layout.header.width,
+                    layout.header.height
+                ),
+                (margin(columns), 1, columns - margin(columns) * 2, 2),
+                "header vector mismatch for {columns}x{rows}"
+            );
+            assert_eq!(
+                (
+                    layout.operator.x,
+                    layout.operator.y,
+                    layout.operator.width,
+                    layout.operator.height
+                ),
+                operator
+            );
+            assert_eq!(
+                (layout.oi.x, layout.oi.y, layout.oi.width, layout.oi.height),
+                oi
+            );
+            assert_eq!(
+                (
+                    layout.controls.x,
+                    layout.controls.y,
+                    layout.controls.width,
+                    layout.controls.height
+                ),
+                controls
+            );
+            assert_eq!(
+                (
+                    layout.prompt.x,
+                    layout.prompt.y,
+                    layout.prompt.width,
+                    layout.prompt.height
+                ),
+                prompt
+            );
+        }
+    }
+
+    #[test]
+    fn native_layout_degrades_to_plain_before_chrome_overlap() {
+        for (columns, rows) in [(89, 45), (160, 19), (89, 19), (80, 18)] {
+            let layout = AthenaLayout::for_terminal(columns, rows);
+            assert!(layout.plain);
+            assert_eq!(layout.operator, layout.chassis);
+        }
     }
 
     #[test]

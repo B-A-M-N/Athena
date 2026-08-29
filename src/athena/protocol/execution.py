@@ -42,6 +42,12 @@ class ExecutionRequest:
     timeout: timedelta | None = None
     network_policy: NetworkPolicy | None = None
     workspace_root: str | None = None
+    # Canonical host paths used by the local sandbox mount policy. ``None``
+    # preserves the legacy whole-workspace writable contract; an empty tuple
+    # means no writable workspace path. These are internal execution data, not
+    # model-controlled capability arguments.
+    writable_paths: tuple[str, ...] | None = None
+    read_only_paths: tuple[str, ...] = ()
     resource_limits: ExecutionLimits | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 

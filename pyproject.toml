@@ -25,7 +25,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-api = []
 mcp = ["mcp>=1.0"]
 anthropic = ["anthropic>=0.39"]
 container = ["docker>=7.0"]

@@ -171,6 +171,58 @@ class TaskStore:
             (json.dumps(meta), utcnow().isoformat(), task_id),
         )
 
+    async def persist_budget_usage(self, task_id: str, usage: dict[str, Any]) -> None:
+        """Persist the budget ledger checkpoint without changing task state."""
+        row = await self._db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
+        if row is None:
+            return
+        try:
+            metadata = json.loads(row.get("metadata") or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["_budget_usage"] = dict(usage)
+        await self._db.execute(
+            "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(metadata), utcnow().isoformat(), task_id),
+        )
+
+    async def persist_runtime_recovery_hint(
+        self,
+        task_id: str,
+        *,
+        runtime_session_id: str,
+        backend: str | None = None,
+    ) -> None:
+        """Persist a fail-closed hint for the next context compilation.
+
+        A resumed task must not assume that variables or a live process
+        survived a service restart.  Keeping this beside the durable task
+        record makes the warning available to every resumed model turn.
+        """
+        row = await self._db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
+        if row is None:
+            return
+        try:
+            metadata = json.loads(row.get("metadata") or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["_runtime_recovery_hint"] = {
+            "runtime_session_id": str(runtime_session_id),
+            "backend": str(backend or "unknown"),
+            "message": (
+                "Runtime state was lost across restart. Do not assume prior "
+                "process variables or session state exist; re-establish state explicitly."
+            ),
+        }
+        await self._db.execute(
+            "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(metadata), utcnow().isoformat(), task_id),
+        )
+
     async def persist_result(
         self,
         task_id: str,

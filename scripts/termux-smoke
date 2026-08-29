@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run a small ANSI/PTY smoke test suitable for Termux.
+"""Run an optional ANSI/PTY compatibility probe.
 
-This intentionally tests Athena *inside the host terminal*. It does not test
-the future native Athena window; it verifies the portable surface that should
-work in Termux, tmux, CI PTYs, and ordinary terminals.
+This tests Athena *inside a host terminal*. It does not test the native Athena
+window, and it is not a stable-beta support or release-gate target. It is a
+manual compatibility probe for Termux, tmux, CI PTYs, and ordinary terminals.
 
 Usage:
     scripts/termux-smoke
@@ -157,10 +157,10 @@ def main() -> int:
         output = _clean(bytes(captured))
         required = (
             "ATHENA",
-            "CONVERSATION",
+            "CHAT LOG",
             "ATHENA OI",
             "WORKSPACE MAP",
-            "RUNTIME GRAPH",
+            "RUNTIME TREE",
             "BUDDY",
         )
         if os.environ.get("ATHENA_SMOKE_MODE", "demo").strip().lower() == "cli":
@@ -178,7 +178,10 @@ def main() -> int:
             print(output[-4000:], file=sys.stderr)
             return 1
 
-        print("termux-smoke: PASS — ANSI/PTTY surface rendered in a 160x45 host terminal")
+        print(
+            "termux-smoke: PASS — optional ANSI/PTTY compatibility probe rendered "
+            "in a 160x45 host terminal"
+        )
         return 0
 
 

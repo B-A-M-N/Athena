@@ -37,6 +37,7 @@ _CAPABILITY_FIELD: dict[str, str] = {
 }
 
 _OFFLINE_PRIVACY = frozenset({"local", "offline"})
+_NO_MODELS = ("__athena_no_model_intersection__",)
 
 _PRIVACY_RANK: dict[PrivacyClass, int] = {
     PrivacyClass.LOCAL: 0,
@@ -132,26 +133,37 @@ class ModelRouter:
         """
         return self._registry.provider_for(provider_name)
 
-    def _resolve_policy(self, policy: ModelPolicy) -> ModelPolicy:
-        """Merge role defaults into a caller-supplied policy.
+    def effective_policy(self, policy: ModelPolicy | None = None) -> ModelPolicy:
+        """Return task policy narrowed by the configured role policy."""
+        return self._resolve_policy(policy or ModelPolicy())
 
-        A caller's explicit allowlist always wins; role defaults only fill in
-        when the caller did not constrain models itself. Unknown roles fall
-        back to the "primary" role policy if one exists (user's global choice).
+    def _resolve_policy(self, policy: ModelPolicy) -> ModelPolicy:
+        """Intersect role restrictions with the task policy.
+
+        Role configuration is a candidate restriction, never an authority
+        expansion.  In particular, a role cannot make an offline task remote,
+        raise its cost ceiling, or replace a task allowlist with a broader one.
+        Unknown roles fall back to the configured primary policy.
         """
-        allowed = tuple(policy.allowed or ())
-        if allowed:
-            return policy
         role_policy = self._role_policies.get(policy.role)
         if role_policy is None and policy.role != "primary":
             role_policy = self._role_policies.get("primary")
         if role_policy is None:
             return policy
+        task_allowed = tuple(policy.allowed or ())
+        role_allowed = tuple(role_policy.allowed or ())
+        if task_allowed and role_allowed:
+            allowed = tuple(item for item in task_allowed if item in role_allowed)
+            if not allowed:
+                allowed = _NO_MODELS
+        else:
+            allowed = task_allowed or role_allowed
         return replace(
             policy,
-            allowed=tuple(role_policy.allowed or ()),
-            privacy=role_policy.privacy or policy.privacy,
-            max_cost_usd=role_policy.max_cost_usd or policy.max_cost_usd,
+            allowed=allowed,
+            require_tools=bool(policy.require_tools or role_policy.require_tools),
+            privacy=_stricter_policy_privacy(policy.privacy, role_policy.privacy),
+            max_cost_usd=_min_cost(policy.max_cost_usd, role_policy.max_cost_usd),
         )
 
     async def select(
@@ -159,6 +171,7 @@ class ModelRouter:
         *,
         policy: ModelPolicy | None = None,
         requirements: ModelRequirements | None = None,
+        exclude: frozenset[str] = frozenset(),
     ) -> ModelSelection:
         policy = self._resolve_policy(policy or ModelPolicy())
         requirements = requirements or ModelRequirements()
@@ -173,6 +186,8 @@ class ModelRouter:
 
         candidates: list[ModelInfo] = []
         for info in models:
+            if info.provider in exclude:
+                continue
             if allowed and not self._is_allowed(info, allowed):
                 continue
             if not self._meets_cap(info, policy, requirements):
@@ -279,7 +294,7 @@ class ModelRouter:
         )
 
     def _privacy_gate(self, policy: ModelPolicy) -> Callable[[ModelInfo], bool]:
-        if policy.privacy in _OFFLINE_PRIVACY:
+        if str(policy.privacy).lower() in _OFFLINE_PRIVACY | {"local"}:
             return lambda info: info.privacy_class is PrivacyClass.LOCAL
         return lambda info: True
 
@@ -349,3 +364,28 @@ __all__ = [
     "ModelSelection",
     "ModelSource",
 ]
+
+
+_POLICY_PRIVACY_RANK = {
+    "offline": 0,
+    "local": 0,
+    "local-preferred": 1,
+    "local-pref": 1,
+    "remote": 2,
+}
+
+
+def _stricter_policy_privacy(left: str, right: str) -> str:
+    left_value = str(left or "local-preferred").lower()
+    right_value = str(right or "local-preferred").lower()
+    left_rank = _POLICY_PRIVACY_RANK.get(left_value, 0)
+    right_rank = _POLICY_PRIVACY_RANK.get(right_value, 0)
+    return left if left_rank <= right_rank else right
+
+
+def _min_cost(left, right):
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return min(left, right)

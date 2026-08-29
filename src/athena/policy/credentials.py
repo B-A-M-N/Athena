@@ -15,8 +15,10 @@ Implements BUILDSPEC 100-103 and BEHAVIORSPEC 20:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Callable, Iterable
 
 
@@ -62,17 +64,25 @@ class FileSource(SecretSource):
     """Resolve a credential by reading a configured base directory file."""
 
     name = "file"
+    _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
     def __init__(self, base_dir: str | None = None) -> None:
         self._base_dir = base_dir
 
     def resolve(self, name: str) -> str | None:
-        if not name:
+        if not name or self._NAME.fullmatch(str(name)) is None:
             return None
         if self._base_dir:
-            candidate = os.path.join(self._base_dir, name)
+            root = Path(self._base_dir).resolve(strict=False)
+            candidate = (root / str(name)).resolve(strict=False)
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                return None
         else:
-            candidate = name
+            candidate = Path(str(name))
+            if candidate.is_absolute():
+                return None
         try:
             with open(candidate, "r", encoding="utf-8") as fh:
                 return fh.read().strip()

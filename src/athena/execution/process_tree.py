@@ -13,8 +13,11 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
+import asyncio
 from functools import lru_cache
+from typing import Any
 
 try:
     import psutil  # type: ignore
@@ -49,6 +52,8 @@ def spawn_owned(
     sandbox_root: str | None = None,
     network_policy: str | None = None,
     sandbox_writable: bool = True,
+    writable_paths: tuple[str, ...] | None = None,
+    read_only_paths: tuple[str, ...] = (),
     **popen_kwargs: object,
 ) -> "subprocess.Popen[str]":
     """Spawn ``argv`` in its own process group so the whole tree can be killed.
@@ -92,6 +97,8 @@ def spawn_owned(
             cwd=cwd,
             network_policy=effective_network_policy,
             writable=sandbox_writable,
+            writable_paths=writable_paths,
+            read_only_paths=read_only_paths,
         )
         root_abs = os.path.realpath(os.path.abspath(sandbox_root))
         my_env["PATH"] = _namespace_path(my_env.get("PATH", ""), root_abs)
@@ -116,6 +123,8 @@ def sandbox_argv(
     cwd: str | None = None,
     network_policy: str | None = None,
     writable: bool = True,
+    writable_paths: tuple[str, ...] | None = None,
+    read_only_paths: tuple[str, ...] = (),
 ) -> list[str]:
     """Build a fail-closed Linux Bubblewrap command line.
 
@@ -152,7 +161,7 @@ def sandbox_argv(
         "/proc",
         "--dev",
         "/dev",
-        "--bind" if writable else "--ro-bind",
+        "--bind" if writable and writable_paths is None else "--ro-bind",
         root,
         namespace_root,
         "--tmpfs",
@@ -174,8 +183,16 @@ def sandbox_argv(
     if argv:
         resolved = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0])
         executable = os.path.realpath(resolved or argv[0])
-    if executable and not (executable == root or executable.startswith(root + os.sep)):
-        parent = os.path.dirname(executable)
+    # The shell dependency route may invoke the exact Athena interpreter from
+    # its source command. Mount it alongside the process entrypoint so that
+    # dependency installation and generated Python use the same interpreter
+    # identity inside the namespace.
+    for tool in dict.fromkeys(
+        item for item in (executable, os.path.realpath(sys.executable)) if item
+    ):
+        if tool == root or tool.startswith(root + os.sep):
+            continue
+        parent = os.path.dirname(tool)
         if os.path.basename(parent) == "bin":
             parent = os.path.dirname(parent)
         if parent and os.path.exists(parent) and parent not in ("/usr", "/bin", "/lib", "/lib64"):
@@ -188,6 +205,16 @@ def sandbox_argv(
                 if directory not in ("/", "/usr", "/bin", "/lib", "/lib64"):
                     command.extend(("--dir", directory))
             command.extend(("--ro-bind", parent, parent))
+
+    # Mount the workspace read-only first whenever an explicit writable policy
+    # is supplied, then overlay only the allowed canonical subtrees. Denied
+    # existing subtrees are overlaid read-only last, preserving deny-overrides-
+    # allow semantics inside arbitrary shell/Python execution.
+    if writable_paths is not None:
+        for path in writable_paths:
+            _append_workspace_mount(command, path, root, namespace_root, "--bind")
+        for path in read_only_paths:
+            _append_workspace_mount(command, path, root, namespace_root, "--ro-bind")
     namespace_argv = []
     for index, arg in enumerate(argv):
         if index == 0 and executable and (arg == argv[0] or os.path.realpath(arg) == executable):
@@ -201,6 +228,18 @@ def sandbox_argv(
             namespace_argv.append(arg)
     command.extend(("--chdir", namespace_cwd, "--"))
     return command + namespace_argv
+
+
+def _append_workspace_mount(
+    command: list[str], path: str, root: str, namespace_root: str, option: str
+) -> None:
+    canonical = os.path.realpath(os.path.abspath(path))
+    if canonical != root and not canonical.startswith(root + os.sep):
+        return
+    if not os.path.exists(canonical):
+        return
+    target = namespace_root + canonical[len(root) :]
+    command.extend((option, canonical, target))
 
 
 def _namespace_path(value: str, root: str) -> str:
@@ -367,8 +406,61 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> None:
             os.waitpid(pid, 0)
         except (ChildProcessError, ProcessLookupError):
             pass
-        except Exception:
+
+
+async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> None:
+    """Terminate an asyncio subprocess and its owned process group.
+
+    This is the async counterpart of :func:`kill_tree`; callers must use it
+    for ``asyncio.subprocess.Process`` instances so cancellation cannot leave
+    validation/compiler grandchildren alive.
+    """
+    if process is None or process.returncode is not None:
+        return
+    pid = int(process.pid)
+    if os.name == "nt":
+        try:
+            process.kill()
+        except ProcessLookupError:
             pass
+        await _wait_async_process(process, timeout=5.0)
+        return
+
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        pgid = None
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    else:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await _wait_async_process(process, timeout=5.0)
+
+
+async def _wait_async_process(process: Any, *, timeout: float) -> None:
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        pass
 
 
 def interrupt_group(process: "subprocess.Popen") -> None:
@@ -395,6 +487,7 @@ def interrupt_group(process: "subprocess.Popen") -> None:
 __all__ = [
     "child_pids",
     "kill_tree",
+    "kill_tree_async",
     "interrupt_group",
     "process_group_id",
     "process_start_identity",

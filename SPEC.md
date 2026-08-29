@@ -8,7 +8,8 @@
 ## Unified Lightweight Autonomous Agent Runtime
 
 **Status:** Initial Architecture Specification  
-**Target:** Linux, macOS, Windows; headless-first  
+**Verified platform:** Linux; headless-first
+**Compatibility intent:** macOS/Windows support is not yet release-verified; native X11 is a development preview
 **Primary Interface:** CLI/TUI  
 **Secondary Interfaces:** Python API, HTTP/SSE/WebSocket API, ACP, optional messaging gateway  
 **Design ancestry:** Hermes Agent + Open Interpreter Classic  

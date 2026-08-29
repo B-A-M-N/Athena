@@ -172,7 +172,11 @@ class WorkspaceSpec:
     readable: tuple[PathRule, ...] = ()
     writable: tuple[PathRule, ...] = ()
     temp_root: str | None = None
-    execution_backend: str = "local"
+    # ``None`` means the caller did not select a backend.  Consumers resolve
+    # it to the local backend at the execution boundary; delegation must keep
+    # this distinction so an omitted child backend cannot masquerade as an
+    # explicit request to downgrade a container parent.
+    execution_backend: str | None = None
     network_policy: NetworkPolicy = NetworkPolicy.ALLOW
     mutation_mode: MutationMode = MutationMode.DIRECT
     # Optional revision supplied by a persisted project/workspace index.  A

@@ -52,6 +52,7 @@ Usage
 -----
     scripts/scenarios                              # all families
     scripts/scenarios --family SYNTH --family COMPAT --output /tmp/scm.json
+    scripts/scenarios --exclude-family VHS --output /tmp/scm.json
     scripts/scenarios --output /tmp/scm.json
     scripts/scenarios --list                       # registry dump, no runs
     scripts/scenarios --only SYNTH-001 --output /tmp/scm.json
@@ -347,6 +348,12 @@ def main(argv: list[str] | None = None) -> int:
         help="restrict to a family (repeatable): " + ", ".join(FAMILY_ORDER),
     )
     parser.add_argument(
+        "--exclude-family",
+        action="append",
+        default=None,
+        help="omit a family (repeatable): " + ", ".join(FAMILY_ORDER),
+    )
+    parser.add_argument(
         "--only",
         action="append",
         default=None,
@@ -373,8 +380,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quiet", "-q", action="store_true", help="only print the summary line")
     args = parser.parse_args(argv)
 
+    selected = SCENARIOS
+    if args.family:
+        unknown = [f for f in args.family if f not in FAMILY_ORDER]
+        if unknown:
+            parser.error(f"unknown family(ies): {', '.join(unknown)}")
+        selected = tuple(s for s in selected if s.family in set(args.family))
+    if args.exclude_family:
+        unknown = [f for f in args.exclude_family if f not in FAMILY_ORDER]
+        if unknown:
+            parser.error(f"unknown family(ies): {', '.join(unknown)}")
+        selected = tuple(s for s in selected if s.family not in set(args.exclude_family))
+    if args.only:
+        known = {s.id for s in SCENARIOS}
+        unknown = [i for i in args.only if i not in known]
+        if unknown:
+            parser.error(f"unknown scenario id(s): {', '.join(unknown)}")
+        selected = tuple(s for s in selected if s.id in set(args.only))
+
     if args.list:
-        for sc in SCENARIOS:
+        for sc in selected:
             print(
                 f"{sc.id:<15} {sc.status:<8} "
                 f"{'required' if sc.required else 'optional':<9} {sc.title}"
@@ -392,21 +417,8 @@ def main(argv: list[str] | None = None) -> int:
             "--require-clean for developer runs"
         )
 
-    selected = SCENARIOS
-    if args.family:
-        unknown = [f for f in args.family if f not in FAMILY_ORDER]
-        if unknown:
-            parser.error(f"unknown family(ies): {', '.join(unknown)}")
-        selected = tuple(s for s in selected if s.family in set(args.family))
-    if args.only:
-        known = {s.id for s in SCENARIOS}
-        unknown = [i for i in args.only if i not in known]
-        if unknown:
-            parser.error(f"unknown scenario id(s): {', '.join(unknown)}")
-        selected = tuple(s for s in selected if s.id in set(args.only))
-
     if args.output is None:
-        if args.family or args.only:
+        if args.family or args.exclude_family or args.only:
             parser.error(
                 "filtered scenario runs require --output; refusing to overwrite "
                 "the full checked-in manifest"

@@ -106,7 +106,13 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             "network_policy": (
                 request.network_policy.value if request.network_policy is not None else None
             ),
+            "writable_paths": request.writable_paths,
+            "read_only_paths": request.read_only_paths,
         }
+        return self._make_session_compatible(kwargs)
+
+    def _make_session_compatible(self, kwargs: dict[str, Any]) -> Any:
+        """Call runtime session factories across old and new runtime shapes."""
         try:
             params = inspect.signature(self._make_session).parameters
             kwargs = {key: value for key, value in kwargs.items() if key in params}
@@ -135,6 +141,10 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             requested_network = getattr(request.network_policy, "value", request.network_policy)
             if getattr(session, "network_policy", None) != requested_network:
                 return False
+        if request.writable_paths != getattr(session, "writable_paths", None):
+            return False
+        if tuple(request.read_only_paths) != tuple(getattr(session, "read_only_paths", ()) or ()):
+            return False
         return True
 
     # ------------------------------------------------------------------ #
@@ -149,15 +159,21 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         env: Mapping[str, str] | None = None,  # noqa: N802
         workspace_root: str | None = None,
         network_policy: str | None = None,
+        writable_paths: tuple[str, ...] | None = None,
+        read_only_paths: tuple[str, ...] = (),
     ) -> str:
         runtime_session_id = f"{self.name}_{task_id}"
         self._register_session(
             runtime_session_id,
-            self._make_session(
-                env=env,
-                cwd=cwd,
-                sandbox_root=workspace_root,
-                network_policy=network_policy,
+            self._make_session_compatible(
+                {
+                    "env": env,
+                    "cwd": cwd,
+                    "sandbox_root": workspace_root,
+                    "network_policy": network_policy,
+                    "writable_paths": writable_paths,
+                    "read_only_paths": read_only_paths,
+                }
             ),
         )
         return runtime_session_id
@@ -200,6 +216,8 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         cwd: str | None = None,
         sandbox_root: str | None = None,
         network_policy: str | None = None,
+        writable_paths: tuple[str, ...] | None = None,
+        read_only_paths: tuple[str, ...] = (),
     ) -> Any: ...
 
     @abc.abstractmethod

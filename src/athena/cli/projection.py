@@ -144,6 +144,7 @@ class OperationNode:
     progress_value: float | None = None
     progress_determinate: bool = False
     diagnostics: tuple[dict[str, Any], ...] = ()
+    parent_id: str | None = None
 
 
 @dataclass
@@ -151,6 +152,14 @@ class ProjectionState:
     """Pure-ish reducer state used by both the dual surface and ``oi-stream``."""
 
     operations: dict[str, OperationNode] = field(default_factory=dict)
+    # Task lifecycle facts are retained independently of operation cards so a
+    # scene can render the canonical task hierarchy even when no capability
+    # has emitted an operation yet.
+    tasks: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    # Execution nodes are separate from operation nodes so the runtime tree
+    # can show task -> operation -> execution without making a renderer infer
+    # process identity from an operation's mutable fields.
+    executions: dict[str, dict[str, str | None]] = field(default_factory=dict)
     execution_to_operation: dict[str, str] = field(default_factory=dict)
     active_operation_id: str | None = None
     last_operation_id: str | None = None
@@ -168,6 +177,14 @@ class ProjectionState:
     instruments: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=48))
     verification_checks: dict[str, dict[str, Any]] = field(default_factory=dict)
     verification_status: str = ""
+    # These fields are the latest observed model request, not configuration.
+    # They intentionally remain populated after completion/failure so a
+    # fallback or failed attempt cannot make an unobserved model look active.
+    active_provider: str | None = None
+    active_model: str | None = None
+    active_model_role: str | None = None
+    active_model_request_id: str | None = None
+    model_request_status: str = "idle"
     raw_events: deque[tuple[str, Mapping[str, Any]]] = field(
         default_factory=lambda: deque(maxlen=128)
     )
@@ -263,6 +280,13 @@ class ProjectionState:
                 detail=sanitize_terminal_text(args.get("operation") or args.get("action") or ""),
                 action_kind=action.value,
                 language=sanitize_terminal_text(args.get("language") or language_for_path(target)),
+                parent_id=sanitize_terminal_text(
+                    payload.get("parent_id")
+                    or payload.get("parent_task_id")
+                    or payload.get("_event_task_id")
+                    or ""
+                )
+                or None,
             )
             self.operations[op_id] = operation
             self.last_operation_id = op_id
@@ -300,6 +324,86 @@ class ProjectionState:
             operation.mutation_state = operation.mutation_state or "prepared"
         if payload.get("language"):
             operation.language = sanitize_terminal_text(payload["language"])
+        parent_id = sanitize_terminal_text(
+            payload.get("parent_id")
+            or payload.get("parent_task_id")
+            or payload.get("_event_task_id")
+            or ""
+        )
+        if parent_id:
+            operation.parent_id = parent_id
+
+    @staticmethod
+    def _task_key(value: object) -> str:
+        value = sanitize_terminal_text(value).strip()
+        return value.removeprefix("task:") if value.startswith("task:") else value
+
+    def _reduce_task(self, event_type: str, payload: Mapping[str, Any]) -> None:
+        """Project task lifecycle facts into one stable runtime namespace."""
+        raw_id = (
+            payload.get("child_task_id") or payload.get("task_id") or payload.get("_event_task_id")
+        )
+        task_id = self._task_key(raw_id)
+        if not task_id:
+            return
+        parent = self._task_key(payload.get("parent_task_id") or payload.get("parent_id"))
+        existing = self.tasks.get(task_id, {})
+        status_by_event = {
+            "TaskCreated": "created",
+            "TaskQueued": "queued",
+            "TaskStarted": "running",
+            "TaskCompleted": "complete",
+            "TaskPartial": "partial",
+            "TaskFailed": "failed",
+            "TaskBlocked": "blocked",
+            "TaskCancelled": "cancelled",
+            "TaskInterrupted": "interrupted",
+            "ChildTaskCreated": "created",
+            "ChildTaskCompleted": "complete",
+        }
+        status = status_by_event.get(event_type)
+        if event_type == "TaskStateChanged":
+            status = sanitize_terminal_text(payload.get("status") or payload.get("to") or "changed")
+        if event_type in {"DelegationStarted", "BackgroundTaskStarted"}:
+            status = "running"
+        if event_type in {"BackgroundTaskCompleted"}:
+            status = "complete"
+        if event_type in {"BackgroundTaskFailed"}:
+            status = "failed"
+        self.tasks[task_id] = {
+            "label": sanitize_terminal_text(
+                payload.get("objective") or payload.get("name") or existing.get("label") or task_id
+            ),
+            "status": status or existing.get("status") or "observed",
+            "parent_id": parent or existing.get("parent_id"),
+        }
+
+    def _reduce_execution(self, event_type: str, payload: Mapping[str, Any]) -> None:
+        """Project execution lifecycle into the operation's runtime child."""
+        execution_id = sanitize_terminal_text(payload.get("execution_id") or "").strip()
+        if not execution_id:
+            return
+        existing = self.executions.get(execution_id, {})
+        status = {
+            "ExecutionStarted": "running",
+            "ExecutionExited": "complete" if payload.get("exit_code") in (None, 0) else "failed",
+            "ExecutionTimedOut": "timed out",
+            "ExecutionInterrupted": "interrupted",
+        }.get(event_type)
+        call_id = sanitize_terminal_text(payload.get("call_id") or "").strip()
+        task_id = self._task_key(payload.get("_event_task_id"))
+        self.executions[execution_id] = {
+            "label": sanitize_terminal_text(
+                payload.get("runtime") or existing.get("label") or execution_id
+            ),
+            "status": status or existing.get("status") or "observed",
+            # A call id is the canonical operation identity in the event
+            # stream. Fall back to the task only for externally replayed
+            # execution events that omit it.
+            "parent_id": call_id
+            or existing.get("parent_id")
+            or (f"task:{task_id}" if task_id else None),
+        }
 
     def _close_active(self, state: str) -> None:
         operation = self.operations.get(self.active_operation_id or "")
@@ -313,12 +417,50 @@ class ProjectionState:
             operation.state = state
         self.active_operation_id = None
 
-    def reduce(self, event_type: str, payload: Mapping[str, Any] | None = None) -> None:
+    def _model_request_identity(self, payload: Mapping[str, Any], *, reset: bool = False) -> None:
+        """Record provider facts emitted by the actual request lifecycle."""
+        provider = (
+            sanitize_terminal_text(
+                payload.get("provider") or payload.get("provider_profile_id") or ""
+            )
+            or None
+        )
+        model = (
+            sanitize_terminal_text(payload.get("model") or payload.get("model_id") or "") or None
+        )
+        role = sanitize_terminal_text(payload.get("role") or "") or None
+        request_id = sanitize_terminal_text(payload.get("request_id") or "") or None
+        if reset:
+            self.active_provider = provider
+            self.active_model = model
+            self.active_model_role = role
+            self.active_model_request_id = request_id
+            return
+        if provider:
+            self.active_provider = provider
+        if model:
+            self.active_model = model
+        if role:
+            self.active_model_role = role
+        if request_id:
+            self.active_model_request_id = request_id
+
+    def reduce(
+        self,
+        event_type: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        task_id: str | None = None,
+    ) -> None:
         """Apply one event. Raw payload is retained separately for audit/debug views."""
         payload = dict(payload or {})
         etype = str(event_type)
         self.event_count += 1
         self.raw_events.append((etype, _bounded_event_payload(payload)))
+        if task_id:
+            payload.setdefault("_event_task_id", task_id)
+        self._reduce_task(etype, payload)
+        self._reduce_execution(etype, payload)
         action = classify_event(etype, payload)
         if action is not VisualActionKind.IDLE:
             if etype in {
@@ -349,24 +491,33 @@ class ProjectionState:
             )
         elif etype == "ModelRequestStarted":
             self.status, self.thinking = "THINKING", True
-            provider = payload.get("provider") or "model"
-            model = payload.get("model") or ""
-            self.add_recent("·", f"Model request · {provider}/{model}".rstrip("/"))
+            self._model_request_identity(payload, reset=True)
+            self.model_request_status = "active"
+            model_label = (
+                f"{self.active_provider or '—'}/{self.active_model or '—'}"
+                if self.active_provider or self.active_model
+                else "—"
+            )
+            self.add_recent("·", f"Model request · {model_label}")
         elif etype in {"ModelReasoningDelta", "TaskIterationStarted"}:
             self.status, self.thinking = "THINKING", True
         elif etype == "ModelDelta":
             self.status, self.thinking = "RESPONDING", False
             self.feed_stream(payload.get("text") or "")
         elif etype == "ModelResponseCompleted":
+            self._model_request_identity(payload)
             self.thinking = False
             self.status = "RESPONDING"
+            self.model_request_status = "completed"
             self.seal_stream()
         elif etype == "ModelRequestFailed":
+            self._model_request_identity(payload)
             self.status, self.status_message, self.thinking = (
                 "FAILURE",
                 "The model request failed; inspect the error and retry.",
                 False,
             )
+            self.model_request_status = "failed"
             self.add_recent(
                 "!",
                 f"Model request failed · {payload.get('error') or payload.get('reason') or 'provider error'}",

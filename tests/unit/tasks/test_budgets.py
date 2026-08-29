@@ -19,6 +19,38 @@ def _task(task_id, *, budget=None, parent=None):
     )
 
 
+class _TreeStore:
+    def __init__(self, tasks):
+        self.tasks = {task.id: task for task in tasks}
+        self.metadata = {task.id: {} for task in tasks}
+
+    async def get(self, task_id):
+        task = self.tasks.get(task_id)
+        if task is None:
+            return None
+        return {
+            "id": task.id,
+            "parent_task_id": task.parent_task_id,
+            "resource_budget": task.resource_budget,
+            "metadata": self.metadata[task.id],
+        }
+
+    async def list_children(self, task_id):
+        return [{"id": task.id} for task in self.tasks.values() if task.parent_task_id == task_id]
+
+    async def list_descendants(self, task_id):
+        result = []
+        frontier = [task_id]
+        while frontier:
+            children = await self.list_children(frontier.pop(0))
+            result.extend(children)
+            frontier.extend(child["id"] for child in children)
+        return result
+
+    async def persist_budget_usage(self, task_id, usage):
+        self.metadata[task_id]["_budget_usage"] = dict(usage)
+
+
 @pytest.mark.athena_claim("BHV-083")
 @pytest.mark.athena_evidence("test", "invariant")
 async def test_consume_decreases_remaining():
@@ -57,3 +89,139 @@ async def test_remaining_keeps_decimal_cost_precision():
     tracker.consume("t", cost=Decimal("0.1"))
     rem = await tracker.remaining("t")
     assert rem["cost_usd"] == Decimal("0.80")
+
+
+async def test_artifact_commit_is_owned_once_but_aggregates_to_root():
+    root = _task("root", budget=ResourceBudget(max_artifact_bytes=1_000))
+    child = _task("child", parent="root", budget=ResourceBudget(max_artifact_bytes=1_000))
+    tracker = BudgetTracker(task_store=_TreeStore([root, child]))
+    tracker.register(root)
+    tracker.register(child)
+
+    await tracker.reserve_artifact("child", 100)
+    await tracker.commit_artifact("child", 100)
+
+    assert tracker.own("child").artifact_bytes == 100
+    assert tracker.own("root").artifact_bytes == 0
+    assert (await tracker.total("child")).artifact_bytes == 100
+    assert (await tracker.total("root")).artifact_bytes == 100
+
+
+async def test_sibling_artifacts_roll_up_without_double_counting():
+    root = _task("root", budget=ResourceBudget(max_artifact_bytes=1_000))
+    child_a = _task("child-a", parent="root", budget=ResourceBudget(max_artifact_bytes=1_000))
+    child_b = _task("child-b", parent="root", budget=ResourceBudget(max_artifact_bytes=1_000))
+    tracker = BudgetTracker(task_store=_TreeStore([root, child_a, child_b]))
+    for task in (root, child_a, child_b):
+        tracker.register(task)
+
+    await tracker.reserve_artifact("child-a", 100)
+    await tracker.commit_artifact("child-a", 100)
+    await tracker.reserve_artifact("child-b", 150)
+    await tracker.commit_artifact("child-b", 150)
+
+    assert (await tracker.total("root")).artifact_bytes == 250
+
+
+async def test_sibling_reservations_share_root_ceiling():
+    root = _task("root", budget=ResourceBudget(max_artifact_bytes=200))
+    child_a = _task("child-a", parent="root", budget=ResourceBudget(max_artifact_bytes=200))
+    child_b = _task("child-b", parent="root", budget=ResourceBudget(max_artifact_bytes=200))
+    tracker = BudgetTracker(task_store=_TreeStore([root, child_a, child_b]))
+    for task in (root, child_a, child_b):
+        tracker.register(task)
+
+    await tracker.reserve_artifact("child-a", 150)
+    with pytest.raises(ValueError, match="artifact budget exceeded.*root"):
+        await tracker.reserve_artifact("child-b", 100)
+
+
+async def test_model_reconciliation_releases_phantom_reservation_immediately():
+    root = _task("root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    child = _task("child", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    tracker = BudgetTracker(task_store=_TreeStore([root, child]))
+    tracker.register(root)
+    tracker.register(child)
+
+    await tracker.reserve_model_cost("child", Decimal("0.40"))
+    await tracker.reconcile_model_cost("child", reserved=Decimal("0.40"), actual=Decimal("0.10"))
+    await tracker.reserve_model_cost("child", Decimal("0.60"))
+
+    assert tracker.own("child").cost == Decimal("0.10")
+    assert (await tracker.total("root")).cost == Decimal("0.10")
+    assert (await tracker.remaining("root"))["cost_usd"] == Decimal("0.30")
+
+
+async def test_model_costs_from_siblings_aggregate_at_root_once():
+    root = _task("root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    child_a = _task("child-a", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    child_b = _task("child-b", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    tracker = BudgetTracker(task_store=_TreeStore([root, child_a, child_b]))
+    for task in (root, child_a, child_b):
+        tracker.register(task)
+
+    await tracker.reserve_model_cost("child-a", Decimal("0.40"))
+    await tracker.reconcile_model_cost("child-a", reserved=Decimal("0.40"), actual=Decimal("0.10"))
+    await tracker.reserve_model_cost("child-b", Decimal("0.40"))
+    await tracker.reconcile_model_cost("child-b", reserved=Decimal("0.40"), actual=Decimal("0.15"))
+
+    assert (await tracker.total("root")).cost == Decimal("0.25")
+    assert tracker.own("root").cost == Decimal("0")
+
+
+async def test_failed_model_attempt_releases_reservation_before_fallback():
+    root = _task("root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    child = _task("child", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    tracker = BudgetTracker(task_store=_TreeStore([root, child]))
+    tracker.register(root)
+    tracker.register(child)
+
+    await tracker.reserve_model_cost("child", Decimal("0.60"))
+    await tracker.release_model_cost("child", Decimal("0.60"))
+    await tracker.reserve_model_cost("child", Decimal("0.60"))
+    await tracker.reconcile_model_cost("child", reserved=Decimal("0.60"), actual=Decimal("0.20"))
+
+    assert (await tracker.total("root")).cost == Decimal("0.20")
+    assert (await tracker.remaining("root"))["cost_usd"] == Decimal("0.80")
+
+
+async def test_simultaneous_model_reservations_share_root_ceiling():
+    import asyncio
+
+    root = _task("root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    child_a = _task("child-a", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    child_b = _task("child-b", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    tracker = BudgetTracker(task_store=_TreeStore([root, child_a, child_b]))
+    for task in (root, child_a, child_b):
+        tracker.register(task)
+
+    outcomes = await asyncio.gather(
+        tracker.reserve_model_cost("child-a", Decimal("0.60")),
+        tracker.reserve_model_cost("child-b", Decimal("0.60")),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(outcome, ValueError) for outcome in outcomes) == 1
+    assert (await tracker.remaining("root"))["cost_usd"] == Decimal("0.40")
+
+
+async def test_model_reservation_survives_restart_as_reservation_not_spend():
+    root = _task("root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    child = _task("child", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
+    store = _TreeStore([root, child])
+    first = BudgetTracker(task_store=store)
+    first.register(root)
+    first.register(child)
+    await first.reserve_model_cost("child", Decimal("0.40"))
+
+    restored = BudgetTracker(task_store=store)
+    restored.register(root)
+    restored.register(child)
+    assert (await restored.total("root")).cost == Decimal("0")
+    assert (await restored.remaining("root"))["cost_usd"] == Decimal("0.60")
+    with pytest.raises(ValueError, match="model cost budget exceeded"):
+        await restored.reserve_model_cost("child", Decimal("0.61"))
+
+    await restored.reconcile_model_cost("child", reserved=Decimal("0.40"), actual=Decimal("0.20"))
+    assert (await restored.total("root")).cost == Decimal("0.20")
+    assert (await restored.remaining("root"))["cost_usd"] == Decimal("0.80")

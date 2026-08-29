@@ -45,3 +45,15 @@ async def test_large_content_above_threshold_is_artifactized(tmp_path):
 
     small = await refs.maybe_artifactize(store, "small inline text", threshold=50_000)
     assert small == "small inline text"
+
+
+async def test_open_stream_yields_bounded_chunks(store):
+    ref = await store.save(content=b"abcdefghij")
+
+    chunks = []
+    async with store.open_stream(ref, chunk_size=3) as stream:
+        async for chunk in stream:
+            chunks.append(chunk)
+
+    assert chunks == [b"abc", b"def", b"ghi", b"j"]
+    assert all(len(chunk) <= 3 for chunk in chunks)

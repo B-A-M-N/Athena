@@ -7,7 +7,8 @@
 **Project:** Athena
 **Derived from:** `SPEC.md`, `RESEARCHSPEC.md`, `IMPLEMENTATIONSPEC.md`
 **Implementation target:** Python 3.12+
-**Primary platforms:** Linux, macOS, Windows
+**Verified platform:** Linux
+**Compatibility intent:** macOS/Windows support is not yet release-verified; native X11 is a development preview
 **Primary operating mode:** Local-first, headless-first, asynchronous
 **Primary interface:** CLI
 **Secondary interfaces:** HTTP/SSE, ACP

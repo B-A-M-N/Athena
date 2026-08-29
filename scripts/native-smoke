@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-projection='{"title":"ATHENA OI // BRIDGE","status":"ACTIVE","oi":["operation=verify-release","event=CapabilityCompleted"]}'
+projection='{"title":"ATHENA OI // BRIDGE","status":"ACTIVE","oi":["operation=verify-release","event=CapabilityCompleted"],"model_request":{"provider":"openrouter","model":"configured/model","role":"planner","request_id":"req-smoke","status":"active"},"workspace_tree":[{"id":"workspace:src","kind":"directory","label":"src","status":"active","children":[{"id":"workspace:src/main.rs","kind":"resource","label":"main.rs","status":"active","metadata":{"canonical_path":"src/main.rs"},"children":[]}]}],"trace":["> NEXT STEP · verify-release"]}'
 output="$({ printf '%s\n' "$projection"; } | cargo run --manifest-path native/Cargo.toml --offline -- \
   --headless --bridge-stdin --command 'printf "native-pty-ok\\n"' 2>&1)"
 
@@ -12,4 +12,8 @@ printf '%s\n' "$output"
 rg -q 'native-pty-ok' <<<"$output"
 rg -q 'ATHENA OI // BRIDGE' <<<"$output"
 rg -q 'event=CapabilityCompleted' <<<"$output"
+rg -q 'MODEL REQUEST · openrouter/configured/model' <<<"$output"
+rg -q 'TREE directory \[active\] src' <<<"$output"
+rg -q 'TREE resource \[active\] main.rs' <<<"$output"
+rg -q 'TRACE > NEXT STEP · verify-release' <<<"$output"
 printf '%s\n' 'native-smoke: PASS — PTY/core/projection bridge'

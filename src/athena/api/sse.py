@@ -17,6 +17,7 @@ that cursor when the event store supports replay (best effort).
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 from datetime import datetime
 from decimal import Decimal
@@ -172,13 +173,28 @@ def run(
         import uvicorn
     except ImportError as exc:
         raise RuntimeError(
-            "uvicorn is required to serve the HTTP API. Install it with "
-            "`pip install -e '.[api]'` (provides uvicorn + starlette)."
+            "uvicorn is required to serve the HTTP API. Install Athena's base "
+            "dependencies before starting the API."
         ) from exc
 
     config = dict(server_config or {})
     app = app or _build_default_app()
-    uvicorn.run(app, host=config.get("host", host), port=int(config.get("port", port)))
+    selected_host = str(config.get("host", host))
+    if not _is_loopback_host(selected_host):
+        raise RuntimeError(
+            "Athena's beta API is local-only; bind to 127.0.0.1, ::1, or "
+            "localhost until an authenticated API boundary is configured"
+        )
+    uvicorn.run(app, host=selected_host, port=int(config.get("port", port)))
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _build_default_app() -> Any:

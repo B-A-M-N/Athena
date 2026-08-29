@@ -201,7 +201,7 @@ def _decode_workspace(raw: Any) -> WorkspaceSpec | None:
             for r in (data.get("writable") or [])
         ),
         temp_root=data.get("temp_root"),
-        execution_backend=data.get("execution_backend", "local"),
+        execution_backend=data.get("execution_backend"),
         network_policy=NetworkPolicy(data.get("network_policy", "allow")),
         mutation_mode=MutationMode(data.get("mutation_mode", MutationMode.DIRECT.value)),
     )

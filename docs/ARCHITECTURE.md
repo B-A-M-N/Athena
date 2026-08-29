@@ -135,8 +135,11 @@ capabilities.created_this_task(task_id)
 The live reflection capability now also searches/describes visible workflows
 and skills, and the ContextCompiler uses the fabric's deterministic ranked
 search for progressive capability disclosure while retaining foundational
-creation/reflection routes. Runtime, dependency, permission, device, and
-project-affordance reflection remain future extensions of the same interface.
+creation/reflection routes. The same interface now exposes narrow runtime,
+dependency, permission, device, and availability passports, and search already
+respects task/project/user overlays. These routes report bounded, advisory
+inventories; they are not yet broad host-resource discovery or full dependency
+manager coverage.
 
 ### OI Classic-aligned machinery patterns
 
@@ -529,15 +532,15 @@ complete.
 | Design area | Current alignment |
 | --- | --- |
 | One AgentKernel, Task, policy, execution, and durable event model | **Mostly aligned**; existing core contracts support this model. |
-| Affordance Fabric and task/project/user overlays | **Partial**; fabric, live task-scoped synthesis, durable project/user/candidate records, ownership filtering, lifecycle history, and proof updates exist; review and promotion UX remain incomplete. |
+| Affordance Fabric and task/project/user overlays | **Live for beta scope**; fabric search carries readiness/proof evidence, task-scoped synthesis, durable project/user/candidate records, ownership filtering, lifecycle history, and explicit CLI review/promotion/deprecation exist. Broader host-resource discovery remains incomplete. |
 | Scratch lifecycle | **Partial**; records exist, but the kernel does not yet choose scratch/composition/synthesis through one explicit strategy surface. |
-| GeneratedCapability | **Partial**; model-visible task-scoped creation, hashes, dependency locks, proof evolution, candidate retention, project/user rehydration, and deprecation exist; promotion UX and fully enforced sandbox semantics remain incomplete. |
+| GeneratedCapability | **Live for beta scope**; model-visible task-scoped creation, hashes, dependency locks, proof evolution, candidate retention, project/user rehydration, and explicit promotion/deprecation exist. Native-window and platform-specific sandbox parity remain incomplete. |
 | Declarative nested workflows | **Partial**; models, SQLite storage, validation, execution, and a capability route exist; kernel-level strategy integration and full conformance are incomplete. |
-| Reflection | **Partial**; scoped/ranked capability reflection plus workflow/skill search and description are live; broader resource/runtime/device/permission discovery is incomplete. |
+| Reflection | **Partial**; scoped/ranked capability reflection, workflow/skill search and description, runtime/dependency/permission/device inventories, and availability passports are live; broader resource discovery and fuller dependency-manager coverage are incomplete. |
 | Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, and deterministic plan/assess/bundle/run operations are live; semantic retrieval, autonomous acquisition/critique, and full completion verification remain incomplete. |
-| Dependency acquisition | **Partial**; a governed Python route records resolved versions, source metadata, file hashes, and environment fingerprints; manager breadth, lock replay, and full policy coverage remain. |
+| Dependency acquisition | **Partial**; a governed Python route records resolved versions, source metadata, file hashes, exact runtime identity, and environment fingerprints, and rejects lock replay on mismatch; manager breadth and full policy coverage remain. |
 | Tiered validation | **Partial**; task admission now records parse/interface/security/format/lint checks, candidate/project/user tiers can require Ruff/Mypy, and exact JSON Schema is compiled; generated-test planning, independent evidence, and optional Semgrep remain incomplete. |
-| Promotion and retention | **Partial**; explicit project/user promotion paths, durable generated proof, candidate retention, lifecycle history, quality scoring, deprecation, and garbage collection exist; richer review/supersession UX remains. |
+| Promotion and retention | **Live for beta scope**; `/candidates`, `/candidate`, `/promote`, and `/deprecate` provide explicit project/user review and lifecycle control with durable proof, history, quality scoring, and garbage collection. Richer review/supersession UX remains. |
 | Authority inheritance and isolation | **Not release-ready** until every generated/shadow/verification path is backed by a real restricted backend. |
 
 This table is an alignment guard. It prevents class names, comments, or

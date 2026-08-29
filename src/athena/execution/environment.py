@@ -38,8 +38,8 @@ class ProjectEnvironmentFingerprint:
             "system": platform.system(),
             "release": platform.release(),
             "machine": platform.machine(),
-            "execution_backend": workspace.execution_backend,
-            "sandbox_backend": workspace.execution_backend,
+            "execution_backend": workspace.execution_backend or "local",
+            "sandbox_backend": workspace.execution_backend or "local",
             "workspace_policy": {
                 "readable": [
                     {"path": rule.path, "allow": rule.allow} for rule in workspace.readable
@@ -111,8 +111,8 @@ class ProjectEnvironmentFingerprint:
             "system": platform.system(),
             "release": platform.release(),
             "machine": platform.machine(),
-            "execution_backend": workspace.execution_backend,
-            "sandbox_backend": workspace.execution_backend,
+            "execution_backend": workspace.execution_backend or "local",
+            "sandbox_backend": workspace.execution_backend or "local",
             "workspace_policy": {
                 "readable": [
                     {"path": rule.path, "allow": rule.allow} for rule in workspace.readable

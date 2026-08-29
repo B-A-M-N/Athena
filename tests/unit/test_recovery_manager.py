@@ -5,6 +5,13 @@ from athena.recovery.manager import RecoveryManager
 
 @pytest.mark.asyncio
 async def test_runtime_restart_emits_explicit_state_loss_event():
+    class Tasks:
+        def __init__(self):
+            self.hints = []
+
+        async def persist_runtime_recovery_hint(self, task_id, **kwargs):
+            self.hints.append((task_id, kwargs))
+
     class RuntimeSessions:
         async def list_alive(self):
             return [{"id": "runtime-1", "task_id": "task-1", "backend": "python"}]
@@ -20,8 +27,9 @@ async def test_runtime_restart_emits_explicit_state_loss_event():
             self.calls.append((args, kwargs))
 
     events = Events()
+    tasks = Tasks()
     manager = RecoveryManager(
-        task_store=object(),
+        task_store=tasks,
         runtime_session_store=RuntimeSessions(),
         event_store=events,
     )
@@ -38,5 +46,11 @@ async def test_runtime_restart_emits_explicit_state_loss_event():
                 },
             ),
             {"task_id": "task-1"},
+        )
+    ]
+    assert tasks.hints == [
+        (
+            "task-1",
+            {"runtime_session_id": "runtime-1", "backend": "python"},
         )
     ]

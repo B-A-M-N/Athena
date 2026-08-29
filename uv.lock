@@ -196,7 +196,7 @@ requires-dist = [
     { name = "wcwidth", specifier = ">=0.2" },
     { name = "wcwidth", marker = "extra == 'cli'", specifier = ">=0.2" },
 ]
-provides-extras = ["api", "mcp", "anthropic", "container", "debug", "cli", "glass", "dev"]
+provides-extras = ["mcp", "anthropic", "container", "debug", "cli", "glass", "dev"]
 
 [[package]]
 name = "attrs"

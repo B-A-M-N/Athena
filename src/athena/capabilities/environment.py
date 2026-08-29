@@ -1969,9 +1969,13 @@ class DatabaseCapability:
         if readonly:
             from urllib.parse import quote
 
-            conn = sqlite3.connect(f"file:{quote(path, safe='/')}?mode=ro", uri=True)
+            conn = sqlite3.connect(  # architecture-lint: allow raw-db-outside-state reason=read-only task database view
+                f"file:{quote(path, safe='/')}?mode=ro", uri=True
+            )
         else:
-            conn = sqlite3.connect(path)
+            conn = sqlite3.connect(  # architecture-lint: allow raw-db-outside-state reason=read-only task database view
+                path
+            )
         conn.row_factory = sqlite3.Row
         return conn
 

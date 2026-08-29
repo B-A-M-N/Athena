@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import json
 import base64
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -104,6 +105,12 @@ def resolve_dependency_environment(
             )
         hashes = record_hashes(distribution)
         verify_record_files(distribution)
+        expected_runtime = record.get("runtime_identity")
+        runtime_identity = _python_runtime_identity()
+        if expected_runtime and expected_runtime != runtime_identity:
+            raise DependencyEnvironmentError(
+                f"dependency {requirement.name!r} runtime identity changed"
+            )
         expected_hashes = sorted(str(item) for item in record.get("record_hashes") or ())
         if expected_hashes and hashes != expected_hashes:
             raise DependencyEnvironmentError(
@@ -114,7 +121,9 @@ def resolve_dependency_environment(
             "resolved_version": installed_version,
             "record_hashes": hashes,
         }
-        package_fingerprint = environment_fingerprint((package,))
+        package_fingerprint = environment_fingerprint(
+            (package,), runtime_identity=runtime_identity if expected_runtime else None
+        )
         expected_package_fingerprint = record.get("environment_fingerprint")
         if expected_package_fingerprint and expected_package_fingerprint != package_fingerprint:
             raise DependencyEnvironmentError(
@@ -122,7 +131,17 @@ def resolve_dependency_environment(
             )
         verified.append(package)
 
-    fingerprint = environment_fingerprint(verified)
+    runtime_identity = _python_runtime_identity()
+    fingerprint = environment_fingerprint(
+        verified,
+        runtime_identity=runtime_identity
+        if any(
+            record.get("runtime_identity")
+            for record in packages.values()
+            if isinstance(record, Mapping)
+        )
+        else None,
+    )
     if expected_fingerprint and fingerprint != expected_fingerprint:
         raise DependencyEnvironmentError(
             "dependency environment fingerprint does not match generated capability"
@@ -170,9 +189,21 @@ def verify_record_files(distribution: Any) -> None:
             raise DependencyEnvironmentError(f"dependency RECORD content hash mismatch: {path}")
 
 
-def environment_fingerprint(packages: Sequence[Mapping[str, Any]]) -> str:
-    encoded = json.dumps(list(packages), sort_keys=True, separators=(",", ":")).encode()
+def environment_fingerprint(
+    packages: Sequence[Mapping[str, Any]], *, runtime_identity: str | None = None
+) -> str:
+    payload: Any = list(packages)
+    if runtime_identity:
+        payload = {"packages": payload, "runtime_identity": runtime_identity}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _python_runtime_identity() -> str:
+    """Return the exact interpreter identity used for dependency imports."""
+    from athena.execution.environment import ProjectEnvironmentFingerprint
+
+    return ProjectEnvironmentFingerprint._executable_identity("python", sys.executable)
 
 
 def _find_record(packages: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:

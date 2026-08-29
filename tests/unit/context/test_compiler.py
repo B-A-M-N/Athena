@@ -24,6 +24,30 @@ class _SearchCapRegistry(_CapRegistry):
         return [{"id": "files.read"}]
 
 
+class _EvidenceCapRegistry(_CapRegistry):
+    def __init__(self, descriptors):
+        super().__init__(descriptors)
+        self.workspace = None
+
+    async def search(self, query, **kwargs):
+        self.workspace = kwargs.get("workspace")
+        return [
+            {
+                "id": "files.read",
+                "scope": "project",
+                "availability": "available",
+                "effects": ["READ_LOCAL"],
+                "tags": ["evidence"],
+                "output_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "proof": {"all_passed": True, "quality_score": 0.9},
+                "optimizer": {
+                    "dependency_available": True,
+                    "environment_compatible": True,
+                },
+            }
+        ]
+
+
 class _ContextBlockStore:
     async def list(self, *, scopes, attached_only, limit):
         assert attached_only is True
@@ -70,6 +94,24 @@ async def test_attached_context_blocks_are_mandatory_and_provenanced():
     assert messages[0].provenance.trust is TrustClass.CONFIGURED_INSTRUCTION
 
 
+@pytest.mark.asyncio
+async def test_runtime_recovery_hint_is_visible_in_resumed_context():
+    context = await ContextCompiler().compile(
+        _task(
+            metadata={
+                "_runtime_recovery_hint": {
+                    "message": "re-establish state before continuing",
+                }
+            }
+        )
+    )
+
+    assert any(
+        "Runtime recovery hint: re-establish state before continuing" in message.text()
+        for message in context.messages
+    )
+
+
 @pytest.mark.athena_claim("BHV-029")
 @pytest.mark.athena_evidence("test")
 async def test_to_request_includes_capabilities_when_registered():
@@ -95,6 +137,24 @@ async def test_fabric_progressively_discloses_relevant_capabilities():
     ctx = await compiler.compile(_task(objective="read files"))
 
     assert [descriptor.id for descriptor in ctx.capability_definitions] == ["files.read"]
+
+
+@pytest.mark.asyncio
+async def test_strategy_preserves_fabric_proof_and_workspace_scope():
+    workspace = WorkspaceSpec(id="repo", root="/tmp/repo")
+    registry = _EvidenceCapRegistry(
+        [CapabilityDescriptor(id="files.read", description="read files", input_schema={})]
+    )
+    context = await ContextCompiler(capability_registry=registry).compile(
+        _task(objective="inspect evidence", workspace=workspace)
+    )
+
+    assert registry.workspace is workspace
+    evidence = context.strategy.affordances[0]
+    assert evidence.scope == "project"
+    assert evidence.proof["all_passed"] is True
+    assert evidence.proof["optimizer"]["dependency_available"] is True
+    assert evidence.output_schema["type"] == "object"
 
 
 @pytest.mark.athena_claim("BHV-029")

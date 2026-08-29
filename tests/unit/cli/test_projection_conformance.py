@@ -286,3 +286,247 @@ def test_diagnostics_and_verification_are_first_class_projection_facts():
     frame = native_projection_frame(state, width=80, height=24)
     assert frame["diagnostics"][0]["path"] == "src/a.py"
     assert frame["verification"]["status"] == "failed"
+
+
+def test_live_trace_overflow_cue_renders_at_right_edge_for_long_lines():
+    """Regression: long LIVE TRACE rows must stay inside the cell aperture.
+
+    When the terminal is narrower than the trace content the renderer must
+    (a) fit/truncate the trace line to the aperture width, and (b) place a
+    "…" overflow cue on the last trace row at the rightmost column. The cue
+    must actually appear — a previous bug used ``overwrite=False`` for the
+    cue cell, causing it to silently fail because ``fit_cells`` had already
+    filled that column.
+    """
+    from athena.cli.scene import OIScene
+
+    state = ProjectionState()
+    # Seed the shared stream with a line far wider than the aperture.
+    long_text = "x" * 80
+    state.feed_stream(long_text)
+    state.seal_stream()
+
+    scene = OIScene(
+        viewport=Rect(0, 0, 40, 24),
+        status="ok",
+        title="TEST",
+        mode=VisualActionKind.IDLE,
+    )
+
+    lines = render_scene_lines(
+        state,
+        scene,
+        width=40,
+        height=24,
+        buddy_enabled=False,
+    )
+
+    # Find the LIVE TRACE section (it appears near the bottom).
+    trace_idx = None
+    for i, line in enumerate(lines):
+        if "LIVE TRACE" in line:
+            trace_idx = i
+            break
+
+    assert trace_idx is not None, "LIVE TRACE header not found in output"
+
+    # The row immediately after LIVE TRACE must start with the pipe character.
+    trace_row = lines[trace_idx + 1]
+    assert trace_row.startswith("\u2502 "), f"trace row should start with '│ ': {trace_row!r}"
+
+    # The overflow cue "…" must be at the very last column of the last
+    # trace row (second trace line).  The last two rows of the output are
+    # the two trace lines.
+    assert len(lines) >= trace_idx + 3
+    last_trace = lines[trace_idx + 2]
+    assert last_trace.endswith("\u2026"), (
+        f"Overflow cue '…' missing at right edge. "
+        f"Last trace row: {last_trace!r} (width={len(last_trace)})"
+    )
+
+    # The total line width must not exceed the aperture width.
+    for line in lines:
+        assert len(line) <= 40, f"Line exceeds aperture: {line!r} (len={len(line)})"
+
+
+def test_workspace_tree_is_bounded_to_aperture_and_exposes_truthful_node_overflow_label():
+    """Regression: an overlong workspace tree must fit inside the tree aperture and
+    expose a truthful ``[N nodes]`` overflow/scroll affordance when the number of
+    flattened tree rows exceeds the available row budget (height - 3).
+    """
+    from athena.cli.scene import OIScene, TreeNode
+    from athena.cli.render.scene import render_scene_lines
+
+    state = ProjectionState()
+
+    # Build 60 flat workspace-tree nodes — far more than the ~20 row budget for
+    # a height=24 aperture.  Each has a long label so we can confirm fit_cells
+    # clamping works on the individual rows.
+    workspace_tree: list[TreeNode] = []
+    for i in range(60):
+        workspace_tree.append(
+            TreeNode(
+                id=f"res-{i}",
+                kind="resource",
+                label=f"{'x' * 25}-file-{i:04d}",
+                status="complete",
+                children=(),
+            )
+        )
+
+    scene = OIScene(
+        viewport=Rect(0, 0, 50, 24),
+        status="ok",
+        title="TEST",
+        mode=VisualActionKind.IDLE,
+        workspace_tree=tuple(workspace_tree),
+    )
+
+    width, height = 50, 24
+    split = max(width // 2, 18)  # 25
+    tree_col_width = split - 1  # 24
+
+    lines = render_scene_lines(
+        state,
+        scene,
+        width=width,
+        height=height,
+        buddy_enabled=False,
+    )
+
+    # Invariant 1: no line exceeds the aperture width
+    for idx, line in enumerate(lines):
+        assert len(line) <= width, (
+            f"Line {idx} exceeds aperture width {width}: len={len(line)} — {line!r}"
+        )
+
+    # Invariant 2: WORKSPACE MAP header in left half, bounded
+    header_idx = None
+    for idx, line in enumerate(lines):
+        if "WORKSPACE MAP" in line:
+            header_idx = idx
+            break
+    assert header_idx is not None, "WORKSPACE MAP header not found"
+
+    header_line = lines[header_idx]
+    split_pos = split
+    left_header = header_line[:split_pos] if split_pos <= len(header_line) else header_line
+    assert len(left_header.rstrip()) <= tree_col_width, (
+        f"Left header exceeds tree column width: {left_header!r}"
+    )
+
+    # Invariant 3: tree rows fit inside the tree column width
+    tree_start_row = header_idx + 1
+    tree_rows_in_output = []
+    for idx in range(tree_start_row, header_idx + 1 + 24):
+        if idx < len(lines):
+            tree_rows_in_output.append((idx, lines[idx]))
+
+    assert len(tree_rows_in_output) > 1, (
+        f"Expected multiple tree rows; got {len(tree_rows_in_output)}"
+    )
+
+    for row_idx, line in tree_rows_in_output:
+        left_part = line[:split_pos] if split_pos <= len(line) else line
+        assert len(left_part.rstrip()) <= tree_col_width, (
+            f"Row {row_idx} tree content exceeds column width: {left_part!r}"
+        )
+
+    # Invariant 4: truthful [60 nodes] overflow label present
+    found_label = False
+    for row_idx, line in tree_rows_in_output:
+        left_part = line[:split_pos] if split_pos <= len(line) else line
+        stripped = left_part.rstrip()
+        if stripped == "[60 nodes]" or stripped.endswith("[60 nodes]"):
+            found_label = True
+            break
+
+    assert found_label, (
+        f"[60 nodes] overflow label not found. "
+        f"Lines: {[line_text for _, line_text in tree_rows_in_output]}"
+    )
+
+
+def test_native_projection_frame_preserves_buddy_character_owl():
+    """Ensure the canonical character='owl' survives the Python→Rust bridge."""
+    from athena.cli.native_bridge import native_projection_frame
+
+    state = ProjectionState()
+    frame = native_projection_frame(state)
+
+    assert frame["buddy"]["character"] == "owl"
+    assert frame["buddy"]["state"] == "idle"  # scene.mode.value, not state.status
+    assert isinstance(frame["buddy"]["anchor"], str)
+
+
+def test_native_projection_frame_custom_character_serializes():
+    """A non-default character must be preserved through the bridge."""
+    from athena.cli.native_bridge import native_projection_frame
+
+    state = ProjectionState()
+    frame = native_projection_frame(state, character="cat")
+
+    assert frame["buddy"]["character"] == "cat"
+
+
+def test_native_projection_frame_model_request_fields_present():
+    """The model_request section of the frame must contain the expected keys."""
+    from athena.cli.native_bridge import native_projection_frame
+
+    state = ProjectionState()
+    state.feed_stream("test line")
+    state.seal_stream()
+
+    frame = native_projection_frame(state)
+
+    mr = frame["model_request"]
+    assert "provider" in mr
+    assert "model" in mr
+    assert "role" in mr
+    assert "request_id" in mr
+    assert "status" in mr
+
+
+def test_write_native_projection_outputs_valid_json_with_owl():
+    """write_native_projection must emit parseable JSON with character='owl'."""
+    from io import StringIO
+
+    from athena.cli.native_bridge import write_native_projection
+
+    state = ProjectionState()
+    state.feed_stream("hello")
+    state.seal_stream()
+
+    buf = StringIO()
+    write_native_projection(buf, state)
+    output = buf.getvalue()
+
+    import json
+
+    frame = json.loads(output)
+    assert frame["buddy"]["character"] == "owl"
+
+
+def test_runtime_tree_keeps_task_operation_and_execution_hierarchy():
+    state = ProjectionState()
+    state.reduce("TaskStarted", {}, task_id="task-1")
+    state.reduce(
+        "CapabilityRequested",
+        {"call_id": "call-1", "capability_id": "execute"},
+        task_id="task-1",
+    )
+    state.reduce(
+        "ExecutionStarted",
+        {"call_id": "call-1", "execution_id": "exec-1", "runtime": "python"},
+        task_id="task-1",
+    )
+
+    scene = build_oi_scene(state, Rect(0, 0, 80, 24))
+    frame = native_projection_frame(state)
+    by_id = {node.id: node for node in scene.entities}
+
+    assert by_id["execution:exec-1"].metadata["parent_id"] == "call-1"
+    runtime = frame["runtime_tree"]
+    assert runtime[0]["id"] == "task:task-1"
+    assert runtime[0]["children"][0]["id"] == "operation:call-1"
+    assert runtime[0]["children"][0]["children"][0]["id"] == "execution:exec-1"

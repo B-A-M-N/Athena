@@ -496,7 +496,7 @@ class TaskWorldState:
 
         def _git():
             try:
-                proc = subprocess.run(
+                proc = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only git observation
                     ["git", "-C", root, "status", "--porcelain"],
                     capture_output=True,
                     text=True,

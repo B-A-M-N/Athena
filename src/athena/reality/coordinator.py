@@ -302,6 +302,33 @@ class RealityCoordinator:
                 branch_id=branch.id,
             )
 
+        if bool((task.metadata or {}).get("review_before_commit")):
+            # Verification is complete, but self-hosted work has an explicit
+            # human gate. Reattach the verified branch so Git/execute and the
+            # restart path continue to resolve the candidate workspace.
+            activate = getattr(self._gate, "activate_branch", None)
+            if callable(activate):
+                activate(branch)
+            certificate = branch.verification_certificate
+            await self._emit(
+                EV["CANDIDATE_READY_FOR_REVIEW"],
+                {
+                    "branch_id": branch.id,
+                    "base_fingerprint": certificate.get("base_fingerprint"),
+                    "candidate_fingerprint": certificate.get("candidate_fingerprint"),
+                    "certificate_hash": certificate.get("certificate_hash"),
+                    "changed_resources": list(certificate.get("changed_resources") or []),
+                },
+                task,
+            )
+            return RealityCompletionResult(
+                decision=decision,
+                branch_id=branch.id,
+                certificate=certificate.to_record()
+                if hasattr(certificate, "to_record")
+                else dict(certificate),
+            )
+
         self._completion.begin_verified(
             task_id=task.id,
             branch_id=branch.id,

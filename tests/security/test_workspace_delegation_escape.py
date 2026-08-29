@@ -190,8 +190,63 @@ def test_parent_writable_narrower_than_child_request():
             ),
         )
         scoped = _scope_workspace(parent, child_ws)
-        # Both rules are under parent_root, so both pass containment.
-        # (Note: _restrict_paths checks containment, not parent's writable rules.)
-        # The key check is that an outside path is rejected.
-        for rule in scoped.writable or ():
-            assert str(Path(rule.path).resolve()).startswith(parent_root)
+        assert tuple(rule.path for rule in scoped.writable if rule.allow) == ()
+        assert any(not rule.allow for rule in scoped.writable)
+
+
+@pytest.mark.athena_claim("BHV-053")
+@pytest.mark.athena_evidence("test", "security")
+def test_parent_deny_survives_child_allow():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        parent_root = Path(tmpdir) / "parent"
+        allowed = parent_root / "allowed"
+        child_root = allowed / "tasks" / "child"
+        denied = child_root / "secrets"
+        denied.mkdir(parents=True)
+        parent = TaskSpec(
+            id="p",
+            objective="p",
+            workspace=WorkspaceSpec(
+                id="parent",
+                root=str(parent_root),
+                readable=(PathRule(str(allowed), True), PathRule(str(denied), False)),
+            ),
+        )
+        child = WorkspaceSpec(
+            id="child",
+            root=str(child_root),
+            readable=(PathRule(str(child_root), True),),
+        )
+        scoped = _scope_workspace(parent, child)
+        assert any(
+            rule.path == str(child_root.resolve()) and rule.allow for rule in scoped.readable
+        )
+        assert any(
+            rule.path == str(denied.resolve()) and not rule.allow for rule in scoped.readable
+        )
+
+
+@pytest.mark.athena_claim("BHV-053")
+@pytest.mark.athena_evidence("test", "security")
+def test_omitted_backend_inherits_but_explicit_downgrade_is_rejected(tmp_path):
+    parent_root = tmp_path / "parent"
+    parent_root.mkdir()
+    parent = TaskSpec(
+        id="p",
+        objective="p",
+        workspace=WorkspaceSpec(id="parent", root=str(parent_root), execution_backend="container"),
+    )
+    inherited = _scope_workspace(
+        parent,
+        WorkspaceSpec(id="child", root=str(parent_root / "child")),
+    )
+    assert inherited.execution_backend == "container"
+    with pytest.raises(ValueError, match="weaker"):
+        _scope_workspace(
+            parent,
+            WorkspaceSpec(
+                id="child",
+                root=str(parent_root / "child"),
+                execution_backend="local",
+            ),
+        )

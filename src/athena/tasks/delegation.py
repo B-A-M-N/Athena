@@ -40,6 +40,9 @@ class ChildLimitExceeded(DelegationError):
 
 _DEFAULT_MAX_DEPTH = 1
 _DEFAULT_MAX_CHILDREN = 4
+_NO_CAPABILITY_INTERSECTION = "__athena_no_capability_intersection__"
+_NO_EFFECT_INTERSECTION = "__athena_no_effect_intersection__"
+_NO_MODEL_INTERSECTION = "__athena_no_model_intersection__"
 
 
 class DelegationManager:
@@ -143,6 +146,9 @@ class DelegationManager:
         created = await self._tasks.create(child)
         if self._budgets is not None:
             self._budgets.record_child(parent_task.id)
+            persist_budget = getattr(self._budgets, "_persist_usage", None)
+            if persist_budget is not None:
+                await persist_budget(parent_task.id)
         return created
 
     # ------------------------------------------------------------------ #
@@ -346,19 +352,38 @@ def _scope_policy(parent: TaskSpec, child: CapabilityPolicy | None = None) -> Ca
     parent = parent or TaskSpec(id="", objective="")
     parent_cap = parent.capability_policy or CapabilityPolicy()
     child_cap = child or CapabilityPolicy()
-    deny = tuple(sorted(set(parent_cap.deny) | set(child_cap.deny)))
-    base_allow = parent_cap.allow or parent_cap.ask or ()
-    child_allow = tuple(c for c in child_cap.allow if c not in deny)
-    # Empty allow on the child = inherit the parent's permissions, not deny-all.
-    allow = child_allow if child_cap.allow else base_allow
-    allow = tuple(c for c in allow if c not in deny)
-    ask_set = set(parent_cap.ask) | set(child_cap.ask)
-    ask = tuple(c for c in ask_set if c not in deny)
+    parent_allow = set(parent_cap.allow)
+    parent_ask = set(parent_cap.ask)
+    child_requested = set(child_cap.allow)
+    if child_requested:
+        # An empty parent allowlist is the protocol's unrestricted value. A
+        # child request narrows that open ceiling to the capabilities it asks
+        # for; it must not become impossible merely because the parent did
+        # not enumerate every native capability.
+        allow_set = child_requested & parent_allow if parent_allow else child_requested
+        ask_set = parent_ask & child_requested
+        outside = child_requested - parent_allow - parent_ask
+    else:
+        allow_set = parent_allow
+        ask_set = parent_ask
+        outside = set()
+    deny_set = set(parent_cap.deny) | set(child_cap.deny) | outside
+    if (parent_allow or parent_ask) and not (allow_set or ask_set):
+        # Empty ``allow`` means unrestricted to the dispatcher, so use an
+        # impossible sentinel when two non-empty ceilings have no overlap.
+        allow_set = {_NO_CAPABILITY_INTERSECTION}
+    allow = tuple(sorted(c for c in allow_set if c not in deny_set))
+    ask = tuple(sorted(c for c in ask_set if c not in deny_set))
+    effects = set(parent_cap.effects)
+    if child_cap.effects:
+        effects = effects & set(child_cap.effects) if effects else set(child_cap.effects)
+    if parent_cap.effects and child_cap.effects and not effects:
+        effects = {_NO_EFFECT_INTERSECTION}
     return CapabilityPolicy(
-        effects=frozenset(parent_cap.effects),
+        effects=frozenset(effects),
         allow=allow,
         ask=ask,
-        deny=deny,
+        deny=tuple(sorted(deny_set)),
     )
 
 
@@ -366,9 +391,12 @@ def _scope_model_policy(parent: TaskSpec, child):
     base = _as_model_policy(parent.model_policy)
     child_v = _as_model_policy(child or base)
     allowed = tuple(a for a in child_v.allowed if not base.allowed or a in base.allowed)
+    if base.allowed and child_v.allowed and not allowed:
+        allowed = (_NO_MODEL_INTERSECTION,)
     return replace(
         base,
-        require_tools=bool(base.require_tools),
+        require_tools=bool(base.require_tools or child_v.require_tools),
+        privacy=_stricter_privacy(base.privacy, child_v.privacy),
         allowed=allowed,
         max_cost_usd=_intersect_cost(base.max_cost_usd, child_v.max_cost_usd),
     )
@@ -434,13 +462,31 @@ def _scope_workspace(parent: TaskSpec, child):
     )
     network = _restrict_network(parent_ws.network_policy, child_ws.network_policy)
 
+    parent_temp = _canonical_workspace_path(parent_ws.temp_root, parent_root_canonical)
+    if parent_temp is None:
+        parent_temp = parent_root_canonical
+    requested_temp = _canonical_workspace_path(child_ws.temp_root, child_root_canonical)
+    if requested_temp is None:
+        requested_temp = child_root_canonical / ".tmp"
+    if not _is_within(requested_temp, parent_temp) or not _is_within(
+        requested_temp, parent_root_canonical
+    ):
+        requested_temp = child_root_canonical / ".tmp"
+
+    parent_backend = parent_ws.execution_backend or "local"
+    child_backend = child_ws.execution_backend
+    if child_backend is None:
+        effective_backend = parent_backend
+    else:
+        effective_backend = _monotonic_backend(parent_backend, child_backend)
+
     return WorkspaceSpec(
         id=child_ws.id,
         root=str(child_root_canonical),
-        readable=readable or parent_ws.readable,
-        writable=writable or parent_ws.writable,
-        temp_root=child_ws.temp_root or parent_ws.temp_root,
-        execution_backend=child_ws.execution_backend or parent_ws.execution_backend,
+        readable=readable,
+        writable=writable,
+        temp_root=str(requested_temp),
+        execution_backend=effective_backend,
         network_policy=network,
         mutation_mode=(
             child_ws.mutation_mode
@@ -460,45 +506,131 @@ def _is_strict_descendant(child: Path, parent: Path) -> bool:
 
 
 def _restrict_paths(parent_rules, child_rules, parent_root: Path, child_root: Path):
-    """Intersect child path rules with parent containment.
+    """Return the canonical intersection of two prefix path policies.
 
-    Each rule's path is canonicalized relative to child_root. If the canonical
-    path is not within parent_root, the rule is dropped (child cannot access
-    paths outside parent). If the canonical path IS within parent_root but not
-    within the parent's own allowed rules, it is also dropped.
+    An empty rule tuple means the corresponding workspace root is implicitly
+    allowed.  The returned policy is always explicit, including a deny rule
+    at ``child_root`` when the intersection is empty.  This matters because
+    downstream scope checkers interpret an empty tuple as unrestricted.
+
+    ``Path.resolve(strict=False)`` canonicalizes existing symlink components;
+    every candidate is then checked against both roots and both allow sets.
+    Deny rules are retained when they overlap the surviving allow region, so
+    a parent deny cannot be erased by a child allow rule.
     """
     from athena.protocol.tasks import PathRule
 
-    out = []
-    # Build canonical set of parent-allowed paths for intersection
-    parent_allowed = set()
-    for pr in parent_rules or ():
-        try:
-            canon = Path(pr.path).resolve()
-            parent_allowed.add(str(canon))
-        except (OSError, ValueError):
-            continue
+    parent = _canonical_rules(parent_rules, parent_root, parent_root)
+    child = _canonical_rules(child_rules, child_root, child_root)
+    if not parent:
+        parent = [(parent_root, True)]
+    if not child:
+        child = [(child_root, True)]
 
-    for rule in child_rules or ():
-        allow = bool(rule.allow)
-        if not rule.path:
-            continue
-        # Canonicalize the child rule's path relative to child_root
-        raw = rule.path
-        try:
-            if Path(raw).is_absolute():
-                canon = Path(raw).resolve()
-            else:
-                canon = (child_root / raw).resolve()
-        except (OSError, ValueError):
-            continue
+    parent_allows = [path for path, allow in parent if allow and _is_within(path, parent_root)]
+    child_allows = [path for path, allow in child if allow and _is_within(path, child_root)]
+    candidates: list[Path] = []
+    for parent_allow in parent_allows:
+        for child_allow in child_allows:
+            overlap = _prefix_intersection(parent_allow, child_allow)
+            if overlap is None:
+                continue
+            if _is_within(overlap, parent_root) and _is_within(overlap, child_root):
+                candidates.append(overlap)
 
-        canon_str = str(canon)
-        # Must be within parent_root (containment check)
-        if not _is_within(canon, parent_root):
+    denies = [
+        path
+        for path, allow in (*parent, *child)
+        if not allow and (_is_within(path, parent_root) or _is_within(path, child_root))
+    ]
+    surviving: list[Path] = []
+    for candidate in _unique_paths(candidates):
+        # A deny ancestor/equal to the candidate removes that whole region.
+        if any(_is_within(candidate, deny) for deny in denies):
             continue
-        out.append(PathRule(path=canon_str, allow=allow))
+        surviving.append(candidate)
+
+    out: list[PathRule] = [PathRule(path=str(path), allow=True) for path in surviving]
+    for deny in _unique_paths(denies):
+        if any(_is_within(deny, candidate) for candidate in surviving):
+            out.append(PathRule(path=str(deny), allow=False))
+    if not out:
+        out.append(PathRule(path=str(child_root), allow=False))
     return tuple(out)
+
+
+def _canonical_workspace_path(value: str | None, base: Path) -> Path | None:
+    if not value:
+        return None
+    raw = Path(value)
+    return (raw if raw.is_absolute() else base / raw).resolve(strict=False)
+
+
+def _canonical_rules(rules, base: Path, root: Path) -> list[tuple[Path, bool]]:
+    result: list[tuple[Path, bool]] = []
+    for rule in rules or ():
+        if not getattr(rule, "path", None):
+            continue
+        path = _canonical_workspace_path(str(rule.path), base)
+        if path is None:
+            continue
+        result.append((path, bool(rule.allow)))
+    return result
+
+
+def _prefix_intersection(left: Path, right: Path) -> Path | None:
+    if _is_within(left, right):
+        return left
+    if _is_within(right, left):
+        return right
+    return None
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        value = str(path)
+        if value not in seen:
+            seen.add(value)
+            result.append(path)
+    return result
+
+
+def _monotonic_backend(parent: str, child: str) -> str:
+    """Reject a delegated backend that weakens the parent's isolation."""
+    strength = {
+        "local": 0,
+        "sandbox": 1,
+        "sandboxed-local": 1,
+        "verification": 1,
+        "shadow": 1,
+        "container": 2,
+    }
+    parent_strength = strength.get(parent)
+    child_strength = strength.get(child)
+    if parent_strength is None or child_strength is None:
+        if child != parent:
+            raise ValueError(f"unknown or incompatible delegated execution backend: {child!r}")
+        return child
+    if child_strength < parent_strength:
+        raise ValueError(
+            f"delegated execution backend {child!r} is weaker than parent backend {parent!r}"
+        )
+    return child
+
+
+def _stricter_privacy(left: str, right: str) -> str:
+    rank = {
+        "offline": 0,
+        "local": 0,
+        "local-preferred": 1,
+        "local-pref": 1,
+        "remote": 2,
+    }
+    left_value = str(left or "local-preferred")
+    right_value = str(right or "local-preferred")
+    return left_value if rank.get(left_value, 0) <= rank.get(right_value, 0) else right_value
 
 
 def _is_within(path: Path, base: Path) -> bool:

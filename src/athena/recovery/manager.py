@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import enum
 import logging
+from typing import Mapping
 
 from athena.protocol.tasks import TaskStatus
 from athena.state.tasks import TaskStore
@@ -8,9 +11,23 @@ from athena.state.mutations import PLANNED, STARTED, MutationStore
 from athena.state.executions import ExecutionStore
 from athena.state.runtime_sessions import RuntimeSessionStore
 
-__all__ = ["RecoveryManager"]
+__all__ = ["RecoveryManager", "RecoveryResult", "RecoveryStatus"]
 
 _logger = logging.getLogger("athena.recovery")
+
+
+class RecoveryStatus(str, enum.Enum):
+    HEALTHY = "healthy"
+    RECOVERED = "recovered"
+    RECOVERY_REQUIRED = "recovery_required"
+    RECOVERY_FAILED = "recovery_failed"
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    status: RecoveryStatus
+    summary: Mapping[str, int]
+    error: str | None = None
 
 
 class RecoveryManager:
@@ -38,10 +55,12 @@ class RecoveryManager:
         self._events = event_store
         self._runtime_state_loss_count = 0
         self._lease_timeout = lease_timeout_seconds
+        self._recovery_required = False
 
-    async def recover(self) -> dict[str, int]:
-        """Run all recovery passes and return a summary of reconciled items."""
+    async def recover(self) -> RecoveryResult:
+        """Run every recovery pass without treating unreadable state as empty."""
         self._runtime_state_loss_count = 0
+        self._recovery_required = False
         summary = {
             "tasks_interrupted": 0,
             "executions_interrupted": 0,
@@ -49,13 +68,28 @@ class RecoveryManager:
             "runtime_state_lost": 0,
             "mutations_recovered": 0,
         }
-        summary["tasks_interrupted"] = await self._recover_tasks()
-        summary["executions_interrupted"] = await self._recover_executions()
-        summary["runtime_sessions_cleaned"] = await self._recover_runtime_sessions()
-        summary["runtime_state_lost"] = self._runtime_state_loss_count
-        if self._mutations is not None:
-            summary["mutations_recovered"] = await self._recover_mutations()
-        return summary
+        try:
+            summary["tasks_interrupted"] = await self._recover_tasks()
+            summary["executions_interrupted"] = await self._recover_executions()
+            summary["runtime_sessions_cleaned"] = await self._recover_runtime_sessions()
+            summary["runtime_state_lost"] = self._runtime_state_loss_count
+            if self._mutations is not None:
+                summary["mutations_recovered"] = await self._recover_mutations()
+        except Exception as exc:
+            _logger.error("crash recovery failed closed: %s", exc)
+            return RecoveryResult(
+                status=RecoveryStatus.RECOVERY_FAILED,
+                summary=summary,
+                error=str(exc),
+            )
+        status = (
+            RecoveryStatus.RECOVERY_REQUIRED
+            if self._recovery_required
+            else RecoveryStatus.RECOVERED
+            if any(summary.values())
+            else RecoveryStatus.HEALTHY
+        )
+        return RecoveryResult(status=status, summary=summary)
 
     async def _recover_tasks(self) -> int:
         """Transition orphaned RUNNING tasks to INTERRUPTED.
@@ -66,10 +100,7 @@ class RecoveryManager:
         retain their state (they are waiting for user input, not crash-recoverable).
         """
         count = 0
-        try:
-            running = await self._tasks.list_by_status(TaskStatus.RUNNING)
-        except Exception:
-            return 0
+        running = await self._tasks.list_by_status(TaskStatus.RUNNING)
         for row in running or []:
             task_id = row.get("id") if isinstance(row, dict) else None
             if not task_id:
@@ -79,7 +110,7 @@ class RecoveryManager:
                 count += 1
                 _logger.info("recovered task %s: RUNNING -> INTERRUPTED", task_id)
             except Exception as exc:
-                _logger.warning("failed to recover task %s: %s", task_id, exc)
+                raise RuntimeError(f"failed to recover task {task_id}: {exc}") from exc
         return count
 
     async def _recover_executions(self) -> int:
@@ -87,11 +118,9 @@ class RecoveryManager:
         if self._executions is None:
             return 0
         count = 0
-        try:
-            # ExecutionStore should have a list_by_status or similar
-            stale = await self._executions.list_by_status("RUNNING")
-        except Exception:
-            stale = []
+        # ExecutionStore should have a list_by_status or similar. A read
+        # failure is not equivalent to there being no stale executions.
+        stale = await self._executions.list_by_status("RUNNING")
         for row in stale or []:
             exec_id = row.get("id") if isinstance(row, dict) else None
             if not exec_id:
@@ -100,7 +129,7 @@ class RecoveryManager:
                 await self._executions.mark_interrupted(exec_id)
                 count += 1
             except Exception as exc:
-                _logger.warning("failed to recover execution %s: %s", exec_id, exc)
+                raise RuntimeError(f"failed to recover execution {exec_id}: {exc}") from exc
         return count
 
     async def _recover_runtime_sessions(self) -> int:
@@ -108,10 +137,7 @@ class RecoveryManager:
         if self._runtime_sessions is None:
             return 0
         count = 0
-        try:
-            alive = await self._runtime_sessions.list_alive()
-        except Exception:
-            alive = []
+        alive = await self._runtime_sessions.list_alive()
         for row in alive or []:
             sid = row.get("id") if isinstance(row, dict) else None
             if not sid:
@@ -132,11 +158,24 @@ class RecoveryManager:
                         )
                         self._runtime_state_loss_count += 1
                     except Exception as exc:
-                        # Session truth still wins if observability is
-                        # temporarily unavailable during startup recovery.
-                        _logger.warning("failed to emit runtime state loss for %s: %s", sid, exc)
+                        raise RuntimeError(
+                            f"failed to emit runtime state loss for {sid}: {exc}"
+                        ) from exc
+                if row.get("task_id"):
+                    try:
+                        persist_hint = getattr(self._tasks, "persist_runtime_recovery_hint", None)
+                        if persist_hint is not None:
+                            await persist_hint(
+                                str(row["task_id"]),
+                                runtime_session_id=str(sid),
+                                backend=row.get("backend"),
+                            )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"failed to persist runtime recovery hint for {sid}: {exc}"
+                        ) from exc
             except Exception as exc:
-                _logger.warning("failed to mark runtime session %s dead: %s", sid, exc)
+                raise RuntimeError(f"failed to mark runtime session {sid} dead: {exc}") from exc
         return count
 
     async def _recover_mutations(self) -> int:
@@ -149,13 +188,12 @@ class RecoveryManager:
         """
         assert self._mutations is not None
         count = 0
-        try:
-            # The mutation store exposes list_by_status for recovery queries.
-            planned = await self._mutations.list_by_status(PLANNED)
-            started = await self._mutations.list_by_status(STARTED)
-        except Exception:
-            planned = []
-            started = []
+        # The mutation store exposes list_by_status for recovery queries. Each
+        # read is authoritative; an exception must fail startup closed.
+        planned = await self._mutations.list_by_status(PLANNED)
+        started = await self._mutations.list_by_status(STARTED)
+        if started:
+            self._recovery_required = True
         for row in started or []:
             mid = row.get("id") if isinstance(row, dict) else None
             if not mid:
@@ -164,7 +202,9 @@ class RecoveryManager:
                 await self._mutations.mark_recovery_required(mid)
                 count += 1
             except Exception as exc:
-                _logger.warning("failed to mark mutation %s recovery-required: %s", mid, exc)
+                raise RuntimeError(
+                    f"failed to mark mutation {mid} recovery-required: {exc}"
+                ) from exc
         # PLANNED mutations never had their side effect started, so mark
         # them FAILED (the intent can be retried).
         for row in planned or []:
@@ -175,5 +215,5 @@ class RecoveryManager:
                 await self._mutations.mark_failed(mid, error="crash before effect started")
                 count += 1
             except Exception as exc:
-                _logger.warning("failed to fail PLANNED mutation %s: %s", mid, exc)
+                raise RuntimeError(f"failed to fail PLANNED mutation {mid}: {exc}") from exc
         return count

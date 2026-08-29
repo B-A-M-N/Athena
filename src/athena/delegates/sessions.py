@@ -359,7 +359,7 @@ class _SubprocessTransport:
                 "ATHENA_WORKSPACE_ROOT": os.path.realpath(workspace.root),
             }
         )
-        process = await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned specialist transport
             *spec.command,
             cwd=os.path.realpath(workspace.root),
             stdin=asyncio.subprocess.PIPE,

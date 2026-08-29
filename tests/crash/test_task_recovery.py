@@ -10,6 +10,7 @@ import pytest
 
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskStatus
 from athena.state.database import Database
+from athena.state.mutations import MutationStore
 
 
 _SLEEP_SCRIPT = (
@@ -127,13 +128,21 @@ async def test_mutation_intent_wal_survives_crash(make_durable_service, durable_
     assert planned_id and started_id
     await svc1.stop()
 
-    # Restart on the same DB: recovery reconciles both intents.
-    svc2 = await make_durable_service(durable_db_path, scripts=None)
-    tables = await svc2._db.fetch_all(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='mutations'"
-    )
-    assert tables, "mutations WAL table missing after restart"
-    rows = await svc2._store_mutations.list_for_task(task.id)
+    # Restart on the same DB: the WAL is reconciled, but unresolved STARTED
+    # effects fail closed and prevent the service from claiming fresh work.
+    with pytest.raises(RuntimeError, match="recovery_required"):
+        await make_durable_service(durable_db_path, scripts=None)
+
+    db = Database(durable_db_path)
+    await db._ensure_ready()
+    try:
+        tables = await db.fetch_all(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='mutations'"
+        )
+        assert tables, "mutations WAL table missing after restart"
+        rows = await MutationStore(db).list_for_task(task.id)
+    finally:
+        await db.close()
     by_id = {r["id"]: r for r in rows}
     assert planned_id in by_id, f"PLANNED intent lost across restart: {rows!r}"
     assert started_id in by_id, f"STARTED intent lost across restart: {rows!r}"

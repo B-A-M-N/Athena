@@ -7,10 +7,12 @@ import importlib.metadata
 import json
 import os
 import platform
+import shlex
 import re
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, Protocol
 
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
@@ -21,10 +23,39 @@ from athena.protocol.capabilities import (
     EffectClass,
 )
 from athena.execution.dependencies import environment_fingerprint, record_hashes
+from athena.execution.dependencies import resolve_dependency_environment
+from athena.affordances.models import DependencyRequirement
 from athena.protocol.execution import ExecutionRequest
 from athena.protocol.messages import utcnow
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_HOST_INTERPRETER_BACKENDS = frozenset(
+    {"local", "shadow", "sandbox", "sandboxed-local", "verification"}
+)
+
+
+class DependencyManager(Protocol):
+    """Contract implemented by policy-routed dependency managers."""
+
+    name: str
+
+    def package_spec(self, name: str, version: str) -> str: ...
+
+    def target(self, root: str) -> str: ...
+
+
+class PythonDependencyManager:
+    """The first dependency manager, with no free-form shell surface."""
+
+    name = "python"
+
+    @staticmethod
+    def package_spec(name: str, version: str) -> str:
+        return f"{name}=={version}"
+
+    @staticmethod
+    def target(root: str) -> str:
+        return str(Path(root) / ".athena" / "dependencies")
 
 
 class DependencyCapability:
@@ -33,13 +64,17 @@ class DependencyCapability:
         description=(
             "Inspect, resolve, and policy-gated install of named dependencies. "
             "Installs are workspace-local and never accept shell flags or a "
-            "free-form package manager command. Operations: inspect/resolve/install."
+            "free-form package manager command. Operations: inspect/resolve/"
+            "install/replay."
         ),
         input_schema={
             "type": "object",
             "required": ["operation", "name"],
             "properties": {
-                "operation": {"type": "string", "enum": ["inspect", "resolve", "install"]},
+                "operation": {
+                    "type": "string",
+                    "enum": ["inspect", "resolve", "install", "replay"],
+                },
                 "name": {"type": "string", "minLength": 1, "maxLength": 128},
                 "manager": {"type": "string", "enum": ["python"]},
                 "version": {"type": "string", "maxLength": 64},
@@ -60,6 +95,7 @@ class DependencyCapability:
 
     def __init__(self, execution_manager=None) -> None:
         self._execution = execution_manager
+        self._managers: dict[str, DependencyManager] = {"python": PythonDependencyManager()}
 
     async def invoke(self, request: CapabilityRequest, *, context=None, **kw):
         args = dict(request.arguments or {})
@@ -68,15 +104,25 @@ class DependencyCapability:
         manager = str(args.get("manager") or "python")
         if not _NAME.fullmatch(name):
             return _result(request, ok=False, error="invalid dependency name")
-        if manager != "python":
-            return _result(request, ok=False, error="only the python manager is supported")
+        dependency_manager = self._managers.get(manager)
+        if dependency_manager is None:
+            return _result(request, ok=False, error=f"unsupported dependency manager: {manager}")
+        backend = getattr(getattr(context, "workspace", None), "execution_backend", None) or "local"
         if operation in {"inspect", "resolve"}:
             lock = _read_lock(context)
-            record = lock.get("packages", {}).get(name) if lock else None
+            record = _lock_record(lock, name) if lock else None
             found = (
                 record is not None or importlib.util.find_spec(name.replace("-", "_")) is not None
             )
-            metadata = {"name": name, "installed": found}
+            metadata = {
+                "name": name,
+                "installed": found,
+                "environment": {
+                    "task_execution_backend": backend,
+                    "task_runtime": "host-python",
+                    "host_interpreter": sys.executable,
+                },
+            }
             if record:
                 metadata["lock"] = record
                 output = f"{name}: installed ({record.get('resolved_version', 'unknown')})"
@@ -84,21 +130,37 @@ class DependencyCapability:
                 output = f"{name}: {'installed' if found else 'missing'}"
             return _result(request, output=output, metadata=metadata)
         if operation != "install":
+            if operation == "replay":
+                return await self._replay(
+                    request,
+                    context=context,
+                    manager=dependency_manager,
+                    name=name,
+                )
             return _result(request, ok=False, error=f"unknown operation: {operation}")
         if self._execution is None or context is None:
             return _result(
                 request, ok=False, error="dependency install requires execution workspace"
             )
+        if backend not in _HOST_INTERPRETER_BACKENDS:
+            return _result(
+                request,
+                ok=False,
+                error=(
+                    f"dependency {operation} is unsupported for execution backend {backend!r}; "
+                    "use local, shadow, or sandbox with a known host Python interpreter"
+                ),
+            )
         root = context.workspace.root
-        target = f"{root}/.athena/dependencies"
+        target = dependency_manager.target(root)
         version = str(args.get("version") or "")
-        package = name + (f"=={version}" if version else "")
+        package = dependency_manager.package_spec(name, version) if version else name
         # This command is deliberately assembled from validated fields.  It
         # still goes through ExecutionManager, whose sandbox/network profile
         # and task cancellation own the actual process.
         source = (
-            f"python -m pip install --disable-pip-version-check --no-input "
-            f"--target {target!r} {package!r}"
+            f"{shlex.quote(sys.executable)} -m pip install --disable-pip-version-check --no-input "
+            f"--target {shlex.quote(target)} {shlex.quote(package)}"
         )
         result = await self._execution.execute(
             ExecutionRequest(
@@ -106,6 +168,7 @@ class DependencyCapability:
                 source=source,
                 task_id=request.task_id or "dependency",
                 workspace_id=context.workspace.id,
+                backend=context.workspace.execution_backend or "local",
                 cwd=root,
                 network_policy=context.workspace.network_policy,
                 workspace_root=root,
@@ -143,6 +206,109 @@ class DependencyCapability:
             },
         )
 
+    async def _replay(
+        self,
+        request: CapabilityRequest,
+        *,
+        context: Any,
+        manager: DependencyManager,
+        name: str,
+    ):
+        """Replay one exact lock entry through the governed executor."""
+        if self._execution is None or context is None:
+            return _result(
+                request, ok=False, error="dependency replay requires execution workspace"
+            )
+        backend = getattr(context.workspace, "execution_backend", None) or "local"
+        if backend not in _HOST_INTERPRETER_BACKENDS:
+            return _result(
+                request,
+                ok=False,
+                error=(
+                    f"dependency replay is unsupported for execution backend {backend!r}; "
+                    "use local, shadow, or sandbox with a known host Python interpreter"
+                ),
+            )
+        lock = _read_lock(context)
+        record = _lock_record(lock, name)
+        if record is None:
+            return _result(request, ok=False, error=f"dependency {name!r} is not in the lock")
+        if str(record.get("manager") or "") != manager.name:
+            return _result(
+                request, ok=False, error="locked dependency manager does not match request"
+            )
+        version = str(record.get("resolved_version") or "")
+        expected_hashes = sorted(str(item) for item in record.get("record_hashes") or ())
+        if not version or not expected_hashes:
+            return _result(
+                request,
+                ok=False,
+                error="lock entry lacks a resolved version or content hashes; replay refused",
+            )
+        root = str(context.workspace.root)
+        target = manager.target(root)
+        source = (
+            f"{shlex.quote(sys.executable)} -m pip install --disable-pip-version-check --no-input --no-deps "
+            f"--upgrade --target {shlex.quote(target)} "
+            f"{shlex.quote(manager.package_spec(name, version))}"
+        )
+        result = await self._execution.execute(
+            ExecutionRequest(
+                runtime="shell",
+                source=source,
+                task_id=request.task_id or "dependency",
+                workspace_id=context.workspace.id,
+                backend=context.workspace.execution_backend or "local",
+                cwd=root,
+                network_policy=context.workspace.network_policy,
+                workspace_root=root,
+            )
+        )
+        if result.exit_code != 0:
+            return _result(
+                request,
+                ok=False,
+                output=result.stdout,
+                error=result.stderr or "dependency replay failed",
+                metadata={"exit_code": result.exit_code, "target": target},
+            )
+        try:
+            verified = resolve_dependency_environment(
+                root,
+                (
+                    DependencyRequirement(
+                        name=name,
+                        manager=manager.name,
+                        version=version,
+                    ),
+                ),
+                expected_fingerprint=record.get("environment_fingerprint"),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            return _result(
+                request,
+                ok=False,
+                output=result.stdout,
+                error=f"dependency replay verification failed: {exc}",
+                metadata={"exit_code": result.exit_code, "target": target},
+            )
+        return _result(
+            request,
+            output=result.stdout,
+            metadata={
+                "exit_code": result.exit_code,
+                "target": target,
+                "manager": manager.name,
+                "lock": dict(record),
+                "environment": verified.to_metadata(),
+                "provenance": {
+                    "task_id": request.task_id,
+                    "call_id": request.call_id,
+                    "lock_source": str(_lock_path(context)),
+                },
+            },
+        )
+
 
 def _lock_path(context) -> Path:
     workspace = getattr(context, "workspace", None)
@@ -157,6 +323,17 @@ def _read_lock(context) -> dict:
     except (FileNotFoundError, OSError, TypeError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _lock_record(lock: dict, name: str) -> dict[str, Any] | None:
+    packages = lock.get("packages") if isinstance(lock, dict) else None
+    if not isinstance(packages, dict):
+        return None
+    wanted = name.replace("-", "_").casefold()
+    for key, value in packages.items():
+        if str(key).replace("-", "_").casefold() == wanted and isinstance(value, dict):
+            return value
+    return None
 
 
 def _record_installed_package(
@@ -183,6 +360,7 @@ def _record_installed_package(
     if not resolved_version:
         raise ValueError(f"could not resolve installed version for {name}")
     hashes = record_hashes(distribution)
+    runtime_identity = _runtime_identity()
     record = {
         "name": name,
         "manager": "python",
@@ -197,6 +375,7 @@ def _record_installed_package(
             "executable": sys.executable,
             "platform": platform.platform(),
         },
+        "runtime_identity": runtime_identity,
         "owner": {"task_id": task_id, "call_id": call_id},
         "recorded_at": utcnow().isoformat(),
     }
@@ -207,9 +386,16 @@ def _record_installed_package(
                 "resolved_version": resolved_version,
                 "record_hashes": hashes,
             },
-        )
+        ),
+        runtime_identity=runtime_identity,
     )
     return record
+
+
+def _runtime_identity() -> str:
+    from athena.execution.dependencies import _python_runtime_identity
+
+    return _python_runtime_identity()
 
 
 def _write_lock(context, record: dict) -> None:

@@ -1215,7 +1215,7 @@ def workspace_identity(workspace: WorkspaceSpec | None) -> str:
         "readable": [(rule.path, rule.allow) for rule in workspace.readable],
         "writable": [(rule.path, rule.allow) for rule in workspace.writable],
         "temp_root": workspace.temp_root,
-        "execution_backend": workspace.execution_backend,
+        "execution_backend": workspace.execution_backend or "local",
         "network_policy": getattr(workspace.network_policy, "value", workspace.network_policy),
         "mutation_mode": getattr(workspace.mutation_mode, "value", workspace.mutation_mode),
     }

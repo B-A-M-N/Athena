@@ -66,7 +66,7 @@ class NativeSession:
         raise RuntimeError(f"could not connect native projection bridge: {last_error}")
 
     async def _on_event(self, event: Any) -> None:
-        self.projection.reduce(event.type, event.payload)
+        self.projection.reduce(event.type, event.payload, task_id=event.task_id)
         await self._send_projection()
 
     async def _send_projection(self) -> None:

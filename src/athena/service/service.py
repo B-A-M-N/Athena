@@ -108,6 +108,7 @@ from athena.protocol.tasks import (
     ContextRef,
     ResourceBudget,
     MutationMode,
+    NetworkPolicy,
     TaskSpec,
     TaskStatus,
     TERMINAL_STATUSES,
@@ -138,6 +139,10 @@ class AthenaService:
         # reporting "unsupported" for a provider owned by the host.
         self._device_provider = device_provider
         self._started = False
+        self._recovery_status = "not_started"
+        self._recovery_summary: dict[str, int] = {}
+        self._recovery_error: str | None = None
+        self._startup_health: dict[str, Any] = {"status": "not_started", "checks": {}}
         cfg_ws = config.workspace_root if config is not None else None
         self._default_workspace: WorkspaceSpec = WorkspaceSpec(
             id="root",
@@ -243,6 +248,7 @@ class AthenaService:
         try:
             await self._start_impl()
         except BaseException:
+            self._startup_health = {**self._startup_health, "status": "failed"}
             # Startup is a transaction over resources acquired in order. The
             # service must not leak a DB, worker, poller, scheduler, client, or
             # runtime when a later stage fails.
@@ -260,6 +266,10 @@ class AthenaService:
         """
 
         cfg = self.config
+        self._startup_health = {"status": "starting", "checks": {}}
+        self._recovery_status = "starting"
+        self._recovery_summary = {}
+        self._recovery_error = None
         workspace = WorkspaceSpec(
             id="root",
             root=cfg.workspace_root or self._default_workspace.root,
@@ -361,8 +371,13 @@ class AthenaService:
         self._capability_health = CapabilityHealth(store=self._capability_health_store)
         try:
             await self._capability_health.load(await self._capability_health_store.list())
+            self._startup_health["checks"]["capability_health"] = {"status": "ok"}
         except Exception as exc:
             _logger.warning("capability health rehydration failed: %s", exc)
+            self._startup_health["checks"]["capability_health"] = {
+                "status": "degraded",
+                "error": str(exc),
+            }
 
         # 4. Memory + skills.
         memory = MemoryStore(db)
@@ -375,10 +390,19 @@ class AthenaService:
         try:
             discovered = await skill_loader.load()
             await self._sync_skills(skill_lifecycle, discovered)
+            self._skill_discovery_status = "ok"
+            self._startup_health["checks"]["skills"] = {
+                "status": "ok",
+                "discovered": len(discovered),
+            }
         except Exception as exc:
             _logger.warning("skill discovery failed: %s", exc)
             # Track skill discovery status for visibility
             self._skill_discovery_status = f"failed: {exc}"
+            self._startup_health["checks"]["skills"] = {
+                "status": "degraded",
+                "error": str(exc),
+            }
 
         # 4. Policy engine.
         policy = PolicyEngine(profile=cfg.autonomy_level)
@@ -416,6 +440,7 @@ class AthenaService:
         # 7. TaskManager (needs budgets/cancellations, built a bit later).
         budgets = BudgetTracker(task_store=tasks)
         self._budgets = budgets
+        self._artifacts.set_budget_tracker(budgets)
         task_manager = TaskManager(
             task_store=tasks,
             events=events,
@@ -651,12 +676,18 @@ class AthenaService:
             runtime_session_store=runtime_sessions,
             event_store=events,
         )
-        try:
-            recovery_summary = await recovery.recover()
-            if any(recovery_summary.values()):
-                _logger.info("crash recovery reconciled: %s", recovery_summary)
-        except Exception as exc:
-            _logger.warning("crash recovery failed: %s", exc)
+        recovery_result = await recovery.recover()
+        self._recovery_status = recovery_result.status.value
+        self._recovery_summary = dict(recovery_result.summary)
+        self._recovery_error = recovery_result.error
+        if recovery_result.status.value not in {"healthy", "recovered"}:
+            raise RuntimeError(
+                "service startup aborted: durable recovery state is "
+                f"{recovery_result.status.value}"
+                + (f": {recovery_result.error}" if recovery_result.error else "")
+            )
+        if any(recovery_result.summary.values()):
+            _logger.info("crash recovery reconciled: %s", recovery_result.summary)
 
         # Reconcile transaction ownership after the mutation ledger has
         # classified any in-flight effects, but before workers can route new
@@ -737,13 +768,27 @@ class AthenaService:
                 mcp_client_sink=self._mcp_clients.append,
             )
             try:
-                await self._pack_manager.rehydrate_enabled()
+                activated = await self._pack_manager.rehydrate_enabled()
+                self._startup_health["checks"]["enabled_packs"] = {
+                    "status": "ok",
+                    "activated": activated,
+                }
             except Exception as exc:
                 _logger.warning("enabled capability-pack rehydration failed: %s", exc)
+                self._startup_health["checks"]["enabled_packs"] = {
+                    "status": "degraded",
+                    "error": str(exc),
+                }
 
         # 15. Start background scheduler loop.
         await scheduler.start()
         self._started = True
+        degraded = any(
+            value.get("status") != "ok"
+            for value in self._startup_health["checks"].values()
+            if isinstance(value, dict)
+        )
+        self._startup_health["status"] = "degraded" if degraded else "ok"
 
     async def stop(self) -> None:
         if not self._started and self._db is None:
@@ -890,6 +935,17 @@ class AthenaService:
         self._synthesis = None
         self._world_states = {}
         self._started = False
+
+    def startup_health(self) -> dict[str, Any]:
+        """Return startup checks for readiness and operator diagnostics."""
+        return {
+            "status": self._startup_health.get("status", "not_started"),
+            "checks": {
+                str(name): dict(value)
+                for name, value in (self._startup_health.get("checks") or {}).items()
+                if isinstance(value, dict)
+            },
+        }
 
     async def _recover_approved_continuations(
         self,
@@ -1641,6 +1697,84 @@ class AthenaService:
             "forensics": categories,
         }
 
+    def _candidate_branch(self, task_id: str):
+        """Return the durable operator-review candidate for one task."""
+        branches = getattr(self.shadow_engine(), "list_branches", lambda: ())()
+        for branch in reversed(branches):
+            if getattr(branch, "task_id", None) != task_id:
+                continue
+            if getattr(branch, "status", None) not in {
+                "PROPOSED",
+                "EXECUTING",
+                "VERIFIED",
+                "CONFLICTED",
+                "RECOVERY_REQUIRED",
+            }:
+                continue
+            return branch
+        return None
+
+    async def operator_candidate(self, task_id: str) -> dict | None:
+        """Return a review bundle for a retained verified candidate."""
+        branch = self._candidate_branch(task_id)
+        if branch is None:
+            return None
+        certificate = getattr(branch, "verification_certificate", {})
+        certificate = (
+            certificate.to_record()
+            if hasattr(certificate, "to_record")
+            else dict(certificate or {})
+        )
+        return {
+            "task_id": task_id,
+            "branch_id": branch.id,
+            "status": branch.status,
+            "base_workspace_root": branch.base_workspace.root,
+            "candidate_workspace_root": branch.shadow_workspace.root,
+            "base_fingerprint": certificate.get("base_fingerprint"),
+            "candidate_fingerprint": certificate.get("candidate_fingerprint"),
+            "certificate_hash": certificate.get("certificate_hash"),
+            "changed_resources": list(certificate.get("changed_resources") or []),
+            "verification": list(getattr(branch, "verification", ()) or ()),
+            "error": getattr(branch, "error", None),
+        }
+
+    async def apply_candidate(self, task_id: str) -> dict:
+        """Apply a reviewed candidate through the existing shadow commit path."""
+        branch = self._candidate_branch(task_id)
+        if branch is None:
+            return {"status": "missing", "error": "no retained candidate"}
+        if branch.status != "VERIFIED":
+            return {"status": "refused", "error": branch.error or f"candidate is {branch.status}"}
+        # A retained candidate is normally active so reads remain coherent
+        # while it is under review.  Detach it for the canonical commit call:
+        # otherwise RealityGate correctly routes the commit's direct fs
+        # requests back into the shadow and the final proof can never match
+        # the real workspace.  Reattach every non-committed outcome so stale
+        # or conflicted candidates remain recoverable.
+        if self._reality_gate is not None:
+            await self._reality_gate.deactivate_branch(task_id)
+        try:
+            outcome = await self.shadow_engine().commit(branch)
+        except Exception:
+            if self._reality_gate is not None and branch.status == "VERIFIED":
+                self._reality_gate.activate_branch(branch)
+            raise
+        if outcome.get("status") != "committed" and self._reality_gate is not None:
+            if branch.status in {"VERIFIED", "CONFLICTED", "RECOVERY_REQUIRED"}:
+                self._reality_gate.activate_branch(branch)
+        return outcome
+
+    async def discard_candidate(self, task_id: str) -> dict:
+        """Discard a retained candidate through the existing shadow engine."""
+        branch = self._candidate_branch(task_id)
+        if branch is None:
+            return {"status": "missing", "error": "no retained candidate"}
+        outcome = await self.shadow_engine().discard(branch, reason="discarded by operator")
+        if self._reality_gate is not None:
+            await self._reality_gate.deactivate_branch(task_id)
+        return outcome
+
     # ------------------------------------------------------------------ #
     # Operator projections (stable views over canonical durable state)
     # ------------------------------------------------------------------ #
@@ -1781,6 +1915,68 @@ class AthenaService:
             )
         return out
 
+    async def operator_generated_capabilities(self, task_id: str | None = None) -> list[dict]:
+        """Review candidates for one task through the canonical synthesis API."""
+        result = await self._invoke_synthesis({"operation": "candidates"}, task_id=task_id)
+        return result["value"]
+
+    async def operator_generated_capability(
+        self, capability_id: str, task_id: str | None = None
+    ) -> dict:
+        """Inspect one generated capability through the canonical synthesis API."""
+        result = await self._invoke_synthesis(
+            {"operation": "inspect", "capability_id": capability_id}, task_id=task_id
+        )
+        return result["value"]
+
+    async def operator_promote_generated_capability(
+        self, capability_id: str, scope: str, task_id: str | None = None
+    ) -> dict:
+        """Promote a generated capability through policy and synthesis."""
+        return await self._invoke_synthesis(
+            {"operation": "promote", "capability_id": capability_id, "scope": scope},
+            task_id=task_id,
+        )
+
+    async def operator_deprecate_generated_capability(
+        self, capability_id: str, task_id: str | None = None
+    ) -> dict:
+        """Retire a generated capability through policy and synthesis."""
+        return await self._invoke_synthesis(
+            {"operation": "deprecate", "capability_id": capability_id}, task_id=task_id
+        )
+
+    async def _invoke_synthesis(self, arguments: dict, *, task_id: str | None) -> dict:
+        from athena.protocol.capabilities import (
+            CapabilityRequest,
+            CapabilityRequestOrigin,
+            CapabilityResult,
+            CapabilityResultStatus,
+        )
+
+        if self._dispatcher is None:
+            raise RuntimeError("AthenaService not started")
+        result = await self._dispatcher.dispatch(
+            CapabilityRequest(
+                capability_id="synthesis",
+                arguments=arguments,
+                task_id=task_id,
+                call_id=new_id("operator-synthesis"),
+                origin=CapabilityRequestOrigin.USER_DIRECT,
+            ),
+            workspace=self._default_workspace,
+            profile=self.config.autonomy_level,
+        )
+        if not isinstance(result, CapabilityResult):
+            raise RuntimeError("generated capability operation requires approval")
+        if result.status is not CapabilityResultStatus.OK:
+            raise ValueError(result.error or "generated capability operation failed")
+        try:
+            value = json.loads(result.output or "null")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("generated capability operation returned invalid output") from exc
+        return {"value": value, "metadata": dict(result.metadata or {})}
+
     # ------------------------------------------------------------------ #
     # Internal wiring
     # ------------------------------------------------------------------ #
@@ -1788,11 +1984,28 @@ class AthenaService:
         ws = request.workspace or self._default_workspace
         autonomy = request.autonomy or self.config.autonomy_level
         # Preserve request metadata (autonomy + any caller-supplied fields)
-        meta = {"autonomy": autonomy.value}
+        meta: dict[str, Any] = {"autonomy": autonomy.value}
         if request.metadata:
             meta.update(request.metadata)
+        self_host = bool(meta.get("self_host"))
+        if self_host:
+            # Self-hosting is a service invariant, not a CLI convention. A
+            # caller cannot escape the candidate/review boundary by sending a
+            # direct mutation mode or a permissive network workspace.
+            autonomy = AutonomyLevel.CODING
+            meta["autonomy"] = autonomy.value
+            meta["review_before_commit"] = True
+            ws = replace(
+                ws,
+                network_policy=NetworkPolicy.DENY,
+                mutation_mode=MutationMode.SPECULATIVE,
+            )
         raw_mutation_mode = meta.pop("mutation_mode", None)
-        if raw_mutation_mode is not None:
+        if self_host:
+            # The service-enforced self-host boundary wins over any copied
+            # request metadata, including an explicit direct-mode escape.
+            ws = replace(ws, mutation_mode=MutationMode.SPECULATIVE)
+        elif raw_mutation_mode is not None:
             try:
                 mutation_mode = MutationMode(str(raw_mutation_mode))
             except ValueError as exc:
@@ -2176,7 +2389,7 @@ class AthenaService:
         registry.register(FilesystemCapability(workspace))
         from athena.capabilities.git import GitCapability
 
-        registry.register(GitCapability())
+        registry.register(GitCapability(candidate_resolver=self._candidate_git_view))
         if self._artifacts is not None:
             registry.register(ArtifactCapability(self._artifacts))
         registry.register(
@@ -2654,6 +2867,27 @@ class AthenaService:
             self._shadow.bind(self._dispatcher)
         self._shadow.bind_service(self)
         return self._shadow
+
+    def _candidate_git_view(self, task_id: str | None) -> dict[str, str] | None:
+        """Resolve Git's base metadata and candidate work tree for a task."""
+        if not task_id:
+            return None
+        shadow = self.shadow_engine()
+        branches = getattr(shadow, "list_branches", lambda: ())()
+        for branch in reversed(branches):
+            if getattr(branch, "task_id", None) != task_id:
+                continue
+            if getattr(branch, "status", None) not in {"PROPOSED", "EXECUTING", "VERIFIED"}:
+                continue
+            base_root = getattr(getattr(branch, "base_workspace", None), "root", None)
+            candidate_root = getattr(getattr(branch, "shadow_workspace", None), "root", None)
+            if base_root and candidate_root:
+                return {
+                    "base_root": str(base_root),
+                    "candidate_root": str(candidate_root),
+                    "branch_id": str(getattr(branch, "id", "")),
+                }
+        return None
 
     def fusion_orchestrator(self):
         """Return the service-owned, single-agent fusion orchestrator."""

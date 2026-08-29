@@ -108,7 +108,7 @@ class TaskForker:
                 readable=workspace.readable,
                 writable=workspace.writable,
                 temp_root=workspace.temp_root,
-                execution_backend=workspace.execution_backend,
+                execution_backend=workspace.execution_backend or "local",
                 network_policy=workspace.network_policy,
                 mutation_mode=workspace.mutation_mode,
             )
