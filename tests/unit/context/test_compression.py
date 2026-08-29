@@ -96,3 +96,24 @@ async def test_small_transcript_has_recap():
     joined = "\n".join(s.text for s in result)
     assert "latest message now" in joined
     assert "first user message with facts" in joined
+
+
+async def test_compression_reuses_summary_for_unchanged_source():
+    calls: list[str] = []
+
+    async def summarize(text: str) -> str:
+        calls.append(text)
+        return f"summary:{text}"
+
+    compressor = ContextCompressor(recent_turns=0, summarizer=summarize)
+    selections = [_sel("a", "first"), _sel("b", "second")]
+
+    await compressor.compress(selections)
+    first_count = len(calls)
+    await compressor.compress(selections)
+
+    assert first_count == 3  # one per source plus the merged recap
+    assert len(calls) == first_count
+
+    await compressor.compress([_sel("a", "changed"), selections[1]])
+    assert len(calls) > first_count

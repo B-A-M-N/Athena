@@ -14,6 +14,8 @@ Compression is a replaceable strategy.  The default strategy:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
@@ -148,8 +150,31 @@ class ContextCompressor:
         self.recent_turns = recent_turns
         self.max_summary_chars = max_summary_chars
         self._summarizer = summarizer
+        self._summary_cache: dict[str, str] = {}
 
-    async def _summarize(self, text: str, *, task=None) -> str:
+    async def _summarize(
+        self,
+        text: str,
+        *,
+        task=None,
+        cache_key: str | None = None,
+    ) -> str:
+        identity = {
+            "source": cache_key or hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "max_summary_chars": self.max_summary_chars,
+            "recent_turns": self.recent_turns,
+            "summarizer": (
+                type(self._summarizer).__qualname__
+                if self._summarizer is not None
+                else "deterministic"
+            ),
+        }
+        key = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        cached = self._summary_cache.get(key)
+        if cached is not None:
+            return cached
         if self._summarizer is not None:
             try:
                 try:
@@ -159,12 +184,17 @@ class ContextCompressor:
                     # contract used by standalone compiler clients.
                     result = await self._summarizer(text)
                 if result:
-                    return str(result)[: self.max_summary_chars]
+                    summary = str(result)[: self.max_summary_chars]
+                    self._summary_cache[key] = summary
+                    return summary
             except Exception:
                 pass
         if len(text) <= self.max_summary_chars:
-            return text
-        return text[: self.max_summary_chars] + " …"
+            summary = text
+        else:
+            summary = text[: self.max_summary_chars] + " …"
+        self._summary_cache[key] = summary
+        return summary
 
     async def compress(
         self,
@@ -199,7 +229,11 @@ class ContextCompressor:
             if idx < recent_turns:
                 result.append(sel)
                 continue
-            summarized = await self._summarize(sel.text, task=task)
+            summarized = await self._summarize(
+                sel.text,
+                task=task,
+                cache_key=_selection_cache_key(sel),
+            )
             marker = CompressionMarker(
                 selection_ids=(sel.name,),
                 message_ids=tuple(sel.provenance_meta.get("message_ids", ())),
@@ -217,7 +251,9 @@ class ContextCompressor:
 
         if summarized_sels:
             summary_text = await self._summarize(
-                "\n".join(s.text for s in summarized_sels if s.text), task=task
+                "\n".join(s.text for s in summarized_sels if s.text),
+                task=task,
+                cache_key=_selection_group_cache_key(summarized_sels),
             )
             merged = _merged_provenance(summarized_sels)
             result.append(
@@ -243,6 +279,26 @@ class ContextCompressor:
 
 
 CompressedRecord = CompressionRecord
+
+
+def _selection_cache_key(selection: Selection) -> str:
+    return json.dumps(
+        {
+            "name": selection.name,
+            "text": hashlib.sha256(selection.text.encode("utf-8")).hexdigest(),
+            "provenance": dict(selection.provenance_meta or {}),
+        },
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+
+
+def _selection_group_cache_key(selections: list[Selection]) -> str:
+    return json.dumps(
+        [_selection_cache_key(selection) for selection in selections],
+        separators=(",", ":"),
+    )
 
 
 __all__ = [

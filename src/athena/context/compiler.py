@@ -17,6 +17,7 @@ into a bounded, provider-neutral model request.  It:
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -791,7 +792,9 @@ class ContextCompiler:
         if summarized_subject:
             merged = _merged_provenance(summarized_subject)
             summary_text = await self._compressor._summarize(
-                "\n".join(e.text for e in summarized_subject if e.text), task=task
+                "\n".join(e.text for e in summarized_subject if e.text),
+                task=task,
+                cache_key=_entry_group_cache_key(summarized_subject, task=task),
             )
             markers.append(
                 CompressionMarker(
@@ -1143,6 +1146,29 @@ def _merged_provenance(entries: Sequence[_Entry]) -> Provenance:
     if not pros:
         return prov(SourceType.RUNTIME, trust=TrustClass.AGENT_CURATED, scope="compression")
     return merge_provenance(pros)
+
+
+def _entry_group_cache_key(entries: Sequence[_Entry], *, task: TaskSpec | None = None) -> str:
+    """Identify a compression input by ordered content, provenance, and policy."""
+    metadata = dict(getattr(task, "metadata", {}) or {}) if task is not None else {}
+    identity = {
+        "entries": [
+            {
+                "id": entry.name,
+                "content": hashlib.sha256(entry.text.encode("utf-8")).hexdigest(),
+                "category": entry.category,
+                "trust": str(entry.trust),
+            }
+            for entry in entries
+        ],
+        "compression_policy": {
+            "compiler": "context-v1",
+        },
+        "summarizer_profile": metadata.get("model_profile")
+        or metadata.get("summarizer_profile")
+        or metadata.get("model_id"),
+    }
+    return json.dumps(identity, sort_keys=True, default=str, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
