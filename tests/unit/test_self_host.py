@@ -10,11 +10,13 @@ import pytest
 
 from athena.execution.manager import ExecutionManager
 from athena.execution.runtimes import PythonRuntime
+from athena.execution.environment import VerificationEnvironment
 from athena.protocol.execution import ExecutionExitStatus, ExecutionRequest
-from athena.protocol.tasks import AgentRequest, MutationMode, NetworkPolicy
+from athena.protocol.tasks import AgentRequest
 from athena.reality import RealityGate
 from athena.service.service import AthenaService
 from athena.shadow.engine import BranchStatus, ShadowEngine
+from athena.self_host.gates import SelfHostGatePolicy
 
 
 @pytest.fixture
@@ -194,16 +196,45 @@ async def test_self_host_python_verification_imports_candidate_code(tmp_path):
     assert Path(result.stdout.strip()).resolve() == init.resolve()
 
 
-def test_self_host_direct_metadata_cannot_escape_candidate_boundary():
+def test_self_host_control_metadata_cannot_enter_generic_request():
     svc = AthenaService.in_memory()
+    with pytest.raises(ValueError, match="reserved Athena metadata"):
+        svc._build_task_spec(
+            AgentRequest(
+                prompt="self-host escape",
+                metadata={
+                    "self_host": True,
+                    "mutation_mode": "direct",
+                    "network_policy": "allow",
+                },
+            ),
+            "self-host-session",
+        )
+
+
+def test_service_owned_self_host_context_forces_boundary_and_required_gates():
+    svc = AthenaService.in_memory()
+    verification = VerificationEnvironment(
+        project_root="/repo",
+        python="/repo/.venv/bin/python",
+        uv="/usr/local/bin/uv",
+        environment_root="/repo/.venv",
+        environment={"UV_PROJECT_ENVIRONMENT": "/repo/.venv"},
+        readonly_mounts=("/repo/.venv", "/usr/local/bin/uv"),
+    )
     spec = svc._build_task_spec(
-        AgentRequest(
-            prompt="self-host escape",
-            metadata={"self_host": True, "mutation_mode": "direct", "network_policy": "allow"},
-        ),
+        AgentRequest(prompt="self-host", metadata={"acceptance_criteria": ["command:true"]}),
         "self-host-session",
+        trusted_verification=verification,
+        trusted_self_host=True,
+        trusted_gate_criteria=SelfHostGatePolicy.required_criteria(("command:true",)),
     )
 
-    assert spec.workspace.mutation_mode is MutationMode.SPECULATIVE
-    assert spec.workspace.network_policy is NetworkPolicy.DENY
-    assert spec.metadata["review_before_commit"] is True
+    assert spec.workspace is not None
+    assert spec.workspace.mutation_mode.value == "speculative"
+    assert spec.workspace.network_policy.value == "deny"
+    assert spec.metadata["_athena_review_before_commit"] is True
+    descriptions = {criterion.description for criterion in spec.acceptance_criteria}
+    assert all(
+        f"command:{command}" in descriptions for command in SelfHostGatePolicy.REQUIRED_COMMANDS
+    )

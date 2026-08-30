@@ -11,13 +11,6 @@ from typing import Any, AsyncIterator, Callable, Sequence
 import sqlite3
 
 
-class _CallResult:
-    def __init__(self) -> None:
-        self.ready = threading.Event()
-        self.value: Any = None
-        self.error: BaseException | None = None
-
-
 class _AsyncSQLiteConnection:
     """Awaitable facade over one serialized SQLite connection.
 
@@ -32,7 +25,9 @@ class _AsyncSQLiteConnection:
         self._path = path
         self._on_close = on_close
         self._connection: sqlite3.Connection | None = None
-        self._queue: queue.Queue[tuple[Callable[[], Any], _CallResult] | None] = queue.Queue()
+        self._queue: queue.Queue[tuple[Callable[[], Any], asyncio.Future[Any]] | None] = (
+            queue.Queue()
+        )
         self._closed = False
         self._started = False
         self._thread = threading.Thread(
@@ -61,30 +56,64 @@ class _AsyncSQLiteConnection:
     async def _call(self, operation: Callable[[], Any]) -> Any:
         if self._closed:
             raise RuntimeError("SQLite connection is closed")
-        result = _CallResult()
-        self._queue.put((operation, result))
-        # A direct worker-to-loop callback is unreliable in some embedded
-        # runtimes. Polling a thread event with a zero-duration async yield
-        # still leaves the loop fully serviceable while avoiding a second
-        # executor or any synchronous SQLite wait on the loop thread.
-        while not result.ready.is_set():
-            await asyncio.sleep(0)
-        if result.error is not None:
-            raise result.error
-        return result.value
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        self._queue.put((operation, future))
+        # The worker completes this Future through the loop's thread-safe
+        # callback.  A short timer is only a compatibility nudge for embedded
+        # selector adapters that enqueue that callback without waking select;
+        # it is not a busy-yield and is never the normal completion path.
+        while True:
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout=0.001)
+            except TimeoutError:
+                continue
+            return future.result()
 
     def _worker_loop(self) -> None:
         while True:
             item = self._queue.get()
             if item is None:
                 return
-            operation, result = item
+            operation, future = item
             try:
-                result.value = operation()
+                value = operation()
             except BaseException as exc:  # propagate SQLite and callback failures
-                result.error = exc
-            finally:
-                result.ready.set()
+                self._publish_future(future, error=exc)
+            else:
+                self._publish_future(future, value=value)
+
+    @staticmethod
+    def _publish_future(
+        future: asyncio.Future[Any],
+        *,
+        value: Any = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Complete a loop-owned Future from the SQLite worker thread."""
+        loop = future.get_loop()
+
+        def complete() -> None:
+            if future.done():
+                return
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(value)
+
+        try:
+            loop.call_soon_threadsafe(complete)
+            # CPython's public method normally performs this wakeup itself.
+            # Keep the explicit nudge for embedded event-loop adapters that
+            # enqueue the callback but do not wake a selector blocked in
+            # ``select`` (the callback remains the only completion path).
+            wake_self = getattr(loop, "_write_to_self", None)
+            if callable(wake_self):
+                wake_self()
+        except RuntimeError:
+            # The owning loop is already gone; no consumer can observe this
+            # result and the daemon worker must still be allowed to exit.
+            return
 
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> "_AsyncSQLiteCursor":
         def operation() -> tuple[sqlite3.Cursor, int]:
@@ -345,6 +374,21 @@ class Database:
             return await self._conn.execute(sql, params)
         async with self._lock:
             return await self._conn.execute(sql, params)
+
+    async def executemany_raw(
+        self,
+        sql: str,
+        params: Sequence[Sequence[Any]],
+    ) -> None:
+        """Execute many rows without auto-commit inside the caller's transaction."""
+        await self._ensure_ready()
+        assert self._conn is not None
+        task = asyncio.current_task()
+        if task is not None and task is self._txn_owner:
+            await self._conn.executemany(sql, params)
+            return
+        async with self._lock:
+            await self._conn.executemany(sql, params)
 
     async def fetch_one_raw(
         self,

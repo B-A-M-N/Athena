@@ -347,6 +347,7 @@ class ShadowEngine:
         branch: ShadowBranch,
         criteria_results: list[dict],
         verification_plan: Mapping[str, Any] | None = None,
+        proof_authority: Mapping[str, Any] | None = None,
     ) -> None:
         """Attach structured verification evidence to the branch."""
         branch.verification = list(criteria_results)
@@ -421,6 +422,12 @@ class ShadowEngine:
                 "verification_completed_at": utcnow().isoformat(),
                 "issued_at": utcnow().isoformat(),
             }
+            if proof_authority is not None:
+                certificate["proof_authority"] = {
+                    "source_revision": str(proof_authority.get("source_revision") or ""),
+                    "design_bundle_hash": str(proof_authority.get("design_bundle_hash") or ""),
+                    "gate_bundle_hash": str(proof_authority.get("gate_bundle_hash") or ""),
+                }
             branch.verification_certificate = VerificationCertificate.issue(certificate)
         else:
             branch.verification_certificate = VerificationCertificate.empty()

@@ -86,7 +86,9 @@ from athena.state.sessions import SessionRepository
 from athena.state.tasks import TaskStore
 from athena.state.tool_repairs import ToolRepairStore
 from athena.state.context_blocks import ContextBlockStore
+from athena.state.self_host import SelfHostMissionStore
 from athena.packs.store import PackStore
+from athena.self_host.gates import SelfHostGateBundle, SelfHostGatePolicy
 from athena.state.delegate_sessions import DelegateSessionStore
 from athena.project.index.store import ProjectIndexStore
 from athena.project.index.builder import ProjectIndexBuilder
@@ -127,6 +129,20 @@ _DEFAULT_ANSWER_SCRIPTS = (
 
 _logger = logging.getLogger("athena.service")
 
+_RESERVED_REQUEST_METADATA = frozenset(
+    {
+        "self_host",
+        "review_before_commit",
+        "_verification_environment",
+        "_athena_verification_environment",
+        "verification_writable_paths",
+        "_athena_verification_writable_paths",
+        "_athena_self_host",
+        "_athena_review_before_commit",
+        "_athena_required_gates",
+    }
+)
+
 
 class AthenaService:
     """The application API — composition root above the core services."""
@@ -165,6 +181,7 @@ class AthenaService:
         self._store_schedules: ScheduleStore | None = None
         self._store_runtime_sessions: RuntimeSessionStore | None = None
         self._store_executions: ExecutionStore | None = None
+        self._self_host_missions: SelfHostMissionStore | None = None
         self._tool_repair_store: ToolRepairStore | None = None
         self._context_block_store: ContextBlockStore | None = None
         self._pack_store: PackStore | None = None
@@ -363,6 +380,7 @@ class AthenaService:
         self._execution = execution
         self._store_runtime_sessions = runtime_sessions
         self._store_executions = execution_store
+        self._self_host_missions = SelfHostMissionStore(db)
         self._tool_repair_store = ToolRepairStore(db)
         self._context_block_store = ContextBlockStore(db)
         self._pack_store = PackStore(db)
@@ -979,6 +997,11 @@ class AthenaService:
 
         # DB last.
         if self._db is not None:
+            if self._store_events is not None:
+                try:
+                    await self._store_events.close()
+                except Exception as exc:
+                    _logger.warning("event store close failed: %s", exc)
             if self._fabric is not None:
                 try:
                     await self._fabric.flush()
@@ -1103,21 +1126,137 @@ class AthenaService:
         """Turn an :class:`AgentRequest` into a Task and optionally drive it
         through the worker to completion (BHV-002: all work becomes a Task)."""
         tm = self._require_task_manager()
+        self._validate_request_metadata(request.metadata)
         session_id = request.session_id or new_id("session")
         spec = self._build_task_spec(request, session_id)
-        if spec.metadata.get("self_host"):
-            verification = self._self_host_verification_environment(spec.workspace)
-            metadata = dict(spec.metadata)
-            metadata["_verification_environment"] = verification.to_record()
-            spec = replace(spec, metadata=metadata)
+        return await self._enqueue_spec(tm, spec, wait=wait)
+
+    async def submit_self_host(
+        self,
+        objective: str,
+        *,
+        workspace_root: str | None = None,
+        additional_criteria: tuple[str, ...] = (),
+        task_id: str | None = None,
+        wait: bool = True,
+        mission_id: str | None = None,
+    ) -> TaskSpec:
+        """Submit one bounded self-host task through the trusted service path.
+
+        Generic :class:`AgentRequest` metadata cannot opt into this method's
+        verification mounts or review boundary.  The CLI is only a caller of
+        this service-owned orchestration entrypoint.
+        """
+        tm = self._require_task_manager()
+        root = str(Path(workspace_root or os.getcwd()).resolve())
+        workspace = WorkspaceSpec(id="athena-self", root=root)
+        bundle = SelfHostGateBundle.capture(root)
+        verification = self._self_host_verification_environment(
+            workspace, include_project_root=True, include_rust=True
+        )
+        criteria = SelfHostGatePolicy.required_criteria(
+            additional_criteria,
+            frozen_safety=bundle.required_commands,
+        )
+        request = AgentRequest(
+            prompt=str(objective),
+            task_id=task_id,
+            workspace=workspace,
+            autonomy=AutonomyLevel.CODING,
+            metadata={"acceptance_criteria": list(criteria)},
+        )
+        session_id = request.session_id or new_id("session")
+        spec = self._build_task_spec(
+            request,
+            session_id,
+            trusted_verification=verification,
+            trusted_self_host=True,
+            trusted_gate_criteria=criteria,
+            trusted_gate_bundle=bundle.to_record(),
+        )
         created = await tm.create(spec)
+        missions = self._self_host_missions
+        if missions is None:
+            raise RuntimeError("self-host mission store is not started")
+        bundle_record = bundle.to_record()
+        if mission_id is None:
+            await missions.create(
+                project_root=root,
+                objective=str(objective),
+                task_id=created.id,
+                base_revision=str(bundle_record.get("source_revision") or ""),
+                design_bundle_hash=str(bundle_record.get("design_bundle_hash") or ""),
+                gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
+            )
+        else:
+            await missions.update(
+                mission_id,
+                status="active",
+                current_task_id=created.id,
+                last_error=None,
+            )
         await tm.enqueue(created.id)
         if wait:
             await self.wait_for(created.id)
         return created
 
+    async def self_host_status(self, *, workspace_root: str | None = None) -> list[dict[str, Any]]:
+        missions = self._self_host_missions
+        if missions is None:
+            raise RuntimeError("self-host mission store is not started")
+        root = str(Path(workspace_root or os.getcwd()).resolve())
+        records = await missions.list_recent(root)
+        for record in records:
+            task_id = record.get("current_task_id")
+            if task_id:
+                record["candidate"] = await self.operator_candidate(str(task_id))
+        return records
+
+    async def continue_self_host(self, *, workspace_root: str | None = None) -> dict[str, Any]:
+        missions = self._self_host_missions
+        tm = self._require_task_manager()
+        if missions is None:
+            raise RuntimeError("self-host mission store is not started")
+        root = str(Path(workspace_root or os.getcwd()).resolve())
+        mission = await missions.latest_active(root)
+        if mission is None:
+            return {"status": "missing", "error": "no active self-host mission"}
+        task_id = str(mission.get("current_task_id") or "")
+        candidate = await self.operator_candidate(task_id) if task_id else None
+        if candidate is not None:
+            if candidate.get("status") == "VERIFIED":
+                await missions.update(mission["id"], status="review")
+            return {"status": "review", "mission": mission, "candidate": candidate}
+        task = await self._store_tasks.get(task_id) if self._store_tasks and task_id else None
+        task_status = str((task or {}).get("status") or "")
+        if task_status in {"queued", "running", "interrupted"}:
+            if task_status == "interrupted":
+                await tm.enqueue(task_id)
+            return {"status": "resumed", "mission": mission, "task_id": task_id}
+        if task_status in {"complete", "failed", "cancelled", "blocked", "partial"}:
+            created = await self.submit_self_host(
+                str(mission.get("objective") or ""),
+                workspace_root=root,
+                mission_id=str(mission["id"]),
+                wait=False,
+            )
+            return {"status": "started", "mission": mission, "task_id": created.id}
+        return {"status": "pending", "mission": mission, "task_id": task_id}
+
+    async def _enqueue_spec(self, task_manager: TaskManager, spec: TaskSpec, *, wait: bool):
+        created = await task_manager.create(spec)
+        await task_manager.enqueue(created.id)
+        if wait:
+            await self.wait_for(created.id)
+        return created
+
     @staticmethod
-    def _self_host_verification_environment(workspace) -> VerificationEnvironment:
+    def _self_host_verification_environment(
+        workspace,
+        *,
+        include_project_root: bool = False,
+        include_rust: bool = False,
+    ) -> VerificationEnvironment:
         """Validate the only supported self-host target and its proof tools."""
         if workspace is None:
             raise ValueError("athena self requires an Athena source checkout")
@@ -1133,7 +1272,11 @@ class AthenaService:
         if project.get("project", {}).get("name") != "athena-agent":
             raise ValueError("athena self must target the athena-agent checkout")
         try:
-            return VerificationEnvironment.from_project(str(root))
+            return VerificationEnvironment.from_project(
+                str(root),
+                include_project_root=include_project_root,
+                include_rust=include_rust,
+            )
         except ValueError as exc:
             raise ValueError(f"athena self: {exc}") from exc
 
@@ -1873,8 +2016,16 @@ class AthenaService:
             "certificate_hash": certificate.get("certificate_hash"),
             "changed_resources": list(certificate.get("changed_resources") or []),
             "verification": list(getattr(branch, "verification", ()) or ()),
+            "proof_authority": certificate.get("proof_authority"),
+            "risk": self._self_host_risk(certificate.get("changed_resources") or []),
             "error": getattr(branch, "error", None),
         }
+
+    @staticmethod
+    def _self_host_risk(changed_resources: list[Any]) -> dict[str, Any]:
+        from athena.self_host.risk import SelfHostRiskClassifier
+
+        return SelfHostRiskClassifier.classify(changed_resources)
 
     async def request_candidate_apply_approval(
         self,
@@ -2001,6 +2152,18 @@ class AthenaService:
             review,
             outcome,
         )
+        missions = self._self_host_missions
+        if missions is not None:
+            mission = await missions.for_task(task_id)
+            if mission is not None:
+                await missions.update(
+                    mission["id"],
+                    status="promoted" if outcome.get("status") == "committed" else "active",
+                    candidate_fingerprint=review.get("candidate_fingerprint"),
+                    last_error=(
+                        outcome.get("error") if outcome.get("status") != "committed" else None
+                    ),
+                )
         return outcome
 
     async def discard_candidate(self, task_id: str) -> dict:
@@ -2014,6 +2177,11 @@ class AthenaService:
             await self._reality_gate.deactivate_branch(task_id)
         if outcome.get("status") == "discarded":
             await self._candidate_review_event("CANDIDATE_DISCARDED", task_id, review, outcome)
+            missions = self._self_host_missions
+            if missions is not None:
+                mission = await missions.for_task(task_id)
+                if mission is not None:
+                    await missions.update(mission["id"], status="discarded")
         return outcome
 
     async def _candidate_review_event(
@@ -2245,21 +2413,44 @@ class AthenaService:
     # ------------------------------------------------------------------ #
     # Internal wiring
     # ------------------------------------------------------------------ #
-    def _build_task_spec(self, request: AgentRequest, session_id: str) -> TaskSpec:
+    def _build_task_spec(
+        self,
+        request: AgentRequest,
+        session_id: str,
+        *,
+        trusted_verification: VerificationEnvironment | None = None,
+        trusted_self_host: bool = False,
+        trusted_gate_criteria: tuple[str, ...] = (),
+        trusted_gate_bundle: Mapping[str, Any] | None = None,
+    ) -> TaskSpec:
         ws = request.workspace or self._default_workspace
         autonomy = request.autonomy or self.config.autonomy_level
+        self._validate_request_metadata(request.metadata)
         # Preserve request metadata (autonomy + any caller-supplied fields)
         meta: dict[str, Any] = {"autonomy": autonomy.value}
         if request.metadata:
             meta.update(request.metadata)
-        self_host = bool(meta.get("self_host"))
+        self_host = trusted_self_host
         if self_host:
             # Self-hosting is a service invariant, not a CLI convention. A
             # caller cannot escape the candidate/review boundary by sending a
             # direct mutation mode or a permissive network workspace.
             autonomy = AutonomyLevel.CODING
             meta["autonomy"] = autonomy.value
-            meta["review_before_commit"] = True
+            meta["_athena_self_host"] = True
+            meta["_athena_review_before_commit"] = True
+            if trusted_verification is None:
+                raise ValueError("self-host tasks require a trusted verification environment")
+            if not trusted_gate_criteria:
+                raise ValueError("self-host tasks require service-owned verification gates")
+            meta["_athena_verification_environment"] = trusted_verification.to_record()
+            meta["_athena_required_gates"] = list(trusted_gate_criteria)
+            # The trusted criteria are the task's actual proof contract.  Do
+            # not leave them only in private metadata where the verifier's
+            # acceptance evaluator cannot enforce them.
+            meta["acceptance_criteria"] = list(trusted_gate_criteria)
+            if trusted_gate_bundle is not None:
+                meta["_athena_gate_bundle"] = dict(trusted_gate_bundle)
             ws = replace(
                 ws,
                 network_policy=NetworkPolicy.DENY,
@@ -2361,6 +2552,13 @@ class AthenaService:
         if cap_policy is not None:
             spec_kwargs["capability_policy"] = cap_policy
         return TaskSpec(**spec_kwargs)
+
+    @staticmethod
+    def _validate_request_metadata(metadata: Mapping[str, Any] | None) -> None:
+        for key in metadata or {}:
+            name = str(key)
+            if name.startswith("_") or name in _RESERVED_REQUEST_METADATA:
+                raise ValueError(f"reserved Athena metadata: {name}")
 
     def _workspace_reader(self):
         """Return a workspace instruction reader bound to the current workspace.

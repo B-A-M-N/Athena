@@ -265,6 +265,7 @@ class Options:
     criteria: str | None = None
     deny: bool = False
     review_task_id: str | None = None
+    self_action: str | None = None
     artifact_root: str | None = None
     _providers: tuple[Any, ...] = ()
 
@@ -461,13 +462,37 @@ def _athena_checkout_root() -> str:
 async def _cmd_self(o: Options, service: Any) -> int:
     if o.review_task_id:
         return await _cmd_self_review(o.review_task_id, service)
+    if o.self_action in {"status", "continue"}:
+        root = _athena_checkout_root()
+        if o.self_action == "status":
+            records = await service.self_host_status(workspace_root=root)
+            if not records:
+                print("athena self: no missions")
+                return 0
+            for record in records:
+                print(
+                    f"{record.get('id')}\t{record.get('status')}\t"
+                    f"{record.get('current_task_id') or '-'}\t{record.get('objective') or ''}"
+                )
+            return 0
+        result = await service.continue_self_host(workspace_root=root)
+        print(f"athena self: {result.get('status', 'unknown')}")
+        if result.get("task_id"):
+            print(f"task: {result['task_id']}")
+        candidate = result.get("candidate")
+        if isinstance(candidate, dict):
+            print(f"candidate: {candidate.get('branch_id')}")
+            _print_candidate_proof(candidate)
+        return 0 if result.get("status") != "missing" else 1
     objective = o.args[0] if o.args else None
     if not objective:
         print("athena self: missing objective", file=sys.stderr)
         return 2
     try:
         root = _athena_checkout_root()
-        verification = VerificationEnvironment.from_project(root)
+        verification = VerificationEnvironment.from_project(
+            root, include_project_root=True, include_rust=True
+        )
     except ValueError as exc:
         print(f"athena self: {exc}", file=sys.stderr)
         return 2
@@ -478,27 +503,10 @@ async def _cmd_self(o: Options, service: Any) -> int:
     print(f"  ✓ Python ({verification.python})")
     print(f"  ✓ .venv ({verification.environment_root})")
     print("  ✓ ruff / mypy / pytest")
+    print("  ✓ cargo / rustc")
     if os.name == "posix":
         print("  ✓ bubblewrap")
 
-    criteria = [
-        "command:uv run --frozen --no-sync ruff format --check --no-cache src tests",
-        "command:uv run --frozen --no-sync ruff check --no-cache src tests",
-        "command:uv run --frozen --no-sync mypy --cache-dir /tmp/athena-mypy-cache src",
-        "command:uv run --frozen --no-sync pytest -p no:cacheprovider -q",
-        "command:uv run --frozen --no-sync python scripts/architecture-lint",
-    ]
-    request = AgentRequest(
-        prompt=objective,
-        autonomy=AutonomyLevel.CODING,
-        workspace=WorkspaceSpec(id="athena-self", root=root),
-        metadata={
-            "self_host": True,
-            "review_before_commit": True,
-            "acceptance_criteria": criteria,
-            "_verification_environment": verification.to_record(),
-        },
-    )
     from athena.cli.chat import _make_surface, _model_label, render_summary, stream_task
 
     surface = _make_surface(
@@ -515,7 +523,13 @@ async def _cmd_self(o: Options, service: Any) -> int:
         opener()
     try:
         surface.render_user_message(objective)
-        task = await service.submit(request, wait=False)
+        additional = tuple(_criteria_metadata(o).get("acceptance_criteria") or ())
+        task = await service.submit_self_host(
+            objective,
+            workspace_root=root,
+            additional_criteria=additional,
+            wait=False,
+        )
         task_id = getattr(task, "id", task)
         result = await stream_task(service, task_id, autonomy=AutonomyLevel.CODING, surface=surface)
         if result is not None:
@@ -810,6 +824,9 @@ def _click_cli(click: Any):
         """Improve this Athena checkout in a verified candidate workspace."""
         o = base_options(ctx, "self", [objective] if objective else [])
         o.review_task_id = review_task_id
+        if objective in {"continue", "status"} and review_task_id is None:
+            o.args = []
+            o.self_action = objective
         sys.exit(dispatch(o))
 
     @cli.command()
@@ -965,6 +982,9 @@ def _arg_parse(argv: list[str]) -> Options:
         o.args = [ns.objective]
     elif command == "self":
         o.args = [ns.objective] if ns.objective else []
+        if ns.objective in {"continue", "status"} and not o.review_task_id:
+            o.args = []
+            o.self_action = ns.objective
     elif command in ("inspect", "resume", "cancel", "approve"):
         o.args = [
             getattr(

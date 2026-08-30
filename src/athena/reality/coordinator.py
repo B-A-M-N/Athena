@@ -269,6 +269,7 @@ class RealityCoordinator:
             branch,
             results,
             verification_plan=self._plans.get(task.id),
+            proof_authority=(task.metadata or {}).get("_athena_gate_bundle"),
         )
 
         if branch.status != "VERIFIED":
@@ -302,7 +303,7 @@ class RealityCoordinator:
                 branch_id=branch.id,
             )
 
-        if bool((task.metadata or {}).get("review_before_commit")):
+        if bool((task.metadata or {}).get("_athena_review_before_commit")):
             # Verification is complete, but self-hosted work has an explicit
             # human gate. Reattach the verified branch so Git/execute and the
             # restart path continue to resolve the candidate workspace.

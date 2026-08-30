@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.capabilities.fs import FilesystemCapability
 from athena.capabilities.registry import CapabilityRegistry
@@ -335,7 +337,8 @@ async def test_self_host_retains_verified_candidate_until_operator_apply(tmp_pat
         )
     ]
     spec = replace(
-        _spec(ws, criteria), metadata={"autonomy": "coding", "review_before_commit": True}
+        _spec(ws, criteria),
+        metadata={"autonomy": "coding", "_athena_review_before_commit": True},
     )
     (Path(branch.shadow_workspace.root) / "README.txt").write_text(
         "self-hosted\n", encoding="utf-8"
@@ -497,21 +500,17 @@ def test_coding_tasks_default_to_speculative_workspace():
 
 def test_self_host_forces_candidate_boundary_even_for_direct_request():
     service = AthenaService.in_memory()
-    spec = service._build_task_spec(
-        AgentRequest(
-            prompt="improve Athena",
-            autonomy=AutonomyLevel.SUPERVISED,
-            workspace=WorkspaceSpec(
-                id="repo",
-                root="/tmp/repo",
-                mutation_mode=MutationMode.DIRECT,
+    with pytest.raises(ValueError, match="reserved Athena metadata"):
+        service._build_task_spec(
+            AgentRequest(
+                prompt="improve Athena",
+                autonomy=AutonomyLevel.SUPERVISED,
+                workspace=WorkspaceSpec(
+                    id="repo",
+                    root="/tmp/repo",
+                    mutation_mode=MutationMode.DIRECT,
+                ),
+                metadata={"self_host": True, "mutation_mode": "direct"},
             ),
-            metadata={"self_host": True, "mutation_mode": "direct"},
-        ),
-        "session-self",
-    )
-    assert spec.metadata["autonomy"] == AutonomyLevel.CODING.value
-    assert spec.metadata["review_before_commit"] is True
-    assert spec.workspace is not None
-    assert spec.workspace.mutation_mode is MutationMode.SPECULATIVE
-    assert spec.workspace.network_policy.value == "deny"
+            "session-self",
+        )

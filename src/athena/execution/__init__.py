@@ -20,7 +20,11 @@ from athena.execution.diagnostics import (
     normalize_diagnostics,
     normalize_diagnostics_payload,
 )
-from athena.execution.environment import ProjectEnvironmentFingerprint, VerificationEnvironment
+from athena.execution.environment import (
+    ProjectEnvironmentFingerprint,
+    ToolchainBinding,
+    VerificationEnvironment,
+)
 
 __all__ = [
     "ExecutionManager",
@@ -36,5 +40,6 @@ __all__ = [
     "normalize_diagnostics",
     "normalize_diagnostics_payload",
     "ProjectEnvironmentFingerprint",
+    "ToolchainBinding",
     "VerificationEnvironment",
 ]

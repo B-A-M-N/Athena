@@ -449,8 +449,8 @@ class CompositeVerifier:
 
 
 def _task_verification_environment(task: TaskSpec) -> Any:
-    """Rebuild a host-approved verification environment from task metadata."""
-    record = (task.metadata or {}).get("_verification_environment")
+    """Rebuild a service-approved verification environment from task state."""
+    record = (task.metadata or {}).get("_athena_verification_environment")
     if not isinstance(record, dict):
         return None
     try:
@@ -489,7 +489,7 @@ async def _verification_manifest(workspace: Any) -> dict[str, str]:
 
 
 def _verification_writable_paths(task: TaskSpec) -> frozenset[str]:
-    raw = (task.metadata or {}).get("verification_writable_paths", ())
+    raw = (task.metadata or {}).get("_athena_verification_writable_paths", ())
     if isinstance(raw, str):
         raw = (raw,)
     if not isinstance(raw, (list, tuple, set, frozenset)):

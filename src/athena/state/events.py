@@ -61,6 +61,11 @@ class EventStore:
         self._subscribers: list[_Subscription] = []
         self._append_condition = asyncio.Condition()
         self._append_generation = 0
+        self._append_guard = asyncio.Lock()
+        self._fast_pending: list[Event] = []
+        self._fast_flush_task: asyncio.Task | None = None
+        self._fast_batch_size = 128
+        self._fast_flush_delay = 0.02
 
     def subscribe(
         self,
@@ -130,36 +135,110 @@ class EventStore:
         causal_id: str | None = None,
         id: str | None = None,
     ) -> Event:
+        event = make_event(
+            type=type_,
+            payload=payload,
+            task_id=task_id,
+            session_id=session_id,
+            id=id,
+            causal_id=causal_id,
+        )
+        if type_ in FAST_EVENT_TYPES:
+            return await self._buffer_fast(event)
+        return await self._append_durable(event)
+
+    async def _append_durable(self, event: Event) -> Event:
+        """Append control/evidence events after flushing prior stream data."""
+        async with self._append_guard:
+            pending = self._take_fast_locked(task_id=event.task_id)
+            durable = await self._write_batch((*pending, event))
+        await self._publish(durable)
+        return durable[-1]
+
+    async def _buffer_fast(self, event: Event) -> Event:
+        """Queue presentation traffic without putting SQLite on its hot path."""
+        async with self._append_guard:
+            self._fast_pending.append(event)
+            if len(self._fast_pending) >= self._fast_batch_size:
+                self._schedule_fast_flush_locked(delay=0)
+            elif self._fast_flush_task is None or self._fast_flush_task.done():
+                self._schedule_fast_flush_locked(delay=self._fast_flush_delay)
+        # Sequence is assigned only when the batch is durably committed.  A
+        # caller needing replay identity must flush or query the store first.
+        return event
+
+    def _schedule_fast_flush_locked(self, *, delay: float) -> None:
+        async def flush_later() -> None:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self.flush_fast_events()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception("buffered event flush failed")
+            finally:
+                # A producer can enqueue between _take_fast_locked() and the
+                # end of the write.  Keep that tail from waiting forever for
+                # an unrelated control event.
+                async with self._append_guard:
+                    if self._fast_pending and self._fast_flush_task is asyncio.current_task():
+                        self._schedule_fast_flush_locked(delay=self._fast_flush_delay)
+
+        self._fast_flush_task = asyncio.create_task(flush_later())
+
+    def _take_fast_locked(self, *, task_id: str | None) -> list[Event]:
+        if task_id is None:
+            pending = self._fast_pending
+            self._fast_pending = []
+            return pending
+        selected = [event for event in self._fast_pending if event.task_id == task_id]
+        self._fast_pending = [event for event in self._fast_pending if event.task_id != task_id]
+        return selected
+
+    async def flush_fast_events(self, task_id: str | None = None) -> None:
+        """Durably flush queued stream events before a caller's final event.
+
+        ``task_id=None`` flushes all pending stream traffic.  A task-scoped
+        flush is used by control events so unrelated model streams do not
+        block one another.
+        """
+        async with self._append_guard:
+            pending = self._take_fast_locked(task_id=task_id)
+            if not pending:
+                return
+            durable = await self._write_batch(tuple(pending))
+        await self._publish(durable)
+
+    async def _write_batch(self, events: tuple[Event, ...]) -> list[Event]:
+        if not events:
+            return []
         while True:
             try:
                 async with self._db.transaction() as db:
-                    row = await db.fetch_one_raw(
-                        "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq "
-                        "FROM events WHERE task_id = ?",
-                        (task_id,),
-                    )
-                    seq = int(row["seq"]) if row and row.get("seq") else 1
-                    event = make_event(
-                        type=type_,
-                        payload=payload,
-                        task_id=task_id,
-                        session_id=session_id,
-                        sequence=seq,
-                        id=id,
-                        causal_id=causal_id,
-                    )
-                    await db.execute_raw(
+                    next_sequences: dict[str | None, int] = {}
+                    durable: list[Event] = []
+                    for pending in events:
+                        if pending.task_id not in next_sequences:
+                            row = await db.fetch_one_raw(
+                                "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq "
+                                "FROM events WHERE task_id = ?",
+                                (pending.task_id,),
+                            )
+                            next_sequences[pending.task_id] = (
+                                int(row["seq"]) if row and row.get("seq") else 1
+                            )
+                        committed = replace(
+                            pending,
+                            sequence=next_sequences[pending.task_id],
+                        )
+                        durable.append(committed)
+                        next_sequences[pending.task_id] += 1
+                    await db.executemany_raw(
                         f"INSERT INTO events({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        self._values(event),
+                        [self._values(event) for event in durable],
                     )
-                await self._notify_append()
-                for callback in tuple(self._subscribers):
-                    if callback.accepts(event.type):
-                        if event.type in FAST_EVENT_TYPES:
-                            self._enqueue_fast(callback, event)
-                        else:
-                            await self._deliver(callback, event)
-                return event
+                return durable
             except IntegrityError as exc:
                 # Retry only on a genuine (task_id, sequence) UNIQUE collision
                 # from a concurrent writer. FK violations must propagate.
@@ -167,9 +246,33 @@ class EventStore:
                     raise
                 continue
 
-    async def append(self, event: Event) -> None:
-        if event.id and await self._db.fetch_one("SELECT id FROM events WHERE id = ?", (event.id,)):
+    async def close(self) -> None:
+        """Flush presentation traffic and stop its delayed producer task."""
+        await self.flush_fast_events()
+        task = self._fast_flush_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._fast_flush_task = None
+
+    async def _publish(self, events: list[Event]) -> None:
+        if not events:
             return
+        await self._notify_append()
+        for event in events:
+            for callback in tuple(self._subscribers):
+                if callback.accepts(event.type):
+                    if event.type in FAST_EVENT_TYPES:
+                        self._enqueue_fast(callback, event)
+                    else:
+                        await self._deliver(callback, event)
+
+    async def append(self, event: Event) -> None:
+        if event.type not in FAST_EVENT_TYPES:
+            if event.id and await self._db.fetch_one(
+                "SELECT id FROM events WHERE id = ?", (event.id,)
+            ):
+                return
         await self.append_event(
             event.type,
             event.payload,
@@ -249,6 +352,7 @@ class EventStore:
         task_id: str,
         after_sequence: int = 0,
     ) -> list[Event]:
+        await self.flush_fast_events(task_id)
         rows = await self._db.fetch_all(
             "SELECT * FROM events WHERE task_id = ? AND sequence > ? ORDER BY sequence ASC",
             (task_id, after_sequence),
@@ -267,6 +371,7 @@ class EventStore:
         cursor); only newer events are returned. Distinct from per-task
         ``sequence``, which resets per task.
         """
+        await self.flush_fast_events()
         rows = await self._db.fetch_all(
             "SELECT *, rowid AS _rid FROM events WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
             (after_rowid, int(limit)),
@@ -283,6 +388,7 @@ class EventStore:
         return out
 
     async def list_for_session(self, session_id: str) -> list[Event]:
+        await self.flush_fast_events()
         rows = await self._db.fetch_all(
             "SELECT * FROM events WHERE session_id = ? ORDER BY timestamp ASC, sequence ASC",
             (session_id,),
@@ -290,6 +396,7 @@ class EventStore:
         return [_row_to_event(r) for r in rows]
 
     async def last_sequence(self, task_id: str) -> int:
+        await self.flush_fast_events(task_id)
         row = await self._db.fetch_one(
             "SELECT MAX(sequence) AS seq FROM events WHERE task_id = ?",
             (task_id,),

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Measure the buffered event producer path used by the terminal stream."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import time
+
+from athena.state.database import Database
+from athena.state.events import EventStore
+
+
+async def _run(count: int) -> dict[str, object]:
+    database = Database(":memory:")
+    await database._ensure_ready()  # noqa: SLF001 - benchmark setup
+    events = EventStore(database)
+    try:
+        started = time.perf_counter()
+        for index in range(count):
+            await events.append_event("ModelDelta", {"text": f"chunk-{index}"})
+        producer_seconds = time.perf_counter() - started
+
+        flush_started = time.perf_counter()
+        await events.append_event("ModelResponseCompleted", {"count": count})
+        flush_seconds = time.perf_counter() - flush_started
+        row = await database.fetch_one("SELECT COUNT(*) AS count FROM events")
+        tail = await database.fetch_all("SELECT type FROM events ORDER BY rowid DESC LIMIT 3")
+        persisted = int((row or {}).get("count") or 0)
+        return {
+            "events": count,
+            "persisted_events": persisted,
+            "producer_events_per_second": round(count / max(producer_seconds, 1e-9), 2),
+            "producer_seconds": round(producer_seconds, 6),
+            "final_flush_seconds": round(flush_seconds, 6),
+            "ordering": [str(row["type"]) for row in reversed(tail)],
+        }
+    finally:
+        await database.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--events", type=int, default=5000)
+    args = parser.parse_args()
+    if args.events < 1 or args.events > 100_000:
+        parser.error("--events must be between 1 and 100000")
+    print(json.dumps(asyncio.run(_run(args.events)), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

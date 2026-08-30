@@ -131,3 +131,30 @@ async def test_fast_stream_subscriber_is_filtered_and_does_not_backpressure_appe
     assert all(item == "ModelDelta" for item in received)
 
     events.unsubscribe(slow)
+
+
+async def test_fast_events_flush_before_task_control_event(db):
+    events = EventStore(db)
+    task = await _create_task(events)
+
+    await events.append_event("ModelDelta", {"text": "partial"}, task_id=task.id)
+    await events.append_event("TaskCompleted", {"status": "complete"}, task_id=task.id)
+
+    stored = await events.list_for_task(task.id)
+    assert [event.type for event in stored][-2:] == ["ModelDelta", "TaskCompleted"]
+    assert [event.sequence for event in stored] == list(range(1, len(stored) + 1))
+
+
+async def test_fast_events_batch_without_control_event_is_replayed_after_flush(db):
+    events = EventStore(db)
+    task = await _create_task(events)
+
+    for index in range(256):
+        await events.append_event("StdoutChunk", {"data": str(index)}, task_id=task.id)
+
+    # Reads are an explicit durability boundary and must return the complete
+    # ordered log even when no control event follows the stream.
+    stored = await events.list_for_task(task.id)
+    chunks = [event for event in stored if event.type == "StdoutChunk"]
+    assert len(chunks) == 256
+    assert [event.sequence for event in stored] == list(range(1, len(stored) + 1))

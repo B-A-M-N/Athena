@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from athena.capabilities.dispatcher import CapabilityDispatcher
 from athena.execution.manager import ExecutionManager
 from athena.execution.runtimes import PythonRuntime
@@ -176,3 +178,32 @@ async def test_candidate_proof_uses_execute_dispatcher_sandbox_and_uv(tmp_path):
     assert toolchain.status.value == "ok"
     assert toolchain.output.startswith("uv ")
     assert not (candidate / ".venv").exists()
+
+
+def test_verification_environment_rejects_forged_host_mount():
+    with pytest.raises(ValueError, match="untrusted mount"):
+        VerificationEnvironment.from_record(
+            {
+                "project_root": "/project",
+                "python": "/project/.venv/bin/python",
+                "uv": "/usr/local/bin/uv",
+                "environment_root": "/project/.venv",
+                "environment": {"UV_PROJECT_ENVIRONMENT": "/project/.venv"},
+                "readonly_mounts": ["/etc"],
+            }
+        )
+
+
+def test_verification_environment_rejects_foreign_base_root():
+    with pytest.raises(ValueError, match="base root does not match"):
+        VerificationEnvironment.from_record(
+            {
+                "project_root": "/project",
+                "base_root": "/other",
+                "python": "/project/.venv/bin/python",
+                "uv": "/usr/local/bin/uv",
+                "environment_root": "/project/.venv",
+                "environment": {"UV_PROJECT_ENVIRONMENT": "/project/.venv"},
+                "readonly_mounts": ["/project/.venv", "/usr/local/bin/uv"],
+            }
+        )
