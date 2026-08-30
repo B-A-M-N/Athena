@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from typing import Any
@@ -55,6 +56,29 @@ from athena.protocol.models import (
 )
 
 _PATH = "/v1/messages"
+
+
+def _reported_cost_usd(raw: Any) -> float | None:
+    """Normalize an optional provider-reported USD cost without inventing 0."""
+    if isinstance(raw, Mapping):
+        values = raw
+    else:
+        values = {key: getattr(raw, key, None) for key in ("cost_usd", "cost")}
+    for key in ("cost_usd", "cost"):
+        value = values.get(key)
+        if isinstance(value, Mapping):
+            value = value.get("usd", value.get("amount"))
+        if value is None:
+            continue
+        try:
+            cost = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(cost) and cost >= 0:
+            return cost
+    return None
+
+
 _logger = logging.getLogger("athena.provider.anthropic")
 
 
@@ -243,6 +267,9 @@ class AnthropicProvider:
                     )
                 )
         usage = response.usage
+        reported_cost = _reported_cost_usd(usage)
+        if reported_cost is None:
+            reported_cost = _reported_cost_usd(response)
         return _done_event(
             request,
             blocks=blocks,
@@ -250,6 +277,7 @@ class AnthropicProvider:
             usage=UsageInfo(
                 input_tokens=getattr(usage, "input_tokens", 0) or 0,
                 output_tokens=getattr(usage, "output_tokens", 0) or 0,
+                cost_usd=reported_cost,
                 cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
                 cache_write_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
                 provider_metadata={
@@ -559,6 +587,9 @@ class AnthropicProvider:
                     )
                 )
         usage_raw = data.get("usage") or {}
+        reported_cost = _reported_cost_usd(usage_raw)
+        if reported_cost is None:
+            reported_cost = _reported_cost_usd(data)
         return _done_event(
             request,
             blocks=blocks,
@@ -566,6 +597,7 @@ class AnthropicProvider:
             usage=UsageInfo(
                 input_tokens=int(usage_raw.get("input_tokens") or 0),
                 output_tokens=int(usage_raw.get("output_tokens") or 0),
+                cost_usd=reported_cost,
                 cache_read_tokens=int(usage_raw.get("cache_read_input_tokens") or 0),
                 cache_write_tokens=int(usage_raw.get("cache_creation_input_tokens") or 0),
                 provider_metadata={"raw_usage": usage_raw},

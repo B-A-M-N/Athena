@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
@@ -64,6 +65,25 @@ _ROLE_MAP: dict[Role, str] = {
     Role.CAPABILITY: "tool",
     Role.SYSTEM: "system",
 }
+
+
+def _reported_cost_usd(raw: Any) -> float | None:
+    """Normalize an optional provider-reported USD cost without inventing 0."""
+    if not isinstance(raw, Mapping):
+        return None
+    for key in ("cost_usd", "cost"):
+        value = raw.get(key)
+        if isinstance(value, Mapping):
+            value = value.get("usd", value.get("amount"))
+        if value is None:
+            continue
+        try:
+            cost = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(cost) and cost >= 0:
+            return cost
+    return None
 
 
 def _capability_schema(desc) -> dict[str, Any]:
@@ -398,6 +418,7 @@ class OpenAICompatProvider:
                     input_tokens=prompt,
                     output_tokens=int(usage_raw.get("completion_tokens") or 0),
                     reasoning_tokens=int(usage_raw.get("reasoning_tokens") or 0),
+                    cost_usd=_reported_cost_usd(usage_raw),
                     cache_read_tokens=cached,
                     uncached_input_tokens=max(prompt - cached, 0),
                     provider_metadata={"raw_usage": usage_raw},
@@ -521,9 +542,13 @@ class OpenAICompatProvider:
         details = usage_raw.get("prompt_tokens_details") or {}
         cached = int(details.get("cached_tokens") or 0)
         prompt = int(usage_raw.get("prompt_tokens") or 0)
+        reported_cost = _reported_cost_usd(usage_raw)
+        if reported_cost is None:
+            reported_cost = _reported_cost_usd(data)
         usage = UsageInfo(
             input_tokens=prompt,
             output_tokens=int(usage_raw.get("completion_tokens") or 0),
+            cost_usd=reported_cost,
             cache_read_tokens=cached,
             uncached_input_tokens=max(prompt - cached, 0),
             provider_metadata={"raw_usage": usage_raw},

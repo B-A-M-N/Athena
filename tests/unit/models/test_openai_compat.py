@@ -87,7 +87,8 @@ async def test_stream_events_delta_and_done_with_usage(monkeypatch):
     provider = _provider()
     sse = [
         "data: " + json.dumps({"choices": [{"delta": {"content": "Hello"}}]}),
-        "data: " + json.dumps({"usage": {"prompt_tokens": 10, "completion_tokens": 3}}),
+        "data: "
+        + json.dumps({"usage": {"prompt_tokens": 10, "completion_tokens": 3, "cost_usd": 0.004}}),
         "data: [DONE]",
     ]
     fake_resp = _FakeSSEResponse(sse)
@@ -104,6 +105,21 @@ async def test_stream_events_delta_and_done_with_usage(monkeypatch):
     assert done.response.usage is not None
     assert done.response.usage.input_tokens == 10
     assert done.response.usage.output_tokens == 3
+    assert done.response.usage.cost_usd == 0.004
+
+
+def test_nonstream_response_preserves_provider_reported_cost():
+    provider = _provider()
+    event = provider._parse_complete(
+        _user_request(),
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+            "cost": 0.0007,
+        },
+    )
+
+    assert event.response.usage.cost_usd == 0.0007
 
 
 async def test_provider_response_keeps_profile_and_cache_metadata(monkeypatch):

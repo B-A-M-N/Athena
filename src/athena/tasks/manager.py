@@ -367,7 +367,8 @@ class TaskManager:
             "input_tokens": result.usage.input_tokens,
             "output_tokens": result.usage.output_tokens,
             "model_calls": result.usage.model_calls,
-            "cost_usd": str(result.usage.cost_usd),
+            "cost_usd": (str(result.usage.cost_usd) if result.usage.cost_known else None),
+            "cost_known": result.usage.cost_known,
             "duration_ms": result.usage.duration_ms,
             "executions": result.usage.executions,
             "mutations": result.usage.mutations,
@@ -413,7 +414,8 @@ class TaskManager:
             "input_tokens": result.usage.input_tokens,
             "output_tokens": result.usage.output_tokens,
             "model_calls": result.usage.model_calls,
-            "cost_usd": str(result.usage.cost_usd),
+            "cost_usd": (str(result.usage.cost_usd) if result.usage.cost_known else None),
+            "cost_known": result.usage.cost_known,
             "duration_ms": result.usage.duration_ms,
             "executions": result.usage.executions,
             "mutations": result.usage.mutations,
@@ -550,7 +552,12 @@ def _decode_result(row: dict[str, Any]) -> TaskResult | None:
             input_tokens=int(usage.get("input_tokens", 0)),
             output_tokens=int(usage.get("output_tokens", 0)),
             model_calls=int(usage.get("model_calls", 0)),
-            cost_usd=Decimal(str(usage.get("cost_usd", "0")) or "0"),
+            cost_usd=(
+                Decimal(str(usage["cost_usd"]))
+                if usage.get("cost_usd") is not None
+                else Decimal("0")
+            ),
+            cost_known=bool(usage.get("cost_known", usage.get("cost_usd") is not None)),
             duration_ms=int(usage.get("duration_ms", 0)),
             executions=int(usage.get("executions", 0)),
             mutations=int(usage.get("mutations", 0)),

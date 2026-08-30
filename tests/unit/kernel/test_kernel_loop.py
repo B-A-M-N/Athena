@@ -126,6 +126,7 @@ async def test_end_to_end_simple_completes(stack):
     spec = await _create(stack, "hello world")
     result = await stack.kernel.run_task(spec.id)
     assert result.status == TaskStatus.COMPLETE, result
+    assert result.usage.cost_known is False
     events = await stack.events.list_for_task(spec.id)
     types = {e.type for e in events}
     assert "TaskCreated" in types

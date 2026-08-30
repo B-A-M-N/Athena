@@ -100,9 +100,14 @@ def _usage_from_record(record: dict) -> str:
     in_tok = usage.get("input_tokens", record.get("input_tokens"))
     out_tok = usage.get("output_tokens", record.get("output_tokens"))
     cost = usage.get("cost_usd", record.get("cost_usd"))
+    cost_known = usage.get("cost_known", cost is not None)
     if in_tok is None and out_tok is None and cost is None:
         return "—"
-    return f"in={in_tok if in_tok is not None else 0} out={out_tok if out_tok is not None else 0} cost={cost if cost is not None else '—'}"
+    shown_cost = cost if cost_known and cost is not None else "unknown"
+    return (
+        f"in={in_tok if in_tok is not None else 0} "
+        f"out={out_tok if out_tok is not None else 0} cost={shown_cost}"
+    )
 
 
 def _render_inference(events: list[Event], usage_records: list[dict]) -> None:

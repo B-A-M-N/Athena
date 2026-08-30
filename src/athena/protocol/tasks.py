@@ -273,6 +273,10 @@ class UsageSummary:
     output_tokens: int = 0
     model_calls: int = 0
     cost_usd: Decimal = Decimal(0)
+    # False means one or more model attempts completed without a trustworthy
+    # provider report or configured pricing. Numeric cost remains useful for
+    # budget accounting, but surfaces must display the aggregate as unknown.
+    cost_known: bool = True
     duration_ms: int = 0
     executions: int = 0
     mutations: int = 0

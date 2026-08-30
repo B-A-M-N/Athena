@@ -115,6 +115,26 @@ before using it for sensitive work. Other `:free` model IDs can be selected
 with `OPENROUTER_MODEL`. Free-route privacy and training terms are provider
 terms, not Athena guarantees; keep secrets out of prompts.
 
+For providers that do not report a per-request cost, configure pricing when a
+monetary budget or cost accounting is required:
+
+```toml
+[[providers]]
+kind = "openai"
+name = "main"
+base_url = "https://api.example.test/v1"
+model = "example/model"
+
+[providers.cost]
+per_1m_input = 1.00
+per_1m_output = 4.00
+currency = "USD"
+```
+
+Athena treats pricing as `known free`, `known paid`, or `unknown`; unknown
+cost is shown as `cost=unknown` and cannot pass a hard monetary-budget
+admission check.
+
 ## Architecture at a glance
 
 - `athena.kernel` — the one reasoning loop (INV-001).

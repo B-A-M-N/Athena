@@ -137,3 +137,16 @@ def test_anthropic_malformed_tool_input_keeps_empty_raw_candidate():
     assert block.candidate is not None
     assert block.candidate.raw_arguments == ""
     assert block.candidate.parsed_arguments is None
+
+
+def test_anthropic_response_preserves_provider_reported_cost():
+    provider = AnthropicProvider(api_key="key", use_sdk=False)
+    event = provider._parse_complete(
+        _request(),
+        {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 4, "output_tokens": 2, "cost": 0.0007},
+        },
+    )
+
+    assert event.response.usage.cost_usd == 0.0007

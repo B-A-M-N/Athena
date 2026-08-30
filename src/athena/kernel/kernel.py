@@ -183,6 +183,7 @@ class RunState:
     input_tokens: int = 0
     output_tokens: int = 0
     cost: Decimal = field(default_factory=Decimal)
+    cost_known: bool = True
     request_id: str | None = None
     provider: str | None = None
     budget_wall_time_remaining_s: float | None = None
@@ -393,6 +394,11 @@ class AgentKernel:
             self._lifecycle.set_cancellation_manager(cancellations)
 
         self._runs: dict[str, RunState] = {}
+        # Durable terminal state is written by the lifecycle before the
+        # kernel's final budget checkpoint runs.  Keep a process-local barrier
+        # so callers that need a stable snapshot (forks, reviews) can wait for
+        # the complete run boundary as well.
+        self._completion_events: dict[str, asyncio.Event] = {}
         self._resume: dict[str, asyncio.Event] = {}
         self._resume_decision: dict[str, str] = {}
         self._stored_responses: set[str] = set()
@@ -415,6 +421,8 @@ class AgentKernel:
     # Public API
     # ------------------------------------------------------------------ #
     async def run_task(self, task_id: str) -> TaskResult:
+        completion = self._completion_events.setdefault(task_id, asyncio.Event())
+        completion.clear()
         task = await self._lifecycle.acquire(task_id)
         state = self._runs.get(task_id) or RunState(task)
         self._runs[task_id] = state
@@ -438,6 +446,17 @@ class AgentKernel:
             if end_compute is not None and compute_started:
                 await end_compute(task.id)
             self._runs.pop(task_id, None)
+            completion.set()
+
+    async def wait_for_completion(self, task_id: str, *, timeout: float | None = None) -> None:
+        """Wait until the kernel has finished post-result cleanup for a run."""
+        event = self._completion_events.get(task_id)
+        if event is None:
+            return
+        if timeout is None:
+            await event.wait()
+        else:
+            await asyncio.wait_for(event.wait(), timeout=max(float(timeout), 0.0))
 
     async def _bootstrap(self, task: TaskSpec, state: RunState) -> None:
         """Crash-recovery entry: an INTERRUPTED task may be resumed (BUILDSPEC
@@ -804,16 +823,18 @@ class AgentKernel:
                     task,
                 )
                 state.model_calls += 1
+                actual_cost = _actual_model_cost(
+                    selection_for_attempt.info,
+                    response,
+                    request,
+                    estimator=token_estimator,
+                )
+                if actual_cost is None:
+                    state.cost_known = False
                 if self._budgets is not None:
                     # Persist actual usage at the model boundary. The final
                     # TaskResult is an aggregate and BudgetTracker consumes
                     # only any execution/mutation delta during finalization.
-                    actual_cost = _actual_model_cost(
-                        selection_for_attempt.info,
-                        response,
-                        request,
-                        estimator=token_estimator,
-                    )
                     usage_kwargs: dict[str, Any] = {
                         "input_tokens": _input_tokens_of(
                             response, request, estimator=token_estimator
@@ -836,10 +857,10 @@ class AgentKernel:
                                 reserved=worst_cost,
                                 actual=actual_cost,
                             )
-                    state.cost += actual_cost or Decimal("0")
                     persist_budget = getattr(self._budgets, "_persist_usage", None)
                     if persist_budget is not None:
                         await persist_budget(task.id)
+                state.cost += actual_cost or Decimal("0")
                 reservation = False
                 # Record final usage
                 if self._provider_usage_store is not None and attempt_usage_id is not None:
@@ -2057,6 +2078,7 @@ class AgentKernel:
                 output_tokens=state.output_tokens,
                 model_calls=state.model_calls,
                 cost_usd=state.cost,
+                cost_known=state.cost_known,
                 duration_ms=state.elapsed_ms,
             ),
         )
@@ -2074,6 +2096,7 @@ class AgentKernel:
                 output_tokens=state.output_tokens,
                 model_calls=state.model_calls,
                 cost_usd=state.cost,
+                cost_known=state.cost_known,
                 duration_ms=state.elapsed_ms,
             ),
         )

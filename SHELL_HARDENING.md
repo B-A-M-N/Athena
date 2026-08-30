@@ -69,7 +69,7 @@ current code paths:
 Reference-image fidelity items not listed as implemented remain deliberately
 deferred visual work; they are not release claims.
 
-### GAP-01 — Shell Outer Bezel / Physical Cabinet Shape ❌
+### GAP-01 — Shell Outer Bezel / Physical Cabinet Shape — DEFERRED
 
 **What the images show (Athenabox):**
 - A dark, nearly-black outer chassis surround — a physical *bezel* extending several rows/columns beyond the inner apertures. It looks like a desk instrument / CRT monitor body.
@@ -83,7 +83,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-02 — Inset Aperture Rim / CRT Bezel Inset ❌
+### GAP-02 — Inset Aperture Rim / CRT Bezel Inset — DEFERRED
 
 **What the images show:**
 - Each monitor screen (left and right) has its own distinct rounded-rectangle bezel — a second layer of nesting. The screen content sits *inside* a slightly recessed aperture with rounded corners different from the outer chassis corners.
@@ -94,7 +94,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-03 — Bottom Hardware Row: Speaker Grille, Knob Row, LED Rail ❌
+### GAP-03 — Bottom Hardware Row: Speaker Grille, Knob Row, LED Rail — DEFERRED
 
 **What the images show (both images):**
 - Bottom strip below the two screens contains (left to right):
@@ -116,7 +116,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-04 — Top Header: "LIVE VIEWPORT" Label + Right-Side Status Chip ❌
+### GAP-04 — Top Header: "LIVE VIEWPORT" Label + Right-Side Status Chip — DEFERRED
 
 **What the images show (DA GOAL):**
 - Right pane title row shows `ATHENA OI // GLASS COMPUTE` left and `LIVE VIEWPORT` right-aligned — a persistent label in the header of the OI aperture.
@@ -128,7 +128,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-05 — Dot-Matrix / Dithered Buddy Pixel Style ❌
+### GAP-05 — Dot-Matrix / Dithered Buddy Pixel Style — DEFERRED
 
 **What the images show (DA GOAL, right pane):**
 - The Buddy/mascot figure in the OI panel is rendered in a **dithered dot-matrix** or **stippled pixel grid** style — the body is composed of discrete square pixel blocks (`▪`, `█`, `░`, `▒`) arranged to give a retro low-resolution monitor character look, matching the CRT aesthetic.
@@ -141,7 +141,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-06 — OI Panel: MODEL REQUEST Header Row ❌
+### GAP-06 — OI Panel: MODEL REQUEST Header Row — DEFERRED
 
 **What DA GOAL shows:**
 - At the very top of the OI pane content (below the title bar), a dedicated row shows: `> MODEL REQUEST · fake/fake-1`
@@ -154,7 +154,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-07 — Workspace File Tree: Inline Status Glyphs with `[✓]` / `[...]` Badges ❌
+### GAP-07 — Workspace File Tree: Inline Status Glyphs with `[✓]` / `[...]` Badges — DEFERRED
 
 **What DA GOAL shows:**
 - The workspace file listing uses tree-drawing characters (`├─`, `└─`) with right-aligned status badges: `[✓] read`, `[...] testing`.
@@ -166,7 +166,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-08 — Runtime Tree: Hierarchical Box-Node Graph with Edge Lines ❌
+### GAP-08 — Runtime Tree: Hierarchical Box-Node Graph with Edge Lines — PARTIAL
 
 **What the images show:**
 - DA GOAL right side shows a `RUNTIME TREE` with box nodes (`verify-release / task`, `inspector / module`, etc.) connected by explicit vertical edge lines. The graph is a top-down tree structure with proper parent→child lines.
@@ -178,7 +178,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-09 — TESTING Progress Bar: Pixel-Fill Style with `%` Label ❌
+### GAP-09 — TESTING Progress Bar: Pixel-Fill Style with `%` Label — PARTIAL
 
 **What DA GOAL shows:**
 - The TESTING view shows a dense filled block bar: `████████████████▒▒▒▒▒▒▒▒ 62%` — a wide, dense bar that spans most of the panel width with a percentage label.
@@ -190,7 +190,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-10 — RESULT / FAILURE Card: Expected/Actual/Location/Severity Block ❌
+### GAP-10 — RESULT / FAILURE Card: Expected/Actual/Location/Severity Block — PARTIAL
 
 **What DA GOAL shows:**
 - The FAILURE scene shows a structured diagnostic card:
@@ -209,7 +209,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-11 — NEXT STEP / Scanning Animation Row ❌
+### GAP-11 — NEXT STEP / Scanning Animation Row — PARTIAL
 
 **What DA GOAL shows:**
 - Below the diagnostic card, a live stream row: `> NEXT STEP: isolate divergence` and `> scanning call graph…` with an animated dot-matrix progress strip at the bottom.
@@ -220,7 +220,7 @@ deferred visual work; they are not release claims.
 
 ---
 
-### GAP-12 — OI Panel Animation NOT Extended to All Capability/Action Events in ANSI Mode ⚠️
+### GAP-12 — OI Panel Animation NOT Extended to All Capability/Action Events in ANSI Mode — DEFERRED
 
 **What the reference implies:**
 - The scan-beam, pulsing borders, cursor blink, and code-reveal animations should be consistent across all action states. Crucially, the **ANSI renderer** (when Kitty/Glass is unavailable) shows static text and has no animated equivalents for these effects.

@@ -731,7 +731,9 @@ def render_summary(result: Any) -> str:
         parts.append(f"out={usage.output_tokens}")
     if getattr(usage, "model_calls", 0):
         parts.append(f"calls={usage.model_calls}")
-    if getattr(usage, "cost_usd", None) and usage.cost_usd > 0:
+    if not getattr(usage, "cost_known", True):
+        parts.append("cost=unknown")
+    elif getattr(usage, "cost_usd", None) and usage.cost_usd > 0:
         parts.append(f"cost=${usage.cost_usd:.4f}")
     if getattr(usage, "duration_ms", 0):
         parts.append(f"{usage.duration_ms}ms")

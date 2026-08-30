@@ -1320,6 +1320,15 @@ class AthenaService:
                         # optional observer must not turn a completed task
                         # into an unavailable one for callers with a deadline.
                         pass
+                kernel = self._kernel
+                if kernel is not None and hasattr(kernel, "wait_for_completion"):
+                    remaining = max(deadline - time.monotonic(), 0.0)
+                    try:
+                        await kernel.wait_for_completion(task_id, timeout=remaining)
+                    except TimeoutError:
+                        # The durable result is authoritative; the barrier only
+                        # protects callers that require a fully quiesced run.
+                        pass
                 return task
             if time.monotonic() >= deadline:
                 return task
@@ -3346,6 +3355,7 @@ def _result_from_row(row: dict):
             output_tokens=int(usage.get("output_tokens") or 0),
             model_calls=int(usage.get("model_calls") or 0),
             cost_usd=Decimal(str(cost)) if cost is not None else Decimal(0),
+            cost_known=bool(usage.get("cost_known", cost is not None)),
             duration_ms=int(usage.get("duration_ms") or 0),
             executions=int(usage.get("executions") or 0),
             mutations=int(usage.get("mutations") or 0),
