@@ -3077,7 +3077,15 @@ class AthenaService:
                     if self._project_index_coordinator is not None and root:
                         self._project_index_coordinator.mark_stale(root)
                         try:
-                            await self._project_index_coordinator.refresh(root)
+                            changed_paths = [
+                                str(resource.get("path") or resource.get("resource") or "")
+                                for resource in review.get("changed_resources") or ()
+                                if isinstance(resource, Mapping)
+                            ]
+                            await self._project_index_coordinator.refresh(
+                                root,
+                                changed_paths=changed_paths,
+                            )
                         except Exception as exc:
                             _logger.warning("self-host project index refresh failed: %s", exc)
                 await missions.update(

@@ -71,3 +71,17 @@ async def test_source_verified_freshness_detects_external_edits_without_invalida
 
     assert verified.source_revision != first.source_revision
     assert verified.files[0]["sha256"] != first.files[0]["sha256"]
+
+
+async def test_refresh_uses_changed_paths_for_incremental_builder(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text("value = 1\n")
+    coordinator = ProjectIndexCoordinator(_Store(), ProjectIndexBuilder())
+    first = await coordinator.current(str(tmp_path))
+
+    source.write_text("value = 2\n")
+    coordinator.mark_stale(str(tmp_path))
+    second = await coordinator.refresh(str(tmp_path), changed_paths=["app.py"])
+
+    assert second.source_revision != first.source_revision
+    assert second.files[0]["sha256"] != first.files[0]["sha256"]

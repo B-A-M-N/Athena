@@ -32,6 +32,7 @@ class ProjectIndexCoordinator:
         *,
         refresh: bool = False,
         freshness: str = "cached",
+        changed_paths: Iterable[str] = (),
     ) -> ProjectIndex:
         """Return an index at the requested freshness level.
 
@@ -42,6 +43,7 @@ class ProjectIndexCoordinator:
         if freshness not in {"cached", "source_verified"}:
             raise ValueError("freshness must be cached or source_verified")
         canonical = _canonical_root(root)
+        changed = tuple(str(path) for path in changed_paths if str(path).strip())
         cached = self._cache.get(canonical)
         if (
             cached is not None
@@ -84,8 +86,33 @@ class ProjectIndexCoordinator:
                 ):
                     self._cache[canonical] = persisted
                     return persisted
+            previous = cached
+            if previous is None and self._store is not None:
+                persisted = await self._store.get(canonical)
+                if persisted is not None:
+                    previous = persisted
+                    if (
+                        not refresh
+                        and persisted.source_revision
+                        and await self._matches_source_revision(
+                            canonical,
+                            persisted.source_revision,
+                        )
+                    ):
+                        self._cache[canonical] = persisted
+                        return persisted
             loop = asyncio.get_running_loop()
-            index = await loop.run_in_executor(None, self._builder.build, canonical)
+            incremental = getattr(self._builder, "incremental", None)
+            if refresh and changed and previous is not None and callable(incremental):
+                index = await loop.run_in_executor(
+                    None,
+                    incremental,
+                    canonical,
+                    previous,
+                    changed,
+                )
+            else:
+                index = await loop.run_in_executor(None, self._builder.build, canonical)
             if self._store is not None:
                 await self._store.save(index)
             self._cache[canonical] = index
@@ -107,8 +134,13 @@ class ProjectIndexCoordinator:
             return False
         return str(current) == expected
 
-    async def refresh(self, root: str) -> ProjectIndex:
-        return await self.current(root, refresh=True)
+    async def refresh(
+        self,
+        root: str,
+        *,
+        changed_paths: Iterable[str] = (),
+    ) -> ProjectIndex:
+        return await self.current(root, refresh=True, changed_paths=changed_paths)
 
     def mark_stale(self, root: str) -> None:
         self._stale.add(_canonical_root(root))

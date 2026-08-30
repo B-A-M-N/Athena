@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +14,10 @@ from athena.project.index.models import ProjectIndex
 from athena.project.index.lexical import extract_imports, extract_symbols
 from athena.project.index.semantic import SemanticProjectAnalyzer
 from athena.project.profile import (
-    _IGNORED_DIRS,
     _PROFILE_FILES,
     _SOURCE_EXTENSIONS,
+    _is_environment_directory,
     ProjectInspector,
-    _token_matches,
 )
 from athena.protocol.messages import utcnow
 
@@ -56,7 +57,8 @@ class ProjectIndexBuilder:
 
     def build(self, root: str) -> ProjectIndex:
         root_path = Path(os.path.realpath(os.path.abspath(root)))
-        profile = self._inspector.inspect(str(root_path))
+        files, truncated = self._files(root_path)
+        profile = self._inspector.inspect(str(root_path), inventory=files)
         profile_record = profile.to_dict()
         environment = dict(profile_record.pop("environment", {}) or {})
 
@@ -64,10 +66,8 @@ class ProjectIndexBuilder:
         contents: dict[str, str] = {}
         imports: dict[str, tuple[str, ...]] = {}
         symbols: dict[str, tuple[str, ...]] = {}
-        references: dict[str, set[str]] = {}
         semantic_files: dict[str, dict[str, Any]] = {}
         analyzer = SemanticProjectAnalyzer()
-        files, truncated = self._files(root_path)
         for path in files:
             relative = path.relative_to(root_path).as_posix()
             record: dict[str, Any] = {
@@ -79,6 +79,7 @@ class ProjectIndexBuilder:
             try:
                 stat = path.stat()
                 record["size"] = stat.st_size
+                record["mtime_ns"] = stat.st_mtime_ns
                 if stat.st_size <= self.max_file_bytes:
                     content = path.read_text(encoding="utf-8", errors="replace")
                     contents[relative] = content
@@ -89,7 +90,8 @@ class ProjectIndexBuilder:
                 records.append(record)
                 continue
             records.append(record)
-            if record["language"] is None:
+            language = record.get("language")
+            if not isinstance(language, str):
                 continue
             imported = extract_imports(contents.get(relative, ""))
             imports[relative] = tuple(imported)
@@ -98,7 +100,7 @@ class ProjectIndexBuilder:
             semantic = analyzer.analyze(
                 path=relative,
                 content=contents.get(relative, ""),
-                language=record["language"],
+                language=language,
             )
             semantic_files[relative] = semantic
             imports[relative] = tuple(
@@ -112,10 +114,174 @@ class ProjectIndexBuilder:
                 if isinstance(item, dict) and item.get("name")
             }
             symbols[relative] = tuple(sorted(set(symbols[relative]) | semantic_names))
+
+        return self._assemble_index(
+            root_path=root_path,
+            profile_record=profile_record,
+            environment=environment,
+            records=records,
+            contents=contents,
+            imports=imports,
+            symbols=symbols,
+            semantic_files=semantic_files,
+            truncated=truncated,
+        )
+
+    def incremental(
+        self,
+        root: str,
+        previous: ProjectIndex,
+        changed_paths: list[str] | tuple[str, ...] = (),
+    ) -> ProjectIndex:
+        """Update one index while re-parsing only changed source files."""
+        root_path = Path(os.path.realpath(os.path.abspath(root)))
+        files, truncated = self._files(root_path)
+        profile = self._inspector.inspect(str(root_path), inventory=files)
+        profile_record = profile.to_dict()
+        environment = dict(profile_record.pop("environment", {}) or {})
+        requested = {
+            _relative_change(value, root_path)
+            for value in changed_paths
+            if _relative_change(value, root_path)
+        }
+        previous_records = {
+            str(item.get("path")): dict(item) for item in previous.files if item.get("path")
+        }
+        imports = {str(key): tuple(value) for key, value in previous.imports.items()}
+        symbols = {str(key): tuple(value) for key, value in previous.symbols.items()}
+        semantic_files = {
+            str(key): dict(value)
+            for key, value in (previous.semantic.get("files") or {}).items()
+            if isinstance(value, Mapping)
+        }
+        records: list[dict[str, Any]] = []
+        contents: dict[str, str] = {}
+        analyzer = SemanticProjectAnalyzer()
+        current_paths: set[str] = set()
+        for path in files:
+            relative = path.relative_to(root_path).as_posix()
+            current_paths.add(relative)
+            old = previous_records.get(relative)
+            try:
+                stat = path.stat()
+            except OSError:
+                stat = None
+            changed = (
+                relative in requested
+                or old is None
+                or stat is None
+                or old.get("mtime_ns") != stat.st_mtime_ns
+                or old.get("size") != stat.st_size
+            )
+            record = (
+                dict(old)
+                if old is not None and not changed
+                else {
+                    "path": relative,
+                    "language": _SOURCE_EXTENSIONS.get(path.suffix.lower()),
+                    "size": 0,
+                    "sha256": None,
+                }
+            )
+            record.update(
+                {
+                    "path": relative,
+                    "language": _SOURCE_EXTENSIONS.get(path.suffix.lower()),
+                    "size": int(stat.st_size) if stat is not None else 0,
+                    "mtime_ns": int(stat.st_mtime_ns) if stat is not None else 0,
+                }
+            )
+            records.append(record)
+            if not changed:
+                continue
+            content = ""
+            if stat is not None and stat.st_size <= self.max_file_bytes:
+                try:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    content = ""
+                contents[relative] = content
+                record["sha256"] = hashlib.sha256(
+                    content.encode("utf-8", errors="replace")
+                ).hexdigest()
+            imports.pop(relative, None)
+            symbols.pop(relative, None)
+            semantic_files.pop(relative, None)
+            language = record.get("language")
+            if not isinstance(language, str):
+                continue
+            imported = extract_imports(content)
+            imports[relative] = tuple(imported)
+            names = extract_symbols(content)
+            symbols[relative] = tuple(names)
+            semantic = analyzer.analyze(
+                path=relative,
+                content=content,
+                language=language,
+            )
+            semantic_files[relative] = semantic
+            imports[relative] = tuple(
+                sorted(
+                    set(imports[relative]) | {str(value) for value in semantic.get("imports") or ()}
+                )
+            )
+            semantic_names = {
+                str(item.get("name"))
+                for item in semantic.get("definitions") or ()
+                if isinstance(item, dict) and item.get("name")
+            }
+            symbols[relative] = tuple(sorted(set(symbols[relative]) | semantic_names))
+
+        for relative in set(previous_records) - current_paths:
+            imports.pop(relative, None)
+            symbols.pop(relative, None)
+            semantic_files.pop(relative, None)
+
+        # Association fallback needs test text, but never performs a nested
+        # source-by-test scan.  Unchanged source facts stay in the previous
+        # snapshot; only the test corpus is read once to build the inverted map.
+        for record in records:
+            relative = str(record["path"])
+            if _is_test(relative) and relative not in contents:
+                path = root_path / relative
+                try:
+                    if path.stat().st_size <= self.max_file_bytes:
+                        contents[relative] = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+
+        return self._assemble_index(
+            root_path=root_path,
+            profile_record=profile_record,
+            environment=environment,
+            records=records,
+            contents=contents,
+            imports=imports,
+            symbols=symbols,
+            semantic_files=semantic_files,
+            truncated=truncated,
+        )
+
+    def _assemble_index(
+        self,
+        *,
+        root_path: Path,
+        profile_record: dict[str, Any],
+        environment: dict[str, Any],
+        records: list[dict[str, Any]],
+        contents: dict[str, str],
+        imports: dict[str, tuple[str, ...]],
+        symbols: dict[str, tuple[str, ...]],
+        semantic_files: dict[str, dict[str, Any]],
+        truncated: bool,
+    ) -> ProjectIndex:
+        references: dict[str, set[str]] = {}
+        for source, names in symbols.items():
             for name in names:
-                references.setdefault(name, set()).add(relative)
+                references.setdefault(str(name), set()).add(source)
+            semantic = semantic_files.get(source) or {}
             for name in semantic.get("references") or ():
-                references.setdefault(str(name), set()).add(relative)
+                references.setdefault(str(name), set()).add(source)
 
         path_by_variant = self._path_variants(records)
         edges: list[dict[str, str]] = []
@@ -132,9 +298,6 @@ class ProjectIndexBuilder:
                         }
                     )
 
-        # Turn only unambiguous Python semantic references into impact edges.
-        # A same-name collision is deliberately left unresolved so
-        # verification widens instead of claiming false precision.
         definitions: dict[str, set[str]] = {}
         for target, semantic in semantic_files.items():
             for definition in semantic.get("definitions") or ():
@@ -153,33 +316,37 @@ class ProjectIndexBuilder:
                 if len(targets) != 1:
                     continue
                 target = next(iter(targets))
-                if target == source:
-                    continue
-                edges.append(
-                    {
-                        "source": source,
-                        "target": target,
-                        "kind": "semantic",
-                        "name": name,
-                        "confidence": "high",
-                    }
-                )
+                if target != source:
+                    edges.append(
+                        {
+                            "source": source,
+                            "target": target,
+                            "kind": "semantic",
+                            "name": name,
+                            "confidence": "high",
+                        }
+                    )
 
         test_associations: dict[str, set[str]] = {}
         for edge in edges:
             if _is_test(edge["source"]):
                 test_associations.setdefault(edge["target"], set()).add(edge["source"])
-        for source, content in contents.items():
-            if _is_test(source):
+        test_mentions: dict[str, set[str]] = {}
+        for test, test_content in contents.items():
+            if _is_test(test):
+                for token in _identifier_tokens(test_content):
+                    test_mentions.setdefault(token, set()).add(test)
+        for record in records:
+            source = str(record["path"])
+            if _is_test(source) or source in test_associations:
                 continue
-            stem = Path(source).stem
-            for test, test_content in contents.items():
-                if not _is_test(test):
-                    continue
-                if _mentions_identifier(test_content, stem):
-                    test_associations.setdefault(source, set()).add(test)
+            source_tokens = {Path(source).stem.casefold(), Path(source).name.casefold()}
+            source_tokens.update(part.casefold() for part in Path(source).parts)
+            associated = set().union(*(test_mentions.get(token, set()) for token in source_tokens))
+            if associated:
+                test_associations[source] = associated
 
-        generated_dirs = set(profile.generated_dirs)
+        generated_dirs = set(profile_record.get("generated_dirs") or ())
         generated_files = tuple(
             sorted(
                 record["path"]
@@ -197,7 +364,9 @@ class ProjectIndexBuilder:
             for record in sorted(records, key=lambda item: item["path"])
         )
         revision = hashlib.sha256(
-            (profile.fingerprint + "\x1f" + revision_payload).encode("utf-8")
+            (str(profile_record.get("fingerprint") or "") + "\x1f" + revision_payload).encode(
+                "utf-8"
+            )
         ).hexdigest()
         source_revision = _source_revision(records, truncated)
         return ProjectIndex(
@@ -217,7 +386,7 @@ class ProjectIndexBuilder:
                 sorted(edges, key=lambda edge: (edge["source"], edge["target"], edge["name"]))
             ),
             semantic={
-                **analyzer.status(),
+                **SemanticProjectAnalyzer().status(),
                 "complete": not truncated,
                 "files": semantic_files,
             },
@@ -252,11 +421,19 @@ class ProjectIndexBuilder:
         return _source_revision(records, truncated)
 
     def _files(self, root: Path) -> tuple[list[Path], bool]:
+        if (root / ".git").exists():
+            inventory = _git_inventory(root)
+            if inventory is not None:
+                return inventory[: self.max_files], len(inventory) > self.max_files
         count = 0
         output: list[Path] = []
         truncated = False
         for directory, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = sorted(name for name in dirnames if name not in _IGNORED_DIRS)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if not _is_environment_directory(Path(directory) / name, name)
+            )
             for name in sorted(filenames):
                 if count >= self.max_files:
                     truncated = True
@@ -292,7 +469,10 @@ class ProjectIndexBuilder:
                 continue
             without_suffix = relative[: -len(path.suffix)]
             dotted = without_suffix.replace("/", ".")
-            for value in (relative, without_suffix, dotted, path.stem):
+            dotted_parts = dotted.split(".")
+            aliases = [".".join(dotted_parts[start:]) for start in range(len(dotted_parts))]
+            slash_aliases = [value.replace(".", "/") for value in aliases]
+            for value in (relative, without_suffix, dotted, path.stem, *aliases, *slash_aliases):
                 variants.setdefault(value, relative)
         return variants
 
@@ -302,9 +482,6 @@ class ProjectIndexBuilder:
         direct = variants.get(imported) or variants.get(candidate)
         if direct is not None:
             return direct
-        for value, relative in variants.items():
-            if _token_matches(imported, value) or _token_matches(candidate, value):
-                return relative
         return None
 
 
@@ -316,10 +493,58 @@ def _is_test(path: str) -> bool:
     )
 
 
-def _mentions_identifier(content: str, value: str) -> bool:
-    return bool(
-        value and re.search(rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])", content)
-    )
+def _identifier_tokens(content: str) -> set[str]:
+    return {token.casefold() for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", content)}
+
+
+def _relative_change(value: object, root: Path) -> str:
+    raw = str(value or "").replace("\\", "/")
+    if not raw:
+        return ""
+    path = Path(raw)
+    if path.is_absolute():
+        try:
+            return path.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            return ""
+    while raw.startswith("./"):
+        raw = raw[2:]
+    return raw
+
+
+def _git_inventory(root: Path) -> list[Path] | None:
+    """Use Git's own tracked/unignored inventory for a Git workspace."""
+    try:
+        result = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only git project inventory
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output: list[Path] = []
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            relative = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        path = root / relative
+        if path.is_symlink() or not path.is_file():
+            continue
+        output.append(path)
+    return sorted(output)
 
 
 def _source_revision(records: list[dict[str, Any]], truncated: bool) -> str:

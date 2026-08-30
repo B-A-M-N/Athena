@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ _IGNORED_DIRS = {
     ".hg",
     ".svn",
     ".venv",
+    ".venv312",
     "venv",
     "node_modules",
     "__pycache__",
@@ -164,9 +166,18 @@ class ProjectInspector:
         self.max_files = max_files
         self.max_file_bytes = max_file_bytes
 
-    def inspect(self, root: str) -> ProjectProfile:
+    def inspect(
+        self,
+        root: str,
+        *,
+        inventory: Iterable[str | Path] | None = None,
+    ) -> ProjectProfile:
         root_path = Path(os.path.realpath(os.path.abspath(root)))
-        files = list(self._files(root_path))
+        files = (
+            [Path(path) for path in inventory]
+            if inventory is not None
+            else list(self._files(root_path))
+        )
         languages = {
             _SOURCE_EXTENSIONS[path.suffix.lower()]
             for path in files
@@ -298,7 +309,11 @@ class ProjectInspector:
     def _files(self, root: Path):
         count = 0
         for directory, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = sorted(name for name in dirnames if name not in _IGNORED_DIRS)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if not _is_environment_directory(Path(directory) / name, name)
+            )
             for name in sorted(filenames):
                 if count >= self.max_files:
                     return
@@ -386,6 +401,16 @@ class ProjectInspector:
             # Ref may be packed; the branch name is still valid.
             pass
         return result
+
+
+def _is_environment_directory(path: Path, name: str) -> bool:
+    """Skip generated environments without enumerating project packages."""
+    if name in _IGNORED_DIRS or name == "site-packages":
+        return True
+    try:
+        return (path / "pyvenv.cfg").is_file()
+    except OSError:
+        return False
 
 
 def _token_matches(imported: str, target: str) -> bool:
