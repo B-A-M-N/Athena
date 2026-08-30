@@ -47,7 +47,7 @@ class OperatorSurface:
         self.details = details
         self._input_fn = input_fn or input
         self._input_supplied = input_fn is not None
-        self._model_text = ""
+        self._model_chunks: list[str] = []
         self._stdout = ""
         self._stderr = ""
         self._handled_approvals: set[str] = set()
@@ -98,7 +98,7 @@ class OperatorSurface:
             if self.details:
                 self._write(text, end="")
             else:
-                self._model_text += text
+                self._model_chunks.append(text)
             return
 
         if event_type == "ModelRequestStarted":
@@ -460,10 +460,20 @@ class OperatorSurface:
     # ------------------------------------------------------------------
     # Buffers
     # ------------------------------------------------------------------
+    @property
+    def _model_text(self) -> str:
+        """Compatibility view over the append-only model-delta buffer."""
+        return "".join(self._model_chunks)
+
+    @_model_text.setter
+    def _model_text(self, value: str) -> None:
+        self._model_chunks = [str(value)] if value else []
+
     def _flush_model(self) -> None:
-        if not self._model_text:
+        text = self._model_text
+        if not text:
             return
-        self._write_block(self._model_text, prefix="assistant> ")
+        self._write_block(text, prefix="assistant> ")
         self._model_text = ""
 
     def _flush_stream(self, name: str) -> None:

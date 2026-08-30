@@ -30,6 +30,11 @@ _CONTENT_KEYS = (
     "content_base64",
     "new_content_base64",
 )
+_MAX_TASKS = 128
+_MAX_EXECUTIONS = 256
+_MAX_VERIFICATION_CHECKS = 64
+_MAX_PARTIAL_DISPLAY = 32 * 1024
+_PARTIAL_TRUNCATION_MARKER = "[… truncated …]"
 
 
 def _bounded_event_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -188,6 +193,9 @@ class ProjectionState:
     raw_events: deque[tuple[str, Mapping[str, Any]]] = field(
         default_factory=lambda: deque(maxlen=128)
     )
+    _task_order: deque[str] = field(default_factory=deque, repr=False)
+    _execution_order: deque[str] = field(default_factory=deque, repr=False)
+    _stream_partial_truncated: bool = field(default=False, repr=False)
 
     def add_recent(self, glyph: str, text: object) -> None:
         clean = sanitize_terminal_text(text).strip()
@@ -209,12 +217,17 @@ class ProjectionState:
         self.stream_partial += clean
         while "\n" in self.stream_partial:
             line, _, self.stream_partial = self.stream_partial.partition("\n")
-            self.stream.append(line)
+            self.stream.append(_cap_display(line))
+            self._stream_partial_truncated = False
+        if len(self.stream_partial) > _MAX_PARTIAL_DISPLAY:
+            self.stream_partial = _cap_display(self.stream_partial)
+            self._stream_partial_truncated = True
 
     def seal_stream(self) -> None:
         if self.stream_partial:
-            self.stream.append(self.stream_partial)
+            self.stream.append(_cap_display(self.stream_partial))
             self.stream_partial = ""
+            self._stream_partial_truncated = False
 
     def acknowledge_approval(self, *, granted: bool, scope: str | None = None) -> None:
         """Project a local approval choice before its durable event arrives.
@@ -377,6 +390,8 @@ class ProjectionState:
             "status": status or existing.get("status") or "observed",
             "parent_id": parent or existing.get("parent_id"),
         }
+        self._touch(self._task_order, task_id)
+        self._prune_tasks()
 
     def _reduce_execution(self, event_type: str, payload: Mapping[str, Any]) -> None:
         """Project execution lifecycle into the operation's runtime child."""
@@ -404,6 +419,8 @@ class ProjectionState:
             or existing.get("parent_id")
             or (f"task:{task_id}" if task_id else None),
         }
+        self._touch(self._execution_order, execution_id)
+        self._prune_executions()
 
     def _close_active(self, state: str) -> None:
         operation = self.operations.get(self.active_operation_id or "")
@@ -416,6 +433,43 @@ class ProjectionState:
         }:
             operation.state = state
         self.active_operation_id = None
+
+    @staticmethod
+    def _touch(order: deque[str], key: str) -> None:
+        try:
+            order.remove(key)
+        except ValueError:
+            pass
+        order.append(key)
+
+    def _prune_tasks(self) -> None:
+        active = {
+            key
+            for key, value in self.tasks.items()
+            if value.get("status") in {"created", "queued", "running", "approval", "approved"}
+        }
+        keep = active | set(list(self._task_order)[-_MAX_TASKS:])
+        for key in tuple(self.tasks):
+            if key not in keep:
+                self.tasks.pop(key, None)
+        self._task_order = deque(key for key in self._task_order if key in self.tasks)
+
+    def _prune_executions(self) -> None:
+        active = {
+            key
+            for key, value in self.executions.items()
+            if value.get("status") in {"running", "observed"}
+        }
+        keep = active | set(list(self._execution_order)[-_MAX_EXECUTIONS:])
+        for key in tuple(self.executions):
+            if key not in keep:
+                self.executions.pop(key, None)
+        self._execution_order = deque(
+            key for key in self._execution_order if key in self.executions
+        )
+        for execution_id in tuple(self.execution_to_operation):
+            if execution_id not in self.executions:
+                self.execution_to_operation.pop(execution_id, None)
 
     def _model_request_identity(self, payload: Mapping[str, Any], *, reset: bool = False) -> None:
         """Record provider facts emitted by the actual request lifecycle."""
@@ -731,6 +785,8 @@ class ProjectionState:
                 payload.get("criterion") or payload.get("check_id") or len(self.verification_checks)
             )
             self.verification_checks[check_id] = _bounded_event_payload(payload)
+            while len(self.verification_checks) > _MAX_VERIFICATION_CHECKS:
+                self.verification_checks.pop(next(iter(self.verification_checks)))
             self.verification_status = sanitize_terminal_text(payload.get("status") or "running")
         elif etype == "VerificationCompleted":
             self.verification_status = sanitize_terminal_text(payload.get("status") or "completed")
@@ -869,6 +925,14 @@ class ProjectionState:
             )
         elif etype and payload.get("details"):
             self.add_recent("·", etype)
+
+
+def _cap_display(value: object) -> str:
+    text = str(value)
+    if len(text) <= _MAX_PARTIAL_DISPLAY:
+        return text
+    tail_length = _MAX_PARTIAL_DISPLAY - len(_PARTIAL_TRUNCATION_MARKER)
+    return _PARTIAL_TRUNCATION_MARKER + text[-max(tail_length, 0) :]
 
 
 __all__ = ["OperationNode", "ProjectionState"]

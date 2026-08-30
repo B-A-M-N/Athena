@@ -653,23 +653,6 @@ class AgentKernel:
     async def _invoke(
         self, task: TaskSpec, state: RunState, selection: ModelSelection, compiled: CompiledContext
     ) -> ModelResponse:
-        metadata = self._inference_metadata(selection)
-        cache_metadata = await self._observe_prefix(task, compiled, selection)
-        if cache_metadata.get("boundary") is not None:
-            await self._emit("CacheBoundary", cache_metadata["boundary"], task)
-        metadata.update(cache_metadata)
-        replay_metadata = self._replay_metadata(compiled, selection)
-        if replay_metadata.get("boundary") is not None:
-            await self._emit(
-                "InferenceReplayBoundary",
-                {
-                    "boundary": replay_metadata["boundary"],
-                    "provider": selection.provider,
-                    "model": selection.model,
-                },
-                task,
-            )
-        metadata.update(replay_metadata)
         role = getattr(task.model_policy, "role", None) or "primary"
         last_err: ProviderError | None = None
         attempted: set[str] = set()
@@ -682,6 +665,7 @@ class AgentKernel:
                     f"no candidate model excludes failed providers {sorted(attempted)}"
                 )
             provider = self._registry.provider_for(selection_for_attempt.provider)
+            attempt_metadata = await self._attempt_metadata(task, compiled, selection_for_attempt)
             request = compiled.to_request(
                 provider=selection_for_attempt.provider,
                 model=selection_for_attempt.model,
@@ -690,8 +674,7 @@ class AgentKernel:
                     "task_id": task.id,
                     "session_id": task.session_id,
                     **self._inference_metadata(selection_for_attempt),
-                    **(await self._observe_prefix(task, compiled, selection_for_attempt)),
-                    **self._replay_metadata(compiled, selection_for_attempt),
+                    **attempt_metadata,
                 },
             )
             state.request_id = request.request_id
@@ -1398,6 +1381,26 @@ class AgentKernel:
             "protocol": getattr(profile, "protocol", "openai-compat"),
             "model_profile": (dict(vars(model_profile)) if model_profile is not None else None),
         }
+
+    async def _attempt_metadata(
+        self, task: TaskSpec, compiled: CompiledContext, selection: ModelSelection
+    ) -> dict[str, Any]:
+        """Collect cache/replay metadata once for one provider attempt."""
+        cache_metadata = await self._observe_prefix(task, compiled, selection)
+        if cache_metadata.get("boundary") is not None:
+            await self._emit("CacheBoundary", cache_metadata["boundary"], task)
+        replay_metadata = self._replay_metadata(compiled, selection)
+        if replay_metadata.get("boundary") is not None:
+            await self._emit(
+                "InferenceReplayBoundary",
+                {
+                    "boundary": replay_metadata["boundary"],
+                    "provider": selection.provider,
+                    "model": selection.model,
+                },
+                task,
+            )
+        return {**cache_metadata, **replay_metadata}
 
     async def _observe_prefix(
         self, task: TaskSpec, compiled: CompiledContext, selection: ModelSelection

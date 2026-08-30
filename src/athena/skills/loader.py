@@ -144,19 +144,47 @@ class SkillLoader:
         self._skills: list[Skill] = []
         self.errors: list[str] = []
         self._loaded = False
+        self._revision: tuple[tuple[str, int, int, int], ...] | None = None
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Monotonic revision for consumers caching skill selection."""
+        return self._generation
+
+    def invalidate(self) -> None:
+        """Invalidate the parsed snapshot after an out-of-band skill change."""
+        self._loaded = False
+        self._revision = None
 
     async def load(self) -> list[Skill]:
         """Parse all skills, deduped by (name, version)."""
+        discovered = tuple(self._discovered_files())
+        revision = tuple(
+            (
+                str(path),
+                int(stat.st_mtime_ns),
+                int(stat.st_size),
+                int(getattr(stat, "st_ino", 0)),
+            )
+            for _rank, path, _scope, stat in discovered
+        )
+        if self._loaded and revision == self._revision:
+            return list(self._skills)
+
         seen: dict[tuple[str, int], Skill] = {}
         ranked: dict[tuple[str, int], int] = {}
         self.errors = []
-        for rank, root, scope in self._roots:
-            for parsed in self._parse_root(root, scope):
-                key = (parsed.name, parsed.version)
-                if key in seen and rank <= ranked[key]:
-                    continue
-                seen[key] = parsed
-                ranked[key] = rank
+        for rank, path, scope, _stat in discovered:
+            parsed = self.parse_skill_file(path, scope=scope)
+            if parsed is None:
+                continue
+            key = (parsed.name, parsed.version)
+            if key in seen and rank <= ranked[key]:
+                continue
+            seen[key] = parsed
+            ranked[key] = rank
+        loaded: list[Skill] = []
         for skill in seen.values():
             result = self._validator.validate(skill)
             if not result.ok:
@@ -164,8 +192,11 @@ class SkillLoader:
                     f"{skill.path or skill.name}: invalid ({'; '.join(result.errors)})"
                 )
                 continue
-            self._skills.append(skill)
+            loaded.append(skill)
+        self._skills = loaded
         self._loaded = True
+        self._revision = revision
+        self._generation += 1
         return list(self._skills)
 
     async def load_active(self) -> list[Skill]:
@@ -177,6 +208,16 @@ class SkillLoader:
             skill = self.parse_skill_file(skill_root / _skill_filename(skill_root), scope=scope)
             if skill is not None:
                 yield skill
+
+    def _discovered_files(self):
+        for rank, root, scope in self._roots:
+            for skill_root in _iter_skill_roots(root):
+                path = skill_root / _skill_filename(skill_root)
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                yield rank, path, scope, stat
 
     def parse_skill_file(
         self,

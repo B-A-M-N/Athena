@@ -40,6 +40,7 @@ const SELECTION_REQUEST: c_int = 30;
 const SELECTION_NOTIFY: c_int = 31;
 const DESTROY_NOTIFY: c_int = 17;
 const CONFIGURE_NOTIFY: c_int = 22;
+const EXPOSE: c_int = 12;
 const CLIENT_MESSAGE: c_int = 33;
 const KEY_PRESS_MASK: c_long = 1;
 const BUTTON_PRESS_MASK: c_long = 1 << 2;
@@ -714,8 +715,9 @@ fn run_window(
     let mut height = 700_i32;
     let mut running = true;
     let mut child_exited = false;
+    let mut dirty = true;
     while running {
-        apply_available(core, &output_rx, bridge_rx.as_ref(), projection);
+        dirty |= apply_available(core, &output_rx, bridge_rx.as_ref(), projection);
         while unsafe { XPending(display) } > 0 {
             let mut event = XEvent {
                 type_: 0,
@@ -766,6 +768,7 @@ fn run_window(
                         };
                         let _ = writer.write_all(bytes);
                         let _ = writer.flush();
+                        dirty = true;
                     }
                 }
                 BUTTON_PRESS => {
@@ -775,6 +778,7 @@ fn run_window(
                             FrameGeometry::new(width, height).cell_at(button.x, button.y)
                         {
                             selection = Some((cell, cell));
+                            dirty = true;
                         }
                     }
                 }
@@ -786,6 +790,7 @@ fn run_window(
                             FrameGeometry::new(width, height).cell_at(motion.x, motion.y),
                         ) {
                             selection = Some((anchor, cell));
+                            dirty = true;
                         }
                     }
                 }
@@ -797,6 +802,7 @@ fn run_window(
                             FrameGeometry::new(width, height).cell_at(button.x, button.y),
                         ) {
                             selection = Some((anchor, cell));
+                            dirty = true;
                         }
                     }
                 }
@@ -806,17 +812,23 @@ fn run_window(
                     width = configure.width.max(1);
                     height = configure.height.max(1);
                     resize_terminal(core, pty, width, height);
+                    dirty = true;
                 }
+                EXPOSE => dirty = true,
                 DESTROY_NOTIFY | CLIENT_MESSAGE => running = false,
                 _ => {}
             }
         }
         if matches!(pty.next_child_event(), Some(ChildEvent::Exited(_))) {
             child_exited = true;
+            dirty = true;
         }
-        draw_frame(
-            display, window, gc, width, height, core, projection, selection,
-        );
+        if dirty {
+            draw_frame(
+                display, window, gc, width, height, core, projection, selection,
+            );
+            dirty = false;
+        }
         if child_exited {
             // Keep one final frame visible long enough for a caller or bridge
             // to observe it, then restore/destroy the native surface.

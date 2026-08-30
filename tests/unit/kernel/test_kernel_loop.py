@@ -136,6 +136,26 @@ async def test_end_to_end_simple_completes(stack):
     assert "ModelResponseCompleted" in types
 
 
+async def test_prefix_metadata_is_observed_once_per_provider_attempt(stack, monkeypatch):
+    stack.provider._scripts = [
+        {"match": {"user_contains": "prefix"}, "respond": {"text": "done", "done": True}}
+    ]
+    observed = 0
+    original = stack.kernel._observe_prefix
+
+    async def counted(*args, **kwargs):
+        nonlocal observed
+        observed += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(stack.kernel, "_observe_prefix", counted)
+    spec = await _create(stack, "prefix check")
+    result = await stack.kernel.run_task(spec.id)
+
+    assert result.status == TaskStatus.COMPLETE
+    assert observed == 1
+
+
 @pytest.mark.athena_claim("INV-001")
 @pytest.mark.athena_evidence("test", "invariant")
 @pytest.mark.athena_scenario("FUSE-004")

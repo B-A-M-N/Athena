@@ -349,6 +349,31 @@ def test_live_trace_overflow_cue_renders_at_right_edge_for_long_lines():
         assert len(line) <= 40, f"Line exceeds aperture: {line!r} (len={len(line)})"
 
 
+def test_projection_retains_bounded_runtime_entities_and_partial_output():
+    state = ProjectionState()
+    for index in range(140):
+        task_id = f"task-{index}"
+        state.reduce("TaskCreated", {"task_id": task_id, "objective": task_id})
+        state.reduce("TaskCompleted", {"task_id": task_id})
+    for index in range(300):
+        execution_id = f"execution-{index}"
+        state.reduce("ExecutionStarted", {"execution_id": execution_id, "runtime": "python"})
+        state.reduce("ExecutionExited", {"execution_id": execution_id, "exit_code": 0})
+    for index in range(80):
+        state.reduce(
+            "VerificationCheckCompleted",
+            {"criterion": f"check-{index}", "status": "passed"},
+        )
+
+    state.feed_stream("x" * (64 * 1024))
+
+    assert len(state.tasks) == 128
+    assert len(state.executions) == 256
+    assert len(state.verification_checks) == 64
+    assert len(state.stream_partial) <= 32 * 1024
+    assert "truncated" in state.stream_partial
+
+
 def test_workspace_tree_is_bounded_to_aperture_and_exposes_truthful_node_overflow_label():
     """Regression: an overlong workspace tree must fit inside the tree aperture and
     expose a truthful ``[N nodes]`` overflow/scroll affordance when the number of

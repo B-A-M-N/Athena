@@ -939,9 +939,6 @@ class DualPaneSurface(OperatorSurface):
         self.layout = compute_layout(self._term_cols, self._term_rows, self.display_requested)
         self.dual = self.layout.mode.value != "plain"
         self._full_screen = self._supports_full_screen()
-        self.scene = build_oi_scene(
-            self.projection, self.layout.oi, character=self.mascot.character
-        )
 
     def _left_width(self) -> int:
         if not self.dual:
@@ -1078,8 +1075,6 @@ class DualPaneSurface(OperatorSurface):
     async def render_event(self, event: Any) -> None:
         etype = str(getattr(event, "type", ""))
         payload = dict(getattr(event, "payload", {}) or {})
-        if self._full_screen:
-            self._refresh_terminal_size()
         self._ingest_event(etype, payload, task_id=getattr(event, "task_id", None))
 
         # In a composed TTY, details mode means expandable thinking content,

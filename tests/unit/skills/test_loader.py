@@ -54,3 +54,34 @@ async def test_malformed_skill_md_is_skipped_gracefully(skills_dir: Path):
     assert "valid_helper" in names
     assert "99invalid" not in names
     assert loader.errors
+
+
+async def test_repeated_loads_replace_state_and_use_revision_cache(
+    skills_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    skill_dir = skills_dir / "cached"
+    skill_dir.mkdir()
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text("---\nname: cached\ndescription: cached skill\n---\nDo the thing.\n")
+    loader = SkillLoader(search_paths=[skills_dir])
+    original = loader.parse_skill_file
+    parses = 0
+
+    def counted(*args, **kwargs):
+        nonlocal parses
+        parses += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "parse_skill_file", counted)
+
+    for _ in range(100):
+        assert len(await loader.load_active()) == 1
+
+    assert len(loader._skills) == 1  # noqa: SLF001 - cache invariant
+    assert parses == 1
+    assert loader.generation == 1
+
+    skill_path.write_text("---\nname: cached\ndescription: changed skill\n---\nDo the new thing.\n")
+    assert (await loader.load_active())[0].description == "changed skill"
+    assert parses == 2
+    assert loader.generation == 2
