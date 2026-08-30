@@ -58,6 +58,7 @@ from athena.models.compat.profiles import ModelProfile, resolve_profile
 from athena.execution.runtimes import PythonRuntime, ShellRuntime
 from athena.execution.runtimes.powershell import PowerShellRuntime
 from athena.execution.runtimes.node import NodeRuntime
+from athena.hermes import HermesDecision, HermesReferee, HermesVerdict, ReviewPacket
 from athena.kernel.kernel import AgentKernel
 from athena.kernel.dispatch import CapabilityDispatchShim
 from athena.kernel.termination import TerminationEvaluator
@@ -152,12 +153,19 @@ class AthenaService:
     # ------------------------------------------------------------------ #
     # Construction / factories
     # ------------------------------------------------------------------ #
-    def __init__(self, *, config: AthenaConfig | None = None, device_provider=None) -> None:
+    def __init__(
+        self,
+        *,
+        config: AthenaConfig | None = None,
+        device_provider=None,
+        hermes_referee: HermesReferee | None = None,
+    ) -> None:
         self.config = config or AthenaConfig()
         # Optional OI/device adapter surface.  Reflection must receive the
         # configured provider at registration time instead of silently
         # reporting "unsupported" for a provider owned by the host.
         self._device_provider = device_provider
+        self._hermes_referee = hermes_referee
         self._started = False
         self._recovery_status = "not_started"
         self._recovery_summary: dict[str, int] = {}
@@ -1463,6 +1471,21 @@ class AthenaService:
             "reason": verdict["reason"],
             "missing_obligations": verdict["missing_obligations"],
         }
+        if self._hermes_referee is not None:
+            hermes = await self._run_hermes_mission_referee(
+                mission,
+                plan=plan,
+                current_index=current_index,
+                bundle=bundle,
+                current_fingerprint=current_fingerprint,
+                release_evidence=release_evidence,
+                task_id=task_id,
+            )
+            verification["hermes"] = hermes
+            if hermes.get("decision") != HermesDecision.MISSION_COMPLETE_SUPPORTED.value:
+                return None, str(
+                    hermes.get("rationale") or "Hermes did not support mission completion"
+                )
         proof = SelfHostMissionController.completion_proof(
             plan,
             objective=str(mission.get("objective") or ""),
@@ -1473,6 +1496,70 @@ class AthenaService:
             completion_verification=verification,
         )
         return proof, None
+
+    async def _run_hermes_mission_referee(
+        self,
+        mission: Mapping[str, Any],
+        *,
+        plan: Mapping[str, Any],
+        current_index: Any,
+        bundle: SelfHostGateBundle,
+        current_fingerprint: str,
+        release_evidence: Mapping[str, Any],
+        task_id: str | None,
+    ) -> dict[str, Any]:
+        """Referee the whole mission without granting mutation authority."""
+        referee = self._hermes_referee
+        if referee is None:
+            return HermesVerdict(
+                decision=HermesDecision.HOLD,
+                rationale="Hermes referee is not configured",
+            ).to_record()
+        try:
+            completed = plan.get("completed_work_items") or ()
+            context = bundle.retrieve_design_context(
+                paths=("SELF_HOSTING.md", "SECURITY.md", "docs/ARCHITECTURE.md"),
+                invariants=("mission completion", "proof before promotion"),
+            )
+            packet = ReviewPacket(
+                kind="mission",
+                mission={
+                    "id": mission.get("id"),
+                    "objective": mission.get("objective"),
+                    "status": mission.get("status"),
+                },
+                work_item={"completed_work_items": list(completed)},
+                risk={"level": "medium", "paths": []},
+                base_identity={
+                    "fingerprint": current_fingerprint,
+                    "source_revision": bundle.source_revision,
+                },
+                candidate_identity={"fingerprint": current_fingerprint},
+                frozen_contract_context=context,
+                release_results={
+                    **dict(release_evidence),
+                    "review_eligible": (
+                        release_evidence.get("review", {}).get("eligible") is True
+                        if isinstance(release_evidence.get("review"), Mapping)
+                        else False
+                    ),
+                },
+                reviewer_history=tuple(
+                    dict(item) for item in completed if isinstance(item, Mapping)
+                ),
+                resource_usage={
+                    "current_index_revision": getattr(current_index, "index_revision", ""),
+                    "task_id": task_id,
+                },
+            )
+            verdict = await referee.review(packet)
+            return verdict.to_record()
+        except Exception as exc:
+            return HermesVerdict(
+                decision=HermesDecision.HOLD,
+                rationale=f"Hermes mission packet construction failed: {exc}",
+                blockers=("Hermes mission review unavailable",),
+            ).to_record()
 
     async def self_host_status(self, *, workspace_root: str | None = None) -> list[dict[str, Any]]:
         missions = self._self_host_missions
@@ -2524,13 +2611,125 @@ class AthenaService:
             isinstance(existing, dict)
             and existing.get("certificate_hash") == candidate.get("certificate_hash")
             and (candidate.get("integrity_review") or {}).get("eligible") is True
+            and (self._hermes_referee is None or isinstance(existing.get("hermes"), Mapping))
         ):
             return existing
         review = await self._run_self_host_reviewer(task_row or {}, candidate)
+        if self._hermes_referee is not None:
+            review = await self._run_hermes_candidate_referee(
+                mission,
+                task_row or {},
+                candidate,
+                review,
+            )
         plan = dict(mission.get("plan") or {})
         plan["review"] = review
         await mission_store.update(mission["id"], status="review", plan=plan)
         return review
+
+    async def _run_hermes_candidate_referee(
+        self,
+        mission: Mapping[str, Any],
+        task_row: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        review: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Run the optional external referee over one canonical review packet."""
+        referee = self._hermes_referee
+        if referee is None:
+            return dict(review)
+        try:
+            base_root = str(candidate.get("base_workspace_root") or "")
+            raw_bundle = (task_row.get("metadata") or {}).get("_athena_gate_bundle")
+            if not isinstance(raw_bundle, Mapping) or not base_root:
+                raise ValueError("review authority bundle is missing")
+            bundle = SelfHostGateBundle.capture(base_root, allow_dirty=True)
+            for key in ("source_revision", "design_bundle_hash", "gate_bundle_hash"):
+                if str(getattr(bundle, key)) != str(raw_bundle.get(key) or ""):
+                    raise ValueError("review authority bundle is stale")
+            changed_paths = [
+                str(resource.get("path") or resource.get("resource") or "")
+                if isinstance(resource, Mapping)
+                else str(resource)
+                for resource in candidate.get("changed_resources") or ()
+            ]
+            context = (
+                bundle.retrieve_design_context(paths=changed_paths) if bundle is not None else ""
+            )
+            mission_plan = mission.get("plan") or {}
+            item = (
+                mission_plan.get("current_work_item") if isinstance(mission_plan, Mapping) else {}
+            )
+            if not isinstance(item, Mapping):
+                item = next(
+                    (
+                        value
+                        for value in mission_plan.get("completed_work_items", ())
+                        if isinstance(value, Mapping)
+                        and value.get("task_id") == candidate.get("task_id")
+                    ),
+                    {},
+                )
+            usage = task_row.get("usage") or (task_row.get("metadata") or {}).get(
+                "_budget_usage", {}
+            )
+            packet = ReviewPacket(
+                kind="candidate",
+                mission={
+                    "id": mission.get("id"),
+                    "objective": mission.get("objective"),
+                    "status": mission.get("status"),
+                },
+                work_item=dict(item),
+                risk=dict(candidate.get("risk") or {}),
+                base_identity={
+                    "fingerprint": candidate.get("base_fingerprint"),
+                    "source_revision": (candidate.get("proof_authority") or {}).get(
+                        "source_revision"
+                    )
+                    if isinstance(candidate.get("proof_authority"), Mapping)
+                    else None,
+                },
+                candidate_identity={
+                    "branch_id": candidate.get("branch_id"),
+                    "fingerprint": candidate.get("candidate_fingerprint"),
+                    "certificate_hash": candidate.get("certificate_hash"),
+                },
+                diff=await self._candidate_diff_text(str(candidate.get("task_id") or "")),
+                frozen_contract_context=context,
+                verification_results=tuple(
+                    value
+                    for value in candidate.get("verification") or ()
+                    if isinstance(value, Mapping)
+                ),
+                release_results={
+                    "task_status": task_row.get("status"),
+                    "review_eligible": review.get("eligible") is True,
+                    "certificate_hash": candidate.get("certificate_hash"),
+                    "authority_bundle_present": True,
+                },
+                producer_models=tuple(str(value) for value in review.get("producer_models") or ()),
+                reviewer_history=(dict(review),),
+                resource_usage=dict(usage) if isinstance(usage, Mapping) else {},
+            )
+            verdict = await referee.review(packet)
+        except Exception as exc:  # the external referee fails closed
+            verdict = HermesVerdict(
+                decision=HermesDecision.HOLD,
+                rationale=f"Hermes packet construction failed: {exc}",
+                blockers=("Hermes review packet unavailable",),
+            )
+        result = dict(review)
+        result["hermes"] = verdict.to_record()
+        if verdict.decision not in {
+            HermesDecision.PASS,
+            HermesDecision.READY_FOR_HUMAN_REVIEW,
+        }:
+            result["eligible"] = False
+        if verdict.decision == HermesDecision.READY_FOR_HUMAN_REVIEW:
+            result["requires_human_review"] = True
+        result["evidence_hash"] = _json_hash(result)
+        return result
 
     async def _run_self_host_reviewer(
         self,

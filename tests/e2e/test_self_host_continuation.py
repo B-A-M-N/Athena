@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from athena.hermes import HermesReferee
 from athena.service.service import AthenaService
 from athena.self_host.controller import SelfHostMissionController
 
@@ -104,6 +105,9 @@ async def test_completion_requires_a_separate_verifier():
 
     service = AthenaService.in_memory()
     service._kernel = _Verifier()  # noqa: SLF001 - exercise completion authority
+    service._hermes_referee = HermesReferee(  # noqa: SLF001 - exercise external seam
+        lambda _packet: {"decision": "PASS", "rationale": "history is covered"}
+    )
     index = SimpleNamespace(index_revision="index", source_revision="source")
     authority = _Authority()
     plan = {
@@ -142,4 +146,5 @@ async def test_completion_requires_a_separate_verifier():
     assert error is None
     assert proof is not None
     assert proof["completion_verification"]["complete"] is True
+    assert proof["completion_verification"]["hermes"]["decision"] == "MISSION_COMPLETE_SUPPORTED"
     assert proof["proof_hash"]

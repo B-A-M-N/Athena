@@ -556,6 +556,7 @@ async def _cmd_self(o: Options, service: Any) -> int:
             f"certificate {candidate.get('certificate_hash', 'missing')}"
         )
         _print_candidate_proof(candidate)
+        _print_hermes_verdict(candidate)
         print("[a] Apply  [d] Discard  [l] Later")
         # Full-screen terminal sessions own stdin/stdout modes.  Return the
         # terminal to normal cooked mode before collecting the operator's
@@ -601,6 +602,7 @@ async def _cmd_self_review(task_id: str, service: Any) -> int:
     for resource in candidate.get("changed_resources") or ():
         print(f"  {resource.get('path', resource) if isinstance(resource, dict) else resource}")
     _print_candidate_proof(candidate)
+    _print_hermes_verdict(candidate)
     independent = candidate.get("independent_review") or {}
     if independent:
         print(
@@ -636,6 +638,21 @@ def _print_candidate_proof(candidate: dict[str, Any]) -> None:
             label = str(check)
             passed = False
         print(f"  {label:<14} {'PASS' if passed else 'FAIL'}")
+
+
+def _print_hermes_verdict(candidate: dict[str, Any]) -> None:
+    """Render optional external-governor evidence without making a decision."""
+    review = candidate.get("independent_review") or {}
+    verdict = review.get("hermes") if isinstance(review, dict) else None
+    if not isinstance(verdict, dict):
+        return
+    print(f"\nHermes referee: {verdict.get('decision', 'UNKNOWN')}")
+    rationale = str(verdict.get("rationale") or "").strip()
+    if rationale:
+        print(f"  {rationale}")
+    for challenge in verdict.get("challenges") or ():
+        if isinstance(challenge, dict):
+            print(f"  challenge: {challenge.get('request') or challenge.get('claim') or challenge}")
 
 
 async def _cmd_sessions(service: Any) -> int:
