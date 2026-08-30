@@ -14,22 +14,13 @@ from pathlib import Path
 import subprocess
 from dataclasses import dataclass
 
+from athena.release.gates import candidate_commands
+
 
 class SelfHostGatePolicy:
     """Build the mandatory candidate proof set for Athena source changes."""
 
-    REQUIRED_COMMANDS = (
-        "uv run --frozen --no-sync ruff format --check --no-cache src tests",
-        "uv run --frozen --no-sync ruff check --no-cache src tests",
-        "uv run --frozen --no-sync mypy --cache-dir /tmp/athena-mypy-cache src",
-        "uv run --frozen --no-sync pytest -p no:cacheprovider -q",
-        "uv run --frozen --no-sync python scripts/architecture-lint",
-        "uv run --frozen --no-sync python scripts/scenarios --exclude-family VHS --output /tmp/athena-self-scenarios.json",
-        "cargo check --manifest-path native/Cargo.toml --locked --offline",
-        "cargo test --manifest-path native/Cargo.toml --locked --offline",
-        "scripts/native-smoke",
-        "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_release_black_box.py",
-    )
+    REQUIRED_COMMANDS = candidate_commands()
 
     DESIGN_CONTRACTS = (
         "SPEC.md",
@@ -39,6 +30,7 @@ class SelfHostGatePolicy:
         "docs/ARCHITECTURE.md",
         "SHELL_HARDENING.md",
         "SELF_HOSTING.md",
+        "src/athena/release/gates.py",
     )
 
     @classmethod

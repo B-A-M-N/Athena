@@ -593,6 +593,11 @@ async def _cmd_self_review(task_id: str, service: Any) -> int:
     for resource in candidate.get("changed_resources") or ():
         print(f"  {resource.get('path', resource) if isinstance(resource, dict) else resource}")
     _print_candidate_proof(candidate)
+    independent = candidate.get("independent_review") or {}
+    if independent:
+        print(
+            f"\nIndependent review: {'ELIGIBLE' if independent.get('eligible') else 'NOT ELIGIBLE'}"
+        )
     print("\n[a] Apply  [d] Discard  [l] Later")
     try:
         choice = input("choice> ").strip().lower()[:1]

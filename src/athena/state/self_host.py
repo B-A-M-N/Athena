@@ -87,7 +87,7 @@ class SelfHostMissionStore:
     async def latest_active(self, project_root: str) -> dict[str, Any] | None:
         row = await self._db.fetch_one(
             "SELECT * FROM self_host_missions WHERE project_root = ? "
-            "AND status IN ('active', 'review', 'blocked') "
+            "AND status IN ('active', 'review', 'blocked', 'promoted', 'discarded') "
             "ORDER BY updated_at DESC LIMIT 1",
             (project_root,),
         )

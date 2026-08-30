@@ -31,6 +31,9 @@ import time
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from athena.release.gates import release_commands  # noqa: E402
 
 
 def _git(*args: str, cwd: Path = REPO_ROOT) -> str:
@@ -113,91 +116,6 @@ def _extract_commit(commit: str, checkout: Path, *, timeout: float) -> None:
                 raise RuntimeError(f"frozen archive contains unsafe path: {member.name}")
             members.append(member)
         tar.extractall(checkout, members=members)
-
-
-def _commands(uv: str, *, skip_e2e: bool, bootstrap: bool) -> list[tuple[str, list[str]]]:
-    # The clean archive has no editable development environment. Select the
-    # locked dev extra explicitly so pytest/mypy/ruff/build never fall through
-    # to an unrelated host interpreter on PATH.
-    prefix = [uv, "run", "--frozen", "--extra", "dev"]
-    commands: list[tuple[str, list[str]]] = [
-        ("ruff-format", [*prefix, "ruff", "format", "--check", "src", "tests"]),
-        ("ruff-check", [*prefix, "ruff", "check", "src", "tests"]),
-        ("mypy", [*prefix, "mypy", "src/athena"]),
-        ("compileall", [*prefix, "python", "-m", "compileall", "-q", "src", "tests"]),
-        ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "--ignore=tests/e2e"]),
-        (
-            "release-scenarios",
-            [
-                *prefix,
-                "python",
-                "scripts/scenarios",
-                "--require-clean",
-                "--exclude-family",
-                "VHS",
-                "--output",
-                "release-scenarios.json",
-            ],
-        ),
-        ("architecture-lint", [*prefix, "python", "scripts/architecture-lint"]),
-    ]
-    if bootstrap:
-        commands.append(
-            (
-                "native-fetch",
-                [
-                    "cargo",
-                    "fetch",
-                    "--manifest-path",
-                    "native/Cargo.toml",
-                    "--locked",
-                ],
-            )
-        )
-    # The native crate pins a git dependency. The release gate is offline by
-    # default; --bootstrap opts into the one network phase above.
-    commands.extend(
-        [
-            (
-                "native-check",
-                [
-                    "cargo",
-                    "check",
-                    "--manifest-path",
-                    "native/Cargo.toml",
-                    "--locked",
-                    "--offline",
-                ],
-            ),
-            (
-                "native-test",
-                [
-                    "cargo",
-                    "test",
-                    "--manifest-path",
-                    "native/Cargo.toml",
-                    "--locked",
-                    "--offline",
-                ],
-            ),
-            ("native-smoke", ["scripts/native-smoke"]),
-        ]
-    )
-    if not skip_e2e:
-        commands.append(
-            (
-                "e2e",
-                [
-                    *prefix,
-                    "pytest",
-                    "-q",
-                    "-p",
-                    "no:cacheprovider",
-                    "tests/e2e/test_release_black_box.py",
-                ],
-            )
-        )
-    return commands
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -313,7 +231,11 @@ def main(argv: list[str] | None = None) -> int:
         # scenarios --require-clean assertion fail for the wrong reason.
         env["UV_PROJECT_ENVIRONMENT"] = str(temp_root / "venv")
         env["UV_CACHE_DIR"] = str(temp_root / "uv-cache")
-        for name, command in _commands(args.uv, skip_e2e=args.skip_e2e, bootstrap=args.bootstrap):
+        for name, command in release_commands(
+            args.uv,
+            skip_e2e=args.skip_e2e,
+            bootstrap=args.bootstrap,
+        ):
             record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
             record["name"] = name
             lanes.append(record)

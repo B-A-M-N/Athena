@@ -2005,6 +2005,9 @@ class AthenaService:
             if hasattr(certificate, "to_record")
             else dict(certificate or {})
         )
+        from athena.self_host.reviewer import SelfHostIndependentReviewer
+
+        verification = list(getattr(branch, "verification", ()) or ())
         return {
             "task_id": task_id,
             "branch_id": branch.id,
@@ -2015,9 +2018,14 @@ class AthenaService:
             "candidate_fingerprint": certificate.get("candidate_fingerprint"),
             "certificate_hash": certificate.get("certificate_hash"),
             "changed_resources": list(certificate.get("changed_resources") or []),
-            "verification": list(getattr(branch, "verification", ()) or ()),
+            "verification": verification,
             "proof_authority": certificate.get("proof_authority"),
             "risk": self._self_host_risk(certificate.get("changed_resources") or []),
+            "independent_review": SelfHostIndependentReviewer.review(
+                status=str(branch.status),
+                certificate=certificate,
+                verification=verification,
+            ),
             "error": getattr(branch, "error", None),
         }
 
@@ -2118,6 +2126,14 @@ class AthenaService:
                     "error": "candidate apply requires the matching durable operator approval",
                 }
         review = await self.operator_candidate(task_id) or {}
+        task_row = await self._store_tasks.get(task_id) if self._store_tasks is not None else None
+        self_host = bool(((task_row or {}).get("metadata") or {}).get("_athena_self_host"))
+        if self_host and not (review.get("independent_review") or {}).get("eligible", False):
+            return {
+                "status": "REVIEW_REQUIRED",
+                "branch": branch.id,
+                "error": "independent certificate review is not eligible for promotion",
+            }
         await self._candidate_review_event(
             "CANDIDATE_APPLY_REQUESTED", task_id, review, {"operator": "local"}
         )
@@ -2156,13 +2172,23 @@ class AthenaService:
         if missions is not None:
             mission = await missions.for_task(task_id)
             if mission is not None:
+                committed = outcome.get("status") == "committed"
+                mission_plan = dict(mission.get("plan") or {})
+                if committed:
+                    mission_plan["step"] = int(mission_plan.get("step") or 1) + 1
+                    root = str(review.get("base_workspace_root") or "")
+                    if self._project_index_coordinator is not None and root:
+                        self._project_index_coordinator.mark_stale(root)
+                        try:
+                            await self._project_index_coordinator.refresh(root)
+                        except Exception as exc:
+                            _logger.warning("self-host project index refresh failed: %s", exc)
                 await missions.update(
                     mission["id"],
-                    status="promoted" if outcome.get("status") == "committed" else "active",
+                    status="promoted" if committed else "active",
                     candidate_fingerprint=review.get("candidate_fingerprint"),
-                    last_error=(
-                        outcome.get("error") if outcome.get("status") != "committed" else None
-                    ),
+                    plan=mission_plan,
+                    last_error=(outcome.get("error") if not committed else None),
                 )
         return outcome
 

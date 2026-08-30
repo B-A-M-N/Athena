@@ -7,6 +7,7 @@ from athena.state.database import Database
 from athena.state.self_host import SelfHostMissionStore
 from athena.state.tasks import TaskStore
 from athena.self_host.risk import SelfHostRiskClassifier
+from athena.self_host.reviewer import SelfHostIndependentReviewer
 
 
 @pytest.fixture
@@ -46,3 +47,22 @@ def test_self_host_risk_is_deterministic_and_operator_bound():
     assert result["level"] == "high"
     assert result["requires_operator_promotion"] is True
     assert result["requires_independent_review"] is True
+
+
+def test_independent_review_requires_bound_certificate_and_all_checks():
+    result = SelfHostIndependentReviewer.review(
+        status="VERIFIED",
+        certificate={
+            "certificate_hash": "cert",
+            "base_fingerprint": "base",
+            "candidate_fingerprint": "candidate",
+            "proof_authority": {
+                "source_revision": "abc",
+                "gate_bundle_hash": "gates",
+            },
+        },
+        verification=[{"id": "gate", "passed": True}],
+    )
+    assert result["eligible"] is True
+    assert result["independent"] is True
+    assert result["evidence_hash"]
