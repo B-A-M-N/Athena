@@ -27,6 +27,9 @@ class SelfHostMissionStore:
         design_bundle_hash: str,
         gate_bundle_hash: str,
         current_base_fingerprint: str | None = None,
+        current_git_revision: str | None = None,
+        current_design_bundle_hash: str | None = None,
+        current_gate_bundle_hash: str | None = None,
         plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         mission_id = new_id("mission")
@@ -43,6 +46,9 @@ class SelfHostMissionStore:
             "gate_bundle_hash": gate_bundle_hash,
             "candidate_fingerprint": None,
             "current_base_fingerprint": current_base_fingerprint,
+            "current_git_revision": current_git_revision or base_revision,
+            "current_design_bundle_hash": current_design_bundle_hash or design_bundle_hash,
+            "current_gate_bundle_hash": current_gate_bundle_hash or gate_bundle_hash,
             "plan": mission_plan,
             "last_error": None,
             "created_at": now,
@@ -52,9 +58,10 @@ class SelfHostMissionStore:
             "INSERT INTO self_host_missions ("
             "id, project_root, objective, status, current_task_id, base_revision, "
             "design_bundle_hash, gate_bundle_hash, candidate_fingerprint, "
-            "current_base_fingerprint, plan, "
+            "current_base_fingerprint, current_git_revision, "
+            "current_design_bundle_hash, current_gate_bundle_hash, plan, "
             "last_error, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mission_id,
                 project_root,
@@ -66,6 +73,9 @@ class SelfHostMissionStore:
                 gate_bundle_hash,
                 None,
                 current_base_fingerprint,
+                current_git_revision or base_revision,
+                current_design_bundle_hash or design_bundle_hash,
+                current_gate_bundle_hash or gate_bundle_hash,
                 json.dumps(mission_plan, sort_keys=True),
                 None,
                 now,
@@ -116,6 +126,9 @@ class SelfHostMissionStore:
             "design_bundle_hash",
             "gate_bundle_hash",
             "current_base_fingerprint",
+            "current_git_revision",
+            "current_design_bundle_hash",
+            "current_gate_bundle_hash",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:

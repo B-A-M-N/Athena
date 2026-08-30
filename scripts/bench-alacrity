@@ -6,7 +6,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
+import sys
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from athena.state.database import Database
 from athena.state.events import EventStore
@@ -43,10 +47,20 @@ async def _run(count: int) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--events", type=int, default=5000)
+    parser.add_argument("--min-producer-events-per-second", type=float, default=10_000)
     args = parser.parse_args()
     if args.events < 1 or args.events > 100_000:
         parser.error("--events must be between 1 and 100000")
-    print(json.dumps(asyncio.run(_run(args.events)), sort_keys=True))
+    result = asyncio.run(_run(args.events))
+    print(json.dumps(result, sort_keys=True))
+    rate = float(result.get("producer_events_per_second") or 0)
+    if rate < args.min_producer_events_per_second:
+        print(
+            f"bench-alacrity: producer rate {rate:g} is below "
+            f"threshold {args.min_producer_events_per_second:g}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

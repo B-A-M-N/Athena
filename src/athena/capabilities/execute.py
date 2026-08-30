@@ -226,6 +226,11 @@ class ExecuteCapability:
                 if verification_environment is not None
                 else _trusted_toolchain_paths(ws)
             ),
+            writable_toolchain_paths=(
+                verification_environment.writable_mounts
+                if verification_environment is not None
+                else ()
+            ),
         )
         execution_id = _new_id()
 

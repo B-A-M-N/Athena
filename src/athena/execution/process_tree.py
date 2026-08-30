@@ -55,6 +55,7 @@ def spawn_owned(
     writable_paths: tuple[str, ...] | None = None,
     read_only_paths: tuple[str, ...] = (),
     toolchain_paths: tuple[str, ...] = (),
+    writable_toolchain_paths: tuple[str, ...] = (),
     **popen_kwargs: object,
 ) -> "subprocess.Popen[str]":
     """Spawn ``argv`` in its own process group so the whole tree can be killed.
@@ -110,6 +111,7 @@ def spawn_owned(
             writable_paths=writable_paths,
             read_only_paths=read_only_paths,
             toolchain_paths=toolchain_paths,
+            writable_toolchain_paths=writable_toolchain_paths,
         )
         root_abs = os.path.realpath(os.path.abspath(sandbox_root))
         my_env["PATH"] = _namespace_path(my_env.get("PATH", ""), root_abs)
@@ -137,6 +139,7 @@ def sandbox_argv(
     writable_paths: tuple[str, ...] | None = None,
     read_only_paths: tuple[str, ...] = (),
     toolchain_paths: tuple[str, ...] = (),
+    writable_toolchain_paths: tuple[str, ...] = (),
 ) -> list[str]:
     """Build a fail-closed Linux Bubblewrap command line.
 
@@ -236,6 +239,21 @@ def sandbox_argv(
             if directory not in ("/", "/usr", "/bin", "/lib", "/lib64"):
                 command.extend(("--dir", directory))
         command.extend(("--ro-bind", bind_path, bind_path))
+
+    for raw_path in writable_toolchain_paths:
+        path = os.path.realpath(os.path.abspath(raw_path))
+        if not os.path.exists(path):
+            raise RuntimeError(f"trusted writable toolchain path does not exist: {raw_path}")
+        parent = path if os.path.isdir(path) else os.path.dirname(path)
+        writable_ancestors: list[str] = []
+        ancestor = parent
+        while ancestor not in ("", os.path.dirname(ancestor)):
+            writable_ancestors.append(ancestor)
+            ancestor = os.path.dirname(ancestor)
+        for directory in reversed(writable_ancestors):
+            if directory not in ("/", "/usr", "/bin", "/lib", "/lib64"):
+                command.extend(("--dir", directory))
+        command.extend(("--bind", path, path))
 
     # Mount the workspace read-only first whenever an explicit writable policy
     # is supplied, then overlay only the allowed canonical subtrees. Denied

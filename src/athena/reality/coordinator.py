@@ -27,6 +27,8 @@ from athena.protocol.tasks import (
     MutationMode,
     TaskSpec,
     TaskStatus,
+    VerificationSpec,
+    VerificationType,
     WorkspaceSpec,
 )
 from athena.reality.gate import ExecutionDisposition
@@ -725,6 +727,29 @@ class RealityCoordinator:
         impact: Mapping[str, Any] | None = None,
     ) -> tuple[Criterion, ...]:
         explicit = tuple(c for c in task.acceptance_criteria if c.required)
+        metadata = task.metadata or {}
+        if bool(metadata.get("_athena_self_host")):
+            from athena.self_host.gates import SelfHostGatePolicy
+
+            if SelfHostGatePolicy.requires_dependency_proof(changed_resources):
+                dependency_command = SelfHostGatePolicy.dependency_sync_command(task.id)
+                if not any(
+                    getattr(c.verification, "command", None) == dependency_command for c in explicit
+                ):
+                    explicit += (
+                        Criterion(
+                            id="self_host_dependency_environment",
+                            description=(
+                                "self-host dependency proof: isolated offline sync "
+                                f"{dependency_command}"
+                            ),
+                            verification=VerificationSpec(
+                                type=VerificationType.COMMAND,
+                                command=dependency_command,
+                            ),
+                            required=True,
+                        ),
+                    )
         baseline = tuple(
             await self._derive_default_criteria(
                 task,

@@ -96,6 +96,7 @@ class PythonRuntime(BaseRuntime):
         writable_paths=None,
         read_only_paths=(),
         toolchain_paths=(),
+        writable_toolchain_paths=(),
     ) -> "_PythonSession":
         sess = _PythonSession(
             env=env,
@@ -105,6 +106,7 @@ class PythonRuntime(BaseRuntime):
             writable_paths=writable_paths,
             read_only_paths=read_only_paths,
             toolchain_paths=toolchain_paths,
+            writable_toolchain_paths=writable_toolchain_paths,
         )
         sess.start()
         return sess
@@ -129,6 +131,7 @@ class _PythonSession:
         writable_paths=None,
         read_only_paths=(),
         toolchain_paths=(),
+        writable_toolchain_paths=(),
     ) -> None:
         self.env = env or {}
         self.cwd = cwd
@@ -137,6 +140,7 @@ class _PythonSession:
         self.writable_paths = writable_paths
         self.read_only_paths = read_only_paths
         self.toolchain_paths = toolchain_paths
+        self.writable_toolchain_paths = writable_toolchain_paths
         self.process: subprocess.Popen | None = None
         self.frames: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
@@ -151,6 +155,7 @@ class _PythonSession:
             writable_paths=self.writable_paths,
             read_only_paths=self.read_only_paths,
             toolchain_paths=self.toolchain_paths,
+            writable_toolchain_paths=self.writable_toolchain_paths,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

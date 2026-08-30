@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 from athena.context.compiler import CompiledContext, ContextCompiler
 from athena.models.registry import ProviderRegistry
@@ -1090,6 +1090,9 @@ class AgentKernel:
         system_prompt: str,
         user_prompt: str,
         role: str = "summarizer",
+        task_id: str | None = None,
+        session_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> str | None:
         """Route ONE task-less auxiliary inference through this kernel.
 
@@ -1117,10 +1120,20 @@ class AgentKernel:
                 policy=ModelPolicy(role=role, require_tools=False)
             )
             provider = self._registry.provider_for(selection.provider)
+            attempt_metadata = dict(metadata or {})
+            attempt_metadata.update(
+                {
+                    "role": role,
+                    "purpose": attempt_metadata.get("purpose", "utility_inference"),
+                    "state": "started",
+                }
+            )
             usage_id = await self._provider_usage_store.record_attempt(
                 provider=selection.provider,
                 model=selection.model,
-                metadata={"role": role, "purpose": "utility_inference"},
+                task_id=task_id,
+                session_id=session_id,
+                metadata=attempt_metadata,
             )
             messages: list[Message] = []
             if system_prompt:
@@ -1166,10 +1179,26 @@ class AgentKernel:
                                 parts.append(block.text)
                         usage = getattr(resp, "usage", None)
                         try:
+                            completion_metadata = dict(metadata or {})
+                            completion_metadata.update(
+                                {
+                                    "role": role,
+                                    "purpose": completion_metadata.get(
+                                        "purpose", "utility_inference"
+                                    ),
+                                    "state": "success",
+                                }
+                            )
                             await self._provider_usage_store.record_completion(
                                 usage_id,
                                 input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
                                 output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+                                cost_usd=(
+                                    str(getattr(usage, "cost_usd"))
+                                    if getattr(usage, "cost_usd", None) is not None
+                                    else None
+                                ),
+                                metadata=completion_metadata,
                             )
                             usage_id = None
                         except Exception:
@@ -1178,15 +1207,15 @@ class AgentKernel:
                 # started but never completed (stream ended without done);
                 # keep role metadata — record_completion REPLACES it
                 try:
+                    failure_metadata = dict(metadata or {})
+                    failure_metadata.update(
+                        {"role": role, "purpose": "utility_inference", "state": "no_done_event"}
+                    )
                     await self._provider_usage_store.record_completion(
                         usage_id,
                         input_tokens=0,
                         output_tokens=0,
-                        metadata={
-                            "role": role,
-                            "purpose": "utility_inference",
-                            "state": "no_done_event",
-                        },
+                        metadata=failure_metadata,
                     )
                 except Exception:
                     pass
@@ -1196,11 +1225,15 @@ class AgentKernel:
                 # started but never completed (exception mid-stream): close
                 # the row honestly rather than leaving it in-flight forever
                 try:
+                    failure_metadata = dict(metadata or {})
+                    failure_metadata.update(
+                        {"role": role, "purpose": "utility_inference", "state": "error"}
+                    )
                     await self._provider_usage_store.record_completion(
                         usage_id,
                         input_tokens=0,
                         output_tokens=0,
-                        metadata={"role": role, "purpose": "utility_inference", "state": "error"},
+                        metadata=failure_metadata,
                     )
                 except Exception:
                     pass

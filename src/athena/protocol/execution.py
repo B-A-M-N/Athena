@@ -51,6 +51,9 @@ class ExecutionRequest:
     # Trusted, operator-selected toolchain paths mounted read-only for
     # verification. This is deliberately separate from model-controlled env.
     toolchain_paths: tuple[str, ...] = ()
+    # Explicit trusted caches that proof tools may update, such as the uv
+    # cache during an offline ephemeral dependency sync.
+    writable_toolchain_paths: tuple[str, ...] = ()
     resource_limits: ExecutionLimits | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 

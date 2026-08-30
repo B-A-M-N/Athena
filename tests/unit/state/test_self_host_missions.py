@@ -59,6 +59,7 @@ def test_independent_review_requires_bound_certificate_and_all_checks():
             "candidate_fingerprint": "candidate",
             "proof_authority": {
                 "source_revision": "abc",
+                "design_bundle_hash": "design",
                 "gate_bundle_hash": "gates",
             },
         },
@@ -70,7 +71,7 @@ def test_independent_review_requires_bound_certificate_and_all_checks():
     assert result["evidence_hash"]
 
 
-def test_self_host_plan_is_bounded_and_advances_without_repeating_completed_work():
+def test_self_host_plan_is_bounded_and_accepts_a_fresh_next_item():
     class Index:
         index_revision = "index-1"
         source_revision = "source-1"
@@ -94,3 +95,16 @@ def test_self_host_plan_is_bounded_and_advances_without_repeating_completed_work
     assert promoted["current_work_item"] is None
     assert promoted["completed_work_items"][0]["task_id"] == "task-1"
     assert SelfHostMissionController.next_work_item(promoted) is None
+    item, reason, error = SelfHostMissionController.parse_planner_output(
+        '{"done":false,"reason":"next bounded item",'
+        '"work_item":{"title":"fix next", "objective":"fix next thing",'
+        '"affected_files":["src/athena/kernel/kernel.py"],'
+        '"affected_invariants":["single-loop"],"dependencies":[]}}',
+        indexed_files={"src/athena/kernel/kernel.py"},
+    )
+    assert error is None
+    assert reason == "next bounded item"
+    assert item is not None
+    next_plan = SelfHostMissionController.replace_current_item(promoted, item, reason=reason)
+    assert next_plan["current_work_item"]["objective"] == "fix next thing"
+    assert len(next_plan["work_items"]) == 2

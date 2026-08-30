@@ -21,6 +21,16 @@ class SelfHostGatePolicy:
     """Build the mandatory candidate proof set for Athena source changes."""
 
     REQUIRED_COMMANDS = candidate_commands()
+    DEPENDENCY_MANIFESTS = frozenset(
+        {
+            "pyproject.toml",
+            "uv.lock",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "setup.py",
+            "setup.cfg",
+        }
+    )
 
     DESIGN_CONTRACTS = (
         "SPEC.md",
@@ -32,6 +42,14 @@ class SelfHostGatePolicy:
         "SELF_HOSTING.md",
         "src/athena/release/gates.py",
         "src/athena/self_host/gates.py",
+        "src/athena/self_host/controller.py",
+        "src/athena/self_host/reviewer.py",
+        "src/athena/self_host/risk.py",
+        "src/athena/service/service.py",
+        "src/athena/reality/coordinator.py",
+        "src/athena/shadow/engine.py",
+        "src/athena/kernel/verifiers.py",
+        "src/athena/execution/environment.py",
         "scripts/architecture-lint",
     )
 
@@ -64,6 +82,27 @@ class SelfHostGatePolicy:
                     criteria.append(normalized)
                     seen.add(normalized)
         return tuple(criteria)
+
+    @classmethod
+    def dependency_sync_command(cls, task_id: str) -> str:
+        """Return an isolated, offline dependency proof for one candidate."""
+        proof_id = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:16]
+        return (
+            f"UV_PROJECT_ENVIRONMENT=/tmp/athena-self-proof-{proof_id} "
+            "uv sync --locked --offline --extra dev"
+        )
+
+    @classmethod
+    def requires_dependency_proof(cls, changed_resources: Iterable[str]) -> bool:
+        """Identify dependency material from candidate-relative paths."""
+        for raw in changed_resources:
+            path = str(raw).replace("\\", "/").lstrip("./")
+            if path in cls.DEPENDENCY_MANIFESTS or path.rsplit("/", 1)[-1] in {
+                "pyproject.toml",
+                "uv.lock",
+            }:
+                return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -132,6 +171,46 @@ class SelfHostGateBundle:
             "design_bundle_hash": self.design_bundle_hash,
             "gate_bundle_hash": self.gate_bundle_hash,
         }
+
+    def design_context(self, *, max_bytes: int = 24_000) -> str:
+        """Return bounded contract text after rechecking captured hashes.
+
+        This reads only the host-captured base checkout.  It never reads the
+        candidate tree, and a changed authority file invalidates the context.
+        """
+        chunks: list[str] = []
+        consumed = 0
+        core = {
+            "SECURITY.md",
+            "SELF_HOSTING.md",
+            "docs/ARCHITECTURE.md",
+            "SHELL_HARDENING.md",
+        }
+        root = Path(self.project_root)
+        # Put the compact, high-value contracts first.  With a bounded prompt
+        # budget, iterating the manifest order could exhaust the budget on
+        # SPEC/BUILD excerpts before SELF_HOSTING.md was ever presented.
+        ordered_entries = sorted(
+            self.design_files,
+            key=lambda entry: (
+                0 if str(entry.get("path") or "") in core else 1,
+                self.design_files.index(entry),
+            ),
+        )
+        for entry in ordered_entries:
+            relative = str(entry.get("path") or "")
+            path = root / relative
+            if hashlib.sha256(path.read_bytes()).hexdigest() != str(entry.get("sha256") or ""):
+                raise ValueError(f"frozen design authority changed: {relative}")
+            text = path.read_text(encoding="utf-8", errors="replace")
+            budget = 4_500 if relative in core else 1_200
+            excerpt = text[:budget]
+            block = f"\n--- {relative} ---\n{excerpt}\n"
+            if consumed + len(block) > max_bytes:
+                break
+            chunks.append(block)
+            consumed += len(block)
+        return "".join(chunks)
 
 
 def _git_output(command: list[str]) -> str:

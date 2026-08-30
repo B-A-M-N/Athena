@@ -42,6 +42,7 @@ class VerificationEnvironment:
     environment_root: str | None
     environment: Mapping[str, str] = field(default_factory=dict)
     readonly_mounts: tuple[str, ...] = ()
+    writable_mounts: tuple[str, ...] = ()
     base_root: str | None = None
     toolchains: tuple[ToolchainBinding, ...] = ()
 
@@ -75,10 +76,15 @@ class VerificationEnvironment:
             missing.append("bubblewrap")
         cargo = shutil.which("cargo") if include_rust else None
         rustc = shutil.which("rustc") if include_rust else None
+        compiler_command = None
+        if include_rust:
+            compiler_command = shutil.which("gcc") or shutil.which("clang") or shutil.which("cc")
         if include_rust and cargo is None:
             missing.append("cargo")
         if include_rust and rustc is None:
             missing.append("rustc")
+        if include_rust and compiler_command is None:
+            missing.append("C compiler (gcc, clang, or cc)")
         if missing:
             raise ValueError(
                 "development verification environment is not bootstrapped "
@@ -103,8 +109,18 @@ class VerificationEnvironment:
             ).resolve()
             cargo_launcher = Path(cargo).resolve() if cargo else None
             rustc_launcher = Path(rustc).resolve() if rustc else None
+            compiler = Path(compiler_command).resolve() if compiler_command else None
             cargo_bin = Path(cargo).absolute().parent if cargo else None
             rustup_settings = rustup_home / "settings.toml"
+            uv_cache_raw = os.environ.get("UV_CACHE_DIR")
+            if uv_cache_raw:
+                uv_cache = Path(uv_cache_raw).resolve()
+            elif os.environ.get("XDG_CACHE_HOME"):
+                uv_cache = (Path(os.environ["XDG_CACHE_HOME"]) / "uv").resolve()
+            else:
+                uv_cache = (Path.home() / ".cache" / "uv").resolve()
+            ar = shutil.which("ar")
+            ranlib = shutil.which("ranlib")
             rust_roots = tuple(
                 str(path)
                 for path in (
@@ -113,32 +129,48 @@ class VerificationEnvironment:
                     cargo_home / "git",
                     rustup_settings if rustup_settings.is_file() else None,
                     rustup_home / "toolchains",
+                    compiler,
                 )
                 if path is not None and path.exists()
             )
             mounts.extend((*rust_roots,))
-            environment.update(
-                {
-                    "CARGO_HOME": str(cargo_home),
-                    "RUSTUP_HOME": str(rustup_home),
-                    "CARGO_NET_OFFLINE": "true",
-                }
-            )
+            rust_environment: dict[str, str] = {
+                "CARGO_HOME": str(cargo_home),
+                "RUSTUP_HOME": str(rustup_home),
+                "CARGO_NET_OFFLINE": "true",
+            }
+            if compiler is not None:
+                rust_environment["CC"] = str(compiler)
+                target = _rust_target_for_host()
+                if target:
+                    rust_environment[f"CARGO_TARGET_{target.upper().replace('-', '_')}_LINKER"] = (
+                        str(compiler)
+                    )
+                if ar:
+                    rust_environment["AR"] = str(Path(ar).resolve())
+                if ranlib:
+                    rust_environment["RANLIB"] = str(Path(ranlib).resolve())
+            if uv_cache.is_dir():
+                rust_environment["UV_CACHE_DIR"] = str(uv_cache)
+            environment.update(rust_environment)
             toolchains.append(
                 ToolchainBinding(
                     name="rust",
                     executable=str(Path(cargo).absolute()),
-                    readonly_roots=(
-                        str(Path(rustc).absolute()),
-                        str(rustc_launcher) if rustc_launcher else "",
-                        str(cargo_launcher) if cargo_launcher else "",
-                        *rust_roots,
+                    readonly_roots=tuple(
+                        path
+                        for path in (
+                            str(Path(rustc).absolute()),
+                            str(rustc_launcher) if rustc_launcher else "",
+                            str(cargo_launcher) if cargo_launcher else "",
+                            str(compiler) if compiler else "",
+                            str(Path(ar).resolve()) if ar else "",
+                            str(Path(ranlib).resolve()) if ranlib else "",
+                            *rust_roots,
+                        )
+                        if path
                     ),
-                    environment={
-                        "CARGO_HOME": str(cargo_home),
-                        "RUSTUP_HOME": str(rustup_home),
-                        "CARGO_NET_OFFLINE": "true",
-                    },
+                    environment=rust_environment,
                 )
             )
         return cls(
@@ -148,6 +180,11 @@ class VerificationEnvironment:
             environment_root=str(environment_root),
             environment=environment,
             readonly_mounts=tuple(dict.fromkeys(mounts)),
+            writable_mounts=(
+                (str(Path(environment["UV_CACHE_DIR"]).resolve()),)
+                if environment.get("UV_CACHE_DIR")
+                else ()
+            ),
             base_root=project_root if include_project_root else None,
             toolchains=tuple(toolchains),
         )
@@ -169,6 +206,7 @@ class VerificationEnvironment:
             "environment_root": self.environment_root,
             "environment": dict(self.environment),
             "readonly_mounts": list(self.readonly_mounts),
+            "writable_mounts": list(self.writable_mounts),
             "base_root": self.base_root,
             "toolchains": [
                 {
@@ -198,6 +236,7 @@ class VerificationEnvironment:
             ),
             "environment": dict(sorted((str(k), str(v)) for k, v in self.environment.items())),
             "readonly_mounts": sorted(str(Path(path).resolve()) for path in self.readonly_mounts),
+            "writable_mounts": sorted(str(Path(path).resolve()) for path in self.writable_mounts),
             "base_root": str(Path(self.base_root).resolve()) if self.base_root else None,
             "toolchains": [
                 {
@@ -249,6 +288,10 @@ class VerificationEnvironment:
             "CARGO_HOME",
             "RUSTUP_HOME",
             "CARGO_NET_OFFLINE",
+            "CC",
+            "AR",
+            "RANLIB",
+            "UV_CACHE_DIR",
         }
         if set(environment) - allowed_environment:
             raise ValueError("verification environment contains an untrusted binding")
@@ -272,6 +315,9 @@ class VerificationEnvironment:
         mounts = tuple(str(path) for path in (record.get("readonly_mounts") or ()))
         if not mounts or any(not os.path.isabs(path) for path in mounts):
             raise ValueError("verification environment has invalid read-only mounts")
+        writable_mounts = tuple(str(path) for path in (record.get("writable_mounts") or ()))
+        if any(not os.path.isabs(path) for path in writable_mounts):
+            raise ValueError("verification environment has invalid writable mounts")
         base_root = record.get("base_root")
         if base_root is not None:
             if not Path(str(base_root)).is_absolute():
@@ -284,6 +330,8 @@ class VerificationEnvironment:
             allowed_mounts.add(str(Path(uv).resolve()))
         if base_root:
             allowed_mounts.add(base_root)
+        if environment.get("UV_CACHE_DIR"):
+            allowed_mounts.add(str(Path(environment["UV_CACHE_DIR"]).resolve()))
         raw_toolchains = record.get("toolchains") or ()
         toolchains: list[ToolchainBinding] = []
         try:
@@ -322,6 +370,8 @@ class VerificationEnvironment:
             raise ValueError("verification environment has invalid toolchains") from exc
         if any(str(Path(path).resolve()) not in allowed_mounts for path in mounts):
             raise ValueError("verification environment contains an untrusted mount")
+        if any(str(Path(path).resolve()) not in allowed_mounts for path in writable_mounts):
+            raise ValueError("verification environment contains an untrusted writable mount")
         resolved_mounts = {str(Path(path).resolve()) for path in mounts}
         if str(Path(environment_root).resolve()) not in resolved_mounts:
             raise ValueError("verification environment root is not mounted")
@@ -334,12 +384,25 @@ class VerificationEnvironment:
             environment_root=str(environment_root) if environment_root else None,
             environment=environment,
             readonly_mounts=mounts,
+            writable_mounts=writable_mounts,
             base_root=base_root,
             toolchains=tuple(toolchains),
         )
         if expected is not None and parsed.identity() != expected.identity():
             raise ValueError("verification environment does not match trusted service identity")
         return parsed
+
+
+def _rust_target_for_host() -> str | None:
+    """Return the stable GNU target key used for the verified host linker."""
+    if sys.platform != "linux":
+        return None
+    return {
+        "x86_64": "x86_64-unknown-linux-gnu",
+        "amd64": "x86_64-unknown-linux-gnu",
+        "aarch64": "aarch64-unknown-linux-gnu",
+        "arm64": "aarch64-unknown-linux-gnu",
+    }.get(platform.machine().lower())
 
 
 class ProjectEnvironmentFingerprint:

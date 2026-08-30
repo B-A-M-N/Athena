@@ -1172,8 +1172,28 @@ class AthenaService:
                 gate_bundle_hash=bundle.gate_bundle_hash,
                 base_fingerprint=base_fingerprint,
             )
+            plan, planning_error = await self._plan_next_self_host_item(
+                {"objective": str(objective), "plan": plan},
+                plan=plan,
+                current_index=index,
+                bundle=bundle,
+                task_id=None,
+                initial=True,
+            )
+            if planning_error:
+                raise RuntimeError(planning_error)
         else:
             plan = dict(plan)
+            evidence = dict(plan.get("evidence") or {})
+            evidence.update(
+                {
+                    "source_revision": bundle.source_revision,
+                    "design_bundle_hash": bundle.design_bundle_hash,
+                    "gate_bundle_hash": bundle.gate_bundle_hash,
+                    "base_fingerprint": base_fingerprint,
+                }
+            )
+            plan["evidence"] = evidence
         planned_task_id = task_id or new_id("task")
         plan = SelfHostMissionController.mark_task(plan, planned_task_id)
         planned_prompt = SelfHostMissionController.task_prompt(plan)
@@ -1215,6 +1235,9 @@ class AthenaService:
                 design_bundle_hash=str(bundle_record.get("design_bundle_hash") or ""),
                 gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
                 current_base_fingerprint=base_fingerprint,
+                current_git_revision=str(bundle_record.get("source_revision") or ""),
+                current_design_bundle_hash=str(bundle_record.get("design_bundle_hash") or ""),
+                current_gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
                 plan=plan,
             )
         else:
@@ -1224,12 +1247,119 @@ class AthenaService:
                 current_task_id=created.id,
                 last_error=None,
                 current_base_fingerprint=base_fingerprint,
+                current_git_revision=str(bundle_record.get("source_revision") or ""),
+                current_design_bundle_hash=str(bundle_record.get("design_bundle_hash") or ""),
+                current_gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
                 plan=plan,
             )
         await tm.enqueue(created.id)
         if wait:
             await self.wait_for(created.id)
         return created
+
+    async def _plan_next_self_host_item(
+        self,
+        mission: Mapping[str, Any],
+        *,
+        plan: Mapping[str, Any],
+        current_index: Any,
+        bundle: SelfHostGateBundle,
+        task_id: str | None,
+        initial: bool = False,
+        current_release_evidence: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Ask the existing kernel for one bounded next mission item."""
+        controller = SelfHostMissionController
+        kernel = self._kernel
+        design_context = bundle.design_context()
+        updated_plan: dict[str, Any] = json.loads(json.dumps(dict(plan), sort_keys=True))
+        plan = updated_plan
+        evidence = dict(plan.get("evidence") or {})
+        evidence.update(
+            {
+                "source_revision": bundle.source_revision,
+                "design_bundle_hash": bundle.design_bundle_hash,
+                "gate_bundle_hash": bundle.gate_bundle_hash,
+            }
+        )
+        plan["evidence"] = evidence
+        mission_for_prompt = dict(mission)
+        mission_for_prompt["plan"] = plan
+        prompt = controller.planner_prompt(
+            mission_for_prompt,
+            current_index=current_index,
+            design_context=design_context,
+            current_release_evidence=current_release_evidence,
+        )
+        response = None
+        if kernel is not None:
+            response = await kernel.utility_inference(
+                system_prompt=(
+                    "You are Athena's bounded planning role. Use only the trusted "
+                    "source index and frozen design context supplied by the service. "
+                    "Return the requested JSON shape. Never claim promotion authority."
+                ),
+                user_prompt=prompt,
+                role="planner",
+                task_id=task_id,
+                metadata={"purpose": "self_host_plan"},
+            )
+        indexed_files = {
+            str(value.get("path"))
+            for value in (getattr(current_index, "files", ()) or ())
+            if isinstance(value, Mapping) and value.get("path")
+        }
+        item, reason, error = controller.parse_planner_output(
+            response,
+            indexed_files=indexed_files,
+        )
+        if item is not None:
+            return controller.replace_current_item(
+                plan, item, reason=reason or "planner item"
+            ), None
+        completed = plan.get("completed_work_items") or ()
+        if initial:
+            # A source checkout without a configured planner still gets one
+            # bounded ordinary coding task; continuation never gets this
+            # fallback and therefore cannot falsely declare completion.
+            fallback = dict(plan.get("current_work_item") or {})
+            fallback["affected_invariants"] = [
+                "candidate-isolated",
+                "proof-before-promotion",
+            ]
+            return (
+                controller.replace_current_item(
+                    plan,
+                    fallback,
+                    reason=error or "planner unavailable; using bounded objective seed",
+                ),
+                None,
+            )
+        release_evidence = (
+            current_release_evidence if isinstance(current_release_evidence, Mapping) else {}
+        )
+        release_proven = bool(
+            release_evidence.get("task_status") == "complete"
+            and isinstance(release_evidence.get("review"), Mapping)
+            and release_evidence["review"].get("eligible") is True
+        )
+        if reason and completed and release_proven:
+            proof = controller.completion_proof(
+                plan,
+                reason=reason,
+                authority=bundle.to_record(),
+                base_fingerprint=str(
+                    release_evidence.get("base_fingerprint")
+                    or (plan.get("evidence") or {}).get("base_fingerprint")
+                    or ""
+                ),
+            )
+            updated = json.loads(json.dumps(dict(plan), sort_keys=True))
+            updated["phase"] = "COMPLETE"
+            updated["completion_proof"] = proof
+            updated["remaining"] = []
+            return updated, None
+        return dict(plan), error or "planner did not produce a next work item"
 
     async def self_host_status(self, *, workspace_root: str | None = None) -> list[dict[str, Any]]:
         missions = self._self_host_missions
@@ -1261,6 +1391,8 @@ class AthenaService:
             return {"status": "missing", "error": "mission belongs to another workspace"}
         if mission is None:
             return {"status": "missing", "error": "no active self-host mission"}
+        if str(mission.get("status") or "") == "complete":
+            return {"status": "complete", "mission": mission}
         task_id = str(mission.get("current_task_id") or "")
         candidate = await self.operator_candidate(task_id) if task_id else None
         if candidate is not None:
@@ -1288,15 +1420,60 @@ class AthenaService:
                 "promoted",
                 "complete",
             }:
-                next_plan = SelfHostMissionController.next_work_item(plan)
-                if next_plan is None:
+                coordinator = self._project_index_coordinator
+                if coordinator is None:
+                    error = "self-host project index is not started"
+                    await missions.update(mission["id"], status="blocked", last_error=error)
+                    return {"status": "blocked", "mission": mission, "error": error}
+                try:
+                    index = await coordinator.current(
+                        root,
+                        refresh=True,
+                        freshness="source_verified",
+                    )
+                    bundle = SelfHostGateBundle.capture(root, allow_dirty=True)
+                    plan, planning_error = await self._plan_next_self_host_item(
+                        mission,
+                        plan=plan,
+                        current_index=index,
+                        bundle=bundle,
+                        task_id=task_id or None,
+                        current_release_evidence={
+                            "task_status": task_status,
+                            "base_fingerprint": actual,
+                            "review": plan.get("review"),
+                        },
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    planning_error = f"self-host PLAN NEXT failed: {exc}"
+                if planning_error:
+                    await missions.update(
+                        mission["id"],
+                        status="blocked",
+                        last_error=planning_error,
+                        plan=plan,
+                    )
+                    return {"status": "blocked", "mission": mission, "error": planning_error}
+                if plan.get("phase") == "COMPLETE":
                     await missions.update(
                         mission["id"],
                         status="complete",
-                        plan={**plan, "phase": "COMPLETE", "remaining": []},
+                        plan=plan,
+                        current_base_fingerprint=actual,
+                        current_git_revision=bundle.source_revision,
+                        current_design_bundle_hash=bundle.design_bundle_hash,
+                        current_gate_bundle_hash=bundle.gate_bundle_hash,
                     )
-                    return {"status": "complete", "mission": mission}
-                plan = next_plan
+                    return {"status": "complete", "mission": {**mission, "plan": plan}}
+                await missions.update(
+                    mission["id"],
+                    status="active",
+                    plan=plan,
+                    current_base_fingerprint=actual,
+                    current_git_revision=bundle.source_revision,
+                    current_design_bundle_hash=bundle.design_bundle_hash,
+                    current_gate_bundle_hash=bundle.gate_bundle_hash,
+                )
             created = await self.submit_self_host(
                 str(
                     (plan.get("current_work_item") or {}).get("objective")
@@ -2077,21 +2254,34 @@ class AthenaService:
         from athena.self_host.reviewer import SelfHostIndependentReviewer
 
         verification = list(getattr(branch, "verification", ()) or ())
+        expected_authority = None
+        task_row = await self._store_tasks.get(task_id) if self._store_tasks is not None else None
+        task_metadata = (task_row or {}).get("metadata") or {}
+        if isinstance(task_metadata, dict):
+            raw_bundle = task_metadata.get("_athena_gate_bundle")
+            if isinstance(raw_bundle, Mapping):
+                expected_authority = raw_bundle
+        missions = self._self_host_missions
+        mission = await missions.for_task(task_id) if missions is not None else None
+        if expected_authority is None and mission is not None:
+            expected_authority = {
+                "source_revision": mission.get("base_revision"),
+                "design_bundle_hash": mission.get("design_bundle_hash"),
+                "gate_bundle_hash": mission.get("gate_bundle_hash"),
+            }
         integrity_review = SelfHostIndependentReviewer.review(
             status=str(branch.status),
             certificate=certificate,
             verification=verification,
+            expected_authority=expected_authority,
         )
         stored_review = None
-        missions = self._self_host_missions
-        if missions is not None:
-            mission = await missions.for_task(task_id)
-            if mission is not None:
-                raw_review = (mission.get("plan") or {}).get("review")
-                if isinstance(raw_review, dict) and raw_review.get(
-                    "certificate_hash"
-                ) == certificate.get("certificate_hash"):
-                    stored_review = dict(raw_review)
+        if mission is not None:
+            raw_review = (mission.get("plan") or {}).get("review")
+            if isinstance(raw_review, dict) and raw_review.get(
+                "certificate_hash"
+            ) == certificate.get("certificate_hash"):
+                stored_review = dict(raw_review)
         return {
             "task_id": task_id,
             "branch_id": branch.id,
@@ -2131,8 +2321,10 @@ class AthenaService:
         if mission is None:
             return None
         existing = (mission.get("plan") or {}).get("review")
-        if isinstance(existing, dict) and existing.get("certificate_hash") == candidate.get(
-            "certificate_hash"
+        if (
+            isinstance(existing, dict)
+            and existing.get("certificate_hash") == candidate.get("certificate_hash")
+            and (candidate.get("integrity_review") or {}).get("eligible") is True
         ):
             return existing
         review = await self._run_self_host_reviewer(task_row or {}, candidate)
@@ -2147,26 +2339,42 @@ class AthenaService:
         candidate: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Ask the configured reviewer role for structured evidence."""
-        from athena.protocol.tasks import ModelPolicy
-
         integrity = dict(candidate.get("integrity_review") or {})
-        router = self._router
         kernel = self._kernel
-        if router is None or kernel is None:
+        if kernel is None:
             return _review_failure(candidate, integrity, "reviewer runtime unavailable")
+        usage_store = self._provider_usage_store
+        if usage_store is None:
+            return _review_failure(candidate, integrity, "provider usage evidence unavailable")
         try:
-            reviewer_selection = await router.select(
-                policy=ModelPolicy(role="reviewer", require_tools=False)
-            )
-            producer_selection = await router.select(
-                policy=ModelPolicy(role="primary", require_tools=False)
-            )
+            producer_rows = await usage_store.list_for_task(str(candidate.get("task_id") or ""))
         except Exception as exc:
-            return _review_failure(candidate, integrity, f"reviewer model unavailable: {exc}")
+            return _review_failure(
+                candidate, integrity, f"producer usage evidence unavailable: {exc}"
+            )
+        producer_models = {
+            (str(row.get("provider") or ""), str(row.get("model") or ""))
+            for row in producer_rows
+            if _successful_usage(row)
+            and str((row.get("metadata") or {}).get("role") or "primary")
+            in {"primary", "coding", "interpreter", "agent"}
+        }
+        try:
+            raw_bundle = (task_row.get("metadata") or {}).get("_athena_gate_bundle")
+            base_root = str(candidate.get("base_workspace_root") or "")
+            if not isinstance(raw_bundle, Mapping) or not base_root:
+                raise ValueError("review authority bundle is missing")
+            base_bundle = SelfHostGateBundle.capture(base_root, allow_dirty=True)
+            if base_bundle.gate_bundle_hash != str(raw_bundle.get("gate_bundle_hash") or ""):
+                raise ValueError("review authority bundle is stale")
+            design_context = base_bundle.design_context()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return _review_failure(candidate, integrity, f"review authority unavailable: {exc}")
         prompt = _self_host_review_prompt(
             task_row,
             candidate,
             await self._candidate_diff_text(str(candidate.get("task_id") or "")),
+            design_context=design_context,
         )
         response = await kernel.utility_inference(
             system_prompt=(
@@ -2178,6 +2386,35 @@ class AthenaService:
             ),
             user_prompt=prompt,
             role="reviewer",
+            task_id=str(candidate.get("task_id") or "") or None,
+            session_id=str(task_row.get("session_id") or "") or None,
+            metadata={
+                "purpose": "self_host_review",
+                "certificate_hash": candidate.get("certificate_hash"),
+            },
+        )
+        try:
+            reviewer_rows = await usage_store.list_for_task(str(candidate.get("task_id") or ""))
+        except Exception as exc:
+            return _review_failure(
+                candidate, integrity, f"reviewer usage evidence unavailable: {exc}"
+            )
+        reviewer_row = next(
+            (
+                row
+                for row in reversed(reviewer_rows)
+                if _successful_usage(row)
+                and str((row.get("metadata") or {}).get("role") or "") == "reviewer"
+                and str((row.get("metadata") or {}).get("purpose") or "") == "self_host_review"
+                and str((row.get("metadata") or {}).get("certificate_hash") or "")
+                == str(candidate.get("certificate_hash") or "")
+            ),
+            None,
+        )
+        reviewer_identity = (
+            (str(reviewer_row.get("provider") or ""), str(reviewer_row.get("model") or ""))
+            if reviewer_row is not None
+            else None
         )
         parsed = _parse_review_json(response)
         if parsed is None:
@@ -2195,7 +2432,9 @@ class AthenaService:
             "untested_paths": _bounded_strings(parsed.get("untested_paths")),
         }
         risk = candidate.get("risk") or {}
-        independent_model = str(reviewer_selection) != str(producer_selection)
+        independent_model = (
+            reviewer_identity is not None and reviewer_identity not in producer_models
+        )
         eligible = bool(
             integrity.get("eligible")
             and parsed["recommendation"] == "promote"
@@ -2206,8 +2445,16 @@ class AthenaService:
         evidence: dict[str, Any] = {
             "reviewer": "model-reviewer",
             "review_type": "independent-model",
-            "reviewer_model": str(reviewer_selection),
-            "producer_model": str(producer_selection),
+            "reviewer_model": (
+                f"{reviewer_identity[0]}/{reviewer_identity[1]}" if reviewer_identity else None
+            ),
+            "producer_models": sorted(f"{provider}/{model}" for provider, model in producer_models),
+            "reviewer_usage_id": reviewer_row.get("id") if reviewer_row else None,
+            "producer_model": (
+                sorted(f"{provider}/{model}" for provider, model in producer_models)[0]
+                if producer_models
+                else None
+            ),
             "independent": independent_model,
             "independent_model": independent_model,
             "eligible": eligible,
@@ -2412,6 +2659,17 @@ class AthenaService:
                         or review.get("candidate_fingerprint"),
                     )
                     root = str(review.get("base_workspace_root") or "")
+                    refreshed_authority: dict[str, Any] = {}
+                    if root:
+                        try:
+                            current_bundle = SelfHostGateBundle.capture(root, allow_dirty=True)
+                            refreshed_authority = {
+                                "current_git_revision": current_bundle.source_revision,
+                                "current_design_bundle_hash": current_bundle.design_bundle_hash,
+                                "current_gate_bundle_hash": current_bundle.gate_bundle_hash,
+                            }
+                        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                            _logger.warning("self-host authority refresh failed: %s", exc)
                     if self._project_index_coordinator is not None and root:
                         self._project_index_coordinator.mark_stale(root)
                         try:
@@ -2429,6 +2687,7 @@ class AthenaService:
                         if committed
                         else mission.get("current_base_fingerprint")
                     ),
+                    **refreshed_authority,
                 )
         return outcome
 
@@ -3927,6 +4186,12 @@ def _bounded_strings(value: Any, *, limit: int = 16, item_limit: int = 512) -> l
     return [str(item)[:item_limit] for item in values[:limit] if str(item).strip()]
 
 
+def _successful_usage(row: Mapping[str, Any]) -> bool:
+    """Accept only a durable completed provider attempt as identity evidence."""
+    metadata = row.get("metadata")
+    return isinstance(metadata, Mapping) and str(metadata.get("state") or "") == "success"
+
+
 def _parse_review_json(value: str | None) -> dict[str, Any] | None:
     if not value:
         return None
@@ -3985,7 +4250,11 @@ def _review_failure(
 
 
 def _self_host_review_prompt(
-    task_row: Mapping[str, Any], candidate: Mapping[str, Any], diff: str
+    task_row: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    diff: str,
+    *,
+    design_context: str = "",
 ) -> str:
     return (
         "Review this untrusted candidate between the delimiters.\n"
@@ -3993,6 +4262,9 @@ def _self_host_review_prompt(
         f"Risk: {json.dumps(candidate.get('risk') or {}, sort_keys=True)}\n"
         f"Proof: {json.dumps(candidate.get('verification') or [], sort_keys=True)}\n"
         f"Authority: {json.dumps(candidate.get('proof_authority') or {}, sort_keys=True)}\n"
+        "--- BEGIN FROZEN DESIGN CONTEXT ---\n"
+        f"{design_context[:24_000]}\n"
+        "--- END FROZEN DESIGN CONTEXT ---\n"
         "--- BEGIN CANDIDATE DIFF ---\n"
         f"{diff}\n"
         "--- END CANDIDATE DIFF ---\n"

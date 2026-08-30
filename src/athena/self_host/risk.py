@@ -9,6 +9,24 @@ from pathlib import PurePosixPath
 class SelfHostRiskClassifier:
     """Classify candidate paths without model discretion."""
 
+    _HIGH_PREFIXES = (
+        "src/athena/self_host/",
+        "src/athena/release/",
+        "src/athena/kernel/",
+        "src/athena/policy/",
+        "src/athena/reality/",
+        "src/athena/shadow/",
+        "src/athena/recovery/",
+        "src/athena/execution/",
+        "src/athena/tasks/",
+        "src/athena/state/",
+        "src/athena/protocol/",
+        ".github/workflows/",
+        "tests/contract/",
+        "tests/security/",
+        "tests/crash/",
+    )
+
     _HIGH_COMPONENTS = frozenset(
         {
             "capabilities",
@@ -26,7 +44,13 @@ class SelfHostRiskClassifier:
             "security",
             "service",
             "shadow",
+            "self_host",
             "native",
+            "contract",
+            "security",
+            "crash",
+            "workflows",
+            "scripts/release-check",
             "scripts/architecture-lint",
             "SELF_HOSTING.md",
             "SECURITY.md",
@@ -47,10 +71,10 @@ class SelfHostRiskClassifier:
         reasons: set[str] = set()
         level = "low"
         for resource in changed_resources:
+            operation = ""
             if isinstance(resource, Mapping):
                 path = str(resource.get("path") or resource.get("resource") or "")
                 operation = str(resource.get("operation") or "").lower()
-                deleted = deleted or operation in {"delete", "remove", "unlink"}
             else:
                 path = str(resource)
             normalized = path.replace("\\", "/").lstrip("./")
@@ -58,8 +82,19 @@ class SelfHostRiskClassifier:
                 continue
             paths.append(normalized)
             parts = PurePosixPath(normalized).parts
+            before = resource.get("before_hash") if isinstance(resource, Mapping) else None
+            after = resource.get("after_hash") if isinstance(resource, Mapping) else None
+            if operation not in {"delete", "remove", "unlink"}:
+                if before is not None and after is None:
+                    operation = "delete"
+                elif before is None and after is not None:
+                    operation = "add"
+                else:
+                    operation = "modify"
+            deleted = deleted or operation in {"delete", "remove", "unlink"}
             if (
-                any(part in cls._HIGH_COMPONENTS for part in parts)
+                normalized.startswith(cls._HIGH_PREFIXES)
+                or any(part in cls._HIGH_COMPONENTS for part in parts)
                 or normalized in cls._HIGH_COMPONENTS
             ):
                 level = "high"

@@ -17,11 +17,18 @@ class SelfHostIndependentReviewer:
         status: str,
         certificate: Mapping[str, Any],
         verification: Sequence[Mapping[str, Any] | Any],
+        expected_authority: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         authority = certificate.get("proof_authority")
-        authority_ok = isinstance(authority, Mapping) and all(
-            str(authority.get(key) or "") for key in ("source_revision", "gate_bundle_hash")
-        )
+        authority_record = authority if isinstance(authority, Mapping) else {}
+        authority_keys = ("source_revision", "design_bundle_hash", "gate_bundle_hash")
+        authority_present = all(str(authority_record.get(key) or "") for key in authority_keys)
+        authority_ok = authority_present
+        if authority_ok and expected_authority is not None:
+            authority_ok = all(
+                str(authority_record.get(key) or "") == str(expected_authority.get(key) or "")
+                for key in authority_keys
+            )
         checks_ok = bool(verification) and all(
             bool(item.get("passed")) if isinstance(item, Mapping) else False
             for item in verification

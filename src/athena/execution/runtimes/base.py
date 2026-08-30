@@ -109,6 +109,7 @@ class BaseRuntime(metaclass=abc.ABCMeta):
             "writable_paths": request.writable_paths,
             "read_only_paths": request.read_only_paths,
             "toolchain_paths": request.toolchain_paths,
+            "writable_toolchain_paths": request.writable_toolchain_paths,
         }
         return self._make_session_compatible(kwargs)
 
@@ -147,6 +148,10 @@ class BaseRuntime(metaclass=abc.ABCMeta):
         if tuple(request.read_only_paths) != tuple(getattr(session, "read_only_paths", ()) or ()):
             return False
         if tuple(request.toolchain_paths) != tuple(getattr(session, "toolchain_paths", ()) or ()):
+            return False
+        if tuple(request.writable_toolchain_paths) != tuple(
+            getattr(session, "writable_toolchain_paths", ()) or ()
+        ):
             return False
         return True
 

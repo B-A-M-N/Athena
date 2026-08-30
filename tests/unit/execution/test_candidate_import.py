@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -157,6 +158,80 @@ async def test_self_host_sandbox_exposes_frozen_python_and_rust_toolchains(tmp_p
     assert "Python " in result.stdout
     assert "cargo " in result.stdout
     assert "rustc " in result.stdout
+
+
+async def test_self_host_sandbox_runs_locked_offline_cargo_check(tmp_path):
+    """Rust proof must link inside the actual network-denied candidate sandbox."""
+    project_root = Path(__file__).resolve().parents[3]
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    shutil.copytree(project_root / "native", candidate / "native")
+    verification = VerificationEnvironment.from_project(
+        str(project_root), include_project_root=True, include_rust=True
+    )
+    manager = ExecutionManager()
+    manager.register_runtime(ShellRuntime())
+
+    result = await manager.execute(
+        ExecutionRequest(
+            runtime="shell",
+            source="cargo check --manifest-path native/Cargo.toml --locked --offline",
+            task_id="candidate-cargo-check",
+            workspace_id="candidate",
+            backend="shadow",
+            cwd=str(candidate),
+            workspace_root=str(candidate),
+            network_policy=NetworkPolicy.DENY,
+            env=verification.for_workspace(str(candidate)),
+            toolchain_paths=verification.readonly_mounts,
+        )
+    )
+
+    assert result.status is ExecutionExitStatus.EXITED
+    assert result.exit_code == 0, result.stderr
+
+
+async def test_self_host_dependency_proof_fails_closed_for_broken_candidate(tmp_path):
+    """Dependency proof must reject candidate metadata instead of using base venv."""
+    project_root = Path(__file__).resolve().parents[3]
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    shutil.copytree(project_root / "src", candidate / "src")
+    for name in ("pyproject.toml", "uv.lock", "README.md"):
+        shutil.copy2(project_root / name, candidate / name)
+    manifest = candidate / "pyproject.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            '"httpx>=0.27",', '"definitely-not-a-real-athena-package-xyz>=1",'
+        ),
+        encoding="utf-8",
+    )
+    verification = VerificationEnvironment.from_project(
+        str(project_root), include_project_root=True, include_rust=True
+    )
+    manager = ExecutionManager()
+    manager.register_runtime(ShellRuntime())
+
+    result = await manager.execute(
+        ExecutionRequest(
+            runtime="shell",
+            source=(
+                "UV_PROJECT_ENVIRONMENT=/tmp/athena-self-proof-test "
+                "uv sync --locked --offline --extra dev"
+            ),
+            task_id="candidate-dependency-proof",
+            workspace_id="candidate",
+            backend="shadow",
+            cwd=str(candidate),
+            workspace_root=str(candidate),
+            network_policy=NetworkPolicy.DENY,
+            env=verification.for_workspace(str(candidate)),
+            toolchain_paths=verification.readonly_mounts,
+            writable_toolchain_paths=verification.writable_mounts,
+        )
+    )
+
+    assert result.exit_code != 0
 
 
 async def test_candidate_proof_uses_execute_dispatcher_sandbox_and_uv(tmp_path):

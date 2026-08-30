@@ -10,6 +10,7 @@ def candidate_commands() -> tuple[str, ...]:
         "uv run --frozen --no-sync ruff check --no-cache src tests",
         "uv run --frozen --no-sync mypy --cache-dir /tmp/athena-mypy-cache src",
         "uv run --frozen --no-sync python --version",
+        "uv lock --check --offline",
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q",
         "uv run --frozen --no-sync python scripts/architecture-lint",
         "uv run --frozen --no-sync python scripts/scenarios --exclude-family VHS --output /tmp/athena-self-scenarios.json",
@@ -33,9 +34,22 @@ def release_commands(
     commands: list[tuple[str, list[str]]] = [
         ("ruff-format", [*prefix, "ruff", "format", "--check", "src", "tests"]),
         ("ruff-check", [*prefix, "ruff", "check", "src", "tests"]),
+        ("uv-lock-check", ["uv", "lock", "--check", "--offline"]),
         ("mypy", [*prefix, "mypy", "src/athena"]),
         ("compileall", [*prefix, "python", "-m", "compileall", "-q", "src", "tests"]),
         ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "--ignore=tests/e2e"]),
+        (
+            "alacrity-benchmark",
+            [
+                *prefix,
+                "python",
+                "scripts/bench-alacrity",
+                "--events",
+                "5000",
+                "--min-producer-events-per-second",
+                "10000",
+            ],
+        ),
         (
             "release-scenarios",
             [
