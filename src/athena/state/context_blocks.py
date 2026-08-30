@@ -18,6 +18,12 @@ class ContextBlockStore:
 
     def __init__(self, db: Database) -> None:
         self._db = db
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Monotonic revision for compiled-context cache invalidation."""
+        return self._generation
 
     async def create(
         self,
@@ -60,6 +66,7 @@ class ContextBlockStore:
             _params(block),
         )
         await self._write_version(block)
+        self._generation += 1
         return block
 
     async def get(
@@ -161,6 +168,7 @@ class ContextBlockStore:
             ),
         )
         await self._write_version(updated)
+        self._generation += 1
         return updated
 
     async def set_attached(
@@ -191,6 +199,7 @@ class ContextBlockStore:
             ),
         )
         await self._write_version(updated)
+        self._generation += 1
         return updated
 
     async def history(

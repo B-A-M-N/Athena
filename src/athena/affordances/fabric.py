@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import os
 import re
-import time
+import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from athena.affordances.models import AffordanceScope, GeneratedCapability
@@ -45,10 +49,17 @@ class CapabilityFabric:
         self._persistence_tasks: set[asyncio.Task] = set()
         self._persistence_errors: dict[asyncio.Task, BaseException] = {}
         self._optimizer = AffordanceOptimizer()
-        self._availability_cache: dict[tuple[Any, ...], tuple[float, tuple[bool, bool]]] = {}
+        self._availability_cache: dict[tuple[Any, ...], tuple[bool, bool]] = {}
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Monotonic revision of effective overlays and generated evidence."""
+        return self._generation
 
     def _invalidate_availability(self) -> None:
         self._availability_cache.clear()
+        self._generation += 1
 
     @staticmethod
     def _check(executor: Any) -> None:
@@ -241,6 +252,9 @@ class CapabilityFabric:
             )[-100:],
         )
         self._records[capability_id] = updated
+        # Proof quality and usage affect discovery/strategy scores, so they
+        # are part of the same revision boundary as overlay registration.
+        self._invalidate_availability()
         owner = (
             updated.project_scope
             if updated.scope is AffordanceScope.PROJECT
@@ -582,6 +596,8 @@ class CapabilityFabric:
         """
         record = self._records.get(capability_id)
         key = (
+            self._generation,
+            getattr(self.global_registry, "generation", 0),
             capability_id,
             task_id,
             project_id,
@@ -589,15 +605,21 @@ class CapabilityFabric:
             getattr(workspace, "root", None),
             str(record.lifecycle_state) if record is not None else "",
             str(record.validation_state) if record is not None else "",
+            str(record.code_hash) if record is not None else "",
+            str(record.schema_hash) if record is not None else "",
+            tuple(sorted(str(effect) for effect in record.declared_effects))
+            if record is not None
+            else (),
             tuple(sorted(record.required_capabilities)) if record is not None else (),
             tuple(d.key() for d in (record.required_dependencies or ())) if record else (),
             str(record.dependency_lock.get("environment_fingerprint"))
             if record is not None
             else "",
+            _dependency_state_fingerprint(workspace, record),
         )
         cached = self._availability_cache.get(key)
-        if cached is not None and time.monotonic() - cached[0] < 1.0:
-            return cached[1]
+        if cached is not None:
+            return cached
         result = self._record_availability(
             record,
             task_id=task_id,
@@ -607,7 +629,7 @@ class CapabilityFabric:
         )
         if len(self._availability_cache) >= 2048:
             self._availability_cache.clear()
-        self._availability_cache[key] = (time.monotonic(), result)
+        self._availability_cache[key] = result
         return result
 
     def search(
@@ -808,3 +830,31 @@ class CapabilityFabric:
 
 
 __all__ = ["CapabilityFabric"]
+
+
+def _dependency_state_fingerprint(
+    workspace: WorkspaceSpec | None,
+    record: GeneratedCapability | None,
+) -> str:
+    """Identify filesystem/runtime facts used by generated dependency checks."""
+    if workspace is None or record is None or not record.required_dependencies:
+        return ""
+    root = Path(workspace.root).resolve()
+    facts: list[tuple[str, Any]] = [("root", str(root))]
+    for relative in (".athena/dependencies.lock.json", ".athena/dependencies"):
+        path = root / relative
+        try:
+            stat = path.stat()
+            facts.append((relative, (stat.st_mtime_ns, stat.st_size, stat.st_ino)))
+            if path.is_file():
+                facts.append((relative + ":sha256", hashlib.sha256(path.read_bytes()).hexdigest()))
+        except OSError:
+            facts.append((relative, None))
+    facts.extend(
+        (
+            ("requirements", tuple(item.key() for item in record.required_dependencies)),
+            ("python", os.path.realpath(sys.executable)),
+            ("version", tuple(sys.version_info[:3])),
+        )
+    )
+    return hashlib.sha256(json.dumps(facts, sort_keys=True, default=str).encode()).hexdigest()

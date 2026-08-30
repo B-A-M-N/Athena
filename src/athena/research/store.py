@@ -23,6 +23,12 @@ class ResearchStore:
         self._db = db
         self._ready = False
         self._ready_lock = asyncio.Lock()
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Monotonic revision for compiled-context cache invalidation."""
+        return self._generation
 
     async def _ensure(self) -> None:
         if self._ready:
@@ -126,6 +132,7 @@ class ResearchStore:
             "content_hash=excluded.content_hash, mime_type=excluded.mime_type",
             (source_id, str(content), content_hash, str(mime_type or "")),
         )
+        self._generation += 1
 
     async def search_content(
         self,
@@ -208,6 +215,7 @@ class ResearchStore:
                 json.dumps(dict(source.metadata), sort_keys=True),
             ),
         )
+        self._generation += 1
         return source
 
     async def get_source(self, source_id: str) -> SourceRecord | None:
@@ -304,6 +312,7 @@ class ResearchStore:
                 "claim_id, evidence_id, task_id, created_at) VALUES (?, ?, ?, ?)",
                 (evidence.claim_id, evidence.id, evidence.task_id, evidence.created_at),
             )
+        self._generation += 1
         return evidence
 
     async def _link(self, evidence_id: str, related_id: str, relation: str) -> None:
@@ -400,6 +409,7 @@ class ResearchStore:
                 json.dumps(dict(gap.metadata), sort_keys=True),
             ),
         )
+        self._generation += 1
         return gap
 
     async def list_gaps(

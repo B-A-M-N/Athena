@@ -2,7 +2,7 @@ from io import StringIO
 
 import pytest
 
-from athena.cli.oi_stream import OIStreamViewer
+from athena.cli.oi_stream import OIStreamViewer, _RenderScheduler
 from athena.protocol.events import make_event
 
 
@@ -79,3 +79,10 @@ def test_oi_viewer_restores_tty_screen_lifecycle():
 
     assert "\x1b[?1049h" in output.getvalue()
     assert "\x1b[?1049l" in output.getvalue()
+
+
+def test_oi_render_scheduler_defaults_to_bounded_25_fps():
+    viewer = OIStreamViewer(output=StringIO(), interactive=False)
+    scheduler = _RenderScheduler(viewer)
+
+    assert scheduler.interval == pytest.approx(1.0 / 25.0)

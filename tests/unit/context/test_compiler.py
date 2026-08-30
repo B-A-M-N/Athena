@@ -206,6 +206,18 @@ class _ResearchStore:
         ]
 
 
+class _RevisionedResearchStore:
+    generation = 0
+
+    def __init__(self):
+        self.calls = 0
+
+    async def search_content(self, query, **kwargs):
+        del query, kwargs
+        self.calls += 1
+        return []
+
+
 async def test_compiler_retrieves_scoped_research_as_external_evidence():
     compiler = ContextCompiler(research_store=_ResearchStore())
     context = await compiler.compile(_task(objective="what is the protocol"))
@@ -218,3 +230,18 @@ async def test_compiler_retrieves_scoped_research_as_external_evidence():
         if message.provenance and message.provenance.source_id == "src-1"
     ]
     assert research_messages
+
+
+@pytest.mark.asyncio
+async def test_compiler_reuses_revisioned_static_context_until_store_changes():
+    research = _RevisionedResearchStore()
+    compiler = ContextCompiler(research_store=research)
+    task = _task(objective="cached research")
+
+    await compiler.compile(task)
+    await compiler.compile(task)
+    assert research.calls == 1
+
+    research.generation += 1
+    await compiler.compile(task)
+    assert research.calls == 2

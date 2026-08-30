@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure bounded Python projection-frame rendering."""
+"""Measure projection, serialization, and retained Glass rendering costs."""
 
 from __future__ import annotations
 
@@ -7,41 +7,152 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import statistics
 import time
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from athena.cli.animation import OIVisualState  # noqa: E402
+from athena.cli.framebuffer import OIFrameBuffer, pillow_available  # noqa: E402
+from athena.cli.layout import Rect  # noqa: E402
 from athena.cli.native_bridge import native_projection_frame  # noqa: E402
 from athena.cli.projection import ProjectionState  # noqa: E402
+from athena.cli.scene import build_oi_scene  # noqa: E402
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    return statistics.quantiles(values, n=100, method="inclusive")[int(percentile) - 1]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frames", type=int, default=300)
-    parser.add_argument("--min-frames-per-second", type=float, default=10.0)
+    parser.add_argument("--min-frames-per-second", type=float, default=100.0)
+    parser.add_argument("--max-scene-p95-ms", type=float, default=25.0)
+    parser.add_argument("--max-serialization-p95-ms", type=float, default=10.0)
+    parser.add_argument("--max-motion-p95-ms", type=float, default=250.0)
     args = parser.parse_args()
     if args.frames < 1 or args.frames > 10_000:
         parser.error("--frames must be between 1 and 10000")
 
     state = ProjectionState()
+    for index in range(12):
+        state.tasks[f"task-{index}"] = {
+            "label": f"task {index}",
+            "status": "EXECUTING" if index == 0 else "COMPLETE",
+            "parent_id": None,
+        }
+        state.executions[f"exec-{index}"] = {
+            "label": f"execution {index}",
+            "status": "running" if index == 0 else "complete",
+            "parent_id": f"task-{index}",
+        }
+    state.reduce("SearchStarted", {"query": "benchmark"})
+    scene_times: list[float] = []
+    native_times: list[float] = []
+    serialization_times: list[float] = []
+    frame_bytes: list[int] = []
     started = time.perf_counter()
     for index in range(args.frames):
         state.status = "THINKING" if index % 2 else "EXECUTING"
         state.add_recent("·", f"frame {index}")
-        native_projection_frame(state, width=96, height=32)
+        scene_started = time.perf_counter()
+        build_oi_scene(state, Rect(0, 0, 96, 32), character="owl")
+        scene_times.append((time.perf_counter() - scene_started) * 1000.0)
+
+        native_started = time.perf_counter()
+        frame = native_projection_frame(state, width=96, height=32)
+        native_times.append((time.perf_counter() - native_started) * 1000.0)
+        serialization_started = time.perf_counter()
+        encoded = json.dumps(frame, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        serialization_times.append((time.perf_counter() - serialization_started) * 1000.0)
+        frame_bytes.append(len(encoded))
     elapsed = time.perf_counter() - started
     rate = args.frames / max(elapsed, 1e-9)
+    native_scene = build_oi_scene(state, Rect(0, 0, 96, 32), character="owl")
+    glass: dict[str, object] = {"available": False}
+    if pillow_available():
+        framebuffer = OIFrameBuffer()
+        visual = OIVisualState(
+            semantic_state="EXECUTING",
+            action_kind="search",
+            buddy_anchor="center",
+            transition=1.0,
+        )
+        glass_scene = build_oi_scene(state, Rect(0, 0, 640, 360), character="owl")
+        base_started = time.perf_counter()
+        framebuffer.render_base(glass_scene, 640, 360)
+        base_ms = (time.perf_counter() - base_started) * 1000.0
+        motion_times: list[float] = []
+        overlay_times: list[float] = []
+        motion_bytes: list[int] = []
+        overlay_bytes: list[int] = []
+        for index in range(min(args.frames, 120)):
+            visual.scan_phase = (index * 0.07) % 1.0
+            visual.activity_phase = (index * 0.11) % 1.0
+            motion_started = time.perf_counter()
+            motion = framebuffer.render_motion_overlay(glass_scene, visual, 640, 360)
+            motion_times.append((time.perf_counter() - motion_started) * 1000.0)
+            motion_bytes.append(len(motion.png) if motion is not None else 0)
+            overlay_started = time.perf_counter()
+            overlay = framebuffer.render_overlay(glass_scene, visual, 640, 360)
+            overlay_times.append((time.perf_counter() - overlay_started) * 1000.0)
+            overlay_bytes.append(len(overlay.png) if overlay is not None else 0)
+        glass = {
+            "available": True,
+            "base_encode_ms": round(base_ms, 3),
+            "motion_encode_p95_ms": round(_percentile(motion_times, 95), 3),
+            "overlay_encode_p95_ms": round(_percentile(overlay_times, 95), 3),
+            "motion_bytes": round(statistics.mean(motion_bytes)),
+            "overlay_bytes": round(statistics.mean(overlay_bytes)),
+            "cache_bytes": framebuffer._base_frame_bytes + framebuffer._base_png_bytes,
+        }
     result = {
         "frames": args.frames,
         "elapsed_seconds": round(elapsed, 6),
         "frames_per_second": round(rate, 2),
+        "scene_build_p50_ms": round(_percentile(scene_times, 50), 3),
+        "scene_build_p95_ms": round(_percentile(scene_times, 95), 3),
+        "native_projection_p95_ms": round(_percentile(native_times, 95), 3),
+        "json_serialization_p95_ms": round(_percentile(serialization_times, 95), 3),
+        "frame_bytes_p50": round(_percentile([float(value) for value in frame_bytes], 50)),
+        "retained_entities": len(glass_scene.entities)
+        if "glass_scene" in locals()
+        else len(native_scene.entities),
+        "glass": glass,
     }
     print(json.dumps(result, sort_keys=True))
     if rate < args.min_frames_per_second:
         print(
             f"bench-rendering: frame rate {rate:.2f} is below "
             f"threshold {args.min_frames_per_second:.2f}",
+            file=sys.stderr,
+        )
+        return 1
+    if _percentile(scene_times, 95) > args.max_scene_p95_ms:
+        print(
+            f"bench-rendering: scene p95 {_percentile(scene_times, 95):.2f}ms exceeds "
+            f"{args.max_scene_p95_ms:.2f}ms",
+            file=sys.stderr,
+        )
+        return 1
+    if _percentile(serialization_times, 95) > args.max_serialization_p95_ms:
+        print(
+            f"bench-rendering: serialization p95 "
+            f"{_percentile(serialization_times, 95):.2f}ms exceeds "
+            f"{args.max_serialization_p95_ms:.2f}ms",
+            file=sys.stderr,
+        )
+        return 1
+    if glass.get("available") and float(glass["motion_encode_p95_ms"]) > args.max_motion_p95_ms:
+        print(
+            f"bench-rendering: motion encode p95 {glass['motion_encode_p95_ms']:.2f}ms exceeds "
+            f"{args.max_motion_p95_ms:.2f}ms",
             file=sys.stderr,
         )
         return 1

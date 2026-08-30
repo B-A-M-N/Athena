@@ -26,6 +26,12 @@ class CapabilityRegistry:
         self._by_id: dict[str, CapabilityExecutor] = {}
         self._validators: dict[str, Any] = {}
         self._registration_audit: list[dict[str, Any]] = []
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Monotonic revision of the native capability inventory."""
+        return self._generation
 
     def register(
         self, executor: CapabilityExecutor, *, authority: str = "native", replace: bool = False
@@ -59,6 +65,7 @@ class CapabilityRegistry:
         self._by_id[descriptor.id] = executor
         self._validators[descriptor.id] = validator
         self._registration_audit.append(audit)
+        self._generation += 1
         return audit
 
     def replace(self, executor: CapabilityExecutor, *, authority: str) -> dict[str, Any]:
@@ -71,6 +78,7 @@ class CapabilityRegistry:
         if capability_id in self._by_id:
             del self._by_id[capability_id]
             self._validators.pop(capability_id, None)
+            self._generation += 1
 
     def resolve(self, capability_id: str) -> CapabilityDescriptor:
         """Return the descriptor for a registered capability id."""

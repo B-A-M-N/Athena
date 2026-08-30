@@ -213,3 +213,27 @@ async def test_router_cache_keeps_role_histories_separate():
     assert judge.provider == "primary-model"
     assert "history=rolling_attempts" in primary.rationale
     assert "history=rolling_attempts" in judge.rationale
+
+
+async def test_provider_registry_resolve_uses_cached_model_inventory():
+    class CountingProvider(FakeModelProvider):
+        def __init__(self):
+            super().__init__(model="counted", provider="counted")
+            self.list_calls = 0
+
+        async def list_models(self):
+            self.list_calls += 1
+            return await super().list_models()
+
+    provider = CountingProvider()
+    registry = _registry({"counted": provider})
+
+    first = await registry.resolve("counted", "counted")
+    second = await registry.resolve("counted", "counted")
+
+    assert second is first
+    assert provider.list_calls == 1
+    assert registry.generation == 1
+
+    await registry.refresh_models()
+    assert provider.list_calls == 2

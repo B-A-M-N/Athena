@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure full and changed-file project-index refreshes."""
+"""Measure full, incremental, revision, and impact-index performance."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=REPO_ROOT)
     parser.add_argument("--max-full-seconds", type=float, default=10.0)
     parser.add_argument("--max-incremental-seconds", type=float, default=2.0)
+    parser.add_argument("--max-ten-file-seconds", type=float, default=4.0)
+    parser.add_argument("--max-impact-ms", type=float, default=100.0)
     args = parser.parse_args()
     root = args.root.resolve()
     builder = ProjectIndexBuilder()
@@ -28,23 +30,59 @@ def main() -> int:
     index = builder.build(str(root))
     full_seconds = time.perf_counter() - started
 
+    candidates = [
+        str(item["path"])
+        for item in index.files
+        if str(item.get("path") or "").endswith((".py", ".rs", ".ts", ".go"))
+    ]
+    one_path = candidates[:1] or ["src/athena/project/index/builder.py"]
+    ten_paths = candidates[:10] or one_path
+
     started = time.perf_counter()
-    refreshed = builder.incremental(
-        str(root), index, ["src/athena/project/index/builder.py"]
-    )
+    refreshed = builder.incremental(str(root), index, one_path)
     incremental_seconds = time.perf_counter() - started
+    source_started = time.perf_counter()
+    source_revision = builder.source_revision(str(root))
+    source_revision_seconds = time.perf_counter() - source_started
+
+    started = time.perf_counter()
+    refreshed_ten = builder.incremental(str(root), index, ten_paths)
+    ten_file_seconds = time.perf_counter() - started
+
+    impact_started = time.perf_counter()
+    impact = refreshed_ten.impact(ten_paths)
+    impact_ms = (time.perf_counter() - impact_started) * 1000.0
     result = {
         "root": str(root),
         "files": len(refreshed.files),
         "full_seconds": round(full_seconds, 6),
         "incremental_seconds": round(incremental_seconds, 6),
+        "ten_file_incremental_seconds": round(ten_file_seconds, 6),
+        "source_revision_seconds": round(source_revision_seconds, 6),
+        "source_revision": source_revision,
         "incremental_source_revision": refreshed.source_revision,
+        "impact_ms": round(impact_ms, 3),
+        "impact_count": len(impact["impacted"]),
+        "one_file_count": len(one_path),
+        "ten_file_count": len(ten_paths),
     }
     print(json.dumps(result, sort_keys=True))
     if full_seconds > args.max_full_seconds:
         print(
-            f"bench-indexing: full build {full_seconds:.3f}s exceeds "
-            f"{args.max_full_seconds:.3f}s",
+            f"bench-indexing: full build {full_seconds:.3f}s exceeds {args.max_full_seconds:.3f}s",
+            file=sys.stderr,
+        )
+        return 1
+    if ten_file_seconds > args.max_ten_file_seconds:
+        print(
+            f"bench-indexing: ten-file incremental build {ten_file_seconds:.3f}s exceeds "
+            f"{args.max_ten_file_seconds:.3f}s",
+            file=sys.stderr,
+        )
+        return 1
+    if impact_ms > args.max_impact_ms:
+        print(
+            f"bench-indexing: impact lookup {impact_ms:.2f}ms exceeds {args.max_impact_ms:.2f}ms",
             file=sys.stderr,
         )
         return 1

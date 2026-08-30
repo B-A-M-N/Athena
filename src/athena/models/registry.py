@@ -33,9 +33,16 @@ class ProviderRegistry:
         self._model_profiles: dict[tuple[str, str], object] = {}
         self._models_cache: tuple[float, tuple[ModelInfo, ...]] | None = None
         self._models_cache_ttl = 2.0
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Monotonic inventory revision for consumers caching route data."""
+        return self._generation
 
     def _invalidate_models(self) -> None:
         self._models_cache = None
+        self._generation += 1
 
     def register(self, provider_name: str, provider: ModelProvider) -> None:
         if not isinstance(provider, object) or not hasattr(provider, "complete"):
@@ -100,9 +107,16 @@ class ProviderRegistry:
         self._models_cache = (now, result)
         return result
 
+    async def refresh_models(self) -> Sequence[ModelInfo]:
+        """Refresh the provider inventory once, bypassing the TTL cache."""
+        self._invalidate_models()
+        return await self.list_models()
+
     async def resolve(self, provider_name: str, model_name: str) -> ModelInfo:
-        provider = self.provider_for(provider_name)
-        for info in await provider.list_models():
+        self.provider_for(provider_name)
+        for info in await self.list_models():
+            if info.provider != provider_name:
+                continue
             if info.id == model_name or f"{provider_name}/{info.id}" == model_name:
                 return info
         raise ModelUnavailable(f"model {model_name!r} not offered by {provider_name!r}")

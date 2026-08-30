@@ -16,6 +16,7 @@ into a bounded, provider-neutral model request.  It:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import hashlib
 import json
@@ -144,6 +145,22 @@ class _Entry:
     droppable: bool = False  # memory/skill/artifact: removable under pressure
 
 
+@dataclass(frozen=True)
+class _StaticContext:
+    """Revisioned context material that is stable across model turns."""
+
+    context_blocks: tuple[_Entry, ...] = ()
+    memories: tuple[Any, ...] = ()
+    skills: tuple[Any, ...] = ()
+    research: tuple[_Entry, ...] = ()
+    capabilities: tuple[CapabilityDescriptor, ...] = ()
+    strategy: StrategyGuidance = field(
+        default_factory=lambda: StrategyGuidance(
+            route="direct", rationale="Use the smallest available capability."
+        )
+    )
+
+
 class ContextCompiler:
     """Compiles task + state + policy + knowledge into a bounded request.
 
@@ -197,6 +214,7 @@ class ContextCompiler:
         self.capability_limit = max(1, capability_limit)
         self._project_cache: dict[str, tuple[str, tuple[_Entry, ...]]] = {}
         self._memory_cache: OrderedDict[tuple[str, int], tuple[Any, ...]] = OrderedDict()
+        self._static_cache: OrderedDict[tuple[Any, ...], _StaticContext] = OrderedDict()
 
     async def compile(
         self,
@@ -221,10 +239,12 @@ class ContextCompiler:
         ]
         required.extend(self._project_entries(workspace))
 
+        static = await self._load_static_context(task)
+
         # Explicitly attached blocks are working context, not retrieval
         # results. Load them before optional corpus material so they remain
         # mandatory and provenance survives every provider translation.
-        required.extend(await self._load_context_blocks(task))
+        required.extend(static.context_blocks)
 
         # Process attachments: load from ContextRef if needed and create entries
         attachment_entries = await self._process_attachments(task, normalized_attachments)
@@ -236,18 +256,13 @@ class ContextCompiler:
         # tokens must NOT also be subtracted here (that double-counts them).
         input_budget = max(0, self.context_window - self.reserve_output)
 
-        corpus = await self._collect_entries(task, recent_messages)
+        corpus = await self._collect_entries(task, recent_messages, static)
 
-        capabilities, strategy_evidence = await self._load_capabilities(
-            task=task,
-            require_tools=bool(task.model_policy.require_tools),
-        )
-        capabilities = tuple(capabilities)
+        capabilities = static.capabilities
         # Strategy sees the same fabric records used for progressive
         # disclosure, including readiness and validation proof.  It remains
         # advisory, but it no longer has to infer route quality from an id.
-        strategy = select_strategy(task.objective, strategy_evidence)
-        required.append(_strategy_entry(strategy))
+        required.append(_strategy_entry(static.strategy))
 
         final_entries, record, omitted = await self._bound_and_compress(
             required, corpus, input_budget, task=task
@@ -265,7 +280,71 @@ class ContextCompiler:
             omitted_refs=tuple(omitted),
             compression=record,
             capability_definitions=capabilities,
-            strategy=strategy,
+            strategy=static.strategy,
+        )
+
+    async def _load_static_context(self, task: TaskSpec) -> _StaticContext:
+        """Load revisioned context once; transcript/tool state stays dynamic."""
+        key = self._static_context_key(task)
+        if key is not None:
+            cached = self._static_cache.get(key)
+            if cached is not None:
+                self._static_cache.move_to_end(key)
+                return cached
+
+        blocks, memories, skills, research, capability_result = await asyncio.gather(
+            self._load_context_blocks(task),
+            self._load_memories(task),
+            self._load_skills(task),
+            self._load_research(task),
+            self._load_capabilities(
+                task=task,
+                require_tools=bool(task.model_policy.require_tools),
+            ),
+        )
+        capabilities, strategy_evidence = capability_result
+        static = _StaticContext(
+            context_blocks=tuple(blocks),
+            memories=tuple(memories),
+            skills=tuple(skills),
+            research=tuple(research),
+            capabilities=tuple(capabilities),
+            strategy=select_strategy(task.objective, strategy_evidence),
+        )
+        if key is not None:
+            self._static_cache[key] = static
+            self._static_cache.move_to_end(key)
+            while len(self._static_cache) > 128:
+                self._static_cache.popitem(last=False)
+        return static
+
+    def _static_context_key(self, task: TaskSpec) -> tuple[Any, ...] | None:
+        """Build a cache key only from stores that expose invalidation revisions."""
+        revisions: list[Any] = []
+        for store, methods in (
+            (self._context_block_store, ("list",)),
+            (self._memory_store, ("search", "search_scopes")),
+            (self._skill_loader, ("load_active",)),
+            (self._research_store, ("search_content",)),
+            (self._capability_registry, ("list_descriptors", "list_available")),
+        ):
+            revision = _component_revision(store, methods)
+            if revision is None:
+                return None
+            revisions.append(revision)
+        workspace = task.workspace
+        policy = task.model_policy
+        return (
+            task.id,
+            task.session_id,
+            task.objective,
+            workspace.id if workspace else None,
+            workspace.root if workspace else None,
+            repr(policy),
+            self._principal_id,
+            self.skill_limit,
+            self.capability_limit,
+            tuple(revisions),
         )
 
     async def _load_context_blocks(self, task: TaskSpec) -> list[_Entry]:
@@ -580,7 +659,12 @@ class ContextCompiler:
             reserved_output=self.reserve_output,
         )
 
-    async def _collect_entries(self, task: TaskSpec, recent: Sequence[Any] | None) -> list[_Entry]:
+    async def _collect_entries(
+        self,
+        task: TaskSpec,
+        recent: Sequence[Any] | None,
+        static: _StaticContext,
+    ) -> list[_Entry]:
         out: list[_Entry] = []
         transcript = list(recent) if recent else await self._load_transcript(task)
         # ``!!`` direct escapes are durable audit records, but explicitly opt
@@ -598,11 +682,11 @@ class ContextCompiler:
         ]
         for i, m in enumerate(transcript):
             out.append(_message_entry(m, is_last=(i == len(transcript) - 1)))
-        for rec in await self._load_memories(task):
+        for rec in static.memories:
             out.append(_memory_entry(rec))
-        for s in await self._load_skills(task):
+        for s in static.skills:
             out.append(_skill_entry(s))
-        out.extend(await self._load_research(task))
+        out.extend(static.research)
         return out
 
     async def _load_research(self, task: TaskSpec) -> list[_Entry]:
@@ -1034,6 +1118,20 @@ def _bounded_json(value: Mapping[str, Any]) -> str:
     """Keep proof visible in the bounded strategy entry without log injection."""
     text = json.dumps(dict(value), sort_keys=True, default=str, separators=(",", ":"))
     return text[:384] + ("…" if len(text) > 384 else "")
+
+
+def _component_revision(component: Any, methods: Sequence[str]) -> tuple[Any, ...] | None:
+    """Return a stable cache token, or disable caching for legacy mutable doubles."""
+    if component is None:
+        return ("none",)
+    generation = getattr(component, "generation", None)
+    if isinstance(generation, int):
+        return ("generation", generation)
+    if any(callable(getattr(component, method, None)) for method in methods):
+        # A component that can supply mutable context but cannot publish a
+        # revision must not be cached: stale context is worse than a lookup.
+        return None
+    return ("static", type(component).__module__, type(component).__qualname__)
 
 
 def _project_entries(compiler: ContextCompiler, workspace: str | None) -> list[_Entry]:

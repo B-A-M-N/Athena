@@ -50,7 +50,7 @@ _FORCE_RENDER_EVENTS = frozenset(
 class _RenderScheduler:
     """Coalesce bursty event updates into a bounded terminal frame rate."""
 
-    def __init__(self, viewer: "OIStreamViewer", *, fps: float = 30.0) -> None:
+    def __init__(self, viewer: "OIStreamViewer", *, fps: float = 25.0) -> None:
         self.viewer = viewer
         self.interval = 1.0 / max(float(fps), 1.0)
         self.last_render = 0.0
