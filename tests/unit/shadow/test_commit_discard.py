@@ -341,6 +341,44 @@ async def test_verified_delete_apply_retains_candidate_for_explicit_path(service
     assert "CandidateApplyFailed" in event_types
 
 
+async def test_approved_mixed_candidate_applies_exact_plan_without_partial_writes(service):
+    """A delete approval resumes the proven mixed write/delete plan atomically."""
+    svc, ws = service
+    task_id = await _real_task(svc, ws)
+    engine = svc.shadow_engine()
+    keep = Path(ws.root) / "keep.txt"
+    remove = Path(ws.root) / "remove.txt"
+    keep.write_text("base\n")
+    remove.write_text("delete me\n")
+
+    branch = await engine.open_branch(task_id=task_id, base_workspace=ws, proposal=[])
+    branch = await engine.execute_branch(branch, profile="autonomous")
+    candidate_keep = Path(branch.shadow_workspace.root) / "keep.txt"
+    candidate_keep.write_text("candidate\n")
+    (Path(branch.shadow_workspace.root) / "new.txt").write_text("added\n")
+    (Path(branch.shadow_workspace.root) / "remove.txt").unlink()
+    await engine.record_verification(branch, [{"id": "ac", "passed": True}])
+    svc._reality_gate.activate_branch(branch)
+
+    pending = await svc.apply_candidate(task_id)
+
+    assert pending["status"] == "APPROVAL_REQUIRED"
+    assert pending["approval_id"]
+    assert branch.commit_state == "AWAITING_APPROVAL"
+    assert keep.read_text() == "base\n"
+    assert remove.read_text() == "delete me\n"
+    assert not (Path(ws.root) / "new.txt").exists()
+    assert not await svc._store_mutations.list_for_task(task_id)
+
+    await svc.approve(pending["approval_id"], granted=True)
+
+    assert keep.read_text() == "candidate\n"
+    assert not remove.exists()
+    assert (Path(ws.root) / "new.txt").read_text() == "added\n"
+    assert branch.status == BranchStatus.COMMITTED
+    assert await svc.operator_candidate(task_id) is None
+
+
 async def test_commit_deletion_requires_approval_and_never_lands_unapproved(service):
     """Deletions are ASK under every autonomy profile: a shadow branch that
     removed a file can never silently delete it from reality at commit.

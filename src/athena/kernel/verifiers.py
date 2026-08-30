@@ -394,7 +394,16 @@ class CompositeVerifier:
     ) -> list[bool]:
         """Evaluate a plan against the disposable workspace view."""
         results: list[bool] = []
-        protected = await _verification_manifest(task.workspace)
+        # Only command probes can mutate the protected workspace.  Avoid
+        # spawning a recursive manifest worker for read-only/manual criteria;
+        # a task rooted at a broad path such as ``/tmp`` must not turn a
+        # simple manual check into an unbounded filesystem scan.
+        guard_workspace = any(
+            criterion.verification is not None
+            and criterion.verification.type == VerificationType.COMMAND
+            for criterion in criteria
+        )
+        protected = await _verification_manifest(task.workspace) if guard_workspace else {}
         allowed = _verification_writable_paths(task)
         for criterion in criteria:
             spec = criterion.verification
@@ -420,20 +429,21 @@ class CompositeVerifier:
                 ok = await self._manual.verify_one(task, spec)
             else:
                 ok = False
-            after = await _verification_manifest(task.workspace)
-            changed = _manifest_changes(protected, after)
-            unexpected = sorted(path for path in changed if path not in allowed)
-            if unexpected:
-                _logger.error(
-                    "verification probe mutated protected workspace resources: %s",
-                    ", ".join(unexpected[:16]),
-                )
-                # The view is disposable, but a mutating verifier is still
-                # not valid evidence.  Do not certify any remaining checks.
-                ok = False
-                results.append(ok)
-                results.extend(False for _ in criteria[len(results) :])
-                return results
+            if guard_workspace:
+                after = await _verification_manifest(task.workspace)
+                changed = _manifest_changes(protected, after)
+                unexpected = sorted(path for path in changed if path not in allowed)
+                if unexpected:
+                    _logger.error(
+                        "verification probe mutated protected workspace resources: %s",
+                        ", ".join(unexpected[:16]),
+                    )
+                    # The view is disposable, but a mutating verifier is still
+                    # not valid evidence.  Do not certify any remaining checks.
+                    ok = False
+                    results.append(ok)
+                    results.extend(False for _ in criteria[len(results) :])
+                    return results
             results.append(ok)
         return results
 

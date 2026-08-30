@@ -94,6 +94,10 @@ class DispatchDirectives:
     # These are dispatcher-created controls; model input cannot set them.
     inherited_effects: frozenset[EffectClass] = frozenset()
     inherited_capability_id: str | None = None
+    # A durable operator approval for a trusted orchestration batch.  This is
+    # intentionally not part of CapabilityRequest, so model input cannot
+    # manufacture an approved commit.
+    approval_id: str | None = None
 
 
 class Availability(str, enum.Enum):

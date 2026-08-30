@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
 
+from athena.execution.async_call import run_blocking
 from athena.protocol.artifacts import ArtifactRef, parse_artifact_uri
 from athena.protocol.ids import new_id
 from athena.protocol.messages import Provenance, utcnow
@@ -47,10 +48,16 @@ class ArtifactStore:
         # Per-digest lock for sidecar metadata updates (race-prone without lock).
         self._meta_locks: dict[str, asyncio.Lock] = {}
         self._meta_locks_lock = asyncio.Lock()
+        self._io_slots = asyncio.Semaphore(8)
         self._budget_tracker = budget_tracker
 
     def set_budget_tracker(self, budget_tracker) -> None:
         self._budget_tracker = budget_tracker
+
+    async def _io(self, function, *args, **kwargs):
+        """Run bounded blob/sidecar filesystem work off the event loop."""
+        async with self._io_slots:
+            return await run_blocking(function, *args, **kwargs)
 
     async def _meta_lock(self, digest: str) -> asyncio.Lock:
         """Get or create a per-digest lock for sidecar updates."""
@@ -86,7 +93,7 @@ class ArtifactStore:
             await self._budget_tracker.reserve_artifact(task_id, len(data))
             reserved = True
         try:
-            self._write_if_absent(digest, data)
+            await self._io(self._write_if_absent, digest, data)
 
             ref = ArtifactRef(
                 id=uri,
@@ -133,8 +140,8 @@ class ArtifactStore:
         lock = await self._meta_lock(ref.hash)
         async with lock:
             # Re-read inside lock to get latest state
-            sidecar_exists = sidecar.exists()
-            previous = _read_meta_sync(sidecar) if sidecar_exists else None
+            sidecar_exists = await self._io(sidecar.exists)
+            previous = await self._io(_read_meta_sync, sidecar) if sidecar_exists else None
             if isinstance(previous, dict) and isinstance(previous.get("provenances"), list):
                 existing = previous["provenances"]
                 # Remove duplicate entry (same task_id + created_at)
@@ -149,43 +156,43 @@ class ArtifactStore:
             else:
                 previous = {"digest": ref.hash or uri_digest(ref.uri), "provenances": [occurrence]}
             # Atomic write: temp file + os.replace (atomic on same filesystem)
-            _atomic_write_bytes(sidecar, json.dumps(previous).encode("utf-8"))
+            await self._io(_atomic_write_bytes, sidecar, json.dumps(previous).encode("utf-8"))
 
     # -- reads ------------------------------------------------------------
 
     async def load(self, ref: ArtifactRef | str) -> bytes:
         path = self._path_for(ref)
-        if path is None or not path.exists():
+        if path is None:
             raise FileNotFoundError(f"artifact blob not found: {ref}")
-        return path.read_bytes()
+        return await self._io(_load_blob_sync, path, ref)
 
     async def read_range(self, ref: ArtifactRef | str, offset: int, limit: int) -> bytes:
         """Read a bounded byte range without materialising the complete blob."""
         if offset < 0 or limit < 0:
             raise ValueError("offset and limit must be non-negative")
         path = self._path_for(ref)
-        if path is None or not path.exists():
+        if path is None:
             raise FileNotFoundError(f"artifact blob not found: {ref}")
-        return _read_range_sync(path, offset, limit)
+        return await self._io(_read_range_checked, path, ref, offset, limit)
 
     @asynccontextmanager
     async def open_stream(
         self, ref: ArtifactRef | str, chunk_size: int = 65536
     ) -> AsyncIterator[AsyncIterator[bytes]]:
         path = self._path_for(ref)
-        if path is None or not path.exists():
+        if path is None:
             raise FileNotFoundError(f"artifact blob not found: {ref}")
-        fh = path.open("rb")
+        fh = await self._io(_open_blob_checked, path, ref)
 
         async def _gen() -> AsyncIterator[bytes]:
             try:
                 while True:
-                    chunk = fh.read(chunk_size)
+                    chunk = await self._io(fh.read, chunk_size)
                     if not chunk:
                         break
                     yield chunk
             finally:
-                fh.close()
+                await self._io(fh.close)
 
         try:
             # The context manager yields a single async iterator. Consumers
@@ -194,7 +201,7 @@ class ArtifactStore:
             yield _gen()
         finally:
             if not fh.closed:
-                fh.close()
+                await self._io(fh.close)
 
     async def list(
         self,
@@ -204,7 +211,13 @@ class ArtifactStore:
         producer: str | None = None,
         limit: int | None = 100,
     ) -> list[ArtifactRef]:
-        return self._list_sync(mime_type=mime_type, task_id=task_id, producer=producer, limit=limit)
+        return await self._io(
+            self._list_sync,
+            mime_type=mime_type,
+            task_id=task_id,
+            producer=producer,
+            limit=limit,
+        )
 
     async def find_occurrence(self, *, task_id: str, uri: str) -> ArtifactRef | None:
         """Look up one task-owned occurrence by digest-sidecar index.
@@ -217,14 +230,11 @@ class ArtifactStore:
         if not task_id or digest is None:
             return None
         sidecar = self._meta / f"{digest}.json"
-        if not sidecar.exists():
-            return None
-        meta = _read_meta_sync(sidecar)
-        if meta is None:
-            return None
-        return next(
-            (ref for ref in _occurrences(meta) if ref.task_id == task_id and ref.uri == uri),
-            None,
+        return await self._io(
+            _find_occurrence_sync,
+            sidecar,
+            task_id,
+            uri,
         )
 
     async def is_visible(self, *, task_id: str, uri: str) -> bool:
@@ -269,10 +279,10 @@ class ArtifactStore:
             return False
         removed = False
         sidecar = self._sidecar(ref)
-        if sidecar is not None and sidecar.exists():
+        if sidecar is not None and await self._io(sidecar.exists):
             lock = await self._meta_lock(digest)
             async with lock:
-                removed = _remove_occurrence_sync(sidecar, ref)
+                removed = await self._io(_remove_occurrence_sync, sidecar, ref)
         return removed
 
     async def delete_blob(self, ref: ArtifactRef | str) -> bool:
@@ -284,17 +294,7 @@ class ArtifactStore:
         digest = _ref_digest(ref)
         if digest is None:
             return False
-        removed = False
-        blob = self._blob_path(digest)
-        if blob.exists():
-            blob.unlink()
-            _prune_empty(blob.parent)
-            removed = True
-        sidecar = self._sidecar(ref)
-        if sidecar is not None and sidecar.exists():
-            sidecar.unlink()
-            removed = True
-        return removed
+        return await self._io(_delete_blob_sync, self._blobs, self._meta, digest)
 
     # -- accessors --------------------------------------------------------
 
@@ -458,6 +458,36 @@ def _read_range_sync(path: Path, offset: int, limit: int) -> bytes:
         return handle.read(limit)
 
 
+def _load_blob_sync(path: Path, ref: ArtifactRef | str) -> bytes:
+    if not path.exists():
+        raise FileNotFoundError(f"artifact blob not found: {ref}")
+    return path.read_bytes()
+
+
+def _read_range_checked(path: Path, ref: ArtifactRef | str, offset: int, limit: int) -> bytes:
+    if not path.exists():
+        raise FileNotFoundError(f"artifact blob not found: {ref}")
+    return _read_range_sync(path, offset, limit)
+
+
+def _open_blob_checked(path: Path, ref: ArtifactRef | str):
+    if not path.exists():
+        raise FileNotFoundError(f"artifact blob not found: {ref}")
+    return path.open("rb")
+
+
+def _find_occurrence_sync(path: Path, task_id: str, uri: str) -> ArtifactRef | None:
+    if not path.exists():
+        return None
+    meta = _read_meta_sync(path)
+    if meta is None:
+        return None
+    return next(
+        (ref for ref in _occurrences(meta) if ref.task_id == task_id and ref.uri == uri),
+        None,
+    )
+
+
 def _remove_occurrence_sync(path: Path, ref: ArtifactRef | str) -> bool:
     """Remove one provenance entry without blocking the event loop."""
     meta = _read_meta_sync(path)
@@ -477,6 +507,20 @@ def _remove_occurrence_sync(path: Path, ref: ArtifactRef | str) -> bool:
     else:
         path.unlink()
     return True
+
+
+def _delete_blob_sync(blobs: Path, meta_root: Path, digest: str) -> bool:
+    removed = False
+    blob = blobs / digest[:HASH_PREFIX_BYTES] / digest
+    if blob.exists():
+        blob.unlink()
+        _prune_empty(blob.parent)
+        removed = True
+    sidecar = meta_root / f"{digest}.json"
+    if sidecar.exists():
+        sidecar.unlink()
+        removed = True
+    return removed
 
 
 def _read_meta_sync(path: Path) -> dict[str, Any] | None:

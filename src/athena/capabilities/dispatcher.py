@@ -516,6 +516,20 @@ class CapabilityDispatcher:
             # marks those decisions with an approval rule.
             combined = PolicyVerdict.ASK
             reason = "requires approval by external-effect contract"
+        orchestration_approval_id = _directives.approval_id if _directives is not None else None
+        trusted_approval = (
+            orchestration_approval_id
+            and getattr(request.origin, "value", request.origin) == "trusted_orchestration"
+        )
+        if (
+            trusted_approval
+            and global_verdict is PolicyVerdict.ASK
+            and task_verdict in {None, PolicyVerdict.ALLOW}
+            and not external_floor_requires_approval
+            and not (external_contract is not None and external_contract.approval_floor == "deny")
+        ):
+            combined = PolicyVerdict.ALLOW
+            reason = f"approved orchestration plan {orchestration_approval_id}"
         if (
             combined == PolicyVerdict.ASK
             and inherited_effects

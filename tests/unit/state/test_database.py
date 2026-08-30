@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import pytest
 
 from athena.state.database import Database
@@ -43,3 +46,26 @@ async def test_transaction_rolls_back_on_exception(db):
             raise RuntimeError("boom")
     row = await db.fetch_one("SELECT id FROM sessions WHERE id = 's_2'")
     assert row is None
+
+
+async def test_slow_sqlite_work_does_not_stall_asyncio_heartbeat(db):
+    await db._ensure_ready()
+    connection = db._conn
+    assert connection is not None
+    await connection._call(  # noqa: SLF001 - install a deterministic test-only SQLite function
+        lambda: connection._require_connection().create_function("pause", 1, time.sleep)  # noqa: SLF001
+    )
+
+    heartbeat = 0
+
+    async def beat() -> None:
+        nonlocal heartbeat
+        for _ in range(10):
+            heartbeat += 1
+            await asyncio.sleep(0.01)
+
+    beat_task = asyncio.create_task(beat())
+    await db.fetch_one("SELECT pause(?) AS paused", (0.08,))
+    await beat_task
+
+    assert heartbeat >= 5

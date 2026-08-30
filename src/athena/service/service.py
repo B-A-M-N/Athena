@@ -28,7 +28,7 @@ import logging
 import os
 import tempfile
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -1451,6 +1451,22 @@ class AthenaService:
             except Exception as exc:
                 _logger.warning("record_deny failed for %s: %s", approval_id, exc)
 
+        # Candidate deletion approvals are operator decisions over a durable
+        # ShadowEngine commit plan, not parked kernel capability calls. Apply
+        # the retained plan after the approval is persisted and do not wake a
+        # normal task continuation for this review-only path.
+        if metadata.get("candidate_apply"):
+            if granted and task_id is not None:
+                try:
+                    await self.apply_candidate(task_id, approval_id=approval_id)
+                except Exception as exc:  # preserve the candidate for recovery
+                    _logger.warning(
+                        "candidate apply after approval failed for %s: %s",
+                        approval_id,
+                        exc,
+                    )
+            return
+
         # Durable continuation: retain the canonical call until the kernel
         # consumes it. A live kernel wakes its in-memory wait; after restart,
         # no coroutine exists, so transition the same task back to RUNNING and
@@ -1804,13 +1820,96 @@ class AthenaService:
             "error": getattr(branch, "error", None),
         }
 
-    async def apply_candidate(self, task_id: str) -> dict:
+    async def request_candidate_apply_approval(
+        self,
+        branch,
+        *,
+        plan_digest: str,
+    ) -> str | None:
+        """Persist operator approval for one exact candidate commit plan."""
+        approvals = self._store_approvals
+        if approvals is None or not getattr(branch, "task_id", None):
+            return None
+
+        task_id = str(branch.task_id)
+        for record in await approvals.list_pending(task_id):
+            metadata = record.get("metadata") or {}
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("candidate_apply") is True
+                and metadata.get("candidate_branch_id") == branch.id
+                and metadata.get("candidate_plan_digest") == plan_digest
+            ):
+                return str(record.get("id") or "") or None
+
+        from athena.protocol.messages import utcnow
+
+        expires_at = utcnow().replace(microsecond=0) + timedelta(hours=24)
+        metadata = {
+            "candidate_apply": True,
+            "candidate_branch_id": branch.id,
+            "candidate_plan_digest": plan_digest,
+            "capability_id": "shadow.commit",
+            "scope": ApprovalScope.CALL.value,
+            "requested_scope": [ApprovalScope.CALL.value],
+            "expires_at": expires_at.isoformat(),
+        }
+        approval_id = await approvals.create_request(
+            task_id,
+            "shadow.commit",
+            arguments={"branch_id": branch.id, "plan_digest": plan_digest},
+            metadata=metadata,
+        )
+        if self._store_events is not None:
+            from athena.protocol.events import EV
+
+            await self._store_events.append_event(
+                EV["APPROVAL_REQUESTED"],
+                {
+                    "approval_id": approval_id,
+                    "capability_id": "shadow.commit",
+                    "scope": ApprovalScope.CALL.value,
+                    "candidate_apply": True,
+                    "branch_id": branch.id,
+                    "plan_digest": plan_digest,
+                },
+                task_id=task_id,
+            )
+        return approval_id
+
+    async def _candidate_apply_approval_matches(self, approval_id: str, branch) -> bool:
+        approvals = self._store_approvals
+        if approvals is None:
+            return False
+        record = await approvals.get(approval_id)
+        if not isinstance(record, dict) or record.get("status") != ApprovalStore.GRANTED:
+            return False
+        metadata = record.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return False
+        return bool(
+            metadata.get("candidate_apply") is True
+            and metadata.get("candidate_branch_id") == branch.id
+            and metadata.get("candidate_plan_digest") == branch.commit_outcome.get("plan_digest")
+        )
+
+    async def apply_candidate(self, task_id: str, approval_id: str | None = None) -> dict:
         """Apply a reviewed candidate through the existing shadow commit path."""
         branch = self._candidate_branch(task_id)
         if branch is None:
             return {"status": "missing", "error": "no retained candidate"}
         if branch.status != "VERIFIED":
             return {"status": "refused", "error": branch.error or f"candidate is {branch.status}"}
+        if branch.commit_state == "AWAITING_APPROVAL":
+            if not approval_id or not await self._candidate_apply_approval_matches(
+                approval_id, branch
+            ):
+                return {
+                    "status": "APPROVAL_REQUIRED",
+                    "branch": branch.id,
+                    "approval_id": branch.commit_outcome.get("approval_id"),
+                    "error": "candidate apply requires the matching durable operator approval",
+                }
         review = await self.operator_candidate(task_id) or {}
         await self._candidate_review_event(
             "CANDIDATE_APPLY_REQUESTED", task_id, review, {"operator": "local"}
@@ -1824,7 +1923,7 @@ class AthenaService:
         if self._reality_gate is not None:
             await self._reality_gate.deactivate_branch(task_id)
         try:
-            outcome = await self.shadow_engine().commit(branch)
+            outcome = await self.shadow_engine().commit(branch, approval_id=approval_id)
         except Exception as exc:
             await self._candidate_review_event(
                 "CANDIDATE_APPLY_FAILED",

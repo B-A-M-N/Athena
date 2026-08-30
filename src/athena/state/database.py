@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Sequence
@@ -9,68 +11,156 @@ from typing import Any, AsyncIterator, Callable, Sequence
 import sqlite3
 
 
+class _CallResult:
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.value: Any = None
+        self.error: BaseException | None = None
+
+
 class _AsyncSQLiteConnection:
     """Awaitable facade over one serialized SQLite connection.
 
-    Athena already serializes access with ``Database._lock``.  Keeping the
-    facade awaitable preserves the Database contract while avoiding a second
-    worker-thread scheduler that can fail to service its queue in embedded
-    runtimes.
+    SQLite owns a connection and cursor from the thread that created it.
+    A dedicated daemon worker therefore owns both and services a small queue;
+    the asyncio thread only enqueues work and awaits a loop-bound Future. This
+    keeps disk access, lock waits, and cursor operations off Athena's event
+    loop while preserving one-connection transaction affinity.
     """
 
     def __init__(self, path: str, *, on_close: Callable[[], None] | None = None) -> None:
-        self._connection = sqlite3.connect(path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
+        self._path = path
         self._on_close = on_close
+        self._connection: sqlite3.Connection | None = None
+        self._queue: queue.Queue[tuple[Callable[[], Any], _CallResult] | None] = queue.Queue()
+        self._closed = False
+        self._started = False
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name="athena-sqlite",
+            daemon=True,
+        )
+        self._thread.start()
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        await self._call(self._open)
+
+    def _open(self) -> None:
+        connection = sqlite3.connect(self._path)
+        connection.row_factory = sqlite3.Row
+        self._connection = connection
+
+    def _require_connection(self) -> sqlite3.Connection:
+        if self._connection is None:
+            raise RuntimeError("SQLite connection is not open")
+        return self._connection
+
+    async def _call(self, operation: Callable[[], Any]) -> Any:
+        if self._closed:
+            raise RuntimeError("SQLite connection is closed")
+        result = _CallResult()
+        self._queue.put((operation, result))
+        # A direct worker-to-loop callback is unreliable in some embedded
+        # runtimes. Polling a thread event with a zero-duration async yield
+        # still leaves the loop fully serviceable while avoiding a second
+        # executor or any synchronous SQLite wait on the loop thread.
+        while not result.ready.is_set():
+            await asyncio.sleep(0)
+        if result.error is not None:
+            raise result.error
+        return result.value
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            operation, result = item
+            try:
+                result.value = operation()
+            except BaseException as exc:  # propagate SQLite and callback failures
+                result.error = exc
+            finally:
+                result.ready.set()
 
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> "_AsyncSQLiteCursor":
-        await asyncio.sleep(0)
-        return _AsyncSQLiteCursor(self._connection.execute(sql, params))
+        def operation() -> tuple[sqlite3.Cursor, int]:
+            cursor = self._require_connection().execute(sql, params)
+            return cursor, cursor.rowcount
+
+        cursor, rowcount = await self._call(operation)
+        return _AsyncSQLiteCursor(self, cursor, rowcount)
 
     async def executemany(self, sql: str, params: Sequence[Sequence[Any]]) -> "_AsyncSQLiteCursor":
-        await asyncio.sleep(0)
-        return _AsyncSQLiteCursor(self._connection.executemany(sql, params))
+        def operation() -> tuple[sqlite3.Cursor, int]:
+            cursor = self._require_connection().executemany(sql, params)
+            return cursor, cursor.rowcount
+
+        cursor, rowcount = await self._call(operation)
+        return _AsyncSQLiteCursor(self, cursor, rowcount)
 
     async def executescript(self, sql: str) -> "_AsyncSQLiteCursor":
-        await asyncio.sleep(0)
-        return _AsyncSQLiteCursor(self._connection.executescript(sql))
+        def operation() -> tuple[sqlite3.Cursor, int]:
+            cursor = self._require_connection().executescript(sql)
+            return cursor, cursor.rowcount
+
+        cursor, rowcount = await self._call(operation)
+        return _AsyncSQLiteCursor(self, cursor, rowcount)
 
     async def commit(self) -> None:
-        await asyncio.sleep(0)
-        self._connection.commit()
+        await self._call(lambda: self._require_connection().commit())
 
     async def rollback(self) -> None:
-        await asyncio.sleep(0)
-        self._connection.rollback()
+        await self._call(lambda: self._require_connection().rollback())
 
     async def close(self) -> None:
-        await asyncio.sleep(0)
+        if self._closed:
+            return
+
+        def operation() -> None:
+            connection = self._connection
+            if connection is None:
+                return
+            try:
+                connection.close()
+            finally:
+                self._connection = None
+                if self._on_close is not None:
+                    self._on_close()
+
         try:
-            self._connection.close()
+            await self._call(operation)
         finally:
-            if self._on_close is not None:
-                self._on_close()
+            self._closed = True
+            self._queue.put(None)
 
 
 class _AsyncSQLiteCursor:
-    def __init__(self, cursor: sqlite3.Cursor) -> None:
+    def __init__(
+        self,
+        connection: _AsyncSQLiteConnection,
+        cursor: sqlite3.Cursor,
+        rowcount: int,
+    ) -> None:
+        self._connection = connection
         self._cursor = cursor
+        self._rowcount = rowcount
 
     @property
     def rowcount(self) -> int:
-        return self._cursor.rowcount
+        return self._rowcount
 
     async def fetchone(self) -> sqlite3.Row | None:
-        await asyncio.sleep(0)
-        return self._cursor.fetchone()
+        return await self._connection._call(self._cursor.fetchone)  # noqa: SLF001
 
     async def fetchall(self) -> list[sqlite3.Row]:
-        await asyncio.sleep(0)
-        return self._cursor.fetchall()
+        return await self._connection._call(self._cursor.fetchall)  # noqa: SLF001
 
     async def close(self) -> None:
-        await asyncio.sleep(0)
-        self._cursor.close()
+        await self._connection._call(self._cursor.close)  # noqa: SLF001
 
 
 class Database:
@@ -95,6 +185,7 @@ class Database:
     async def _ensure_ready_unlocked(self) -> None:
         if self._conn is None:
             self._conn = _AsyncSQLiteConnection(self._path, on_close=self._mark_closed)
+            await self._conn.start()
             if self._path != ":memory:":
                 await self._conn.execute("PRAGMA journal_mode=WAL")
             await self._conn.execute("PRAGMA foreign_keys=ON")

@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import pytest
 
 from athena.artifacts.store import ArtifactStore
@@ -57,3 +60,19 @@ async def test_open_stream_yields_bounded_chunks(store):
 
     assert chunks == [b"abc", b"def", b"ghi", b"j"]
     assert all(len(chunk) <= 3 for chunk in chunks)
+
+
+async def test_slow_artifact_io_does_not_stall_asyncio_heartbeat(store):
+    heartbeat = 0
+
+    async def beat() -> None:
+        nonlocal heartbeat
+        for _ in range(10):
+            heartbeat += 1
+            await asyncio.sleep(0.01)
+
+    beat_task = asyncio.create_task(beat())
+    await store._io(time.sleep, 0.08)  # noqa: SLF001 - deterministic worker proof
+    await beat_task
+
+    assert heartbeat >= 5
