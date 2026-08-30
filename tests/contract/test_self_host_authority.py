@@ -7,6 +7,7 @@ deterministic, and independent of candidate-authored unit tests.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -66,7 +67,22 @@ def test_dependency_proof_runs_python_gates_in_ephemeral_environment():
 
 def test_frozen_design_context_prioritizes_core_and_supports_retrieval():
     root = Path(__file__).resolve().parents[2]
-    bundle = SelfHostGateBundle.capture(str(root), allow_dirty=True)
+    design_files = tuple(
+        {
+            "path": relative,
+            "sha256": hashlib.sha256((root / relative).read_bytes()).hexdigest(),
+        }
+        for relative in SelfHostGatePolicy.DESIGN_CONTRACTS
+    )
+    bundle = SelfHostGateBundle(
+        source_revision="test-source",
+        project_root=str(root),
+        design_files=design_files,
+        safety_files=(),
+        required_commands=(),
+        design_bundle_hash="test-design",
+        gate_bundle_hash="test-gates",
+    )
     context = bundle.retrieve_design_context(paths=["src/athena/self_host/gates.py"])
     assert "--- SECURITY.md ---" in context
     assert "--- SELF_HOSTING.md ---" in context
