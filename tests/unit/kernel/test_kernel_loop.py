@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -110,12 +111,13 @@ async def stack():
     await db.close()
 
 
-def _task(objective, session_id, *, budget=None):
+def _task(objective, session_id, *, budget=None, metadata=None):
     return TaskSpec(
         id=new_id("task"),
         objective=objective,
         session_id=session_id,
         resource_budget=budget or ResourceBudget(),
+        metadata=metadata or {},
     )
 
 
@@ -193,6 +195,23 @@ async def test_utility_inference_receives_a_reusable_opaque_cache_key(stack):
     assert captured["cache_session_key"].startswith("athena-cache-v2:")
     assert "stable utility instructions" not in captured["cache_session_key"]
     assert usage.attempt_metadata["cache_session_key"] == captured["cache_session_key"]
+
+
+def test_cache_namespace_uses_compiler_identity_not_public_task_metadata(stack):
+    stack.kernel._compiler = SimpleNamespace(principal_id="tenant-a")
+    public_override = _task(
+        "cache partition check",
+        "session-a",
+        metadata={"cache_namespace": "victim"},
+    )
+    trusted_override = _task(
+        "cache partition check",
+        "session-b",
+        metadata={"_athena_cache_namespace": "tenant-b"},
+    )
+
+    assert stack.kernel._trusted_cache_namespace(public_override) == "tenant-a"
+    assert stack.kernel._trusted_cache_namespace(trusted_override) == "tenant-b"
 
 
 @pytest.mark.athena_claim("INV-001")

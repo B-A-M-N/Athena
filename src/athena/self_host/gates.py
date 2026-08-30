@@ -56,6 +56,75 @@ class SelfHostGatePolicy:
         "src/athena/execution/environment.py",
         "scripts/architecture-lint",
     )
+    PERFORMANCE_PATHS = {
+        "performance.alacrity": (
+            "src/athena/kernel/",
+            "src/athena/models/",
+            "src/athena/context/",
+            "src/athena/tasks/worker.py",
+            "src/athena/capabilities/dispatcher.py",
+            "src/athena/state/events.py",
+            "src/athena/state/database.py",
+            "scripts/bench-alacrity",
+        ),
+        "performance.indexing": (
+            "src/athena/project/index/",
+            "src/athena/project/profile.py",
+            "src/athena/workspace_manifest.py",
+            "scripts/bench-indexing",
+        ),
+        "performance.rendering": (
+            "src/athena/cli/",
+            "src/athena/cli/animation.py",
+            "src/athena/cli/framebuffer.py",
+            "src/athena/cli/layout.py",
+            "src/athena/cli/projection.py",
+            "src/athena/cli/scene.py",
+            "native/",
+            "scripts/bench-rendering",
+        ),
+    }
+    PERFORMANCE_GATE_AUTHORITY = frozenset(
+        {
+            "src/athena/release/gates.py",
+            "src/athena/self_host/gates.py",
+        }
+    )
+
+    @classmethod
+    def performance_proofs_for(cls, changed_resources: Iterable[str]) -> tuple[str, ...]:
+        """Return only performance proofs affected by the candidate diff."""
+        resources = tuple(
+            str(value).replace("\\", "/").lstrip("./")
+            for value in changed_resources
+            if str(value).strip()
+        )
+        if not resources:
+            return ()
+        if any(path in cls.PERFORMANCE_GATE_AUTHORITY for path in resources):
+            identities = tuple(cls.PERFORMANCE_PATHS)
+        else:
+            identities = tuple(
+                identity
+                for identity, prefixes in cls.PERFORMANCE_PATHS.items()
+                if any(
+                    resource == prefix or resource.startswith(prefix)
+                    for resource in resources
+                    for prefix in prefixes
+                )
+            )
+        return tuple(
+            command for command in cls.REQUIRED_COMMANDS if command_proof_id(command) in identities
+        )
+
+    @classmethod
+    def all_performance_commands(cls) -> tuple[str, ...]:
+        """Return the complete performance matrix for mission completion."""
+        return tuple(
+            command
+            for command in cls.REQUIRED_COMMANDS
+            if command_proof_id(command) in cls.PERFORMANCE_PATHS
+        )
 
     @classmethod
     def frozen_safety_commands(cls, root: str) -> tuple[str, ...]:
@@ -116,6 +185,7 @@ class SelfHostGatePolicy:
         tests = _impact_tests(impact)
 
         allowed = {command_proof_id(command) for command in cls.REQUIRED_COMMANDS}
+        performance_commands = cls.performance_proofs_for(resources)
         if level != "high":
             allowed = {"architecture"}
             if python:
@@ -127,6 +197,7 @@ class SelfHostGatePolicy:
                 allowed.add("dependency.lock")
             if level == "medium" and not dependency:
                 allowed.add("python.full_tests")
+            allowed.update(command_proof_id(command) for command in performance_commands)
         if dependency:
             allowed.difference_update(
                 {

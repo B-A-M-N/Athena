@@ -70,6 +70,8 @@ class FakeModelProvider:
                 per_1m_input=_optional_float(cost.get("per_1m_input")),
                 per_1m_output=_optional_float(cost.get("per_1m_output")),
                 currency=str(cost.get("currency", "USD")),
+                per_1m_cache_read_input=_optional_float(cost.get("per_1m_cache_read_input")),
+                per_1m_cache_write_input=_optional_float(cost.get("per_1m_cache_write_input")),
             )
         self._response_cost_usd = response_cost_usd
         self._info_kwargs: _InfoKwargs = {

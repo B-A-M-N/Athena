@@ -59,6 +59,39 @@ _PATH = "/v1/messages"
 _CACHEABLE_MODES = frozenset({"session-key", "explicit-cache-api"})
 
 
+def _anthropic_usage(raw: Any) -> UsageInfo:
+    """Normalize Anthropic usage to total prompt tokens plus subdivisions.
+
+    Anthropic reports ``input_tokens`` as the uncached portion. Cache reads
+    and writes are reported separately and must be added for the canonical
+    prompt total used by budgets, compression, and cost accounting.
+    """
+    if isinstance(raw, Mapping):
+        values = dict(raw)
+    else:
+        values = {
+            key: getattr(raw, key, 0)
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        }
+    uncached = int(values.get("input_tokens") or 0)
+    read = int(values.get("cache_read_input_tokens") or 0)
+    write = int(values.get("cache_creation_input_tokens") or 0)
+    return UsageInfo(
+        input_tokens=uncached + read + write,
+        output_tokens=int(values.get("output_tokens") or 0),
+        cost_usd=_reported_cost_usd(values),
+        cache_read_tokens=read,
+        cache_write_tokens=write,
+        uncached_input_tokens=uncached,
+        provider_metadata={"raw_usage": values},
+    )
+
+
 def _reported_cost_usd(raw: Any) -> float | None:
     """Normalize an optional provider-reported USD cost without inventing 0."""
     if isinstance(raw, Mapping):
@@ -189,6 +222,8 @@ class AnthropicProvider:
                 per_1m_input=_optional_float(cost.get("per_1m_input")),
                 per_1m_output=_optional_float(cost.get("per_1m_output")),
                 currency=str(cost.get("currency", "USD")),
+                per_1m_cache_read_input=_optional_float(cost.get("per_1m_cache_read_input")),
+                per_1m_cache_write_input=_optional_float(cost.get("per_1m_cache_write_input")),
             )
         self._cost = cost
         self._latency_class = latency_class
@@ -284,32 +319,16 @@ class AnthropicProvider:
                     )
                 )
         usage = response.usage
-        reported_cost = _reported_cost_usd(usage)
+        normalized_usage = _anthropic_usage(usage)
+        reported_cost = normalized_usage.cost_usd
         if reported_cost is None:
             reported_cost = _reported_cost_usd(response)
+            normalized_usage = replace(normalized_usage, cost_usd=reported_cost)
         return _done_event(
             request,
             blocks=blocks,
             finish=response.stop_reason or "end_turn",
-            usage=UsageInfo(
-                input_tokens=getattr(usage, "input_tokens", 0) or 0,
-                output_tokens=getattr(usage, "output_tokens", 0) or 0,
-                cost_usd=reported_cost,
-                cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-                cache_write_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
-                provider_metadata={
-                    "raw_usage": {
-                        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
-                        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
-                        "cache_read_input_tokens": (
-                            getattr(usage, "cache_read_input_tokens", 0) or 0
-                        ),
-                        "cache_creation_input_tokens": (
-                            getattr(usage, "cache_creation_input_tokens", 0) or 0
-                        ),
-                    }
-                },
-            ),
+            usage=normalized_usage,
             metadata=({"response_id": response.id} if getattr(response, "id", None) else None),
         )
 
@@ -486,6 +505,7 @@ class AnthropicProvider:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         stream_complete = False
+        usage_raw: dict[str, Any] = {}
         async for line in resp.aiter_lines():
             line = line.strip()
             if not line.startswith("data:"):
@@ -496,7 +516,15 @@ class AnthropicProvider:
             except ValueError:
                 continue
             ptype = payload.get("type")
-            if ptype == "content_block_start":
+            if ptype == "message_start":
+                message = payload.get("message") or {}
+                if isinstance(message.get("usage"), Mapping):
+                    usage_raw.update(message["usage"])
+            elif ptype == "message_delta":
+                delta_usage = payload.get("usage") or {}
+                if isinstance(delta_usage, Mapping):
+                    usage_raw.update(delta_usage)
+            elif ptype == "content_block_start":
                 block = payload.get("content_block") or {}
                 if block.get("type") == "tool_use":
                     index = payload.get("index", 0)
@@ -591,7 +619,7 @@ class AnthropicProvider:
             blocks.append(ReasoningBlock(type="reasoning", text="".join(reasoning_parts)))
         if text_parts:
             blocks.append(TextBlock(type="text", text="".join(text_parts)))
-        yield _done_event(request, blocks=blocks)
+        yield _done_event(request, blocks=blocks, usage=_anthropic_usage(usage_raw))
 
     def _parse_complete(self, request: ModelRequest, data: dict[str, Any]) -> ModelEvent:
         blocks: list[ContentBlock] = []
@@ -632,21 +660,16 @@ class AnthropicProvider:
                     )
                 )
         usage_raw = data.get("usage") or {}
-        reported_cost = _reported_cost_usd(usage_raw)
+        usage = _anthropic_usage(usage_raw)
+        reported_cost = usage.cost_usd
         if reported_cost is None:
             reported_cost = _reported_cost_usd(data)
+            usage = replace(usage, cost_usd=reported_cost)
         return _done_event(
             request,
             blocks=blocks,
             finish=data.get("stop_reason") or "end_turn",
-            usage=UsageInfo(
-                input_tokens=int(usage_raw.get("input_tokens") or 0),
-                output_tokens=int(usage_raw.get("output_tokens") or 0),
-                cost_usd=reported_cost,
-                cache_read_tokens=int(usage_raw.get("cache_read_input_tokens") or 0),
-                cache_write_tokens=int(usage_raw.get("cache_creation_input_tokens") or 0),
-                provider_metadata={"raw_usage": usage_raw},
-            ),
+            usage=usage,
             metadata={"response_id": data.get("id")} if data.get("id") else {},
         )
 

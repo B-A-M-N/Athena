@@ -165,16 +165,25 @@ def _config_set(o: "Options") -> int:
         print(
             "athena config: supported keys are hermes-referee.enabled, "
             "hermes-referee.endpoint, hermes-referee.profile, "
-            "hermes-referee.timeout-seconds, and hermes-referee.credential-id",
+            "hermes-referee.timeout-seconds, hermes-referee.credential-id, "
+            "hermes-referee.allow-remote, and hermes-referee.allow-insecure-remote",
             file=sys.stderr,
         )
         return 2
     field = raw_key[len(prefix) :].replace("-", "_")
-    if field not in {"enabled", "endpoint", "profile", "timeout_seconds", "credential_id"}:
+    if field not in {
+        "enabled",
+        "endpoint",
+        "profile",
+        "timeout_seconds",
+        "credential_id",
+        "allow_remote",
+        "allow_insecure_remote",
+    }:
         print(f"athena config: unsupported key {o.config_key!r}", file=sys.stderr)
         return 2
     value = str(o.config_value or "").strip()
-    if field == "enabled":
+    if field in {"enabled", "allow_remote", "allow_insecure_remote"}:
         lowered = value.lower()
         if lowered not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
             print("athena config: enabled expects true or false", file=sys.stderr)
@@ -230,6 +239,8 @@ def _cmd_config(o: "Options", config: Any) -> int:
         print(f"  profile: {settings.profile}")
         print(f"  timeout_seconds: {settings.timeout_seconds:g}")
         print(f"  credential_id: {settings.credential_id or '-'}")
+        print(f"  allow_remote: {str(settings.allow_remote).lower()}")
+        print(f"  allow_insecure_remote: {str(settings.allow_insecure_remote).lower()}")
         return 0
     print("athena config: use 'set KEY VALUE' or 'show'", file=sys.stderr)
     return 2

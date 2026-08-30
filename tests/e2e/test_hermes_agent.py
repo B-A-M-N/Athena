@@ -33,7 +33,8 @@ async def test_live_hermes_referee_transport() -> None:
         api_key=os.environ.get("ATHENA_HERMES_E2E_API_KEY", ""),
     )
     try:
-        await adapter.health()
+        preflight = await adapter.preflight()
+        assert preflight.safety_verified is True
         raw = await adapter(_packet())
         assert str(raw.get("decision")) in {decision.value for decision in HermesDecision}
         verdict = await HermesReferee(adapter).review(_packet())

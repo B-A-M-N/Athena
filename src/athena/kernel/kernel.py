@@ -1117,13 +1117,7 @@ class AgentKernel:
                 }
             )
             inference_metadata = self._inference_metadata(selection)
-            namespace = (
-                str(
-                    attempt_metadata.get("cache_namespace")
-                    or getattr(self._compiler, "principal_id", "athena")
-                ).strip()
-                or "athena"
-            )
+            namespace = self._trusted_cache_namespace()
             stable_payload = (
                 [{"role": "system", "block_types": ["text"], "content": system_prompt}]
                 if system_prompt
@@ -1448,14 +1442,7 @@ class AgentKernel:
         )
 
         session_key = task.session_id or task.id
-        task_metadata = dict(task.metadata or {})
-        namespace = (
-            str(
-                task_metadata.get("cache_namespace")
-                or getattr(self._compiler, "principal_id", "athena")
-            ).strip()
-            or "athena"
-        )
+        namespace = self._trusted_cache_namespace(task)
         metadata = self._inference_metadata(selection)
         # Keep the tracker stable across profile revisions so it can emit a
         # provider-profile boundary instead of silently starting a new tracker.
@@ -1541,6 +1528,19 @@ class AgentKernel:
         }
         await self._emit("InferencePrefixObserved", output, task)
         return output
+
+    def _trusted_cache_namespace(self, task: TaskSpec | None = None) -> str:
+        """Return the service-owned cache partition, never caller metadata.
+
+        ``cache_namespace`` is an ownership boundary. Public request metadata
+        rejects that name; only the internal underscored form can carry a
+        trusted override, and the normal path uses the compiler principal.
+        """
+        internal = None
+        if task is not None:
+            internal = (task.metadata or {}).get("_athena_cache_namespace")
+        value = internal or getattr(self._compiler, "principal_id", "athena")
+        return str(value).strip() or "athena"
 
     def _replay_metadata(
         self,
@@ -2479,12 +2479,25 @@ def _actual_model_cost(
     output_tokens = int(getattr(usage, "output_tokens", 0) or 0) or _output_tokens_of(response)
     if input_tokens is None:
         return None
-    if pricing.per_1m_input is None and input_tokens:
+    cache_read = int(getattr(usage, "cache_read_tokens", 0) or 0)
+    cache_write = int(getattr(usage, "cache_write_tokens", 0) or 0)
+    uncached = getattr(usage, "uncached_input_tokens", None)
+    if uncached is None:
+        uncached = max(input_tokens - cache_read - cache_write, 0)
+    else:
+        uncached = max(int(uncached), 0)
+    if pricing.per_1m_input is None and uncached:
+        return None
+    if cache_read and pricing.per_1m_cache_read_input is None:
+        return None
+    if cache_write and pricing.per_1m_cache_write_input is None:
         return None
     if pricing.per_1m_output is None and output_tokens:
         return None
     return (
-        Decimal(str(pricing.per_1m_input or 0)) * input_tokens
+        Decimal(str(pricing.per_1m_input or 0)) * uncached
+        + Decimal(str(pricing.per_1m_cache_read_input or 0)) * cache_read
+        + Decimal(str(pricing.per_1m_cache_write_input or 0)) * cache_write
         + Decimal(str(pricing.per_1m_output or 0)) * output_tokens
     ) / Decimal(1_000_000)
 
@@ -2503,7 +2516,18 @@ def _worst_case_cost(
         return None
     if pricing.per_1m_input is None or pricing.per_1m_output is None:
         return None
-    input_rate = Decimal(str(pricing.per_1m_input))
+    cache_mode = str((request.metadata or {}).get("cache_mode") or "none").strip().lower()
+    input_rates = [Decimal(str(pricing.per_1m_input))]
+    if cache_mode not in {"", "none", "off"}:
+        if pricing.per_1m_cache_read_input is None or pricing.per_1m_cache_write_input is None:
+            return None
+        input_rates.extend(
+            [
+                Decimal(str(pricing.per_1m_cache_read_input)),
+                Decimal(str(pricing.per_1m_cache_write_input)),
+            ]
+        )
+    input_rate = max(input_rates)
     output_rate = Decimal(str(pricing.per_1m_output))
     return (input_rate * input_tokens + output_rate * output_tokens) / Decimal(1_000_000)
 

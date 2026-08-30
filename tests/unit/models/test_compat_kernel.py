@@ -221,6 +221,7 @@ def test_cache_key_reuses_compatible_prefixes_across_sessions_without_leaking_sc
 
     assert first == second
     assert "tenant-a" not in first
+    assert build_cache_key(**{**args, "namespace": "tenant-b"}) != first
     assert build_cache_key(**{**args, "prefix_fingerprint": "prefix-b"}) != first
     assert build_cache_key(**args, session_id="session-1", session_scoped=True) != first
 

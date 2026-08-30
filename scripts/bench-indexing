@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import resource
 import sys
+import statistics
 import time
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -18,18 +21,37 @@ from athena.project.index.builder import ProjectIndexBuilder  # noqa: E402
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--max-full-seconds", type=float, default=5.0)
+    parser.add_argument("--hard-max-full-seconds", type=float, default=8.0)
     parser.add_argument("--max-incremental-seconds", type=float, default=0.5)
+    parser.add_argument("--hard-max-incremental-seconds", type=float, default=1.0)
     parser.add_argument("--max-ten-file-seconds", type=float, default=0.5)
     parser.add_argument("--max-source-revision-ms", type=float, default=500.0)
     parser.add_argument("--max-impact-ms", type=float, default=50.0)
     args = parser.parse_args()
+    if args.samples < 1 or args.samples > 20:
+        parser.error("--samples must be between 1 and 20")
     root = args.root.resolve()
-    builder = ProjectIndexBuilder()
 
-    started = time.perf_counter()
-    index = builder.build(str(root))
-    full_seconds = time.perf_counter() - started
+    def measure(operation):
+        before_cpu = resource.getrusage(resource.RUSAGE_SELF).ru_utime
+        started = time.perf_counter()
+        value = operation()
+        elapsed = time.perf_counter() - started
+        after_cpu = resource.getrusage(resource.RUSAGE_SELF).ru_utime
+        return value, elapsed, max(0.0, after_cpu - before_cpu)
+
+    cold_samples: list[float] = []
+    cold_cpu_samples: list[float] = []
+    index = None
+    for _ in range(args.samples):
+        builder = ProjectIndexBuilder()
+        index, elapsed, cpu = measure(lambda: builder.build(str(root)))
+        cold_samples.append(elapsed)
+        cold_cpu_samples.append(cpu)
+    assert index is not None
+    builder = ProjectIndexBuilder()
 
     candidates = [
         str(item["path"])
@@ -39,9 +61,13 @@ def main() -> int:
     one_path = candidates[:1] or ["src/athena/project/index/builder.py"]
     ten_paths = candidates[:10] or one_path
 
-    started = time.perf_counter()
-    refreshed = builder.incremental(str(root), index, one_path)
-    incremental_seconds = time.perf_counter() - started
+    incremental_samples: list[float] = []
+    incremental_cpu_samples: list[float] = []
+    refreshed = index
+    for _ in range(args.samples):
+        refreshed, elapsed, cpu = measure(lambda: builder.incremental(str(root), index, one_path))
+        incremental_samples.append(elapsed)
+        incremental_cpu_samples.append(cpu)
     source_started = time.perf_counter()
     source_revision = builder.source_revision(str(root))
     source_revision_seconds = time.perf_counter() - source_started
@@ -53,11 +79,25 @@ def main() -> int:
     impact_started = time.perf_counter()
     impact = refreshed_ten.impact(ten_paths)
     impact_ms = (time.perf_counter() - impact_started) * 1000.0
+    full_seconds = statistics.median(cold_samples)
+    incremental_seconds = statistics.median(incremental_samples)
     result = {
         "root": str(root),
         "files": len(refreshed.files),
         "full_seconds": round(full_seconds, 6),
+        "full_seconds_max": round(max(cold_samples), 6),
+        "full_seconds_samples": [round(value, 6) for value in cold_samples],
+        "full_process_cpu_seconds_median": round(statistics.median(cold_cpu_samples), 6),
         "incremental_seconds": round(incremental_seconds, 6),
+        "incremental_seconds_max": round(max(incremental_samples), 6),
+        "incremental_seconds_samples": [round(value, 6) for value in incremental_samples],
+        "incremental_process_cpu_seconds_median": round(
+            statistics.median(incremental_cpu_samples), 6
+        ),
+        "logical_cpus": os.cpu_count() or 1,
+        "load_average": [round(value, 3) for value in os.getloadavg()]
+        if hasattr(os, "getloadavg")
+        else None,
         "ten_file_incremental_seconds": round(ten_file_seconds, 6),
         "source_revision_seconds": round(source_revision_seconds, 6),
         "source_revision_ms": round(source_revision_seconds * 1000.0, 3),
@@ -72,6 +112,13 @@ def main() -> int:
     if full_seconds > args.max_full_seconds:
         print(
             f"bench-indexing: full build {full_seconds:.3f}s exceeds {args.max_full_seconds:.3f}s",
+            file=sys.stderr,
+        )
+        return 1
+    if max(cold_samples) > args.hard_max_full_seconds:
+        print(
+            f"bench-indexing: full build sample {max(cold_samples):.3f}s exceeds hard "
+            f"maximum {args.hard_max_full_seconds:.3f}s",
             file=sys.stderr,
         )
         return 1
@@ -99,6 +146,13 @@ def main() -> int:
         print(
             f"bench-indexing: incremental build {incremental_seconds:.3f}s exceeds "
             f"{args.max_incremental_seconds:.3f}s",
+            file=sys.stderr,
+        )
+        return 1
+    if max(incremental_samples) > args.hard_max_incremental_seconds:
+        print(
+            f"bench-indexing: incremental sample {max(incremental_samples):.3f}s exceeds "
+            f"hard maximum {args.hard_max_incremental_seconds:.3f}s",
             file=sys.stderr,
         )
         return 1

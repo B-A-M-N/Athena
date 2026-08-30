@@ -23,6 +23,7 @@ _IGNORED_DIRS = {
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
+    ".ruff_cache",
     "target",
     "dist",
     "build",
@@ -405,7 +406,11 @@ class ProjectInspector:
 
 def _is_environment_directory(path: Path, name: str) -> bool:
     """Skip generated environments without enumerating project packages."""
-    if name in _IGNORED_DIRS or name == "site-packages":
+    if (
+        name in _IGNORED_DIRS
+        or name == "site-packages"
+        or name.endswith((".egg-info", ".dist-info"))
+    ):
         return True
     try:
         return (path / "pyvenv.cfg").is_file()

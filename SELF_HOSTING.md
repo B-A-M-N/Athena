@@ -55,3 +55,19 @@ profile, and the invariant that human promotion remains required. Hermes is
 called only at semantic candidate/mission checkpoints. It receives a bounded
 read-only `ReviewPacket`; a missing, malformed, or failed response holds the
 review closed.
+
+## Completion and performance gates
+
+Candidate verification is diff-targeted, but mission completion is stricter:
+the service-owned completion verifier runs all three performance proofs against
+the promoted source before it can create a complete mission record:
+
+- event-stream alacrity;
+- project indexing, measured with three samples (median target ≤5 seconds,
+  hard maximum 8 seconds) and incremental updates (median target ≤500 ms,
+  hard maximum 1 second); and
+- native/TUI rendering, including idle redraw and CPU bounds.
+
+The benchmark output records process CPU, logical CPU count, and load average.
+Performance proof identities are semantic, so equivalent command wrappers remain
+the same proof and release-check is the authoritative final gate.

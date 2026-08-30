@@ -156,6 +156,14 @@ service process serves more than one principal; the value is hashed before it
 reaches a provider. Task- or session-specific context stays outside the shared
 stable prefix.
 
+“Maximum prompt-cache reuse” means that this stable prefix remains byte-stable:
+system instructions, policy context, tool schemas, ordering, model, and provider
+profile are all part of the cache identity. Athena records cache reads, writes,
+and uncached input separately, so reported prompt totals and costs remain correct
+when a provider returns cache subdivisions. Reuse is still bounded by the
+provider’s cache lifetime and invalidated when any tracked prefix component
+changes; it is not an infinite local prompt store.
+
 ### Hermes Agent self-host referee
 
 Athena can send one bounded review packet at the candidate and mission
@@ -185,8 +193,18 @@ enabled = true
 endpoint = "http://127.0.0.1:8642"
 profile = "athena-referee"
 timeout_seconds = 60
+# allow_remote = true                 # required for a non-loopback endpoint
+# allow_insecure_remote = true        # development-only HTTP exception
 # credential_id = "HERMES_API_KEY"  # optional managed secret name
 ```
+
+Before review, Athena performs a cached safety preflight against
+`/v1/models` and `/v1/capabilities`. The selected profile must advertise
+`runtime.mode = "referee"`, `runtime.tool_execution = "disabled"`, referee
+policy version `1`, and `effective_tools = []`. Loopback endpoints are allowed
+by default; remote endpoints require explicit opt-in and HTTPS unless the
+development-only insecure override is enabled. `athena self status` distinguishes
+disconnected, connected-but-unsafe, and safety-verified states.
 
 Hermes is called at semantic review checkpoints, not for every tool or model
 event. Its profile should be read-only, low-temperature, and free of mutation

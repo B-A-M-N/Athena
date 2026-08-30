@@ -89,6 +89,8 @@ def test_roundtrip_hermes_referee_config():
             profile="athena-referee",
             timeout_seconds=45.0,
             credential_id="HERMES_API_KEY",
+            allow_remote=True,
+            allow_insecure_remote=True,
         )
     )
 

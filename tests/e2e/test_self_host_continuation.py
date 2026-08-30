@@ -32,6 +32,7 @@ class _Planner:
 
 
 class _Authority:
+    project_root = "/repo"
     source_revision = "source"
     design_bundle_hash = "design"
     gate_bundle_hash = "gates"
@@ -105,6 +106,13 @@ async def test_completion_requires_a_separate_verifier():
 
     service = AthenaService.in_memory()
     service._kernel = _Verifier()  # noqa: SLF001 - exercise completion authority
+
+    class _PerformanceVerifier:
+        async def verify(self, _task, criteria, *, verification_environment=None):
+            return [True for _ in criteria]
+
+    service._acceptance_verifier = _PerformanceVerifier()  # noqa: SLF001
+    service._self_host_verification_environment = lambda *args, **kwargs: object()  # noqa: SLF001
     service._hermes_referee = HermesReferee(  # noqa: SLF001 - exercise external seam
         lambda _packet: {"decision": "PASS", "rationale": "history is covered"}
     )

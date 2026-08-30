@@ -124,12 +124,17 @@ class HermesReferee:
                 packet_hash=packet_hash,
             )
         try:
+            preflight = getattr(self._evaluator, "preflight", None)
+            if callable(preflight):
+                result = preflight()
+                if inspect.isawaitable(result):
+                    await result
             raw = self._evaluator(packet)
             if inspect.isawaitable(raw):
                 raw = await raw
             verdict = _parse_verdict(raw, packet_hash=packet_hash)
         except Exception as exc:  # external governance must fail closed
-            reason = f"Hermes evaluator failed: {exc}"
+            reason = f"Hermes preflight/evaluator failed: {exc}"
             return HermesVerdict(
                 decision=HermesDecision.HOLD,
                 rationale=reason,

@@ -145,6 +145,10 @@ class HermesRefereeConfig:
     profile: str = "athena-referee"
     timeout_seconds: float = 60.0
     credential_id: str | None = None
+    # Remote Hermes endpoints require an explicit operator opt-in. Loopback
+    # endpoints remain valid over HTTP for local deployments.
+    allow_remote: bool = False
+    allow_insecure_remote: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +317,8 @@ def _parse_hermes_referee(data: Any) -> HermesRefereeConfig:
         profile=profile,
         timeout_seconds=timeout,
         credential_id=str(credential_id) if credential_id else None,
+        allow_remote=bool(data.get("allow_remote", False)),
+        allow_insecure_remote=bool(data.get("allow_insecure_remote", False)),
     )
 
 
@@ -383,6 +389,8 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
             "endpoint": config.hermes_referee.endpoint,
             "profile": config.hermes_referee.profile,
             "timeout_seconds": config.hermes_referee.timeout_seconds,
+            "allow_remote": config.hermes_referee.allow_remote,
+            "allow_insecure_remote": config.hermes_referee.allow_insecure_remote,
             **(
                 {"credential_id": config.hermes_referee.credential_id}
                 if config.hermes_referee.credential_id

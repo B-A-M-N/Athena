@@ -118,6 +118,16 @@ async def test_anthropic_stream_accumulates_reasoning_text_and_tool_call():
     request = _request()
     response_events = [
         {
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 900,
+                    "cache_creation_input_tokens": 50,
+                }
+            },
+        },
+        {
             "type": "content_block_start",
             "index": 0,
             "content_block": {"type": "thinking", "thinking": "inspect first"},
@@ -144,6 +154,7 @@ async def test_anthropic_stream_accumulates_reasoning_text_and_tool_call():
             "delta": {"type": "input_json_delta", "partial_json": '{"path":"README.md"}'},
         },
         {"type": "content_block_stop", "index": 2},
+        {"type": "message_delta", "usage": {"output_tokens": 20}},
         {"type": "message_stop"},
     ]
 
@@ -164,8 +175,30 @@ async def test_anthropic_stream_accumulates_reasoning_text_and_tool_call():
     assert response.blocks[2].arguments == {"path": "README.md"}
     assert any(event.type is ModelEventType.REASONING for event in events)
     done = next(event.response for event in events if event.response is not None)
+    assert done.usage.input_tokens == 1050
+    assert done.usage.uncached_input_tokens == 100
+    assert done.usage.cache_read_tokens == 900
+    assert done.usage.cache_write_tokens == 50
+    assert done.usage.output_tokens == 20
     assert done.metadata["provider_profile_id"] == "anthropic-hosted"
     assert done.metadata["provider_profile_fingerprint"] == "fp-anthropic"
+
+
+def test_anthropic_usage_total_includes_cache_subdivisions():
+    from athena.models.providers.anthropic import _anthropic_usage
+
+    usage = _anthropic_usage(
+        {
+            "input_tokens": 100,
+            "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 50,
+            "output_tokens": 20,
+        }
+    )
+    assert usage.input_tokens == 1050
+    assert usage.uncached_input_tokens == 100
+    assert usage.cache_read_tokens == 900
+    assert usage.cache_write_tokens == 50
 
 
 def test_anthropic_malformed_tool_input_keeps_empty_raw_candidate():

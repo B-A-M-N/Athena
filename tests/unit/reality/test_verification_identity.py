@@ -23,6 +23,7 @@ def test_equivalent_command_implementations_share_proof_identity():
     assert command_proof_id("pytest -q tests/e2e/test_release_black_box.py") == "python.e2e_tests"
     assert command_proof_id("pytest -q --ignore=tests/e2e") == "python.full_tests"
     assert command_proof_id("cargo check --manifest-path native/Cargo.toml") == "rust.check"
+    assert command_proof_id("python scripts/bench-indexing --samples 3") == ("performance.indexing")
 
 
 def test_stronger_proof_subsumes_narrower_python_proof():
@@ -97,3 +98,26 @@ def test_high_risk_patch_keeps_full_gate_matrix():
     assert {command_proof_id(command) for command in SelfHostGatePolicy.REQUIRED_COMMANDS} <= {
         verification_proof_id(item.verification) for item in selected if item.verification
     }
+
+
+def test_performance_proofs_follow_affected_resource_families():
+    assert {"performance.alacrity"} == {
+        command_proof_id(command)
+        for command in SelfHostGatePolicy.performance_proofs_for(("src/athena/kernel/kernel.py",))
+    }
+    assert {"performance.indexing"} == {
+        command_proof_id(command)
+        for command in SelfHostGatePolicy.performance_proofs_for(("src/athena/project/profile.py",))
+    }
+    assert {"performance.rendering"} == {
+        command_proof_id(command)
+        for command in SelfHostGatePolicy.performance_proofs_for(("native/src/lib.rs",))
+    }
+
+
+def test_performance_matrix_is_complete_for_mission_completion():
+    assert {
+        "performance.alacrity",
+        "performance.indexing",
+        "performance.rendering",
+    } == {command_proof_id(command) for command in SelfHostGatePolicy.all_performance_commands()}

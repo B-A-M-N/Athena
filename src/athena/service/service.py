@@ -33,6 +33,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
+import httpx
+
 from athena.artifacts.store import ArtifactStore
 from athena.affordances import (
     CapabilityFabric,
@@ -149,6 +151,7 @@ _RESERVED_REQUEST_METADATA = frozenset(
         "_athena_self_host",
         "_athena_review_before_commit",
         "_athena_required_gates",
+        "cache_namespace",
     }
 )
 
@@ -229,6 +232,7 @@ class AthenaService:
         self._dispatcher: CapabilityDispatcher | None = None
         self._reality_gate: Any = None
         self._reality_coordinator: Any = None
+        self._acceptance_verifier: Any = None
         self._compiler: ContextCompiler | None = None
         self._model_registry: ProviderRegistry | None = None
         self._kernel: AgentKernel | None = None
@@ -569,6 +573,7 @@ class AthenaService:
             evidence_provider=self._verification_evidence,
             inference_broker=self._make_judge_broker(),
         )
+        self._acceptance_verifier = verifier
         from athena.reality import RealityCoordinator, ShadowCandidateVerifier
 
         coordinator = RealityCoordinator(
@@ -1103,8 +1108,8 @@ class AthenaService:
                 "error": self._hermes_status_error,
             }
         try:
-            await self._hermes_adapter.health()
-        except Exception as exc:
+            preflight = await self._hermes_adapter.preflight()
+        except httpx.HTTPError as exc:
             return {
                 "enabled": True,
                 "state": "disconnected",
@@ -1112,11 +1117,24 @@ class AthenaService:
                 "endpoint": settings.endpoint,
                 "error": str(exc),
             }
+        except Exception as exc:
+            from athena.hermes.agent_adapter import HermesRefereeSafetyError
+
+            return {
+                "enabled": True,
+                "state": ("unsafe" if isinstance(exc, HermesRefereeSafetyError) else "connected"),
+                "safety_verified": False,
+                "profile": settings.profile,
+                "endpoint": settings.endpoint,
+                "error": str(exc),
+            }
         return {
             "enabled": True,
-            "state": "connected",
+            "state": "safety_verified",
+            "safety_verified": True,
             "profile": settings.profile,
             "endpoint": settings.endpoint,
+            "policy_fingerprint": preflight.policy_fingerprint,
         }
 
     async def _recover_approved_continuations(
@@ -1448,6 +1466,84 @@ class AthenaService:
             return controller.propose_completion(plan, reason=reason), None
         return dict(plan), error or "planner did not produce a next work item"
 
+    async def _verify_self_host_performance(
+        self,
+        *,
+        bundle: SelfHostGateBundle,
+        task_id: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Run the complete performance matrix before mission completion.
+
+        Candidate verification remains diff-targeted. Mission completion is a
+        separate boundary, so it pays for all three performance proofs against
+        a disposable view of the current promoted source.
+        """
+        from athena.protocol.tasks import Criterion, VerificationSpec, VerificationType
+        from athena.self_host.gates import SelfHostGatePolicy
+        from athena.verification.identity import command_proof_id
+
+        verifier = self._acceptance_verifier
+        commands = SelfHostGatePolicy.all_performance_commands()
+        if verifier is None:
+            return [], "completion requires the service-owned performance verifier"
+        if not commands:
+            return [], "completion requires the service-owned performance matrix"
+
+        proof_task_id = f"self-host-performance-{task_id or 'completion'}"
+        workspace = WorkspaceSpec(
+            id="athena-self-completion-performance",
+            root=bundle.project_root,
+            revision=bundle.source_revision,
+            network_policy=NetworkPolicy.DENY,
+            mutation_mode=MutationMode.READ_ONLY,
+        )
+        try:
+            environment = self._self_host_verification_environment(
+                workspace,
+                include_project_root=True,
+                include_rust=True,
+                task_id=proof_task_id,
+            )
+            proof_task = TaskSpec(
+                id=proof_task_id,
+                objective="prove all self-host performance invariants",
+                workspace=workspace,
+                metadata={"autonomy": AutonomyLevel.CODING.value},
+            )
+            criteria = tuple(
+                Criterion(
+                    id=f"self_host_completion_{command_proof_id(command)}",
+                    description=command,
+                    verification=VerificationSpec(
+                        type=VerificationType.COMMAND,
+                        command=command,
+                    ),
+                    required=True,
+                )
+                for command in commands
+            )
+            results = await verifier.verify(
+                proof_task,
+                criteria,
+                verification_environment=environment,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return [], f"completion performance proof could not run: {exc}"
+
+        if len(results) != len(commands):
+            return [], "completion performance proof returned incomplete results"
+        evidence = [
+            {
+                "proof_id": command_proof_id(command),
+                "passed": bool(passed),
+            }
+            for command, passed in zip(commands, results)
+        ]
+        failed = [str(item["proof_id"]) for item in evidence if not item["passed"]]
+        if failed:
+            return evidence, "completion performance proofs failed: " + ", ".join(failed)
+        return evidence, None
+
     async def _verify_self_host_completion(
         self,
         mission: Mapping[str, Any],
@@ -1491,6 +1587,13 @@ class AthenaService:
         ):
             return None, "completion contains an incomplete promoted work item"
 
+        performance_evidence, performance_error = await self._verify_self_host_performance(
+            bundle=bundle,
+            task_id=task_id,
+        )
+        if performance_error:
+            return None, performance_error
+
         proposal = plan.get("completion_proposal") or {}
         context = bundle.retrieve_design_context(
             paths=("SELF_HOSTING.md", "SECURITY.md", "docs/ARCHITECTURE.md"),
@@ -1509,6 +1612,7 @@ class AthenaService:
             f"Current workspace fingerprint: {current_fingerprint}\n"
             f"Frozen authority: {json.dumps(bundle.to_record(), sort_keys=True)[:6000]}\n"
             f"Final release evidence: {json.dumps(dict(release_evidence), sort_keys=True)[:12000]}\n"
+            f"Full completion performance evidence: {json.dumps(performance_evidence, sort_keys=True)}\n"
             f"Frozen contract context:\n{context[:18000]}"
         )
         response = None
@@ -1537,6 +1641,7 @@ class AthenaService:
             "complete": True,
             "reason": verdict["reason"],
             "missing_obligations": verdict["missing_obligations"],
+            "performance_proofs": performance_evidence,
         }
         if self._hermes_referee is not None:
             hermes = await self._run_hermes_mission_referee(
@@ -4611,6 +4716,8 @@ class AthenaService:
                 profile=settings.profile,
                 timeout_seconds=settings.timeout_seconds,
                 api_key=api_key,
+                allow_remote=settings.allow_remote,
+                allow_insecure_remote=settings.allow_insecure_remote,
             )
         except (TypeError, ValueError) as exc:
             reason = f"Hermes configuration invalid: {exc}"

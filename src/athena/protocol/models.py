@@ -35,6 +35,8 @@ class CostInfo:
     per_1m_input: float | None = None
     per_1m_output: float | None = None
     currency: str = "USD"
+    per_1m_cache_read_input: float | None = None
+    per_1m_cache_write_input: float | None = None
 
 
 @dataclass(frozen=True)

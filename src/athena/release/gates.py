@@ -11,7 +11,6 @@ def candidate_commands() -> tuple[str, ...]:
         "uv run --frozen --no-sync mypy --cache-dir /tmp/athena-mypy-cache src",
         "uv run --frozen --no-sync python --version",
         "uv lock --check --offline",
-        "uv run --frozen --no-sync pytest -p no:cacheprovider -q",
         "uv run --frozen --no-sync python scripts/architecture-lint",
         "uv run --frozen --no-sync python scripts/scenarios --exclude-family VHS --output /tmp/athena-self-scenarios.json",
         "cargo check --manifest-path native/Cargo.toml --locked --offline",
@@ -19,6 +18,10 @@ def candidate_commands() -> tuple[str, ...]:
         "cargo --version",
         "rustc --version",
         "scripts/native-smoke",
+        "uv run --frozen --no-sync python scripts/bench-alacrity --events 5000 --min-producer-events-per-second 10000",
+        "uv run --frozen --no-sync python scripts/bench-indexing --samples 3 --max-full-seconds 5 --hard-max-full-seconds 8 --max-incremental-seconds 0.5 --hard-max-incremental-seconds 1",
+        "uv run --frozen --no-sync python scripts/bench-rendering --max-scene-p95-ms 2 --max-native-projection-p95-ms 5 --max-idle-redraws-per-second 0.1 --max-idle-cpu-percent 2 --max-active-fps 25 --max-cache-bytes 16777216 --require-native",
+        "uv run --frozen --no-sync pytest -p no:cacheprovider -q",
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_release_black_box.py",
     )
 
@@ -32,12 +35,6 @@ def release_commands(
     """Return the release lanes without duplicating them in shell glue."""
     prefix = [uv, "run", "--frozen", "--extra", "dev"]
     commands: list[tuple[str, list[str]]] = [
-        ("ruff-format", [*prefix, "ruff", "format", "--check", "src", "tests"]),
-        ("ruff-check", [*prefix, "ruff", "check", "src", "tests"]),
-        ("uv-lock-check", ["uv", "lock", "--check", "--offline"]),
-        ("mypy", [*prefix, "mypy", "src/athena"]),
-        ("compileall", [*prefix, "python", "-m", "compileall", "-q", "src", "tests"]),
-        ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "--ignore=tests/e2e"]),
         (
             "alacrity-benchmark",
             [
@@ -56,10 +53,16 @@ def release_commands(
                 *prefix,
                 "python",
                 "scripts/bench-indexing",
+                "--samples",
+                "3",
                 "--max-full-seconds",
                 "5",
+                "--hard-max-full-seconds",
+                "8",
                 "--max-incremental-seconds",
                 "0.5",
+                "--hard-max-incremental-seconds",
+                "1",
                 "--max-ten-file-seconds",
                 "0.5",
                 "--max-source-revision-ms",
@@ -89,6 +92,12 @@ def release_commands(
                 "--require-native",
             ],
         ),
+        ("ruff-format", [*prefix, "ruff", "format", "--check", "--no-cache", "src", "tests"]),
+        ("ruff-check", [*prefix, "ruff", "check", "--no-cache", "src", "tests"]),
+        ("uv-lock-check", ["uv", "lock", "--check", "--offline"]),
+        ("mypy", [*prefix, "mypy", "src/athena"]),
+        ("compileall", [*prefix, "python", "-m", "compileall", "-q", "src", "tests"]),
+        ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "--ignore=tests/e2e"]),
         (
             "release-scenarios",
             [

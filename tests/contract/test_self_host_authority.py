@@ -37,6 +37,18 @@ def test_generic_metadata_cannot_activate_self_host():
         )
 
 
+def test_generic_metadata_cannot_override_cache_namespace():
+    service = AthenaService.in_memory()
+    with pytest.raises(ValueError, match="reserved Athena metadata"):
+        service._build_task_spec(  # noqa: SLF001 - frozen authority assertion
+            AgentRequest(
+                prompt="attempt cache partition bypass",
+                metadata={"cache_namespace": "victim"},
+            ),
+            "contract-session",
+        )
+
+
 def test_persisted_verification_environment_is_not_authority():
     expected = VerificationEnvironment(
         project_root="/repo",

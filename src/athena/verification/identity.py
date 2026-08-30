@@ -29,6 +29,12 @@ def command_proof_id(command: str) -> str:
         return "architecture"
     if "native-smoke" in normalized:
         return "native.smoke"
+    if "scripts/bench-alacrity" in normalized:
+        return "performance.alacrity"
+    if "scripts/bench-indexing" in normalized:
+        return "performance.indexing"
+    if "scripts/bench-rendering" in normalized:
+        return "performance.rendering"
     if re.search(r"\bcargo\s+test\b", normalized):
         return "rust.tests"
     if re.search(r"\bcargo\s+check\b", normalized):

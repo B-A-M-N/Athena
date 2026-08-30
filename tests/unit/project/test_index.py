@@ -85,6 +85,18 @@ def test_project_inspector_skips_structural_python_environments(tmp_path):
     assert ".custom-python" not in profile.source_roots
 
 
+def test_project_index_skips_generated_metadata_and_tool_caches(tmp_path):
+    (tmp_path / "app.py").write_text("value = 1\n")
+    (tmp_path / ".ruff_cache" / "0.1").mkdir(parents=True)
+    (tmp_path / ".ruff_cache" / "0.1" / "cache").write_text("generated")
+    (tmp_path / "src" / "athena_agent.egg-info").mkdir(parents=True)
+    (tmp_path / "src" / "athena_agent.egg-info" / "PKG-INFO").write_text("generated")
+
+    index = ProjectIndexBuilder().build(str(tmp_path))
+
+    assert [record["path"] for record in index.files] == ["app.py"]
+
+
 def test_project_index_uses_git_inventory_when_available(tmp_path, monkeypatch):
     tracked = tmp_path / "tracked.py"
     ignored = tmp_path / ".venv312" / "lib.py"

@@ -8,19 +8,25 @@ external recommendation with Athena's deterministic proof.
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
+import ipaddress
+import time
 
 import httpx
 
 from athena.hermes.referee import ReviewPacket
 
-__all__ = ["HermesAgentEvaluator"]
+__all__ = ["HermesAgentEvaluator", "HermesRefereePreflight", "HermesRefereeSafetyError"]
 
 
 _MAX_PACKET_BYTES = 128 * 1024
 _MAX_RESPONSE_BYTES = 32 * 1024
+_REFEREE_POLICY_VERSION = 1
+_PREFLIGHT_TTL_SECONDS = 45.0
 _REFEREE_SYSTEM_PROMPT = """You are Athena's read-only adversarial referee.
 
 Review the bounded evidence packet supplied by Athena. Attack the claim that
@@ -30,6 +36,31 @@ Return exactly one JSON object and no markdown. Its decision must be one of:
 PASS, HOLD, REJECT, CHALLENGE. Include concise rationale and any blockers,
 challenges, risks, or missing_evidence that matter.
 """
+
+
+class HermesRefereeSafetyError(ValueError):
+    """The endpoint is reachable or configured, but not safe for referee use."""
+
+
+@dataclass(frozen=True)
+class HermesRefereePreflight:
+    """Authoritative, read-only proof returned by Hermes capabilities."""
+
+    endpoint: str
+    profile: str
+    policy_fingerprint: str
+    models: tuple[str, ...]
+    capabilities: Mapping[str, Any]
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "endpoint": self.endpoint,
+            "profile": self.profile,
+            "policy_fingerprint": self.policy_fingerprint,
+            "models": list(self.models),
+            "runtime": dict(self.capabilities.get("runtime") or {}),
+            "referee": dict(self.capabilities.get("referee") or {}),
+        }
 
 
 class HermesAgentEvaluator:
@@ -46,6 +77,8 @@ class HermesAgentEvaluator:
         profile: str = "athena-referee",
         timeout_seconds: float = 60.0,
         api_key: str = "",
+        allow_remote: bool = False,
+        allow_insecure_remote: bool = False,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         endpoint = endpoint.strip().rstrip("/")
@@ -58,6 +91,8 @@ class HermesAgentEvaluator:
         self.endpoint = endpoint
         self.profile = profile.strip()
         self.timeout_seconds = float(timeout_seconds)
+        self.allow_remote = bool(allow_remote)
+        self.allow_insecure_remote = bool(allow_insecure_remote)
         profile_path = quote(self.profile, safe="")
         endpoint_root = endpoint[:-3].rstrip("/") if endpoint.endswith("/v1") else endpoint
         if not endpoint_root.endswith(f"/p/{profile_path}"):
@@ -73,6 +108,7 @@ class HermesAgentEvaluator:
             headers=headers,
         )
         self._owns_client = client is None
+        self._preflight_cache: dict[tuple[str, str, str], tuple[float, HermesRefereePreflight]] = {}
 
     async def __call__(self, packet: ReviewPacket) -> Mapping[str, Any]:
         packet_record = packet.to_record()
@@ -113,10 +149,76 @@ class HermesAgentEvaluator:
         response = await self._client.get(self._health_url)
         response.raise_for_status()
 
+    async def preflight(self) -> HermesRefereePreflight:
+        """Verify the selected profile is an actual no-tools referee.
+
+        This is deliberately separate from ``health``: reachability proves
+        only that a server answered, while the capabilities contract proves
+        the runtime mode and effective model-visible tool surface.
+        """
+        _validate_endpoint_safety(
+            self.endpoint,
+            allow_remote=self.allow_remote,
+            allow_insecure_remote=self.allow_insecure_remote,
+        )
+        policy_fingerprint = _policy_fingerprint()
+        cache_key = (self.endpoint, self.profile, policy_fingerprint)
+        cached = self._preflight_cache.get(cache_key)
+        if cached is not None and time.monotonic() - cached[0] < _PREFLIGHT_TTL_SECONDS:
+            return cached[1]
+
+        models_response = await self._client.get(self._health_url)
+        models_response.raise_for_status()
+        models_payload = models_response.json()
+        if not isinstance(models_payload, Mapping):
+            raise HermesRefereeSafetyError("Hermes models response is not an object")
+        model_rows = models_payload.get("data")
+        if not isinstance(model_rows, list):
+            raise HermesRefereeSafetyError("Hermes models response has no model list")
+        models = tuple(
+            str(row.get("id")) for row in model_rows if isinstance(row, Mapping) and row.get("id")
+        )
+        if not models:
+            raise HermesRefereeSafetyError("Hermes referee profile advertises no models")
+
+        capabilities_response = await self._client.get(self._capabilities_url)
+        capabilities_response.raise_for_status()
+        capabilities = capabilities_response.json()
+        if not isinstance(capabilities, Mapping):
+            raise HermesRefereeSafetyError("Hermes capabilities response is not an object")
+        runtime = capabilities.get("runtime")
+        referee = capabilities.get("referee")
+        if not isinstance(runtime, Mapping) or not isinstance(referee, Mapping):
+            raise HermesRefereeSafetyError("Hermes referee capability contract is missing")
+        if runtime.get("mode") != "referee":
+            raise HermesRefereeSafetyError("Hermes profile is not in referee mode")
+        if runtime.get("tool_execution") != "disabled":
+            raise HermesRefereeSafetyError("Hermes referee tool execution is not disabled")
+        if referee.get("enabled") is not True:
+            raise HermesRefereeSafetyError("Hermes referee mode is not enabled")
+        if referee.get("policy_version") != _REFEREE_POLICY_VERSION:
+            raise HermesRefereeSafetyError("Hermes referee policy version is unsupported")
+        if referee.get("effective_tools") != []:
+            raise HermesRefereeSafetyError("Hermes referee exposes model-visible tools")
+
+        result = HermesRefereePreflight(
+            endpoint=self.endpoint,
+            profile=self.profile,
+            policy_fingerprint=policy_fingerprint,
+            models=models,
+            capabilities=dict(capabilities),
+        )
+        self._preflight_cache[cache_key] = (time.monotonic(), result)
+        return result
+
     async def aclose(self) -> None:
         """Close the adapter-owned HTTP client."""
         if self._owns_client:
             await self._client.aclose()
+
+    @property
+    def _capabilities_url(self) -> str:
+        return f"{self._api_base}/capabilities"
 
 
 def _decode_verdict_content(response: Any) -> Mapping[str, Any]:
@@ -149,3 +251,46 @@ def _decode_verdict_content(response: Any) -> Mapping[str, Any]:
     if not isinstance(decoded, Mapping):
         raise ValueError("Hermes verdict must be a JSON object")
     return dict(decoded)
+
+
+def _policy_fingerprint() -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "runtime_mode": "referee",
+                "tool_execution": "disabled",
+                "policy_version": _REFEREE_POLICY_VERSION,
+                "effective_tools": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _validate_endpoint_safety(
+    endpoint: str,
+    *,
+    allow_remote: bool,
+    allow_insecure_remote: bool,
+) -> None:
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HermesRefereeSafetyError("Hermes endpoint must be an HTTP(S) URL")
+    if parsed.username or parsed.password:
+        raise HermesRefereeSafetyError("Hermes endpoint must not contain URL credentials")
+    host = parsed.hostname.rstrip(".").casefold()
+    loopback = host == "localhost"
+    if not loopback:
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+    if loopback:
+        return
+    if not allow_remote:
+        raise HermesRefereeSafetyError("remote Hermes endpoint requires explicit allow_remote=true")
+    if parsed.scheme != "https" and not allow_insecure_remote:
+        raise HermesRefereeSafetyError(
+            "remote Hermes endpoint requires HTTPS unless allow_insecure_remote=true"
+        )
