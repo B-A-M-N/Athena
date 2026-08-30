@@ -23,6 +23,7 @@ def test_roundtrip_providers_mcp_model_roles():
                 credential_id="cred-1",
                 api_key="sk-test",
                 base_url="https://example.com/v1",
+                cache_mode="none",
                 latency_class="fast",
                 extra={"temperature": 0.2},
             ),
@@ -57,6 +58,7 @@ def test_roundtrip_providers_mcp_model_roles():
     assert p.credential_id == "cred-1"
     assert p.api_key == "sk-test"
     assert p.base_url == "https://example.com/v1"
+    assert p.cache_mode == "none"
     assert p.latency_class == "fast"
     assert p.extra == {"temperature": 0.2}
 

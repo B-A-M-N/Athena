@@ -134,6 +134,21 @@ Athena treats pricing as `known free`, `known paid`, or `unknown`; unknown
 cost is shown as `cost=unknown` and cannot pass a hard monetary-budget
 admission check.
 
+Hosted OpenAI-compatible providers, including FreeInference, emit Athena's
+stable `prompt_cache_key` by default so repeated stable prefixes can use the
+provider's prompt cache. Known local presets (`ollama`, `lmstudio`, `vllm`, and
+`llamacpp`) remain opt-out because they do not promise that extension. For a
+custom OpenAI-compatible server that rejects the field, disable it explicitly:
+
+```toml
+[[providers]]
+kind = "openai-compat"
+name = "custom"
+base_url = "https://api.example.test/v1"
+model = "example/model"
+cache_mode = "none"
+```
+
 ### Hermes Agent self-host referee
 
 Athena can send one bounded review packet at the candidate and mission

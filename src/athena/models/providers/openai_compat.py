@@ -294,11 +294,11 @@ class OpenAICompatProvider:
         tools = [_capability_schema(b) for b in request.capabilities]
         if tools:
             payload["tools"] = tools
-        # OpenAI's cache key is a request-semantic control.  Do not send it to
-        # generic local servers unless the resolved profile explicitly says it
-        # speaks the OpenAI cache extension.
+        # OpenAI's cache key is a request-semantic control. Hosted
+        # OpenAI-compatible profiles opt into this extension; known local
+        # profiles remain ``cache_mode=none`` unless explicitly overridden.
         if (
-            request.metadata.get("protocol") == "openai"
+            request.metadata.get("protocol") in {"openai", "openai-compat"}
             and request.metadata.get("cache_session_key")
             and request.metadata.get("cache_mode") in {"automatic-prefix", "explicit-cache-api"}
         ):

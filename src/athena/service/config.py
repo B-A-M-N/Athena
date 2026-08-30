@@ -103,6 +103,9 @@ class ProviderConfig:
     credential_id: str | None = None
     api_key: str | None = None
     base_url: str | None = None
+    # ``None`` uses the provider-profile default. Hosted OpenAI-compatible
+    # routes default to automatic prefix caching; local presets default off.
+    cache_mode: str | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
     latency_class: str | None = None
 
@@ -248,6 +251,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         "credential_id",
         "api_key",
         "base_url",
+        "cache_mode",
         "latency_class",
     ):
         extra.pop(key, None)
@@ -261,6 +265,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         credential_id=data.get("credential_id"),
         api_key=data.get("api_key"),
         base_url=data.get("base_url"),
+        cache_mode=data.get("cache_mode"),
         latency_class=data.get("latency_class"),
         extra=extra,
     )
@@ -347,6 +352,7 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
                 "credential_id": p.credential_id,
                 "api_key": p.api_key,
                 "base_url": p.base_url,
+                "cache_mode": p.cache_mode,
                 "latency_class": p.latency_class,
                 **dict(p.extra),
             }

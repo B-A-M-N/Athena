@@ -185,14 +185,21 @@ def schema_fingerprint(schema: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _preset(pid: str, base_url: str, *, keyless: bool, protocol: str) -> ProviderProfile:
+def _preset(
+    pid: str,
+    base_url: str,
+    *,
+    keyless: bool,
+    protocol: str,
+    cache_mode: str = CacheMode.NONE,
+) -> ProviderProfile:
     return ProviderProfile(
         id=pid,
         protocol=protocol,
         base_url=base_url,
         auth_mode=AuthMode.KEYLESS if keyless else AuthMode.OPTIONAL_KEY,
         capabilities=frozenset({"streaming", "tools"}),
-        cache_mode=CacheMode.NONE,
+        cache_mode=cache_mode,
         timeouts={
             "connect": 5.0,
             "first_event": 300.0,
@@ -227,7 +234,16 @@ PRESETS: dict[str, ProviderProfile] = {
     "llamacpp": _preset(
         "llamacpp", "http://127.0.0.1:8080/v1", keyless=True, protocol=Protocol.OPENAI_COMPAT
     ),
-    "openai-compat": _preset("openai-compat", "", keyless=False, protocol=Protocol.OPENAI_COMPAT),
+    # Hosted gateways that expose the OpenAI chat-completions contract can
+    # use the portable request cache-key extension. Known local presets stay
+    # conservative because Ollama/vLLM/LM Studio do not promise that field.
+    "openai-compat": _preset(
+        "openai-compat",
+        "",
+        keyless=False,
+        protocol=Protocol.OPENAI_COMPAT,
+        cache_mode=CacheMode.AUTOMATIC_PREFIX,
+    ),
     "openai": ProviderProfile(
         id="openai",
         protocol=Protocol.OPENAI,
@@ -252,7 +268,11 @@ PRESETS: dict[str, ProviderProfile] = {
 
 
 def resolve_profile(
-    kind_or_id: str, *, base_url: str | None = None, model_id: str | None = None
+    kind_or_id: str,
+    *,
+    base_url: str | None = None,
+    model_id: str | None = None,
+    cache_mode: str | None = None,
 ) -> ProviderProfile:
     """Resolve a preset by kind, optionally overriding endpoint/model.
 
@@ -277,6 +297,17 @@ def resolve_profile(
         overrides["base_url"] = base_url
     if model_id:
         overrides["model_id"] = model_id
+    if cache_mode is not None:
+        known_cache_modes = {
+            CacheMode.AUTOMATIC_PREFIX,
+            CacheMode.EXPLICIT_CACHE_API,
+            CacheMode.SESSION_KEY,
+            CacheMode.NONE,
+        }
+        if cache_mode not in known_cache_modes:
+            known = ", ".join(sorted(known_cache_modes))
+            raise ValueError(f"unknown cache mode {cache_mode!r}; known: {known}")
+        overrides["cache_mode"] = cache_mode
     return replace(preset, **overrides) if overrides else preset
 
 

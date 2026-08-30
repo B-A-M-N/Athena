@@ -83,6 +83,46 @@ def _user_request(text: str = "hello") -> ModelRequest:
     )
 
 
+def test_openai_compatible_hosted_profile_emits_prompt_cache_key():
+    provider = _provider()
+    base = _user_request()
+    request = ModelRequest(
+        messages=base.messages,
+        model=base.model,
+        provider=base.provider,
+        request_id=base.request_id,
+        system=base.system,
+        metadata={
+            "protocol": "openai-compat",
+            "cache_mode": "automatic-prefix",
+            "cache_session_key": "session:freeinference:glm-5.2",
+        },
+    )
+
+    payload = provider._build_request(request)
+
+    assert payload["prompt_cache_key"] == "session:freeinference:glm-5.2"
+
+
+def test_openai_compatible_local_profile_does_not_emit_prompt_cache_key():
+    provider = _provider()
+    base = _user_request()
+    request = ModelRequest(
+        messages=base.messages,
+        model=base.model,
+        provider=base.provider,
+        request_id=base.request_id,
+        system=base.system,
+        metadata={
+            "protocol": "openai-compat",
+            "cache_mode": "none",
+            "cache_session_key": "session:ollama:qwen3:8b",
+        },
+    )
+
+    assert "prompt_cache_key" not in provider._build_request(request)
+
+
 async def test_stream_events_delta_and_done_with_usage(monkeypatch):
     provider = _provider()
     sse = [

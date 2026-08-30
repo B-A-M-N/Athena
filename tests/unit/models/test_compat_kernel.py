@@ -194,6 +194,19 @@ def test_presets_keyless_local():
     assert resolved.base_url == "http://127.0.0.1:11434/v1"
 
 
+def test_hosted_openai_compatible_profile_enables_prefix_cache_key():
+    hosted = resolve_profile(
+        "openai-compat",
+        base_url="https://freeinference.org/v1",
+        model_id="glm-5.2",
+    )
+    local = resolve_profile("ollama", model_id="qwen3:8b")
+
+    assert hosted.cache_mode == "automatic-prefix"
+    assert local.cache_mode == "none"
+    assert resolve_profile("openai-compat", cache_mode="none").cache_mode == "none"
+
+
 def test_profile_fingerprint_stable_and_sensitive():
     a = resolve_profile("ollama", model_id="m1")
     b = resolve_profile("ollama", model_id="m1")

@@ -4484,6 +4484,7 @@ class AthenaService:
                 pc.kind,
                 base_url=pc.base_url,
                 model_id=pc.model,
+                cache_mode=pc.cache_mode,
             )
             if profile.protocol in {"openai", "openai-compat"}:
                 if not profile.base_url:
