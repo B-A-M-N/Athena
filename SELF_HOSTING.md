@@ -35,3 +35,23 @@ athena self continue
 athena self status
 ```
 
+To add the optional local Hermes Agent referee, configure it once:
+
+```bash
+athena config set hermes-referee.enabled true
+athena config set hermes-referee.endpoint http://127.0.0.1:8642
+athena config set hermes-referee.profile athena-referee
+athena self status
+```
+
+On the Hermes host, create and harden the `athena-referee` profile, enable its
+API-server multiplex route, and start Hermes. Keep browser, terminal, file,
+code-execution, and other mutation toolsets disabled in that profile. The
+Hermes API key belongs in the host secret store; reference it from Athena with
+`hermes-referee.credential-id` rather than placing the key in `config.toml`.
+
+`athena self status` reports Athena proof readiness, Hermes connectivity and
+profile, and the invariant that human promotion remains required. Hermes is
+called only at semantic candidate/mission checkpoints. It receives a bounded
+read-only `ReviewPacket`; a missing, malformed, or failed response holds the
+review closed.

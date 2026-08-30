@@ -35,6 +35,7 @@ except ModuleNotFoundError:  # pragma: no cover - legacy/minimal Python builds
 
 __all__ = [
     "AthenaConfig",
+    "HermesRefereeConfig",
     "ProviderConfig",
     "MCPConfig",
     "DEFAULT_DB_PATH",
@@ -132,6 +133,17 @@ class MCPConfig:
     connect_timeout: float = 10.0
 
 
+@dataclass(frozen=True)
+class HermesRefereeConfig:
+    """Optional operator-configured Hermes Agent governance endpoint."""
+
+    enabled: bool = False
+    endpoint: str = "http://127.0.0.1:8642"
+    profile: str = "athena-referee"
+    timeout_seconds: float = 60.0
+    credential_id: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Main config dataclass
 # ---------------------------------------------------------------------------
@@ -148,6 +160,7 @@ class AthenaConfig:
     skills_paths: tuple[str, ...] = ()
     providers: tuple[ProviderConfig, ...] = ()
     mcp_servers: tuple[MCPConfig, ...] = ()
+    hermes_referee: HermesRefereeConfig = field(default_factory=HermesRefereeConfig)
     context_window: int = 128_000
     reserve_output: int = 4096
     worker_max_parallel: int = 16
@@ -271,6 +284,29 @@ def _parse_mcp(data: dict[str, Any]) -> MCPConfig:
     )
 
 
+def _parse_hermes_referee(data: Any) -> HermesRefereeConfig:
+    """Parse the bounded external-referee settings without accepting secrets."""
+    if not isinstance(data, Mapping):
+        return HermesRefereeConfig()
+    endpoint = str(data.get("endpoint", HermesRefereeConfig.endpoint)).strip()
+    profile = str(data.get("profile", HermesRefereeConfig.profile)).strip()
+    timeout = float(data.get("timeout_seconds", HermesRefereeConfig.timeout_seconds))
+    if not endpoint:
+        raise ValueError("hermes_referee.endpoint cannot be empty")
+    if not profile:
+        raise ValueError("hermes_referee.profile cannot be empty")
+    if timeout <= 0:
+        raise ValueError("hermes_referee.timeout_seconds must be positive")
+    credential_id = data.get("credential_id")
+    return HermesRefereeConfig(
+        enabled=bool(data.get("enabled", False)),
+        endpoint=endpoint,
+        profile=profile,
+        timeout_seconds=timeout,
+        credential_id=str(credential_id) if credential_id else None,
+    )
+
+
 def _expand_user(value: str) -> str:
     """Expand ``~`` and env vars in a path string."""
     return os.path.expandvars(os.path.expanduser(value))
@@ -329,6 +365,18 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
             }
             for m in config.mcp_servers
         ]
+    if config.hermes_referee != HermesRefereeConfig():
+        d["hermes_referee"] = {
+            "enabled": config.hermes_referee.enabled,
+            "endpoint": config.hermes_referee.endpoint,
+            "profile": config.hermes_referee.profile,
+            "timeout_seconds": config.hermes_referee.timeout_seconds,
+            **(
+                {"credential_id": config.hermes_referee.credential_id}
+                if config.hermes_referee.credential_id
+                else {}
+            ),
+        }
     if config.model_roles:
         d["model_roles"] = {k: dict(v) for k, v in config.model_roles.items()}
     if config.research_allowed_domains:
@@ -381,6 +429,7 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         skills_paths=skills,
         providers=providers,
         mcp_servers=mcp_servers,
+        hermes_referee=_parse_hermes_referee(data.get("hermes_referee")),
         context_window=int(data.get("context_window", 128_000)),
         reserve_output=int(data.get("reserve_output", 4096)),
         worker_max_parallel=int(data.get("worker_max_parallel", 4)),
@@ -470,6 +519,28 @@ def _env_map() -> dict[str, Any]:
                 result[key] = cast(value)
             except (ValueError, TypeError):
                 pass
+    hermes: dict[str, Any] = {}
+    hermes_env: tuple[tuple[str, str, Callable[[Any], Any]], ...] = (
+        (
+            "ATHENA_HERMES_REFEREE_ENABLED",
+            "enabled",
+            lambda v: str(v).strip().lower() in {"1", "true", "yes", "on"},
+        ),
+        ("ATHENA_HERMES_REFEREE_ENDPOINT", "endpoint", str),
+        ("ATHENA_HERMES_REFEREE_PROFILE", "profile", str),
+        ("ATHENA_HERMES_REFEREE_TIMEOUT_SECONDS", "timeout_seconds", float),
+        ("ATHENA_HERMES_REFEREE_CREDENTIAL_ID", "credential_id", str),
+    )
+    for env_name, key, cast in hermes_env:
+        value = os.environ.get(env_name)
+        if not value:
+            continue
+        try:
+            hermes[key] = cast(value)
+        except (ValueError, TypeError):
+            continue
+    if hermes:
+        result["hermes_referee"] = hermes
     return result
 
 

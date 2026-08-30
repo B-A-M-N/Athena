@@ -134,6 +134,47 @@ Athena treats pricing as `known free`, `known paid`, or `unknown`; unknown
 cost is shown as `cost=unknown` and cannot pass a hard monetary-budget
 admission check.
 
+### Hermes Agent self-host referee
+
+Athena can send one bounded review packet at the candidate and mission
+boundaries to a local Hermes Agent profile. Hermes is advisory only: Athena's
+deterministic proof remains authoritative, and human promotion is always
+required.
+
+Enable it once with the operator config command:
+
+```bash
+athena config set hermes-referee.enabled true
+athena config set hermes-referee.endpoint http://127.0.0.1:8642
+athena config set hermes-referee.profile athena-referee
+athena self status
+```
+
+The Hermes host should expose the named profile through its API-server
+multiplexing, with browser, terminal, file, code-execution, and other mutation
+toolsets disabled for that profile. Athena does not grant Hermes any mutation
+authority; the profile hardening is an operator-owned Hermes setting.
+
+The equivalent TOML is:
+
+```toml
+[hermes_referee]
+enabled = true
+endpoint = "http://127.0.0.1:8642"
+profile = "athena-referee"
+timeout_seconds = 60
+# credential_id = "HERMES_API_KEY"  # optional managed secret name
+```
+
+Hermes is called at semantic review checkpoints, not for every tool or model
+event. Its profile should be read-only, low-temperature, and free of mutation
+tools. A transport failure or malformed response produces a hold; it cannot
+apply, promote, or write Athena changes.
+
+For an opt-in live transport check, set `ATHENA_HERMES_E2E_ENDPOINT` (and,
+when required, `ATHENA_HERMES_E2E_API_KEY`) and run
+`uv run --frozen --no-sync pytest -q tests/e2e/test_hermes_agent.py`.
+
 ## Architecture at a glance
 
 - `athena.kernel` — the one reasoning loop (INV-001).

@@ -26,6 +26,7 @@ import asyncio
 import os
 import shutil
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -154,6 +155,86 @@ def build_service(config) -> Any:
     return AthenaService(config=config)
 
 
+def _config_set(o: "Options") -> int:
+    """Persist one supported operator setting without starting the service."""
+    from athena.service.config import global_config_path, load_toml_file
+
+    raw_key = str(o.config_key or "").strip().replace("_", "-")
+    prefix = "hermes-referee."
+    if not raw_key.startswith(prefix):
+        print(
+            "athena config: supported keys are hermes-referee.enabled, "
+            "hermes-referee.endpoint, hermes-referee.profile, "
+            "hermes-referee.timeout-seconds, and hermes-referee.credential-id",
+            file=sys.stderr,
+        )
+        return 2
+    field = raw_key[len(prefix) :].replace("-", "_")
+    if field not in {"enabled", "endpoint", "profile", "timeout_seconds", "credential_id"}:
+        print(f"athena config: unsupported key {o.config_key!r}", file=sys.stderr)
+        return 2
+    value = str(o.config_value or "").strip()
+    if field == "enabled":
+        lowered = value.lower()
+        if lowered not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+            print("athena config: enabled expects true or false", file=sys.stderr)
+            return 2
+        parsed: Any = lowered in {"true", "1", "yes", "on"}
+    elif field == "timeout_seconds":
+        try:
+            parsed = float(value)
+        except ValueError:
+            print("athena config: timeout-seconds expects a positive number", file=sys.stderr)
+            return 2
+        if parsed <= 0:
+            print("athena config: timeout-seconds expects a positive number", file=sys.stderr)
+            return 2
+    else:
+        if not value:
+            print(f"athena config: {o.config_key} cannot be empty", file=sys.stderr)
+            return 2
+        parsed = value
+
+    path = Path(o.config_path).expanduser() if o.config_path else global_config_path()
+    data = load_toml_file(path)
+    section = data.setdefault("hermes_referee", {})
+    if not isinstance(section, dict):
+        print(f"athena config: {path} has a non-table hermes_referee value", file=sys.stderr)
+        return 2
+    section[field] = parsed
+    try:
+        import tomli_w
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as tmp:
+            tomli_w.dump(data, tmp)
+            temporary = Path(tmp.name)
+        os.replace(temporary, path)
+    except (ImportError, OSError) as exc:
+        print(f"athena config: could not write {path}: {exc}", file=sys.stderr)
+        return 1
+    print(f"updated {path}: hermes_referee.{field} = {parsed!r}")
+    return 0
+
+
+def _cmd_config(o: "Options", config: Any) -> int:
+    if o.config_action == "set":
+        return _config_set(o)
+    if o.config_action == "show":
+        settings = config.hermes_referee
+        print("hermes_referee:")
+        print(f"  enabled: {str(settings.enabled).lower()}")
+        print(f"  endpoint: {settings.endpoint}")
+        print(f"  profile: {settings.profile}")
+        print(f"  timeout_seconds: {settings.timeout_seconds:g}")
+        print(f"  credential_id: {settings.credential_id or '-'}")
+        return 0
+    print("athena config: use 'set KEY VALUE' or 'show'", file=sys.stderr)
+    return 2
+
+
 def _doctor_display(o: "Options", config: Any) -> int:
     """Report the selected terminal projection without starting Athena."""
     from athena.cli.framebuffer import pillow_available
@@ -268,6 +349,9 @@ class Options:
     self_action: str | None = None
     self_mission_id: str | None = None
     artifact_root: str | None = None
+    config_action: str | None = None
+    config_key: str | None = None
+    config_value: str | None = None
     _providers: tuple[Any, ...] = ()
 
 
@@ -286,6 +370,8 @@ def dispatch(o: Options) -> int:
         o.animations = getattr(config, "animations", True)
     if not o.reduced_motion:
         o.reduced_motion = bool(getattr(config, "reduced_motion", False))
+    if o.command == "config":
+        return _cmd_config(o, config)
     _register_config_mascots(config)
     if o.command == "doctor":
         target = o.args[0] if o.args else "startup"
@@ -466,6 +552,15 @@ async def _cmd_self(o: Options, service: Any) -> int:
     if o.self_action in {"status", "continue"}:
         root = _athena_checkout_root()
         if o.self_action == "status":
+            governance = await service.hermes_referee_status()
+            print("SELF HOST GOVERNANCE")
+            print("  Athena proof       READY")
+            print(f"  Hermes referee     {str(governance.get('state', 'unknown')).upper()}")
+            print(f"  Hermes profile     {governance.get('profile', '-')}")
+            print("  Human promotion    REQUIRED")
+            if governance.get("error"):
+                print(f"  Hermes detail      {governance['error']}")
+            print()
             records = await service.self_host_status(workspace_root=root)
             if not records:
                 print("athena self: no missions")
@@ -795,6 +890,31 @@ def _click_cli(click: Any):
         if ctx.invoked_subcommand is None:
             sys.exit(dispatch(base_options(ctx, "doctor", ["startup"])))
 
+    @cli.group()
+    @click.pass_context
+    def config(ctx):
+        """Inspect or update operator configuration."""
+
+    @config.command("show")
+    @click.pass_context
+    def config_show(ctx):
+        """Show effective Hermes referee settings."""
+        o = base_options(ctx, "config")
+        o.config_action = "show"
+        sys.exit(dispatch(o))
+
+    @config.command("set")
+    @click.argument("key")
+    @click.argument("value")
+    @click.pass_context
+    def config_set(ctx, key, value):
+        """Set a supported operator setting."""
+        o = base_options(ctx, "config")
+        o.config_action = "set"
+        o.config_key = key
+        o.config_value = value
+        sys.exit(dispatch(o))
+
     @doctor.command("display")
     @click.pass_context
     def doctor_display(ctx):
@@ -983,6 +1103,13 @@ def _arg_parse(argv: list[str]) -> Options:
     sp = sub.add_parser("doctor", help="Diagnose service startup and display support.")
     globals_(sp)
     sp.add_argument("target", nargs="?", choices=["startup", "display"], default="startup")
+    sp = sub.add_parser("config", help="Inspect or update operator configuration.")
+    globals_(sp)
+    config_sub = sp.add_subparsers(dest="config_action")
+    config_sub.add_parser("show", help="Show effective Hermes referee settings.")
+    config_set = config_sub.add_parser("set", help="Set one supported operator setting.")
+    config_set.add_argument("key")
+    config_set.add_argument("value")
     sp = sub.add_parser("oi-stream", help="Stream the live OI projection.")
     globals_(sp)
     sp.add_argument("--task", dest="task_id", default=None)
@@ -1010,6 +1137,10 @@ def _arg_parse(argv: list[str]) -> Options:
     )
     if command == "doctor":
         o.args = [ns.target]
+    if command == "config":
+        o.config_action = getattr(ns, "config_action", None)
+        o.config_key = getattr(ns, "key", None)
+        o.config_value = getattr(ns, "value", None)
     if command == "oi-stream":
         o.args = [ns.task_id] if ns.task_id else []
     elif command == "run":

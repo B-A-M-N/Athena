@@ -3,7 +3,8 @@
 
 This tests Athena *inside a host terminal*. It does not test the native Athena
 window, and it is not a stable-beta support or release-gate target. It is a
-manual compatibility probe for Termux, tmux, CI PTYs, and ordinary terminals.
+manual preview compatibility probe for Termux, tmux, CI PTYs, and ordinary
+terminals.
 
 Usage:
     scripts/termux-smoke
@@ -17,6 +18,7 @@ import pty
 import re
 import select
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -46,16 +48,35 @@ def _set_size(fd: int, columns: int, rows: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
 
 
-def _argv() -> list[str]:
+def _python_argv() -> list[str]:
+    """Resolve the explicit smoke runtime, preferring the frozen project env."""
+    configured = os.environ.get("ATHENA_SMOKE_PYTHON")
+    if configured:
+        return shlex.split(configured)
+    uv = shutil.which("uv")
+    if uv:
+        return [uv, "run", "--frozen", "--no-sync", "--project", str(_REPO_ROOT), "python"]
+    venv_python = _REPO_ROOT / ".venv" / "bin" / "python"
+    if venv_python.is_file():
+        return [str(venv_python)]
+    return [sys.executable]
+
+
+def _argv(python_argv: list[str]) -> list[str]:
     if os.environ.get("ATHENA_SMOKE_MODE", "demo").strip().lower() != "cli":
         return [
-            sys.executable,
+            *python_argv,
             str(_REPO_ROOT / "demos" / "capability_fabric_demo.py"),
             "--speed",
             "0",
         ]
-    configured = os.environ.get("ATHENA_BIN", "athena")
-    return shlex.split(configured) + [
+    configured = os.environ.get("ATHENA_BIN")
+    command = (
+        shlex.split(configured)
+        if configured
+        else [*python_argv, "-m", "athena.cli.app"]
+    )
+    return command + [
         "--display",
         "ansi",
         "--db",
@@ -71,7 +92,8 @@ def _argv() -> list[str]:
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="athena-termux-") as root:
         root_path = Path(root)
-        argv = _argv()
+        python_argv = _python_argv()
+        argv = _argv(python_argv)
         if "__ATHENA_DB__" in argv:
             argv[argv.index("__ATHENA_DB__")] = str(root_path / "athena.db")
         if "__ATHENA_WORKSPACE__" in argv:
@@ -89,6 +111,27 @@ def main() -> int:
         # developer's provider quota or depend on network/model availability.
         env.pop("OPENROUTER_API_KEY", None)
         env.pop("OPENROUTER_MODEL", None)
+        # Keep uv's lock/cache bookkeeping inside the isolated smoke root.
+        # Termux users can override this normally, while CI/sandboxed hosts do
+        # not need a writable global uv cache.
+        env.setdefault("UV_CACHE_DIR", str(root_path / "uv-cache"))
+
+        try:
+            probe = subprocess.run(
+                [*python_argv, "-c", "import aiosqlite; import athena"],
+                cwd=_REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"termux-smoke: dependency/bootstrap failure: {exc}", file=sys.stderr)
+            return 2
+        if probe.returncode != 0:
+            print("termux-smoke: dependency/bootstrap failure", file=sys.stderr)
+            print((probe.stderr or probe.stdout).strip()[-4000:], file=sys.stderr)
+            return 2
 
         master, slave = pty.openpty()
         try:

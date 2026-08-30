@@ -5,6 +5,7 @@ from pathlib import Path
 from athena.service.config import (
     MCPConfig,
     AthenaConfig,
+    HermesRefereeConfig,
     ProviderConfig,
     config_from_dict,
     config_to_dict,
@@ -74,6 +75,22 @@ def test_roundtrip_providers_mcp_model_roles():
             "routing_preference": "latency",
         }
     }
+
+
+def test_roundtrip_hermes_referee_config():
+    config = AthenaConfig(
+        hermes_referee=HermesRefereeConfig(
+            enabled=True,
+            endpoint="http://127.0.0.1:8642",
+            profile="athena-referee",
+            timeout_seconds=45.0,
+            credential_id="HERMES_API_KEY",
+        )
+    )
+
+    restored = config_from_dict(config_to_dict(config))
+
+    assert restored.hermes_referee == config.hermes_referee
 
 
 def test_project_config_paths_root_most_first(tmp_path: Path):

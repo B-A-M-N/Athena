@@ -58,7 +58,13 @@ from athena.models.compat.profiles import ModelProfile, resolve_profile
 from athena.execution.runtimes import PythonRuntime, ShellRuntime
 from athena.execution.runtimes.powershell import PowerShellRuntime
 from athena.execution.runtimes.node import NodeRuntime
-from athena.hermes import HermesDecision, HermesReferee, HermesVerdict, ReviewPacket
+from athena.hermes import (
+    HermesAgentEvaluator,
+    HermesDecision,
+    HermesReferee,
+    HermesVerdict,
+    ReviewPacket,
+)
 from athena.kernel.kernel import AgentKernel
 from athena.kernel.dispatch import CapabilityDispatchShim
 from athena.kernel.termination import TerminationEvaluator
@@ -166,6 +172,9 @@ class AthenaService:
         # reporting "unsupported" for a provider owned by the host.
         self._device_provider = device_provider
         self._hermes_referee = hermes_referee
+        self._hermes_adapter: HermesAgentEvaluator | None = None
+        self._hermes_referee_owned = False
+        self._hermes_status_error: str | None = None
         self._started = False
         self._recovery_status = "not_started"
         self._recovery_summary: dict[str, int] = {}
@@ -368,6 +377,7 @@ class AthenaService:
         self._secrets = SecretManager(
             sources=[EnvSource(), FileSource("/etc/athena/secrets")],
         )
+        self._configure_hermes_referee()
 
         # 3. Execution + runtimes.
         runtime_sessions = RuntimeSessionStore(db)
@@ -988,6 +998,17 @@ class AthenaService:
                 _logger.warning("MCP client close failed: %s", exc)
         self._mcp_clients = []
 
+        # External Hermes transport is optional and owns only its HTTP client.
+        if self._hermes_adapter is not None:
+            try:
+                await self._hermes_adapter.aclose()
+            except Exception as exc:
+                _logger.warning("Hermes referee close failed: %s", exc)
+            self._hermes_adapter = None
+            if self._hermes_referee_owned:
+                self._hermes_referee = None
+                self._hermes_referee_owned = False
+
         # Runtimes / execution. Kill every in-flight subprocess tree so a
         # shutdown never leaves an orphan process, including sessions the
         # runtimes adopted that were never surfaced into _task_sessions.
@@ -1060,6 +1081,41 @@ class AthenaService:
             "status": self._startup_health.get("status", "not_started"),
             "checks": checks,
             "blocking_failures": list(self._startup_health.get("blocking_failures") or ()),
+        }
+
+    async def hermes_referee_status(self) -> dict[str, Any]:
+        """Return operator-safe Hermes configuration and connectivity status."""
+        settings = self.config.hermes_referee
+        if not settings.enabled and self._hermes_referee is None:
+            return {
+                "enabled": False,
+                "state": "disabled",
+                "profile": settings.profile,
+                "endpoint": settings.endpoint,
+            }
+        if self._hermes_adapter is None:
+            return {
+                "enabled": settings.enabled,
+                "state": "configured" if self._hermes_referee is not None else "unavailable",
+                "profile": settings.profile,
+                "endpoint": settings.endpoint,
+                "error": self._hermes_status_error,
+            }
+        try:
+            await self._hermes_adapter.health()
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "state": "disconnected",
+                "profile": settings.profile,
+                "endpoint": settings.endpoint,
+                "error": str(exc),
+            }
+        return {
+            "enabled": True,
+            "state": "connected",
+            "profile": settings.profile,
+            "endpoint": settings.endpoint,
         }
 
     async def _recover_approved_continuations(
@@ -4506,6 +4562,80 @@ class AthenaService:
         if pc.api_key is not None:
             return pc.api_key
         return ""
+
+    def _configure_hermes_referee(self) -> None:
+        """Build the optional transport after the secret boundary exists."""
+        settings = self.config.hermes_referee
+        if self._hermes_referee is not None and not self._hermes_referee_owned:
+            self._startup_health["checks"]["hermes_referee"] = {
+                "status": "ok",
+                "blocking": False,
+                "state": "injected",
+            }
+            return
+        if not settings.enabled:
+            self._startup_health["checks"]["hermes_referee"] = {
+                "status": "ok",
+                "blocking": False,
+                "state": "disabled",
+            }
+            return
+        api_key = ""
+        self._hermes_status_error = None
+        if settings.credential_id:
+            try:
+                if self._secrets is None:
+                    raise RuntimeError("SecretManager is not ready")
+                api_key = self._secrets.resolve(settings.credential_id)
+            except Exception as exc:
+                reason = f"Hermes credential unavailable: {exc}"
+                self._hermes_status_error = reason
+
+                async def unavailable(_packet: ReviewPacket) -> Mapping[str, Any]:
+                    raise RuntimeError(reason)
+
+                self._hermes_referee = HermesReferee(unavailable)
+                self._hermes_referee_owned = True
+                self._startup_health["checks"]["hermes_referee"] = {
+                    "status": "degraded",
+                    "blocking": False,
+                    "state": "credential_unavailable",
+                    "error": reason,
+                }
+                return
+        try:
+            adapter = HermesAgentEvaluator(
+                endpoint=settings.endpoint,
+                profile=settings.profile,
+                timeout_seconds=settings.timeout_seconds,
+                api_key=api_key,
+            )
+        except (TypeError, ValueError) as exc:
+            reason = f"Hermes configuration invalid: {exc}"
+            self._hermes_status_error = reason
+
+            async def unavailable(_packet: ReviewPacket) -> Mapping[str, Any]:
+                raise RuntimeError(reason)
+
+            self._hermes_referee = HermesReferee(unavailable)
+            self._hermes_referee_owned = True
+            self._startup_health["checks"]["hermes_referee"] = {
+                "status": "degraded",
+                "blocking": False,
+                "state": "invalid",
+                "error": reason,
+            }
+            return
+        self._hermes_adapter = adapter
+        self._hermes_referee = HermesReferee(adapter)
+        self._hermes_referee_owned = True
+        self._startup_health["checks"]["hermes_referee"] = {
+            "status": "ok",
+            "blocking": False,
+            "state": "configured",
+            "profile": settings.profile,
+            "endpoint": settings.endpoint,
+        }
 
     # ------------------------------------------------------------------ #
     # Internal accessors

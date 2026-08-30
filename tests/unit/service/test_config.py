@@ -87,6 +87,22 @@ def test_load_config_cli_overrides():
         os.environ.update(old_env)
 
 
+def test_load_config_reads_hermes_referee_environment(monkeypatch):
+    monkeypatch.setenv("ATHENA_HERMES_REFEREE_ENABLED", "true")
+    monkeypatch.setenv("ATHENA_HERMES_REFEREE_ENDPOINT", "http://hermes.test:8642")
+    monkeypatch.setenv("ATHENA_HERMES_REFEREE_PROFILE", "athena-referee")
+    monkeypatch.setenv("ATHENA_HERMES_REFEREE_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("ATHENA_HERMES_REFEREE_CREDENTIAL_ID", "HERMES_API_KEY")
+
+    config = load_config(cwd="/tmp/nonexistent_athena_test")
+
+    assert config.hermes_referee.enabled is True
+    assert config.hermes_referee.endpoint == "http://hermes.test:8642"
+    assert config.hermes_referee.profile == "athena-referee"
+    assert config.hermes_referee.timeout_seconds == 30.0
+    assert config.hermes_referee.credential_id == "HERMES_API_KEY"
+
+
 def test_save_and_load_roundtrip():
     """Save a config and load it back (requires tomli_w)."""
     try:
