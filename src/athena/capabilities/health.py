@@ -104,7 +104,9 @@ class CapabilityHealth:
         if last is None:
             self._last_persisted[capability_id] = time.monotonic()
             return dirty >= self._persist_batch_size
-        return dirty >= self._persist_batch_size or time.monotonic() - last >= self._persist_interval
+        return (
+            dirty >= self._persist_batch_size or time.monotonic() - last >= self._persist_interval
+        )
 
     def mark_persisted(self, capability_id: str) -> None:
         self._dirty_calls[capability_id] = 0

@@ -689,9 +689,7 @@ class ContextCompiler:
             scopes: list[tuple[MemoryScope, str | None]] = []
             if task.session_id:
                 scopes.append((MemoryScope.SESSION, task.session_id))
-            scopes.append(
-                (MemoryScope.PROJECT, task.workspace.id if task.workspace else None)
-            )
+            scopes.append((MemoryScope.PROJECT, task.workspace.id if task.workspace else None))
             scopes.append((MemoryScope.GLOBAL, None))
             try:
                 result = list(

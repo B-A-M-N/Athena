@@ -403,8 +403,7 @@ class EventStore:
         """Return one session event without materializing its history."""
         await self.flush_fast_events()
         row = await self._db.fetch_one(
-            "SELECT * FROM events WHERE session_id = ? AND type = ? "
-            "ORDER BY rowid DESC LIMIT 1",
+            "SELECT * FROM events WHERE session_id = ? AND type = ? ORDER BY rowid DESC LIMIT 1",
             (session_id, event_type),
         )
         return _row_to_event(row) if row is not None else None

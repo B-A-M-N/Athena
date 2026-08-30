@@ -128,9 +128,7 @@ class OIFrameBuffer:
             or len(self._base_png) > 8
             or self._base_frame_bytes + self._base_png_bytes > self._max_cache_bytes
         ):
-            frame_candidate = next(
-                (key for key in self._base_frames if key != protected_key), None
-            )
+            frame_candidate = next((key for key in self._base_frames if key != protected_key), None)
             png_candidate = next((key for key in self._base_png if key != protected_key), None)
             if frame_candidate is None and png_candidate is None:
                 break
@@ -714,7 +712,12 @@ class OIFrameBuffer:
             source = view.diff_hunks or view.lines
             if source:
                 visible = min(len(source), max(1, int(visual.code_reveal * len(source))))
-                include(margin, body_top + 45 + visible * 16, width - margin, body_top + 60 + visible * 16)
+                include(
+                    margin,
+                    body_top + 45 + visible * 16,
+                    width - margin,
+                    body_top + 60 + visible * 16,
+                )
 
         if mode is VisualActionKind.FAILURE:
             include(margin, body_top + 28, width - margin, height - 92)

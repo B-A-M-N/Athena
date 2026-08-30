@@ -83,9 +83,7 @@ class MemoryRetriever:
                     await self._store.retrieve_by_recency(scope, scope_id, limit, tags=tags)
                 )
             return sorted(rows, key=lambda item: item.created_at, reverse=True)[:limit]
-        candidate = await self._store.retrieve_by_fts_scopes(
-            query, scopes, limit * 8, tags=tags
-        )
+        candidate = await self._store.retrieve_by_fts_scopes(query, scopes, limit * 8, tags=tags)
         if mode is RetrievalMode.EXACT:
             return candidate[:limit]
         return self._rank(candidate, query, limit)

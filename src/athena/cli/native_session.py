@@ -105,7 +105,11 @@ class NativeSession:
         if not self._projection_dirty:
             return
         now = time.monotonic()
-        if not force and not self._projection_force and now - self._last_projection < self._projection_interval:
+        if (
+            not force
+            and not self._projection_force
+            and now - self._last_projection < self._projection_interval
+        ):
             return
         async with self._projection_lock:
             if not self._projection_dirty:
