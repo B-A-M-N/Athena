@@ -61,7 +61,7 @@ def _git_root(directory: Path) -> Path | None:
 def _tracked_paths(git_root: Path) -> frozenset[str]:
     """Return indexed paths once per checkout for copytree callbacks."""
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=read-only tracked manifest query
             ["git", "-C", str(git_root), "ls-files", "--cached", "-z"],
             capture_output=True,
             check=False,
