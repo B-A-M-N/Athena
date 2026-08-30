@@ -762,17 +762,7 @@ class AthenaService:
             kernel=kernel,
         )
 
-        # 13. Worker + scheduler.
-        worker = TaskWorker(
-            task_manager=task_manager,
-            kernel=kernel,
-            config=WorkerConfig(max_parallel=cfg.worker_max_parallel),
-        )
-        self._worker = worker
-        task_manager.set_wakeup_callback(worker.notify)
-        self._worker_task = asyncio.create_task(self._worker.run_forever())
-
-        # 14. MCP (best-effort).
+        # 13. MCP (best-effort).
         self._mcp = MCPAdapter(registry)
         await self._connect_mcp()
 
@@ -791,10 +781,19 @@ class AthenaService:
             )
             try:
                 activated = await self._pack_manager.rehydrate_enabled()
+                failures = self._pack_manager.rehydration_failures()
+                unavailable = {str(item["pack_id"]) for item in failures}
+                quarantined = await self._quarantine_tasks_for_packs(
+                    task_store=tasks,
+                    task_manager=task_manager,
+                    unavailable=unavailable,
+                )
                 self._startup_health["checks"]["enabled_packs"] = {
-                    "status": "ok",
+                    "status": "degraded" if failures else "ok",
                     "blocking": False,
                     "activated": activated,
+                    "failures": failures,
+                    "quarantined_tasks": quarantined,
                 }
             except Exception as exc:
                 _logger.warning("enabled capability-pack rehydration failed: %s", exc)
@@ -803,6 +802,17 @@ class AthenaService:
                     "blocking": False,
                     "error": str(exc),
                 }
+
+        # 14. Worker + scheduler. Packs and any dependent resumable tasks are
+        # settled before a worker can claim fresh work.
+        worker = TaskWorker(
+            task_manager=task_manager,
+            kernel=kernel,
+            config=WorkerConfig(max_parallel=cfg.worker_max_parallel),
+        )
+        self._worker = worker
+        task_manager.set_wakeup_callback(worker.notify)
+        self._worker_task = asyncio.create_task(self._worker.run_forever())
 
         # 15. Start background scheduler loop.
         await scheduler.start()
@@ -818,6 +828,43 @@ class AthenaService:
             for name, value in self._startup_health["checks"].items()
             if isinstance(value, dict) and value.get("blocking") and value.get("status") != "ok"
         ]
+
+    async def _quarantine_tasks_for_packs(
+        self,
+        *,
+        task_store: TaskStore,
+        task_manager: TaskManager,
+        unavailable: set[str],
+    ) -> list[str]:
+        """Park resumable tasks whose explicit pack dependency is unavailable."""
+        if not unavailable:
+            return []
+        quarantined: list[str] = []
+        for status in (TaskStatus.RUNNING, TaskStatus.INTERRUPTED):
+            for row in await task_store.list_by_status(status):
+                metadata = row.get("metadata") or {}
+                required = metadata.get("required_packs") if isinstance(metadata, dict) else ()
+                if isinstance(required, str):
+                    required = (required,)
+                required_ids = {str(item) for item in required or ()}
+                missing = sorted(required_ids.intersection(unavailable))
+                if not missing:
+                    continue
+                try:
+                    await task_manager.transition(
+                        str(row["id"]),
+                        TaskStatus.RECOVERY_REQUIRED,
+                        reason="required capability pack unavailable: " + ", ".join(missing),
+                    )
+                except (KeyError, ValueError) as exc:
+                    _logger.warning(
+                        "could not quarantine task %s for unavailable packs: %s",
+                        row.get("id"),
+                        exc,
+                    )
+                    continue
+                quarantined.append(str(row["id"]))
+        return quarantined
 
     async def stop(self) -> None:
         if not self._started and self._db is None:

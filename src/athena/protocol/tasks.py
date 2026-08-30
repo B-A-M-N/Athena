@@ -264,6 +264,9 @@ class TaskSpec:
     resource_budget: ResourceBudget = ResourceBudget()
     deadline: datetime | None = None
     delivery: DeliverySpec | None = None
+    # ``required_packs`` is an optional durable startup dependency contract.
+    # Pack failures remain non-blocking globally, but the service quarantines
+    # a resumable task that explicitly names an unavailable pack.
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 

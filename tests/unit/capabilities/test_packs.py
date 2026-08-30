@@ -76,6 +76,25 @@ def _pack(root):
     return pack
 
 
+def test_rehydrate_records_individual_pack_failure(tmp_path):
+    store = _PackStore()
+    manager = PackManager(store, install_root=str(tmp_path / "installed"))
+    good = SimpleNamespace(id="good-pack", enabled=True)
+    bad = SimpleNamespace(id="bad-pack", enabled=True)
+    store.values = {good.id: good, bad.id: bad}
+
+    manager.bind_integrations(fabric=object())
+
+    async def activate(state):
+        if state.id == bad.id:
+            raise ValueError("missing payload")
+
+    manager._activate = activate
+
+    assert asyncio.run(manager.rehydrate_enabled()) == 1
+    assert manager.rehydration_failures() == [{"pack_id": "bad-pack", "error": "missing payload"}]
+
+
 def test_declarative_pack_is_validated_installed_and_health_checked(tmp_path):
     store = _PackStore()
     manager = PackManager(store, install_root=str(tmp_path / "installed"))

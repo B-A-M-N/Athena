@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from importlib import import_module
 import json
+import logging
 import os
 import re
 import shutil
@@ -50,6 +51,8 @@ _PROVIDED_FILES = {
     "instruments": (".json",),
 }
 
+_logger = logging.getLogger("athena.packs")
+
 
 class PackManager:
     """Manage packs without loading pack code into Athena's interpreter."""
@@ -65,6 +68,7 @@ class PackManager:
         self._mcp_adapter = None
         self._mcp_client_sink = None
         self._mcp_clients: dict[str, MCPClient] = {}
+        self._rehydration_failures: list[dict[str, str]] = []
 
     def bind_integrations(
         self,
@@ -93,13 +97,23 @@ class PackManager:
         """Activate enabled packs after the host rebuilds its surfaces."""
         if not self._integrations_bound:
             return 0
+        self._rehydration_failures = []
         activated = 0
         for state in await self._store.list():
             if not state.enabled:
                 continue
-            await self._activate(state)
+            try:
+                await self._activate(state)
+            except Exception as exc:  # noqa: BLE001 - optional packs degrade independently
+                _logger.warning("capability-pack rehydration failed for %s: %s", state.id, exc)
+                self._rehydration_failures.append({"pack_id": state.id, "error": str(exc)})
+                continue
             activated += 1
         return activated
+
+    def rehydration_failures(self) -> list[dict[str, str]]:
+        """Return pack failures from the most recent startup rehydration."""
+        return [dict(item) for item in self._rehydration_failures]
 
     def inspect_source(
         self, source_path: str, *, allowed_root: str | None = None
