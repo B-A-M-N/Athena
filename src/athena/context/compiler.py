@@ -20,6 +20,7 @@ import inspect
 import hashlib
 import json
 import logging
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -194,6 +195,8 @@ class ContextCompiler:
         self.safety_margin = safety_margin
         self._principal_id = principal_id
         self.capability_limit = max(1, capability_limit)
+        self._project_cache: dict[str, tuple[str, tuple[_Entry, ...]]] = {}
+        self._memory_cache: OrderedDict[tuple[str, int], tuple[Any, ...]] = OrderedDict()
 
     async def compile(
         self,
@@ -216,7 +219,7 @@ class ContextCompiler:
             _system_entry(system or _DEFAULT_SAFETY),
             _task_entry(task),
         ]
-        required.extend(_project_entries(self, workspace))
+        required.extend(self._project_entries(workspace))
 
         # Explicitly attached blocks are working context, not retrieval
         # results. Load them before optional corpus material so they remain
@@ -674,6 +677,38 @@ class ContextCompiler:
         if self._memory_store is None:
             return []
         store = self._memory_store
+        generation = getattr(store, "generation", None)
+        cache_key = (task.id, int(generation)) if isinstance(generation, int) else None
+        if cache_key is not None:
+            cached = self._memory_cache.get(cache_key)
+            if cached is not None:
+                self._memory_cache.move_to_end(cache_key)
+                return list(cached)
+        combined = getattr(store, "search_scopes", None)
+        if callable(combined):
+            scopes: list[tuple[MemoryScope, str | None]] = []
+            if task.session_id:
+                scopes.append((MemoryScope.SESSION, task.session_id))
+            scopes.append(
+                (MemoryScope.PROJECT, task.workspace.id if task.workspace else None)
+            )
+            scopes.append((MemoryScope.GLOBAL, None))
+            try:
+                result = list(
+                    await combined(
+                        task.objective,
+                        scopes,
+                        limit=24,
+                    )
+                )
+                if cache_key is not None:
+                    self._memory_cache[cache_key] = tuple(result)
+                    self._memory_cache.move_to_end(cache_key)
+                    while len(self._memory_cache) > 256:
+                        self._memory_cache.popitem(last=False)
+                return result
+            except Exception:
+                pass
         out: list[Any] = []
         try:
             if task.session_id:
@@ -700,6 +735,11 @@ class ContextCompiler:
             out.extend(await store.search(task.objective, scope=MemoryScope.GLOBAL))
         except Exception:
             pass
+        if cache_key is not None:
+            self._memory_cache[cache_key] = tuple(out)
+            self._memory_cache.move_to_end(cache_key)
+            while len(self._memory_cache) > 256:
+                self._memory_cache.popitem(last=False)
         return out
 
     async def _load_skills(self, task: TaskSpec) -> list[Any]:
@@ -717,6 +757,33 @@ class ContextCompiler:
             limit=self.skill_limit,
         )
         return selected
+
+    def _project_entries(self, workspace: str | None) -> list[_Entry]:
+        reader = self._workspace_reader
+        if reader is None or not hasattr(reader, "list_agents_md"):
+            return []
+        snapshot = getattr(reader, "snapshot", None)
+        files: list[tuple[str, str]]
+        revision: str
+        try:
+            if callable(snapshot):
+                raw_revision, raw_files = snapshot()
+                revision = str(raw_revision)
+                files = list(raw_files or ())
+            else:
+                files = list(reader.list_agents_md())
+                revision = hashlib.sha256(
+                    json.dumps(files, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
+        except Exception:
+            return []
+        key = str(workspace or "")
+        cached = self._project_cache.get(key)
+        if cached is not None and cached[0] == revision:
+            return list(cached[1])
+        entries = tuple(_agents_entry(path, text) for path, text in files)
+        self._project_cache[key] = (revision, entries)
+        return list(entries)
 
     async def _bound_and_compress(
         self,

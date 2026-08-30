@@ -1315,8 +1315,9 @@ class DualPaneSurface(OperatorSurface):
             return self._active_lines(height, width)
         return self._scene_lines(height, width)
 
-    def _frame_lines(self) -> list[str]:
-        self._refresh_terminal_size()
+    def _frame_lines(self, *, refresh: bool = True) -> list[str]:
+        if refresh:
+            self._refresh_terminal_size()
         layout = self.layout
         cols, rows = layout.columns, layout.rows
         if layout.mode.value == "plain":
@@ -1499,7 +1500,7 @@ class DualPaneSurface(OperatorSurface):
         if not force and now - self._last_paint < self._REPAINT_INTERVAL:
             return
         self._last_paint = now
-        frame = self._frame_lines()
+        frame = self._frame_lines(refresh=False)
         self.frame_renderer.draw(frame, columns=self._term_cols)
         if self.display == "glass":
             self._present_glass()

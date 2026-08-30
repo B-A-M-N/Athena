@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Measure full and changed-file project-index refreshes."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+import time
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from athena.project.index.builder import ProjectIndexBuilder  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--max-full-seconds", type=float, default=10.0)
+    parser.add_argument("--max-incremental-seconds", type=float, default=2.0)
+    args = parser.parse_args()
+    root = args.root.resolve()
+    builder = ProjectIndexBuilder()
+
+    started = time.perf_counter()
+    index = builder.build(str(root))
+    full_seconds = time.perf_counter() - started
+
+    started = time.perf_counter()
+    refreshed = builder.incremental(
+        str(root), index, ["src/athena/project/index/builder.py"]
+    )
+    incremental_seconds = time.perf_counter() - started
+    result = {
+        "root": str(root),
+        "files": len(refreshed.files),
+        "full_seconds": round(full_seconds, 6),
+        "incremental_seconds": round(incremental_seconds, 6),
+        "incremental_source_revision": refreshed.source_revision,
+    }
+    print(json.dumps(result, sort_keys=True))
+    if full_seconds > args.max_full_seconds:
+        print(
+            f"bench-indexing: full build {full_seconds:.3f}s exceeds "
+            f"{args.max_full_seconds:.3f}s",
+            file=sys.stderr,
+        )
+        return 1
+    if incremental_seconds > args.max_incremental_seconds:
+        print(
+            f"bench-indexing: incremental build {incremental_seconds:.3f}s exceeds "
+            f"{args.max_incremental_seconds:.3f}s",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

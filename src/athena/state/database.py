@@ -21,7 +21,13 @@ class _AsyncSQLiteConnection:
     loop while preserving one-connection transaction affinity.
     """
 
-    def __init__(self, path: str, *, on_close: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        on_close: Callable[[], None] | None = None,
+        poll_fallback: bool = False,
+    ) -> None:
         self._path = path
         self._on_close = on_close
         self._connection: sqlite3.Connection | None = None
@@ -29,6 +35,7 @@ class _AsyncSQLiteConnection:
             queue.Queue()
         )
         self._closed = False
+        self._poll_fallback = poll_fallback
         self._started = False
         self._thread = threading.Thread(
             target=self._worker_loop,
@@ -59,18 +66,19 @@ class _AsyncSQLiteConnection:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         self._queue.put((operation, future))
-        # The worker completes this Future through the loop's thread-safe
-        # callback.  A short timer is a compatibility nudge for embedded
-        # selector adapters that enqueue that callback without waking select;
-        # the callback remains the normal completion path.  This bounded
-        # fallback prevents a locked-down host event loop from hanging SQLite
-        # callers indefinitely.
-        while True:
-            try:
-                await asyncio.wait_for(asyncio.shield(future), timeout=0.001)
-            except TimeoutError:
-                continue
-            return future.result()
+        # ``call_soon_threadsafe`` wakes the owning event loop and completes
+        # the Future.  The normal path has no timer or polling overhead.
+        if self._poll_fallback:
+            # Explicit compatibility mode for embedded adapters that violate
+            # the asyncio thread-safe wakeup contract.  It is opt-in so the
+            # ordinary Athena runtime never pays this cost.
+            while True:
+                try:
+                    await asyncio.wait_for(asyncio.shield(future), timeout=0.001)
+                except TimeoutError:
+                    continue
+                return future.result()
+        return await future
 
     def _worker_loop(self) -> None:
         while True:
@@ -195,8 +203,9 @@ class _AsyncSQLiteCursor:
 
 
 class Database:
-    def __init__(self, path: str = ":memory:") -> None:
+    def __init__(self, path: str = ":memory:", *, sqlite_poll_fallback: bool = False) -> None:
         self._path = path
+        self._sqlite_poll_fallback = bool(sqlite_poll_fallback)
         self._conn: _AsyncSQLiteConnection | None = None
         self._closed = False
         self._migrated = False
@@ -215,7 +224,11 @@ class Database:
 
     async def _ensure_ready_unlocked(self) -> None:
         if self._conn is None:
-            self._conn = _AsyncSQLiteConnection(self._path, on_close=self._mark_closed)
+            self._conn = _AsyncSQLiteConnection(
+                self._path,
+                on_close=self._mark_closed,
+                poll_fallback=self._sqlite_poll_fallback,
+            )
             await self._conn.start()
             if self._path != ":memory:":
                 await self._conn.execute("PRAGMA journal_mode=WAL")

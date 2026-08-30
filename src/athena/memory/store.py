@@ -206,6 +206,12 @@ class MemoryStore:
 
     def __init__(self, db: Database) -> None:
         self._db = db
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Process-local revision for compiler retrieval caches."""
+        return self._generation
 
     def _record_metadata(
         self,
@@ -338,6 +344,7 @@ class MemoryStore:
             json.dumps(md, default=str),
         )
         await self._db.execute(sql, params)
+        self._generation += 1
         return record
 
     async def _merge_superseded(self, superseded_ids: Sequence[str], by_id: str) -> None:
@@ -369,7 +376,10 @@ class MemoryStore:
 
     async def delete(self, id: str) -> bool:
         cursor = await self._db.execute("DELETE FROM memories WHERE id = ?", (id,))
-        return cursor.rowcount is not None and cursor.rowcount > 0
+        changed = cursor.rowcount is not None and cursor.rowcount > 0
+        if changed:
+            self._generation += 1
+        return changed
 
     async def list_by_scope(self, scope: MemoryScope, scope_id: str | None) -> list[MemoryRecord]:
         conditions = ["scope = ?"]
@@ -444,6 +454,26 @@ class MemoryStore:
             tags=tags,
         )
 
+    async def search_scopes(
+        self,
+        query: str,
+        scopes: Sequence[tuple[MemoryScope, str | None]],
+        *,
+        limit: int = 10,
+        mode: RetrievalMode | str = RetrievalMode.SEMANTIC,
+        tags: Sequence[str] | None = None,
+    ) -> list[MemoryRecord]:
+        """Search several authority scopes with one retrieval operation."""
+        from athena.memory.retrieval import MemoryRetriever
+
+        return await MemoryRetriever(self).retrieve_scopes(
+            query=query,
+            scopes=scopes,
+            mode=mode,
+            limit=limit,
+            tags=tags,
+        )
+
     # ---- retrieval SQL (owned by the store; the retriever only re-ranks) ----
 
     async def _scope_where(
@@ -507,6 +537,40 @@ class MemoryStore:
         )
         params.append(limit)
         return await self._fetch_records(sql, params)
+
+    async def retrieve_by_fts_scopes(
+        self,
+        query: str,
+        scopes: Sequence[tuple[MemoryScope, str | None]],
+        limit: int,
+        tags: Sequence[str] | None = None,
+    ) -> list[MemoryRecord]:
+        match = self.sanitize_match(query)
+        if not match or not scopes:
+            return []
+        groups: list[str] = []
+        params: list[Any] = [match]
+        for scope, scope_id in scopes:
+            parts = ["m.scope = ?"]
+            params.append(scope.value)
+            if scope_id:
+                parts.append("json_extract(m.metadata, '$._athena:scope_id') = ?")
+                params.append(scope_id)
+            groups.append("(" + " AND ".join(parts) + ")")
+        tag_parts: list[str] = []
+        for tag in tags or ():
+            if tag:
+                tag_parts.append("json_extract(m.metadata, '$._athena:tags') LIKE ?")
+                params.append(f'%"{tag}"%')
+        where = ["memories_fts MATCH ?", "(" + " OR ".join(groups) + ")"]
+        where.extend(tag_parts)
+        params.append(limit)
+        return await self._fetch_records(
+            "SELECT m.* FROM memories_fts "
+            "JOIN memories m ON m.rowid = memories_fts.rowid "
+            "WHERE " + " AND ".join(where) + " ORDER BY bm25(memories_fts) LIMIT ?",
+            params,
+        )
 
     @staticmethod
     def sanitize_match(query: str) -> str:

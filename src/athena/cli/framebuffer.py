@@ -76,8 +76,13 @@ class OIFrameBuffer:
     def __init__(self, *, font_path: str | None = None) -> None:
         self.font_path = font_path
         self._fonts: dict[int, Any] = {}
+        self._max_font_entries = 32
         self._base_frames: dict[tuple[int, int, tuple[Any, ...]], Any] = {}
+        self._base_frame_sizes: dict[tuple[int, int, tuple[Any, ...]], int] = {}
+        self._base_frame_bytes = 0
         self._base_png: dict[tuple[int, int, tuple[Any, ...]], bytes] = {}
+        self._base_png_bytes = 0
+        self._max_cache_bytes = 64 * 1024 * 1024
 
     def _font(self, size: int):
         if ImageFont is None:
@@ -96,6 +101,8 @@ class OIFrameBuffer:
                     pass
         font = ImageFont.load_default()
         self._fonts[size] = font
+        if len(self._fonts) > self._max_font_entries:
+            self._fonts.pop(next(iter(self._fonts)))
         return font
 
     @staticmethod
@@ -140,12 +147,19 @@ class OIFrameBuffer:
         if base is None:
             base = self._render_base(scene, width, height)
             self._base_frames[key] = base
+            size = width * height * 4
+            self._base_frame_sizes[key] = size
+            self._base_frame_bytes += size
             # Live traces can produce many distinct scene keys. Retain only a
-            # small working set so an active session cannot grow without bound.
-            if len(self._base_frames) > 8:
+            # small working set and byte budget so an active session cannot
+            # grow without bound.
+            while len(self._base_frames) > 8 or self._base_frame_bytes > self._max_cache_bytes:
                 oldest = next(iter(self._base_frames))
                 if oldest != key:
                     del self._base_frames[oldest]
+                    self._base_frame_bytes -= self._base_frame_sizes.pop(oldest, 0)
+                else:
+                    break
         return base, key
 
     @staticmethod
@@ -572,10 +586,13 @@ class OIFrameBuffer:
             base.convert("RGB").save(encoded, format="PNG", optimize=False, compress_level=1)
             png = encoded.getvalue()
             self._base_png[key] = png
-            if len(self._base_png) > 8:
+            self._base_png_bytes += len(png)
+            while len(self._base_png) > 8 or self._base_png_bytes > self._max_cache_bytes:
                 oldest = next(iter(self._base_png))
                 if oldest != key:
-                    del self._base_png[oldest]
+                    self._base_png_bytes -= len(self._base_png.pop(oldest))
+                else:
+                    break
         return FrameBuffer(png, width, height, layer="base", base_key=key)
 
     def render_motion_overlay(

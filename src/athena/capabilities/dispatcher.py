@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import re
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -165,10 +166,11 @@ class CapabilityDispatcher:
         self._reality_gate = None
         self._execution_semaphores: dict[str, asyncio.Semaphore] = {}
         self._resource_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        self._result_cache: dict[
+        self._result_cache: OrderedDict[
             tuple[str | None, str, str, str, str | None],
             tuple[float, CapabilityResult],
-        ] = {}
+        ] = OrderedDict()
+        self._result_cache_limit = 2048
 
     def set_reality_gate(self, gate) -> None:
         """Bind the execution authority that resolves speculative workspaces."""
@@ -862,6 +864,9 @@ class CapabilityDispatcher:
                             ),
                             result,
                         )
+                        self._result_cache.move_to_end(cache_key)
+                        while len(self._result_cache) > self._result_cache_limit:
+                            self._result_cache.popitem(last=False)
                 elif not isolated_call and not verification_call:
                     self._invalidate_result_cache(routed_workspace.root)
                 await self._emit(
@@ -977,6 +982,7 @@ class CapabilityDispatcher:
         if time.monotonic() >= expires_at:
             self._result_cache.pop(key, None)
             return None
+        self._result_cache.move_to_end(key)
         return result
 
     def _invalidate_result_cache(self, workspace_root: str) -> None:

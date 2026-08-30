@@ -421,10 +421,15 @@ class CompositeVerifier:
         )
         protected = await _verification_manifest(task.workspace) if guard_workspace else {}
         allowed = _verification_writable_paths(task)
+        verified: dict[tuple[Any, ...], bool] = {}
         for criterion in criteria:
             spec = criterion.verification
             if spec is None:
                 results.append(False)
+                continue
+            semantic_id = _verification_semantic_id(spec)
+            if semantic_id in verified:
+                results.append(verified[semantic_id])
                 continue
             vtype = spec.type
             if vtype == VerificationType.COMMAND:
@@ -445,6 +450,7 @@ class CompositeVerifier:
                 ok = await self._manual.verify_one(task, spec)
             else:
                 ok = False
+            verified[semantic_id] = ok
             if guard_workspace:
                 after = await _verification_manifest(task.workspace)
                 changed = _manifest_changes(protected, after)
@@ -462,6 +468,17 @@ class CompositeVerifier:
                     return results
             results.append(ok)
         return results
+
+
+def _verification_semantic_id(spec: VerificationSpec) -> tuple[Any, ...]:
+    """Identify equivalent probes without depending on object identity."""
+    return (
+        spec.type.value,
+        spec.command or "",
+        spec.path or "",
+        spec.predicate or "",
+        spec.capability or "",
+    )
 
 
 def _task_verification_environment(task: TaskSpec) -> Any:

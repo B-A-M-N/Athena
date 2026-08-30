@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import sys
+import time
 from collections import deque
 from collections.abc import Mapping
 from typing import Any, Callable, TextIO
@@ -33,6 +34,45 @@ from athena.cli.terminal import TerminalSession
 _DIM = "\x1b[2m"
 _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
+
+_FORCE_RENDER_EVENTS = frozenset(
+    {
+        "ApprovalRequested",
+        "TaskCompleted",
+        "TaskFailed",
+        "TaskCancelled",
+        "TaskPaused",
+        "RecoveryRequired",
+    }
+)
+
+
+class _RenderScheduler:
+    """Coalesce bursty event updates into a bounded terminal frame rate."""
+
+    def __init__(self, viewer: "OIStreamViewer", *, fps: float = 30.0) -> None:
+        self.viewer = viewer
+        self.interval = 1.0 / max(float(fps), 1.0)
+        self.last_render = 0.0
+        self.dirty = False
+
+    def update(self, event_type: str) -> None:
+        self.dirty = True
+        now = time.monotonic()
+        if (
+            event_type in _FORCE_RENDER_EVENTS
+            or self.last_render == 0.0
+            or now - self.last_render >= self.interval
+        ):
+            self.viewer.render()
+            self.last_render = now
+            self.dirty = False
+
+    def flush(self) -> None:
+        if self.dirty or self.last_render == 0.0:
+            self.viewer.render()
+            self.last_render = time.monotonic()
+            self.dirty = False
 
 
 class OIStreamViewer:
@@ -216,6 +256,7 @@ async def run_viewer(
         input_fn=input_fn,
         mascot=mascot,
     )
+    scheduler = _RenderScheduler(viewer)
     startup_health = getattr(service, "startup_health", lambda: None)()
     if isinstance(startup_health, Mapping) and startup_health.get("status") != "ok":
         viewer.projection.add_recent(
@@ -235,10 +276,10 @@ async def run_viewer(
                 if isinstance(seq, int) and seq > last_seq:
                     last_seq = seq
                 await viewer.handle_event(ev)
-                viewer.render()
+                scheduler.update(str(getattr(ev, "type", "")))
             # Terminal: one final render so nothing appended since the last event
             # frame is missed, then exit cleanly instead of looping forever.
-            viewer.render()
+            scheduler.flush()
             return 0
         # Global tail: use the service's same-process append notification with
         # a bounded database-poll fallback for other Athena processes.
@@ -247,7 +288,7 @@ async def run_viewer(
             if isinstance(rid, int):
                 cursor = max(cursor, rid)
             await viewer.handle_event(ev)
-            viewer.render()
+            scheduler.update(str(getattr(ev, "type", "")))
         return 0
     finally:
         viewer.close()

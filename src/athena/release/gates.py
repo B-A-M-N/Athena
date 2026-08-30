@@ -51,6 +51,14 @@ def release_commands(
             ],
         ),
         (
+            "indexing-benchmark",
+            [*prefix, "python", "scripts/bench-indexing"],
+        ),
+        (
+            "rendering-benchmark",
+            [*prefix, "python", "scripts/bench-rendering"],
+        ),
+        (
             "release-scenarios",
             [
                 *prefix,

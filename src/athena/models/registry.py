@@ -8,6 +8,7 @@ with the caller; the registry holds adapter instances and their declared models.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+import time
 
 from athena.protocol.errors import ModelUnavailable, ProviderUnavailable
 from athena.protocol.models import (
@@ -30,11 +31,17 @@ class ProviderRegistry:
         # describe selected-model quirks. Both belong to this one registry so
         # the kernel, adapters, and repair boundary share an authority.
         self._model_profiles: dict[tuple[str, str], object] = {}
+        self._models_cache: tuple[float, tuple[ModelInfo, ...]] | None = None
+        self._models_cache_ttl = 2.0
+
+    def _invalidate_models(self) -> None:
+        self._models_cache = None
 
     def register(self, provider_name: str, provider: ModelProvider) -> None:
         if not isinstance(provider, object) or not hasattr(provider, "complete"):
             raise ProviderUnavailable(f"provider {provider_name!r} is not a ModelProvider")
         self._providers[provider_name] = provider
+        self._invalidate_models()
 
     def unregister(self, provider_name: str) -> None:
         self._providers.pop(provider_name, None)
@@ -42,6 +49,7 @@ class ProviderRegistry:
         self._model_profiles = {
             key: value for key, value in self._model_profiles.items() if key[0] != provider_name
         }
+        self._invalidate_models()
 
     def set_profile(self, provider_name: str, profile: object) -> None:
         if provider_name not in self._providers:
@@ -79,13 +87,18 @@ class ProviderRegistry:
             raise ProviderUnavailable(f"provider {provider_name!r} is not registered")
 
     async def list_models(self) -> Sequence[ModelInfo]:
+        now = time.monotonic()
+        if self._models_cache is not None and now - self._models_cache[0] < self._models_cache_ttl:
+            return self._models_cache[1]
         out: list[ModelInfo] = []
         for name, provider in self._providers.items():
             for info in await provider.list_models():
                 if info.provider == "":
                     info = _with_provider(info, name)
                 out.append(info)
-        return out
+        result = tuple(out)
+        self._models_cache = (now, result)
+        return result
 
     async def resolve(self, provider_name: str, model_name: str) -> ModelInfo:
         provider = self.provider_for(provider_name)

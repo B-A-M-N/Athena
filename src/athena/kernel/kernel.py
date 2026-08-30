@@ -1417,14 +1417,27 @@ class AgentKernel:
         tracker = self._prefix_trackers.setdefault(key, PrefixTracker())
         if tracker.last_prefix_fp is None and self._events is not None:
             try:
-                for event in reversed(await self._events.list_for_session(session_key)):
-                    if event.type != "InferencePrefixObserved":
-                        continue
+                latest = getattr(self._events, "latest_for_session", None)
+                event = (
+                    await latest(session_key, "InferencePrefixObserved")
+                    if callable(latest)
+                    else None
+                )
+                if event is not None:
                     payload = dict(event.payload or {})
                     tracker.last_prefix_fp = payload.get("prefix_fingerprint")
                     tracker.last_full_fp = payload.get("full_fingerprint")
                     tracker.components_fp = dict(payload.get("components_fp") or {})
-                    break
+                else:
+                    # Compatibility with older event-store adapters.
+                    for event in reversed(await self._events.list_for_session(session_key)):
+                        if event.type != "InferencePrefixObserved":
+                            continue
+                        payload = dict(event.payload or {})
+                        tracker.last_prefix_fp = payload.get("prefix_fingerprint")
+                        tracker.last_full_fp = payload.get("full_fingerprint")
+                        tracker.components_fp = dict(payload.get("components_fp") or {})
+                        break
             except Exception as exc:
                 _logger.debug("prefix tracker restore failed for %s: %s", session_key, exc)
         system_blocks = [m.text() for m in compiled.messages if m.role.value == "system"]

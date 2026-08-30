@@ -50,10 +50,14 @@ pub struct NativeTerminalCore {
     size: TerminalSize,
 }
 
+const MAX_SCROLLBACK_LINES: usize = 4_000;
+
 impl NativeTerminalCore {
     pub fn new(columns: usize, rows: usize) -> Self {
         let size = TerminalSize::new(columns, rows);
-        let term = Term::new(TerminalConfig::default(), &size, VoidListener);
+        let mut config = TerminalConfig::default();
+        config.scrolling_history = MAX_SCROLLBACK_LINES;
+        let term = Term::new(config, &size, VoidListener);
         Self {
             term,
             parser: vte::ansi::Processor::new(),

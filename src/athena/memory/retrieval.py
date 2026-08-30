@@ -61,6 +61,48 @@ class MemoryRetriever:
     async def retrieve_all(self, query: str, limit: int = 10) -> list[MemoryRecord]:
         return await self._by_semantic(query, None, None, limit)
 
+    async def retrieve_scopes(
+        self,
+        *,
+        query: str,
+        scopes: Sequence[tuple[MemoryScope, str | None]],
+        mode: RetrievalMode | str,
+        limit: int,
+        tags: Sequence[str] | None = None,
+    ) -> list[MemoryRecord]:
+        mode = RetrievalMode(mode)
+        limit = max(0, int(limit or 0))
+        if limit == 0 or not scopes:
+            return []
+        if mode is RetrievalMode.RECENCY:
+            # One SQL query is reserved for the common semantic/exact path;
+            # recency keeps its explicit per-scope ordering semantics.
+            rows: list[MemoryRecord] = []
+            for scope, scope_id in scopes:
+                rows.extend(
+                    await self._store.retrieve_by_recency(scope, scope_id, limit, tags=tags)
+                )
+            return sorted(rows, key=lambda item: item.created_at, reverse=True)[:limit]
+        candidate = await self._store.retrieve_by_fts_scopes(
+            query, scopes, limit * 8, tags=tags
+        )
+        if mode is RetrievalMode.EXACT:
+            return candidate[:limit]
+        return self._rank(candidate, query, limit)
+
+    @staticmethod
+    def _rank(candidate: list[MemoryRecord], query: str, limit: int) -> list[MemoryRecord]:
+        qset = _tokens(query)
+        if not qset:
+            return candidate[:limit]
+        scored: list[tuple[float, MemoryRecord]] = []
+        for rec in candidate:
+            text = " ".join((rec.content or "", rec.summary or "")).lower()
+            intersect = len(qset & _tokens(text))
+            scored.append((intersect / len(qset), rec))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [rec for score, rec in scored if score > 0][:limit]
+
     async def _by_semantic(
         self,
         query: str,
@@ -70,18 +112,7 @@ class MemoryRetriever:
         tags: Sequence[str] | None = None,
     ) -> list[MemoryRecord]:
         candidate = await self._store.retrieve_by_fts(query, scope, scope_id, limit * 8, tags=tags)
-        qset = _tokens(query)
-        if not qset:
-            return candidate[:limit]
-        scored: list[tuple[float, MemoryRecord]] = []
-        for rec in candidate:
-            text = " ".join((rec.content or "", rec.summary or "")).lower()
-            intersect = len(qset & _tokens(text))
-            score = intersect / len(qset)
-            scored.append((score, rec))
-        scored.sort(key=lambda t: t[0], reverse=True)
-        best = [rec for score, rec in scored if score > 0]
-        return best[:limit]
+        return self._rank(candidate, query, limit)
 
 
 __all__ = ["MemoryRetriever"]

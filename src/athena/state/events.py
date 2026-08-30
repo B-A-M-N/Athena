@@ -395,6 +395,20 @@ class EventStore:
         )
         return [_row_to_event(r) for r in rows]
 
+    async def latest_for_session(
+        self,
+        session_id: str,
+        event_type: str,
+    ) -> Event | None:
+        """Return one session event without materializing its history."""
+        await self.flush_fast_events()
+        row = await self._db.fetch_one(
+            "SELECT * FROM events WHERE session_id = ? AND type = ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (session_id, event_type),
+        )
+        return _row_to_event(row) if row is not None else None
+
     async def last_sequence(self, task_id: str) -> int:
         await self.flush_fast_events(task_id)
         row = await self._db.fetch_one(

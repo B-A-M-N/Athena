@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
@@ -146,11 +147,35 @@ class ContextCompressor:
         recent_turns: int = 8,
         max_summary_chars: int = 600,
         summarizer=None,
+        max_cached_summaries: int = 512,
+        max_cached_summary_chars: int = 512 * 1024,
     ) -> None:
         self.recent_turns = recent_turns
         self.max_summary_chars = max_summary_chars
         self._summarizer = summarizer
-        self._summary_cache: dict[str, str] = {}
+        self.max_cached_summaries = max(1, int(max_cached_summaries))
+        self.max_cached_summary_chars = max(1024, int(max_cached_summary_chars))
+        self._summary_cache: OrderedDict[str, str] = OrderedDict()
+        self._summary_cache_size = 0
+
+    def _cached_summary(self, key: str) -> str | None:
+        value = self._summary_cache.get(key)
+        if value is not None:
+            self._summary_cache.move_to_end(key)
+        return value
+
+    def _remember_summary(self, key: str, summary: str) -> None:
+        previous = self._summary_cache.pop(key, None)
+        if previous is not None:
+            self._summary_cache_size -= len(previous)
+        self._summary_cache[key] = summary
+        self._summary_cache_size += len(summary)
+        while (
+            len(self._summary_cache) > self.max_cached_summaries
+            or self._summary_cache_size > self.max_cached_summary_chars
+        ):
+            _old_key, old_value = self._summary_cache.popitem(last=False)
+            self._summary_cache_size -= len(old_value)
 
     async def _summarize(
         self,
@@ -172,7 +197,7 @@ class ContextCompressor:
         key = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
-        cached = self._summary_cache.get(key)
+        cached = self._cached_summary(key)
         if cached is not None:
             return cached
         if self._summarizer is not None:
@@ -185,7 +210,7 @@ class ContextCompressor:
                     result = await self._summarizer(text)
                 if result:
                     summary = str(result)[: self.max_summary_chars]
-                    self._summary_cache[key] = summary
+                    self._remember_summary(key, summary)
                     return summary
             except Exception:
                 pass
@@ -193,7 +218,7 @@ class ContextCompressor:
             summary = text
         else:
             summary = text[: self.max_summary_chars] + " …"
-        self._summary_cache[key] = summary
+        self._remember_summary(key, summary)
         return summary
 
     async def compress(

@@ -8,7 +8,8 @@
 
 use std::env;
 use std::io::{self, BufRead, Read, Write};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -334,7 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(spawn_projection_socket)
         .transpose()?;
     #[cfg(not(unix))]
-    let bridge_socket: Option<Receiver<ProjectionFrame>> = None;
+    let bridge_socket: Option<LatestProjection> = None;
     if args.bridge_socket.is_some() && !cfg!(unix) {
         return Err("--bridge-socket is only supported on Unix targets".into());
     }
@@ -354,7 +355,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let pty = tty::new(&pty_options, window_size, 0)?;
     let reader = pty.file().try_clone()?;
-    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(64);
     spawn_pty_reader(reader, output_tx);
     let bridge_rx = if bridge_socket.is_some() {
         bridge_socket
@@ -408,7 +409,7 @@ fn window_size(columns: usize, rows: usize) -> WindowSize {
     }
 }
 
-fn spawn_pty_reader(mut reader: std::fs::File, output_tx: mpsc::Sender<Vec<u8>>) {
+fn spawn_pty_reader(mut reader: std::fs::File, output_tx: SyncSender<Vec<u8>>) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -428,46 +429,61 @@ fn spawn_pty_reader(mut reader: std::fs::File, output_tx: mpsc::Sender<Vec<u8>>)
     });
 }
 
-fn spawn_projection_reader() -> Receiver<ProjectionFrame> {
-    let (tx, rx) = mpsc::channel();
+#[derive(Clone, Default)]
+struct LatestProjection {
+    frame: Arc<Mutex<Option<ProjectionFrame>>>,
+}
+
+impl LatestProjection {
+    fn publish(&self, frame: ProjectionFrame) {
+        if let Ok(mut slot) = self.frame.lock() {
+            *slot = Some(frame);
+        }
+    }
+
+    fn take(&self) -> Option<ProjectionFrame> {
+        self.frame.lock().ok()?.take()
+    }
+}
+
+fn spawn_projection_reader() -> LatestProjection {
+    let latest = LatestProjection::default();
+    let writer = latest.clone();
     thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
             if let Ok(frame) = serde_json::from_str::<ProjectionFrame>(&line) {
-                if tx.send(frame).is_err() {
-                    break;
-                }
+                writer.publish(frame);
             }
         }
     });
-    rx
+    latest
 }
 
 #[cfg(unix)]
-fn spawn_projection_socket(path: &str) -> Result<Receiver<ProjectionFrame>, io::Error> {
+fn spawn_projection_socket(path: &str) -> Result<LatestProjection, io::Error> {
     let listener = UnixListener::bind(path)?;
-    let (tx, rx) = mpsc::channel();
+    let latest = LatestProjection::default();
+    let writer = latest.clone();
     thread::spawn(move || {
         for connection in listener.incoming() {
             let Ok(stream) = connection else { break };
             for line in io::BufReader::new(stream).lines() {
                 let Ok(line) = line else { break };
                 if let Ok(frame) = serde_json::from_str::<ProjectionFrame>(&line) {
-                    if tx.send(frame).is_err() {
-                        return;
-                    }
+                    writer.publish(frame);
                 }
             }
         }
     });
-    Ok(rx)
+    Ok(latest)
 }
 
 fn apply_available(
     core: &mut NativeTerminalCore,
     output_rx: &Receiver<Vec<u8>>,
-    bridge_rx: Option<&Receiver<ProjectionFrame>>,
+    bridge_rx: Option<&LatestProjection>,
     projection: &mut Projection,
 ) -> bool {
     let mut changed = false;
@@ -481,14 +497,9 @@ fn apply_available(
         }
     }
     if let Some(bridge_rx) = bridge_rx {
-        loop {
-            match bridge_rx.try_recv() {
-                Ok(frame) => {
-                    projection.apply(frame);
-                    changed = true;
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        if let Some(frame) = bridge_rx.take() {
+            projection.apply(frame);
+            changed = true;
         }
     }
     changed
@@ -498,7 +509,7 @@ fn run_headless(
     mut core: NativeTerminalCore,
     mut pty: tty::Pty,
     output_rx: Receiver<Vec<u8>>,
-    bridge_rx: Option<Receiver<ProjectionFrame>>,
+    bridge_rx: Option<LatestProjection>,
     mut projection: Projection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(10);

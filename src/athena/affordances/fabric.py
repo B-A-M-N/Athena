@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -44,6 +45,10 @@ class CapabilityFabric:
         self._persistence_tasks: set[asyncio.Task] = set()
         self._persistence_errors: dict[asyncio.Task, BaseException] = {}
         self._optimizer = AffordanceOptimizer()
+        self._availability_cache: dict[tuple[Any, ...], tuple[float, tuple[bool, bool]]] = {}
+
+    def _invalidate_availability(self) -> None:
+        self._availability_cache.clear()
 
     @staticmethod
     def _check(executor: Any) -> None:
@@ -65,6 +70,7 @@ class CapabilityFabric:
             raise ValueError("task overlay requires task_id")
         self._check(executor)
         self._install(self._task.setdefault(task_id, {}), executor)
+        self._invalidate_availability()
         self._record(executor, generated, "task", task_id)
 
     def register_project(self, project_id: str, executor: Any, *, generated=None) -> None:
@@ -81,6 +87,7 @@ class CapabilityFabric:
             )
             return
         self._install(self._project.setdefault(project_id, {}), executor)
+        self._invalidate_availability()
         self._record(executor, generated, "project", project_id)
         self._persist_if_durable(generated, owner=project_id)
 
@@ -98,6 +105,7 @@ class CapabilityFabric:
             )
             return
         self._install(self._user.setdefault(user_id, {}), executor)
+        self._invalidate_availability()
         self._record(executor, generated, "user", user_id)
         self._persist_if_durable(generated, owner=user_id)
 
@@ -392,6 +400,7 @@ class CapabilityFabric:
         return await self._store.list(task_id=task_id)
 
     def unregister_task(self, task_id: str) -> None:
+        self._invalidate_availability()
         self._task.pop(task_id, None)
         for generated_id, record in list(self._records.items()):
             if record.scope.value == "task" and record.task_scope == task_id:
@@ -409,6 +418,7 @@ class CapabilityFabric:
         overlay = self._task.get(task_id)
         if overlay is None or capability_id not in overlay:
             return
+        self._invalidate_availability()
         overlay.pop(capability_id)
         self._history.setdefault(capability_id, []).append(
             {
@@ -430,6 +440,7 @@ class CapabilityFabric:
         scope: str | None = None,
     ) -> bool:
         """Retire one generated overlay while keeping its provenance record."""
+        self._invalidate_availability()
         record = self._records.get(capability_id)
         if record is None or record.scope.value not in {"task", "project", "user"}:
             return False
@@ -569,13 +580,35 @@ class CapabilityFabric:
         reflection and ranking use the same generated-capability evidence
         instead of each inventing its own availability rules.
         """
-        return self._record_availability(
-            self._records.get(capability_id),
+        record = self._records.get(capability_id)
+        key = (
+            capability_id,
+            task_id,
+            project_id,
+            user_id,
+            getattr(workspace, "root", None),
+            str(record.lifecycle_state) if record is not None else "",
+            str(record.validation_state) if record is not None else "",
+            tuple(sorted(record.required_capabilities)) if record is not None else (),
+            tuple(d.key() for d in (record.required_dependencies or ())) if record else (),
+            str(record.dependency_lock.get("environment_fingerprint"))
+            if record is not None
+            else "",
+        )
+        cached = self._availability_cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < 1.0:
+            return cached[1]
+        result = self._record_availability(
+            record,
             task_id=task_id,
             project_id=project_id,
             user_id=user_id,
             workspace=workspace,
         )
+        if len(self._availability_cache) >= 2048:
+            self._availability_cache.clear()
+        self._availability_cache[key] = (time.monotonic(), result)
+        return result
 
     def search(
         self,

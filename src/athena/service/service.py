@@ -3528,6 +3528,20 @@ class AthenaService:
                 except Exception:
                     return []
 
+            def snapshot(_self):
+                files = _self.list_agents_md()
+                revision = tuple(
+                    (
+                        str(path),
+                        int(Path(root, str(path)).stat().st_mtime_ns)
+                        if Path(root, str(path)).exists()
+                        else 0,
+                        len(text),
+                    )
+                    for path, text in files
+                )
+                return revision, files
+
         return _Reader()
 
     def _build_verifier(

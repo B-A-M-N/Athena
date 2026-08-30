@@ -21,7 +21,7 @@ use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
 use athena_terminal::NativeTerminalCore;
 
 use crate::{
-    Projection, ProjectionCodeView, ProjectionEntity, ProjectionFrame, ProjectionOperation,
+    LatestProjection, Projection, ProjectionCodeView, ProjectionEntity, ProjectionOperation,
     ProjectionTreeNode, apply_available,
 };
 
@@ -591,7 +591,7 @@ pub fn run(
     mut core: NativeTerminalCore,
     mut pty: tty::Pty,
     output_rx: Receiver<Vec<u8>>,
-    bridge_rx: Option<Receiver<ProjectionFrame>>,
+    bridge_rx: Option<LatestProjection>,
     mut projection: Projection,
 ) -> Result<(), String> {
     let display = unsafe { XOpenDisplay(ptr::null()) };
@@ -615,7 +615,7 @@ fn run_window(
     core: &mut NativeTerminalCore,
     pty: &mut tty::Pty,
     output_rx: Receiver<Vec<u8>>,
-    bridge_rx: Option<Receiver<ProjectionFrame>>,
+    bridge_rx: Option<LatestProjection>,
     projection: &mut Projection,
 ) -> Result<(), String> {
     let screen = unsafe { XDefaultScreen(display) };
