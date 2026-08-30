@@ -8,12 +8,13 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use std::env;
 use std::ffi::{CString, c_char, c_int, c_long, c_ulong, c_void};
 use std::io::Write;
 use std::ptr;
 use std::sync::mpsc::Receiver;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
@@ -70,6 +71,8 @@ const CURRENT_TIME: c_ulong = 0;
 const PROP_MODE_REPLACE: c_int = 0;
 const CELL_WIDTH: i32 = 9;
 const CELL_HEIGHT: i32 = 18;
+const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(40);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[repr(C)]
 struct XVisualInfo {
@@ -716,8 +719,23 @@ fn run_window(
     let mut running = true;
     let mut child_exited = false;
     let mut dirty = true;
+    let mut activity_dirty = false;
+    let mut initial_redraws = 0_u64;
+    let mut event_redraws = 0_u64;
+    let mut idle_redraws = 0_u64;
+    let mut redraws = 0_u64;
+    let render_started = Instant::now();
+    let cpu_started = process_cpu_seconds();
+    let mut last_draw: Option<Instant> = None;
+    let mut steady_started: Option<Instant> = None;
+    let mut steady_cpu_started: Option<f64> = None;
+    let mut steady_elapsed_seconds = 0.0_f64;
+    let mut steady_cpu_seconds = 0.0_f64;
     while running {
-        dirty |= apply_available(core, &output_rx, bridge_rx.as_ref(), projection);
+        if apply_available(core, &output_rx, bridge_rx.as_ref(), projection) {
+            dirty = true;
+            activity_dirty = true;
+        }
         while unsafe { XPending(display) } > 0 {
             let mut event = XEvent {
                 type_: 0,
@@ -769,6 +787,7 @@ fn run_window(
                         let _ = writer.write_all(bytes);
                         let _ = writer.flush();
                         dirty = true;
+                        activity_dirty = true;
                     }
                 }
                 BUTTON_PRESS => {
@@ -779,6 +798,7 @@ fn run_window(
                         {
                             selection = Some((cell, cell));
                             dirty = true;
+                            activity_dirty = true;
                         }
                     }
                 }
@@ -791,6 +811,7 @@ fn run_window(
                         ) {
                             selection = Some((anchor, cell));
                             dirty = true;
+                            activity_dirty = true;
                         }
                     }
                 }
@@ -803,6 +824,7 @@ fn run_window(
                         ) {
                             selection = Some((anchor, cell));
                             dirty = true;
+                            activity_dirty = true;
                         }
                     }
                 }
@@ -813,8 +835,12 @@ fn run_window(
                     height = configure.height.max(1);
                     resize_terminal(core, pty, width, height);
                     dirty = true;
+                    activity_dirty = true;
                 }
-                EXPOSE => dirty = true,
+                EXPOSE => {
+                    dirty = true;
+                    activity_dirty = true;
+                }
                 DESTROY_NOTIFY | CLIENT_MESSAGE => running = false,
                 _ => {}
             }
@@ -822,12 +848,49 @@ fn run_window(
         if matches!(pty.next_child_event(), Some(ChildEvent::Exited(_))) {
             child_exited = true;
             dirty = true;
+            activity_dirty = true;
         }
-        if dirty {
+        if activity_dirty {
+            finish_steady_interval(
+                &mut steady_started,
+                &mut steady_cpu_started,
+                &mut steady_elapsed_seconds,
+                &mut steady_cpu_seconds,
+            );
+        }
+        let now = Instant::now();
+        let draw_ready = last_draw
+            .map(|last| now.duration_since(last) >= ACTIVE_FRAME_INTERVAL)
+            .unwrap_or(true);
+        if dirty && draw_ready {
             draw_frame(
                 display, window, gc, width, height, core, projection, selection,
             );
+            redraws += 1;
+            if last_draw.is_none() {
+                initial_redraws += 1;
+            } else if activity_dirty {
+                event_redraws += 1;
+            } else {
+                idle_redraws += 1;
+            }
+            last_draw = Some(now);
             dirty = false;
+            activity_dirty = false;
+        }
+        if !dirty && !child_exited && steady_started.is_none() {
+            steady_started = Some(Instant::now());
+            steady_cpu_started = process_cpu_seconds();
+        }
+        if child_exited && dirty {
+            if let Some(last) = last_draw {
+                let remaining =
+                    ACTIVE_FRAME_INTERVAL.saturating_sub(Instant::now().duration_since(last));
+                if !remaining.is_zero() {
+                    thread::sleep(remaining);
+                    continue;
+                }
+            }
         }
         if child_exited {
             // Keep one final frame visible long enough for a caller or bridge
@@ -835,9 +898,37 @@ fn run_window(
             thread::sleep(Duration::from_millis(80));
             running = false;
         } else {
-            thread::sleep(Duration::from_millis(16));
+            let sleep_for = if dirty {
+                last_draw
+                    .map(|last| {
+                        ACTIVE_FRAME_INTERVAL
+                            .saturating_sub(Instant::now().duration_since(last))
+                            .min(IDLE_POLL_INTERVAL)
+                    })
+                    .unwrap_or(IDLE_POLL_INTERVAL)
+            } else {
+                IDLE_POLL_INTERVAL
+            };
+            thread::sleep(sleep_for);
         }
     }
+
+    finish_steady_interval(
+        &mut steady_started,
+        &mut steady_cpu_started,
+        &mut steady_elapsed_seconds,
+        &mut steady_cpu_seconds,
+    );
+    write_render_stats(
+        render_started,
+        cpu_started,
+        steady_elapsed_seconds,
+        steady_cpu_seconds,
+        redraws,
+        initial_redraws,
+        event_redraws,
+        idle_redraws,
+    );
 
     unsafe {
         XFreeGC(display, gc);
@@ -846,6 +937,65 @@ fn run_window(
         XDestroyWindow(display, window);
     }
     Ok(())
+}
+
+fn process_cpu_seconds() -> Option<f64> {
+    let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return None;
+    }
+    Some(
+        usage.ru_utime.tv_sec as f64
+            + usage.ru_utime.tv_usec as f64 / 1_000_000.0
+            + usage.ru_stime.tv_sec as f64
+            + usage.ru_stime.tv_usec as f64 / 1_000_000.0,
+    )
+}
+
+fn write_render_stats(
+    started: Instant,
+    cpu_started: Option<f64>,
+    steady_elapsed_seconds: f64,
+    steady_cpu_seconds: f64,
+    redraws: u64,
+    initial_redraws: u64,
+    event_redraws: u64,
+    idle_redraws: u64,
+) {
+    let Ok(path) = env::var("ATHENA_NATIVE_RENDER_STATS") else {
+        return;
+    };
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    let cpu_seconds = process_cpu_seconds()
+        .zip(cpu_started)
+        .map(|(end, start)| end - start);
+    let value = serde_json::json!({
+        "elapsed_seconds": elapsed_seconds,
+        "redraws": redraws,
+        "initial_redraws": initial_redraws,
+        "event_redraws": event_redraws,
+        "idle_redraws": idle_redraws,
+        "cpu_seconds": cpu_seconds,
+        "steady_elapsed_seconds": steady_elapsed_seconds,
+        "steady_cpu_seconds": steady_cpu_seconds,
+    });
+    let _ = std::fs::write(path, value.to_string());
+}
+
+fn finish_steady_interval(
+    started: &mut Option<Instant>,
+    cpu_started: &mut Option<f64>,
+    elapsed_seconds: &mut f64,
+    cpu_seconds: &mut f64,
+) {
+    let Some(start) = started.take() else {
+        cpu_started.take();
+        return;
+    };
+    *elapsed_seconds += start.elapsed().as_secs_f64();
+    if let (Some(start_cpu), Some(end_cpu)) = (cpu_started.take(), process_cpu_seconds()) {
+        *cpu_seconds += end_cpu - start_cpu;
+    }
 }
 
 fn resize_terminal(core: &mut NativeTerminalCore, pty: &mut tty::Pty, width: i32, height: i32) {

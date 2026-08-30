@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
 import statistics
+import subprocess
+import tempfile
 import time
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,13 +33,134 @@ def _percentile(values: list[float], percentile: float) -> float:
     return statistics.quantiles(values, n=100, method="inclusive")[int(percentile) - 1]
 
 
+def _xvfb_run() -> str:
+    executable = shutil.which("xvfb-run")
+    if executable is None:
+        raise RuntimeError("xvfb-run is required for native rendering measurements")
+    return executable
+
+
+def _native_binary() -> Path:
+    binary = REPO_ROOT / "native" / "target" / "debug" / "athena-terminal"
+    command = [
+        "cargo",
+        "build",
+        "--manifest-path",
+        "native/Cargo.toml",
+        "--locked",
+        "--offline",
+        "--bin",
+        "athena-terminal",
+    ]
+    result = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"native rendering build failed:\n{result.stdout}")
+    if not binary.exists():
+        raise RuntimeError(f"native rendering build did not produce {binary}")
+    return binary
+
+
+def _run_native_render(
+    binary: Path, xvfb_run: str, command: str, stats_path: Path
+) -> dict[str, object]:
+    environment = dict(os.environ)
+    environment["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    environment["ATHENA_NATIVE_RENDER_STATS"] = str(stats_path)
+    started = time.perf_counter()
+    process = subprocess.Popen(
+        [
+            xvfb_run,
+            "-a",
+            "-s",
+            "-screen 0 1024x768x24 -nolisten tcp",
+            str(binary),
+            "--command",
+            command,
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=10.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate()
+        raise RuntimeError(f"native rendering probe timed out:\n{output}")
+    if process.returncode != 0:
+        raise RuntimeError(f"native rendering probe failed:\n{output}")
+    try:
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"native rendering probe produced no valid stats: {error}") from error
+    elapsed = float(stats.get("elapsed_seconds") or (time.perf_counter() - started))
+    cpu_seconds = stats.get("cpu_seconds")
+    stats["wall_seconds"] = round(time.perf_counter() - started, 6)
+    stats["redraws_per_second"] = round(float(stats.get("redraws") or 0) / max(elapsed, 1e-9), 3)
+    stats["cpu_percent"] = (
+        round(float(cpu_seconds) / max(elapsed, 1e-9) * 100.0, 3)
+        if cpu_seconds is not None
+        else None
+    )
+    steady_elapsed = float(stats.get("steady_elapsed_seconds") or elapsed)
+    steady_cpu_seconds = stats.get("steady_cpu_seconds")
+    stats["steady_cpu_percent"] = (
+        round(float(steady_cpu_seconds) / max(steady_elapsed, 1e-9) * 100.0, 3)
+        if steady_cpu_seconds is not None
+        else None
+    )
+    stats["idle_redraws_per_second"] = round(
+        float(stats.get("idle_redraws") or 0) / max(steady_elapsed, 1e-9), 3
+    )
+    return stats
+
+
+def _native_render_metrics(*, required: bool) -> dict[str, object]:
+    if os.name != "posix" or shutil.which("xvfb-run") is None:
+        if required:
+            raise RuntimeError("native rendering gate requires a POSIX host with xvfb-run")
+        return {"available": False, "reason": "POSIX/xvfb-run unavailable"}
+    try:
+        binary = _native_binary()
+        xvfb_run = _xvfb_run()
+    except RuntimeError:
+        if required:
+            raise
+        return {"available": False, "reason": "native probe unavailable"}
+    with tempfile.TemporaryDirectory(prefix="athena-render-stats-") as directory:
+        directory_path = Path(directory)
+        idle = _run_native_render(binary, xvfb_run, "sleep 1", directory_path / "idle.json")
+        active = _run_native_render(
+            binary,
+            xvfb_run,
+            "for i in $(seq 1 80); do printf 'tick %s\\n' \"$i\"; sleep 0.01; done; sleep 0.5",
+            directory_path / "active.json",
+        )
+    return {"available": True, "binary": str(binary), "idle": idle, "active": active}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frames", type=int, default=300)
     parser.add_argument("--min-frames-per-second", type=float, default=100.0)
-    parser.add_argument("--max-scene-p95-ms", type=float, default=25.0)
-    parser.add_argument("--max-serialization-p95-ms", type=float, default=10.0)
+    parser.add_argument("--max-scene-p95-ms", type=float, default=2.0)
+    parser.add_argument("--max-native-projection-p95-ms", type=float, default=5.0)
+    parser.add_argument("--max-serialization-p95-ms", type=float, default=5.0)
     parser.add_argument("--max-motion-p95-ms", type=float, default=250.0)
+    parser.add_argument("--max-idle-redraws-per-second", type=float, default=0.1)
+    parser.add_argument("--max-idle-cpu-percent", type=float, default=2.0)
+    parser.add_argument("--max-active-fps", type=float, default=25.0)
+    parser.add_argument("--max-cache-bytes", type=int, default=16 * 1024 * 1024)
+    parser.add_argument("--require-native", action="store_true")
     args = parser.parse_args()
     if args.frames < 1 or args.frames > 10_000:
         parser.error("--frames must be between 1 and 10000")
@@ -112,6 +237,7 @@ def main() -> int:
             "overlay_bytes": round(statistics.mean(overlay_bytes)),
             "cache_bytes": framebuffer._base_frame_bytes + framebuffer._base_png_bytes,
         }
+    native = _native_render_metrics(required=args.require_native)
     result = {
         "frames": args.frames,
         "elapsed_seconds": round(elapsed, 6),
@@ -125,6 +251,7 @@ def main() -> int:
         if "glass_scene" in locals()
         else len(native_scene.entities),
         "glass": glass,
+        "native": native,
     }
     print(json.dumps(result, sort_keys=True))
     if rate < args.min_frames_per_second:
@@ -149,6 +276,14 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if _percentile(native_times, 95) > args.max_native_projection_p95_ms:
+        print(
+            f"bench-rendering: native projection p95 "
+            f"{_percentile(native_times, 95):.2f}ms exceeds "
+            f"{args.max_native_projection_p95_ms:.2f}ms",
+            file=sys.stderr,
+        )
+        return 1
     if glass.get("available") and float(glass["motion_encode_p95_ms"]) > args.max_motion_p95_ms:
         print(
             f"bench-rendering: motion encode p95 {glass['motion_encode_p95_ms']:.2f}ms exceeds "
@@ -156,6 +291,40 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if glass.get("available") and int(glass["cache_bytes"]) > args.max_cache_bytes:
+        print(
+            f"bench-rendering: framebuffer cache {glass['cache_bytes']} bytes exceeds "
+            f"{args.max_cache_bytes} bytes",
+            file=sys.stderr,
+        )
+        return 1
+    if native.get("available"):
+        idle = native["idle"]
+        active = native["active"]
+        if float(idle["idle_redraws_per_second"]) > args.max_idle_redraws_per_second:
+            print(
+                f"bench-rendering: idle redraw rate {idle['idle_redraws_per_second']:.2f}/s exceeds "
+                f"{args.max_idle_redraws_per_second:.2f}/s",
+                file=sys.stderr,
+            )
+            return 1
+        if (
+            idle.get("steady_cpu_percent") is not None
+            and float(idle["steady_cpu_percent"]) > args.max_idle_cpu_percent
+        ):
+            print(
+                f"bench-rendering: idle native CPU {idle['steady_cpu_percent']:.2f}% exceeds "
+                f"{args.max_idle_cpu_percent:.2f}%",
+                file=sys.stderr,
+            )
+            return 1
+        if float(active["redraws_per_second"]) > args.max_active_fps:
+            print(
+                f"bench-rendering: active native redraw rate "
+                f"{active['redraws_per_second']:.2f}/s exceeds {args.max_active_fps:.2f}/s",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 
