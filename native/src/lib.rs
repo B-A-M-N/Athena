@@ -9,6 +9,7 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::Config as TerminalConfig;
+use alacritty_terminal::term::RenderableContent;
 use alacritty_terminal::{Term, vte};
 
 /// Dimensions passed to the upstream terminal core.
@@ -134,6 +135,15 @@ impl NativeTerminalCore {
 
     pub fn term(&self) -> &Term<VoidListener> {
         &self.term
+    }
+
+    /// Return Alacritty's renderer-facing view of the terminal.
+    ///
+    /// The native compositor must consume this instead of flattening the
+    /// grid to strings: it carries cell attributes, cursor shape, selection,
+    /// scroll offset, and terminal modes together.
+    pub fn renderable_content(&self) -> RenderableContent<'_> {
+        self.term.renderable_content()
     }
 }
 

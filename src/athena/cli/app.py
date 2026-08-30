@@ -1132,10 +1132,46 @@ def _click_cli(click: Any):
         sys.exit(dispatch(o))
 
     @cli.command("native")
+    @click.option("--config", "native_config_path", default=None, help="Path to config file.")
+    @click.option("--db", "native_db_path", default=None, help="Path to persistence DB.")
+    @click.option("--workspace", "native_workspace", default=None, help="Workspace root directory.")
+    @click.option("--autonomy", "native_autonomy", default=None, help="Autonomy profile.")
+    @click.option("--model", "native_model", default=None, help="Model policy.")
+    @click.option("--mascot", "native_mascot", default=None, help="Mascot/buddy character.")
+    @click.option("--criteria", "native_criteria", default=None, help="Acceptance criteria.")
+    @click.option("--no-animations", "native_no_animations", is_flag=True)
+    @click.option("--reduced-motion", "native_reduced_motion", is_flag=True)
+    @click.option("--verbose", "native_verbose", is_flag=True)
     @click.pass_context
-    def native(ctx):
+    def native(
+        ctx,
+        native_config_path,
+        native_db_path,
+        native_workspace,
+        native_autonomy,
+        native_model,
+        native_mascot,
+        native_criteria,
+        native_no_animations,
+        native_reduced_motion,
+        native_verbose,
+    ):
         """Launch the development native Athena terminal frontend."""
-        sys.exit(dispatch(base_options(ctx, "native")))
+        o = base_options(ctx, "native")
+        o.config_path = native_config_path or o.config_path
+        o.db_path = native_db_path or o.db_path
+        o.workspace = native_workspace or o.workspace
+        o.autonomy = native_autonomy or o.autonomy
+        o.model = native_model or o.model
+        o.mascot = native_mascot or o.mascot
+        o.criteria = native_criteria or o.criteria
+        if native_no_animations:
+            o.animations = False
+        if native_reduced_motion:
+            o.reduced_motion = True
+        if native_verbose:
+            o.verbose = True
+        sys.exit(dispatch(o))
 
     return cli
 

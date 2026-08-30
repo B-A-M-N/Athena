@@ -42,6 +42,12 @@ def worker_command(options: Any) -> list[str]:
             command.extend((flag, str(value)))
     if getattr(options, "verbose", False):
         command.append("--verbose")
+    if getattr(options, "mascot", None):
+        command.extend(("--mascot", str(options.mascot)))
+    if getattr(options, "animations", True) is False:
+        command.append("--no-animations")
+    if getattr(options, "reduced_motion", False):
+        command.append("--reduced-motion")
     return command
 
 
@@ -66,6 +72,12 @@ def launch(options: Any) -> int:
             "--command",
             shlex.join(worker_command(options)),
         ]
+        if getattr(options, "mascot", None):
+            argv.extend(("--mascot", str(options.mascot)))
+        if getattr(options, "animations", True) is False:
+            argv.append("--no-animations")
+        if getattr(options, "reduced_motion", False):
+            argv.append("--reduced-motion")
         env = os.environ.copy()
         repository_src = str(Path(__file__).resolve().parents[2])
         env["PYTHONPATH"] = repository_src + (

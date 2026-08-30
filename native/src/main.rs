@@ -272,12 +272,17 @@ struct Args {
     command: Option<String>,
     columns: usize,
     rows: usize,
+    mascot: String,
+    animations: bool,
+    reduced_motion: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         columns: 100,
         rows: 32,
+        mascot: "owl".to_owned(),
+        animations: true,
         ..Args::default()
     };
     let mut values = env::args().skip(1);
@@ -305,9 +310,14 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--rows must be an integer")?;
             }
+            "--mascot" => {
+                args.mascot = values.next().ok_or("--mascot needs a value")?;
+            }
+            "--no-animations" => args.animations = false,
+            "--reduced-motion" => args.reduced_motion = true,
             "--help" | "-h" => {
                 println!(
-                    "athena-terminal [--headless] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE]"
+                    "athena-terminal [--headless] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot NAME] [--no-animations] [--reduced-motion]"
                 );
                 println!("  --headless       run the PTY/core slice without opening a window");
                 println!("  --bridge-stdin   read JSON projection frames from stdin");
@@ -383,7 +393,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         #[cfg(unix)]
         {
-            x11::run(core, pty, output_rx, bridge_rx, projection).map_err(|error| error.into())
+            x11::run(
+                core,
+                pty,
+                output_rx,
+                bridge_rx,
+                projection,
+                x11::RendererOptions {
+                    mascot: args.mascot,
+                    animations: args.animations,
+                    reduced_motion: args.reduced_motion,
+                },
+            )
+            .map_err(|error| error.into())
         }
 
         #[cfg(not(unix))]

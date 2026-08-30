@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import os
 import sys
-import time
 from io import StringIO
 from typing import Any
 
@@ -40,8 +39,7 @@ class NativeSession:
         self._projection_lock = asyncio.Lock()
         self._projection_dirty = False
         self._projection_force = False
-        self._last_projection = 0.0
-        self._projection_interval = 1.0 / 25.0
+        self._projection_interval = 0.05
 
     async def start(self) -> None:
         socket_path = os.environ.get("ATHENA_NATIVE_BRIDGE_SOCKET")
@@ -58,7 +56,6 @@ class NativeSession:
         events.subscribe(self._on_event)
         self._projection_dirty = True
         await self._flush_projection(force=True)
-        self._projection_task = asyncio.create_task(self._projection_loop())
 
     async def close(self) -> None:
         for task in tuple(self._tasks):
@@ -92,24 +89,19 @@ class NativeSession:
     async def _on_event(self, event: Any) -> None:
         self.projection.reduce(event.type, event.payload, task_id=event.task_id)
         self._projection_dirty = True
+        if self._projection_task is None or self._projection_task.done():
+            self._projection_task = asyncio.create_task(self._debounced_projection())
         if event.type in _FORCE_PROJECTION_EVENTS:
             self._projection_force = True
             await self._flush_projection(force=True)
 
-    async def _projection_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self._projection_interval)
-            await self._flush_projection()
+    async def _debounced_projection(self) -> None:
+        """Coalesce event bursts; idle sessions send no bridge traffic."""
+        await asyncio.sleep(self._projection_interval)
+        await self._flush_projection()
 
     async def _flush_projection(self, *, force: bool = False) -> None:
         if not self._projection_dirty:
-            return
-        now = time.monotonic()
-        if (
-            not force
-            and not self._projection_force
-            and now - self._last_projection < self._projection_interval
-        ):
             return
         async with self._projection_lock:
             if not self._projection_dirty:
@@ -117,13 +109,16 @@ class NativeSession:
             self._projection_dirty = False
             self._projection_force = False
             await self._send_projection()
-            self._last_projection = time.monotonic()
 
     async def _send_projection(self) -> None:
         if self._writer is None:
             return
         output = StringIO()
-        write_native_projection(output, self.projection, width=72, height=24)
+        write_native_projection(
+            output,
+            self.projection,
+            character=self.options.mascot or "owl",
+        )
         self._writer.write(output.getvalue().encode("utf-8"))
         await self._writer.drain()
 
@@ -210,6 +205,9 @@ def parse_args(argv: list[str] | None = None) -> Options:
     parser.add_argument("--autonomy")
     parser.add_argument("--model")
     parser.add_argument("--criteria")
+    parser.add_argument("--mascot")
+    parser.add_argument("--no-animations", action="store_true")
+    parser.add_argument("--reduced-motion", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     return Options(
@@ -220,6 +218,9 @@ def parse_args(argv: list[str] | None = None) -> Options:
         autonomy=args.autonomy,
         model=args.model,
         criteria=args.criteria,
+        mascot=args.mascot,
+        animations=False if args.no_animations else None,
+        reduced_motion=args.reduced_motion,
         verbose=args.verbose,
     )
 

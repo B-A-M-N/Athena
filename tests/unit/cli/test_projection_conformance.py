@@ -530,6 +530,7 @@ def test_write_native_projection_outputs_valid_json_with_owl():
 
     frame = json.loads(output)
     assert frame["buddy"]["character"] == "owl"
+    assert "layout" not in frame
 
 
 def test_runtime_tree_keeps_task_operation_and_execution_hierarchy():

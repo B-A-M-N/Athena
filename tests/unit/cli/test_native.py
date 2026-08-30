@@ -20,6 +20,9 @@ def test_native_worker_command_forwards_scope_without_credentials():
         model="openrouter/free",
         criteria="command:pytest -q;report exists",
         verbose=True,
+        mascot="owl",
+        animations=False,
+        reduced_motion=True,
     )
 
     command = worker_command(options)
@@ -28,6 +31,7 @@ def test_native_worker_command_forwards_scope_without_credentials():
     assert "--workspace" in command
     assert "--model" in command
     assert "OPENROUTER_API_KEY" not in command
+    assert command[-5:] == ["--verbose", "--mascot", "owl", "--no-animations", "--reduced-motion"]
 
 
 def test_native_session_parser_matches_worker_contract():
@@ -49,3 +53,11 @@ def test_native_session_parser_matches_worker_contract():
     assert options.workspace == "/tmp/project"
     assert options.autonomy == "coding"
     assert options.criteria == "tests pass"
+
+
+def test_native_session_parser_accepts_presentation_controls():
+    options = parse_args(["--mascot", "cat", "--no-animations", "--reduced-motion"])
+
+    assert options.mascot == "cat"
+    assert options.animations is False
+    assert options.reduced_motion is True

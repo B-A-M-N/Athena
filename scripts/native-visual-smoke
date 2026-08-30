@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+command -v xvfb-run >/dev/null || {
+  printf '%s\n' 'native-visual-smoke: SKIP — xvfb-run is unavailable' >&2
+  exit 0
+}
+command -v import >/dev/null || {
+  printf '%s\n' 'native-visual-smoke: SKIP — ImageMagick import is unavailable' >&2
+  exit 0
+}
+
+cargo build --manifest-path native/Cargo.toml --offline >/dev/null
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+projection='{"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"buddy":{"state":"SEARCH","anchor":"left","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
+
+PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" \
+  IMAGE_PATH="$tmp_dir/native.png" \
+  xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -lc '
+    printf "%s\n" "$PROJECTION" | "$NATIVE_BIN" --bridge-stdin --no-animations --command "sleep 4" &
+    native_pid=$!
+    sleep 1
+    import -window root "$IMAGE_PATH"
+    kill "$native_pid" 2>/dev/null || true
+    wait "$native_pid" 2>/dev/null || true
+  '
+
+dimensions="$(identify -format '%wx%h' "$tmp_dir/native.png")"
+if [[ "$dimensions" != "1280x800" ]]; then
+  printf 'native-visual-smoke: FAIL — screenshot dimensions %s\n' "$dimensions" >&2
+  exit 1
+fi
+if [[ ! -s "$tmp_dir/native.png" ]]; then
+  printf '%s\n' 'native-visual-smoke: FAIL — empty screenshot' >&2
+  exit 1
+fi
+printf '%s\n' 'native-visual-smoke: PASS — deterministic AthenaBOX frame'

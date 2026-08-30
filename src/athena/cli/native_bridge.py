@@ -70,14 +70,19 @@ def _tree_payload(nodes: tuple[TreeNode, ...]) -> list[dict[str, Any]]:
 def native_projection_frame(
     state: ProjectionState,
     *,
-    width: int = 72,
-    height: int = 24,
+    width: int | None = None,
+    height: int | None = None,
     character: str = "owl",
 ) -> dict[str, Any]:
     """Build one native-terminal frame from canonical projection state."""
-    width = max(int(width), 1)
-    height = max(int(height), 1)
-    scene = build_oi_scene(state, Rect(0, 0, width, height), character=character)
+    has_viewport = width is not None and height is not None
+    viewport_width = max(int(width), 1) if width is not None else 1
+    viewport_height = max(int(height), 1) if height is not None else 1
+    scene = build_oi_scene(
+        state,
+        Rect(0, 0, viewport_width, viewport_height),
+        character=character,
+    )
     entities: list[dict[str, Any]] = []
     for entity in scene.entities:
         parent_id = entity.metadata.get("parent_id")
@@ -96,13 +101,17 @@ def native_projection_frame(
     runtime_entities = [
         entity for entity in entities if entity["kind"] not in {"resource", "research", "artifact"}
     ]
-    lines = render_scene_lines(
-        state,
-        scene,
-        width=width,
-        height=height,
-        recent=state.recent,
-        buddy_enabled=False,
+    lines = (
+        render_scene_lines(
+            state,
+            scene,
+            width=viewport_width,
+            height=viewport_height,
+            recent=state.recent,
+            buddy_enabled=False,
+        )
+        if has_viewport
+        else []
     )
     active = state.operations.get(state.active_operation_id or "")
     if active is None and state.last_operation_id:
@@ -137,7 +146,7 @@ def native_projection_frame(
             "mutation_state": sanitize_terminal_text(code_view.mutation_state),
             "preview_truncated": code_view.preview_truncated,
         }
-    return {
+    frame = {
         "schema_version": 2,
         "title": "ATHENA OI // GLASS COMPUTE",
         "status": sanitize_terminal_text(state.status),
@@ -174,7 +183,14 @@ def native_projection_frame(
             "history_label": "OI // HISTORY",
             "live_label": "OI // LIVE",
         },
-        "layout": {
+        "workspace_entities": workspace_entities,
+        "runtime_entities": runtime_entities,
+        "oi": [sanitize_terminal_text(line) for line in lines],
+        "entities": entities,
+        "alerts": [sanitize_terminal_text(alert) for alert in scene.alerts[-4:]],
+    }
+    if has_viewport:
+        frame["layout"] = {
             "viewport": {
                 "x": scene.viewport.x,
                 "y": scene.viewport.y,
@@ -182,29 +198,26 @@ def native_projection_frame(
                 "height": scene.viewport.height,
             },
             "chrome": {
-                "pane_gap": 3,
-                "header_rows": 2,
-                "aperture_rim": 1,
-                "rail_rows": 4,
-                "prompt_rows": 2,
+                "note": "native frontend owns physical placement",
             },
-        },
-        "workspace_entities": workspace_entities,
-        "runtime_entities": runtime_entities,
-        "oi": [sanitize_terminal_text(line) for line in lines],
-        "entities": entities,
-        "alerts": [sanitize_terminal_text(alert) for alert in scene.alerts[-4:]],
-    }
+        }
+    return frame
 
 
 def write_native_projection(
     output: TextIO,
     state: ProjectionState,
     *,
-    width: int = 72,
-    height: int = 24,
+    width: int | None = None,
+    height: int | None = None,
+    character: str = "owl",
 ) -> None:
     """Write and flush one bridge frame for the native frontend."""
-    frame = native_projection_frame(state, width=width, height=height)
+    frame = native_projection_frame(
+        state,
+        width=width,
+        height=height,
+        character=character,
+    )
     output.write(json.dumps(frame, sort_keys=True, ensure_ascii=False) + "\n")
     output.flush()

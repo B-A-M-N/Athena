@@ -538,7 +538,7 @@ and documentation are not by themselves evidence that a subsystem is complete.
 
 ## Operator surface
 
-`athena chat` and `athena run` use a calm operator surface over Athena's
+`athena chat` and `athena run` use a calm host-terminal operator surface over Athena's
 durable task events. The two apertures are equal in logical size: the left is
 the readable `YOU`/`ATHENA` conversation well, and the right is the OI scene
 viewport. The buddy is an entity inside that viewport, never a permanent
@@ -555,7 +555,7 @@ is unavailable. ANSI is the safe default/fallback and keeps the same scene
 semantics in cell text. The native Athena terminal development slice is documented in
 [`docs/NATIVE_TERMINAL_FRONTEND.md`](docs/NATIVE_TERMINAL_FRONTEND.md); it is
 separate from the Python package and is not yet the default shipped frontend.
-`athena native` launches that frontend with a Python service session inside
+`athena native` launches the native AthenaBOX frontend with a Python service session inside
 its PTY and a Unix-socket projection bridge; build the native binary first with
 `cargo build --manifest-path native/Cargo.toml --offline`.
 Noisy deltas are coalesced, animation is presentation-only, and reduced motion

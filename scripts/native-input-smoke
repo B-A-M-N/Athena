@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+command -v xvfb-run >/dev/null || {
+  printf '%s\n' 'native-input-smoke: SKIP — xvfb-run is unavailable' >&2
+  exit 0
+}
+command -v xdotool >/dev/null || {
+  printf '%s\n' 'native-input-smoke: SKIP — xdotool is unavailable' >&2
+  exit 0
+}
+
+cargo build --manifest-path native/Cargo.toml --offline >/dev/null
+xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -lc '
+    set -euo pipefail
+    native_bin="$1"
+    "$native_bin" --command "read line" >/dev/null 2>&1 &
+    native_pid=$!
+    window=""
+    for _ in $(seq 1 30); do
+      window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
+      [[ -n "$window" ]] && break
+      sleep 0.1
+    done
+    [[ -n "$window" ]]
+    xdotool windowfocus --sync "$window"
+    # Escape is a terminal byte, not a close command. Backspace and Unicode
+    # are then sent through the same focused PTY input path.
+    xdotool key --window "$window" Escape
+    sleep 0.1
+    xdotool type --window "$window" --clearmodifiers "hellp"
+    xdotool key --window "$window" BackSpace
+    xdotool type --window "$window" --clearmodifiers "o"
+    xdotool type --window "$window" --clearmodifiers " — unicode"
+    xdotool key --window "$window" Return
+    wait "$native_pid"
+    printf "%s\\n" "native-input-smoke: PASS — focus, Escape, text, Backspace, Unicode, Enter"
+  ' -- "$repo_root/native/target/debug/athena-terminal"
