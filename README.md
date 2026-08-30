@@ -134,11 +134,11 @@ Athena treats pricing as `known free`, `known paid`, or `unknown`; unknown
 cost is shown as `cost=unknown` and cannot pass a hard monetary-budget
 admission check.
 
-Hosted OpenAI-compatible providers, including FreeInference, emit Athena's
-stable `prompt_cache_key` by default so repeated stable prefixes can use the
-provider's prompt cache. Known local presets (`ollama`, `lmstudio`, `vllm`, and
-`llamacpp`) remain opt-out because they do not promise that extension. For a
-custom OpenAI-compatible server that rejects the field, disable it explicitly:
+Hosted OpenAI-compatible providers emit Athena's stable `prompt_cache_key` by
+default so repeated stable prefixes can use the provider's prompt cache.
+Known local presets (`ollama`, `lmstudio`, `vllm`, and `llamacpp`) remain opt-out
+because they do not promise that extension. For a custom OpenAI-compatible
+server that rejects the field, disable it explicitly:
 
 ```toml
 [[providers]]
@@ -148,6 +148,13 @@ base_url = "https://api.example.test/v1"
 model = "example/model"
 cache_mode = "none"
 ```
+
+Cache routing is shared across sessions inside the configured cache namespace
+and includes the model, provider profile, and rendered stable-prefix identity.
+Set `cache_namespace` to a distinct authenticated user or tenant value when a
+service process serves more than one principal; the value is hashed before it
+reaches a provider. Task- or session-specific context stays outside the shared
+stable prefix.
 
 ### Hermes Agent self-host referee
 

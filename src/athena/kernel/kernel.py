@@ -402,7 +402,7 @@ class AgentKernel:
         self._resume: dict[str, asyncio.Event] = {}
         self._resume_decision: dict[str, str] = {}
         self._stored_responses: set[str] = set()
-        self._prefix_trackers: dict[tuple[str, str], Any] = {}
+        self._prefix_trackers: dict[tuple[str, str, str], Any] = {}
 
     def set_budget_tracker(self, budgets) -> None:
         # Late-bind the budget authority (construction-order tolerant, §19).
@@ -1102,6 +1102,7 @@ class AgentKernel:
         try:
             from athena.protocol.messages import Role, TextBlock
             from athena.protocol.tasks import ModelPolicy
+            from athena.models.compat.caching import build_cache_key, cache_fingerprint
 
             selection = await self._router.select(
                 policy=ModelPolicy(role=role, require_tools=False)
@@ -1113,6 +1114,38 @@ class AgentKernel:
                     "role": role,
                     "purpose": attempt_metadata.get("purpose", "utility_inference"),
                     "state": "started",
+                }
+            )
+            inference_metadata = self._inference_metadata(selection)
+            namespace = (
+                str(
+                    attempt_metadata.get("cache_namespace")
+                    or getattr(self._compiler, "principal_id", "athena")
+                ).strip()
+                or "athena"
+            )
+            stable_payload = (
+                [{"role": "system", "block_types": ["text"], "content": system_prompt}]
+                if system_prompt
+                else []
+            )
+            attempt_metadata.update(
+                {
+                    **inference_metadata,
+                    "cache_namespace": namespace,
+                    "cache_session_key": build_cache_key(
+                        namespace=namespace,
+                        provider=selection.provider,
+                        model=selection.model,
+                        profile_fingerprint=str(
+                            inference_metadata.get(
+                                "provider_profile_fingerprint",
+                                inference_metadata.get("provider_profile_id", selection.provider),
+                            )
+                        ),
+                        prefix_fingerprint=cache_fingerprint(stable_payload),
+                    ),
+                    "cache_prefix_message_count": len(stable_payload),
                 }
             )
             usage_id = await self._provider_usage_store.record_attempt(
@@ -1153,6 +1186,7 @@ class AgentKernel:
                 model=selection.model,
                 provider=selection.provider,
                 request_id=new_id("sum"),
+                metadata=attempt_metadata,
             )
             token_estimator = ModelTokenEstimator.from_profile(
                 self._registry.model_profile_for(selection.provider, selection.model)
@@ -1405,14 +1439,27 @@ class AgentKernel:
     async def _observe_prefix(
         self, task: TaskSpec, compiled: CompiledContext, selection: ModelSelection
     ) -> dict[str, Any]:
-        """Observe the stable prompt prefix for this session/provider pair."""
-        from athena.models.compat.caching import PrefixTracker, PromptEnvelope
+        """Observe the rendered prefix and derive its cache partition key."""
+        from athena.models.compat.caching import (
+            PrefixTracker,
+            PromptEnvelope,
+            build_cache_key,
+            cache_message_payload,
+        )
 
         session_key = task.session_id or task.id
+        task_metadata = dict(task.metadata or {})
+        namespace = (
+            str(
+                task_metadata.get("cache_namespace")
+                or getattr(self._compiler, "principal_id", "athena")
+            ).strip()
+            or "athena"
+        )
         metadata = self._inference_metadata(selection)
         # Keep the tracker stable across profile revisions so it can emit a
         # provider-profile boundary instead of silently starting a new tracker.
-        key = (session_key, selection.provider)
+        key = (namespace, session_key, selection.provider)
         profile_id = str(metadata.get("provider_profile_id", selection.provider))
         tracker = self._prefix_trackers.setdefault(key, PrefixTracker())
         if tracker.last_prefix_fp is None and self._events is not None:
@@ -1423,7 +1470,9 @@ class AgentKernel:
                     if callable(latest)
                     else None
                 )
-                if event is not None:
+                if event is not None and (
+                    event.payload.get("cache_namespace") in {None, namespace}
+                ):
                     payload = dict(event.payload or {})
                     tracker.last_prefix_fp = payload.get("prefix_fingerprint")
                     tracker.last_full_fp = payload.get("full_fingerprint")
@@ -1434,30 +1483,51 @@ class AgentKernel:
                         if event.type != "InferencePrefixObserved":
                             continue
                         payload = dict(event.payload or {})
+                        if payload.get("cache_namespace") not in {None, namespace}:
+                            continue
                         tracker.last_prefix_fp = payload.get("prefix_fingerprint")
                         tracker.last_full_fp = payload.get("full_fingerprint")
                         tracker.components_fp = dict(payload.get("components_fp") or {})
                         break
             except Exception as exc:
                 _logger.debug("prefix tracker restore failed for %s: %s", session_key, exc)
-        system_blocks = [m.text() for m in compiled.messages if m.role.value == "system"]
+        stable_messages = tuple(getattr(compiled, "cache_prefix_messages", ()) or ())
+        stable_payload = [cache_message_payload(message) for message in stable_messages]
+        dynamic_messages = compiled.messages[len(stable_messages) :]
+        tools_payload = [
+            {
+                "name": descriptor.id,
+                "description": descriptor.description or f"Athena capability {descriptor.id}",
+                "parameters": descriptor.input_schema or {"type": "object", "properties": {}},
+            }
+            for descriptor in compiled.capability_definitions
+        ]
         envelope = PromptEnvelope(
-            stable_prefix=[
-                system_blocks,
-                [d.input_schema for d in compiled.capability_definitions],
-            ],
-            append_history=[m.id for m in compiled.messages],
-            dynamic_suffix=[task.objective],
+            stable_prefix=[stable_payload, tools_payload],
+            append_history=[m.id for m in dynamic_messages],
+            dynamic_suffix=[cache_message_payload(m) for m in dynamic_messages],
         )
         observed = tracker.observe(
             envelope,
             components={
-                "system_prompt": system_blocks,
-                "tools": [d.id for d in compiled.capability_definitions],
-                "tool_schemas": [d.input_schema for d in compiled.capability_definitions],
+                "stable_context": stable_payload,
+                "tools": tools_payload,
                 "model": selection.model,
                 "provider_profile": metadata.get("provider_profile_fingerprint", profile_id),
+                "compatibility_policy": {
+                    "profile": metadata.get("compatibility_profile", "auto"),
+                    "repair": metadata.get("tool_repair_mode", "safe"),
+                    "correction_cycles": metadata.get("max_tool_correction_cycles", 0),
+                    "protocol": metadata.get("protocol", "openai-compat"),
+                },
             },
+        )
+        cache_key = build_cache_key(
+            namespace=namespace,
+            provider=selection.provider,
+            model=selection.model,
+            profile_fingerprint=str(metadata.get("provider_profile_fingerprint", profile_id)),
+            prefix_fingerprint=observed["prefix_fp"],
         )
         output = {
             "prefix_fingerprint": observed["prefix_fp"],
@@ -1465,7 +1535,9 @@ class AgentKernel:
             "components_fp": dict(tracker.components_fp),
             "boundary": observed.get("boundary"),
             "cache_boundary": observed.get("boundary"),
-            "cache_session_key": f"{session_key}:{profile_id}",
+            "cache_session_key": cache_key,
+            "cache_namespace": namespace,
+            "cache_prefix_message_count": len(stable_messages),
         }
         await self._emit("InferencePrefixObserved", output, task)
         return output
@@ -1577,6 +1649,8 @@ class AgentKernel:
             "max_tool_correction_cycles",
             "cache_mode",
             "cache_session_key",
+            "cache_namespace",
+            "cache_prefix_message_count",
             "prefix_fingerprint",
             "full_fingerprint",
             "components_fp",

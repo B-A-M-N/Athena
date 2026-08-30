@@ -95,13 +95,13 @@ def test_openai_compatible_hosted_profile_emits_prompt_cache_key():
         metadata={
             "protocol": "openai-compat",
             "cache_mode": "automatic-prefix",
-            "cache_session_key": "session:freeinference:glm-5.2",
+            "cache_session_key": "session:hosted:model-a",
         },
     )
 
     payload = provider._build_request(request)
 
-    assert payload["prompt_cache_key"] == "session:freeinference:glm-5.2"
+    assert payload["prompt_cache_key"] == "session:hosted:model-a"
 
 
 def test_openai_compatible_local_profile_does_not_emit_prompt_cache_key():

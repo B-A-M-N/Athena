@@ -166,6 +166,10 @@ class AthenaConfig:
     hermes_referee: HermesRefereeConfig = field(default_factory=HermesRefereeConfig)
     context_window: int = 128_000
     reserve_output: int = 4096
+    # Stable cache namespace for one authenticated user/tenant. Keep this
+    # distinct between principals when one service process serves multiple
+    # users; the value is hashed before it reaches a provider.
+    cache_namespace: str = "athena"
     worker_max_parallel: int = 16
     scheduler_interval_seconds: float = 1.0
     scheduler_max_concurrent: int = 0
@@ -335,6 +339,8 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["context_window"] = config.context_window
     if config.reserve_output != 4096:
         d["reserve_output"] = config.reserve_output
+    if config.cache_namespace != "athena":
+        d["cache_namespace"] = config.cache_namespace
     if config.worker_max_parallel != 4:
         d["worker_max_parallel"] = config.worker_max_parallel
     if config.scheduler_interval_seconds != 1.0:
@@ -438,6 +444,7 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         hermes_referee=_parse_hermes_referee(data.get("hermes_referee")),
         context_window=int(data.get("context_window", 128_000)),
         reserve_output=int(data.get("reserve_output", 4096)),
+        cache_namespace=str(data.get("cache_namespace", "athena") or "athena").strip() or "athena",
         worker_max_parallel=int(data.get("worker_max_parallel", 4)),
         scheduler_interval_seconds=float(data.get("scheduler_interval_seconds", 1.0)),
         scheduler_max_concurrent=int(data.get("scheduler_max_concurrent", 0)),
@@ -468,7 +475,8 @@ def _env_map() -> dict[str, Any]:
     Supported variables:
         ATHENA_DB_PATH, ATHENA_WORKSPACE, ATHENA_AUTONOMY,
         ATHENA_ARTIFACT_ROOT, ATHENA_CONTEXT_WINDOW,
-        ATHENA_WORKER_MAX_PARALLEL, ATHENA_SCHEDULER_INTERVAL_SECONDS,
+        ATHENA_CACHE_NAMESPACE, ATHENA_WORKER_MAX_PARALLEL,
+        ATHENA_SCHEDULER_INTERVAL_SECONDS,
         ATHENA_SCHEDULER_MAX_CONCURRENT, ATHENA_PROFILE,
         ATHENA_SKILLS_PATHS (comma-separated), ATHENA_MASCOT,
         ATHENA_DISPLAY, ATHENA_ANIMATIONS, ATHENA_REDUCED_MOTION
@@ -483,6 +491,7 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_ARTIFACT_ROOT": ("artifact_root", str),
         "ATHENA_CONTEXT_WINDOW": ("context_window", int),
         "ATHENA_RESERVE_OUTPUT": ("reserve_output", int),
+        "ATHENA_CACHE_NAMESPACE": ("cache_namespace", str),
         "ATHENA_WORKER_MAX_PARALLEL": ("worker_max_parallel", int),
         "ATHENA_SCHEDULER_INTERVAL_SECONDS": ("scheduler_interval_seconds", float),
         "ATHENA_SCHEDULER_MAX_CONCURRENT": ("scheduler_max_concurrent", int),

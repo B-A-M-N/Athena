@@ -15,6 +15,7 @@ from athena.models.compat.caching import (
     PrefixTracker,
     PromptEnvelope,
     UsageRecord,
+    build_cache_key,
 )
 from athena.models.compat.profiles import (
     PRESETS,
@@ -205,6 +206,23 @@ def test_hosted_openai_compatible_profile_enables_prefix_cache_key():
     assert hosted.cache_mode == "automatic-prefix"
     assert local.cache_mode == "none"
     assert resolve_profile("openai-compat", cache_mode="none").cache_mode == "none"
+
+
+def test_cache_key_reuses_compatible_prefixes_across_sessions_without_leaking_scope():
+    args = {
+        "namespace": "tenant-a",
+        "provider": "gateway",
+        "model": "model-a",
+        "profile_fingerprint": "profile-a",
+        "prefix_fingerprint": "prefix-a",
+    }
+    first = build_cache_key(**args)
+    second = build_cache_key(**args, session_id="session-2")
+
+    assert first == second
+    assert "tenant-a" not in first
+    assert build_cache_key(**{**args, "prefix_fingerprint": "prefix-b"}) != first
+    assert build_cache_key(**args, session_id="session-1", session_scoped=True) != first
 
 
 def test_profile_fingerprint_stable_and_sensitive():

@@ -60,6 +60,18 @@ class StubDispatchIface:
         return DispatchResult(results=results)
 
 
+class _UsageRecorder:
+    def __init__(self):
+        self.attempt_metadata = None
+
+    async def record_attempt(self, **kwargs):
+        self.attempt_metadata = kwargs.get("metadata")
+        return "usage-1"
+
+    async def record_completion(self, *args, **kwargs):
+        return None
+
+
 @pytest.fixture
 async def stack():
     db = Database(":memory:")
@@ -154,6 +166,33 @@ async def test_prefix_metadata_is_observed_once_per_provider_attempt(stack, monk
 
     assert result.status == TaskStatus.COMPLETE
     assert observed == 1
+
+
+async def test_utility_inference_receives_a_reusable_opaque_cache_key(stack):
+    stack.provider._scripts = [{"respond": {"text": "compressed", "done": True}}]
+    usage = _UsageRecorder()
+    stack.kernel._provider_usage_store = usage
+    captured = {}
+    original_complete = stack.provider.complete
+
+    async def capture(request):
+        captured.update(request.metadata)
+        async for event in original_complete(request):
+            yield event
+
+    stack.provider.complete = capture
+
+    result = await stack.kernel.utility_inference(
+        system_prompt="stable utility instructions",
+        user_prompt="summarize this turn",
+        role="summarizer",
+    )
+
+    assert result == "compressed"
+    assert captured["cache_prefix_message_count"] == 1
+    assert captured["cache_session_key"].startswith("athena-cache-v2:")
+    assert "stable utility instructions" not in captured["cache_session_key"]
+    assert usage.attempt_metadata["cache_session_key"] == captured["cache_session_key"]
 
 
 @pytest.mark.athena_claim("INV-001")

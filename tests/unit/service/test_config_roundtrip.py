@@ -46,6 +46,7 @@ def test_roundtrip_providers_mcp_model_roles():
                 "routing_preference": "latency",
             }
         },
+        cache_namespace="tenant-a",
     )
     d = config_to_dict(config)
     assert "providers" in d and "mcp_servers" in d
@@ -77,6 +78,7 @@ def test_roundtrip_providers_mcp_model_roles():
             "routing_preference": "latency",
         }
     }
+    assert restored.cache_namespace == "tenant-a"
 
 
 def test_roundtrip_hermes_referee_config():

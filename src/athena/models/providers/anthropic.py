@@ -56,6 +56,7 @@ from athena.protocol.models import (
 )
 
 _PATH = "/v1/messages"
+_CACHEABLE_MODES = frozenset({"session-key", "explicit-cache-api"})
 
 
 def _reported_cost_usd(raw: Any) -> float | None:
@@ -80,6 +81,17 @@ def _reported_cost_usd(raw: Any) -> float | None:
 
 
 _logger = logging.getLogger("athena.provider.anthropic")
+
+
+def _cache_prefix_message_count(request: ModelRequest) -> int | None:
+    """Return the bounded stable-message count, or None for legacy callers."""
+    if "cache_prefix_message_count" not in request.metadata:
+        return None
+    try:
+        count = int(request.metadata["cache_prefix_message_count"])
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(count, len(request.messages)))
 
 
 def _load_anthropic():
@@ -125,6 +137,8 @@ def _done_event(
         "max_tool_correction_cycles",
         "cache_mode",
         "cache_session_key",
+        "cache_namespace",
+        "cache_prefix_message_count",
         "prefix_fingerprint",
         "full_fingerprint",
         "components_fp",
@@ -324,13 +338,31 @@ class AnthropicProvider:
 
     def _build_kwargs(self, request: ModelRequest, *, stream: bool) -> dict[str, Any]:
         system = self._system_prompt(request)
+        cache_enabled = request.metadata.get("cache_mode") in _CACHEABLE_MODES
+        stable_message_count = _cache_prefix_message_count(request)
+        stable_non_system_index = next(
+            (
+                index
+                for index in range(stable_message_count or 0, 0, -1)
+                if request.messages[index - 1].role is not Role.SYSTEM
+            ),
+            None,
+        )
+        cache_system = cache_enabled and (
+            stable_message_count is None or stable_non_system_index is None
+        )
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "messages": self._translate_messages(request),
+            "messages": self._translate_messages(
+                request,
+                cache_breakpoint_index=(
+                    stable_non_system_index - 1 if stable_non_system_index is not None else None
+                ),
+            ),
             "stream": stream,
         }
         if system:
-            if request.metadata.get("cache_mode") in {"session-key", "explicit-cache-api"}:
+            if cache_system:
                 kwargs["system"] = [
                     {
                         "type": "text",
@@ -347,7 +379,10 @@ class AnthropicProvider:
         if request.stop:
             kwargs["stop_sequences"] = list(request.stop)
         if request.capabilities:
-            kwargs["tools"] = [_tool_schema(b) for b in request.capabilities]
+            tools = [_tool_schema(b) for b in request.capabilities]
+            if cache_enabled and not cache_system and stable_non_system_index is None:
+                tools[-1]["cache_control"] = {"type": "ephemeral"}
+            kwargs["tools"] = tools
         return kwargs
 
     def _system_prompt(self, request: ModelRequest) -> str | None:
@@ -357,9 +392,11 @@ class AnthropicProvider:
         texts = [m.text() for m in sys_msgs if m.text()]
         return "\n\n".join(texts) if texts else None
 
-    def _translate_messages(self, request: ModelRequest) -> list[dict[str, Any]]:
+    def _translate_messages(
+        self, request: ModelRequest, *, cache_breakpoint_index: int | None = None
+    ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for msg in request.messages:
+        for index, msg in enumerate(request.messages):
             if msg.role == Role.SYSTEM:
                 continue
             content: list[dict[str, Any]] = []
@@ -425,6 +462,11 @@ class AnthropicProvider:
                         }
                     )
             role = "user" if msg.role in (Role.USER, Role.CAPABILITY) else "assistant"
+            if index == cache_breakpoint_index and content:
+                content[-1] = {
+                    **content[-1],
+                    "cache_control": {"type": "ephemeral"},
+                }
             out.append({"role": role, "content": content or msg.text()})
         return out
 

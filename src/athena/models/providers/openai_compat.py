@@ -175,6 +175,8 @@ def _response_metadata(
         "max_tool_correction_cycles",
         "cache_mode",
         "cache_session_key",
+        "cache_namespace",
+        "cache_prefix_message_count",
         "prefix_fingerprint",
         "full_fingerprint",
         "components_fp",

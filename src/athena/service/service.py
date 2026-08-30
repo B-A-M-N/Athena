@@ -554,6 +554,7 @@ class AthenaService:
             summarizer=self._make_model_summarizer(model_registry),
             context_window=cfg.context_window,
             reserve_output=cfg.reserve_output,
+            principal_id=cfg.cache_namespace,
             workspace_reader=self._workspace_reader(),
         )
         self._compiler = compiler

@@ -97,6 +97,10 @@ async def test_attached_context_blocks_are_mandatory_and_provenanced():
     assert messages[0].provenance.source_id == "ctx-project-contract"
     assert messages[0].provenance.trust is TrustClass.CONFIGURED_INSTRUCTION
 
+    rendered = [message.text() for message in context.messages]
+    assert rendered.index(messages[0].text()) < rendered.index("do the thing")
+    assert context.cache_prefix_messages[-1].text() == messages[0].text()
+
 
 @pytest.mark.asyncio
 async def test_runtime_recovery_hint_is_visible_in_resumed_context():

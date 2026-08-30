@@ -13,6 +13,9 @@ from athena.models.compat.caching import (
     PrefixTracker,
     PromptEnvelope,
     UsageRecord,
+    build_cache_key,
+    cache_fingerprint,
+    cache_message_payload,
 )
 from athena.models.compat.profiles import (
     AuthMode,
@@ -38,6 +41,9 @@ from athena.models.compat.toolrepair import (
 
 __all__ = [
     "AuthMode",
+    "build_cache_key",
+    "cache_fingerprint",
+    "cache_message_payload",
     "CacheBoundary",
     "CacheMode",
     "CompatibilityCandidates",

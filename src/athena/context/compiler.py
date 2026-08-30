@@ -100,6 +100,11 @@ class CompiledContext:
     omitted_refs: tuple[str, ...] = ()
     compression: CompressionRecord = field(default_factory=CompressionRecord)
     capability_definitions: tuple[CapabilityDescriptor, ...] = ()
+    # Messages at the front of the provider request whose contents are
+    # invariant for the selected task namespace.  Keeping this explicit lets
+    # the kernel fingerprint the actual rendered prefix instead of guessing
+    # from roles or provenance after the fact.
+    cache_prefix_messages: tuple[Message, ...] = ()
     strategy: StrategyGuidance = field(
         default_factory=lambda: StrategyGuidance(
             route="direct", rationale="Use the smallest available capability."
@@ -143,6 +148,16 @@ class _Entry:
     message: Message | None = None  # original message kept verbatim
     blocks: tuple[ContentBlock, ...] | None = None
     droppable: bool = False  # memory/skill/artifact: removable under pressure
+    cache_zone: str = "dynamic"  # stable prefix or dynamic/history suffix
+
+
+_STABLE_CONTEXT_SCOPE_ORDER = {"global": 0, "project": 1, "user": 2}
+
+
+def _stable_context_sort_key(entry: _Entry) -> tuple[int, str]:
+    """Keep invariant attached context deterministic across store orderings."""
+    scope = str(entry.provenance.scope) if entry.provenance is not None else ""
+    return (_STABLE_CONTEXT_SCOPE_ORDER.get(scope, 99), entry.name)
 
 
 @dataclass(frozen=True)
@@ -216,6 +231,11 @@ class ContextCompiler:
         self._memory_cache: OrderedDict[tuple[str, int], tuple[Any, ...]] = OrderedDict()
         self._static_cache: OrderedDict[tuple[Any, ...], _StaticContext] = OrderedDict()
 
+    @property
+    def principal_id(self) -> str:
+        """Configured cache namespace owner, never prompt content."""
+        return self._principal_id
+
     async def compile(
         self,
         task: TaskSpec,
@@ -233,18 +253,27 @@ class ContextCompiler:
         )
 
         # Required context categories (BHV-030) that are never dropped.
-        required: list[_Entry] = [
-            _system_entry(system or _DEFAULT_SAFETY),
-            _task_entry(task),
-        ]
+        required: list[_Entry] = [_system_entry(system or _DEFAULT_SAFETY)]
         required.extend(self._project_entries(workspace))
 
         static = await self._load_static_context(task)
 
+        # Stable project/user/global instructions must precede task-specific
+        # content.  Provider prefix caches operate on rendered request order;
+        # placing the task prompt second would prevent later invariant context
+        # from being reused across tasks.
+        stable_blocks = sorted(
+            (block for block in static.context_blocks if block.cache_zone == "stable"),
+            key=_stable_context_sort_key,
+        )
+        dynamic_blocks = [block for block in static.context_blocks if block.cache_zone != "stable"]
+        required.extend(stable_blocks)
+        required.append(_task_entry(task))
+
         # Explicitly attached blocks are working context, not retrieval
         # results. Load them before optional corpus material so they remain
         # mandatory and provenance survives every provider translation.
-        required.extend(static.context_blocks)
+        required.extend(dynamic_blocks)
 
         # Process attachments: load from ContextRef if needed and create entries
         attachment_entries = await self._process_attachments(task, normalized_attachments)
@@ -258,7 +287,9 @@ class ContextCompiler:
 
         corpus = await self._collect_entries(task, recent_messages, static)
 
-        capabilities = static.capabilities
+        # Stable ordering prevents registry insertion order from needlessly
+        # changing the provider's tool prefix.
+        capabilities = tuple(sorted(static.capabilities, key=lambda item: item.id))
         # Strategy sees the same fabric records used for progressive
         # disclosure, including readiness and validation proof.  It remains
         # advisory, but it no longer has to infer route quality from an id.
@@ -269,6 +300,11 @@ class ContextCompiler:
         )
 
         messages = tuple(_render_entry(e) for e in final_entries)
+        stable_count = 0
+        for entry in final_entries:
+            if entry.cache_zone != "stable":
+                break
+            stable_count += 1
         provenance_map = _index_provenance(messages)
         estimated = estimate_tokens("\n\n".join(m.text() for m in messages))
         requirements = self._build_requirements(task, normalized_attachments, estimated)
@@ -280,6 +316,7 @@ class ContextCompiler:
             omitted_refs=tuple(omitted),
             compression=record,
             capability_definitions=capabilities,
+            cache_prefix_messages=messages[:stable_count],
             strategy=static.strategy,
         )
 
@@ -387,6 +424,9 @@ class ContextCompiler:
                     mandatory=True,
                     provenance=block.effective_provenance,
                     created_at=block.updated_at or block.created_at,
+                    cache_zone=(
+                        "stable" if block.scope in {"project", "user", "global"} else "dynamic"
+                    ),
                 )
             )
         return entries
@@ -1002,6 +1042,7 @@ def _system_entry(text: str) -> _Entry:
         category="security_policy",
         trust=TrustClass.AUTHORITY,
         mandatory=True,
+        cache_zone="stable",
         provenance=prov(SourceType.SYSTEM, trust=TrustClass.AUTHORITY, scope="runtime"),
     )
 
@@ -1162,6 +1203,7 @@ def _agents_entry(path: str, text: str) -> _Entry:
         category="project_instruction",
         trust=TrustClass.CONFIGURED_INSTRUCTION,
         mandatory=True,
+        cache_zone="stable",
         provenance=prov(
             SourceType.PROJECT_INSTRUCTION,
             source_id=path,

@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "build_cache_key",
+    "cache_fingerprint",
+    "cache_message_payload",
     "CacheBoundary",
     "InferenceReceipt",
     "PrefixTracker",
@@ -37,6 +40,7 @@ __all__ = [
 
 class CacheBoundary:
     SYSTEM_PROMPT_CHANGED = "system_prompt_changed"
+    STABLE_CONTEXT_CHANGED = "stable_context_changed"
     TOOLS_CHANGED = "tools_changed"
     TOOL_SCHEMA_CHANGED = "tool_schema_changed"
     MODEL_CHANGED = "model_changed"
@@ -51,6 +55,61 @@ def _fp(obj: Any) -> str:
     return hashlib.sha256(
         json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str).encode()
     ).hexdigest()[:16]
+
+
+def cache_fingerprint(obj: Any) -> str:
+    """Return the short canonical fingerprint used for cache identity."""
+    return _fp(obj)
+
+
+def build_cache_key(
+    *,
+    namespace: str,
+    provider: str,
+    model: str,
+    profile_fingerprint: str,
+    prefix_fingerprint: str,
+    session_id: str | None = None,
+    session_scoped: bool = False,
+) -> str:
+    """Build an opaque, deterministic provider cache-routing key.
+
+    The provider still decides whether the rendered token prefix is reusable;
+    this key only keeps compatible requests on the same cache partition.  The
+    default is namespace-scoped so identical prefixes can be reused across
+    sessions belonging to one configured principal/tenant.  Sensitive flows
+    can opt into a session partition without putting raw identifiers or prompt
+    content into the provider request.
+    """
+    if session_scoped:
+        if not session_id:
+            raise ValueError("session-scoped cache keys require a session_id")
+        scope = {"kind": "session", "value": str(session_id)}
+    else:
+        scope = {"kind": "namespace", "value": str(namespace)}
+    material = {
+        "version": "athena-cache-v2",
+        "scope": scope,
+        "provider": str(provider),
+        "model": str(model),
+        "profile": str(profile_fingerprint),
+        "prefix": str(prefix_fingerprint),
+    }
+    digest = hashlib.sha256(
+        json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"athena-cache-v2:{digest}"
+
+
+def cache_message_payload(message: Any) -> dict[str, Any]:
+    """Return the provider-relevant, metadata-free identity of a message."""
+    role = getattr(getattr(message, "role", None), "value", getattr(message, "role", ""))
+    blocks = getattr(message, "blocks", ()) or ()
+    return {
+        "role": str(role),
+        "block_types": [str(getattr(block, "type", type(block).__name__)) for block in blocks],
+        "content": str(message.text() if hasattr(message, "text") else message),
+    }
 
 
 @dataclass

@@ -69,6 +69,49 @@ def test_anthropic_translation_preserves_image_parts():
     ]
 
 
+def test_anthropic_cache_breakpoint_covers_stable_context_before_task():
+    provider = AnthropicProvider(api_key="key", use_sdk=False)
+    messages = (
+        Message(
+            id="system",
+            role=Role.SYSTEM,
+            blocks=(TextBlock(text="runtime policy"),),
+            created_at=None,
+            provenance=None,
+        ),
+        Message(
+            id="project",
+            role=Role.USER,
+            blocks=(TextBlock(text="project contract"),),
+            created_at=None,
+            provenance=None,
+        ),
+        Message(
+            id="task",
+            role=Role.USER,
+            blocks=(TextBlock(text="current task"),),
+            created_at=None,
+            provenance=None,
+        ),
+    )
+    request = ModelRequest(
+        messages=messages,
+        model="claude-test",
+        provider="anthropic",
+        request_id="request-cache",
+        metadata={
+            "cache_mode": "session-key",
+            "cache_prefix_message_count": 2,
+        },
+    )
+
+    payload = provider._build_kwargs(request, stream=False)
+
+    assert payload["system"] == "runtime policy"
+    assert payload["messages"][0]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in payload["messages"][1]["content"][-1]
+
+
 @pytest.mark.asyncio
 async def test_anthropic_stream_accumulates_reasoning_text_and_tool_call():
     provider = AnthropicProvider(api_key="key", use_sdk=False)
