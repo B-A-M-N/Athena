@@ -153,6 +153,18 @@ async def test_router_uses_role_scoped_reliability_after_policy_filters():
     assert selection.provider == "reliable"
 
 
+async def test_router_uses_declared_latency_class_on_cold_start():
+    slow = _fake("slow", privacy=PrivacyClass.LOCAL)
+    fast = _fake("fast", privacy=PrivacyClass.LOCAL)
+    slow._info_kwargs["latency_class"] = "slow"
+    fast._info_kwargs["latency_class"] = "fast"
+    router = ModelRouter(_registry({"slow": slow, "fast": fast}))
+
+    selection = await router.select(policy=ModelPolicy(require_tools=False))
+
+    assert selection.provider == "fast"
+
+
 async def test_router_cache_keeps_role_histories_separate():
     primary_model = _fake("primary-model", privacy=PrivacyClass.LOCAL)
     judge_model = _fake("judge-model", privacy=PrivacyClass.LOCAL)

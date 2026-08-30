@@ -38,6 +38,43 @@ except ImportError:  # pragma: no cover - exercised in minimal installs
 Color: TypeAlias = tuple[int, int, int] | tuple[int, int, int, int]
 
 
+class _OffsetDraw:
+    """Translate drawing coordinates into a cropped dirty-region image."""
+
+    def __init__(self, draw: Any, left: int, top: int) -> None:
+        self._draw = draw
+        self._left = left
+        self._top = top
+
+    def _point(self, point: tuple[int, int]) -> tuple[int, int]:
+        return point[0] - self._left, point[1] - self._top
+
+    def _box(self, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        return (
+            box[0] - self._left,
+            box[1] - self._top,
+            box[2] - self._left,
+            box[3] - self._top,
+        )
+
+    def line(self, xy, **kwargs) -> None:
+        values = tuple(xy)
+        if len(values) == 4 and all(isinstance(value, (int, float)) for value in values):
+            points = ((values[0], values[1]), (values[2], values[3]))
+        else:
+            points = values
+        self._draw.line([self._point(point) for point in points], **kwargs)
+
+    def rectangle(self, xy, **kwargs) -> None:
+        self._draw.rectangle(self._box(tuple(xy)), **kwargs)
+
+    def arc(self, xy, *args, **kwargs) -> None:
+        self._draw.arc(self._box(tuple(xy)), *args, **kwargs)
+
+    def text(self, xy, text, **kwargs) -> None:
+        self._draw.text(self._point(tuple(xy)), text, **kwargs)
+
+
 def _state_marker(status: object) -> str:
     return {
         "complete": "✓",
@@ -82,14 +119,41 @@ class OIFrameBuffer:
         self._base_frame_bytes = 0
         self._base_png: dict[tuple[int, int, tuple[Any, ...]], bytes] = {}
         self._base_png_bytes = 0
-        self._max_cache_bytes = 64 * 1024 * 1024
+        self._max_cache_bytes = 16 * 1024 * 1024
+
+    def _trim_base_caches(self, protected_key: tuple[Any, ...] | None = None) -> None:
+        """Keep framebuffer caches bounded by entries and combined memory."""
+        while (
+            len(self._base_frames) > 8
+            or len(self._base_png) > 8
+            or self._base_frame_bytes + self._base_png_bytes > self._max_cache_bytes
+        ):
+            frame_candidate = next(
+                (key for key in self._base_frames if key != protected_key), None
+            )
+            png_candidate = next((key for key in self._base_png if key != protected_key), None)
+            if frame_candidate is None and png_candidate is None:
+                break
+            if len(self._base_frames) > 8 or (
+                self._base_frame_bytes >= self._base_png_bytes and frame_candidate is not None
+            ):
+                assert frame_candidate is not None
+                self._base_frames.pop(frame_candidate, None)
+                self._base_frame_bytes -= self._base_frame_sizes.pop(frame_candidate, 0)
+            else:
+                assert png_candidate is not None
+                png = self._base_png.pop(png_candidate, None)
+                if png is not None:
+                    self._base_png_bytes -= len(png)
 
     def _font(self, size: int):
         if ImageFont is None:
             return None
         size = max(int(size), 8)
-        if size in self._fonts:
-            return self._fonts[size]
+        font = self._fonts.pop(size, None)
+        if font is not None:
+            self._fonts[size] = font
+            return font
         paths = ([self.font_path] if self.font_path else []) + list(self._FONT_PATHS)
         for candidate in paths:
             if candidate and Path(candidate).is_file():
@@ -143,23 +207,16 @@ class OIFrameBuffer:
     def _base_image(self, scene: OIScene, width: int, height: int) -> tuple[Any, tuple[Any, ...]]:
         """Return a cached opaque scene layer and its stable content key."""
         key = (width, height, self._scene_key(scene))
-        base = self._base_frames.get(key)
+        base = self._base_frames.pop(key, None)
+        if base is not None:
+            self._base_frames[key] = base
         if base is None:
             base = self._render_base(scene, width, height)
             self._base_frames[key] = base
             size = width * height * 4
             self._base_frame_sizes[key] = size
             self._base_frame_bytes += size
-            # Live traces can produce many distinct scene keys. Retain only a
-            # small working set and byte budget so an active session cannot
-            # grow without bound.
-            while len(self._base_frames) > 8 or self._base_frame_bytes > self._max_cache_bytes:
-                oldest = next(iter(self._base_frames))
-                if oldest != key:
-                    del self._base_frames[oldest]
-                    self._base_frame_bytes -= self._base_frame_sizes.pop(oldest, 0)
-                else:
-                    break
+            self._trim_base_caches(protected_key=key)
         return base, key
 
     @staticmethod
@@ -580,19 +637,16 @@ class OIFrameBuffer:
             return None
         width, height = max(int(width), 80), max(int(height), 60)
         base, key = self._base_image(scene, width, height)
-        png = self._base_png.get(key)
+        png = self._base_png.pop(key, None)
+        if png is not None:
+            self._base_png[key] = png
         if png is None:
             encoded = io.BytesIO()
             base.convert("RGB").save(encoded, format="PNG", optimize=False, compress_level=1)
             png = encoded.getvalue()
             self._base_png[key] = png
             self._base_png_bytes += len(png)
-            while len(self._base_png) > 8 or self._base_png_bytes > self._max_cache_bytes:
-                oldest = next(iter(self._base_png))
-                if oldest != key:
-                    self._base_png_bytes -= len(self._base_png.pop(oldest))
-                else:
-                    break
+            self._trim_base_caches(protected_key=key)
         return FrameBuffer(png, width, height, layer="base", base_key=key)
 
     def render_motion_overlay(
@@ -615,8 +669,6 @@ class OIFrameBuffer:
                 layer="motion",
                 base_key=(width, height, self._scene_key(scene)),
             )
-        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image, "RGBA")
         margin = max(18, width // 24)
         top = max(14, height // 22)
         body_top = top + 62
@@ -626,8 +678,66 @@ class OIFrameBuffer:
         bad = (224, 119, 126, 230)
         mode = scene.mode
 
+        # Compute the smallest rectangle that can contain this animation
+        # layer.  A scanline-only frame is intentionally tiny; broad warning
+        # and failure frames still occupy the full semantic region.
+        left, top_bound, right, bottom = width, height, 0, 0
+
+        def include(x1: int, y1: int, x2: int, y2: int) -> None:
+            nonlocal left, top_bound, right, bottom
+            left = min(left, max(0, x1))
+            top_bound = min(top_bound, max(0, y1))
+            right = max(right, min(width, x2))
+            bottom = max(bottom, min(height, y2))
+
         # Moving scanner/data traces are presentation-only; their existence
         # follows the canonical action mode and never invents task progress.
+        if mode in {
+            VisualActionKind.SEARCH,
+            VisualActionKind.READ,
+            VisualActionKind.INSPECT,
+            VisualActionKind.TEST,
+            VisualActionKind.VERIFY,
+            VisualActionKind.APPROVAL,
+            VisualActionKind.RECOVER,
+            VisualActionKind.GENERATE,
+        }:
+            scan_y = body_top + 28 + int(visual.scan_phase * max(height - body_top - 110, 1))
+            include(margin, scan_y - 4, width - margin, scan_y + 5)
+            for index in range(4):
+                x = margin + int(
+                    ((visual.activity_phase + index * 0.23) % 1.0) * max(width - margin * 2, 1)
+                )
+
+        if mode is VisualActionKind.CODE and scene.code_view is not None:
+            view = scene.code_view
+            source = view.diff_hunks or view.lines
+            if source:
+                visible = min(len(source), max(1, int(visual.code_reveal * len(source))))
+                include(margin, body_top + 45 + visible * 16, width - margin, body_top + 60 + visible * 16)
+
+        if mode is VisualActionKind.FAILURE:
+            include(margin, body_top + 28, width - margin, height - 92)
+        elif mode is VisualActionKind.APPROVAL:
+            include(margin, body_top + 28, width - margin, body_top + 92)
+        elif mode is VisualActionKind.RECOVER:
+            include(margin, body_top + 25, width - margin, height - 100)
+
+        entries = scene.stream[-2:]
+        if entries:
+            include(margin, height - 74, width - margin, height - 35)
+
+        if right <= left or bottom <= top_bound:
+            return FrameBuffer(
+                b"",
+                width,
+                height,
+                layer="motion",
+                base_key=(width, height, self._scene_key(scene)),
+            )
+        image = Image.new("RGBA", (right - left, bottom - top_bound), (0, 0, 0, 0))
+        draw = _OffsetDraw(ImageDraw.Draw(image, "RGBA"), left, top_bound)
+
         if mode in {
             VisualActionKind.SEARCH,
             VisualActionKind.READ,
@@ -685,7 +795,6 @@ class OIFrameBuffer:
 
         # Keep streamed evidence live without making it part of the retained
         # base. This is intentionally a bounded tail from ProjectionState.
-        entries = scene.stream[-2:]
         if entries:
             font = self._font(max(10, width // 64))
             band_y = height - 74
@@ -704,9 +813,9 @@ class OIFrameBuffer:
         image.save(encoded, format="PNG", optimize=False, compress_level=1)
         return FrameBuffer(
             encoded.getvalue(),
-            width,
-            height,
-            dirty_region=(0, 0, width, height),
+            right - left,
+            bottom - top_bound,
+            dirty_region=(left, top_bound, right - left, bottom - top_bound),
             layer="motion",
             base_key=(width, height, self._scene_key(scene)),
         )

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 from io import StringIO
 from typing import Any
 
@@ -13,6 +14,17 @@ from athena.cli.app import Options, _autonomy, _model_policy, build_config, work
 from athena.cli.native_bridge import write_native_projection
 from athena.cli.projection import ProjectionState
 from athena.protocol.tasks import AgentRequest
+
+_FORCE_PROJECTION_EVENTS = frozenset(
+    {
+        "ModelRequestStarted",
+        "ApprovalRequested",
+        "TaskCompleted",
+        "TaskFailed",
+        "TaskCancelled",
+        "RecoveryRequired",
+    }
+)
 
 
 class NativeSession:
@@ -24,6 +36,12 @@ class NativeSession:
         self.projection = ProjectionState()
         self._writer: asyncio.StreamWriter | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._projection_task: asyncio.Task[Any] | None = None
+        self._projection_lock = asyncio.Lock()
+        self._projection_dirty = False
+        self._projection_force = False
+        self._last_projection = 0.0
+        self._projection_interval = 1.0 / 25.0
 
     async def start(self) -> None:
         socket_path = os.environ.get("ATHENA_NATIVE_BRIDGE_SOCKET")
@@ -38,13 +56,19 @@ class NativeSession:
         if events is None:
             raise RuntimeError("AthenaService did not expose its event store")
         events.subscribe(self._on_event)
-        await self._send_projection()
+        self._projection_dirty = True
+        await self._flush_projection(force=True)
+        self._projection_task = asyncio.create_task(self._projection_loop())
 
     async def close(self) -> None:
         for task in tuple(self._tasks):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._projection_task is not None:
+            self._projection_task.cancel()
+            await asyncio.gather(self._projection_task, return_exceptions=True)
+            self._projection_task = None
         if self.service is not None:
             try:
                 await self.service.stop()
@@ -67,7 +91,29 @@ class NativeSession:
 
     async def _on_event(self, event: Any) -> None:
         self.projection.reduce(event.type, event.payload, task_id=event.task_id)
-        await self._send_projection()
+        self._projection_dirty = True
+        if event.type in _FORCE_PROJECTION_EVENTS:
+            self._projection_force = True
+            await self._flush_projection(force=True)
+
+    async def _projection_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._projection_interval)
+            await self._flush_projection()
+
+    async def _flush_projection(self, *, force: bool = False) -> None:
+        if not self._projection_dirty:
+            return
+        now = time.monotonic()
+        if not force and not self._projection_force and now - self._last_projection < self._projection_interval:
+            return
+        async with self._projection_lock:
+            if not self._projection_dirty:
+                return
+            self._projection_dirty = False
+            self._projection_force = False
+            await self._send_projection()
+            self._last_projection = time.monotonic()
 
     async def _send_projection(self) -> None:
         if self._writer is None:

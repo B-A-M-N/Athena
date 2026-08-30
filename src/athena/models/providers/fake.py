@@ -38,6 +38,7 @@ class _InfoKwargs(TypedDict, total=False):
     privacy_class: PrivacyClass
     streaming: bool
     cost: CostInfo | None
+    latency_class: str | None
 
 
 class FakeModelProvider:
@@ -58,6 +59,7 @@ class FakeModelProvider:
         privacy_class: PrivacyClass = PrivacyClass.UNKNOWN,
         streaming: bool = True,
         cost: CostInfo | Mapping[str, object] | None = None,
+        latency_class: str | None = None,
         response_cost_usd: float | None = None,
     ) -> None:
         self._scripts = list(scripts) if scripts else []
@@ -80,6 +82,7 @@ class FakeModelProvider:
             "privacy_class": privacy_class,
             "streaming": streaming,
             "cost": cost,
+            "latency_class": latency_class,
         }
 
     async def list_models(self) -> list[ModelInfo]:

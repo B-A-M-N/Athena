@@ -768,34 +768,42 @@ class CapabilityDispatcher:
                     return result
             except Exception as exc:
                 if self._health is not None:
+                    before_health = self._health.get(request.capability_id)
                     health_record = self._health.record_failure(request.capability_id, str(exc))
-                    await self._persist_health(request.capability_id)
-                    await self._emit(
-                        "CapabilityHealthChanged",
-                        {
-                            "capability_id": request.capability_id,
-                            "health": health_record,
-                        },
-                        request.task_id,
-                        causal_id=request.call_id,
-                    )
+                    state_changed = _health_state_changed(before_health, health_record)
+                    if self._health_should_persist(request.capability_id, state_changed):
+                        await self._persist_health(request.capability_id)
+                    if state_changed:
+                        await self._emit(
+                            "CapabilityHealthChanged",
+                            {
+                                "capability_id": request.capability_id,
+                                "health": health_record,
+                            },
+                            request.task_id,
+                            causal_id=request.call_id,
+                        )
                 raise
             if self._health is not None:
+                before_health = self._health.get(request.capability_id)
                 health = (
                     self._health.record_success(request.capability_id)
                     if result.status is CapabilityResultStatus.OK
                     else self._health.record_failure(request.capability_id, result.error)
                 )
-                await self._persist_health(request.capability_id)
-                await self._emit(
-                    "CapabilityHealthChanged",
-                    {
-                        "capability_id": request.capability_id,
-                        "health": health,
-                    },
-                    request.task_id,
-                    causal_id=request.call_id,
-                )
+                state_changed = _health_state_changed(before_health, health)
+                if self._health_should_persist(request.capability_id, state_changed):
+                    await self._persist_health(request.capability_id)
+                if state_changed:
+                    await self._emit(
+                        "CapabilityHealthChanged",
+                        {
+                            "capability_id": request.capability_id,
+                            "health": health,
+                        },
+                        request.task_id,
+                        causal_id=request.call_id,
+                    )
             if reality_metadata:
                 metadata = dict(result.metadata or {})
                 metadata["reality"] = reality_metadata
@@ -901,6 +909,9 @@ class CapabilityDispatcher:
             return
         try:
             await persist(capability_id)
+            mark_persisted = getattr(self._health, "mark_persisted", None)
+            if callable(mark_persisted):
+                mark_persisted(capability_id)
         except Exception as exc:  # health persistence must not alter call truth
             await self._emit(
                 "CapabilityHealthChanged",
@@ -911,6 +922,12 @@ class CapabilityDispatcher:
                 None,
                 causal_id=capability_id,
             )
+
+    def _health_should_persist(self, capability_id: str, state_changed: bool) -> bool:
+        should_persist = getattr(self._health, "should_persist", None)
+        if callable(should_persist):
+            return bool(should_persist(capability_id, state_changed=state_changed))
+        return True
 
     async def _emit_result_observations(
         self,
@@ -1750,6 +1767,11 @@ def _resource_key(workspace: WorkspaceSpec, value: str) -> str:
 
 def _cacheable_effects(effects: tuple[EffectClass, ...]) -> bool:
     return bool(effects) and set(effects).issubset({EffectClass.READ_LOCAL})
+
+
+def _health_state_changed(before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
+    """Detect circuit transitions, excluding routine closed-counter updates."""
+    return str(before.get("status") or "closed") != str(after.get("status") or "closed")
 
 
 async def _result_cache_key(

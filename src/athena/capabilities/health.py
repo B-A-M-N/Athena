@@ -87,6 +87,28 @@ class CapabilityHealth:
         self.cooldown_seconds = max(0.1, float(cooldown_seconds))
         self._records: dict[str, HealthRecord] = {}
         self._store = store
+        self._dirty_calls: dict[str, int] = {}
+        self._last_persisted: dict[str, float] = {}
+        self._persist_batch_size = 32
+        self._persist_interval = 1.0
+
+    def _mark_dirty(self, capability_id: str) -> None:
+        self._dirty_calls[capability_id] = self._dirty_calls.get(capability_id, 0) + 1
+
+    def should_persist(self, capability_id: str, *, state_changed: bool = False) -> bool:
+        """Return whether a health update crossed a durable flush boundary."""
+        if state_changed:
+            return True
+        dirty = self._dirty_calls.get(capability_id, 0)
+        last = self._last_persisted.get(capability_id)
+        if last is None:
+            self._last_persisted[capability_id] = time.monotonic()
+            return dirty >= self._persist_batch_size
+        return dirty >= self._persist_batch_size or time.monotonic() - last >= self._persist_interval
+
+    def mark_persisted(self, capability_id: str) -> None:
+        self._dirty_calls[capability_id] = 0
+        self._last_persisted[capability_id] = time.monotonic()
 
     async def load(self, records: list[dict[str, Any]]) -> None:
         """Restore durable circuits before the worker can invoke tools."""
@@ -121,6 +143,7 @@ class CapabilityHealth:
             if record.status == "half_open":
                 record.status = "open"
             self._records[capability_id] = record
+            self._last_persisted[capability_id] = time.monotonic()
 
     async def persist(self, capability_id: str) -> None:
         if self._store is None:
@@ -163,6 +186,7 @@ class CapabilityHealth:
             capability_id,
             HealthRecord(capability_id, cooldown_seconds=self.cooldown_seconds),
         )
+        self._mark_dirty(capability_id)
         record.total_calls += 1
         record.successes += 1
         record.consecutive_failures = 0
@@ -178,6 +202,7 @@ class CapabilityHealth:
             capability_id,
             HealthRecord(capability_id, cooldown_seconds=self.cooldown_seconds),
         )
+        self._mark_dirty(capability_id)
         record.total_calls += 1
         record.failures += 1
         record.consecutive_failures += 1
@@ -215,9 +240,13 @@ class CapabilityHealth:
     def reset(self, capability_id: str | None = None) -> int:
         if capability_id:
             self._records.pop(capability_id, None)
+            self._dirty_calls.pop(capability_id, None)
+            self._last_persisted.pop(capability_id, None)
             return 1
         count = len(self._records)
         self._records.clear()
+        self._dirty_calls.clear()
+        self._last_persisted.clear()
         return count
 
 

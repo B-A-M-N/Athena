@@ -46,6 +46,8 @@ _PRIVACY_RANK: dict[PrivacyClass, int] = {
     PrivacyClass.REMOTE: 3,
 }
 
+_LATENCY_CLASS_RANK = {"fast": 0, "medium": 1, "slow": 2}
+
 
 @dataclass(frozen=True)
 class ModelRequirements:
@@ -93,6 +95,11 @@ def _cost_per_1m(info: ModelInfo) -> float:
 
 def _candidate_key(info: ModelInfo) -> tuple:
     return (_privacy_rank(info.privacy_class), _cost_per_1m(info), f"{info.provider}/{info.id}")
+
+
+def _declared_latency_rank(info: ModelInfo) -> int:
+    """Return a conservative cold-start latency prior for a model."""
+    return _LATENCY_CLASS_RANK.get(str(info.latency_class or "medium").casefold(), 1)
 
 
 class ModelRouter:
@@ -284,11 +291,16 @@ class ModelRouter:
         # One transient failure therefore influences routing without making a
         # previously viable provider permanently lose the role.
         reliability_penalty = (attempts - successes + 1) / (attempts + 4) if attempts else 0.25
-        average_latency = total_latency / attempts if attempts else 0.0
+        # Measured latency wins once a role has telemetry.  Before that, use
+        # the provider's declared class so a cold router does not select a
+        # known slow model merely because it has no history yet.
+        latency_observed = 0 if attempts else 1
+        latency_value = total_latency / attempts if attempts else _declared_latency_rank(info)
         return (
             _privacy_rank(info.privacy_class),
             reliability_penalty,
-            average_latency,
+            latency_observed,
+            latency_value,
             _cost_per_1m(info),
             f"{info.provider}/{info.id}",
         )
