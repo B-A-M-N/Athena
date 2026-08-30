@@ -101,16 +101,22 @@ class VerificationEnvironment:
             rustup_home = Path(
                 os.environ.get("RUSTUP_HOME") or (Path(os.environ.get("HOME", "")) / ".rustup")
             ).resolve()
+            cargo_launcher = Path(cargo).resolve() if cargo else None
+            rustc_launcher = Path(rustc).resolve() if rustc else None
+            cargo_bin = Path(cargo).absolute().parent if cargo else None
+            rustup_settings = rustup_home / "settings.toml"
             rust_roots = tuple(
                 str(path)
                 for path in (
+                    cargo_bin,
                     cargo_home / "registry",
                     cargo_home / "git",
+                    rustup_settings if rustup_settings.is_file() else None,
                     rustup_home / "toolchains",
                 )
-                if path.exists()
+                if path is not None and path.exists()
             )
-            mounts.extend((os.path.realpath(cargo), os.path.realpath(rustc), *rust_roots))
+            mounts.extend((*rust_roots,))
             environment.update(
                 {
                     "CARGO_HOME": str(cargo_home),
@@ -121,9 +127,11 @@ class VerificationEnvironment:
             toolchains.append(
                 ToolchainBinding(
                     name="rust",
-                    executable=os.path.realpath(cargo),
+                    executable=str(Path(cargo).absolute()),
                     readonly_roots=(
-                        os.path.realpath(rustc),
+                        str(Path(rustc).absolute()),
+                        str(rustc_launcher) if rustc_launcher else "",
+                        str(cargo_launcher) if cargo_launcher else "",
                         *rust_roots,
                     ),
                     environment={
@@ -173,8 +181,49 @@ class VerificationEnvironment:
             ],
         }
 
+    def identity(self) -> dict[str, Any]:
+        """Return the canonical identity used for authority comparisons.
+
+        A persisted environment record is useful evidence, but its strings
+        are not permission to mount anything.  The service compares this
+        identity with a freshly resolved, host-owned environment before it
+        allows the record to reach an executor.
+        """
+        return {
+            "project_root": str(Path(self.project_root).resolve()),
+            "python": str(Path(self.python).resolve()),
+            "uv": str(Path(self.uv).resolve()) if self.uv else None,
+            "environment_root": (
+                str(Path(self.environment_root).resolve()) if self.environment_root else None
+            ),
+            "environment": dict(sorted((str(k), str(v)) for k, v in self.environment.items())),
+            "readonly_mounts": sorted(str(Path(path).resolve()) for path in self.readonly_mounts),
+            "base_root": str(Path(self.base_root).resolve()) if self.base_root else None,
+            "toolchains": [
+                {
+                    "name": binding.name,
+                    "executable": str(Path(binding.executable).resolve()),
+                    "readonly_roots": sorted(
+                        str(Path(path).resolve()) for path in binding.readonly_roots
+                    ),
+                    "environment": dict(
+                        sorted((str(k), str(v)) for k, v in binding.environment.items())
+                    ),
+                }
+                for binding in sorted(
+                    self.toolchains,
+                    key=lambda value: (value.name, value.executable),
+                )
+            ],
+        }
+
     @classmethod
-    def from_record(cls, record: Mapping[str, Any]) -> "VerificationEnvironment":
+    def from_record(
+        cls,
+        record: Mapping[str, Any],
+        *,
+        expected: "VerificationEnvironment | None" = None,
+    ) -> "VerificationEnvironment":
         if not isinstance(record, Mapping):
             raise ValueError("verification environment record must be a mapping")
         project_root = str(record.get("project_root") or "")
@@ -278,7 +327,7 @@ class VerificationEnvironment:
             raise ValueError("verification environment root is not mounted")
         if uv is not None and str(Path(uv).resolve()) not in resolved_mounts:
             raise ValueError("verification environment uv is not mounted")
-        return cls(
+        parsed = cls(
             project_root=str(Path(project_root).resolve()),
             python=python,
             uv=uv,
@@ -288,6 +337,9 @@ class VerificationEnvironment:
             base_root=base_root,
             toolchains=tuple(toolchains),
         )
+        if expected is not None and parsed.identity() != expected.identity():
+            raise ValueError("verification environment does not match trusted service identity")
+        return parsed
 
 
 class ProjectEnvironmentFingerprint:

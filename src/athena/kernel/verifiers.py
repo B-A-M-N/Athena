@@ -350,6 +350,7 @@ class CompositeVerifier:
         evidence_provider: Any = None,
         inference_broker: Any = None,
         model_judgment_trusted: bool = False,
+        verification_environment_resolver: Any = None,
     ) -> None:
         # ``execution`` is retained in the signature for source compatibility,
         # but command verification never uses it: the dispatcher is the only
@@ -365,6 +366,10 @@ class CompositeVerifier:
             inference_broker=inference_broker,
         )
         self._manual = _ManualVerifier()
+        # VerificationEnvironment records are task evidence, never authority.
+        # The service supplies this resolver so persisted records are compared
+        # with a freshly resolved host-owned environment before execution.
+        self._verification_environment_resolver = verification_environment_resolver
 
     async def verify(
         self,
@@ -375,7 +380,18 @@ class CompositeVerifier:
     ) -> list[bool]:
         """Return, in order, whether each criterion is satisfied."""
         if verification_environment is None:
-            verification_environment = _task_verification_environment(task)
+            resolver = self._verification_environment_resolver
+            if resolver is not None:
+                try:
+                    verification_environment = resolver(task)
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    _logger.warning("trusted verification environment rejected: %s", exc)
+                    return [False for _ in criteria]
+            else:
+                # Standalone verifiers have no authority to hydrate a private
+                # task environment. Generic callers must not turn a record in
+                # task metadata into a mount grant.
+                verification_environment = None
         async with _verification_view(
             task, enabled=self._command._dispatcher is not None
         ) as view_task:

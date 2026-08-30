@@ -123,6 +123,42 @@ async def test_candidate_sandbox_can_launch_operator_selected_uv(tmp_path):
     assert result.stdout.startswith("uv ")
 
 
+async def test_self_host_sandbox_exposes_frozen_python_and_rust_toolchains(tmp_path):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    project_root = Path(__file__).resolve().parents[3]
+    for name in ("pyproject.toml", "uv.lock"):
+        (candidate / name).write_text(
+            (project_root / name).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    verification = VerificationEnvironment.from_project(
+        str(project_root), include_project_root=True, include_rust=True
+    )
+    manager = ExecutionManager()
+    manager.register_runtime(ShellRuntime())
+
+    result = await manager.execute(
+        ExecutionRequest(
+            runtime="shell",
+            source=("uv run --frozen --no-sync python --version; cargo --version; rustc --version"),
+            task_id="candidate-toolchains",
+            workspace_id="candidate",
+            backend="shadow",
+            cwd=str(candidate),
+            workspace_root=str(candidate),
+            network_policy=NetworkPolicy.DENY,
+            env=verification.for_workspace(str(candidate)),
+            toolchain_paths=verification.readonly_mounts,
+        )
+    )
+
+    assert result.status is ExecutionExitStatus.EXITED
+    assert result.exit_code == 0
+    assert "Python " in result.stdout
+    assert "cargo " in result.stdout
+    assert "rustc " in result.stdout
+
+
 async def test_candidate_proof_uses_execute_dispatcher_sandbox_and_uv(tmp_path):
     """The real proof path must import the candidate and run its frozen toolchain."""
     candidate = tmp_path / "candidate"
@@ -207,3 +243,51 @@ def test_verification_environment_rejects_foreign_base_root():
                 "readonly_mounts": ["/project/.venv", "/usr/local/bin/uv"],
             }
         )
+
+
+def test_verification_environment_record_must_match_service_identity():
+    expected = VerificationEnvironment(
+        project_root="/project",
+        python="/project/.venv/bin/python",
+        uv="/usr/local/bin/uv",
+        environment_root="/project/.venv",
+        environment={"UV_PROJECT_ENVIRONMENT": "/project/.venv"},
+        readonly_mounts=("/project/.venv", "/usr/local/bin/uv"),
+    )
+    forged = expected.to_record()
+    forged["environment"] = {
+        "UV_PROJECT_ENVIRONMENT": "/project/.venv",
+        "PYTHONDONTWRITEBYTECODE": "0",
+    }
+
+    with pytest.raises(ValueError, match="trusted service identity"):
+        VerificationEnvironment.from_record(forged, expected=expected)
+
+
+async def test_standalone_verifier_does_not_hydrate_private_metadata():
+    from athena.kernel.verifiers import CompositeVerifier
+    from athena.protocol.tasks import Criterion, TaskSpec, VerificationSpec, VerificationType
+
+    task = TaskSpec(
+        id="private-record",
+        objective="test",
+        metadata={
+            "_athena_verification_environment": {
+                "project_root": "/project",
+                "python": "/project/.venv/bin/python",
+                "uv": "/usr/local/bin/uv",
+                "environment_root": "/project/.venv",
+                "environment": {"UV_PROJECT_ENVIRONMENT": "/project/.venv"},
+                "readonly_mounts": ["/project/.venv", "/usr/local/bin/uv"],
+            }
+        },
+    )
+    criterion = Criterion(
+        id="command",
+        description="command:true",
+        verification=VerificationSpec(type=VerificationType.COMMAND, command="true"),
+    )
+
+    verifier = CompositeVerifier()
+    result = await verifier.verify(task, (criterion,))
+    assert result == [False]

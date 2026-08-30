@@ -8,6 +8,7 @@ from athena.state.self_host import SelfHostMissionStore
 from athena.state.tasks import TaskStore
 from athena.self_host.risk import SelfHostRiskClassifier
 from athena.self_host.reviewer import SelfHostIndependentReviewer
+from athena.self_host.controller import SelfHostMissionController
 
 
 @pytest.fixture
@@ -64,5 +65,32 @@ def test_independent_review_requires_bound_certificate_and_all_checks():
         verification=[{"id": "gate", "passed": True}],
     )
     assert result["eligible"] is True
-    assert result["independent"] is True
+    assert result["independent"] is False
+    assert result["independent_model"] is False
     assert result["evidence_hash"]
+
+
+def test_self_host_plan_is_bounded_and_advances_without_repeating_completed_work():
+    class Index:
+        index_revision = "index-1"
+        source_revision = "source-1"
+        files = ({"path": "src/athena/kernel/kernel.py"},)
+
+    plan = SelfHostMissionController.initial_plan(
+        "fix one thing",
+        index=Index(),
+        design_bundle_hash="design",
+        gate_bundle_hash="gates",
+        base_fingerprint="base",
+    )
+    plan = SelfHostMissionController.mark_task(plan, "task-1")
+    assert plan["phase"] == "PATCH"
+    promoted = SelfHostMissionController.mark_promoted(
+        plan,
+        branch_id="branch-1",
+        certificate_hash="cert-1",
+        candidate_fingerprint="candidate-1",
+    )
+    assert promoted["current_work_item"] is None
+    assert promoted["completed_work_items"][0]["task_id"] == "task-1"
+    assert SelfHostMissionController.next_work_item(promoted) is None

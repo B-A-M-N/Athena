@@ -26,6 +26,7 @@ class SelfHostMissionStore:
         base_revision: str,
         design_bundle_hash: str,
         gate_bundle_hash: str,
+        current_base_fingerprint: str | None = None,
         plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         mission_id = new_id("mission")
@@ -41,6 +42,7 @@ class SelfHostMissionStore:
             "design_bundle_hash": design_bundle_hash,
             "gate_bundle_hash": gate_bundle_hash,
             "candidate_fingerprint": None,
+            "current_base_fingerprint": current_base_fingerprint,
             "plan": mission_plan,
             "last_error": None,
             "created_at": now,
@@ -49,9 +51,10 @@ class SelfHostMissionStore:
         await self._db.execute(
             "INSERT INTO self_host_missions ("
             "id, project_root, objective, status, current_task_id, base_revision, "
-            "design_bundle_hash, gate_bundle_hash, candidate_fingerprint, plan, "
+            "design_bundle_hash, gate_bundle_hash, candidate_fingerprint, "
+            "current_base_fingerprint, plan, "
             "last_error, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mission_id,
                 project_root,
@@ -62,6 +65,7 @@ class SelfHostMissionStore:
                 design_bundle_hash,
                 gate_bundle_hash,
                 None,
+                current_base_fingerprint,
                 json.dumps(mission_plan, sort_keys=True),
                 None,
                 now,
@@ -87,7 +91,7 @@ class SelfHostMissionStore:
     async def latest_active(self, project_root: str) -> dict[str, Any] | None:
         row = await self._db.fetch_one(
             "SELECT * FROM self_host_missions WHERE project_root = ? "
-            "AND status IN ('active', 'review', 'blocked', 'promoted', 'discarded') "
+            "AND status IN ('active', 'review', 'blocked', 'promoted', 'discarded', 'complete') "
             "ORDER BY updated_at DESC LIMIT 1",
             (project_root,),
         )
@@ -111,6 +115,7 @@ class SelfHostMissionStore:
             "base_revision",
             "design_bundle_hash",
             "gate_bundle_hash",
+            "current_base_fingerprint",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:

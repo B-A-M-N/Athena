@@ -60,6 +60,17 @@ def test_tree_paths_prunes_untracked_ignored_name_trees(tmp_path):
     assert not paths.intersection({"target/generated.txt", "htmlcov/index.html", ".coverage"})
 
 
+def test_tree_paths_preserves_tracked_coverage_file(tmp_path):
+    _git_repo(tmp_path)
+    coverage = tmp_path / ".coverage"
+    coverage.write_text("tracked coverage\n")
+    subprocess.run(["git", "add", ".coverage"], cwd=tmp_path, check=True)
+
+    paths = {path.relative_to(tmp_path).as_posix() for path in tree_paths(tmp_path)}
+
+    assert ".coverage" in paths
+
+
 def test_tracked_manifest_cache_refreshes_after_git_add(tmp_path):
     _git_repo(tmp_path)
     target = tmp_path / "target"

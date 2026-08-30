@@ -266,6 +266,7 @@ class Options:
     deny: bool = False
     review_task_id: str | None = None
     self_action: str | None = None
+    self_mission_id: str | None = None
     artifact_root: str | None = None
     _providers: tuple[Any, ...] = ()
 
@@ -475,7 +476,10 @@ async def _cmd_self(o: Options, service: Any) -> int:
                     f"{record.get('current_task_id') or '-'}\t{record.get('objective') or ''}"
                 )
             return 0
-        result = await service.continue_self_host(workspace_root=root)
+        result = await service.continue_self_host(
+            workspace_root=root,
+            mission_id=o.self_mission_id,
+        )
         print(f"athena self: {result.get('status', 'unknown')}")
         if result.get("task_id"):
             print(f"task: {result['task_id']}")
@@ -544,6 +548,8 @@ async def _cmd_self(o: Options, service: Any) -> int:
         if candidate is None:
             surface.render_notice("no retained candidate is available", status="NOT_READY")
             return 0
+        await service.review_candidate(task_id)
+        candidate = await service.operator_candidate(task_id) or candidate
         print(
             "\nCandidate ready for review: "
             f"{len(candidate['changed_resources'])} changed resource(s), "
@@ -587,6 +593,8 @@ async def _cmd_self_review(task_id: str, service: Any) -> int:
     if candidate is None:
         print(f"athena self: no retained candidate for task {task_id}", file=sys.stderr)
         return 1
+    await service.review_candidate(task_id)
+    candidate = await service.operator_candidate(task_id) or candidate
     print("ATHENA SELF\n\nPATCH  ✓\nPROVE  ✓\nAPPLY  ?")
     print(f"\nCandidate: {candidate.get('branch_id')}")
     print("Changed:")
@@ -783,7 +791,7 @@ def _click_cli(click: Any):
         sys.exit(dispatch(base_options(ctx, "doctor", ["startup"])))
 
     @cli.command()
-    @click.argument("objective", required=False)
+    @click.argument("objective", required=False, nargs=-1)
     @click.option(
         "--details", "c_details", is_flag=True, help="Show detailed model and task activity."
     )
@@ -827,11 +835,15 @@ def _click_cli(click: Any):
     @click.pass_context
     def self(ctx, objective, review_task_id):
         """Improve this Athena checkout in a verified candidate workspace."""
-        o = base_options(ctx, "self", [objective] if objective else [])
+        values = list(objective)
+        o = base_options(ctx, "self", values)
         o.review_task_id = review_task_id
-        if objective in {"continue", "status"} and review_task_id is None:
+        if values and values[0] in {"continue", "status"} and review_task_id is None:
             o.args = []
-            o.self_action = objective
+            o.self_action = values[0]
+            o.self_mission_id = values[1] if len(values) > 1 else None
+        elif len(values) > 1:
+            o.args = [" ".join(values)]
         sys.exit(dispatch(o))
 
     @cli.command()
@@ -939,7 +951,7 @@ def _arg_parse(argv: list[str]) -> Options:
         sp = sub.add_parser(name, help=help_)
         globals_(sp)
         if name == "self":
-            sp.add_argument(pos, nargs="?")
+            sp.add_argument(pos, nargs="*")
             sp.add_argument("--review", dest="review_task_id", default=None)
         else:
             sp.add_argument(pos)
@@ -986,10 +998,14 @@ def _arg_parse(argv: list[str]) -> Options:
     elif command == "run":
         o.args = [ns.objective]
     elif command == "self":
-        o.args = [ns.objective] if ns.objective else []
-        if ns.objective in {"continue", "status"} and not o.review_task_id:
+        values = list(ns.objective or [])
+        o.args = values
+        if values and values[0] in {"continue", "status"} and not o.review_task_id:
             o.args = []
-            o.self_action = ns.objective
+            o.self_action = values[0]
+            o.self_mission_id = values[1] if len(values) > 1 else None
+        elif len(values) > 1:
+            o.args = [" ".join(values)]
     elif command in ("inspect", "resume", "cancel", "approve"):
         o.args = [
             getattr(

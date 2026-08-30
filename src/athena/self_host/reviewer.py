@@ -1,4 +1,4 @@
-"""Independent, candidate-free eligibility review for self-host promotion."""
+"""Deterministic integrity review used alongside the model reviewer role."""
 
 from __future__ import annotations
 
@@ -35,7 +35,11 @@ class SelfHostIndependentReviewer:
         eligible = status == "VERIFIED" and authority_ok and checks_ok and identity_ok
         evidence = {
             "reviewer": "frozen-certificate-integrity",
-            "independent": True,
+            "review_type": "integrity",
+            # This checker is independent of the candidate filesystem, but it
+            # is not an independent model. Never represent it as one.
+            "independent": False,
+            "independent_model": False,
             "eligible": eligible,
             "checks": {
                 "branch_verified": status == "VERIFIED",

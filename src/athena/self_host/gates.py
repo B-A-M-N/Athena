@@ -31,6 +31,8 @@ class SelfHostGatePolicy:
         "SHELL_HARDENING.md",
         "SELF_HOSTING.md",
         "src/athena/release/gates.py",
+        "src/athena/self_host/gates.py",
+        "scripts/architecture-lint",
     )
 
     @classmethod
@@ -77,7 +79,7 @@ class SelfHostGateBundle:
     gate_bundle_hash: str
 
     @classmethod
-    def capture(cls, root: str) -> "SelfHostGateBundle":
+    def capture(cls, root: str, *, allow_dirty: bool = False) -> "SelfHostGateBundle":
         project_root = Path(root).resolve()
         source_revision = _git_output(["git", "-C", str(project_root), "rev-parse", "HEAD"])
         status = _git_output(
@@ -90,7 +92,7 @@ class SelfHostGateBundle:
                 "--untracked-files=all",
             ]
         )
-        if status:
+        if status and not allow_dirty:
             raise ValueError("athena self requires a clean source checkout")
         design_files = tuple(
             _file_digest(project_root, relative) for relative in SelfHostGatePolicy.DESIGN_CONTRACTS

@@ -60,9 +60,11 @@ class _AsyncSQLiteConnection:
         future: asyncio.Future[Any] = loop.create_future()
         self._queue.put((operation, future))
         # The worker completes this Future through the loop's thread-safe
-        # callback.  A short timer is only a compatibility nudge for embedded
+        # callback.  A short timer is a compatibility nudge for embedded
         # selector adapters that enqueue that callback without waking select;
-        # it is not a busy-yield and is never the normal completion path.
+        # the callback remains the normal completion path.  This bounded
+        # fallback prevents a locked-down host event loop from hanging SQLite
+        # callers indefinitely.
         while True:
             try:
                 await asyncio.wait_for(asyncio.shield(future), timeout=0.001)
