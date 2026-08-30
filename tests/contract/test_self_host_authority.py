@@ -13,7 +13,7 @@ import pytest
 
 from athena.execution.environment import VerificationEnvironment
 from athena.protocol.tasks import AgentRequest
-from athena.self_host.gates import SelfHostGatePolicy
+from athena.self_host.gates import SelfHostGateBundle, SelfHostGatePolicy
 from athena.self_host.reviewer import SelfHostIndependentReviewer
 from athena.self_host.risk import SelfHostRiskClassifier
 from athena.service.service import AthenaService
@@ -55,6 +55,23 @@ def test_mandatory_self_host_boundary_is_service_owned():
         "tests/contract" in command
         for command in SelfHostGatePolicy.frozen_safety_commands("/repo")
     )
+
+
+def test_dependency_proof_runs_python_gates_in_ephemeral_environment():
+    command = SelfHostGatePolicy.dependency_environment_command("dependency-proof")
+    assert "uv sync --locked --offline --extra dev" in command
+    assert "uv run --frozen --no-sync pytest" in command
+    assert "/tmp/athena-self-proof-" in command
+
+
+def test_frozen_design_context_prioritizes_core_and_supports_retrieval():
+    root = Path(__file__).resolve().parents[2]
+    bundle = SelfHostGateBundle.capture(str(root), allow_dirty=True)
+    context = bundle.retrieve_design_context(paths=["src/athena/self_host/gates.py"])
+    assert "--- SECURITY.md ---" in context
+    assert "--- SELF_HOSTING.md ---" in context
+    assert "--- docs/ARCHITECTURE.md ---" in context
+    assert "--- src/athena/self_host/gates.py ---" in context
 
 
 def test_candidate_imports_candidate_source_when_running_in_candidate_view():

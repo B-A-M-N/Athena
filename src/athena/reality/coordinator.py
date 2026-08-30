@@ -732,15 +732,15 @@ class RealityCoordinator:
             from athena.self_host.gates import SelfHostGatePolicy
 
             if SelfHostGatePolicy.requires_dependency_proof(changed_resources):
-                dependency_command = SelfHostGatePolicy.dependency_sync_command(task.id)
+                dependency_command = SelfHostGatePolicy.dependency_environment_command(task.id)
                 if not any(
                     getattr(c.verification, "command", None) == dependency_command for c in explicit
                 ):
                     explicit += (
                         Criterion(
-                            id="self_host_dependency_environment",
+                            id="self_host_dependency_environment_proof",
                             description=(
-                                "self-host dependency proof: isolated offline sync "
+                                "self-host dependency proof: isolated offline sync and Python gates "
                                 f"{dependency_command}"
                             ),
                             verification=VerificationSpec(

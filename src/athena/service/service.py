@@ -1271,7 +1271,6 @@ class AthenaService:
         """Ask the existing kernel for one bounded next mission item."""
         controller = SelfHostMissionController
         kernel = self._kernel
-        design_context = bundle.design_context()
         updated_plan: dict[str, Any] = json.loads(json.dumps(dict(plan), sort_keys=True))
         plan = updated_plan
         evidence = dict(plan.get("evidence") or {})
@@ -1283,6 +1282,23 @@ class AthenaService:
             }
         )
         plan["evidence"] = evidence
+        completed_items = plan.get("completed_work_items") or ()
+        context_paths = [
+            str(path)
+            for item in completed_items[-3:]
+            if isinstance(item, Mapping)
+            for path in item.get("affected_files") or ()
+        ]
+        context_invariants = [
+            str(invariant)
+            for item in completed_items[-3:]
+            if isinstance(item, Mapping)
+            for invariant in item.get("affected_invariants") or ()
+        ]
+        design_context = bundle.retrieve_design_context(
+            paths=context_paths,
+            invariants=context_invariants,
+        )
         mission_for_prompt = dict(mission)
         mission_for_prompt["plan"] = plan
         prompt = controller.planner_prompt(
@@ -1346,6 +1362,7 @@ class AthenaService:
         if reason and completed and release_proven:
             proof = controller.completion_proof(
                 plan,
+                objective=str(mission.get("objective") or ""),
                 reason=reason,
                 authority=bundle.to_record(),
                 base_fingerprint=str(
@@ -1353,6 +1370,7 @@ class AthenaService:
                     or (plan.get("evidence") or {}).get("base_fingerprint")
                     or ""
                 ),
+                release_evidence=release_evidence,
             )
             updated = json.loads(json.dumps(dict(plan), sort_keys=True))
             updated["phase"] = "COMPLETE"
@@ -1442,6 +1460,11 @@ class AthenaService:
                             "task_status": task_status,
                             "base_fingerprint": actual,
                             "review": plan.get("review"),
+                            "unresolved_failures": (
+                                mission.get("last_error")
+                                or (task or {}).get("error")
+                                or (task or {}).get("reason")
+                            ),
                         },
                     )
                 except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -2367,7 +2390,13 @@ class AthenaService:
             base_bundle = SelfHostGateBundle.capture(base_root, allow_dirty=True)
             if base_bundle.gate_bundle_hash != str(raw_bundle.get("gate_bundle_hash") or ""):
                 raise ValueError("review authority bundle is stale")
-            design_context = base_bundle.design_context()
+            changed_paths = [
+                str(resource.get("path") or resource.get("resource") or "")
+                if isinstance(resource, Mapping)
+                else str(resource)
+                for resource in candidate.get("changed_resources") or ()
+            ]
+            design_context = base_bundle.retrieve_design_context(paths=changed_paths)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return _review_failure(candidate, integrity, f"review authority unavailable: {exc}")
         prompt = _self_host_review_prompt(

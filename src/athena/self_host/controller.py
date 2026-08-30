@@ -220,9 +220,11 @@ class SelfHostMissionController:
     def completion_proof(
         plan: Mapping[str, Any],
         *,
+        objective: str,
         reason: str,
         authority: Mapping[str, Any],
         base_fingerprint: str,
+        release_evidence: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Create durable evidence required before declaring completion."""
         import hashlib
@@ -230,6 +232,7 @@ class SelfHostMissionController:
 
         proof = {
             "kind": "self_host_mission_completion",
+            "objective": str(objective)[:4000],
             "reason": str(reason)[:1000],
             "completed_work_items": list(plan.get("completed_work_items") or ()),
             "authority": {
@@ -237,6 +240,18 @@ class SelfHostMissionController:
                 for key in ("source_revision", "design_bundle_hash", "gate_bundle_hash")
             },
             "base_fingerprint": base_fingerprint,
+            "release_evidence": {
+                "task_status": str(release_evidence.get("task_status") or ""),
+                "base_fingerprint": str(release_evidence.get("base_fingerprint") or ""),
+                "certificate_hash": str(
+                    (release_evidence.get("review") or {}).get("certificate_hash") or ""
+                )
+                if isinstance(release_evidence.get("review"), Mapping)
+                else "",
+                "review_eligible": (release_evidence.get("review") or {}).get("eligible") is True
+                if isinstance(release_evidence.get("review"), Mapping)
+                else False,
+            },
         }
         proof["proof_hash"] = hashlib.sha256(
             json.dumps(proof, sort_keys=True, separators=(",", ":")).encode("utf-8")

@@ -20,6 +20,7 @@ from athena.policy.engine import PolicyDecision, PolicyVerdict
 from athena.protocol.capabilities import CapabilityRequest
 from athena.protocol.execution import ExecutionRequest, ExecutionExitStatus
 from athena.protocol.tasks import NetworkPolicy, WorkspaceSpec
+from athena.self_host.gates import SelfHostGatePolicy
 
 
 class _AllowEngine:
@@ -215,10 +216,7 @@ async def test_self_host_dependency_proof_fails_closed_for_broken_candidate(tmp_
     result = await manager.execute(
         ExecutionRequest(
             runtime="shell",
-            source=(
-                "UV_PROJECT_ENVIRONMENT=/tmp/athena-self-proof-test "
-                "uv sync --locked --offline --extra dev"
-            ),
+            source=SelfHostGatePolicy.dependency_environment_command("candidate-dependency-proof"),
             task_id="candidate-dependency-proof",
             workspace_id="candidate",
             backend="shadow",

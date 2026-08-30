@@ -110,6 +110,7 @@ def release_commands(
                     "-p",
                     "no:cacheprovider",
                     "tests/e2e/test_release_black_box.py",
+                    "tests/e2e/test_self_host_continuation.py",
                 ],
             )
         )
