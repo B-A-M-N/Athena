@@ -186,6 +186,8 @@ class VerificationEnvironment:
             if not Path(str(raw_environment_root)).is_absolute():
                 raise ValueError("verification environment root must be absolute")
             environment_root = str(Path(str(raw_environment_root)).resolve())
+        if environment_root is None:
+            raise ValueError("verification environment root is required")
         try:
             environment = {
                 str(key): str(value) for key, value in dict(record.get("environment") or {}).items()
@@ -228,7 +230,7 @@ class VerificationEnvironment:
             base_root = str(Path(str(base_root)).resolve())
             if base_root != str(Path(project_root).resolve()):
                 raise ValueError("verification environment base root does not match its project")
-        allowed_mounts = {str(Path(environment_root).resolve())} if environment_root else set()
+        allowed_mounts = {str(Path(environment_root).resolve())}
         if uv:
             allowed_mounts.add(str(Path(uv).resolve()))
         if base_root:
@@ -271,6 +273,11 @@ class VerificationEnvironment:
             raise ValueError("verification environment has invalid toolchains") from exc
         if any(str(Path(path).resolve()) not in allowed_mounts for path in mounts):
             raise ValueError("verification environment contains an untrusted mount")
+        resolved_mounts = {str(Path(path).resolve()) for path in mounts}
+        if str(Path(environment_root).resolve()) not in resolved_mounts:
+            raise ValueError("verification environment root is not mounted")
+        if uv is not None and str(Path(uv).resolve()) not in resolved_mounts:
+            raise ValueError("verification environment uv is not mounted")
         return cls(
             project_root=str(Path(project_root).resolve()),
             python=python,
