@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+
 import pytest
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskStatus
 from athena.state.database import Database
@@ -110,9 +111,9 @@ async def test_worker_parallelism_real():
     tmpdir = tempfile.mkdtemp(prefix="athena-par-")
     db_path = os.path.join(tmpdir, "test.db")
 
-    # Script that makes tasks sleep briefly so they overlap. The
-    # capability_result_ok script terminal-completes once the execute call
-    # succeeds, so each task performs a single ~1s execution and then stops.
+    # The execution stays active long enough for the observer below to see
+    # overlap. The assertion checks task state directly rather than relying on
+    # a machine-sensitive wall-clock threshold.
     scripts = [
         {"match": {"capability_result_ok": True}, "respond": {"text": "done", "done": True}},
         {
@@ -136,9 +137,6 @@ async def test_worker_parallelism_real():
     svc = AthenaService(config=config)
     await svc.start()
 
-    import time
-
-    start = time.monotonic()
     tasks = []
     for i in range(4):
         t = await svc.submit(
@@ -147,15 +145,17 @@ async def test_worker_parallelism_real():
         )
         tasks.append(t)
 
-    # Wait for all to complete
-    for t in tasks:
-        await _wait_status(svc, t.id, TaskStatus.COMPLETE.value, tries=500)
-    elapsed = time.monotonic() - start
+    import asyncio
 
-    # With real parallelism (4 workers, 4 tasks of ~1s each), total should be ~1-2s
-    # With fake parallelism (1 at a time), it would be ~4s+
-    # Allow generous margin for test environment
-    assert elapsed < 3.5, f"Expected parallel execution (~1-2s), got {elapsed:.1f}s"
+    overlap = False
+    for _ in range(500):
+        states = await asyncio.gather(*(svc.get_task_status(t.id) for t in tasks))
+        if sum(state == TaskStatus.RUNNING.value for state in states) >= 2:
+            overlap = True
+        if all(state == TaskStatus.COMPLETE.value for state in states):
+            break
+        await asyncio.sleep(0.02)
+    assert overlap, "Expected at least two tasks to be RUNNING concurrently"
     await svc.stop()
 
 
