@@ -10,6 +10,7 @@ Usage::
 
     scripts/release-check                 # check HEAD as a clean commit
     scripts/release-check --sha <commit>  # check an exact release candidate
+    scripts/release-check --bootstrap     # fetch locked Rust deps, then check offline
     scripts/release-check --skip-e2e      # local fast gate; not the full gate
     scripts/release-check --sha <commit> --evidence-dir .release-evidence
 """
@@ -34,21 +35,35 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def _git(*args: str, cwd: Path = REPO_ROOT) -> str:
     result = subprocess.run(
-        ["git", *args], cwd=cwd, check=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     return result.stdout.strip()
 
 
 def _run(
-    command: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
 ) -> dict[str, object]:
     print(f"[release] {' '.join(command)}", flush=True)
     started = time.monotonic()
     try:
         result = subprocess.run(
-            command, cwd=cwd, env=env, timeout=timeout, check=False,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            command,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
         output = result.stdout
         exit_code = result.returncode
@@ -79,8 +94,11 @@ def _extract_commit(commit: str, checkout: Path, *, timeout: float) -> None:
     """
     try:
         archive = subprocess.run(
-            ["git", "archive", "--format=tar", commit], cwd=REPO_ROOT,
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ["git", "archive", "--format=tar", commit],
+            cwd=REPO_ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             timeout=timeout,
         ).stdout
     except subprocess.TimeoutExpired as exc:
@@ -97,7 +115,7 @@ def _extract_commit(commit: str, checkout: Path, *, timeout: float) -> None:
         tar.extractall(checkout, members=members)
 
 
-def _commands(uv: str, *, skip_e2e: bool) -> list[tuple[str, list[str]]]:
+def _commands(uv: str, *, skip_e2e: bool, bootstrap: bool) -> list[tuple[str, list[str]]]:
     # The clean archive has no editable development environment. Select the
     # locked dev extra explicitly so pytest/mypy/ruff/build never fall through
     # to an unrelated host interpreter on PATH.
@@ -107,25 +125,78 @@ def _commands(uv: str, *, skip_e2e: bool) -> list[tuple[str, list[str]]]:
         ("ruff-check", [*prefix, "ruff", "check", "src", "tests"]),
         ("mypy", [*prefix, "mypy", "src/athena"]),
         ("compileall", [*prefix, "python", "-m", "compileall", "-q", "src", "tests"]),
-        ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider",
-                     "--ignore=tests/e2e"]),
-        ("release-scenarios", [*prefix, "python", "scripts/scenarios",
-                                "--require-clean", "--exclude-family", "VHS",
-                                "--output", "release-scenarios.json"]),
+        ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "--ignore=tests/e2e"]),
+        (
+            "release-scenarios",
+            [
+                *prefix,
+                "python",
+                "scripts/scenarios",
+                "--require-clean",
+                "--exclude-family",
+                "VHS",
+                "--output",
+                "release-scenarios.json",
+            ],
+        ),
         ("architecture-lint", [*prefix, "python", "scripts/architecture-lint"]),
-        # The native crate pins a git dependency. Fetch it explicitly in the
-        # cold CI environment, then keep the actual checks locked and
-        # reproducible rather than relying on a pre-warmed Cargo cache.
-        ("native-fetch", ["cargo", "fetch", "--manifest-path", "native/Cargo.toml", "--locked"]),
-        ("native-check", ["cargo", "check", "--manifest-path", "native/Cargo.toml", "--locked"]),
-        ("native-test", ["cargo", "test", "--manifest-path", "native/Cargo.toml", "--locked"]),
-        ("native-smoke", ["scripts/native-smoke"]),
     ]
+    if bootstrap:
+        commands.append(
+            (
+                "native-fetch",
+                [
+                    "cargo",
+                    "fetch",
+                    "--manifest-path",
+                    "native/Cargo.toml",
+                    "--locked",
+                ],
+            )
+        )
+    # The native crate pins a git dependency. The release gate is offline by
+    # default; --bootstrap opts into the one network phase above.
+    commands.extend(
+        [
+            (
+                "native-check",
+                [
+                    "cargo",
+                    "check",
+                    "--manifest-path",
+                    "native/Cargo.toml",
+                    "--locked",
+                    "--offline",
+                ],
+            ),
+            (
+                "native-test",
+                [
+                    "cargo",
+                    "test",
+                    "--manifest-path",
+                    "native/Cargo.toml",
+                    "--locked",
+                    "--offline",
+                ],
+            ),
+            ("native-smoke", ["scripts/native-smoke"]),
+        ]
+    )
     if not skip_e2e:
-        commands.append(("e2e", [
-            *prefix, "pytest", "-q", "-p", "no:cacheprovider",
-            "tests/e2e/test_release_black_box.py",
-        ]))
+        commands.append(
+            (
+                "e2e",
+                [
+                    *prefix,
+                    "pytest",
+                    "-q",
+                    "-p",
+                    "no:cacheprovider",
+                    "tests/e2e/test_release_black_box.py",
+                ],
+            )
+        )
     return commands
 
 
@@ -144,9 +215,9 @@ def _write_text(path: Path, value: str) -> None:
 
 
 def _evidence_record(record: dict[str, object]) -> dict[str, object]:
-    return {
-        key: value for key, value in record.items() if key != "output"
-    } | {"output_tail": str(record.get("output") or "")[-4000:]}
+    return {key: value for key, value in record.items() if key != "output"} | {
+        "output_tail": str(record.get("output") or "")[-4000:]
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -155,23 +226,34 @@ def main(argv: list[str] | None = None) -> int:
         description="Run the complete release gate against a frozen commit.",
     )
     parser.add_argument(
-        "--sha", default=None,
+        "--sha",
+        default=None,
         help="commit-ish to check (resolved once before creating the worktree)",
     )
     parser.add_argument(
-        "--uv", default=os.environ.get("ATHENA_RELEASE_UV", "uv"),
+        "--uv",
+        default=os.environ.get("ATHENA_RELEASE_UV", "uv"),
         help="uv executable used for Python lanes",
     )
     parser.add_argument(
-        "--timeout", type=float, default=1800.0,
+        "--timeout",
+        type=float,
+        default=1800.0,
         help="per-command timeout in seconds (default: %(default)s)",
     )
     parser.add_argument(
-        "--skip-e2e", action="store_true",
+        "--skip-e2e",
+        action="store_true",
         help="skip installed-artifact acceptance; not a full release check",
     )
     parser.add_argument(
-        "--evidence-dir", default=None,
+        "--bootstrap",
+        action="store_true",
+        help="fetch locked Rust dependencies before the offline native checks",
+    )
+    parser.add_argument(
+        "--evidence-dir",
+        default=None,
         help="directory outside the temporary checkout for durable release evidence",
     )
     args = parser.parse_args(argv)
@@ -202,21 +284,22 @@ def main(argv: list[str] | None = None) -> int:
 
     temp_root = Path(tempfile.mkdtemp(prefix="athena-release-check-"))
     checkout = temp_root / "checkout"
-    evidence_dir = (
-        Path(args.evidence_dir).expanduser().resolve()
-        if args.evidence_dir else None
-    )
+    evidence_dir = Path(args.evidence_dir).expanduser().resolve() if args.evidence_dir else None
     lanes: list[dict[str, object]] = []
     final_status = "FAIL"
     error: str | None = None
     try:
         if evidence_dir is not None:
-            _write_json(evidence_dir / "release-identity.json", {
-                "commit_sha": resolved,
-                "requested_sha": requested_sha,
-                "explicit_sha": explicit_sha,
-                "skip_e2e": bool(args.skip_e2e),
-            })
+            _write_json(
+                evidence_dir / "release-identity.json",
+                {
+                    "commit_sha": resolved,
+                    "requested_sha": requested_sha,
+                    "explicit_sha": explicit_sha,
+                    "skip_e2e": bool(args.skip_e2e),
+                    "bootstrap": bool(args.bootstrap),
+                },
+            )
         _extract_commit(resolved, checkout, timeout=args.timeout)
         env = dict(os.environ)
         env["PYTHONPATH"] = str(checkout / "src") + (
@@ -230,13 +313,14 @@ def main(argv: list[str] | None = None) -> int:
         # scenarios --require-clean assertion fail for the wrong reason.
         env["UV_PROJECT_ENVIRONMENT"] = str(temp_root / "venv")
         env["UV_CACHE_DIR"] = str(temp_root / "uv-cache")
-        for name, command in _commands(args.uv, skip_e2e=args.skip_e2e):
+        for name, command in _commands(args.uv, skip_e2e=args.skip_e2e, bootstrap=args.bootstrap):
             record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
             record["name"] = name
             lanes.append(record)
             if evidence_dir is not None:
                 _write_text(
-                    evidence_dir / {
+                    evidence_dir
+                    / {
                         "architecture-lint": "architecture-lint.txt",
                         "native-check": "native-check.txt",
                         "native-test": "native-test.txt",
@@ -251,18 +335,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
         if evidence_dir is not None:
             static_names = {"ruff-format", "ruff-check", "mypy", "compileall"}
-            _write_json(evidence_dir / "static-checks.json", {
-                "commit_sha": resolved,
-                "lanes": [_evidence_record(item) for item in lanes
-                          if item.get("name") in static_names],
-            })
-            pytest_lane = next(
-                (item for item in lanes if item.get("name") == "pytest"), None,
+            _write_json(
+                evidence_dir / "static-checks.json",
+                {
+                    "commit_sha": resolved,
+                    "lanes": [
+                        _evidence_record(item) for item in lanes if item.get("name") in static_names
+                    ],
+                },
             )
-            _write_json(evidence_dir / "pytest-summary.json", {
-                "commit_sha": resolved,
-                "lane": _evidence_record(pytest_lane) if pytest_lane else None,
-            })
+            pytest_lane = next(
+                (item for item in lanes if item.get("name") == "pytest"),
+                None,
+            )
+            _write_json(
+                evidence_dir / "pytest-summary.json",
+                {
+                    "commit_sha": resolved,
+                    "lane": _evidence_record(pytest_lane) if pytest_lane else None,
+                },
+            )
             scenario_path = checkout / "release-scenarios.json"
             if scenario_path.exists():
                 _write_text(
@@ -274,10 +366,13 @@ def main(argv: list[str] | None = None) -> int:
                     (item for item in lanes if item.get("name") == "release-scenarios"),
                     None,
                 )
-                _write_json(evidence_dir / "release-scenarios.json", {
-                    "commit_sha": resolved,
-                    "lane": _evidence_record(scenario_lane) if scenario_lane else None,
-                })
+                _write_json(
+                    evidence_dir / "release-scenarios.json",
+                    {
+                        "commit_sha": resolved,
+                        "lane": _evidence_record(scenario_lane) if scenario_lane else None,
+                    },
+                )
             if args.skip_e2e:
                 _write_text(
                     evidence_dir / "e2e.txt",
@@ -298,13 +393,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         if evidence_dir is not None:
-            _write_json(evidence_dir / "final-release-result.json", {
-                "commit_sha": resolved,
-                "status": final_status,
-                "releasable": final_status == "PASS",
-                "error": error,
-                "lanes": [_evidence_record(item) for item in lanes],
-            })
+            _write_json(
+                evidence_dir / "final-release-result.json",
+                {
+                    "commit_sha": resolved,
+                    "status": final_status,
+                    "releasable": final_status == "PASS",
+                    "error": error,
+                    "lanes": [_evidence_record(item) for item in lanes],
+                },
+            )
         shutil.rmtree(temp_root, ignore_errors=True)
 
 

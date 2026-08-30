@@ -9,9 +9,9 @@ into one durable kernel. The normative contracts live in `SPEC.md`,
 `BUILDSPEC.md`, `BEHAVIORSPEC.md`, and `RESEARCHSPEC.md`; the architectural
 overview is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-> **Status: active development.** Athena is a working prototype with a broad
-> test-backed core, not a production-ready agent. Interfaces and subsystem
-> boundaries may change while the runtime is being built.
+> **Status: stable public beta.** The verified release host is Linux; macOS and
+> Windows are compatibility targets, and the native X11 frontend remains a
+> development preview. Interfaces and subsystem boundaries may still change.
 
 ## Why this exists
 
@@ -25,7 +25,7 @@ checked and reused. Athena is an attempt to make that behavior durable: one
 reasoning loop, explicit authority, retained evidence, and an auditable path
 from decision to execution.
 
-This is still a working prototype, but the direction is deliberate: capability
+This is a stable public beta with a deliberately bounded core: capability
 should expand through evidence and disciplined construction, not through an
 unbounded collection of loosely coordinated agents.
 
@@ -54,8 +54,7 @@ make check           # run the full local verification gate
 ```
 
 `make format-check` verifies formatting without changing files. The broader
-formatter baseline is being normalized incrementally while the project is in
-active development.
+formatter baseline is being normalized incrementally while the project evolves.
 
 ## Quickstart
 
