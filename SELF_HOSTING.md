@@ -45,16 +45,19 @@ athena self status
 ```
 
 On the Hermes host, create and harden the `athena-referee` profile, enable its
-API-server multiplex route, and start Hermes. Keep browser, terminal, file,
-code-execution, and other mutation toolsets disabled in that profile. The
-Hermes API key belongs in the host secret store; reference it from Athena with
+API-server multiplex route and explicit referee mode (`enabled: true`,
+`policy_version: 1`), and start Hermes. Referee mode exposes no model-visible
+tools and advertises `runtime.mode: referee`,
+`runtime.tool_execution: disabled`, and `referee.effective_tools: []`; later
+MCP refreshes must preserve that empty surface. The Hermes API key belongs in
+the host secret store; reference it from Athena with
 `hermes-referee.credential-id` rather than placing the key in `config.toml`.
 
-`athena self status` reports Athena proof readiness, Hermes connectivity and
-profile, and the invariant that human promotion remains required. Hermes is
-called only at semantic candidate/mission checkpoints. It receives a bounded
-read-only `ReviewPacket`; a missing, malformed, or failed response holds the
-review closed.
+`athena self status` reports Athena proof readiness, Hermes connectivity,
+separate read-only safety verification, profile, and the invariant that human
+promotion remains required. Hermes is called only at semantic
+candidate/mission checkpoints. It receives a bounded read-only `ReviewPacket`;
+a missing, malformed, or failed response holds the review closed.
 
 ## Completion and performance gates
 

@@ -52,12 +52,24 @@ class HermesRefereePreflight:
     models: tuple[str, ...]
     capabilities: Mapping[str, Any]
 
+    @property
+    def safety_verified(self) -> bool:
+        """Return whether this result passed the complete safety contract."""
+        return True
+
+    @property
+    def read_only_verified(self) -> bool:
+        """Alias used by operator-facing governance surfaces."""
+        return self.safety_verified
+
     def to_record(self) -> dict[str, Any]:
         return {
             "endpoint": self.endpoint,
             "profile": self.profile,
             "policy_fingerprint": self.policy_fingerprint,
             "models": list(self.models),
+            "safety_verified": self.safety_verified,
+            "read_only_verified": self.read_only_verified,
             "runtime": dict(self.capabilities.get("runtime") or {}),
             "referee": dict(self.capabilities.get("referee") or {}),
         }

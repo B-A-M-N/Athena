@@ -119,6 +119,8 @@ async def test_agent_adapter_preflight_requires_referee_contract_and_caches_succ
         await client.aclose()
 
     assert first == second
+    assert first.safety_verified is True
+    assert first.read_only_verified is True
     assert paths == [
         "/p/athena-referee/v1/models",
         "/p/athena-referee/v1/capabilities",

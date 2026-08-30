@@ -566,7 +566,14 @@ async def _cmd_self(o: Options, service: Any) -> int:
             governance = await service.hermes_referee_status()
             print("SELF HOST GOVERNANCE")
             print("  Athena proof       READY")
-            print(f"  Hermes referee     {str(governance.get('state', 'unknown')).upper()}")
+            state = str(governance.get("state", "unknown"))
+            if state == "safety_verified":
+                print("  Hermes referee     CONNECTED")
+                print("  Hermes safety      READ-ONLY VERIFIED")
+            elif state == "unsafe":
+                print("  Hermes referee     UNSAFE PROFILE")
+            else:
+                print(f"  Hermes referee     {state.upper()}")
             print(f"  Hermes profile     {governance.get('profile', '-')}")
             print("  Human promotion    REQUIRED")
             if governance.get("error"):

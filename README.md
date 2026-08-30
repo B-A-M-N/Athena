@@ -181,9 +181,12 @@ athena self status
 ```
 
 The Hermes host should expose the named profile through its API-server
-multiplexing, with browser, terminal, file, code-execution, and other mutation
-toolsets disabled for that profile. Athena does not grant Hermes any mutation
-authority; the profile hardening is an operator-owned Hermes setting.
+multiplexing with its explicit referee mode enabled (`enabled: true`,
+`policy_version: 1`). Referee mode is a hard no-tools boundary: the profile
+must advertise `runtime.mode = "referee"`,
+`runtime.tool_execution = "disabled"`, and `effective_tools = []`; later MCP
+refreshes must not reintroduce tools. Athena does not grant Hermes any
+mutation authority; the profile hardening is an operator-owned Hermes setting.
 
 The equivalent TOML is:
 
@@ -201,8 +204,10 @@ timeout_seconds = 60
 Before review, Athena performs a cached safety preflight against
 `/v1/models` and `/v1/capabilities`. The selected profile must advertise
 `runtime.mode = "referee"`, `runtime.tool_execution = "disabled"`, referee
-policy version `1`, and `effective_tools = []`. Loopback endpoints are allowed
-by default; remote endpoints require explicit opt-in and HTTPS unless the
+policy version `1`, and `effective_tools = []`. A successful status shows
+`Hermes referee CONNECTED` and `Hermes safety READ-ONLY VERIFIED`; unsafe
+profiles are reported as `UNSAFE PROFILE`. Loopback endpoints are allowed by
+default; remote endpoints require explicit opt-in and HTTPS unless the
 development-only insecure override is enabled. `athena self status` distinguishes
 disconnected, connected-but-unsafe, and safety-verified states.
 
