@@ -33,7 +33,7 @@ from athena.protocol.tasks import (
 )
 from athena.reality.gate import ExecutionDisposition
 from athena.reality.completion import CompletionJournal
-from athena.verification import VerificationPlanner
+from athena.verification import VerificationPlanner, proof_subsumes, verification_proof_id
 
 __all__ = [
     "CandidateVerifier",
@@ -731,6 +731,13 @@ class RealityCoordinator:
         if bool(metadata.get("_athena_self_host")):
             from athena.self_host.gates import SelfHostGatePolicy
 
+            explicit = SelfHostGatePolicy.select_criteria(
+                explicit,
+                changed_resources=changed_resources,
+                impact=impact,
+                task_id=task.id,
+            )
+
             if SelfHostGatePolicy.requires_dependency_proof(changed_resources):
                 dependency_command = SelfHostGatePolicy.dependency_environment_command(task.id)
                 if not any(
@@ -759,7 +766,17 @@ class RealityCoordinator:
             )
         )
         if not explicit:
-            return baseline
+            criteria = tuple(baseline)
+            if bool(metadata.get("_athena_self_host")):
+                from athena.self_host.gates import SelfHostGatePolicy
+
+                return SelfHostGatePolicy.select_criteria(
+                    criteria,
+                    changed_resources=changed_resources,
+                    impact=impact,
+                    task_id=task.id,
+                )
+            return criteria
 
         # Explicit criteria are semantic requirements supplied by the task;
         # they strengthen the project-derived proof instead of replacing it.
@@ -780,6 +797,17 @@ class RealityCoordinator:
             }
         )
         self._plans[task.id] = plan
+        if bool(metadata.get("_athena_self_host")):
+            from athena.self_host.gates import SelfHostGatePolicy
+
+            criteria = _deduplicate_criteria(
+                SelfHostGatePolicy.select_criteria(
+                    criteria,
+                    changed_resources=changed_resources,
+                    impact=impact,
+                    task_id=task.id,
+                )
+            )
         return criteria
 
     async def _verify_or_fail(
@@ -942,25 +970,27 @@ def _impact_tests(impact: Mapping[str, Any] | None) -> tuple[str, ...]:
 
 
 def _deduplicate_criteria(criteria: tuple[Criterion, ...]) -> tuple[Criterion, ...]:
-    """Keep one proof for equivalent checks, preferring explicit criteria."""
-    seen: set[tuple[Any, ...]] = set()
+    """Keep one proof for equivalent checks, preferring stronger proofs."""
     output: list[Criterion] = []
     for criterion in criteria:
         verification = criterion.verification
-        key: tuple[Any, ...]
-        if verification is None:
-            key = ("criterion", criterion.id)
-        else:
-            key = (
-                "verification",
-                verification.type.value,
-                verification.command,
-                verification.path,
-                verification.predicate,
-                verification.capability,
-            )
-        if key in seen:
+        proof_id = (
+            verification_proof_id(verification)
+            if verification is not None
+            else f"criterion:{criterion.id}"
+        )
+        existing_ids = [
+            verification_proof_id(existing.verification)
+            if existing.verification is not None
+            else f"criterion:{existing.id}"
+            for existing in output
+        ]
+        if any(proof_subsumes(existing_id, proof_id) for existing_id in existing_ids):
             continue
-        seen.add(key)
+        output = [
+            existing
+            for existing, existing_id in zip(output, existing_ids)
+            if not proof_subsumes(proof_id, existing_id)
+        ]
         output.append(criterion)
     return tuple(output)

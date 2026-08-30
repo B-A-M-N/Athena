@@ -7,14 +7,18 @@ frozen-base verifier one canonical definition to capture.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 import hashlib
 import json
 from pathlib import Path
+import shlex
 import subprocess
 from dataclasses import dataclass
 
 from athena.release.gates import candidate_commands
+from athena.self_host.risk import SelfHostRiskClassifier
+from athena.verification.identity import command_proof_id
+from athena.protocol.tasks import Criterion
 
 
 class SelfHostGatePolicy:
@@ -82,6 +86,115 @@ class SelfHostGatePolicy:
                     criteria.append(normalized)
                     seen.add(normalized)
         return tuple(criteria)
+
+    @classmethod
+    def select_criteria(
+        cls,
+        criteria: Iterable[Criterion],
+        *,
+        changed_resources: Iterable[str] = (),
+        impact: Mapping[str, object] | None = None,
+        task_id: str = "self-host",
+    ) -> tuple[Criterion, ...]:
+        """Select the service-owned proof matrix for one candidate diff.
+
+        The initial task still carries the complete mandatory command list for
+        provenance.  At candidate proof time this deterministic selector
+        chooses the smallest safe matrix from the actual diff and index
+        impact.  High-risk changes retain every command; dependency changes
+        replace the base-environment Python probes with isolated proof.
+        """
+        from athena.protocol.tasks import VerificationSpec, VerificationType
+
+        resources = tuple(str(value) for value in changed_resources)
+        impact = impact if isinstance(impact, Mapping) else {}
+        risk = SelfHostRiskClassifier.classify(resources)
+        level = str(risk.get("level") or "low")
+        dependency = cls.requires_dependency_proof(resources)
+        native = any(_is_native_path(path) for path in resources)
+        python = any(_is_python_path(path) for path in resources)
+        tests = _impact_tests(impact)
+
+        allowed = {command_proof_id(command) for command in cls.REQUIRED_COMMANDS}
+        if level != "high":
+            allowed = {"architecture"}
+            if python:
+                allowed.update({"python.format", "python.lint", "python.types"})
+                allowed.add("python.full_tests" if not tests else "python.affected_tests")
+            if native:
+                allowed.update({"rust.check", "rust.tests", "native.smoke"})
+            if dependency:
+                allowed.add("dependency.lock")
+            if level == "medium" and not dependency:
+                allowed.add("python.full_tests")
+        if dependency:
+            allowed.difference_update(
+                {
+                    "python.format",
+                    "python.lint",
+                    "python.types",
+                    "python.full_tests",
+                    "python.e2e_tests",
+                }
+            )
+            allowed.add("python.dependency_environment")
+
+        selected: list[Criterion] = []
+        for criterion in criteria:
+            verification = criterion.verification
+            if verification is None:
+                selected.append(criterion)
+                continue
+            proof_id = command_proof_id(verification.command or "")
+            if verification.type is not VerificationType.COMMAND or _proof_allowed(
+                proof_id, allowed
+            ):
+                selected.append(criterion)
+
+        has_affected_test_proof = any(
+            isinstance(item, Criterion)
+            and item.verification is not None
+            and command_proof_id(item.verification.command or "").startswith(
+                "python.affected_tests:"
+            )
+            for item in selected
+        )
+        if tests and python and "python.affected_tests" in allowed and not has_affected_test_proof:
+            selected.append(
+                Criterion(
+                    id="self_host_affected_tests",
+                    description="self-host affected Python tests",
+                    verification=VerificationSpec(
+                        type=VerificationType.COMMAND,
+                        command=cls.affected_tests_command(tests),
+                    ),
+                    required=True,
+                )
+            )
+        if dependency and not any(
+            isinstance(item, Criterion)
+            and item.verification is not None
+            and command_proof_id(item.verification.command or "") == "python.dependency_environment"
+            for item in selected
+        ):
+            selected.append(
+                Criterion(
+                    id="self_host_dependency_environment_proof",
+                    description="self-host isolated offline dependency environment proof",
+                    verification=VerificationSpec(
+                        type=VerificationType.COMMAND,
+                        command=cls.dependency_environment_command(task_id),
+                    ),
+                    required=True,
+                )
+            )
+        return tuple(selected)
+
+    @staticmethod
+    def affected_tests_command(tests: Iterable[str]) -> str:
+        """Build a shell-safe targeted pytest probe from index paths."""
+        paths = tuple(sorted({str(path) for path in tests if str(path).strip()}))[:64]
+        return "uv run --frozen --no-sync pytest -p no:cacheprovider -q " + shlex.join(paths)
 
     @classmethod
     def dependency_sync_command(cls, task_id: str) -> str:
@@ -337,6 +450,32 @@ def _relevant_excerpt(text: str, terms: Iterable[str], budget: int) -> str:
             if section:
                 return section[:budget]
     return text[:budget]
+
+
+def _proof_allowed(proof_id: str, allowed: set[str]) -> bool:
+    if proof_id in {"python.frozen_safety", "architecture.frozen"}:
+        return True
+    if proof_id.startswith("python.affected_tests:"):
+        return "python.affected_tests" in allowed or proof_id in allowed
+    return proof_id in allowed
+
+
+def _is_python_path(path: str) -> bool:
+    return str(path).casefold().endswith((".py", ".pyi"))
+
+
+def _is_native_path(path: str) -> bool:
+    normalized = str(path).replace("\\", "/").casefold()
+    return normalized.startswith("native/") or normalized.endswith(
+        (".rs", "cargo.toml", "cargo.lock")
+    )
+
+
+def _impact_tests(impact: Mapping[str, object]) -> tuple[str, ...]:
+    values = impact.get("affected_tests") or ()
+    if not isinstance(values, (list, tuple, set)):
+        return ()
+    return tuple(sorted({str(value) for value in values if str(value).strip()}))
 
 
 __all__ = ["SelfHostGateBundle", "SelfHostGatePolicy"]

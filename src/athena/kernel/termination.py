@@ -11,7 +11,7 @@ unknown).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 from athena.protocol.messages import (
     CapabilityCallBlock,
@@ -20,6 +20,7 @@ from athena.protocol.messages import (
 )
 from athena.protocol.models import ModelResponse
 from athena.protocol.tasks import Criterion, TaskSpec, TaskStatus
+from athena.protocol.tasks import MutationMode
 
 __all__ = [
     "TerminationDecision",
@@ -77,9 +78,11 @@ class TerminationEvaluator:
         *,
         acceptance_verifier: AcceptanceVerifier | None = None,
         default_max_iterations: int = 100,
+        defer_reality_verification: bool | Callable[[TaskSpec], bool] = False,
     ) -> None:
         self._verifier = acceptance_verifier
         self._default_max_iterations = default_max_iterations
+        self._defer_reality_verification = defer_reality_verification
 
     async def evaluate(
         self,
@@ -126,6 +129,18 @@ class TerminationEvaluator:
                 reason="model did not signal completion",
             )
 
+        # Candidate proof has one owner.  For speculative tasks the reality
+        # coordinator verifies the exact candidate once; running command
+        # criteria here first would duplicate expensive work against a
+        # different verification view.
+        if _should_defer_reality_verification(self._defer_reality_verification, task):
+            return TerminationDecision(
+                terminal=True,
+                reason="candidate verification delegated to reality coordinator",
+                status=TaskStatus.COMPLETE,
+                summary=response_summary(response),
+            )
+
         # The model claims completion. Audit acceptance criteria (BHV-005).
         unresolved = await self._unresolved_criteria(task)
         if unresolved:
@@ -164,6 +179,22 @@ def _claims_complete(response: ModelResponse) -> bool:
 
 def _any_cap(blocks: tuple[ContentBlock, ...]) -> bool:
     return any(isinstance(b, CapabilityCallBlock) for b in blocks)
+
+
+def _reality_owns_verification(task: TaskSpec) -> bool:
+    workspace = task.workspace
+    return bool(workspace is not None and workspace.mutation_mode is MutationMode.SPECULATIVE)
+
+
+def _should_defer_reality_verification(
+    setting: bool | Callable[[TaskSpec], bool], task: TaskSpec
+) -> bool:
+    if callable(setting):
+        try:
+            return bool(setting(task))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+    return bool(setting and _reality_owns_verification(task))
 
 
 def response_summary(response: ModelResponse) -> str:

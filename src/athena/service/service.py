@@ -580,6 +580,10 @@ class AthenaService:
             context_compiler=compiler,
             termination=TerminationEvaluator(
                 acceptance_verifier=verifier,
+                defer_reality_verification=lambda task: (
+                    self._reality_gate.active_branch(task.id) is not None
+                    or self._reality_gate.checkpoint_id(task.id) is not None
+                ),
             ),
             dispatch_factory=self._dispatch_factory,
             continuation_store=continuations,

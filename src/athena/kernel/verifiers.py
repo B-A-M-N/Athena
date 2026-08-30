@@ -27,6 +27,7 @@ from athena.protocol.tasks import (
     PathRule,
 )
 from athena.causal.checkpoint import _run_worker as _run_checkpoint_worker
+from athena.verification.identity import verification_proof_id
 
 _logger = logging.getLogger("athena.verifier")
 
@@ -421,7 +422,7 @@ class CompositeVerifier:
         )
         protected = await _verification_manifest(task.workspace) if guard_workspace else {}
         allowed = _verification_writable_paths(task)
-        verified: dict[tuple[Any, ...], bool] = {}
+        verified: dict[str, bool] = {}
         for criterion in criteria:
             spec = criterion.verification
             if spec is None:
@@ -470,15 +471,9 @@ class CompositeVerifier:
         return results
 
 
-def _verification_semantic_id(spec: VerificationSpec) -> tuple[Any, ...]:
+def _verification_semantic_id(spec: VerificationSpec) -> str:
     """Identify equivalent probes without depending on object identity."""
-    return (
-        spec.type.value,
-        spec.command or "",
-        spec.path or "",
-        spec.predicate or "",
-        spec.capability or "",
-    )
+    return verification_proof_id(spec)
 
 
 def _task_verification_environment(task: TaskSpec) -> Any:

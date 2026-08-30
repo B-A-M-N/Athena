@@ -8,7 +8,7 @@ import pytest
 from athena.kernel.termination import TerminationDecision, TerminationEvaluator
 from athena.protocol.models import ModelResponse, UsageInfo
 from athena.protocol.messages import CapabilityCallBlock, TextBlock
-from athena.protocol.tasks import Criterion, TaskSpec
+from athena.protocol.tasks import Criterion, MutationMode, TaskSpec, TaskStatus, WorkspaceSpec
 
 
 @pytest.fixture
@@ -74,3 +74,36 @@ async def test_truth_outranks_success_unverified_criteria(evaluator):
     assert decision.terminal is True
     assert decision.status.value == "PARTIAL"
     assert "c1" in decision.unresolved
+
+
+async def test_reality_coordinator_owns_speculative_candidate_proof():
+    class _CountingVerifier:
+        calls = 0
+
+        async def verify(self, task, criteria):
+            self.calls += 1
+            return [True for _ in criteria]
+
+    verifier = _CountingVerifier()
+    evaluator = TerminationEvaluator(
+        acceptance_verifier=verifier,
+        defer_reality_verification=lambda task: task.id == "candidate",
+    )
+    task = TaskSpec(
+        id="candidate",
+        objective="patch source",
+        acceptance_criteria=(Criterion(id="command", description="proof"),),
+        workspace=WorkspaceSpec(
+            id="workspace",
+            root="/tmp/project",
+            mutation_mode=MutationMode.SPECULATIVE,
+        ),
+    )
+
+    decision = await evaluator.evaluate(
+        task, _response([TextBlock(type="text", text="done")]), iterations=1
+    )
+
+    assert decision.status is TaskStatus.COMPLETE
+    assert "delegated" in decision.reason
+    assert verifier.calls == 0
