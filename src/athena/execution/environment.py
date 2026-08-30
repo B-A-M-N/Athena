@@ -36,7 +36,11 @@ class VerificationEnvironment:
     @classmethod
     def from_project(cls, root: str, *, require_sandbox: bool = True) -> "VerificationEnvironment":
         project_root = str(Path(root).resolve())
-        environment_root = Path(project_root) / ".venv"
+        configured_root = os.environ.get("UV_PROJECT_ENVIRONMENT")
+        environment_root = Path(configured_root or (Path(project_root) / ".venv"))
+        if not environment_root.is_absolute():
+            environment_root = Path(project_root) / environment_root
+        environment_root = environment_root.resolve()
         python = environment_root / "bin" / "python"
         uv = shutil.which("uv")
         required = {
@@ -98,9 +102,16 @@ class VerificationEnvironment:
             raise ValueError("verification environment has no project root")
         environment_root = record.get("environment_root")
         if environment_root is not None:
-            expected = str(Path(project_root).resolve() / ".venv")
-            if str(Path(str(environment_root)).resolve()) != expected:
-                raise ValueError("verification environment is not bound to project .venv")
+            environment_root = str(Path(str(environment_root)).resolve())
+            if not os.path.isabs(environment_root):
+                raise ValueError("verification environment root must be absolute")
+            configured = dict(record.get("environment") or {}).get("UV_PROJECT_ENVIRONMENT")
+            if configured:
+                configured_path = Path(str(configured))
+                if not configured_path.is_absolute():
+                    configured_path = Path(project_root) / configured_path
+                if configured_path.resolve() != Path(environment_root):
+                    raise ValueError("verification environment root does not match its binding")
         mounts = tuple(str(path) for path in (record.get("readonly_mounts") or ()))
         if not mounts or any(not os.path.isabs(path) for path in mounts):
             raise ValueError("verification environment has invalid read-only mounts")

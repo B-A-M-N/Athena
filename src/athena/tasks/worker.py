@@ -132,6 +132,19 @@ class TaskWorker:
     async def _worker_loop(self, *, worker_id: int) -> None:
         wid = f"worker-{worker_id}-{os.getpid()}"
         while not self._stop.is_set():
+            # Allow an already-running worker pool to be quiesced by updating
+            # its config.  This is also the durable restart boundary: a
+            # queued task must remain QUEUED while the operator has paused
+            # claiming, even if the pool was started before the pause.
+            if self._config.max_parallel <= 0:
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._wake.wait(), min(max(self._config.poll_wait_s, 0.01), 0.5)
+                    )
+                except TimeoutError:
+                    pass
+                continue
             self._wake.clear()
             task_id = await self._claim(worker_id=wid)
             if task_id is None:
@@ -277,7 +290,10 @@ class TaskWorker:
 
     @property
     def _max_parallel(self) -> int:
-        return max(1, self._config.max_parallel)
+        # Zero is a supported paused-worker state used during durable restart
+        # tests and operator quiescing.  A negative value remains invalid but
+        # must not accidentally create a worker either.
+        return max(0, self._config.max_parallel)
 
 
 def _database_is_closed(error: BaseException) -> bool:
