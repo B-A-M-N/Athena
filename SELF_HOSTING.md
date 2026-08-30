@@ -35,23 +35,26 @@ athena self continue
 athena self status
 ```
 
-To add the optional local Hermes Agent referee, configure it once:
+To provision the local Hermes Agent referee, use the Hermes checkout explicitly:
 
 ```bash
-athena config set hermes-referee.enabled true
-athena config set hermes-referee.endpoint http://127.0.0.1:8642
-athena config set hermes-referee.profile athena-referee
+athena referee setup --hermes-root /path/to/hermes-agent
 athena self status
 ```
 
-On the Hermes host, create and harden the `athena-referee` profile, enable its
-API-server multiplex route and explicit referee mode (`enabled: true`,
-`policy_version: 1`), and start Hermes. Referee mode exposes no model-visible
-tools and advertises `runtime.mode: referee`,
-`runtime.tool_execution: disabled`, and `referee.effective_tools: []`; later
-MCP refreshes must preserve that empty surface. The Hermes API key belongs in
-the host secret store; reference it from Athena with
-`hermes-referee.credential-id` rather than placing the key in `config.toml`.
+The named `athena-referee` profile should be the profile clone you prepared in
+Hermes. Provisioning pins the service to the supplied Hermes runtime, binds
+the API to `127.0.0.1:8643`, disables messaging/MCP/background paths, installs
+the user service, and proves `/models`, `/capabilities`, and one structured
+review before Athena is enabled. The capability proof requires
+`runtime.mode: referee`, `runtime.tool_execution: disabled`,
+`referee.effective_tools: []`, and `build.referee_contract: 1`; late MCP
+refreshes cannot repopulate the effective tool surface.
+
+The generated bearer key is kept in the owner-only user secret store at
+`~/.config/athena/secrets/HERMES_REFEREE_API_KEY` and is never placed in
+`config.toml`. Use `athena referee status`, `athena referee repair`, or
+`athena referee disable` for lifecycle operations.
 
 `athena self status` reports Athena proof readiness, Hermes connectivity,
 separate read-only safety verification, profile, and the invariant that human

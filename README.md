@@ -171,40 +171,47 @@ boundaries to a local Hermes Agent profile. Hermes is advisory only: Athena's
 deterministic proof remains authoritative, and human promotion is always
 required.
 
-Enable it once with the operator config command:
+Provision the dedicated service from the Hermes checkout (the command keeps the
+bearer key out of Athena's TOML and passes it to Hermes over stdin):
 
 ```bash
-athena config set hermes-referee.enabled true
-athena config set hermes-referee.endpoint http://127.0.0.1:8642
-athena config set hermes-referee.profile athena-referee
+athena referee setup --hermes-root /path/to/hermes-agent
 athena self status
 ```
 
-The Hermes host should expose the named profile through its API-server
-multiplexing with its explicit referee mode enabled (`enabled: true`,
-`policy_version: 1`). Referee mode is a hard no-tools boundary: the profile
-must advertise `runtime.mode = "referee"`,
-`runtime.tool_execution = "disabled"`, and `effective_tools = []`; later MCP
-refreshes must not reintroduce tools. Athena does not grant Hermes any
-mutation authority; the profile hardening is an operator-owned Hermes setting.
+The Hermes profile must already exist (for example, a profile clone named
+`athena-referee`). Provisioning makes it API-only on loopback port `8643`,
+disables messaging, MCP, multiplexing, and background helpers, installs the
+user service, and proves the live API before enabling Athena. The live contract
+also includes `build.referee_contract = 1`, which detects a stale or different
+Hermes checkout. Re-running setup is safe; use `athena referee repair` to
+reconcile a changed runtime and `athena referee status` to inspect it.
 
 The equivalent TOML is:
 
 ```toml
 [hermes_referee]
 enabled = true
-endpoint = "http://127.0.0.1:8642"
+managed = true
+endpoint = "http://127.0.0.1:8643"
 profile = "athena-referee"
 timeout_seconds = 60
+runtime_root = "/path/to/hermes-agent"
+required_for_self_host = true
 # allow_remote = true                 # required for a non-loopback endpoint
 # allow_insecure_remote = true        # development-only HTTP exception
-# credential_id = "HERMES_API_KEY"  # optional managed secret name
+# credential_id = "HERMES_REFEREE_API_KEY"
 ```
+
+The generated key is stored at `~/.config/athena/secrets/HERMES_REFEREE_API_KEY`
+with owner-only permissions. A system-wide operator may instead provision
+`/etc/athena/secrets/HERMES_REFEREE_API_KEY` with owner-only permissions.
+Neither location is written to Git.
 
 Before review, Athena performs a cached safety preflight against
 `/v1/models` and `/v1/capabilities`. The selected profile must advertise
 `runtime.mode = "referee"`, `runtime.tool_execution = "disabled"`, referee
-policy version `1`, and `effective_tools = []`. A successful status shows
+policy version `1`, `effective_tools = []`, and the referee build contract. A successful status shows
 `Hermes referee CONNECTED` and `Hermes safety READ-ONLY VERIFIED`; unsafe
 profiles are reported as `UNSAFE PROFILE`. Loopback endpoints are allowed by
 default; remote endpoints require explicit opt-in and HTTPS unless the

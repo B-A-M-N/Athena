@@ -241,9 +241,28 @@ def _cmd_config(o: "Options", config: Any) -> int:
         print(f"  credential_id: {settings.credential_id or '-'}")
         print(f"  allow_remote: {str(settings.allow_remote).lower()}")
         print(f"  allow_insecure_remote: {str(settings.allow_insecure_remote).lower()}")
+        print(f"  managed: {str(settings.managed).lower()}")
+        print(f"  runtime_root: {settings.runtime_root or '-'}")
+        print(f"  required_for_self_host: {str(settings.required_for_self_host).lower()}")
         return 0
     print("athena config: use 'set KEY VALUE' or 'show'", file=sys.stderr)
     return 2
+
+
+def _cmd_referee(o: "Options") -> int:
+    """Run an explicit Hermes referee lifecycle action."""
+    from athena.hermes.manager import run_referee_action
+
+    return run_referee_action(
+        o.referee_action or "status",
+        config_path=o.config_path,
+        runtime_root=o.hermes_root,
+        profile=o.referee_profile,
+        endpoint=o.referee_endpoint,
+        host=o.referee_host,
+        port=o.referee_port,
+        credential_id=o.referee_credential_id,
+    )
 
 
 def _doctor_display(o: "Options", config: Any) -> int:
@@ -363,11 +382,20 @@ class Options:
     config_action: str | None = None
     config_key: str | None = None
     config_value: str | None = None
+    referee_action: str | None = None
+    hermes_root: str | None = None
+    referee_profile: str = "athena-referee"
+    referee_endpoint: str = ""
+    referee_host: str = "127.0.0.1"
+    referee_port: int = 8643
+    referee_credential_id: str = "HERMES_REFEREE_API_KEY"
     _providers: tuple[Any, ...] = ()
 
 
 def dispatch(o: Options) -> int:
     """Run a parsed command synchronously (asyncio.run at the top)."""
+    if o.command == "referee":
+        return _cmd_referee(o)
     try:
         config = build_config(o)
     except ValueError as exc:
@@ -933,6 +961,56 @@ def _click_cli(click: Any):
         o.config_value = value
         sys.exit(dispatch(o))
 
+    @cli.group()
+    @click.pass_context
+    def referee(ctx):
+        """Provision and verify Athena's dedicated Hermes referee."""
+
+    def referee_options(func):
+        for decorator in (
+            click.option("--hermes-root", default=None, help="Hermes source/runtime root."),
+            click.option("--profile", "referee_profile", default="athena-referee"),
+            click.option("--endpoint", "referee_endpoint", default=""),
+            click.option("--host", "referee_host", default="127.0.0.1"),
+            click.option("--port", "referee_port", default=8643, type=int),
+            click.option(
+                "--credential-id", "referee_credential_id", default="HERMES_REFEREE_API_KEY"
+            ),
+        ):
+            func = decorator(func)
+        return func
+
+    def finish_referee(ctx, action, values):
+        o = base_options(ctx, "referee")
+        o.referee_action = action
+        for key, value in values.items():
+            setattr(o, key, value)
+        sys.exit(dispatch(o))
+
+    @referee.command("setup")
+    @referee_options
+    @click.pass_context
+    def referee_setup(ctx, **kw):
+        finish_referee(ctx, "setup", kw)
+
+    @referee.command("status")
+    @referee_options
+    @click.pass_context
+    def referee_status(ctx, **kw):
+        finish_referee(ctx, "status", kw)
+
+    @referee.command("repair")
+    @referee_options
+    @click.pass_context
+    def referee_repair(ctx, **kw):
+        finish_referee(ctx, "repair", kw)
+
+    @referee.command("disable")
+    @referee_options
+    @click.pass_context
+    def referee_disable(ctx, **kw):
+        finish_referee(ctx, "disable", kw)
+
     @doctor.command("display")
     @click.pass_context
     def doctor_display(ctx):
@@ -1128,6 +1206,20 @@ def _arg_parse(argv: list[str]) -> Options:
     config_set = config_sub.add_parser("set", help="Set one supported operator setting.")
     config_set.add_argument("key")
     config_set.add_argument("value")
+    sp = sub.add_parser("referee", help="Manage the dedicated Hermes referee.")
+    referee_sub = sp.add_subparsers(dest="referee_action", required=True)
+    for action in ("setup", "status", "repair", "disable"):
+        referee_parser = referee_sub.add_parser(action)
+        referee_parser.add_argument("--hermes-root", default=None)
+        referee_parser.add_argument(
+            "--profile", dest="referee_profile", default="athena-referee"
+        )
+        referee_parser.add_argument("--endpoint", dest="referee_endpoint", default="")
+        referee_parser.add_argument("--host", dest="referee_host", default="127.0.0.1")
+        referee_parser.add_argument("--port", dest="referee_port", default=8643, type=int)
+        referee_parser.add_argument(
+            "--credential-id", dest="referee_credential_id", default="HERMES_REFEREE_API_KEY"
+        )
     sp = sub.add_parser("oi-stream", help="Stream the live OI projection.")
     globals_(sp)
     sp.add_argument("--task", dest="task_id", default=None)
@@ -1152,6 +1244,13 @@ def _arg_parse(argv: list[str]) -> Options:
         criteria=getattr(ns, "criteria", None),
         deny=getattr(ns, "deny", False) if command == "approve" else False,
         review_task_id=getattr(ns, "review_task_id", None),
+        referee_action=getattr(ns, "referee_action", None),
+        hermes_root=getattr(ns, "hermes_root", None),
+        referee_profile=getattr(ns, "referee_profile", "athena-referee"),
+        referee_endpoint=getattr(ns, "referee_endpoint", ""),
+        referee_host=getattr(ns, "referee_host", "127.0.0.1"),
+        referee_port=getattr(ns, "referee_port", 8643),
+        referee_credential_id=getattr(ns, "referee_credential_id", "HERMES_REFEREE_API_KEY"),
     )
     if command == "doctor":
         o.args = [ns.target]

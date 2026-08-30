@@ -26,6 +26,7 @@ __all__ = ["HermesAgentEvaluator", "HermesRefereePreflight", "HermesRefereeSafet
 _MAX_PACKET_BYTES = 128 * 1024
 _MAX_RESPONSE_BYTES = 32 * 1024
 _REFEREE_POLICY_VERSION = 1
+_REFEREE_CONTRACT_VERSION = 1
 _PREFLIGHT_TTL_SECONDS = 45.0
 _REFEREE_SYSTEM_PROMPT = """You are Athena's read-only adversarial referee.
 
@@ -72,6 +73,7 @@ class HermesRefereePreflight:
             "read_only_verified": self.read_only_verified,
             "runtime": dict(self.capabilities.get("runtime") or {}),
             "referee": dict(self.capabilities.get("referee") or {}),
+            "build": dict(self.capabilities.get("build") or {}),
         }
 
 
@@ -203,15 +205,36 @@ class HermesAgentEvaluator:
         if not isinstance(runtime, Mapping) or not isinstance(referee, Mapping):
             raise HermesRefereeSafetyError("Hermes referee capability contract is missing")
         if runtime.get("mode") != "referee":
-            raise HermesRefereeSafetyError("Hermes profile is not in referee mode")
+            raise HermesRefereeSafetyError(
+                "Hermes referee safety verification failed: expected runtime.mode=referee; "
+                f"observed {runtime.get('mode', '<missing>')!r}. "
+                "The endpoint may be bound to a different Hermes runtime."
+            )
         if runtime.get("tool_execution") != "disabled":
-            raise HermesRefereeSafetyError("Hermes referee tool execution is not disabled")
+            raise HermesRefereeSafetyError(
+                "Hermes referee safety verification failed: expected "
+                f"runtime.tool_execution=disabled; observed {runtime.get('tool_execution', '<missing>')!r}"
+            )
         if referee.get("enabled") is not True:
-            raise HermesRefereeSafetyError("Hermes referee mode is not enabled")
+            raise HermesRefereeSafetyError(
+                "Hermes referee safety verification failed: referee.enabled is not true"
+            )
         if referee.get("policy_version") != _REFEREE_POLICY_VERSION:
-            raise HermesRefereeSafetyError("Hermes referee policy version is unsupported")
+            raise HermesRefereeSafetyError(
+                "Hermes referee safety verification failed: unsupported referee.policy_version "
+                f"{referee.get('policy_version', '<missing>')!r}"
+            )
         if referee.get("effective_tools") != []:
-            raise HermesRefereeSafetyError("Hermes referee exposes model-visible tools")
+            raise HermesRefereeSafetyError(
+                "Hermes referee safety verification failed: effective_tools is not empty"
+            )
+        build = capabilities.get("build")
+        if not isinstance(build, Mapping) or build.get("referee_contract") != _REFEREE_CONTRACT_VERSION:
+            raise HermesRefereeSafetyError(
+                "Hermes referee safety verification failed: required referee contract is absent "
+                f"or unsupported (observed {dict(build) if isinstance(build, Mapping) else '<missing>'!r}). "
+                "The endpoint is probably bound to a stale or different Hermes runtime."
+            )
 
         result = HermesRefereePreflight(
             endpoint=self.endpoint,

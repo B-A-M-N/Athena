@@ -7,6 +7,10 @@ from athena.hermes.referee import (
     HermesVerdict,
     ReviewPacket,
 )
+from athena.hermes.manager import (
+    HermesRefereeManager,
+    HermesRefereeManagerError,
+)
 
 __all__ = [
     "HermesAgentEvaluator",
@@ -14,4 +18,6 @@ __all__ = [
     "HermesReferee",
     "HermesVerdict",
     "ReviewPacket",
+    "HermesRefereeManager",
+    "HermesRefereeManagerError",
 ]

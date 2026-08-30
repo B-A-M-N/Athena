@@ -77,7 +77,7 @@ from athena.models.providers.anthropic import AnthropicProvider
 from athena.models.providers.fake import FakeModelProvider
 from athena.models.providers.openai_compat import OpenAICompatProvider
 from athena.models.registry import ProviderRegistry
-from athena.policy.credentials import EnvSource, SecretManager, FileSource
+from athena.policy.credentials import SecretManager
 from athena.policy.engine import PolicyEngine
 from athena.scheduler.scheduler import Scheduler
 from athena.skills.lifecycle import SkillLifecycle, SkillStore
@@ -378,10 +378,9 @@ class AthenaService:
         self._failure_memory = FailureMemory(db)
 
         # 2. Credentials (SecretManager owns resolution + leases).
-        self._secrets = SecretManager(
-            sources=[EnvSource(), FileSource("/etc/athena/secrets")],
-        )
+        self._secrets = SecretManager()
         self._configure_hermes_referee()
+        await self._preflight_hermes_referee()
 
         # 3. Execution + runtimes.
         runtime_sessions = RuntimeSessionStore(db)
@@ -1135,6 +1134,9 @@ class AthenaService:
             "profile": settings.profile,
             "endpoint": settings.endpoint,
             "policy_fingerprint": preflight.policy_fingerprint,
+            "runtime": dict(preflight.capabilities.get("runtime") or {}),
+            "referee": dict(preflight.capabilities.get("referee") or {}),
+            "build": dict(preflight.capabilities.get("build") or {}),
         }
 
     async def _recover_approved_continuations(
@@ -1238,6 +1240,7 @@ class AthenaService:
         verification mounts or review boundary.  The CLI is only a caller of
         this service-owned orchestration entrypoint.
         """
+        await self._require_verified_hermes_referee()
         tm = self._require_task_manager()
         root = str(Path(workspace_root or os.getcwd()).resolve())
         planned_task_id = task_id or new_id("task")
@@ -4669,6 +4672,87 @@ class AthenaService:
         if pc.api_key is not None:
             return pc.api_key
         return ""
+
+    async def _preflight_hermes_referee(self) -> None:
+        """Run the optional safety probe without blocking normal startup."""
+        settings = self.config.hermes_referee
+        if not settings.enabled:
+            return
+        evaluator = self._hermes_adapter
+        if evaluator is None:
+            evaluator = self._hermes_referee
+        preflight = getattr(evaluator, "preflight", None)
+        if not callable(preflight):
+            reason = "Hermes referee does not expose a safety preflight"
+            self._hermes_status_error = reason
+            self._startup_health["checks"]["hermes_referee"] = {
+                "status": "degraded",
+                "blocking": False,
+                "state": "unverified",
+                "profile": settings.profile,
+                "endpoint": settings.endpoint,
+                "error": reason,
+            }
+            return
+        try:
+            result = preflight()
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            reason = str(exc)
+            self._hermes_status_error = reason
+            self._startup_health["checks"]["hermes_referee"] = {
+                "status": "degraded",
+                "blocking": False,
+                "state": "unsafe",
+                "profile": settings.profile,
+                "endpoint": settings.endpoint,
+                "error": reason,
+            }
+            return
+        record = result.to_record() if hasattr(result, "to_record") else {}
+        self._startup_health["checks"]["hermes_referee"] = {
+            "status": "ok",
+            "blocking": False,
+            "state": "safety_verified",
+            "profile": settings.profile,
+            "endpoint": settings.endpoint,
+            "runtime": record.get("runtime", {}),
+            "referee": record.get("referee", {}),
+            "build": record.get("build", {}),
+        }
+        self._hermes_status_error = None
+
+    async def _require_verified_hermes_referee(self) -> None:
+        """Refuse self-host work when an enabled referee is not proven safe."""
+        settings = self.config.hermes_referee
+        if not settings.enabled or not settings.required_for_self_host:
+            return
+        if self._hermes_adapter is None:
+            reason = self._hermes_status_error or "Hermes referee is not configured"
+            raise RuntimeError(
+                "Self-hosting refused: Hermes referee is configured as required "
+                f"but has not proven its read-only runtime contract ({reason}). "
+                "Run `athena referee repair`."
+            )
+        try:
+            preflight = await self._hermes_adapter.preflight()
+        except Exception as exc:
+            self._hermes_status_error = str(exc)
+            raise RuntimeError(
+                "Self-hosting refused: Hermes referee safety verification failed "
+                f"({exc}). Run `athena referee repair`."
+            ) from exc
+        self._startup_health["checks"]["hermes_referee"] = {
+            "status": "ok",
+            "blocking": False,
+            "state": "safety_verified",
+            "profile": settings.profile,
+            "endpoint": settings.endpoint,
+            "runtime": dict(preflight.capabilities.get("runtime") or {}),
+            "referee": dict(preflight.capabilities.get("referee") or {}),
+            "build": dict(preflight.capabilities.get("build") or {}),
+        }
 
     def _configure_hermes_referee(self) -> None:
         """Build the optional transport after the secret boundary exists."""

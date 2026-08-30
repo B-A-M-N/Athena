@@ -107,6 +107,7 @@ async def test_agent_adapter_preflight_requires_referee_contract_and_caches_succ
                     "policy_version": 1,
                     "effective_tools": [],
                 },
+                "build": {"referee_contract": 1},
             },
         )
 

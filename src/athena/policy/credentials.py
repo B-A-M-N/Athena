@@ -66,8 +66,9 @@ class FileSource(SecretSource):
     name = "file"
     _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
-    def __init__(self, base_dir: str | None = None) -> None:
+    def __init__(self, base_dir: str | None = None, *, require_private: bool = False) -> None:
         self._base_dir = base_dir
+        self._require_private = require_private
 
     def resolve(self, name: str) -> str | None:
         if not name or self._NAME.fullmatch(str(name)) is None:
@@ -84,10 +85,60 @@ class FileSource(SecretSource):
             if candidate.is_absolute():
                 return None
         try:
+            if self._require_private and candidate.stat().st_mode & 0o077:
+                return None
             with open(candidate, "r", encoding="utf-8") as fh:
                 return fh.read().strip()
         except OSError:
             return None
+
+
+def user_secret_dir() -> Path:
+    """Return the per-user XDG secret directory used by Athena."""
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(configured).expanduser() if configured else Path.home() / ".config"
+    return root / "athena" / "secrets"
+
+
+def write_user_secret(name: str, value: str) -> Path:
+    """Atomically write one owner-only user secret and return its path."""
+    if FileSource._NAME.fullmatch(str(name)) is None:
+        raise ValueError("invalid secret name")
+    if not value or "\n" in value or "\r" in value:
+        raise ValueError("secret value must be non-empty and single-line")
+    root = user_secret_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    temporary = root / f".{name}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o600)
+        destination = root / str(name)
+        os.replace(temporary, destination)
+        return destination
+    finally:
+        if fd != -1:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def delete_user_secret(name: str) -> None:
+    """Remove one user secret if present."""
+    if FileSource._NAME.fullmatch(str(name)) is None:
+        return
+    try:
+        (user_secret_dir() / str(name)).unlink()
+    except FileNotFoundError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -143,7 +194,8 @@ class SecretManager:
     ) -> None:
         default_sources: list[SecretSource] = [
             EnvSource(),
-            FileSource("/etc/athena/secrets"),
+            FileSource(str(user_secret_dir()), require_private=True),
+            FileSource("/etc/athena/secrets", require_private=True),
         ]
         self._sources: list[SecretSource] = (
             list(sources) if sources is not None else default_sources

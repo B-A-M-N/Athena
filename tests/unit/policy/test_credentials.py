@@ -1,10 +1,36 @@
 import pytest
 
-from athena.policy.credentials import EnvSource, SecretError, SecretManager
+from athena.policy.credentials import (
+    EnvSource,
+    FileSource,
+    SecretError,
+    SecretManager,
+    write_user_secret,
+)
 
 
 def _manager() -> SecretManager:
     return SecretManager(sources=[])
+
+
+def test_user_secret_writer_is_owner_only_and_resolvable(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    path = write_user_secret("HERMES_REFEREE_API_KEY", "test-only-secret")
+
+    assert path.read_text() == "test-only-secret"
+    assert path.stat().st_mode & 0o077 == 0
+    assert path.parent.stat().st_mode & 0o077 == 0
+    assert FileSource(str(path.parent), require_private=True).resolve(
+        "HERMES_REFEREE_API_KEY"
+    ) == "test-only-secret"
+
+
+def test_private_file_source_rejects_loose_secret(tmp_path):
+    path = tmp_path / "secret"
+    path.write_text("test-only-secret")
+    path.chmod(0o644)
+
+    assert FileSource(str(tmp_path), require_private=True).resolve("secret") is None
 
 
 def test_env_source_supports_provider_standard_name(monkeypatch):

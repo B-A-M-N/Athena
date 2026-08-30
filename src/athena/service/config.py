@@ -141,7 +141,7 @@ class HermesRefereeConfig:
     """Optional operator-configured Hermes Agent governance endpoint."""
 
     enabled: bool = False
-    endpoint: str = "http://127.0.0.1:8642"
+    endpoint: str = "http://127.0.0.1:8643"
     profile: str = "athena-referee"
     timeout_seconds: float = 60.0
     credential_id: str | None = None
@@ -149,6 +149,9 @@ class HermesRefereeConfig:
     # endpoints remain valid over HTTP for local deployments.
     allow_remote: bool = False
     allow_insecure_remote: bool = False
+    managed: bool = False
+    runtime_root: str | None = None
+    required_for_self_host: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +322,9 @@ def _parse_hermes_referee(data: Any) -> HermesRefereeConfig:
         credential_id=str(credential_id) if credential_id else None,
         allow_remote=bool(data.get("allow_remote", False)),
         allow_insecure_remote=bool(data.get("allow_insecure_remote", False)),
+        managed=bool(data.get("managed", False)),
+        runtime_root=str(data.get("runtime_root")) if data.get("runtime_root") else None,
+        required_for_self_host=bool(data.get("required_for_self_host", True)),
     )
 
 
@@ -391,9 +397,16 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
             "timeout_seconds": config.hermes_referee.timeout_seconds,
             "allow_remote": config.hermes_referee.allow_remote,
             "allow_insecure_remote": config.hermes_referee.allow_insecure_remote,
+            "managed": config.hermes_referee.managed,
+            "required_for_self_host": config.hermes_referee.required_for_self_host,
             **(
                 {"credential_id": config.hermes_referee.credential_id}
                 if config.hermes_referee.credential_id
+                else {}
+            ),
+            **(
+                {"runtime_root": config.hermes_referee.runtime_root}
+                if config.hermes_referee.runtime_root
                 else {}
             ),
         }
