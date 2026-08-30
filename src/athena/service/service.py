@@ -1165,9 +1165,15 @@ class AthenaService:
         """
         tm = self._require_task_manager()
         root = str(Path(workspace_root or os.getcwd()).resolve())
-        workspace = WorkspaceSpec(id="athena-self", root=root)
         planned_task_id = task_id or new_id("task")
         bundle = SelfHostGateBundle.capture(root, allow_dirty=_allow_known_dirty)
+        # Bind the task-local context cache and execution provenance to the
+        # source revision that the self-host authority actually captured.
+        workspace = WorkspaceSpec(
+            id="athena-self",
+            root=root,
+            revision=bundle.source_revision,
+        )
         base_fingerprint = await self.shadow_engine().workspace_fingerprint(root)
         if plan is None:
             coordinator = self._project_index_coordinator
@@ -3765,6 +3771,7 @@ class AthenaService:
                 privacy=str(spec.get("privacy") or "local-preferred"),
                 require_tools=bool(spec.get("require_tools", False)),
                 max_cost_usd=max_cost,
+                routing_preference=str(spec.get("routing_preference") or "balanced"),
             )
         return out
 
@@ -4407,6 +4414,7 @@ class AthenaService:
                     provider=pc.name,
                     scripts=list(pc.extra.get("scripts") or []),
                     cost=pc.extra.get("cost"),
+                    latency_class=pc.latency_class or pc.extra.get("latency_class"),
                 )
                 registry.register(pc.name, provider)
                 registry.set_profile(pc.name, resolve_profile("fake", model_id=pc.model))
@@ -4433,6 +4441,7 @@ class AthenaService:
                     timeout=float(pc.extra.get("timeout", 60.0)),
                     http2=bool(pc.extra.get("http2", False)),
                     cost=pc.extra.get("cost"),
+                    latency_class=pc.latency_class or pc.extra.get("latency_class"),
                 )
             elif profile.protocol == "anthropic":
                 provider = AnthropicProvider(
@@ -4444,6 +4453,7 @@ class AthenaService:
                     timeout=float(pc.extra.get("timeout", 60.0)),
                     use_sdk=bool(pc.extra.get("use_sdk", True)),
                     cost=pc.extra.get("cost"),
+                    latency_class=pc.latency_class or pc.extra.get("latency_class"),
                 )
             else:
                 raise ValueError(f"unsupported provider protocol: {profile.protocol!r}")

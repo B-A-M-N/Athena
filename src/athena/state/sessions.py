@@ -369,6 +369,7 @@ def _serialize_workspace(ws: WorkspaceSpec | None) -> str | None:
             "execution_backend": ws.execution_backend,
             "network_policy": ws.network_policy.value,
             "mutation_mode": ws.mutation_mode.value,
+            "revision": ws.revision,
         }
     )
 
@@ -423,6 +424,7 @@ def _serialize_model_policy(mp: ModelPolicy) -> str:
             "require_tools": mp.require_tools,
             "privacy": mp.privacy,
             "max_cost_usd": str(mp.max_cost_usd) if mp.max_cost_usd is not None else None,
+            "routing_preference": mp.routing_preference,
         }
     )
 

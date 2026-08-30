@@ -48,6 +48,10 @@ class _EvidenceCapRegistry(_CapRegistry):
         ]
 
 
+class _RevisionedCapRegistry(_CapRegistry):
+    generation = 1
+
+
 class _ContextBlockStore:
     async def list(self, *, scopes, attached_only, limit):
         assert attached_only is True
@@ -155,6 +159,29 @@ async def test_strategy_preserves_fabric_proof_and_workspace_scope():
     assert evidence.proof["all_passed"] is True
     assert evidence.proof["optimizer"]["dependency_available"] is True
     assert evidence.output_schema["type"] == "object"
+
+
+@pytest.mark.asyncio
+async def test_static_context_cache_is_partitioned_by_workspace_revision():
+    registry = _RevisionedCapRegistry(
+        [CapabilityDescriptor(id="files.read", description="read", input_schema={})]
+    )
+    compiler = ContextCompiler(capability_registry=registry)
+    first = _task(
+        workspace=WorkspaceSpec(id="repo", root="/tmp/repo", revision="rev-1"),
+        model_policy=ModelPolicy(require_tools=False),
+    )
+    second = _task(
+        workspace=WorkspaceSpec(id="repo", root="/tmp/repo", revision="rev-2"),
+        model_policy=ModelPolicy(require_tools=False),
+    )
+
+    await compiler.compile(first)
+    await compiler.compile(first)
+    assert len(compiler._static_cache) == 1  # noqa: SLF001 - cache contract
+
+    await compiler.compile(second)
+    assert len(compiler._static_cache) == 2  # noqa: SLF001 - cache contract
 
 
 @pytest.mark.athena_claim("BHV-029")

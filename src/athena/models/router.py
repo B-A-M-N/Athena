@@ -47,6 +47,7 @@ _PRIVACY_RANK: dict[PrivacyClass, int] = {
 }
 
 _LATENCY_CLASS_RANK = {"fast": 0, "medium": 1, "slow": 2}
+_ROUTING_PREFERENCES = frozenset({"balanced", "latency", "cost"})
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,11 @@ class ModelRouter:
             require_tools=bool(policy.require_tools or role_policy.require_tools),
             privacy=_stricter_policy_privacy(policy.privacy, role_policy.privacy),
             max_cost_usd=_min_cost(policy.max_cost_usd, role_policy.max_cost_usd),
+            routing_preference=(
+                policy.routing_preference
+                if policy.routing_preference != "balanced"
+                else role_policy.routing_preference
+            ),
         )
 
     async def select(
@@ -218,7 +224,9 @@ class ModelRouter:
         history_used = any((info.provider, info.id, policy.role) in stats for info in candidates)
         best = min(
             candidates,
-            key=lambda info: self._selection_key(info, stats, policy.role),
+            key=lambda info: self._selection_key(
+                info, stats, policy.role, policy.routing_preference
+            ),
         )
         return ModelSelection(
             provider=best.provider,
@@ -285,6 +293,7 @@ class ModelRouter:
         info: ModelInfo,
         stats: Mapping[tuple[str, str, str], tuple[int, int, float]],
         role: str,
+        routing_preference: str = "balanced",
     ) -> tuple:
         attempts, successes, total_latency = stats.get((info.provider, info.id, role), (0, 0, 0.0))
         # Use a small conservative prior (three successes, one failure).
@@ -296,12 +305,22 @@ class ModelRouter:
         # known slow model merely because it has no history yet.
         latency_observed = 0 if attempts else 1
         latency_value = total_latency / attempts if attempts else _declared_latency_rank(info)
+        preference = str(routing_preference or "balanced").casefold()
+        if preference not in _ROUTING_PREFERENCES:
+            preference = "balanced"
+        operational: tuple[Any, ...]
+        if preference == "cost":
+            operational = (_cost_per_1m(info), latency_observed, latency_value)
+        elif preference == "latency":
+            operational = (latency_observed, latency_value, _cost_per_1m(info))
+        else:
+            # Balanced keeps observed reliability first, then avoids a cold
+            # route to a declared slow model before using cost as a tie-break.
+            operational = (latency_observed, latency_value, _cost_per_1m(info))
         return (
             _privacy_rank(info.privacy_class),
             reliability_penalty,
-            latency_observed,
-            latency_value,
-            _cost_per_1m(info),
+            *operational,
             f"{info.provider}/{info.id}",
         )
 
@@ -368,6 +387,7 @@ class ModelRouter:
             parts.append("caps=" + ",".join(sorted(requirements.required_capabilities)))
         if history_used:
             parts.append("history=rolling_attempts")
+        parts.append(f"preference={policy.routing_preference}")
         return tuple(parts)
 
 

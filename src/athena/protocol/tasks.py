@@ -234,6 +234,11 @@ class ModelPolicy:
     require_tools: bool = True
     privacy: str = "local-preferred"
     max_cost_usd: Decimal | None = None
+    # Routing preference is advisory only; privacy, capability, and cost
+    # constraints remain hard filters.  ``balanced`` preserves the default
+    # latency/reliability-aware route, while ``latency`` and ``cost`` let a
+    # configured role state its operational priority explicitly.
+    routing_preference: str = "balanced"
 
 
 @dataclass(frozen=True)

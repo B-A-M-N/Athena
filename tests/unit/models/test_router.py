@@ -165,6 +165,39 @@ async def test_router_uses_declared_latency_class_on_cold_start():
     assert selection.provider == "fast"
 
 
+async def test_router_role_preference_can_choose_cost_over_cold_latency():
+    expensive_fast = _fake("fast", privacy=PrivacyClass.LOCAL)
+    cheap_slow = _fake("cheap", privacy=PrivacyClass.LOCAL)
+    expensive_fast._info_kwargs["latency_class"] = "fast"
+    cheap_slow._info_kwargs["latency_class"] = "slow"
+    expensive_fast._info_kwargs["cost"] = CostInfo(per_1m_input=10, per_1m_output=10)
+    cheap_slow._info_kwargs["cost"] = CostInfo(per_1m_input=0, per_1m_output=0)
+    router = ModelRouter(_registry({"fast": expensive_fast, "cheap": cheap_slow}))
+
+    selection = await router.select(
+        policy=ModelPolicy(require_tools=False, routing_preference="cost")
+    )
+
+    assert selection.provider == "cheap"
+
+
+async def test_configured_role_preference_is_narrowed_into_task_policy():
+    fast = _fake("fast", privacy=PrivacyClass.LOCAL, tool_calling=True)
+    cheap = _fake("cheap", privacy=PrivacyClass.LOCAL, tool_calling=True)
+    fast._info_kwargs["latency_class"] = "fast"
+    cheap._info_kwargs["latency_class"] = "slow"
+    fast._info_kwargs["cost"] = CostInfo(per_1m_input=10, per_1m_output=10)
+    cheap._info_kwargs["cost"] = CostInfo(per_1m_input=0, per_1m_output=0)
+    router = ModelRouter(
+        _registry({"fast": fast, "cheap": cheap}),
+        role_policies={"coder": ModelPolicy(role="coder", routing_preference="cost")},
+    )
+
+    selection = await router.select(policy=ModelPolicy(role="coder", require_tools=False))
+
+    assert selection.provider == "cheap"
+
+
 async def test_router_cache_keeps_role_histories_separate():
     primary_model = _fake("primary-model", privacy=PrivacyClass.LOCAL)
     judge_model = _fake("judge-model", privacy=PrivacyClass.LOCAL)

@@ -22,6 +22,7 @@ def test_roundtrip_providers_mcp_model_roles():
                 credential_id="cred-1",
                 api_key="sk-test",
                 base_url="https://example.com/v1",
+                latency_class="fast",
                 extra={"temperature": 0.2},
             ),
         ),
@@ -36,7 +37,13 @@ def test_roundtrip_providers_mcp_model_roles():
                 connect_timeout=5.0,
             ),
         ),
-        model_roles={"coder": {"allowed": ["gpt-4o"], "max_cost_usd": "0.01"}},
+        model_roles={
+            "coder": {
+                "allowed": ["gpt-4o"],
+                "max_cost_usd": "0.01",
+                "routing_preference": "latency",
+            }
+        },
     )
     d = config_to_dict(config)
     assert "providers" in d and "mcp_servers" in d
@@ -49,6 +56,7 @@ def test_roundtrip_providers_mcp_model_roles():
     assert p.credential_id == "cred-1"
     assert p.api_key == "sk-test"
     assert p.base_url == "https://example.com/v1"
+    assert p.latency_class == "fast"
     assert p.extra == {"temperature": 0.2}
 
     assert len(restored.mcp_servers) == 1
@@ -59,7 +67,13 @@ def test_roundtrip_providers_mcp_model_roles():
     assert m.secret_env == {"TOKEN": "t"}
     assert m.connect_timeout == 5.0
 
-    assert restored.model_roles == {"coder": {"allowed": ["gpt-4o"], "max_cost_usd": "0.01"}}
+    assert restored.model_roles == {
+        "coder": {
+            "allowed": ["gpt-4o"],
+            "max_cost_usd": "0.01",
+            "routing_preference": "latency",
+        }
+    }
 
 
 def test_project_config_paths_root_most_first(tmp_path: Path):

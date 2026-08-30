@@ -399,6 +399,11 @@ def _scope_model_policy(parent: TaskSpec, child):
         privacy=_stricter_privacy(base.privacy, child_v.privacy),
         allowed=allowed,
         max_cost_usd=_intersect_cost(base.max_cost_usd, child_v.max_cost_usd),
+        routing_preference=(
+            child_v.routing_preference
+            if child_v.routing_preference != "balanced"
+            else base.routing_preference
+        ),
     )
 
 
@@ -413,6 +418,7 @@ def _as_model_policy(value):
         require_tools=bool(getattr(value, "require_tools", True)),
         privacy=getattr(value, "privacy", "local-preferred"),
         max_cost_usd=getattr(value, "max_cost_usd", None),
+        routing_preference=getattr(value, "routing_preference", "balanced"),
     )
 
 
@@ -493,6 +499,7 @@ def _scope_workspace(parent: TaskSpec, child):
             if child_ws.mutation_mode is not MutationMode.DIRECT
             else parent_ws.mutation_mode
         ),
+        revision=child_ws.revision or parent_ws.revision,
     )
 
 

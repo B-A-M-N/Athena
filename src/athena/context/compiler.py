@@ -340,6 +340,11 @@ class ContextCompiler:
             task.objective,
             workspace.id if workspace else None,
             workspace.root if workspace else None,
+            # A task-local workspace can advance while a task is still
+            # running (for example after a candidate promotion).  Include the
+            # service-owned revision so static material is never reused across
+            # source revisions.
+            workspace.revision if workspace else None,
             repr(policy),
             self._principal_id,
             self.skill_limit,

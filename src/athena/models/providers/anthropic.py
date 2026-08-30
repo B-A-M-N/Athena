@@ -164,6 +164,7 @@ class AnthropicProvider:
         timeout: float = 60.0,
         use_sdk: bool = True,
         cost: CostInfo | Mapping[str, object] | None = None,
+        latency_class: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -176,6 +177,7 @@ class AnthropicProvider:
                 currency=str(cost.get("currency", "USD")),
             )
         self._cost = cost
+        self._latency_class = latency_class
         self._api_key = api_key
         self._timeout = timeout
         self._headers = dict(headers or {})
@@ -210,6 +212,7 @@ class AnthropicProvider:
                 reasoning=True,
                 privacy_class=self._privacy_class,
                 cost=self._cost,
+                latency_class=self._latency_class,
             )
         ]
 

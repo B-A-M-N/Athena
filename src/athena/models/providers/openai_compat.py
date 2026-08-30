@@ -199,6 +199,7 @@ class OpenAICompatProvider:
         timeout: float = 60.0,
         http2: bool = False,
         cost: CostInfo | Mapping[str, object] | None = None,
+        latency_class: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -211,6 +212,7 @@ class OpenAICompatProvider:
                 currency=str(cost.get("currency", "USD")),
             )
         self._cost = cost
+        self._latency_class = latency_class
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             http2=http2,
@@ -229,6 +231,7 @@ class OpenAICompatProvider:
                 tool_calling=True,
                 privacy_class=self._privacy_class,
                 cost=self._cost,
+                latency_class=self._latency_class,
             )
         ]
 

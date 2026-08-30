@@ -103,6 +103,7 @@ class ProviderConfig:
     api_key: str | None = None
     base_url: str | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
+    latency_class: str | None = None
 
     def to_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = dict(self.extra)
@@ -113,6 +114,8 @@ class ProviderConfig:
             kwargs.setdefault("api_key", self.api_key)
         if self.base_url is not None:
             kwargs.setdefault("base_url", self.base_url)
+        if self.latency_class is not None:
+            kwargs.setdefault("latency_class", self.latency_class)
         return kwargs
 
 
@@ -225,7 +228,15 @@ def load_toml_file(path: str | Path) -> dict[str, Any]:
 def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
     """Parse a provider entry from a config dict."""
     extra = dict(data)
-    for key in ("kind", "name", "model", "credential_id", "api_key", "base_url"):
+    for key in (
+        "kind",
+        "name",
+        "model",
+        "credential_id",
+        "api_key",
+        "base_url",
+        "latency_class",
+    ):
         extra.pop(key, None)
     args = data.get("args")
     if isinstance(args, list):
@@ -237,6 +248,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         credential_id=data.get("credential_id"),
         api_key=data.get("api_key"),
         base_url=data.get("base_url"),
+        latency_class=data.get("latency_class"),
         extra=extra,
     )
 
@@ -299,6 +311,7 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
                 "credential_id": p.credential_id,
                 "api_key": p.api_key,
                 "base_url": p.base_url,
+                "latency_class": p.latency_class,
                 **dict(p.extra),
             }
             for p in config.providers

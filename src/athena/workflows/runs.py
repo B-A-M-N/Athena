@@ -1218,6 +1218,7 @@ def workspace_identity(workspace: WorkspaceSpec | None) -> str:
         "execution_backend": workspace.execution_backend or "local",
         "network_policy": getattr(workspace.network_policy, "value", workspace.network_policy),
         "mutation_mode": getattr(workspace.mutation_mode, "value", workspace.mutation_mode),
+        "revision": workspace.revision,
     }
     return canonical_hash(value)
 

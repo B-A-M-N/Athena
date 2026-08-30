@@ -236,6 +236,7 @@ class ShadowEngine:
             network_policy=NetworkPolicy.DENY,
             execution_backend="shadow",
             mutation_mode=MutationMode.DIRECT,
+            revision=base.revision,
         )
 
     async def open_branch(
@@ -766,6 +767,7 @@ class ShadowEngine:
                 execution_backend=branch.base_workspace.execution_backend,
                 network_policy=branch.base_workspace.network_policy,
                 mutation_mode=MutationMode.DIRECT,
+                revision=branch.base_workspace.revision,
             )
             outcomes = await self._dispatcher.dispatch_many(
                 requests,
@@ -1345,6 +1347,7 @@ def _workspace_record(workspace: WorkspaceSpec) -> dict:
         "execution_backend": workspace.execution_backend,
         "network_policy": workspace.network_policy.value,
         "mutation_mode": workspace.mutation_mode.value,
+        "revision": workspace.revision,
     }
 
 
@@ -1358,6 +1361,7 @@ def _workspace_from_record(record: dict) -> WorkspaceSpec:
         execution_backend=str(record.get("execution_backend") or "local"),
         network_policy=NetworkPolicy(str(record.get("network_policy") or "allow")),
         mutation_mode=MutationMode(str(record.get("mutation_mode") or MutationMode.DIRECT.value)),
+        revision=record.get("revision"),
     )
 
 

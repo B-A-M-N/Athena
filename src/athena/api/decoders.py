@@ -114,6 +114,7 @@ def decode_workspace(
         ),
         network_policy=net,
         mutation_mode=mutation_mode,
+        revision=(str(data["revision"]) if data.get("revision") is not None else None),
     )
 
 
@@ -143,6 +144,7 @@ def decode_model_policy(raw: Any) -> ModelPolicy:
         require_tools=bool(data.get("require_tools", True)),
         privacy=str(data.get("privacy", "local-preferred")),
         max_cost_usd=Decimal(str(cost)) if cost else None,
+        routing_preference=str(data.get("routing_preference", "balanced")),
     )
 
 
