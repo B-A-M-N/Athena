@@ -94,3 +94,52 @@ async def test_self_host_plans_a_new_item_after_each_promotion():
     assert plan["current_work_item"]["objective"] != first["objective"]
     assert plan["completed_work_items"][0]["task_id"] == "task-1"
     assert plan["phase"] == "PLAN"
+
+
+async def test_completion_requires_a_separate_verifier():
+    class _Verifier:
+        async def utility_inference(self, **kwargs: object) -> str:
+            assert kwargs.get("role") == "completion_verifier"
+            return json.dumps({"complete": True, "reason": "objective proven"})
+
+    service = AthenaService.in_memory()
+    service._kernel = _Verifier()  # noqa: SLF001 - exercise completion authority
+    index = SimpleNamespace(index_revision="index", source_revision="source")
+    authority = _Authority()
+    plan = {
+        "phase": "COMPLETION_PROPOSED",
+        "evidence": {
+            "source_revision": "source",
+            "design_bundle_hash": "design",
+            "gate_bundle_hash": "gates",
+            "base_fingerprint": "base",
+        },
+        "completion_proposal": {"reason": "planner says done"},
+        "completed_work_items": [
+            {
+                "status": "completed",
+                "task_id": "task-1",
+                "branch_id": "branch-1",
+                "certificate_hash": "certificate-1",
+            }
+        ],
+        "review": {"eligible": True, "certificate_hash": "certificate-1"},
+    }
+    proof, error = await service._verify_self_host_completion(  # noqa: SLF001
+        {"objective": "finish Athena"},
+        plan=plan,
+        current_index=index,
+        bundle=authority,
+        current_fingerprint="base",
+        release_evidence={
+            "task_status": "complete",
+            "base_fingerprint": "base",
+            "review": plan["review"],
+        },
+        task_id="task-1",
+    )
+
+    assert error is None
+    assert proof is not None
+    assert proof["completion_verification"]["complete"] is True
+    assert proof["proof_hash"]

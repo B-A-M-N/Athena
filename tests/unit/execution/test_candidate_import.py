@@ -192,6 +192,49 @@ async def test_self_host_sandbox_runs_locked_offline_cargo_check(tmp_path):
     assert result.exit_code == 0, result.stderr
 
 
+async def test_self_host_sandbox_uv_cache_is_task_private(tmp_path, monkeypatch):
+    """Candidate proof may write its cache, never the operator's cache."""
+    project_root = Path(__file__).resolve().parents[3]
+    host_cache = tmp_path / "host-uv-cache"
+    host_cache.mkdir()
+    sentinel = host_cache / "operator-owned-marker"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    monkeypatch.setenv("UV_CACHE_DIR", str(host_cache))
+
+    verification = VerificationEnvironment.from_project(
+        str(project_root), include_project_root=True, include_rust=True, task_id="cache-proof"
+    )
+    private_cache = Path(verification.environment["UV_CACHE_DIR"])
+    assert private_cache != host_cache.resolve()
+    assert private_cache in {Path(path).resolve() for path in verification.writable_mounts}
+
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    manager = ExecutionManager()
+    manager.register_runtime(ShellRuntime())
+    result = await manager.execute(
+        ExecutionRequest(
+            runtime="shell",
+            source='printf "candidate" > "$UV_CACHE_DIR/candidate-marker"',
+            task_id="candidate-cache-proof",
+            workspace_id="candidate",
+            backend="shadow",
+            cwd=str(candidate),
+            workspace_root=str(candidate),
+            network_policy=NetworkPolicy.DENY,
+            env=verification.for_workspace(str(candidate)),
+            toolchain_paths=verification.readonly_mounts,
+            writable_toolchain_paths=verification.writable_mounts,
+        )
+    )
+
+    assert result.status is ExecutionExitStatus.EXITED
+    assert result.exit_code == 0, result.stderr
+    assert (private_cache / "candidate-marker").read_text(encoding="utf-8") == "candidate"
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert not (host_cache / "candidate-marker").exists()
+
+
 async def test_self_host_dependency_proof_fails_closed_for_broken_candidate(tmp_path):
     """Dependency proof must reject candidate metadata instead of using base venv."""
     project_root = Path(__file__).resolve().parents[3]

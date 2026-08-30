@@ -10,6 +10,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -54,6 +55,7 @@ class VerificationEnvironment:
         require_sandbox: bool = True,
         include_project_root: bool = False,
         include_rust: bool = False,
+        task_id: str | None = None,
     ) -> "VerificationEnvironment":
         project_root = str(Path(root).resolve())
         configured_root = os.environ.get("UV_PROJECT_ENVIRONMENT")
@@ -150,8 +152,22 @@ class VerificationEnvironment:
                     rust_environment["AR"] = str(Path(ar).resolve())
                 if ranlib:
                     rust_environment["RANLIB"] = str(Path(ranlib).resolve())
-            if uv_cache.is_dir():
-                rust_environment["UV_CACHE_DIR"] = str(uv_cache)
+            if task_id is not None:
+                # Candidate proof must never receive a writable bind of the
+                # operator's real UV cache. Derive a private cache from the
+                # durable task ID so restart resolves the same environment.
+                # This is a host-side copy, not hard links: candidate writes
+                # cannot reach the source cache through shared inodes.
+                cache_key = hashlib.sha256(f"{project_root}:{task_id}".encode("utf-8")).hexdigest()[
+                    :24
+                ]
+                private_cache = (
+                    Path(tempfile.gettempdir()) / f"athena-self-proof-cache-{cache_key}"
+                ).resolve()
+                private_cache.mkdir(parents=True, exist_ok=True)
+                if uv_cache.is_dir() and uv_cache != private_cache:
+                    shutil.copytree(uv_cache, private_cache, dirs_exist_ok=True)
+                rust_environment["UV_CACHE_DIR"] = str(private_cache)
             environment.update(rust_environment)
             toolchains.append(
                 ToolchainBinding(

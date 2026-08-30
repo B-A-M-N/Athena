@@ -1093,8 +1093,9 @@ class AgentKernel:
         task_id: str | None = None,
         session_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        budget_task_id: str | None = None,
     ) -> str | None:
-        """Route ONE task-less auxiliary inference through this kernel.
+        """Route one auxiliary inference through this kernel.
 
         For auxiliary model work that is not a reasoning turn of any task
         (context compression today; embedding/judging helpers later): the
@@ -1105,13 +1106,16 @@ class AgentKernel:
         None on any failure (auxiliary inference is best-effort by
         contract; the caller's deterministic fallback applies).
 
-        Emits no task events (there is no task); the usage row carries
-        role metadata so `athena inspect` renders it with its true role.
+        Emits no task events; the usage row carries role metadata so
+        ``athena inspect`` renders it with its true role.
         """
         if self._provider_usage_store is None or self._registry is None:
             return None
 
         usage_id: str | None = None
+        budget_id = budget_task_id or task_id
+        reservation_amount: Decimal | None = None
+        model_lease = None
         try:
             from athena.protocol.messages import Role, TextBlock
             from athena.protocol.tasks import ModelPolicy
@@ -1167,6 +1171,29 @@ class AgentKernel:
                 provider=selection.provider,
                 request_id=new_id("sum"),
             )
+            token_estimator = ModelTokenEstimator.from_profile(
+                self._registry.model_profile_for(selection.provider, selection.model)
+            )
+            if self._budgets is not None and budget_id:
+                remaining = await self._budgets.remaining(budget_id)
+                worst_cost = _worst_case_cost(selection.info, request, estimator=token_estimator)
+                if worst_cost is None and remaining.get("cost_usd") is not None:
+                    raise TaskBudgetExceeded(
+                        "utility model pricing unknown under hard monetary budget"
+                    )
+                if (
+                    worst_cost is not None
+                    and remaining.get("cost_usd") is not None
+                    and worst_cost > remaining["cost_usd"]
+                ):
+                    raise TaskBudgetExceeded(
+                        f"utility model call cost {worst_cost} exceeds remaining budget"
+                    )
+                if worst_cost is not None:
+                    await self._budgets.reserve_model_cost(budget_id, worst_cost)
+                    reservation_amount = worst_cost
+                model_lease = self._budgets.model_call_lease(budget_id)
+                await model_lease.__aenter__()
             parts: list[str] = []
             async with self._utility_model_semaphore:
                 async for event in provider.complete(request):
@@ -1178,6 +1205,36 @@ class AgentKernel:
                             if isinstance(block, TextBlock) and block.text:
                                 parts.append(block.text)
                         usage = getattr(resp, "usage", None)
+                        actual_cost = _actual_model_cost(
+                            selection.info,
+                            resp,
+                            request,
+                            estimator=token_estimator,
+                        )
+                        if self._budgets is not None and budget_id:
+                            self._budgets.consume(
+                                budget_id,
+                                input_tokens=_input_tokens_of(
+                                    resp, request, estimator=token_estimator
+                                ),
+                                output_tokens=_output_tokens_of(resp),
+                                model_calls=1,
+                            )
+                            if reservation_amount is not None:
+                                if actual_cost is None:
+                                    await self._budgets.release_model_cost(
+                                        budget_id, reservation_amount
+                                    )
+                                else:
+                                    await self._budgets.reconcile_model_cost(
+                                        budget_id,
+                                        reserved=reservation_amount,
+                                        actual=actual_cost,
+                                    )
+                                reservation_amount = None
+                            persist_budget = getattr(self._budgets, "_persist_usage", None)
+                            if persist_budget is not None:
+                                await persist_budget(budget_id)
                         try:
                             completion_metadata = dict(metadata or {})
                             completion_metadata.update(
@@ -1203,6 +1260,12 @@ class AgentKernel:
                             usage_id = None
                         except Exception:
                             pass
+            if model_lease is not None:
+                await model_lease.__aexit__(None, None, None)
+                model_lease = None
+            if reservation_amount is not None and budget_id and self._budgets is not None:
+                await self._budgets.release_model_cost(budget_id, reservation_amount)
+                reservation_amount = None
             if usage_id is not None:
                 # started but never completed (stream ended without done);
                 # keep role metadata — record_completion REPLACES it
@@ -1221,6 +1284,18 @@ class AgentKernel:
                     pass
             return " ".join(parts).strip() or None
         except Exception:
+            if model_lease is not None:
+                try:
+                    await model_lease.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                model_lease = None
+            if reservation_amount is not None and budget_id and self._budgets is not None:
+                try:
+                    await self._budgets.release_model_cost(budget_id, reservation_amount)
+                except Exception:
+                    pass
+                reservation_amount = None
             if usage_id is not None:
                 # started but never completed (exception mid-stream): close
                 # the row honestly rather than leaving it in-flight forever

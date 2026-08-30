@@ -12,9 +12,14 @@ from pathlib import Path
 
 import pytest
 
+from athena.execution.manager import ExecutionManager
 from athena.execution.environment import VerificationEnvironment
+from athena.execution.runtimes import ShellRuntime
+from athena.protocol.execution import ExecutionExitStatus, ExecutionRequest
 from athena.protocol.tasks import AgentRequest
+from athena.protocol.tasks import NetworkPolicy
 from athena.self_host.gates import SelfHostGateBundle, SelfHostGatePolicy
+from athena.self_host.controller import SelfHostMissionController
 from athena.self_host.reviewer import SelfHostIndependentReviewer
 from athena.self_host.risk import SelfHostRiskClassifier
 from athena.service.service import AthenaService
@@ -45,6 +50,42 @@ def test_persisted_verification_environment_is_not_authority():
     forged["readonly_mounts"] = ["/repo/.venv", "/etc"]
     with pytest.raises(ValueError, match="untrusted mount"):
         VerificationEnvironment.from_record(forged, expected=expected)
+
+
+async def test_candidate_uv_cache_write_cannot_modify_host_cache(tmp_path, monkeypatch):
+    """Frozen proof boundary keeps the real operator cache outside the sandbox."""
+    root = Path(__file__).resolve().parents[2]
+    host_cache = tmp_path / "host-uv-cache"
+    host_cache.mkdir()
+    sentinel = host_cache / "operator-owned-marker"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    monkeypatch.setenv("UV_CACHE_DIR", str(host_cache))
+    verification = VerificationEnvironment.from_project(
+        str(root), include_project_root=True, include_rust=True, task_id="contract-cache-proof"
+    )
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    manager = ExecutionManager()
+    manager.register_runtime(ShellRuntime())
+    result = await manager.execute(
+        ExecutionRequest(
+            runtime="shell",
+            source='printf "candidate" > "$UV_CACHE_DIR/frozen-proof-marker"',
+            task_id="contract-cache-proof",
+            workspace_id="candidate",
+            backend="shadow",
+            cwd=str(candidate),
+            workspace_root=str(candidate),
+            network_policy=NetworkPolicy.DENY,
+            env=verification.for_workspace(str(candidate)),
+            toolchain_paths=verification.readonly_mounts,
+            writable_toolchain_paths=verification.writable_mounts,
+        )
+    )
+    assert result.status is ExecutionExitStatus.EXITED
+    assert result.exit_code == 0, result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert not (host_cache / "frozen-proof-marker").exists()
 
 
 def test_mandatory_self_host_boundary_is_service_owned():
@@ -140,3 +181,18 @@ def test_integrity_review_requires_exact_frozen_authority():
     )
     assert result["eligible"] is False
     assert result["checks"]["proof_authority_bound"] is False
+
+
+def test_planner_completion_is_only_a_proposal():
+    plan = {
+        "completed_work_items": [{"status": "completed", "task_id": "task-1"}],
+        "phase": "PROMOTE",
+    }
+    item, reason, error = SelfHostMissionController.parse_planner_output(
+        '{"done":true,"reason":"looks complete"}', indexed_files=set()
+    )
+    assert item is None
+    assert error is None
+    proposed = SelfHostMissionController.propose_completion(plan, reason=reason or "")
+    assert proposed["phase"] == "COMPLETION_PROPOSED"
+    assert "completion_proof" not in proposed

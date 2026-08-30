@@ -8,6 +8,7 @@ and advances that record after the canonical ShadowEngine promotion.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import PurePosixPath
 from typing import Any
 
 from athena.protocol.ids import new_id
@@ -150,6 +151,11 @@ class SelfHostMissionController:
         files = _safe_paths(raw_item.get("affected_files"), limit=64)
         if files is None:
             return None, None, "planner work item has invalid affected_files"
+        indexed = {_normalise_index_path(path) for path in indexed_files}
+        for path in files:
+            normalised = _normalise_index_path(path)
+            if normalised not in indexed and not _known_project_parent(normalised, indexed):
+                return None, None, f"planner selected a path outside the source index: {path}"
         invariants = _bounded_list(raw_item.get("affected_invariants"), limit=16)
         dependencies = _bounded_list(raw_item.get("dependencies"), limit=16)
         if not invariants:
@@ -173,6 +179,16 @@ class SelfHostMissionController:
             reason or "planner selected the next bounded item",
             None,
         )
+
+    @staticmethod
+    def propose_completion(plan: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
+        """Record a planner completion claim without granting completion."""
+        updated = _copy_plan(plan)
+        updated["phase"] = "COMPLETION_PROPOSED"
+        updated["completion_proposal"] = {"reason": str(reason)[:1000]}
+        updated["current_work_item"] = None
+        updated["remaining"] = []
+        return updated
 
     @staticmethod
     def add_planned_item(
@@ -225,6 +241,7 @@ class SelfHostMissionController:
         authority: Mapping[str, Any],
         base_fingerprint: str,
         release_evidence: Mapping[str, Any],
+        completion_verification: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Create durable evidence required before declaring completion."""
         import hashlib
@@ -252,6 +269,7 @@ class SelfHostMissionController:
                 if isinstance(release_evidence.get("review"), Mapping)
                 else False,
             },
+            "completion_verification": dict(completion_verification),
         }
         proof["proof_hash"] = hashlib.sha256(
             json.dumps(proof, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -367,6 +385,20 @@ def _safe_paths(value: Any, *, limit: int) -> list[str] | None:
         if path.startswith("/") or ".." in path.split("/") or "\\" in path:
             return None
     return values
+
+
+def _normalise_index_path(path: str) -> str:
+    """Normalize source-index paths without allowing filesystem traversal."""
+    return PurePosixPath(str(path).replace("\\", "/")).as_posix().lstrip("./")
+
+
+def _known_project_parent(path: str, indexed_files: set[str]) -> bool:
+    """Allow a new file only below a directory proven by the source index."""
+    parent = PurePosixPath(path).parent.as_posix()
+    if parent == ".":
+        return bool(indexed_files)
+    prefix = parent.rstrip("/") + "/"
+    return any(candidate.startswith(prefix) for candidate in indexed_files)
 
 
 def _json_limit(value: Any) -> str:

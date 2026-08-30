@@ -1154,6 +1154,7 @@ class AthenaService:
         tm = self._require_task_manager()
         root = str(Path(workspace_root or os.getcwd()).resolve())
         workspace = WorkspaceSpec(id="athena-self", root=root)
+        planned_task_id = task_id or new_id("task")
         bundle = SelfHostGateBundle.capture(root, allow_dirty=_allow_known_dirty)
         base_fingerprint = await self.shadow_engine().workspace_fingerprint(root)
         if plan is None:
@@ -1172,12 +1173,20 @@ class AthenaService:
                 gate_bundle_hash=bundle.gate_bundle_hash,
                 base_fingerprint=base_fingerprint,
             )
+            budgets = getattr(tm, "budgets", None)
+            if task_id is None and budgets is not None:
+                from decimal import Decimal
+
+                budgets.register_control_plane(
+                    planned_task_id,
+                    ResourceBudget(max_cost_usd=Decimal("0.25"), max_parallel_model_calls=1),
+                )
             plan, planning_error = await self._plan_next_self_host_item(
                 {"objective": str(objective), "plan": plan},
                 plan=plan,
                 current_index=index,
                 bundle=bundle,
-                task_id=None,
+                task_id=planned_task_id,
                 initial=True,
             )
             if planning_error:
@@ -1194,11 +1203,13 @@ class AthenaService:
                 }
             )
             plan["evidence"] = evidence
-        planned_task_id = task_id or new_id("task")
         plan = SelfHostMissionController.mark_task(plan, planned_task_id)
         planned_prompt = SelfHostMissionController.task_prompt(plan)
         verification = self._self_host_verification_environment(
-            workspace, include_project_root=True, include_rust=True
+            workspace,
+            include_project_root=True,
+            include_rust=True,
+            task_id=planned_task_id,
         )
         criteria = SelfHostGatePolicy.required_criteria(
             additional_criteria,
@@ -1222,6 +1233,10 @@ class AthenaService:
             trusted_mission_plan=plan,
         )
         created = await tm.create(spec)
+        budgets = getattr(tm, "budgets", None)
+        persist_budget = getattr(budgets, "_persist_usage", None)
+        if callable(persist_budget):
+            await persist_budget(created.id)
         missions = self._self_host_missions
         if missions is None:
             raise RuntimeError("self-host mission store is not started")
@@ -1351,33 +1366,113 @@ class AthenaService:
                 ),
                 None,
             )
-        release_evidence = (
-            current_release_evidence if isinstance(current_release_evidence, Mapping) else {}
-        )
-        release_proven = bool(
-            release_evidence.get("task_status") == "complete"
-            and isinstance(release_evidence.get("review"), Mapping)
-            and release_evidence["review"].get("eligible") is True
-        )
-        if reason and completed and release_proven:
-            proof = controller.completion_proof(
-                plan,
-                objective=str(mission.get("objective") or ""),
-                reason=reason,
-                authority=bundle.to_record(),
-                base_fingerprint=str(
-                    release_evidence.get("base_fingerprint")
-                    or (plan.get("evidence") or {}).get("base_fingerprint")
-                    or ""
-                ),
-                release_evidence=release_evidence,
-            )
-            updated = json.loads(json.dumps(dict(plan), sort_keys=True))
-            updated["phase"] = "COMPLETE"
-            updated["completion_proof"] = proof
-            updated["remaining"] = []
-            return updated, None
+        if reason and completed:
+            # A planner may propose completion, but it is never the authority
+            # that grants it. The service records the proposal and runs a
+            # separate completion verifier below.
+            return controller.propose_completion(plan, reason=reason), None
         return dict(plan), error or "planner did not produce a next work item"
+
+    async def _verify_self_host_completion(
+        self,
+        mission: Mapping[str, Any],
+        *,
+        plan: Mapping[str, Any],
+        current_index: Any,
+        bundle: SelfHostGateBundle,
+        current_fingerprint: str,
+        release_evidence: Mapping[str, Any],
+        task_id: str | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Verify a planner completion proposal before creating COMPLETE."""
+        evidence = plan.get("evidence") or {}
+        completed = plan.get("completed_work_items") or ()
+        review = release_evidence.get("review")
+        if not completed:
+            return None, "completion requires at least one promoted work item"
+        if str(getattr(current_index, "source_revision", "") or "") != bundle.source_revision:
+            return None, "completion source index is not bound to the current authority"
+        if str(evidence.get("source_revision") or "") != bundle.source_revision:
+            return None, "completion plan has stale source authority"
+        if str(evidence.get("design_bundle_hash") or "") != bundle.design_bundle_hash:
+            return None, "completion plan has stale design authority"
+        if str(evidence.get("gate_bundle_hash") or "") != bundle.gate_bundle_hash:
+            return None, "completion plan has stale gate authority"
+        if str(evidence.get("base_fingerprint") or "") != current_fingerprint:
+            return None, "completion plan fingerprint does not match the current workspace"
+        if release_evidence.get("task_status") != "complete":
+            return None, "completion requires a complete final proof task"
+        if not isinstance(review, Mapping) or review.get("eligible") is not True:
+            return None, "completion requires eligible final review evidence"
+        if not review.get("certificate_hash"):
+            return None, "completion requires a final verification certificate"
+        if any(
+            not isinstance(item, Mapping)
+            or item.get("status") != "completed"
+            or not item.get("task_id")
+            or not item.get("branch_id")
+            or not item.get("certificate_hash")
+            for item in completed
+        ):
+            return None, "completion contains an incomplete promoted work item"
+
+        proposal = plan.get("completion_proposal") or {}
+        context = bundle.retrieve_design_context(
+            paths=("SELF_HOSTING.md", "SECURITY.md", "docs/ARCHITECTURE.md"),
+            invariants=("mission completion", "proof before promotion", "candidate isolation"),
+        )
+        prompt = (
+            "Verify whether Athena's self-host mission is actually complete. Return JSON only.\n"
+            'Schema: {"complete":true|false,"reason":"...",'
+            '"missing_obligations":["..."]}\n'
+            "The service, not this response, owns the completion transition.\n"
+            f"Original mission objective: {str(mission.get('objective') or '')[:4000]}\n"
+            f"Planner completion proposal: {json.dumps(proposal, sort_keys=True)[:4000]}\n"
+            f"Completed work: {json.dumps(completed, sort_keys=True)[:18000]}\n"
+            f"Current source index: {getattr(current_index, 'index_revision', '')}"
+            f" / {getattr(current_index, 'source_revision', '')}\n"
+            f"Current workspace fingerprint: {current_fingerprint}\n"
+            f"Frozen authority: {json.dumps(bundle.to_record(), sort_keys=True)[:6000]}\n"
+            f"Final release evidence: {json.dumps(dict(release_evidence), sort_keys=True)[:12000]}\n"
+            f"Frozen contract context:\n{context[:18000]}"
+        )
+        response = None
+        if self._kernel is not None:
+            response = await self._kernel.utility_inference(
+                system_prompt=(
+                    "You are Athena's completion-verifier role. Evaluate the original "
+                    "mission against the supplied durable evidence and frozen contracts. "
+                    "Do not invent missing proof and do not approve mutations."
+                ),
+                user_prompt=prompt,
+                role="completion_verifier",
+                task_id=task_id,
+                metadata={"purpose": "self_host_completion_verification"},
+            )
+        verdict = _parse_self_host_completion_verdict(response)
+        if verdict is None:
+            return None, "completion verifier returned invalid JSON"
+        if verdict["complete"] is not True:
+            missing = ", ".join(verdict["missing_obligations"][:8])
+            return None, verdict[
+                "reason"
+            ] or missing or "completion verifier did not prove the objective"
+        verification = {
+            "role": "completion_verifier",
+            "complete": True,
+            "reason": verdict["reason"],
+            "missing_obligations": verdict["missing_obligations"],
+        }
+        proof = SelfHostMissionController.completion_proof(
+            plan,
+            objective=str(mission.get("objective") or ""),
+            reason=verdict["reason"] or str(proposal.get("reason") or "verified completion"),
+            authority=bundle.to_record(),
+            base_fingerprint=current_fingerprint,
+            release_evidence=release_evidence,
+            completion_verification=verification,
+        )
+        return proof, None
 
     async def self_host_status(self, *, workspace_root: str | None = None) -> list[dict[str, Any]]:
         missions = self._self_host_missions
@@ -1410,7 +1505,17 @@ class AthenaService:
         if mission is None:
             return {"status": "missing", "error": "no active self-host mission"}
         if str(mission.get("status") or "") == "complete":
-            return {"status": "complete", "mission": mission}
+            proof = (mission.get("plan") or {}).get("completion_proof")
+            verification = (
+                proof.get("completion_verification") if isinstance(proof, Mapping) else None
+            )
+            if isinstance(verification, Mapping) and verification.get("complete") is True:
+                return {"status": "complete", "mission": mission}
+            return {
+                "status": "completion_hold",
+                "mission": mission,
+                "error": "stored completion lacks service-owned verification evidence",
+            }
         task_id = str(mission.get("current_task_id") or "")
         candidate = await self.operator_candidate(task_id) if task_id else None
         if candidate is not None:
@@ -1477,7 +1582,76 @@ class AthenaService:
                         plan=plan,
                     )
                     return {"status": "blocked", "mission": mission, "error": planning_error}
+                if plan.get("phase") == "COMPLETION_PROPOSED":
+                    release_evidence = {
+                        "task_status": task_status,
+                        "base_fingerprint": actual,
+                        "review": plan.get("review"),
+                        "unresolved_failures": (
+                            mission.get("last_error")
+                            or (task or {}).get("error")
+                            or (task or {}).get("reason")
+                        ),
+                    }
+                    completion_proof, completion_error = await self._verify_self_host_completion(
+                        mission,
+                        plan=plan,
+                        current_index=index,
+                        bundle=bundle,
+                        current_fingerprint=actual,
+                        release_evidence=release_evidence,
+                        task_id=task_id or None,
+                    )
+                    if completion_error:
+                        plan["completion_verification"] = {
+                            "status": "hold",
+                            "error": completion_error,
+                        }
+                        await missions.update(
+                            mission["id"],
+                            status="promoted",
+                            last_error=completion_error,
+                            plan=plan,
+                            current_base_fingerprint=actual,
+                            current_git_revision=bundle.source_revision,
+                            current_design_bundle_hash=bundle.design_bundle_hash,
+                            current_gate_bundle_hash=bundle.gate_bundle_hash,
+                        )
+                        return {
+                            "status": "completion_hold",
+                            "mission": {**mission, "plan": plan},
+                            "error": completion_error,
+                        }
+                    plan["phase"] = "COMPLETE"
+                    plan["completion_proof"] = completion_proof
+                    plan["remaining"] = []
+                    await missions.update(
+                        mission["id"],
+                        status="complete",
+                        last_error=None,
+                        plan=plan,
+                        current_base_fingerprint=actual,
+                        current_git_revision=bundle.source_revision,
+                        current_design_bundle_hash=bundle.design_bundle_hash,
+                        current_gate_bundle_hash=bundle.gate_bundle_hash,
+                    )
+                    return {"status": "complete", "mission": {**mission, "plan": plan}}
                 if plan.get("phase") == "COMPLETE":
+                    proof = plan.get("completion_proof")
+                    verification = (
+                        proof.get("completion_verification") if isinstance(proof, Mapping) else None
+                    )
+                    if (
+                        not isinstance(verification, Mapping)
+                        or verification.get("complete") is not True
+                    ):
+                        planning_error = (
+                            "stored completion lacks service-owned verification evidence"
+                        )
+                        await missions.update(
+                            mission["id"], status="blocked", last_error=planning_error, plan=plan
+                        )
+                        return {"status": "blocked", "mission": mission, "error": planning_error}
                     await missions.update(
                         mission["id"],
                         status="complete",
@@ -1525,6 +1699,7 @@ class AthenaService:
         *,
         include_project_root: bool = False,
         include_rust: bool = False,
+        task_id: str | None = None,
     ) -> VerificationEnvironment:
         """Validate the only supported self-host target and its proof tools."""
         if workspace is None:
@@ -1545,6 +1720,7 @@ class AthenaService:
                 str(root),
                 include_project_root=include_project_root,
                 include_rust=include_rust,
+                task_id=task_id,
             )
         except ValueError as exc:
             raise ValueError(f"athena self: {exc}") from exc
@@ -3202,6 +3378,7 @@ class AthenaService:
             project_root,
             include_project_root=True,
             include_rust=True,
+            task_id=task.id,
         )
         return VerificationEnvironment.from_record(record, expected=expected)
 
@@ -4239,6 +4416,26 @@ def _parse_review_json(value: str | None) -> dict[str, Any] | None:
         except (TypeError, ValueError):
             return None
     return dict(parsed) if isinstance(parsed, dict) else None
+
+
+def _parse_self_host_completion_verdict(value: str | None) -> dict[str, Any] | None:
+    """Parse the separate completion verifier's strictly bounded response."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.startswith("```"):
+        text = "\n".join(line for line in text.splitlines() if not line.strip().startswith("```"))
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, Mapping) or not isinstance(parsed.get("complete"), bool):
+        return None
+    return {
+        "complete": parsed["complete"],
+        "reason": str(parsed.get("reason") or "").strip()[:1000],
+        "missing_obligations": _bounded_strings(parsed.get("missing_obligations")),
+    }
 
 
 def _json_hash(value: Any) -> str:

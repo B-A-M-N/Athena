@@ -189,6 +189,20 @@ class BudgetTracker:
             self._budgets[task.id] = task.resource_budget or ResourceBudget()
             self._parent[task.id] = task.parent_task_id
 
+    def register_control_plane(self, task_id: str, budget: ResourceBudget) -> None:
+        """Register a pre-task control budget for service-owned planning.
+
+        Self-host planning happens before its ordinary Task row exists.  The
+        service may reserve a small, non-inheriting budget under the eventual
+        task ID; normal task creation later preserves the accumulated ledger
+        while replacing this temporary budget with the task's real budget.
+        """
+        with self._lock:
+            self._ledger.setdefault(task_id, Usage())
+            self._budgets[task_id] = budget
+            self._parent[task_id] = None
+            self._usage_hydrated.add(task_id)
+
     def reset(self, task_id: str) -> None:
         with self._lock:
             self._ledger[task_id] = Usage()

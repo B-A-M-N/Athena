@@ -108,3 +108,27 @@ def test_self_host_plan_is_bounded_and_accepts_a_fresh_next_item():
     next_plan = SelfHostMissionController.replace_current_item(promoted, item, reason=reason)
     assert next_plan["current_work_item"]["objective"] == "fix next thing"
     assert len(next_plan["work_items"]) == 2
+
+
+def test_self_host_planner_cannot_select_paths_outside_the_verified_index():
+    raw = (
+        '{"done":false,"reason":"next",'
+        '"work_item":{"title":"escape", "objective":"escape",'
+        '"affected_files":["does/not/exist.py"],'
+        '"affected_invariants":["candidate-isolated"],"dependencies":[]}}'
+    )
+    item, reason, error = SelfHostMissionController.parse_planner_output(
+        raw,
+        indexed_files={"src/athena/service/service.py"},
+    )
+    assert item is None
+    assert reason is None
+    assert error == "planner selected a path outside the source index: does/not/exist.py"
+
+    item, reason, error = SelfHostMissionController.parse_planner_output(
+        raw.replace("does/not/exist.py", "src/athena/service/new_module.py"),
+        indexed_files={"src/athena/service/service.py"},
+    )
+    assert error is None
+    assert reason == "next"
+    assert item is not None
