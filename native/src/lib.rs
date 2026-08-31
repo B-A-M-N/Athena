@@ -276,7 +276,8 @@ impl NativePixelLayout {
         let header_height = (if compact { 44.0_f32 } else { 52.0_f32 }).min(height_f * 0.14);
         let body_y = (if compact { 88.0_f32 } else { 112.0_f32 }).min(height_f * 0.30);
         let rail_gap = (if compact { 10.0_f32 } else { 16.0_f32 }).min(height_f * 0.04);
-        let controls_height = (if compact { 42.0_f32 } else { 52.0_f32 }).min(height_f * 0.08);
+        let controls_height = (if compact { 42.0_f32 } else { 88.0_f32 })
+            .min(height_f * if compact { 0.12 } else { 0.15 });
         let bottom = (if compact { 12.0_f32 } else { 24.0_f32 }).min(height_f * 0.04);
         let body_height = (height_f - body_y - rail_gap - controls_height - bottom).max(0.0);
         let operator_outer = PixelRect {
@@ -291,7 +292,10 @@ impl NativePixelLayout {
             width: aperture_width,
             height: body_height,
         };
-        let desired_inset_x: f32 = if compact { 12.0 } else { 26.0 };
+        // The reference console uses a deep bezel around both displays. Keep
+        // the logical apertures equal, but leave enough metal around them to
+        // make the two screens read as embedded hardware rather than cards.
+        let desired_inset_x: f32 = if compact { 16.0 } else { 44.0 };
         let inset_x = desired_inset_x.min(aperture_width / 4.0);
         let desired_top: f32 = if compact { 30.0 } else { 48.0 };
         let desired_bottom: f32 = if compact { 30.0 } else { 46.0 };
@@ -318,15 +322,25 @@ impl NativePixelLayout {
             width: (width_f - margin * 2.0).max(0.0),
             height: controls_height,
         };
-        let prompt_height = (if compact { 23.0 } else { 25.0_f32 }).min(body_height);
-        let prompt_inset = (if compact { 10.0_f32 } else { 16.0_f32 }).min(aperture_width / 4.0);
+        let prompt_height = (if compact { 28.0 } else { 62.0_f32 }).min(controls_height);
+        let speaker_width = if compact {
+            controls.width.min(72.0)
+        } else {
+            144.0
+        };
+        let right_control_width = if compact {
+            controls.width.min(88.0)
+        } else {
+            360.0
+        };
+        let prompt_gap = if compact { 4.0 } else { 12.0 };
+        let prompt_reserve = if compact { prompt_gap } else { 100.0 };
+        let prompt_x = (controls.x + speaker_width + prompt_gap).min(controls.right());
+        let prompt_right = (controls.right() - right_control_width - prompt_reserve).max(prompt_x);
         let prompt = PixelRect {
-            x: operator_outer.x + prompt_inset,
-            y: (operator_outer.bottom()
-                - prompt_height
-                - (if compact { 8.0_f32 } else { 10.0_f32 }).min(body_height / 4.0))
-            .max(operator_outer.y),
-            width: (operator_outer.width - prompt_inset * 2.0).max(0.0),
+            x: prompt_x,
+            y: controls.y + (controls.height - prompt_height) / 2.0,
+            width: (prompt_right - prompt_x).max(0.0),
             height: prompt_height,
         };
         let layout = Self {

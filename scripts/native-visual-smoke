@@ -36,12 +36,12 @@ fi
 cargo build --manifest-path native/Cargo.toml --offline >/dev/null
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
-projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"buddy":{"state":"SEARCH","anchor":"left","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
+projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
 
 PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" \
   IMAGE_PATH="$tmp_dir/native.png" \
   xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -c '
-    printf "%s\n" "$PROJECTION" | "$NATIVE_BIN" --bridge-stdin --no-animations --command "sleep 4" &
+    printf "%s\n" "$PROJECTION" | "$NATIVE_BIN" --bridge-stdin --no-animations --command "printf '\''ATHENA // OPERATOR\\nready > _\\n'\''; sleep 4" &
     native_pid=$!
     window=""
     for _ in $(seq 1 50); do

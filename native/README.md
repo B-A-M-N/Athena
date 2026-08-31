@@ -7,7 +7,9 @@ the Python CLI.
 The frontend tracks the upstream Alacritty terminal engine for PTY and parsing
 semantics. An
 Athena-owned compositor adds the instrument chassis, equal operator/OI
-apertures, CRT treatment, lower rail, and OpenGL OI scene. The compositor
+apertures, CRT treatment, central divider, control deck, and OpenGL OI scene.
+Structured projections render workspace/runtime text columns while the
+perspective graph remains the fallback for sparse frames. The compositor
 consumes the shared projection contracts from `src/athena/cli/` through a
 semantic bridge rather than reimplementing task semantics.
 
@@ -18,8 +20,8 @@ focus and resize events in its Linux/X11 window path, and consumes semantic
 JSON projection frames without taking authority over Athena state. Projection
 frames carry structured scene entities, model-request identity,
 workspace/runtime trees, diagnostics, and alerts as well as terminal text; the
-OpenGL compositor renders them as an AthenaBOX chassis, rounded CRT graph,
-perspective floor, packets, and a quantized Buddy. Mouse selection,
+OpenGL compositor renders them as an AthenaBOX chassis, deep-bezel displays,
+workspace/runtime OI view, and a quantized Buddy. Mouse selection,
 Ctrl-Shift-C/Ctrl-Shift-V clipboard round-trips, scrollback, navigation keys,
 and explicit prompt states are supported. The lower prompt is a Rust-owned
 Unicode line editor and the PTY receives only completed lines. Ctrl-C cancels

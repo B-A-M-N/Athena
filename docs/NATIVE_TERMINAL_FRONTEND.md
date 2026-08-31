@@ -13,9 +13,10 @@ shared projection / layout / scene / input contracts
 
 The native frontend is the canonical visual destination. It uses an
 upstream-tracking Alacritty terminal core and adds an Athena compositor for
-the graphite chassis, operator well, convex CRT, instrument rail, and DAGOAL
-scene. Athena-specific compositor code remains separate from the terminal
-engine so terminal updates do not become UI rewrites.
+the graphite chassis, deep-bezel operator/OI displays, central divider,
+control deck, and DAGOAL scene. Athena-specific compositor code remains
+separate from the terminal engine so terminal updates do not become UI
+rewrites.
 
 The current Python CLI implements the shared model, the ANSI instrument, and
 the hosted Glass renderer. Glass speaks the Kitty Graphics Protocol, which is
@@ -26,6 +27,9 @@ it owns a PTY, feeds the pinned Alacritty terminal core, renders
 scene in OpenGL, handles focus/keyboard/resize events, and accepts semantic
 projection frames containing model-request identity, workspace/runtime trees,
 structured diagnostics, and alerts.
+Structured OI frames render the reference console's workspace-map/runtime-tree
+information and Buddy display; the perspective graph is reserved for
+projections that do not provide structured tree data.
 `athena.cli.native_bridge` emits those newline-delimited frames from the same
 `ProjectionState` used by hosted Glass and `oi-stream`. The Python bridge does
 not choose pixel placement or stream animation frames; Rust animates the OI
@@ -54,7 +58,10 @@ testing. The CRT scene is scissored to its aperture and long labels/previews are
 clipped or truncated. Static chassis pixels remain retained in the
 single-buffer drawable; terminal output repaints only the operator aperture,
 and motion-only frames redraw only the OI aperture. Projection changes,
-resize, focus, selection, and prompt edits invalidate the full frame.
+resize, focus, selection, and prompt edits invalidate the full frame. The
+lower control deck contains the Rust prompt, scroll/edit guidance, speaker
+grille, activity meter, and labeled presentation controls; bridge state remains
+the only connectivity label.
 
 During development, `athena native` launches the native executable with a
 Python Athena service session as its PTY child. The child publishes the same

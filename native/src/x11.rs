@@ -1789,7 +1789,7 @@ fn draw_frame(
     if dirty.full {
         unsafe {
             glDisable(GL_SCISSOR_TEST);
-            glClearColor(0.018, 0.024, 0.038, 1.0);
+            glClearColor(0.026, 0.028, 0.048, 1.0);
             glClear(GL_COLOR_BUFFER_BIT);
         }
         draw_chassis(&geometry, projection, focused, phase);
@@ -1842,11 +1842,6 @@ fn draw_frame(
         }
         // Xft renders UTF-8 after the OpenGL scene on the same single-buffer
         // X11 drawable. The frame is flushed only after both layers are done.
-        let mode_label = if semantic_mode.is_empty() {
-            "IDLE".to_owned()
-        } else {
-            semantic_mode.to_ascii_uppercase()
-        };
         let header_baseline = geometry.header.y as c_int
             + ((geometry.header.height - text.metrics().height) / 2.0 + text.metrics().baseline)
                 as c_int;
@@ -1861,7 +1856,7 @@ fn draw_frame(
             header_baseline,
             &fit_text(
                 text,
-                "AUTONOMOUS OPERATIONS CONSOLE",
+                "//  OPERATOR INSTRUMENT",
                 (geometry.header.width as c_int - 190).max(1),
             ),
             (112, 145, 174),
@@ -1891,10 +1886,7 @@ fn draw_frame(
             panel_baseline(geometry.operator_outer),
             &fit_text(
                 text,
-                &format!(
-                    "OPERATOR // TERMINAL  ·  {}",
-                    if focused { "FOCUS" } else { "UNFOCUSED" }
-                ),
+                "ATHENA // OPERATOR CONSOLE",
                 (geometry.operator_outer.width as c_int - 48).max(1),
             ),
             (164, 189, 211),
@@ -1904,7 +1896,7 @@ fn draw_frame(
             panel_baseline(geometry.oi_outer),
             &fit_text(
                 text,
-                &format!("DAGOAL // {mode_label}"),
+                "ATHENA OI // GLASS COMPUTE",
                 (geometry.oi_outer.width as c_int - 48).max(1),
             ),
             mode_color(semantic_mode),
@@ -1946,41 +1938,72 @@ fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool
         geometry.chassis.y,
         width,
         height,
-        (0.014, 0.019, 0.030),
+        (0.026, 0.028, 0.048),
     );
     draw_round_rect(
         geometry.left_x - 10.0,
         14.0,
         width - (geometry.left_x - 10.0) * 2.0,
         height - 28.0,
-        20.0,
-        (0.075, 0.090, 0.112),
+        24.0,
+        (0.135, 0.145, 0.180),
+    );
+    draw_round_outline(
+        geometry.left_x - 10.0,
+        14.0,
+        width - (geometry.left_x - 10.0) * 2.0,
+        height - 28.0,
+        (0.25, 0.29, 0.37),
     );
     draw_round_rect(
-        geometry.left_x - 5.0,
-        19.0,
-        width - (geometry.left_x - 5.0) * 2.0,
-        height - 38.0,
-        16.0,
-        (0.043, 0.055, 0.071),
+        geometry.left_x,
+        24.0,
+        width - geometry.left_x * 2.0,
+        height - 48.0,
+        18.0,
+        (0.060, 0.068, 0.096),
+    );
+    draw_round_outline(
+        geometry.left_x,
+        24.0,
+        width - geometry.left_x * 2.0,
+        height - 48.0,
+        (0.13, 0.17, 0.23),
     );
     draw_round_rect(
         geometry.header.x,
         geometry.header.y,
         geometry.header.width,
         geometry.header.height,
-        12.0,
-        (0.095, 0.112, 0.138),
+        14.0,
+        (0.170, 0.180, 0.220),
     );
-    for index in 0..9 {
-        let x = geometry.header.x + geometry.header.width * 0.30 + index as f32 * 15.0;
+    draw_round_outline(
+        geometry.header.x,
+        geometry.header.y,
+        geometry.header.width,
+        geometry.header.height,
+        (0.28, 0.32, 0.40),
+    );
+    // The ventilation slots are deliberately kept clear of the title so the
+    // header reads as designed hardware instead of text with artifacts behind
+    // it.
+    for index in 0..7 {
+        let x = geometry.header.x + geometry.header.width * 0.50 + index as f32 * 14.0;
         draw_round_rect(
             x,
-            geometry.header.y + geometry.header.height * 0.29,
-            9.0,
-            4.0,
+            geometry.header.y + geometry.header.height * 0.31,
+            8.0,
+            3.0,
             2.0,
-            (0.025, 0.034, 0.047),
+            (0.025, 0.030, 0.048),
+        );
+        draw_rect(
+            x + 1.0,
+            geometry.header.y + geometry.header.height * 0.31,
+            6.0,
+            1.0,
+            (0.13, 0.15, 0.20),
         );
     }
     let indicator = if projection.status.to_ascii_lowercase().contains("fail") {
@@ -1990,12 +2013,21 @@ fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool
     } else {
         (0.27, 0.78, 0.68)
     };
-    for (index, color) in [indicator, (0.28, 0.48, 0.62), (0.26, 0.34, 0.43)]
+    for (index, color) in [indicator, (0.31, 0.52, 0.70), (0.29, 0.37, 0.50)]
         .into_iter()
         .enumerate()
     {
+        let x = geometry.header.right() - 72.0 + index as f32 * 24.0;
         draw_round_rect(
-            geometry.header.right() - 60.0 + index as f32 * 22.0,
+            x - 4.0,
+            geometry.header.y + geometry.header.height * 0.27,
+            17.0,
+            17.0,
+            8.5,
+            (0.045, 0.055, 0.080),
+        );
+        draw_round_rect(
+            x,
             geometry.header.y + geometry.header.height * 0.35,
             9.0,
             9.0,
@@ -2005,13 +2037,27 @@ fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool
     }
     draw_beveled_panel(
         geometry.operator_outer,
-        (0.11, 0.125, 0.145),
-        (0.025, 0.033, 0.045),
+        (0.165, 0.175, 0.205),
+        (0.018, 0.027, 0.044),
     );
     draw_beveled_panel(
         geometry.oi_outer,
-        (0.13, 0.145, 0.16),
-        (0.018, 0.047, 0.060),
+        (0.180, 0.190, 0.220),
+        (0.015, 0.042, 0.060),
+    );
+    draw_rect(
+        geometry.operator_outer.x + 22.0,
+        geometry.operator_outer.y + 40.0,
+        (geometry.operator_outer.width - 44.0).max(0.0),
+        1.0,
+        (0.10, 0.17, 0.23),
+    );
+    draw_rect(
+        geometry.oi_outer.x + 22.0,
+        geometry.oi_outer.y + 40.0,
+        (geometry.oi_outer.width - 44.0).max(0.0),
+        1.0,
+        (0.12, 0.27, 0.31),
     );
     draw_round_rect(
         geometry.operator_inner.x - 7.0,
@@ -2020,9 +2066,20 @@ fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool
         geometry.operator_inner.height + 14.0,
         8.0,
         if focused {
-            (0.024, 0.048, 0.063)
+            (0.022, 0.052, 0.074)
         } else {
-            (0.032, 0.038, 0.048)
+            (0.028, 0.035, 0.054)
+        },
+    );
+    draw_rect(
+        geometry.operator_inner.x + 10.0,
+        geometry.operator_inner.y + 10.0,
+        (geometry.operator_inner.width - 20.0).max(0.0),
+        1.0,
+        if focused {
+            (0.10, 0.29, 0.34)
+        } else {
+            (0.08, 0.14, 0.19)
         },
     );
     draw_round_rect(
@@ -2031,7 +2088,7 @@ fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool
         geometry.oi_inner.width + 22.0,
         geometry.oi_inner.height + 22.0,
         24.0,
-        (0.010, 0.028, 0.037),
+        (0.008, 0.024, 0.038),
     );
     draw_round_rect(
         geometry.oi_inner.x - 4.0,
@@ -2039,53 +2096,150 @@ fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool
         geometry.oi_inner.width + 8.0,
         geometry.oi_inner.height + 8.0,
         19.0,
-        (0.014, 0.052, 0.065),
+        (0.012, 0.060, 0.076),
     );
+    draw_round_outline(
+        geometry.oi_inner.x - 4.0,
+        geometry.oi_inner.y - 4.0,
+        geometry.oi_inner.width + 8.0,
+        geometry.oi_inner.height + 8.0,
+        (0.08, 0.25, 0.30),
+    );
+    let seam_x = (geometry.operator_outer.right() + geometry.oi_outer.x) * 0.5;
+    let seam_y = geometry.operator_outer.y + geometry.operator_outer.height * 0.52;
+    draw_rect(
+        seam_x,
+        geometry.operator_outer.y + 34.0,
+        1.0,
+        (geometry.operator_outer.height - 68.0).max(0.0),
+        (0.10, 0.14, 0.20),
+    );
+    draw_round_outline(seam_x - 7.0, seam_y - 12.0, 14.0, 24.0, (0.35, 0.54, 0.60));
+    draw_rect(seam_x - 4.0, seam_y - 3.0, 3.0, 3.0, (0.36, 0.82, 0.78));
+    draw_rect(seam_x + 1.0, seam_y - 3.0, 3.0, 3.0, (0.36, 0.82, 0.78));
     draw_beveled_panel(
         geometry.controls,
-        (0.090, 0.105, 0.123),
-        (0.032, 0.041, 0.052),
+        (0.155, 0.170, 0.205),
+        (0.026, 0.035, 0.058),
     );
-    draw_beveled_panel(
-        geometry.prompt,
-        (0.073, 0.088, 0.106),
-        (0.020, 0.028, 0.038),
+    let speaker_width: f32 = if geometry.compact {
+        geometry.controls.width.min(72.0)
+    } else {
+        144.0
+    };
+    let speaker = PixelRect {
+        x: geometry.controls.x + 7.0,
+        y: geometry.controls.y + 6.0,
+        width: (speaker_width - 14.0).max(0.0),
+        height: (geometry.controls.height - 12.0).max(0.0),
+    };
+    draw_beveled_panel(speaker, (0.075, 0.087, 0.116), (0.020, 0.025, 0.042));
+    if !geometry.compact {
+        for row in 0..4 {
+            for column in 0..8 {
+                draw_round_rect(
+                    speaker.x + 24.0 + column as f32 * 10.0,
+                    speaker.y + 11.0 + row as f32 * 7.0,
+                    5.0,
+                    4.0,
+                    1.5,
+                    (0.008, 0.012, 0.022),
+                );
+            }
+        }
+    }
+    draw_beveled_panel(geometry.prompt, (0.082, 0.098, 0.14), (0.018, 0.026, 0.046));
+    draw_rect(
+        geometry.prompt.x + 16.0,
+        geometry.prompt.y + 4.0,
+        (geometry.prompt.width - 32.0).max(0.0),
+        1.0,
+        (0.12, 0.22, 0.30),
     );
-    for index in 0..18 {
-        let x = geometry.controls.x + 26.0 + index as f32 * 11.0;
+    let right_start = geometry.controls.right() - if geometry.compact { 92.0 } else { 360.0 };
+    draw_rect(
+        right_start,
+        geometry.controls.y + 7.0,
+        1.0,
+        (geometry.controls.height - 14.0).max(0.0),
+        (0.14, 0.19, 0.26),
+    );
+    if !geometry.compact {
+        for offset in [112.0, 224.0] {
+            draw_rect(
+                right_start + offset,
+                geometry.controls.y + 7.0,
+                1.0,
+                (geometry.controls.height - 14.0).max(0.0),
+                (0.14, 0.19, 0.26),
+            );
+        }
+    }
+    let meter_width = (right_start - geometry.prompt.right() - 28.0).max(0.0);
+    let meter_count = (meter_width / 12.0).floor() as usize;
+    for index in 0..meter_count {
+        let x = geometry.prompt.right() + 14.0 + index as f32 * 12.0;
         draw_round_rect(
             x,
-            geometry.controls.y + 18.0,
-            6.0,
-            15.0,
+            geometry.controls.y + geometry.controls.height * 0.34,
+            7.0,
+            geometry.controls.height * 0.30,
             2.0,
-            (0.028, 0.037, 0.049),
+            if index % 4 == 0 {
+                (0.18, 0.41, 0.48)
+            } else {
+                (0.035, 0.060, 0.090)
+            },
         );
     }
-    for index in 0..3 {
-        let x = geometry.controls.x + geometry.controls.width - 160.0 + index as f32 * 42.0;
-        draw_round_rect(
-            x,
-            geometry.controls.y + 11.0,
-            24.0,
-            24.0,
-            12.0,
-            (0.045, 0.058, 0.070),
-        );
-        draw_round_outline(
-            x + 3.0,
-            geometry.controls.y + 14.0,
-            18.0,
-            18.0,
-            (0.24, 0.31, 0.36),
-        );
-        draw_rect(
-            x + 11.0,
-            geometry.controls.y + 6.0,
-            2.0,
-            8.0,
-            (0.31, 0.46, 0.53),
-        );
+    let knob_start = right_start + if geometry.compact { 25.0 } else { 30.0 };
+    let knob_step = if geometry.compact { 28.0 } else { 112.0 };
+    let knob_count = if geometry.compact { 2 } else { 3 };
+    for index in 0..knob_count {
+        let x = knob_start + index as f32 * knob_step;
+        let knob_size = if geometry.compact { 16.0 } else { 24.0 };
+        let top = geometry.controls.y + (geometry.controls.height - knob_size) / 2.0;
+        if !geometry.compact && index == 2 {
+            draw_round_rect(
+                x - knob_size / 2.0,
+                top,
+                knob_size,
+                knob_size,
+                4.0,
+                (0.045, 0.058, 0.086),
+            );
+            draw_round_outline(
+                x - knob_size / 2.0 + 3.0,
+                top + 3.0,
+                knob_size - 6.0,
+                knob_size - 6.0,
+                (0.27, 0.38, 0.48),
+            );
+            draw_round_rect(x - 5.0, top + 7.0, 10.0, 10.0, 2.0, (0.47, 0.70, 0.82));
+        } else {
+            draw_round_rect(
+                x - knob_size / 2.0,
+                top,
+                knob_size,
+                knob_size,
+                knob_size / 2.0,
+                (0.045, 0.058, 0.086),
+            );
+            draw_round_outline(
+                x - knob_size / 2.0 + 3.0,
+                top + 3.0,
+                knob_size - 6.0,
+                knob_size - 6.0,
+                (0.27, 0.38, 0.48),
+            );
+            draw_rect(
+                x - 1.0,
+                top + 5.0,
+                2.0,
+                knob_size * 0.42,
+                (0.31, 0.46, 0.53),
+            );
+        }
     }
 }
 
@@ -2154,9 +2308,37 @@ fn draw_status_text(
             (0.36, 0.76, 0.72),
         );
     }
+    if !geometry.compact {
+        let hint_y = geometry.prompt.y as c_int + geometry.prompt.height as c_int - 22;
+        text.draw(
+            geometry.prompt.x as c_int + 18,
+            hint_y,
+            "↑↓ SCROLL   ←→ EDIT   CTRL-C CANCEL",
+            (94, 126, 153),
+        );
+        text.draw(
+            geometry.controls.x as c_int + 20,
+            geometry.controls.y as c_int + geometry.controls.height as c_int - 12,
+            "AUDIO OUT",
+            (99, 123, 145),
+        );
+        let right_start = geometry.controls.right() - 360.0;
+        for (index, label) in ["BRIGHTNESS", "FOCUS", "POWER"].into_iter().enumerate() {
+            let label_x = right_start as c_int + 10 + index as c_int * 112;
+            text.draw(
+                label_x,
+                geometry.controls.y as c_int + 18,
+                &fit_text(text, label, 98),
+                (105, 132, 153),
+            );
+        }
+    }
     let line_height = text.metrics().height.max(1.0);
     let mut annotation_y = geometry.oi_inner.y as c_int + text.metrics().baseline as c_int;
     let mut annotations: Vec<(String, (u8, u8, u8))> = Vec::new();
+    if projection.active_operation.is_some() {
+        annotations.push(("ACTIVE OPERATION".to_owned(), (157, 193, 214)));
+    }
     if let Some(request) = projection.model_request.as_ref() {
         annotations.push((
             format!(
@@ -2175,6 +2357,24 @@ fn draw_status_text(
             ),
             (166, 191, 211),
         ));
+    }
+    if let Some(buddy) = projection.buddy.as_ref() {
+        let state = if !buddy.state.is_empty() {
+            buddy.state.as_str()
+        } else if !buddy.status.is_empty() {
+            buddy.status.as_str()
+        } else {
+            "active"
+        };
+        let label = format!("BUDDY · {}", state.to_ascii_uppercase());
+        text.draw(
+            geometry.oi_inner.right() as c_int - text.text_width(&label) - 18,
+            geometry.oi_inner.y as c_int
+                + text.metrics().baseline as c_int
+                + text.metrics().height as c_int,
+            &label,
+            (157, 193, 214),
+        );
     }
     if semantic_mode.eq_ignore_ascii_case("code") {
         if let Some(code) = projection.code_view.as_ref() {
@@ -2293,6 +2493,37 @@ fn draw_status_text(
         );
         annotation_y += line_height as c_int;
     }
+    let workspace_lines = tree_lines_or_entities(
+        &projection.workspace_tree,
+        &projection.workspace_entities,
+        &[],
+    );
+    let runtime_lines = tree_lines_or_entities(
+        &projection.runtime_tree,
+        &projection.runtime_entities,
+        &projection.entities,
+    );
+    let column_gap = 24;
+    let column_width = ((geometry.oi_inner.width as c_int - column_gap - 36) / 2).max(1);
+    let column_y = geometry.oi_inner.y as c_int + line_height as c_int * 5 + 18;
+    draw_tree_column(
+        text,
+        geometry.oi_inner.x as c_int + 18,
+        column_y,
+        column_width,
+        "WORKSPACE MAP",
+        &workspace_lines,
+        (146, 183, 204),
+    );
+    draw_tree_column(
+        text,
+        geometry.oi_inner.x as c_int + 18 + column_width + column_gap,
+        column_y,
+        column_width,
+        "RUNTIME TREE",
+        &runtime_lines,
+        (146, 183, 204),
+    );
     if let Some(alert) = projection.alerts.first() {
         text.draw(
             geometry.oi_inner.x as c_int + 18,
@@ -2307,34 +2538,101 @@ fn draw_status_text(
         .or_else(|| projection.stream_tail.first())
         .cloned()
         .unwrap_or_default();
-    if !trace.is_empty() {
-        text.draw(
-            geometry.controls.x as c_int + 26,
-            geometry.controls.y as c_int + 33,
-            &fit_text(
-                text,
-                &trace,
-                (geometry.controls.width as c_int - 220).max(1),
-            ),
-            (110, 150, 174),
-        );
+    let status_line = if !trace.is_empty() {
+        trace.as_str()
+    } else if projection.bridge_status.starts_with("ERROR") {
+        projection.bridge_status.as_str()
+    } else if projection.status.is_empty() {
+        "NO STREAM EVENTS"
     } else {
-        let status_line = if projection.bridge_status.starts_with("ERROR") {
-            projection.bridge_status.as_str()
-        } else if projection.status.is_empty() {
-            "NO STREAM EVENTS"
+        projection.status.as_str()
+    };
+    text.draw(
+        geometry.prompt.x as c_int + 18,
+        geometry.prompt.y as c_int + 16,
+        &fit_text(
+            text,
+            status_line,
+            (geometry.prompt.width as c_int - 36).max(1),
+        ),
+        (110, 150, 174),
+    );
+}
+
+fn tree_lines_or_entities(
+    tree: &[ProjectionTreeNode],
+    entities: &[ProjectionEntity],
+    fallback: &[ProjectionEntity],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !tree.is_empty() {
+        append_tree_lines(tree, 0, &mut lines);
+    } else {
+        let source = if entities.is_empty() {
+            fallback
         } else {
-            projection.status.as_str()
+            entities
         };
+        lines.extend(source.iter().take(7).map(|entity| {
+            let status = if entity.status.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", entity.status.to_ascii_uppercase())
+            };
+            format!("|- {}{}", projection_entity_label(entity), status)
+        }));
+    }
+    if lines.is_empty() {
+        lines.push("|- NO SNAPSHOT".to_owned());
+    }
+    lines
+}
+
+fn append_tree_lines(nodes: &[ProjectionTreeNode], depth: usize, output: &mut Vec<String>) {
+    for (index, node) in nodes.iter().enumerate() {
+        let label = if node.label.is_empty() {
+            if node.kind.is_empty() {
+                "unnamed".to_owned()
+            } else {
+                node.kind.clone()
+            }
+        } else {
+            node.label.clone()
+        };
+        let status = if node.status.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", node.status.to_ascii_uppercase())
+        };
+        let branch = if index + 1 == nodes.len() { "`-" } else { "|-" };
+        output.push(format!(
+            "{}{} {}{}",
+            "  ".repeat(depth),
+            branch,
+            label,
+            status
+        ));
+        append_tree_lines(&node.children, depth + 1, output);
+    }
+}
+
+fn draw_tree_column(
+    text: &TextRenderer,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    title: &str,
+    lines: &[String],
+    color: (u8, u8, u8),
+) {
+    text.draw(x, y, &fit_text(text, title, width), color);
+    let line_height = text.metrics().height.max(1.0) as c_int;
+    for (index, line) in lines.iter().take(7).enumerate() {
         text.draw(
-            geometry.controls.x as c_int + 26,
-            geometry.controls.y as c_int + 33,
-            &fit_text(
-                text,
-                status_line,
-                (geometry.controls.width as c_int - 220).max(1),
-            ),
-            (110, 150, 174),
+            x,
+            y + line_height * (index as c_int + 1),
+            &fit_text(text, line, width),
+            (177, 202, 216),
         );
     }
 }
@@ -2704,7 +3002,10 @@ fn draw_round_rect(x: f32, y: f32, width: f32, height: f32, radius: f32, color: 
 }
 
 fn draw_round_outline(x: f32, y: f32, width: f32, height: f32, color: (f32, f32, f32)) {
-    let radius = width.min(height) / 2.0;
+    // Keep large panels rectangular with softened corners. Using half the
+    // short side here turns a wide CRT into a capsule and creates the giant
+    // arcs that read as rendering artifacts rather than hardware.
+    let radius = (width.min(height) / 2.0).min(18.0);
     unsafe {
         glColor3f(color.0, color.1, color.2);
         glLineWidth(1.0);
@@ -2733,29 +3034,36 @@ fn draw_beveled_panel(rect: PanelRect, outer: (f32, f32, f32), inner: (f32, f32,
     let width = rect.width.max(0.0);
     let height = rect.height.max(0.0);
     draw_round_rect(
-        rect.x + 5.0,
-        rect.y + 7.0,
+        rect.x + 6.0,
+        rect.y + 8.0,
         width,
         height,
-        14.0,
-        (0.008, 0.012, 0.018),
+        16.0,
+        (0.008, 0.010, 0.020),
     );
-    draw_round_rect(rect.x, rect.y, width, height, 14.0, outer);
-    draw_round_outline(rect.x, rect.y, width, height, (0.18, 0.22, 0.26));
+    draw_round_rect(rect.x, rect.y, width, height, 16.0, outer);
+    draw_round_outline(rect.x, rect.y, width, height, (0.27, 0.31, 0.38));
     draw_round_rect(
-        rect.x + 9.0,
-        rect.y + 9.0,
-        (width - 18.0).max(0.0),
-        (height - 18.0).max(0.0),
-        9.0,
-        inner,
-    );
-    draw_round_outline(
         rect.x + 10.0,
         rect.y + 10.0,
         (width - 20.0).max(0.0),
         (height - 20.0).max(0.0),
-        (0.06, 0.11, 0.14),
+        10.0,
+        inner,
+    );
+    draw_round_outline(
+        rect.x + 11.0,
+        rect.y + 11.0,
+        (width - 22.0).max(0.0),
+        (height - 22.0).max(0.0),
+        (0.07, 0.13, 0.19),
+    );
+    draw_rect(
+        rect.x + 16.0,
+        rect.y + 2.0,
+        (width - 32.0).max(0.0),
+        1.0,
+        (0.38, 0.42, 0.49),
     );
 }
 
@@ -2800,30 +3108,102 @@ fn draw_oi_scene(
     // converging floor, sparse phosphor points, and semantic graph links give
     // it a readable depth field while keeping all state authoritative in the
     // projection frame.
-    let horizon = y + height * 0.36;
-    unsafe {
-        glColor3f(
-            scene_color.0 as f32 / 255.0,
-            scene_color.1 as f32 / 255.0,
-            scene_color.2 as f32 / 255.0,
-        );
-        glLineWidth(1.0);
-        glBegin(GL_LINES);
-        for index in 0..8 {
-            let t = index as f32 / 8.0;
-            let gy = horizon + (height - (horizon - y)) * t * t;
-            glVertex2f(x, gy);
-            glVertex2f(x + width, gy);
+    let structured_scene = !projection.workspace_tree.is_empty()
+        || !projection.runtime_tree.is_empty()
+        || !projection.workspace_entities.is_empty()
+        || !projection.runtime_entities.is_empty();
+    let horizon = y + height * 0.58;
+    let grid_color = (
+        scene_color.0 as f32 / 255.0 * 0.30,
+        scene_color.1 as f32 / 255.0 * 0.30,
+        scene_color.2 as f32 / 255.0 * 0.30,
+    );
+    if !structured_scene {
+        unsafe {
+            glColor3f(grid_color.0, grid_color.1, grid_color.2);
+            glLineWidth(1.0);
+            glBegin(GL_LINES);
+            for index in 0..7 {
+                let t = index as f32 / 7.0;
+                let gy = horizon + (height - (horizon - y)) * t * t;
+                glVertex2f(x, gy);
+                glVertex2f(x + width, gy);
+            }
+            let vanishing_x = x + width * 0.5;
+            for index in 0..9 {
+                let bottom_x = x + width * index as f32 / 8.0;
+                glVertex2f(vanishing_x, horizon);
+                glVertex2f(bottom_x, y + height);
+            }
+            glEnd();
         }
-        let vanishing_x = x + width * 0.5;
-        for index in 0..11 {
-            let bottom_x = x + width * index as f32 / 10.0;
-            glVertex2f(vanishing_x, horizon);
-            glVertex2f(bottom_x, y + height);
-        }
-        glEnd();
     }
-    for index in 0..22 {
+    // A very quiet scanline texture gives the CRT depth without competing
+    // with the semantic graph or making motion look like a full-screen flash.
+    let scanline_count = (height / 9.0).floor() as usize;
+    for index in 1..scanline_count {
+        draw_rect(
+            x + 10.0,
+            y + index as f32 * 9.0,
+            (width - 20.0).max(0.0),
+            1.0,
+            (0.018, 0.054, 0.066),
+        );
+    }
+    let horizon_color = (
+        scene_color.0 as f32 / 255.0 * 0.72,
+        scene_color.1 as f32 / 255.0 * 0.72,
+        scene_color.2 as f32 / 255.0 * 0.72,
+    );
+    if !structured_scene {
+        draw_rect(
+            x + 10.0,
+            horizon,
+            (width - 20.0).max(0.0),
+            1.0,
+            horizon_color,
+        );
+    }
+    // Four corner ticks make the aperture feel like an instrument viewport
+    // and give the eye a stable frame around the animated content.
+    let tick_color = (0.20, 0.42, 0.48);
+    draw_rect(x + 12.0, y + 12.0, 26.0, 1.0, tick_color);
+    draw_rect(x + 12.0, y + 12.0, 1.0, 18.0, tick_color);
+    draw_rect(x + width - 38.0, y + 12.0, 26.0, 1.0, tick_color);
+    draw_rect(x + width - 13.0, y + 12.0, 1.0, 18.0, tick_color);
+    draw_rect(x + 12.0, y + height - 13.0, 26.0, 1.0, tick_color);
+    draw_rect(x + 12.0, y + height - 30.0, 1.0, 18.0, tick_color);
+    draw_rect(x + width - 38.0, y + height - 13.0, 26.0, 1.0, tick_color);
+    draw_rect(x + width - 13.0, y + height - 30.0, 1.0, 18.0, tick_color);
+    if structured_scene {
+        let split = x + width * 0.5;
+        let box_top = y + height * 0.25;
+        let box_bottom = y + height - 34.0;
+        unsafe {
+            glColor3f(0.16, 0.32, 0.38);
+            glLineWidth(1.0);
+        }
+        draw_outline_rect(x + 14.0, box_top, width * 0.46 - 20.0, box_bottom - box_top);
+        draw_outline_rect(
+            split + 6.0,
+            box_top,
+            width * 0.46 - 20.0,
+            box_bottom - box_top,
+        );
+        draw_rect(
+            split,
+            box_top + 6.0,
+            1.0,
+            (box_bottom - box_top - 12.0).max(0.0),
+            (0.11, 0.24, 0.30),
+        );
+    }
+    let vanishing_x = x + width * 0.5;
+    if !structured_scene {
+        draw_rect(vanishing_x - 12.0, horizon - 1.0, 24.0, 1.0, horizon_color);
+        draw_rect(vanishing_x, horizon - 12.0, 1.0, 24.0, horizon_color);
+    }
+    for index in 0..if structured_scene { 12 } else { 22 } {
         let px = x + ((index * 37 % 97) as f32 / 97.0) * width;
         let py = y + ((index * 19 % 89) as f32 / 89.0) * height * 0.72;
         let twinkle = 0.55 + 0.35 * ((phase * 1.7 + index as f32).sin().abs());
@@ -2832,7 +3212,7 @@ fn draw_oi_scene(
             py,
             1.5,
             1.5,
-            (0.18 * twinkle, 0.50 * twinkle, 0.57 * twinkle),
+            (0.12 * twinkle, 0.36 * twinkle, 0.44 * twinkle),
         );
     }
     let mut tree_entities = Vec::new();
@@ -2875,28 +3255,30 @@ fn draw_oi_scene(
         let ny = y + height * (0.30 + row as f32 * 0.23);
         positions.push((entity.id.clone(), nx, ny));
     }
-    unsafe {
-        glColor3f(
-            scene_color.0 as f32 / 255.0,
-            scene_color.1 as f32 / 255.0,
-            scene_color.2 as f32 / 255.0,
-        );
-        glLineWidth(1.5);
-        glBegin(GL_LINES);
-        for entity in runtime.iter() {
-            let Some(parent_id) = entity.parent_id.as_ref() else {
-                continue;
-            };
-            let Some((_, px, py)) = positions.iter().find(|(id, _, _)| id == parent_id) else {
-                continue;
-            };
-            let Some((_, cx, cy)) = positions.iter().find(|(id, _, _)| id == &entity.id) else {
-                continue;
-            };
-            glVertex2f(*px, *py);
-            glVertex2f(*cx, *cy);
+    if !structured_scene {
+        unsafe {
+            glColor3f(
+                scene_color.0 as f32 / 255.0 * 0.82,
+                scene_color.1 as f32 / 255.0 * 0.82,
+                scene_color.2 as f32 / 255.0 * 0.82,
+            );
+            glLineWidth(1.5);
+            glBegin(GL_LINES);
+            for entity in runtime.iter() {
+                let Some(parent_id) = entity.parent_id.as_ref() else {
+                    continue;
+                };
+                let Some((_, px, py)) = positions.iter().find(|(id, _, _)| id == parent_id) else {
+                    continue;
+                };
+                let Some((_, cx, cy)) = positions.iter().find(|(id, _, _)| id == &entity.id) else {
+                    continue;
+                };
+                glVertex2f(*px, *py);
+                glVertex2f(*cx, *cy);
+            }
+            glEnd();
         }
-        glEnd();
     }
     for (index, entity) in runtime.iter().enumerate() {
         let (_, nx, ny) = &positions[index];
@@ -2909,6 +3291,9 @@ fn draw_oi_scene(
         } else {
             rgb_f32(scene_color)
         };
+        if structured_scene {
+            continue;
+        }
         draw_node(*nx, *ny, 15.0, color);
         if options.animations && !options.reduced_motion && index % 2 == 0 {
             let pulse = ((phase * 2.0 + index as f32).sin() + 1.0) * 0.5;
@@ -2921,7 +3306,7 @@ fn draw_oi_scene(
             );
         }
     }
-    if positions.len() > 1 {
+    if !structured_scene && positions.len() > 1 {
         for index in 0..positions.len() - 1 {
             let t = (phase * 0.36 + index as f32 * 0.27).fract();
             let sx = positions[index].1;
@@ -2940,15 +3325,15 @@ fn draw_oi_scene(
     }
     let (buddy_x, buddy_y) = match visual_mode {
         VisualMode::Read | VisualMode::Inspect | VisualMode::Search => {
-            (x + width * 0.18, y + height * 0.28)
+            (x + width * 0.80, y + height * 0.17)
         }
         VisualMode::Code | VisualMode::Test | VisualMode::Verify | VisualMode::Execute => {
-            (x + width * 0.76, y + height * 0.26)
+            (x + width * 0.80, y + height * 0.17)
         }
         VisualMode::Failure => (x + width * 0.78, y + height * 0.76),
         VisualMode::Approval => (x + width * 0.72, y + height * 0.84),
         VisualMode::Think | VisualMode::Respond | VisualMode::Generate | VisualMode::Recover => {
-            (x + width * 0.50, y + height * 0.42)
+            (x + width * 0.80, y + height * 0.17)
         }
         VisualMode::Idle => match projection
             .buddy
@@ -2956,9 +3341,9 @@ fn draw_oi_scene(
             .map(|buddy| buddy.anchor.to_ascii_lowercase())
             .as_deref()
         {
-            Some("left") => (x + width * 0.20, y + height * 0.58),
-            Some("right") => (x + width * 0.80, y + height * 0.58),
-            _ => (x + width * 0.50, y + height * 0.58),
+            Some("left") => (x + width * 0.80, y + height * 0.17),
+            Some("right") => (x + width * 0.80, y + height * 0.17),
+            _ => (x + width * 0.80, y + height * 0.17),
         },
     };
     let buddy_status = projection
@@ -3016,6 +3401,13 @@ fn projection_entity_label(entity: &ProjectionEntity) -> String {
 }
 
 fn draw_node(x: f32, y: f32, radius: f32, color: (f32, f32, f32)) {
+    draw_round_outline(
+        x - radius - 5.0,
+        y - radius - 5.0,
+        radius * 2.0 + 10.0,
+        radius * 2.0 + 10.0,
+        (color.0 * 0.28, color.1 * 0.28, color.2 * 0.28),
+    );
     unsafe {
         glColor3f(color.0, color.1, color.2);
         glLineWidth(1.5);
@@ -3026,6 +3418,13 @@ fn draw_node(x: f32, y: f32, radius: f32, color: (f32, f32, f32)) {
         }
         glEnd();
     }
+    draw_rect(
+        x - 2.0,
+        y - 2.0,
+        4.0,
+        4.0,
+        (color.0 * 0.82, color.1 * 0.82, color.2 * 0.82),
+    );
 }
 
 fn draw_buddy(x: f32, y: f32, status: &str, character: &str, phase: f32) {
@@ -3037,6 +3436,13 @@ fn draw_buddy(x: f32, y: f32, status: &str, character: &str, phase: f32) {
     let scale = 5.0;
     let left = x - scale * 5.0;
     let top = y - scale * 4.0;
+    draw_round_outline(
+        left - 18.0,
+        top - 18.0,
+        scale * 10.0 + 36.0,
+        scale * 8.0 + 36.0,
+        (color.0 * 0.32, color.1 * 0.32, color.2 * 0.32),
+    );
     if status.eq_ignore_ascii_case("failure") || status.eq_ignore_ascii_case("blocked") {
         draw_round_outline(
             left - 13.0,
@@ -3082,6 +3488,14 @@ fn draw_buddy(x: f32, y: f32, status: &str, character: &str, phase: f32) {
             }
         }
     }
+    draw_round_rect(
+        left + scale,
+        top + scale * 2.0,
+        scale * 8.0,
+        scale * 3.0,
+        4.0,
+        (0.015, 0.043, 0.054),
+    );
     let eye = if character.eq_ignore_ascii_case("cat") {
         (0.98, 0.84, 0.42)
     } else {
