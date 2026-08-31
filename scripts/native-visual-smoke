@@ -12,19 +12,46 @@ command -v import >/dev/null || {
   printf '%s\n' 'native-visual-smoke: SKIP — ImageMagick import is unavailable' >&2
   exit 0
 }
+command -v identify >/dev/null || {
+  printf '%s\n' 'native-visual-smoke: SKIP — ImageMagick identify is unavailable' >&2
+  exit 0
+}
+command -v convert >/dev/null || {
+  printf '%s\n' 'native-visual-smoke: SKIP — ImageMagick convert is unavailable' >&2
+  exit 0
+}
+command -v xdotool >/dev/null || {
+  printf '%s\n' 'native-visual-smoke: SKIP — xdotool is unavailable' >&2
+  exit 0
+}
+command -v xdpyinfo >/dev/null || {
+  printf '%s\n' 'native-visual-smoke: SKIP — xdpyinfo is unavailable' >&2
+  exit 0
+}
+if ! xvfb-run -a -s '-screen 0 1280x800x24 -ac' xdpyinfo >/dev/null 2>&1; then
+  printf '%s\n' 'native-visual-smoke: SKIP — Xvfb cannot create a usable display' >&2
+  exit 0
+fi
 
 cargo build --manifest-path native/Cargo.toml --offline >/dev/null
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
-projection='{"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"buddy":{"state":"SEARCH","anchor":"left","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
+projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"buddy":{"state":"SEARCH","anchor":"left","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
 
 PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" \
   IMAGE_PATH="$tmp_dir/native.png" \
-  xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -lc '
+  xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -c '
     printf "%s\n" "$PROJECTION" | "$NATIVE_BIN" --bridge-stdin --no-animations --command "sleep 4" &
     native_pid=$!
-    sleep 1
-    import -window root "$IMAGE_PATH"
+    window=""
+    for _ in $(seq 1 50); do
+      window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
+      [[ -n "$window" ]] && break
+      sleep 0.1
+    done
+    [[ -n "$window" ]]
+    sleep 0.5
+    import -window "$window" "$IMAGE_PATH"
     kill "$native_pid" 2>/dev/null || true
     wait "$native_pid" 2>/dev/null || true
   '
@@ -38,4 +65,14 @@ if [[ ! -s "$tmp_dir/native.png" ]]; then
   printf '%s\n' 'native-visual-smoke: FAIL — empty screenshot' >&2
   exit 1
 fi
-printf '%s\n' 'native-visual-smoke: PASS — deterministic AthenaBOX frame'
+colors="$(identify -format '%k' "$tmp_dir/native.png")"
+if [[ "$colors" -lt 100 ]]; then
+  printf 'native-visual-smoke: FAIL — exact window screenshot has only %s colors\n' "$colors" >&2
+  exit 1
+fi
+stddev="$(convert "$tmp_dir/native.png" -colorspace Gray -format '%[standard_deviation]' info:)"
+awk -v stddev="$stddev" 'BEGIN { exit !(stddev > 0.01) }' || {
+  printf 'native-visual-smoke: FAIL — screenshot contrast invariant failed (%s)\n' "$stddev" >&2
+  exit 1
+}
+printf '%s\n' "native-visual-smoke: PASS — exact AthenaBOX window frame (${colors} colors)"

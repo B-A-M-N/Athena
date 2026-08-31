@@ -33,6 +33,7 @@ _ACTION_VIEW_MODES = frozenset(
         VisualActionKind.GENERATE,
     }
 )
+NATIVE_BRIDGE_SCHEMA_VERSION = 3
 
 
 def _json_safe(value: Any, *, depth: int = 0) -> Any:
@@ -146,8 +147,34 @@ def native_projection_frame(
             "mutation_state": sanitize_terminal_text(code_view.mutation_state),
             "preview_truncated": code_view.preview_truncated,
         }
+    query = ""
+    for event_type, payload in reversed(state.raw_events):
+        if event_type in {"SearchStarted", "ResearchStarted", "FileRead", "InspectionStarted"}:
+            query = sanitize_terminal_text(
+                payload.get("query")
+                or payload.get("path")
+                or payload.get("resource")
+                or payload.get("uri")
+                or ""
+            )
+            if query:
+                break
+    action_kind = scene.mode.value
+    action_label = sanitize_terminal_text(active.label if active else action_kind.upper())
+    action_target = sanitize_terminal_text(active.target if active else query)
+    action_detail = sanitize_terminal_text(active.detail if active and active.detail else query)
+    current_action = {
+        "kind": sanitize_terminal_text(action_kind),
+        "label": action_label,
+        "target": action_target,
+        "detail": action_detail,
+        "query": query,
+        "progress": sanitize_terminal_text(active.progress if active else ""),
+        "progress_value": active.progress_value if active else None,
+        "progress_determinate": active.progress_determinate if active else False,
+    }
     frame = {
-        "schema_version": 2,
+        "schema_version": NATIVE_BRIDGE_SCHEMA_VERSION,
         "title": "ATHENA OI // GLASS COMPUTE",
         "status": sanitize_terminal_text(state.status),
         "semantic_state": sanitize_terminal_text(scene.mode.value),
@@ -158,6 +185,7 @@ def native_projection_frame(
             "character": sanitize_terminal_text(scene.character),
         },
         "active_operation": operation,
+        "current_action": current_action,
         "code_view": serialized_code,
         "diagnostics": [dict(item) for item in scene.diagnostics],
         "instruments": [dict(item) for item in scene.instruments],
@@ -176,6 +204,7 @@ def native_projection_frame(
         "workspace_tree": _tree_payload(scene.workspace_tree),
         "runtime_tree": _tree_payload(scene.runtime_tree),
         "trace": [sanitize_terminal_text(item) for item in scene.trace],
+        "stream_tail": [sanitize_terminal_text(item) for item in list(state.stream)[-8:]],
         "view": {
             "label": "action" if scene.mode in _ACTION_VIEW_MODES else "overview",
             "mode": sanitize_terminal_text(scene.mode.value),

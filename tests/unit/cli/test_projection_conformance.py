@@ -203,10 +203,23 @@ def test_native_bridge_uses_the_same_scene_projection_as_hosted_surfaces():
     entity = next(item for item in frame["entities"] if item["id"] == "call-native")
     assert entity["kind"] == "operation"
     assert entity["label"] == "execute"
-    assert frame["schema_version"] == 2
+    assert frame["schema_version"] == 3
     assert frame["semantic_state"] == "test"
+    assert frame["current_action"]["kind"] == "test"
+    assert frame["current_action"]["query"] == ""
     assert frame["buddy"]["character"] == "owl"
     assert any(item["id"] == "call-native" for item in frame["runtime_entities"])
+
+
+def test_native_bridge_preserves_current_action_query_context():
+    state = ProjectionState()
+    state.reduce("ResearchStarted", {"query": "context cache invalidation"})
+
+    frame = native_projection_frame(state)
+
+    assert frame["current_action"]["kind"] == "search"
+    assert frame["current_action"]["query"] == "context cache invalidation"
+    assert frame["current_action"]["target"] == "context cache invalidation"
 
 
 def test_code_mutation_content_is_projected_to_ansi_and_native_surfaces():

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import os
 import sys
+import termios
 from io import StringIO
 from typing import Any
 
@@ -35,10 +36,11 @@ class NativeSession:
         self.projection = ProjectionState()
         self._writer: asyncio.StreamWriter | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._foreground_task: asyncio.Task[Any] | None = None
+        self._foreground_task_id: str | None = None
         self._projection_task: asyncio.Task[Any] | None = None
         self._projection_lock = asyncio.Lock()
         self._projection_dirty = False
-        self._projection_force = False
         self._projection_interval = 0.05
 
     async def start(self) -> None:
@@ -55,7 +57,7 @@ class NativeSession:
             raise RuntimeError("AthenaService did not expose its event store")
         events.subscribe(self._on_event)
         self._projection_dirty = True
-        await self._flush_projection(force=True)
+        await self._flush_projection()
 
     async def close(self) -> None:
         for task in tuple(self._tasks):
@@ -66,6 +68,8 @@ class NativeSession:
             self._projection_task.cancel()
             await asyncio.gather(self._projection_task, return_exceptions=True)
             self._projection_task = None
+        self._foreground_task = None
+        self._foreground_task_id = None
         if self.service is not None:
             try:
                 await self.service.stop()
@@ -92,23 +96,34 @@ class NativeSession:
         if self._projection_task is None or self._projection_task.done():
             self._projection_task = asyncio.create_task(self._debounced_projection())
         if event.type in _FORCE_PROJECTION_EVENTS:
-            self._projection_force = True
-            await self._flush_projection(force=True)
+            await self._flush_projection()
 
     async def _debounced_projection(self) -> None:
         """Coalesce event bursts; idle sessions send no bridge traffic."""
-        await asyncio.sleep(self._projection_interval)
-        await self._flush_projection()
+        while True:
+            await asyncio.sleep(self._projection_interval)
+            await self._flush_projection()
+            if self._projection_dirty:
+                continue
+            # Clear the task marker before returning. An event arriving in
+            # this handoff window can then schedule a new worker instead of
+            # stranding dirty state behind a task that is about to finish.
+            if self._projection_task is asyncio.current_task():
+                self._projection_task = None
+            return
 
-    async def _flush_projection(self, *, force: bool = False) -> None:
+    async def _flush_projection(self) -> None:
         if not self._projection_dirty:
             return
         async with self._projection_lock:
             if not self._projection_dirty:
                 return
             self._projection_dirty = False
-            self._projection_force = False
-            await self._send_projection()
+            try:
+                await self._send_projection()
+            except Exception:
+                self._projection_dirty = True
+                raise
 
     async def _send_projection(self) -> None:
         if self._writer is None:
@@ -123,12 +138,17 @@ class NativeSession:
         await self._writer.drain()
 
     async def run(self) -> int:
+        input_attrs = self._disable_input_echo()
         try:
             await self.start()
             print("ATHENA // NATIVE TERMINAL")
             print("Type a request. /help for commands; /exit to close.")
             while True:
-                line = await asyncio.to_thread(sys.stdin.readline)
+                try:
+                    line = await self._readline()
+                except KeyboardInterrupt:
+                    await self._cancel_foreground()
+                    continue
                 if not line:
                     return 0
                 line = line.strip()
@@ -147,9 +167,80 @@ class NativeSession:
                     continue
                 task = asyncio.create_task(self._submit(line))
                 self._tasks.add(task)
+                self._foreground_task = task
+                task.add_done_callback(self._task_finished)
                 task.add_done_callback(self._tasks.discard)
         finally:
+            self._restore_input_echo(input_attrs)
             await self.close()
+
+    async def _readline(self) -> str:
+        """Read one completed native-editor line without worker-thread leaks."""
+        if not sys.stdin.isatty():
+            return await asyncio.to_thread(sys.stdin.readline)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        fd = sys.stdin.fileno()
+
+        def ready() -> None:
+            if future.done():
+                return
+            try:
+                future.set_result(sys.stdin.readline())
+            except BaseException as exc:
+                future.set_exception(exc)
+            finally:
+                loop.remove_reader(fd)
+
+        loop.add_reader(fd, ready)
+        try:
+            return await future
+        finally:
+            loop.remove_reader(fd)
+
+    @staticmethod
+    def _disable_input_echo() -> list[Any] | None:
+        """Keep line echo in the native prompt instead of the PTY grid."""
+        if not sys.stdin.isatty():
+            return None
+        try:
+            attrs = termios.tcgetattr(sys.stdin.fileno())
+            updated = attrs.copy()
+            updated[3] &= ~(termios.ECHO | termios.ECHONL)
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, updated)
+            return attrs
+        except (OSError, termios.error):
+            return None
+
+    @staticmethod
+    def _restore_input_echo(attrs: list[Any] | None) -> None:
+        if attrs is None or not sys.stdin.isatty():
+            return
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
+        except (OSError, termios.error):
+            pass
+
+    def _task_finished(self, task: asyncio.Task[Any]) -> None:
+        if self._foreground_task is task:
+            self._foreground_task = None
+            self._foreground_task_id = None
+
+    async def _cancel_foreground(self) -> None:
+        """Ctrl-C cancels the foreground task, never the whole session."""
+        task = self._foreground_task
+        task_id = self._foreground_task_id
+        if task_id and self.service is not None:
+            try:
+                await self.service.cancel(task_id)
+            except Exception:
+                pass
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self._foreground_task is task:
+            self._foreground_task = None
+            self._foreground_task_id = None
 
     async def _submit(self, objective: str) -> None:
         print(f"\nYOU\n{objective}")
@@ -170,6 +261,7 @@ class NativeSession:
         )
         task = await self.service.submit(request, wait=False)
         task_id = getattr(task, "id", task)
+        self._foreground_task_id = str(task_id)
         print(f"ATHENA · task {task_id}")
         async for event in self.service.stream_events(task_id, after_sequence=0):
             if event.type == "ApprovalRequested":

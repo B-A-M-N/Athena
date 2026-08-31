@@ -8,7 +8,7 @@
 
 use std::env;
 use std::io::{self, BufRead, Read, Write};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,11 +22,21 @@ use serde::Deserialize;
 
 use athena_terminal::NativeTerminalCore;
 
+mod input;
 #[cfg(unix)]
 mod x11;
 
+const NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 3;
+const LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 2;
+
+fn default_bridge_schema_version() -> u32 {
+    LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 struct ProjectionFrame {
+    #[serde(default = "default_bridge_schema_version")]
+    schema_version: u32,
     title: Option<String>,
     status: Option<String>,
     semantic_state: Option<String>,
@@ -42,6 +52,8 @@ struct ProjectionFrame {
     alerts: Option<Vec<String>>,
     #[serde(default)]
     active_operation: Option<ProjectionOperation>,
+    #[serde(default)]
+    current_action: Option<ProjectionAction>,
     #[serde(default)]
     code_view: Option<ProjectionCodeView>,
     #[serde(default)]
@@ -61,9 +73,46 @@ struct ProjectionFrame {
     #[serde(default)]
     trace: Option<Vec<String>>,
     #[serde(default)]
+    stream_tail: Option<Vec<String>>,
+    #[serde(default)]
     layout: Option<serde_json::Value>,
     #[serde(default)]
     view: Option<ProjectionView>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionAction {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    progress: String,
+    #[serde(default)]
+    progress_value: Option<f64>,
+    #[serde(default)]
+    progress_determinate: bool,
+}
+
+impl ProjectionFrame {
+    fn normalize(mut self) -> Result<Self, String> {
+        match self.schema_version {
+            NATIVE_BRIDGE_SCHEMA_VERSION => Ok(self),
+            LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION => {
+                self.schema_version = NATIVE_BRIDGE_SCHEMA_VERSION;
+                Ok(self)
+            }
+            version => Err(format!(
+                "unsupported native projection schema {version}; expected {NATIVE_BRIDGE_SCHEMA_VERSION}"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -205,6 +254,7 @@ struct ProjectionBuddy {
 
 #[derive(Debug, Default, Clone)]
 struct Projection {
+    bridge_status: String,
     title: String,
     status: String,
     semantic_state: String,
@@ -214,6 +264,7 @@ struct Projection {
     runtime_entities: Vec<ProjectionEntity>,
     alerts: Vec<String>,
     active_operation: Option<ProjectionOperation>,
+    current_action: Option<ProjectionAction>,
     code_view: Option<ProjectionCodeView>,
     diagnostics: Vec<ProjectionDiagnostic>,
     verification: ProjectionVerification,
@@ -223,12 +274,106 @@ struct Projection {
     workspace_tree: Vec<ProjectionTreeNode>,
     runtime_tree: Vec<ProjectionTreeNode>,
     trace: Vec<String>,
+    stream_tail: Vec<String>,
     layout: Option<serde_json::Value>,
     view: ProjectionView,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualMode {
+    Idle,
+    Think,
+    Respond,
+    Inspect,
+    Read,
+    Search,
+    Code,
+    Execute,
+    Test,
+    Verify,
+    Generate,
+    Approval,
+    Recover,
+    Failure,
+}
+
+impl VisualMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Think => "think",
+            Self::Respond => "respond",
+            Self::Inspect => "inspect",
+            Self::Read => "read",
+            Self::Search => "search",
+            Self::Code => "code",
+            Self::Execute => "execute",
+            Self::Test => "test",
+            Self::Verify => "verify",
+            Self::Generate => "generate",
+            Self::Approval => "approval",
+            Self::Recover => "recover",
+            Self::Failure => "failure",
+        }
+    }
+
+    fn from_projection(projection: &Projection) -> Self {
+        let raw = if !projection.view.mode.is_empty() {
+            projection.view.mode.as_str()
+        } else if !projection.semantic_state.is_empty() {
+            projection.semantic_state.as_str()
+        } else {
+            projection
+                .buddy
+                .as_ref()
+                .map(|buddy| buddy.state.as_str())
+                .unwrap_or("")
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "think" => Self::Think,
+            "respond" => Self::Respond,
+            "inspect" => Self::Inspect,
+            "read" | "reading" => Self::Read,
+            "search" | "searching" => Self::Search,
+            "code" | "coding" => Self::Code,
+            "execute" | "executing" | "tools" | "working" => Self::Execute,
+            "test" | "testing" => Self::Test,
+            "verify" | "verifying" => Self::Verify,
+            "generate" | "generating" => Self::Generate,
+            "approval" => Self::Approval,
+            "recover" | "recovery" | "recovering" => Self::Recover,
+            "failure" | "blocked" => Self::Failure,
+            _ => Self::Idle,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        !matches!(self, Self::Idle | Self::Failure | Self::Approval)
+    }
+
+    fn is_animated(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn prompt_state(self, projection: &Projection) -> &'static str {
+        let status = projection.status.to_ascii_lowercase();
+        if projection.bridge_status.starts_with("ERROR") || status.contains("disconnect") {
+            "DISCONNECTED"
+        } else if matches!(self, Self::Failure) || status.contains("fail") || status == "blocked" {
+            "FAILURE"
+        } else if matches!(self, Self::Approval) || status.contains("approval") {
+            "APPROVAL"
+        } else if self.is_active() || status.contains("work") || status.contains("execut") {
+            "WORKING"
+        } else {
+            "READY"
+        }
+    }
+}
+
 impl Projection {
     fn apply(&mut self, frame: ProjectionFrame) {
+        self.bridge_status = "CONNECTED".to_owned();
         if let Some(title) = frame.title {
             self.title = title;
         }
@@ -250,6 +395,7 @@ impl Projection {
             self.alerts = alerts;
         }
         self.active_operation = frame.active_operation;
+        self.current_action = frame.current_action;
         self.code_view = frame.code_view;
         self.diagnostics = frame.diagnostics.unwrap_or_default();
         self.verification = frame.verification.unwrap_or_default();
@@ -259,8 +405,13 @@ impl Projection {
         self.workspace_tree = frame.workspace_tree.unwrap_or_default();
         self.runtime_tree = frame.runtime_tree.unwrap_or_default();
         self.trace = frame.trace.unwrap_or_default();
+        self.stream_tail = frame.stream_tail.unwrap_or_default();
         self.layout = frame.layout;
         self.view = frame.view.unwrap_or_default();
+    }
+
+    fn bridge_error(&mut self, error: String) {
+        self.bridge_status = format!("ERROR: {error}");
     }
 }
 
@@ -454,6 +605,7 @@ fn spawn_pty_reader(mut reader: std::fs::File, output_tx: SyncSender<Vec<u8>>) {
 #[derive(Clone, Default)]
 struct LatestProjection {
     frame: Arc<Mutex<Option<ProjectionFrame>>>,
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl LatestProjection {
@@ -466,6 +618,26 @@ impl LatestProjection {
     fn take(&self) -> Option<ProjectionFrame> {
         self.frame.lock().ok()?.take()
     }
+
+    fn publish_error(&self, error: String) {
+        if let Ok(mut slot) = self.error.lock() {
+            *slot = Some(error);
+        }
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.error.lock().ok()?.take()
+    }
+}
+
+fn publish_projection_line(latest: &LatestProjection, line: &str) {
+    match serde_json::from_str::<ProjectionFrame>(line) {
+        Ok(frame) => match frame.normalize() {
+            Ok(frame) => latest.publish(frame),
+            Err(error) => latest.publish_error(error),
+        },
+        Err(error) => latest.publish_error(format!("invalid projection JSON: {error}")),
+    }
 }
 
 fn spawn_projection_reader() -> LatestProjection {
@@ -475,9 +647,7 @@ fn spawn_projection_reader() -> LatestProjection {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
-            if let Ok(frame) = serde_json::from_str::<ProjectionFrame>(&line) {
-                writer.publish(frame);
-            }
+            publish_projection_line(&writer, &line);
         }
     });
     latest
@@ -493,13 +663,17 @@ fn spawn_projection_socket(path: &str) -> Result<LatestProjection, io::Error> {
             let Ok(stream) = connection else { break };
             for line in io::BufReader::new(stream).lines() {
                 let Ok(line) = line else { break };
-                if let Ok(frame) = serde_json::from_str::<ProjectionFrame>(&line) {
-                    writer.publish(frame);
-                }
+                publish_projection_line(&writer, &line);
             }
         }
     });
     Ok(latest)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ApplyChanges {
+    terminal: bool,
+    projection: bool,
 }
 
 fn apply_available(
@@ -507,21 +681,20 @@ fn apply_available(
     output_rx: &Receiver<Vec<u8>>,
     bridge_rx: Option<&LatestProjection>,
     projection: &mut Projection,
-) -> bool {
-    let mut changed = false;
-    loop {
-        match output_rx.try_recv() {
-            Ok(bytes) => {
-                core.feed(&bytes);
-                changed = true;
-            }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-        }
+) -> ApplyChanges {
+    let mut changed = ApplyChanges::default();
+    while let Ok(bytes) = output_rx.try_recv() {
+        core.feed(&bytes);
+        changed.terminal = true;
     }
     if let Some(bridge_rx) = bridge_rx {
+        if let Some(error) = bridge_rx.take_error() {
+            projection.bridge_error(error);
+            changed.projection = true;
+        }
         if let Some(frame) = bridge_rx.take() {
             projection.apply(frame);
-            changed = true;
+            changed.projection = true;
         }
     }
     changed
@@ -556,10 +729,20 @@ fn run_headless(
 
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{} [{}]", projection.title, projection.status)?;
+    if !projection.bridge_status.is_empty() {
+        writeln!(stdout, "BRIDGE {}", projection.bridge_status)?;
+    }
     for line in core.snapshot() {
         writeln!(stdout, "{line}")?;
     }
     writeln!(stdout, "-- OI PROJECTION --")?;
+    if let Some(action) = projection.current_action.as_ref() {
+        writeln!(
+            stdout,
+            "ACTION {} {} {}",
+            action.kind, action.target, action.detail
+        )?;
+    }
     if let Some(request) = projection.model_request.as_ref() {
         writeln!(
             stdout,
@@ -658,7 +841,52 @@ fn write_projection_tree(
 
 #[cfg(test)]
 mod tests {
-    use super::{Projection, ProjectionFrame};
+    use super::{
+        LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION, NATIVE_BRIDGE_SCHEMA_VERSION, Projection,
+        ProjectionFrame, VisualMode,
+    };
+
+    #[test]
+    fn bridge_schema_accepts_current_and_normalizes_legacy() {
+        let current = ProjectionFrame {
+            schema_version: NATIVE_BRIDGE_SCHEMA_VERSION,
+            ..ProjectionFrame::default()
+        }
+        .normalize()
+        .expect("current schema should be accepted");
+        assert_eq!(current.schema_version, NATIVE_BRIDGE_SCHEMA_VERSION);
+
+        let legacy = ProjectionFrame {
+            schema_version: LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION,
+            ..ProjectionFrame::default()
+        }
+        .normalize()
+        .expect("legacy schema should be normalized");
+        assert_eq!(legacy.schema_version, NATIVE_BRIDGE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn bridge_schema_rejects_unknown_versions_as_visible_errors() {
+        let frame = ProjectionFrame {
+            schema_version: 999,
+            ..ProjectionFrame::default()
+        };
+        assert!(frame.normalize().is_err());
+    }
+
+    #[test]
+    fn visual_mode_covers_the_shared_action_vocabulary() {
+        for value in [
+            "idle", "think", "respond", "inspect", "read", "search", "code", "execute", "test",
+            "verify", "generate", "approval", "recover", "failure",
+        ] {
+            let projection = Projection {
+                semantic_state: value.to_owned(),
+                ..Projection::default()
+            };
+            assert_eq!(VisualMode::from_projection(&projection).as_str(), value);
+        }
+    }
 
     #[test]
     fn bridge_preserves_structured_scene_state() {

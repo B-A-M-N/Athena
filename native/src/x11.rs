@@ -7,6 +7,8 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{CString, c_char, c_int, c_long, c_ulong, c_void};
 use std::io::Write;
@@ -16,16 +18,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{OnResize, WindowSize};
+use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
-use alacritty_terminal::vte::ansi::{Color as TermColor, CursorShape, NamedColor};
+use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 
-use athena_terminal::NativeTerminalCore;
+use athena_terminal::{CellMetrics, NativePixelLayout, NativeTerminalCore, PixelRect};
 
+use crate::input::InputBuffer;
 use crate::{
     LatestProjection, Projection, ProjectionEntity, ProjectionOperation, ProjectionTreeNode,
-    apply_available,
+    VisualMode, apply_available,
 };
 
 type Display = c_void;
@@ -58,7 +63,6 @@ const CW_EVENT_MASK: c_ulong = 1 << 11;
 const CW_COLORMAP: c_ulong = 1 << 13;
 const INPUT_OUTPUT: c_int = 1;
 const GLX_RGBA: c_int = 4;
-const GLX_DOUBLEBUFFER: c_int = 5;
 const GLX_RED_SIZE: c_int = 8;
 const GLX_GREEN_SIZE: c_int = 9;
 const GLX_BLUE_SIZE: c_int = 10;
@@ -70,14 +74,16 @@ const GL_LINE_LOOP: u32 = 0x0002;
 const GL_POLYGON: u32 = 0x0009;
 const GL_PROJECTION: u32 = 0x1701;
 const GL_MODELVIEW: u32 = 0x1700;
+const GL_SCISSOR_TEST: u32 = 0x0c11;
 const SHIFT_MASK: CUint = 1;
 const CONTROL_MASK: CUint = 1 << 2;
 const BUTTON1_MASK: CUint = 1 << 8;
-const MOD1_MASK: CUint = 1 << 3;
 const CURRENT_TIME: c_ulong = 0;
 const PROP_MODE_REPLACE: c_int = 0;
-const CELL_WIDTH: i32 = 9;
-const CELL_HEIGHT: i32 = 18;
+const X_BUFFER_OVERFLOW: c_int = -1;
+const MAX_XIM_BUFFER: usize = 16 * 1024;
+const MAX_CACHED_XFT_COLORS: usize = 256;
+const MAX_CACHED_TEXT_WIDTHS: usize = 512;
 const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(40);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -206,6 +212,18 @@ struct XMotionEvent {
 }
 
 #[repr(C)]
+struct XClientMessageEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    window: Window,
+    message_type: Atom,
+    format: c_int,
+    data: [c_long; 5],
+}
+
+#[repr(C)]
 struct XSelectionRequestEvent {
     type_: c_int,
     serial: c_ulong,
@@ -246,7 +264,6 @@ const XK_DOWN: c_ulong = 0xff54;
 const XK_PAGE_UP: c_ulong = 0xff55;
 const XK_PAGE_DOWN: c_ulong = 0xff56;
 const XK_END: c_ulong = 0xff57;
-const XK_INSERT: c_ulong = 0xff63;
 const XK_DELETE: c_ulong = 0xffff;
 
 #[repr(C)]
@@ -256,6 +273,7 @@ struct XComposeStatus {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct XRenderColor {
     red: u16,
     green: u16,
@@ -264,13 +282,32 @@ struct XRenderColor {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct XftColor {
     pixel: c_ulong,
     color: XRenderColor,
 }
 
+#[repr(C)]
+struct XGlyphInfo {
+    width: u16,
+    height: u16,
+    x: i16,
+    y: i16,
+    x_off: i16,
+    y_off: i16,
+}
+
 type XftDraw = c_void;
-type XftFont = c_void;
+#[repr(C)]
+struct XftFont {
+    ascent: c_int,
+    descent: c_int,
+    height: c_int,
+    max_advance_width: c_int,
+    charset: *mut c_void,
+    pattern: *mut c_void,
+}
 type Xim = c_void;
 type Xic = c_void;
 
@@ -280,6 +317,13 @@ pub struct RendererOptions {
     pub mascot: String,
     pub animations: bool,
     pub reduced_motion: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DirtyDomains {
+    full: bool,
+    terminal: bool,
+    oi_motion: bool,
 }
 
 impl Default for RendererOptions {
@@ -406,6 +450,7 @@ unsafe extern "C" {
         status: *mut c_int,
     ) -> c_int;
     fn XFlush(display: *mut Display) -> c_int;
+    fn XSync(display: *mut Display, discard: c_int) -> c_int;
     fn XDestroyWindow(display: *mut Display, window: Window) -> c_int;
     fn XCloseDisplay(display: *mut Display) -> c_int;
 }
@@ -428,6 +473,26 @@ unsafe extern "C" {
     fn XftDrawDestroy(draw: *mut XftDraw);
     fn XftFontOpenName(display: *mut Display, screen: c_int, name: *const c_char) -> *mut XftFont;
     fn XftFontClose(display: *mut Display, font: *mut XftFont);
+    fn XftColorAllocValue(
+        display: *mut Display,
+        visual: *mut c_void,
+        colormap: Colormap,
+        color: *const XRenderColor,
+        result: *mut XftColor,
+    ) -> c_int;
+    fn XftColorFree(
+        display: *mut Display,
+        visual: *mut c_void,
+        colormap: Colormap,
+        color: *mut XftColor,
+    );
+    fn XftTextExtentsUtf8(
+        display: *mut Display,
+        font: *mut XftFont,
+        string: *const u8,
+        length: c_int,
+        extents: *mut XGlyphInfo,
+    );
     fn XftDrawStringUtf8(
         draw: *mut XftDraw,
         color: *const XftColor,
@@ -453,10 +518,16 @@ unsafe extern "C" {
         direct: c_int,
     ) -> GLXContext;
     fn glXMakeCurrent(display: *mut Display, drawable: Window, context: GLXContext) -> c_int;
-    fn glXSwapBuffers(display: *mut Display, drawable: Window);
     fn glXDestroyContext(display: *mut Display, context: GLXContext);
+    fn glXWaitGL();
+    fn glXWaitX();
     fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32);
     fn glClear(mask: u32);
+    fn glFinish();
+    fn glEnable(cap: u32);
+    fn glDisable(cap: u32);
+    fn glScissor(x: c_int, y: c_int, width: c_int, height: c_int);
+    fn glFlush();
     fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int);
     fn glMatrixMode(mode: u32);
     fn glLoadIdentity();
@@ -479,132 +550,18 @@ struct Clipboard {
     text: String,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PanelRect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FrameGeometry {
-    width: i32,
-    height: i32,
-    left_x: f32,
-    operator_outer: PanelRect,
-    oi_outer: PanelRect,
-    operator_inner: PanelRect,
-    oi_inner: PanelRect,
-    controls: PanelRect,
-    prompt: PanelRect,
-}
-
-impl FrameGeometry {
-    fn new(width: i32, height: i32) -> Self {
-        let width = width.max(1);
-        let height = height.max(1);
-        let margin = (width as f32 * 0.028).clamp(24.0, 42.0);
-        let gap = (width as f32 * 0.022).clamp(22.0, 34.0);
-        let body_y = 112.0_f32;
-        let rail = 92.0_f32;
-        let bottom = 24.0_f32;
-        let body_height = (height as f32 - body_y - rail - bottom).max(180.0);
-        let aperture_width = ((width as f32 - margin * 2.0 - gap) / 2.0).max(160.0);
-        let left_x = margin;
-        let right_x = left_x + aperture_width + gap;
-        let operator_outer = PanelRect {
-            x: left_x,
-            y: body_y,
-            width: aperture_width,
-            height: body_height,
-        };
-        let oi_outer = PanelRect {
-            x: right_x,
-            y: body_y,
-            width: aperture_width,
-            height: body_height,
-        };
-        // Both logical surfaces use the same content rectangle. Their
-        // housings are different, but terminal text, cursor, selection, and
-        // PTY geometry all derive from this exact shared inset.
-        let content_inset_x = 26.0_f32;
-        let content_inset_top = 48.0_f32;
-        let content_inset_bottom = 46.0_f32;
-        let operator_inner = PanelRect {
-            x: operator_outer.x + content_inset_x,
-            y: operator_outer.y + content_inset_top,
-            width: (operator_outer.width - content_inset_x * 2.0).max(80.0),
-            height: (operator_outer.height - content_inset_top - content_inset_bottom).max(80.0),
-        };
-        let oi_inner = PanelRect {
-            x: oi_outer.x + content_inset_x,
-            y: oi_outer.y + content_inset_top,
-            width: (oi_outer.width - content_inset_x * 2.0).max(80.0),
-            height: (oi_outer.height - content_inset_top - content_inset_bottom).max(80.0),
-        };
-        let rail_y = body_y + body_height + 16.0;
-        let controls = PanelRect {
-            x: margin,
-            y: rail_y,
-            width: width as f32 - margin * 2.0,
-            height: 52.0,
-        };
-        let prompt = PanelRect {
-            x: operator_outer.x + 16.0,
-            y: operator_outer.y + operator_outer.height - 36.0,
-            width: operator_outer.width - 32.0,
-            height: 25.0,
-        };
-        Self {
-            width,
-            height,
-            left_x,
-            operator_outer,
-            oi_outer,
-            operator_inner,
-            oi_inner,
-            controls,
-            prompt,
-        }
-    }
-
-    fn operator_origin(&self) -> (i32, i32) {
-        (
-            self.operator_inner.x.round() as i32,
-            self.operator_inner.y.round() as i32,
-        )
-    }
-
-    fn cell_at(&self, x: i32, y: i32) -> Option<(usize, usize)> {
-        let (content_x, content_y) = self.operator_origin();
-        let max_x = (self.operator_inner.x + self.operator_inner.width).floor() as i32;
-        let max_y = (self.operator_inner.y + self.operator_inner.height).floor() as i32;
-        if x < content_x || x >= max_x || y < content_y || y >= max_y {
-            return None;
-        }
-        Some((
-            ((x - content_x) / CELL_WIDTH) as usize,
-            ((y - content_y) / CELL_HEIGHT) as usize,
-        ))
-    }
-
-    fn terminal_size(&self) -> (usize, usize) {
-        (
-            (self.operator_inner.width / CELL_WIDTH as f32)
-                .floor()
-                .max(1.0) as usize,
-            (self.operator_inner.height / CELL_HEIGHT as f32)
-                .floor()
-                .max(1.0) as usize,
-        )
-    }
-}
+type PanelRect = PixelRect;
+type FrameGeometry = NativePixelLayout;
 
 struct TextRenderer {
     display: *mut Display,
     draw: *mut XftDraw,
     font: *mut XftFont,
+    visual: *mut c_void,
+    colormap: Colormap,
+    colors: RefCell<HashMap<(u8, u8, u8), XftColor>>,
+    widths: RefCell<HashMap<String, i32>>,
+    metrics: CellMetrics,
 }
 
 impl TextRenderer {
@@ -629,11 +586,76 @@ impl TextRenderer {
             unsafe { XftDrawDestroy(draw) };
             return Err("could not open a Fontconfig monospace font".to_owned());
         }
+        let sample = CString::new("M").expect("static glyph sample");
+        let mut extents = XGlyphInfo {
+            width: 0,
+            height: 0,
+            x: 0,
+            y: 0,
+            x_off: 0,
+            y_off: 0,
+        };
+        unsafe {
+            XftTextExtentsUtf8(display, font, sample.as_ptr().cast(), 1, &mut extents);
+        }
+        let metrics = unsafe {
+            CellMetrics::new(
+                (*font)
+                    .max_advance_width
+                    .max(i32::from(extents.x_off))
+                    .max(1) as f32,
+                (*font).height as f32,
+                (*font).ascent as f32,
+                (*font).descent as f32,
+            )
+        };
         Ok(Self {
             display,
             draw,
             font,
+            visual,
+            colormap,
+            colors: RefCell::new(HashMap::new()),
+            widths: RefCell::new(HashMap::new()),
+            metrics,
         })
+    }
+
+    fn metrics(&self) -> CellMetrics {
+        self.metrics
+    }
+
+    fn text_width(&self, text: &str) -> i32 {
+        let sanitized = text.replace('\0', "");
+        if let Some(width) = self.widths.borrow().get(&sanitized).copied() {
+            return width;
+        }
+        let Ok(value) = CString::new(sanitized) else {
+            return 0;
+        };
+        let mut extents = XGlyphInfo {
+            width: 0,
+            height: 0,
+            x: 0,
+            y: 0,
+            x_off: 0,
+            y_off: 0,
+        };
+        unsafe {
+            XftTextExtentsUtf8(
+                self.display,
+                self.font,
+                value.as_ptr().cast(),
+                value.as_bytes().len().min(c_int::MAX as usize) as c_int,
+                &mut extents,
+            );
+        }
+        let width = i32::from(extents.x_off.max(0));
+        let mut widths = self.widths.borrow_mut();
+        if widths.len() < MAX_CACHED_TEXT_WIDTHS {
+            widths.insert(value.to_string_lossy().into_owned(), width);
+        }
+        width
     }
 
     fn draw(&self, x: c_int, y: c_int, text: &str, color: (u8, u8, u8)) {
@@ -644,7 +666,47 @@ impl TextRenderer {
         let Ok(value) = CString::new(sanitized) else {
             return;
         };
-        let color = XftColor {
+        if let Some((color, cached)) = self.cached_color(color) {
+            unsafe {
+                XftDrawStringUtf8(
+                    self.draw,
+                    &color,
+                    self.font,
+                    x,
+                    y,
+                    value.as_ptr().cast(),
+                    value.as_bytes().len().min(c_int::MAX as usize) as c_int,
+                );
+                if !cached {
+                    let mut color = color;
+                    XftColorFree(self.display, self.visual, self.colormap, &mut color);
+                }
+            }
+        }
+    }
+
+    fn cached_color(&self, color: (u8, u8, u8)) -> Option<(XftColor, bool)> {
+        if let Some(cached) = self.colors.borrow().get(&color).copied() {
+            return Some((cached, true));
+        }
+        let allocated = self.allocate_color(color)?;
+        let mut colors = self.colors.borrow_mut();
+        if colors.len() < MAX_CACHED_XFT_COLORS {
+            let cached = *colors.entry(color).or_insert(allocated);
+            if cached.pixel != allocated.pixel {
+                unsafe {
+                    let mut allocated = allocated;
+                    XftColorFree(self.display, self.visual, self.colormap, &mut allocated);
+                }
+            }
+            Some((cached, true))
+        } else {
+            Some((allocated, false))
+        }
+    }
+
+    fn allocate_color(&self, color: (u8, u8, u8)) -> Option<XftColor> {
+        let mut allocated = XftColor {
             pixel: 0,
             color: XRenderColor {
                 red: u16::from(color.0) * 257,
@@ -654,15 +716,14 @@ impl TextRenderer {
             },
         };
         unsafe {
-            XftDrawStringUtf8(
-                self.draw,
-                &color,
-                self.font,
-                x,
-                y,
-                value.as_ptr().cast(),
-                value.as_bytes().len().min(c_int::MAX as usize) as c_int,
-            );
+            (XftColorAllocValue(
+                self.display,
+                self.visual,
+                self.colormap,
+                &allocated.color,
+                &mut allocated,
+            ) != 0)
+                .then_some(allocated)
         }
     }
 }
@@ -670,6 +731,9 @@ impl TextRenderer {
 impl Drop for TextRenderer {
     fn drop(&mut self) {
         unsafe {
+            for color in self.colors.get_mut().values_mut() {
+                XftColorFree(self.display, self.visual, self.colormap, color);
+            }
             XftFontClose(self.display, self.font);
             XftDrawDestroy(self.draw);
         }
@@ -679,6 +743,36 @@ impl Drop for TextRenderer {
 struct InputMethod {
     im: *mut Xim,
     ic: *mut Xic,
+}
+
+struct KeyLookup {
+    keysym: c_ulong,
+    bytes: Vec<u8>,
+}
+
+fn terminal_key_bytes(keysym: c_ulong, mode: TermMode, fallback: &[u8]) -> Vec<u8> {
+    let arrow = |key: u8| {
+        if mode.contains(TermMode::APP_CURSOR) {
+            vec![0x1b, b'O', key]
+        } else {
+            vec![0x1b, b'[', key]
+        }
+    };
+    match keysym {
+        XK_LEFT => arrow(b'D'),
+        XK_RIGHT => arrow(b'C'),
+        XK_UP => arrow(b'A'),
+        XK_DOWN => arrow(b'B'),
+        XK_HOME => arrow(b'H'),
+        XK_END => arrow(b'F'),
+        XK_PAGE_UP => b"\x1b[5~".to_vec(),
+        XK_PAGE_DOWN => b"\x1b[6~".to_vec(),
+        XK_DELETE => b"\x1b[3~".to_vec(),
+        XK_BACKSPACE => vec![0x7f],
+        XK_TAB => vec![b'\t'],
+        XK_RETURN => vec![b'\r'],
+        _ => fallback.to_vec(),
+    }
 }
 
 impl InputMethod {
@@ -720,6 +814,68 @@ impl InputMethod {
     ) -> c_int {
         unsafe { Xutf8LookupString(self.ic, event, buffer, length, keysym, status) }
     }
+}
+
+fn lookup_key(input_method: Option<&mut InputMethod>, event: &mut XKeyEvent) -> KeyLookup {
+    if let Some(input_method) = input_method {
+        let mut capacity = 128_usize;
+        loop {
+            let mut buffer = vec![0_i8; capacity];
+            let mut keysym = 0 as c_ulong;
+            let mut status = 0;
+            let count = input_method.lookup(
+                event,
+                buffer.as_mut_ptr(),
+                buffer.len().min(c_int::MAX as usize) as c_int,
+                &mut keysym,
+                &mut status,
+            );
+            if status == X_BUFFER_OVERFLOW {
+                let required = usize::try_from(count).unwrap_or(capacity.saturating_mul(2));
+                let next = required.max(capacity.saturating_mul(2));
+                if next > MAX_XIM_BUFFER {
+                    return KeyLookup {
+                        keysym,
+                        bytes: Vec::new(),
+                    };
+                }
+                capacity = next;
+                continue;
+            }
+            let length = bounded_lookup_length(count, buffer.len()).unwrap_or(0);
+            return KeyLookup {
+                keysym,
+                bytes: buffer[..length].iter().map(|byte| *byte as u8).collect(),
+            };
+        }
+    }
+
+    let mut buffer = [0_i8; 128];
+    let mut keysym = 0 as c_ulong;
+    let mut compose = XComposeStatus {
+        compose_ptr: ptr::null_mut(),
+        chars_matched: 0,
+    };
+    let count = unsafe {
+        XLookupString(
+            event,
+            buffer.as_mut_ptr(),
+            buffer.len() as c_int,
+            &mut keysym,
+            &mut compose,
+        )
+    };
+    let length = bounded_lookup_length(count, buffer.len()).unwrap_or(0);
+    KeyLookup {
+        keysym,
+        bytes: buffer[..length].iter().map(|byte| *byte as u8).collect(),
+    }
+}
+
+fn bounded_lookup_length(count: c_int, capacity: usize) -> Option<usize> {
+    usize::try_from(count)
+        .ok()
+        .filter(|length| *length <= capacity)
 }
 
 impl Drop for InputMethod {
@@ -894,6 +1050,16 @@ fn intern_atom(display: *mut Display, name: &str) -> Atom {
     unsafe { XInternAtom(display, value.as_ptr(), 0) }
 }
 
+fn is_wm_delete_message(
+    message_type: Atom,
+    format: c_int,
+    first_data: c_long,
+    protocols_atom: Atom,
+    delete_atom: Atom,
+) -> bool {
+    message_type == protocols_atom && format == 32 && first_data as c_ulong == delete_atom
+}
+
 pub fn run(
     mut core: NativeTerminalCore,
     mut pty: tty::Pty,
@@ -935,7 +1101,6 @@ fn run_window(
     let screen = unsafe { XDefaultScreen(display) };
     let attributes = [
         GLX_RGBA,
-        GLX_DOUBLEBUFFER,
         GLX_RED_SIZE,
         8,
         GLX_GREEN_SIZE,
@@ -1003,8 +1168,10 @@ fn run_window(
             0,
         )
     };
+    let protocols_atom = intern_atom(display, "WM_PROTOCOLS");
     unsafe { XSetWMProtocols(display, window, &delete_atom as *const Atom as *mut Atom, 1) };
     unsafe { XMapWindow(display, window) };
+    unsafe { XSync(display, 0) };
 
     let context = unsafe { glXCreateContext(display, visual, ptr::null_mut(), 1) };
     if context.is_null() {
@@ -1033,16 +1200,20 @@ fn run_window(
         .try_clone()
         .map_err(|error| format!("could not clone PTY writer: {error}"))?;
     let mut clipboard = Clipboard::new(display);
+    let mut input_buffer = InputBuffer::default();
     let mut selection: Option<((usize, usize), (usize, usize))> = None;
     let mut width = 1280_i32;
     let mut height = 800_i32;
-    resize_terminal(core, pty, width, height);
+    let metrics = text.metrics();
+    resize_terminal(core, pty, width, height, metrics);
     unsafe { XSetInputFocus(display, window, 1, CURRENT_TIME) };
     let mut focused = true;
     let mut running = true;
     let mut window_destroyed = false;
     let mut child_exited = false;
     let mut dirty = true;
+    let mut terminal_dirty = false;
+    let mut oi_motion_dirty = false;
     let mut activity_dirty = false;
     let mut initial_redraws = 0_u64;
     let mut event_redraws = 0_u64;
@@ -1056,8 +1227,12 @@ fn run_window(
     let mut steady_elapsed_seconds = 0.0_f64;
     let mut steady_cpu_seconds = 0.0_f64;
     while running {
-        if apply_available(core, &output_rx, bridge_rx.as_ref(), projection) {
+        let changes = apply_available(core, &output_rx, bridge_rx.as_ref(), projection);
+        if changes.projection {
             dirty = true;
+            activity_dirty = true;
+        } else if changes.terminal {
+            terminal_dirty = true;
             activity_dirty = true;
         }
         while unsafe { XPending(display) } > 0 {
@@ -1067,43 +1242,38 @@ fn run_window(
             };
             unsafe { XNextEvent(display, &mut event) };
             if let Some(bytes) = clipboard.handle_event(display, window, &mut event) {
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
+                if core.mode().contains(TermMode::ALT_SCREEN) {
+                    let filtered: Vec<u8> = bytes
+                        .into_iter()
+                        .filter(|byte| *byte != 0x1b && *byte != 0x03)
+                        .collect();
+                    let _ = writer.write_all(b"\x1b[200~");
+                    let _ = writer.write_all(&filtered);
+                    let _ = writer.write_all(b"\x1b[201~");
+                    let _ = writer.flush();
+                } else {
+                    let text = String::from_utf8_lossy(&bytes);
+                    if input_buffer.insert(&text) {
+                        dirty = true;
+                        activity_dirty = true;
+                    }
+                }
                 continue;
             }
             match event.type_ {
                 KEY_PRESS => {
                     let key_event = unsafe { &mut *(&mut event as *mut XEvent as *mut XKeyEvent) };
-                    let mut buffer = [0_i8; 128];
-                    let mut keysym = 0 as c_ulong;
-                    let mut compose = XComposeStatus {
-                        compose_ptr: ptr::null_mut(),
-                        chars_matched: 0,
-                    };
-                    let count = if let Some(input_method) = input_method.as_mut() {
-                        let mut status = 0;
-                        input_method.lookup(
-                            key_event,
-                            buffer.as_mut_ptr(),
-                            buffer.len() as c_int,
-                            &mut keysym,
-                            &mut status,
-                        )
-                    } else {
-                        unsafe {
-                            XLookupString(
-                                key_event,
-                                buffer.as_mut_ptr(),
-                                buffer.len() as c_int,
-                                &mut keysym,
-                                &mut compose,
-                            )
-                        }
-                    };
+                    let lookup = lookup_key(input_method.as_mut(), key_event);
+                    let keysym = lookup.keysym;
+                    let control = key_event.state & CONTROL_MASK != 0;
+                    let selecting = key_event.state & SHIFT_MASK != 0;
+                    let terminal_app = core.mode().contains(TermMode::ALT_SCREEN);
                     if key_event.state & (CONTROL_MASK | SHIFT_MASK) == (CONTROL_MASK | SHIFT_MASK)
                         && matches!(keysym, k if k == 'c' as c_ulong || k == 'C' as c_ulong)
                     {
-                        if let Some((anchor, extent)) = selection {
+                        if let Some(selected) = input_buffer.selected_text() {
+                            clipboard.own(display, window, selected.to_owned());
+                        } else if let Some((anchor, extent)) = selection {
                             let (start, end) = selection_bounds(anchor, extent);
                             let end = (end.0.saturating_add(1), end.1);
                             clipboard.own(display, window, core.selection_text(start, end));
@@ -1113,11 +1283,77 @@ fn run_window(
                         && matches!(keysym, k if k == 'v' as c_ulong || k == 'V' as c_ulong)
                     {
                         clipboard.request(display, window);
-                    } else {
-                        let bytes = key_bytes(key_event, keysym, &buffer, count);
+                    } else if keysym == XK_ESCAPE {
+                        // Escape remains a terminal byte. It never closes the
+                        // native window and does not mutate the prompt buffer.
+                        let _ = writer.write_all(&[0x1b]);
+                        let _ = writer.flush();
+                        dirty = true;
+                        activity_dirty = true;
+                    } else if control
+                        && matches!(keysym, k if k == 'c' as c_ulong || k == 'C' as c_ulong)
+                    {
+                        // The PTY line discipline turns this into SIGINT for
+                        // the Python session; that session cancels its
+                        // foreground task and keeps the window alive.
+                        input_buffer.clear();
+                        let _ = writer.write_all(&[0x03]);
+                        let _ = writer.flush();
+                        dirty = true;
+                        activity_dirty = true;
+                    } else if terminal_app {
+                        let bytes = terminal_key_bytes(keysym, core.mode(), &lookup.bytes);
                         if !bytes.is_empty() {
                             let _ = writer.write_all(&bytes);
                             let _ = writer.flush();
+                        }
+                    } else if control {
+                        let key = (keysym as u8).to_ascii_lowercase();
+                        let changed = match key {
+                            b'a' if selecting => input_buffer.select_all(),
+                            b'a' => input_buffer.home(false),
+                            b'e' => input_buffer.end(selecting),
+                            b'u' => input_buffer.clear_to_start(),
+                            b'k' => input_buffer.clear_to_end(),
+                            b'w' => input_buffer.move_word_left(),
+                            _ => false,
+                        };
+                        if changed {
+                            dirty = true;
+                            activity_dirty = true;
+                        }
+                    } else {
+                        let changed = match keysym {
+                            XK_BACKSPACE => input_buffer.backspace(),
+                            XK_DELETE => input_buffer.delete(),
+                            XK_LEFT => input_buffer.move_left(selecting),
+                            XK_RIGHT => input_buffer.move_right(selecting),
+                            XK_HOME => input_buffer.home(selecting),
+                            XK_END => input_buffer.end(selecting),
+                            XK_UP => input_buffer.history_up(),
+                            XK_DOWN => input_buffer.history_down(),
+                            XK_PAGE_UP if selecting => {
+                                core.scroll_display(Scroll::PageUp);
+                                true
+                            }
+                            XK_PAGE_DOWN if selecting => {
+                                core.scroll_display(Scroll::PageDown);
+                                true
+                            }
+                            XK_RETURN => {
+                                let mut line = input_buffer.take_line();
+                                line.push('\n');
+                                let _ = writer.write_all(line.as_bytes());
+                                let _ = writer.flush();
+                                true
+                            }
+                            XK_TAB => input_buffer.insert("\t"),
+                            _ => {
+                                let text = String::from_utf8_lossy(&lookup.bytes);
+                                input_buffer.insert(&text)
+                            }
+                        };
+                        if changed {
                             dirty = true;
                             activity_dirty = true;
                         }
@@ -1125,12 +1361,27 @@ fn run_window(
                 }
                 BUTTON_PRESS => {
                     let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
-                    if button.button == 1 {
+                    if button.button == 4 {
+                        core.scroll_display(Scroll::Delta(3));
+                        dirty = true;
+                        activity_dirty = true;
+                    } else if button.button == 5 {
+                        core.scroll_display(Scroll::Delta(-3));
+                        dirty = true;
+                        activity_dirty = true;
+                    } else if button.button == 1 {
                         unsafe { XSetInputFocus(display, window, 1, CURRENT_TIME) };
                         focused = true;
-                        if let Some(cell) =
-                            FrameGeometry::new(width, height).cell_at(button.x, button.y)
-                        {
+                        let geometry = FrameGeometry::for_window(width, height, metrics);
+                        if geometry.prompt.contains(button.x, button.y) {
+                            let offset =
+                                ((button.x as f32 - geometry.prompt.x - geometry.prompt_padding_x)
+                                    / geometry.cell_width)
+                                    .max(0.0) as usize;
+                            input_buffer.set_cursor_chars(offset, button.state & SHIFT_MASK != 0);
+                            dirty = true;
+                            activity_dirty = true;
+                        } else if let Some(cell) = geometry.cell_at(button.x, button.y) {
                             selection = Some((cell, cell));
                             dirty = true;
                             activity_dirty = true;
@@ -1142,7 +1393,8 @@ fn run_window(
                     if motion.state & BUTTON1_MASK != 0 {
                         if let (Some((anchor, _)), Some(cell)) = (
                             selection,
-                            FrameGeometry::new(width, height).cell_at(motion.x, motion.y),
+                            FrameGeometry::for_window(width, height, metrics)
+                                .cell_at(motion.x, motion.y),
                         ) {
                             selection = Some((anchor, cell));
                             dirty = true;
@@ -1155,7 +1407,8 @@ fn run_window(
                     if button.button == 1 {
                         if let (Some((anchor, _)), Some(cell)) = (
                             selection,
-                            FrameGeometry::new(width, height).cell_at(button.x, button.y),
+                            FrameGeometry::for_window(width, height, metrics)
+                                .cell_at(button.x, button.y),
                         ) {
                             selection = Some((anchor, cell));
                             dirty = true;
@@ -1168,7 +1421,7 @@ fn run_window(
                         unsafe { &*(&event as *const XEvent as *const XConfigureEvent) };
                     width = configure.width.max(1);
                     height = configure.height.max(1);
-                    resize_terminal(core, pty, width, height);
+                    resize_terminal(core, pty, width, height, metrics);
                     dirty = true;
                     activity_dirty = true;
                 }
@@ -1201,12 +1454,22 @@ fn run_window(
                     running = false;
                 }
                 CLIENT_MESSAGE => {
-                    // WM_DELETE_WINDOW is an external shutdown request. The
-                    // window manager owns the drawable lifecycle from here;
-                    // let the X connection reclaim Xft/XIM handles rather
-                    // than racing it with a second teardown.
-                    window_destroyed = true;
-                    running = false;
+                    let message =
+                        unsafe { &*(&event as *const XEvent as *const XClientMessageEvent) };
+                    if is_wm_delete_message(
+                        message.message_type,
+                        message.format,
+                        message.data[0],
+                        protocols_atom,
+                        delete_atom,
+                    ) {
+                        // WM_DELETE_WINDOW is an external shutdown request.
+                        // The window manager owns the drawable lifecycle from
+                        // here; let the X connection reclaim Xft/XIM handles
+                        // rather than racing it with a second teardown.
+                        window_destroyed = true;
+                        running = false;
+                    }
                 }
                 _ => {}
             }
@@ -1226,16 +1489,15 @@ fn run_window(
         }
         let now = Instant::now();
         if options.animations && !options.reduced_motion && projection_is_animated(projection) {
-            dirty = true;
+            oi_motion_dirty = true;
             activity_dirty = true;
         }
         let draw_ready = last_draw
             .map(|last| now.duration_since(last) >= ACTIVE_FRAME_INTERVAL)
             .unwrap_or(true);
-        if dirty && draw_ready {
+        if (dirty || terminal_dirty || oi_motion_dirty) && draw_ready {
             draw_frame(
                 display,
-                window,
                 width,
                 height,
                 core,
@@ -1243,7 +1505,13 @@ fn run_window(
                 selection,
                 &text,
                 focused,
+                &input_buffer,
                 options,
+                DirtyDomains {
+                    full: dirty,
+                    terminal: terminal_dirty,
+                    oi_motion: oi_motion_dirty,
+                },
                 if options.animations && !options.reduced_motion {
                     render_started.elapsed().as_secs_f32()
                 } else {
@@ -1260,9 +1528,11 @@ fn run_window(
             }
             last_draw = Some(now);
             dirty = false;
+            terminal_dirty = false;
+            oi_motion_dirty = false;
             activity_dirty = false;
         }
-        if !dirty && !child_exited && steady_started.is_none() {
+        if !dirty && !terminal_dirty && !child_exited && steady_started.is_none() {
             steady_started = Some(Instant::now());
             steady_cpu_started = process_cpu_seconds();
         }
@@ -1398,94 +1668,28 @@ fn finish_steady_interval(
     }
 }
 
-fn resize_terminal(core: &mut NativeTerminalCore, pty: &mut tty::Pty, width: i32, height: i32) {
-    let (columns, rows) = FrameGeometry::new(width, height).terminal_size();
+fn resize_terminal(
+    core: &mut NativeTerminalCore,
+    pty: &mut tty::Pty,
+    width: i32,
+    height: i32,
+    metrics: CellMetrics,
+) {
+    let layout = FrameGeometry::for_window(width, height, metrics);
+    let terminal_size = layout.terminal_size();
+    let columns = terminal_size.columns;
+    let rows = terminal_size.rows;
     core.resize(columns, rows);
     pty.on_resize(WindowSize {
         num_cols: columns.min(u16::MAX as usize) as u16,
         num_lines: rows.min(u16::MAX as usize) as u16,
-        cell_width: CELL_WIDTH as u16,
-        cell_height: CELL_HEIGHT as u16,
+        cell_width: metrics.width.round().max(1.0) as u16,
+        cell_height: metrics.height.round().max(1.0) as u16,
     });
 }
 
-fn key_bytes(event: &XKeyEvent, keysym: c_ulong, buffer: &[c_char], count: c_int) -> Vec<u8> {
-    let control = event.state & CONTROL_MASK != 0;
-    let alt = event.state & MOD1_MASK != 0;
-    let mut bytes = match keysym {
-        XK_BACKSPACE => vec![0x7f],
-        XK_TAB => vec![b'\t'],
-        XK_RETURN => vec![b'\r'],
-        XK_ESCAPE => vec![0x1b],
-        XK_LEFT => csi_key(b'D', control),
-        XK_RIGHT => csi_key(b'C', control),
-        XK_UP => csi_key(b'A', control),
-        XK_DOWN => csi_key(b'B', control),
-        XK_HOME => b"\x1b[H".to_vec(),
-        XK_END => b"\x1b[F".to_vec(),
-        XK_PAGE_UP => b"\x1b[5~".to_vec(),
-        XK_PAGE_DOWN => b"\x1b[6~".to_vec(),
-        XK_INSERT => b"\x1b[2~".to_vec(),
-        XK_DELETE => b"\x1b[3~".to_vec(),
-        0xffbe => b"\x1bOP".to_vec(),
-        0xffbf => b"\x1bOQ".to_vec(),
-        0xffc0 => b"\x1bOR".to_vec(),
-        0xffc1 => b"\x1bOS".to_vec(),
-        0xffc2 => b"\x1b[15~".to_vec(),
-        0xffc3 => b"\x1b[17~".to_vec(),
-        0xffc4 => b"\x1b[18~".to_vec(),
-        0xffc5 => b"\x1b[19~".to_vec(),
-        0xffc6 => b"\x1b[20~".to_vec(),
-        0xffc7 => b"\x1b[21~".to_vec(),
-        0xffc8 => b"\x1b[23~".to_vec(),
-        0xffc9 => b"\x1b[24~".to_vec(),
-        _ if count > 0 => unsafe {
-            std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), count as usize).to_vec()
-        },
-        _ => Vec::new(),
-    };
-    if control && keysym <= 0x7f {
-        let key = (keysym as u8).to_ascii_lowercase();
-        if key.is_ascii_lowercase() {
-            bytes = vec![key - b'a' + 1];
-        }
-    }
-    if alt && !bytes.is_empty() && bytes[0] != 0x1b {
-        bytes.insert(0, 0x1b);
-    }
-    bytes
-}
-
-fn csi_key(final_byte: u8, control: bool) -> Vec<u8> {
-    if control {
-        vec![0x1b, b'[', b'1', b';', b'5', final_byte]
-    } else {
-        vec![0x1b, b'[', final_byte]
-    }
-}
-
 fn projection_is_animated(projection: &Projection) -> bool {
-    let mode = if projection.view.mode.is_empty() {
-        projection.semantic_state.as_str()
-    } else {
-        projection.view.mode.as_str()
-    };
-    matches!(
-        mode.to_ascii_lowercase().as_str(),
-        "search"
-            | "inspect"
-            | "code"
-            | "coding"
-            | "test"
-            | "testing"
-            | "verify"
-            | "approval"
-            | "failure"
-            | "recover"
-            | "recovery"
-            | "execute"
-            | "working"
-    )
+    VisualMode::from_projection(projection).is_animated()
 }
 fn operation_progress(operation: &ProjectionOperation) -> String {
     if !operation.progress_determinate {
@@ -1558,7 +1762,6 @@ fn diagnostic_text(diagnostic: &crate::ProjectionDiagnostic, message: &str) -> S
 
 fn draw_frame(
     display: *mut Display,
-    window: Window,
     width: i32,
     height: i32,
     core: &NativeTerminalCore,
@@ -1566,15 +1769,14 @@ fn draw_frame(
     selection: Option<((usize, usize), (usize, usize))>,
     text: &TextRenderer,
     focused: bool,
+    input_buffer: &InputBuffer,
     options: &RendererOptions,
+    dirty: DirtyDomains,
     phase: f32,
 ) {
-    let geometry = FrameGeometry::new(width, height);
-    let semantic_mode = if projection.view.mode.is_empty() {
-        projection.semantic_state.as_str()
-    } else {
-        projection.view.mode.as_str()
-    };
+    let geometry = FrameGeometry::for_window(width, height, text.metrics());
+    let semantic_mode = VisualMode::from_projection(projection).as_str();
+    unsafe { glXWaitX() };
     unsafe {
         glViewport(0, 0, width, height);
         glMatrixMode(GL_PROJECTION);
@@ -1582,68 +1784,170 @@ fn draw_frame(
         glOrtho(0.0, width as f64, height as f64, 0.0, -1.0, 1.0);
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
-        glClearColor(0.018, 0.024, 0.038, 1.0);
-        glClear(GL_COLOR_BUFFER_BIT);
     }
 
-    draw_chassis(&geometry, projection, focused, phase);
-    draw_terminal_background(core, &geometry, selection, focused);
-    draw_oi_scene(
-        geometry.oi_inner.x,
-        geometry.oi_inner.y,
-        geometry.oi_inner.width,
-        geometry.oi_inner.height,
-        projection,
-        phase,
-        options,
-    );
-    unsafe { glXSwapBuffers(display, window) };
+    if dirty.full {
+        unsafe {
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0.018, 0.024, 0.038, 1.0);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        draw_chassis(&geometry, projection, focused, phase);
+        with_scissor(height, geometry.operator_inner, || {
+            draw_terminal_background(core, &geometry, selection);
+        });
+        with_scissor(height, geometry.oi_inner, || {
+            draw_oi_scene(
+                geometry.oi_inner.x,
+                geometry.oi_inner.y,
+                geometry.oi_inner.width,
+                geometry.oi_inner.height,
+                projection,
+                phase,
+                options,
+            );
+        });
+    } else if dirty.terminal {
+        with_scissor(height, geometry.operator_inner, || {
+            draw_terminal_background(core, &geometry, selection);
+        });
+    } else if dirty.oi_motion {
+        with_scissor(height, geometry.oi_inner, || {
+            draw_rect(
+                geometry.oi_inner.x,
+                geometry.oi_inner.y,
+                geometry.oi_inner.width,
+                geometry.oi_inner.height,
+                (0.010, 0.028, 0.037),
+            );
+            draw_oi_scene(
+                geometry.oi_inner.x,
+                geometry.oi_inner.y,
+                geometry.oi_inner.width,
+                geometry.oi_inner.height,
+                projection,
+                phase,
+                options,
+            );
+        });
+    }
 
-    // Xft renders UTF-8 text on the presented surface. Unlike the old core
-    // font call, this is antialiased, Fontconfig-backed, and preserves the
-    // actual Alacritty cell content rather than a lossy string snapshot.
-    let mode_label = if semantic_mode.is_empty() {
-        "IDLE".to_owned()
-    } else {
-        semantic_mode.to_ascii_uppercase()
-    };
-    text.draw(geometry.left_x as c_int + 22, 48, "ATHENA", (229, 239, 247));
-    text.draw(
-        geometry.left_x as c_int + 145,
-        48,
-        "AUTONOMOUS OPERATIONS CONSOLE",
-        (112, 145, 174),
-    );
-    text.draw(
-        (width as f32 - geometry.left_x - 190.0) as c_int,
-        48,
-        "NATIVE / ONLINE",
-        (103, 198, 181),
-    );
-    text.draw(
-        geometry.operator_outer.x as c_int + 24,
-        geometry.operator_outer.y as c_int + 30,
-        &format!(
-            "OPERATOR // TERMINAL  ·  {}",
-            if focused { "FOCUS" } else { "UNFOCUSED" }
-        ),
-        (164, 189, 211),
-    );
-    text.draw(
-        geometry.oi_outer.x as c_int + 24,
-        geometry.oi_outer.y as c_int + 30,
-        &format!("DAGOAL // {mode_label}"),
-        mode_color(semantic_mode),
-    );
-    draw_terminal_text(text, core, &geometry);
-    draw_status_text(text, &geometry, projection, semantic_mode, focused, options);
-    unsafe { XFlush(display) };
+    if dirty.full {
+        // Complete the OpenGL writes before Xft submits text to the same
+        // single-buffer drawable. GLX and Xlib have separate request paths;
+        // glFlush alone does not establish the ordering Xft needs here.
+        unsafe {
+            glFinish();
+            glXWaitGL();
+        }
+        // Xft renders UTF-8 after the OpenGL scene on the same single-buffer
+        // X11 drawable. The frame is flushed only after both layers are done.
+        let mode_label = if semantic_mode.is_empty() {
+            "IDLE".to_owned()
+        } else {
+            semantic_mode.to_ascii_uppercase()
+        };
+        let header_baseline = geometry.header.y as c_int
+            + ((geometry.header.height - text.metrics().height) / 2.0 + text.metrics().baseline)
+                as c_int;
+        text.draw(
+            geometry.header.x as c_int + 22,
+            header_baseline,
+            &fit_text(text, "ATHENA", (geometry.header.width as c_int - 44).max(1)),
+            (229, 239, 247),
+        );
+        text.draw(
+            geometry.header.x as c_int + 145,
+            header_baseline,
+            &fit_text(
+                text,
+                "AUTONOMOUS OPERATIONS CONSOLE",
+                (geometry.header.width as c_int - 190).max(1),
+            ),
+            (112, 145, 174),
+        );
+        let bridge_label = if projection.bridge_status.is_empty() {
+            "WAITING"
+        } else {
+            projection.bridge_status.as_str()
+        };
+        let bridge_text = format!("BRIDGE / {bridge_label}");
+        text.draw(
+            (geometry.header.right() - text.text_width(&bridge_text) as f32 - 22.0) as c_int,
+            header_baseline,
+            &bridge_text,
+            if bridge_label.starts_with("ERROR") {
+                (235, 112, 116)
+            } else if bridge_label == "CONNECTED" {
+                (103, 198, 181)
+            } else {
+                (239, 194, 105)
+            },
+        );
+        let panel_baseline =
+            |panel: PixelRect| panel.y as c_int + text.metrics().baseline as c_int + 12;
+        text.draw(
+            geometry.operator_outer.x as c_int + 24,
+            panel_baseline(geometry.operator_outer),
+            &fit_text(
+                text,
+                &format!(
+                    "OPERATOR // TERMINAL  ·  {}",
+                    if focused { "FOCUS" } else { "UNFOCUSED" }
+                ),
+                (geometry.operator_outer.width as c_int - 48).max(1),
+            ),
+            (164, 189, 211),
+        );
+        text.draw(
+            geometry.oi_outer.x as c_int + 24,
+            panel_baseline(geometry.oi_outer),
+            &fit_text(
+                text,
+                &format!("DAGOAL // {mode_label}"),
+                (geometry.oi_outer.width as c_int - 48).max(1),
+            ),
+            mode_color(semantic_mode),
+        );
+        with_scissor(height, geometry.operator_inner, || {
+            draw_terminal_text(text, core, &geometry);
+        });
+        draw_status_text(
+            text,
+            &geometry,
+            projection,
+            semantic_mode,
+            focused,
+            options,
+            input_buffer,
+        );
+    } else if dirty.terminal {
+        unsafe {
+            glFinish();
+            glXWaitGL();
+        }
+        with_scissor(height, geometry.operator_inner, || {
+            draw_terminal_text(text, core, &geometry);
+        });
+    }
+    unsafe {
+        if !dirty.full {
+            glFlush();
+        }
+        XFlush(display);
+    }
 }
 
 fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool, _phase: f32) {
-    let width = geometry.width as f32;
-    let height = geometry.height as f32;
-    draw_rect(0.0, 0.0, width, height, (0.014, 0.019, 0.030));
+    let width = geometry.chassis.width;
+    let height = geometry.chassis.height;
+    draw_rect(
+        geometry.chassis.x,
+        geometry.chassis.y,
+        width,
+        height,
+        (0.014, 0.019, 0.030),
+    );
     draw_round_rect(
         geometry.left_x - 10.0,
         14.0,
@@ -1661,16 +1965,23 @@ fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool
         (0.043, 0.055, 0.071),
     );
     draw_round_rect(
-        geometry.left_x,
-        24.0,
-        width - geometry.left_x * 2.0,
-        52.0,
+        geometry.header.x,
+        geometry.header.y,
+        geometry.header.width,
+        geometry.header.height,
         12.0,
         (0.095, 0.112, 0.138),
     );
     for index in 0..9 {
-        let x = geometry.left_x + 250.0 + index as f32 * 15.0;
-        draw_round_rect(x, 39.0, 9.0, 4.0, 2.0, (0.025, 0.034, 0.047));
+        let x = geometry.header.x + geometry.header.width * 0.30 + index as f32 * 15.0;
+        draw_round_rect(
+            x,
+            geometry.header.y + geometry.header.height * 0.29,
+            9.0,
+            4.0,
+            2.0,
+            (0.025, 0.034, 0.047),
+        );
     }
     let indicator = if projection.status.to_ascii_lowercase().contains("fail") {
         (0.82, 0.24, 0.27)
@@ -1684,8 +1995,8 @@ fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool
         .enumerate()
     {
         draw_round_rect(
-            width - geometry.left_x - 60.0 + index as f32 * 22.0,
-            42.0,
+            geometry.header.right() - 60.0 + index as f32 * 22.0,
+            geometry.header.y + geometry.header.height * 0.35,
             9.0,
             9.0,
             4.5,
@@ -1785,6 +2096,7 @@ fn draw_status_text(
     semantic_mode: &str,
     focused: bool,
     options: &RendererOptions,
+    input: &InputBuffer,
 ) {
     let input_state = input_state(projection);
     let detail = projection
@@ -1806,20 +2118,44 @@ fn draw_status_text(
     text.draw(
         geometry.oi_outer.x as c_int + 24,
         geometry.oi_outer.y as c_int + geometry.oi_outer.height as c_int - 12,
-        &format!("{}  ·  {}", detail, options.mascot.to_ascii_uppercase()),
+        &fit_text(
+            text,
+            &format!("{}  ·  {}", detail, options.mascot.to_ascii_uppercase()),
+            (geometry.oi_outer.width as c_int - 48).max(1),
+        ),
         mode_color(semantic_mode),
     );
-    text.draw(
-        geometry.prompt.x as c_int + 20,
-        geometry.prompt.y as c_int + 22,
-        &format!(">  ENTER OBJECTIVE  [{input_state}]"),
-        if focused {
-            (206, 220, 230)
-        } else {
-            (132, 145, 156)
-        },
-    );
-    let mut annotation_y = geometry.oi_inner.y as c_int + 22;
+    let prompt_color = if focused {
+        (206, 220, 230)
+    } else {
+        (132, 145, 156)
+    };
+    let state_label = format!("  [{input_state}]");
+    let prompt_x = geometry.prompt.x as c_int + geometry.prompt_padding_x as c_int;
+    let prompt_y = geometry.prompt.y as c_int + geometry.prompt.height as c_int - 6;
+    let available = (geometry.prompt.width as c_int
+        - geometry.prompt_padding_x as c_int * 2
+        - text.text_width(&state_label)
+        - text.text_width("> "))
+    .max(1);
+    let input_value = format!("{}{}", input.text(), input.composition());
+    let (displayed, display_cursor) = fit_input(text, &input_value, input.cursor(), available);
+    let prompt_value = format!("> {displayed}{state_label}");
+    text.draw(prompt_x, prompt_y, &prompt_value, prompt_color);
+    if focused {
+        let cursor_prefix: String = displayed.chars().take(display_cursor).collect();
+        let cursor_text = format!("> {cursor_prefix}");
+        let cursor_x = prompt_x + text.text_width(&cursor_text);
+        draw_rect(
+            cursor_x as f32,
+            geometry.prompt.y + 5.0,
+            2.0,
+            geometry.prompt.height - 10.0,
+            (0.36, 0.76, 0.72),
+        );
+    }
+    let line_height = text.metrics().height.max(1.0);
+    let mut annotation_y = geometry.oi_inner.y as c_int + text.metrics().baseline as c_int;
     let mut annotations: Vec<(String, (u8, u8, u8))> = Vec::new();
     if let Some(request) = projection.model_request.as_ref() {
         annotations.push((
@@ -1893,13 +2229,50 @@ fn draw_status_text(
             (239, 194, 105),
         ));
     } else {
-        annotations.extend(
-            projection
-                .oi
-                .iter()
-                .take(3)
-                .map(|line| (line.clone(), (176, 205, 220))),
-        );
+        if let Some(action) = projection.current_action.as_ref() {
+            let action_name = if action.kind.is_empty() {
+                semantic_mode
+            } else {
+                action.kind.as_str()
+            };
+            annotations.push((
+                format!("{}  {}", action_name.to_ascii_uppercase(), action.label),
+                (176, 205, 220),
+            ));
+            if !action.query.is_empty() {
+                annotations.push((format!("QUERY  {}", action.query), (192, 208, 220)));
+            } else if !action.target.is_empty() {
+                annotations.push((format!("TARGET  {}", action.target), (192, 208, 220)));
+            }
+            if !action.detail.is_empty()
+                && action.detail != action.query
+                && action.detail != action.target
+            {
+                annotations.push((action.detail.clone(), (176, 205, 220)));
+            }
+            if !action.progress.is_empty() {
+                annotations.push((
+                    if action.progress_determinate {
+                        action.progress_value.map_or_else(
+                            || format!("PROGRESS  {}", action.progress),
+                            |value| format!("PROGRESS  {}  {:.0}%", action.progress, value * 100.0),
+                        )
+                    } else {
+                        format!("PROGRESS  {}", action.progress)
+                    },
+                    (239, 194, 105),
+                ));
+            }
+        }
+        if annotations.is_empty() {
+            annotations.extend(
+                projection
+                    .oi
+                    .iter()
+                    .take(3)
+                    .map(|line| (line.clone(), (176, 205, 220))),
+            );
+        }
     }
     if let Some(entity) = projection.runtime_entities.first() {
         annotations.push((
@@ -1915,68 +2288,108 @@ fn draw_status_text(
         text.draw(
             geometry.oi_inner.x as c_int + 18,
             annotation_y,
-            &line,
+            &fit_text(text, &line, (geometry.oi_inner.width as c_int - 36).max(1)),
             color,
         );
-        annotation_y += 18;
+        annotation_y += line_height as c_int;
     }
     if let Some(alert) = projection.alerts.first() {
         text.draw(
             geometry.oi_inner.x as c_int + 18,
             (geometry.oi_inner.y + geometry.oi_inner.height - 24.0) as c_int,
-            alert,
+            &fit_text(text, alert, (geometry.oi_inner.width as c_int - 36).max(1)),
             (235, 154, 105),
         );
     }
-    if !projection.trace.is_empty() {
-        let trace = projection.trace.first().cloned().unwrap_or_default();
+    let trace = projection
+        .trace
+        .first()
+        .or_else(|| projection.stream_tail.first())
+        .cloned()
+        .unwrap_or_default();
+    if !trace.is_empty() {
         text.draw(
             geometry.controls.x as c_int + 26,
             geometry.controls.y as c_int + 33,
-            &trace,
+            &fit_text(
+                text,
+                &trace,
+                (geometry.controls.width as c_int - 220).max(1),
+            ),
             (110, 150, 174),
         );
     } else {
+        let status_line = if projection.bridge_status.starts_with("ERROR") {
+            projection.bridge_status.as_str()
+        } else if projection.status.is_empty() {
+            "NO STREAM EVENTS"
+        } else {
+            projection.status.as_str()
+        };
         text.draw(
             geometry.controls.x as c_int + 26,
             geometry.controls.y as c_int + 33,
-            "SPEAKER  ·  SIGNAL LOCKED",
+            &fit_text(
+                text,
+                status_line,
+                (geometry.controls.width as c_int - 220).max(1),
+            ),
             (110, 150, 174),
         );
     }
 }
 
 fn input_state(projection: &Projection) -> &'static str {
-    let status = projection.status.to_ascii_lowercase();
-    let mode = if projection.view.mode.is_empty() {
-        projection.semantic_state.to_ascii_lowercase()
+    VisualMode::from_projection(projection).prompt_state(projection)
+}
+
+fn fit_text(text: &TextRenderer, value: &str, available: i32) -> String {
+    if text.text_width(value) <= available {
+        return value.to_owned();
+    }
+    let mut result = String::new();
+    for character in value.chars() {
+        let candidate = format!("{result}{character}…");
+        if text.text_width(&candidate) > available {
+            break;
+        }
+        result.push(character);
+    }
+    if result.is_empty() {
+        "…".to_owned()
     } else {
-        projection.view.mode.to_ascii_lowercase()
-    };
-    if status.contains("disconnect") {
-        "DISCONNECTED"
-    } else if status.contains("fail") || mode == "failure" || mode == "blocked" {
-        "FAILURE"
-    } else if status.contains("approval") || mode == "approval" {
-        "APPROVAL"
-    } else if matches!(
-        mode.as_str(),
-        "search"
-            | "inspect"
-            | "code"
-            | "coding"
-            | "test"
-            | "testing"
-            | "verify"
-            | "execute"
-            | "working"
-            | "recover"
-    ) || status.contains("execut")
-        || status.contains("work")
-    {
-        "WORKING"
-    } else {
-        "READY"
+        format!("{result}…")
+    }
+}
+
+fn fit_input(text: &TextRenderer, value: &str, cursor: usize, available: i32) -> (String, usize) {
+    if text.text_width(value) <= available {
+        return (value.to_owned(), value[..cursor].chars().count());
+    }
+    let characters: Vec<char> = value.chars().collect();
+    let cursor_chars = value[..cursor].chars().count().min(characters.len());
+    let mut start = 0;
+    let mut end = characters.len();
+    loop {
+        let prefix = if start > 0 { "…" } else { "" };
+        let suffix = if end < characters.len() { "…" } else { "" };
+        let middle: String = characters[start..end].iter().collect();
+        let candidate = format!("{prefix}{middle}{suffix}");
+        if text.text_width(&candidate) <= available {
+            let display_cursor = usize::from(start > 0) + cursor_chars.saturating_sub(start);
+            return (candidate, display_cursor);
+        }
+        if start < cursor_chars
+            && (end == characters.len() || cursor_chars - start >= end - cursor_chars)
+        {
+            start += 1;
+        } else if end > cursor_chars {
+            end -= 1;
+        } else if start < end {
+            start += 1;
+        } else {
+            return ("…".to_owned(), 0);
+        }
     }
 }
 
@@ -1984,7 +2397,6 @@ fn draw_terminal_background(
     core: &NativeTerminalCore,
     geometry: &FrameGeometry,
     selection: Option<((usize, usize), (usize, usize))>,
-    focused: bool,
 ) {
     let content = core.renderable_content();
     let columns = core.size().columns.max(1);
@@ -1998,10 +2410,10 @@ fn draw_terminal_background(
         }
         if background != (7, 12, 19) {
             draw_rect(
-                geometry.operator_inner.x + column as f32 * CELL_WIDTH as f32,
-                geometry.operator_inner.y + row as f32 * CELL_HEIGHT as f32,
-                CELL_WIDTH as f32,
-                CELL_HEIGHT as f32,
+                geometry.operator_inner.x + column as f32 * geometry.cell_width,
+                geometry.operator_inner.y + row as f32 * geometry.cell_height,
+                geometry.cell_width,
+                geometry.cell_height,
                 rgb_f32(background),
             );
         }
@@ -2010,30 +2422,20 @@ fn draw_terminal_background(
         geometry.operator_inner.x,
         geometry.operator_inner.y,
         selection,
+        geometry.cell_width,
+        geometry.cell_height,
     );
-    if focused && content.cursor.shape != CursorShape::Hidden {
-        let row = content.cursor.point.line.0.max(0) as f32;
-        let column = content.cursor.point.column.0 as f32;
-        let x = geometry.operator_inner.x + column * CELL_WIDTH as f32;
-        let y = geometry.operator_inner.y + row * CELL_HEIGHT as f32;
-        let color = (0.36, 0.76, 0.72);
-        match content.cursor.shape {
-            CursorShape::Underline => draw_rect(x, y + 15.0, CELL_WIDTH as f32, 2.0, color),
-            CursorShape::Beam => draw_rect(x, y, 2.0, CELL_HEIGHT as f32, color),
-            _ => draw_rect(
-                x,
-                y,
-                CELL_WIDTH as f32,
-                CELL_HEIGHT as f32,
-                (0.18, 0.38, 0.38),
-            ),
-        }
-    }
 }
 
 fn draw_terminal_text(text: &TextRenderer, core: &NativeTerminalCore, geometry: &FrameGeometry) {
     let content = core.renderable_content();
     let columns = core.size().columns.max(1);
+    let mut run_text = String::new();
+    let mut run_row = 0;
+    let mut run_start_column = 0;
+    let mut run_next_column = 0;
+    let mut run_color = (0, 0, 0);
+    let mut has_run = false;
     for (index, indexed) in content.display_iter.enumerate() {
         let cell = indexed.cell;
         if cell
@@ -2041,6 +2443,18 @@ fn draw_terminal_text(text: &TextRenderer, core: &NativeTerminalCore, geometry: 
             .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
             || cell.c == ' '
         {
+            if has_run {
+                draw_terminal_run(
+                    text,
+                    geometry,
+                    run_row,
+                    run_start_column,
+                    &run_text,
+                    run_color,
+                );
+                run_text.clear();
+                has_run = false;
+            }
             continue;
         }
         let row = index / columns;
@@ -2056,13 +2470,57 @@ fn draw_terminal_text(text: &TextRenderer, core: &NativeTerminalCore, geometry: 
                 foreground.2.saturating_mul(2) / 3,
             );
         }
-        text.draw(
-            geometry.operator_inner.x as c_int + column as c_int * CELL_WIDTH,
-            geometry.operator_inner.y as c_int + row as c_int * CELL_HEIGHT + 14,
-            &cell.c.to_string(),
-            foreground,
+        if !has_run || run_row != row || run_next_column != column || run_color != foreground {
+            if has_run {
+                draw_terminal_run(
+                    text,
+                    geometry,
+                    run_row,
+                    run_start_column,
+                    &run_text,
+                    run_color,
+                );
+                run_text.clear();
+            }
+            run_row = row;
+            run_start_column = column;
+            run_color = foreground;
+            has_run = true;
+        }
+        run_text.push(cell.c);
+        run_next_column = column + 1;
+    }
+    if has_run {
+        draw_terminal_run(
+            text,
+            geometry,
+            run_row,
+            run_start_column,
+            &run_text,
+            run_color,
         );
     }
+}
+
+fn draw_terminal_run(
+    text: &TextRenderer,
+    geometry: &FrameGeometry,
+    row: usize,
+    column: usize,
+    value: &str,
+    color: (u8, u8, u8),
+) {
+    if value.is_empty() {
+        return;
+    }
+    text.draw(
+        geometry.operator_inner.x as c_int + column as c_int * geometry.cell_width as c_int,
+        geometry.operator_inner.y as c_int
+            + row as c_int * geometry.cell_height as c_int
+            + text.metrics().baseline as c_int,
+        value,
+        color,
+    );
 }
 
 fn resolve_term_color(color: TermColor, colors: &Colors, foreground: bool) -> (u8, u8, u8) {
@@ -2165,7 +2623,13 @@ fn mode_color(mode: &str) -> (u8, u8, u8) {
     }
 }
 
-fn draw_selection(x: f32, y: f32, selection: Option<((usize, usize), (usize, usize))>) {
+fn draw_selection(
+    x: f32,
+    y: f32,
+    selection: Option<((usize, usize), (usize, usize))>,
+    cell_width: f32,
+    cell_height: f32,
+) {
     let Some((anchor, extent)) = selection else {
         return;
     };
@@ -2184,10 +2648,10 @@ fn draw_selection(x: f32, y: f32, selection: Option<((usize, usize), (usize, usi
             end.0.max(first + 1)
         };
         draw_outline_rect(
-            x + first as f32 * 9.0,
-            y + row as f32 * 18.0,
-            (last.saturating_sub(first)) as f32 * 9.0,
-            18.0,
+            x + first as f32 * cell_width,
+            y + row as f32 * cell_height,
+            (last.saturating_sub(first)) as f32 * cell_width,
+            cell_height,
         );
     }
 }
@@ -2266,29 +2730,31 @@ fn draw_round_outline(x: f32, y: f32, width: f32, height: f32, color: (f32, f32,
 }
 
 fn draw_beveled_panel(rect: PanelRect, outer: (f32, f32, f32), inner: (f32, f32, f32)) {
+    let width = rect.width.max(0.0);
+    let height = rect.height.max(0.0);
     draw_round_rect(
         rect.x + 5.0,
         rect.y + 7.0,
-        rect.width,
-        rect.height,
+        width,
+        height,
         14.0,
         (0.008, 0.012, 0.018),
     );
-    draw_round_rect(rect.x, rect.y, rect.width, rect.height, 14.0, outer);
-    draw_round_outline(rect.x, rect.y, rect.width, rect.height, (0.18, 0.22, 0.26));
+    draw_round_rect(rect.x, rect.y, width, height, 14.0, outer);
+    draw_round_outline(rect.x, rect.y, width, height, (0.18, 0.22, 0.26));
     draw_round_rect(
         rect.x + 9.0,
         rect.y + 9.0,
-        rect.width - 18.0,
-        rect.height - 18.0,
+        (width - 18.0).max(0.0),
+        (height - 18.0).max(0.0),
         9.0,
         inner,
     );
     draw_round_outline(
         rect.x + 10.0,
         rect.y + 10.0,
-        rect.width - 20.0,
-        rect.height - 20.0,
+        (width - 20.0).max(0.0),
+        (height - 20.0).max(0.0),
         (0.06, 0.11, 0.14),
     );
 }
@@ -2305,6 +2771,19 @@ fn draw_rect(x: f32, y: f32, width: f32, height: f32, color: (f32, f32, f32)) {
     }
 }
 
+fn with_scissor(draw_height: i32, rect: PixelRect, draw: impl FnOnce()) {
+    let x = rect.x.max(0.0).round() as c_int;
+    let width = rect.width.max(0.0).round() as c_int;
+    let height = rect.height.max(0.0).round() as c_int;
+    let y = (draw_height as f32 - rect.bottom()).max(0.0).round() as c_int;
+    unsafe {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(x, y, width, height);
+    }
+    draw();
+    unsafe { glDisable(GL_SCISSOR_TEST) };
+}
+
 fn draw_oi_scene(
     x: f32,
     y: f32,
@@ -2314,11 +2793,8 @@ fn draw_oi_scene(
     phase: f32,
     options: &RendererOptions,
 ) {
-    let semantic_mode = if projection.view.mode.is_empty() {
-        projection.semantic_state.as_str()
-    } else {
-        projection.view.mode.as_str()
-    };
+    let visual_mode = VisualMode::from_projection(projection);
+    let semantic_mode = visual_mode.as_str();
     let scene_color = mode_color(semantic_mode);
     // The OI is a CRT-like instrument, not a second text pane: a horizon,
     // converging floor, sparse phosphor points, and semantic graph links give
@@ -2384,6 +2860,9 @@ fn draw_oi_scene(
                     | "task"
                     | "execution"
                     | "generated_tool"
+                    | "research"
+                    | "resource"
+                    | "artifact"
             )
         })
         .take(6)
@@ -2459,29 +2938,28 @@ fn draw_oi_scene(
             );
         }
     }
-    let action = if let Some(buddy) = projection.buddy.as_ref() {
-        if !buddy.state.is_empty() {
-            buddy.state.as_str()
-        } else if buddy.anchor.is_empty() {
-            semantic_mode
-        } else {
-            buddy.anchor.as_str()
-        }
-    } else if projection.semantic_state.is_empty() {
-        projection.status.as_str()
-    } else {
-        semantic_mode
-    };
-    let (buddy_x, buddy_y) = match action.to_ascii_uppercase().as_str() {
-        "READ" | "INSPECT" | "SEARCH" | "READING" | "SEARCHING" => {
+    let (buddy_x, buddy_y) = match visual_mode {
+        VisualMode::Read | VisualMode::Inspect | VisualMode::Search => {
             (x + width * 0.18, y + height * 0.28)
         }
-        "CODE" | "TEST" | "VERIFY" | "EXECUTE" | "EXECUTING" | "TOOLS" => {
+        VisualMode::Code | VisualMode::Test | VisualMode::Verify | VisualMode::Execute => {
             (x + width * 0.76, y + height * 0.26)
         }
-        "FAILURE" | "BLOCKED" => (x + width * 0.78, y + height * 0.76),
-        "APPROVAL" => (x + width * 0.72, y + height * 0.84),
-        _ => (x + width * 0.50, y + height * 0.58),
+        VisualMode::Failure => (x + width * 0.78, y + height * 0.76),
+        VisualMode::Approval => (x + width * 0.72, y + height * 0.84),
+        VisualMode::Think | VisualMode::Respond | VisualMode::Generate | VisualMode::Recover => {
+            (x + width * 0.50, y + height * 0.42)
+        }
+        VisualMode::Idle => match projection
+            .buddy
+            .as_ref()
+            .map(|buddy| buddy.anchor.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("left") => (x + width * 0.20, y + height * 0.58),
+            Some("right") => (x + width * 0.80, y + height * 0.58),
+            _ => (x + width * 0.50, y + height * 0.58),
+        },
     };
     let buddy_status = projection
         .buddy
@@ -2628,11 +3106,9 @@ fn draw_buddy(x: f32, y: f32, status: &str, character: &str, phase: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CELL_HEIGHT, CELL_WIDTH, CONTROL_MASK, FrameGeometry, KEY_PRESS, Projection, XK_ESCAPE,
-        XK_LEFT, XKeyEvent, input_state, key_bytes,
-    };
+    use super::{FrameGeometry, Projection, input_state, is_wm_delete_message};
     use crate::ProjectionView;
+    use alacritty_terminal::term::TermMode;
 
     #[test]
     fn frame_geometry_keeps_apertures_equal() {
@@ -2652,7 +3128,10 @@ mod tests {
 
         assert_eq!(geometry.cell_at(origin_x, origin_y), Some((0, 0)));
         assert_eq!(
-            geometry.cell_at(origin_x + CELL_WIDTH, origin_y + CELL_HEIGHT),
+            geometry.cell_at(
+                origin_x + geometry.cell_width as i32,
+                origin_y + geometry.cell_height as i32,
+            ),
             Some((1, 1))
         );
         assert_eq!(geometry.cell_at(origin_x - 1, origin_y), None);
@@ -2662,57 +3141,11 @@ mod tests {
     #[test]
     fn frame_geometry_preserves_minimum_resize() {
         let tiny = FrameGeometry::new(1, 1).terminal_size();
-        assert!(tiny.0 >= 1 && tiny.1 >= 1);
+        assert!(tiny.columns >= 1 && tiny.rows >= 1);
         let geometry = FrameGeometry::new(1000, 700);
-        assert_eq!(geometry.terminal_size(), (45, 21));
-    }
-
-    #[test]
-    fn escape_is_forwarded_to_the_pty_instead_of_closing_the_window() {
-        let event = XKeyEvent {
-            type_: KEY_PRESS,
-            serial: 0,
-            send_event: 0,
-            display: std::ptr::null_mut(),
-            window: 0,
-            root: 0,
-            subwindow: 0,
-            time: 0,
-            x: 0,
-            y: 0,
-            x_root: 0,
-            y_root: 0,
-            state: 0,
-            keycode: 0,
-            same_screen: 1,
-        };
-        assert_eq!(key_bytes(&event, XK_ESCAPE, &[], 0), vec![0x1b]);
-        assert_eq!(key_bytes(&event, XK_LEFT, &[], 0), b"\x1b[D".to_vec());
-    }
-
-    #[test]
-    fn control_letters_and_alt_preserve_terminal_key_semantics() {
-        let control = XKeyEvent {
-            state: CONTROL_MASK,
-            ..XKeyEvent {
-                type_: KEY_PRESS,
-                serial: 0,
-                send_event: 0,
-                display: std::ptr::null_mut(),
-                window: 0,
-                root: 0,
-                subwindow: 0,
-                time: 0,
-                x: 0,
-                y: 0,
-                x_root: 0,
-                y_root: 0,
-                state: 0,
-                keycode: 0,
-                same_screen: 1,
-            }
-        };
-        assert_eq!(key_bytes(&control, 'a' as u64, &[], 0), vec![1]);
+        let size = geometry.terminal_size();
+        assert!(size.columns >= 1 && size.rows >= 1);
+        assert!(size.columns > 1 && size.rows > 1);
     }
 
     #[test]
@@ -2730,5 +3163,37 @@ mod tests {
             ..ProjectionView::default()
         };
         assert_eq!(input_state(&projection), "WORKING");
+    }
+
+    #[test]
+    fn only_wm_protocol_delete_client_messages_close_the_window() {
+        assert!(is_wm_delete_message(10, 32, 20, 10, 20));
+        assert!(!is_wm_delete_message(10, 32, 21, 10, 20));
+        assert!(!is_wm_delete_message(11, 32, 20, 10, 20));
+        assert!(!is_wm_delete_message(10, 16, 20, 10, 20));
+    }
+
+    #[test]
+    fn terminal_modes_choose_application_cursor_sequences() {
+        assert_eq!(
+            super::terminal_key_bytes(super::XK_LEFT, TermMode::empty(), &[]),
+            b"\x1b[D"
+        );
+        assert_eq!(
+            super::terminal_key_bytes(super::XK_LEFT, TermMode::APP_CURSOR, &[]),
+            b"\x1bOD"
+        );
+        assert_eq!(
+            super::terminal_key_bytes(super::XK_PAGE_DOWN, TermMode::empty(), &[]),
+            b"\x1b[6~"
+        );
+    }
+
+    #[test]
+    fn xim_lookup_lengths_are_never_allowed_to_escape_the_buffer() {
+        assert_eq!(super::bounded_lookup_length(4, 8), Some(4));
+        assert_eq!(super::bounded_lookup_length(8, 8), Some(8));
+        assert_eq!(super::bounded_lookup_length(9, 8), None);
+        assert_eq!(super::bounded_lookup_length(-1, 8), None);
     }
 }

@@ -12,30 +12,73 @@ command -v xdotool >/dev/null || {
   printf '%s\n' 'native-input-smoke: SKIP — xdotool is unavailable' >&2
   exit 0
 }
+command -v xclip >/dev/null || {
+  printf '%s\n' 'native-input-smoke: SKIP — xclip is unavailable' >&2
+  exit 0
+}
+command -v xdpyinfo >/dev/null || {
+  printf '%s\n' 'native-input-smoke: SKIP — xdpyinfo is unavailable' >&2
+  exit 0
+}
+if ! xvfb-run -a -s '-screen 0 1280x800x24 -ac' xdpyinfo >/dev/null 2>&1; then
+  printf '%s\n' 'native-input-smoke: SKIP — Xvfb cannot create a usable display' >&2
+  exit 0
+fi
 
 cargo build --manifest-path native/Cargo.toml --offline >/dev/null
-xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -lc '
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -c '
     set -euo pipefail
     native_bin="$1"
-    "$native_bin" --command "read line" >/dev/null 2>&1 &
+    capture="$2"
+    wait_for_window() {
+      local window=""
+      for _ in $(seq 1 50); do
+        window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
+        [[ -n "$window" ]] && { printf "%s" "$window"; return; }
+        sleep 0.1
+      done
+      return 1
+    }
+
+    "$native_bin" --command "IFS= read -r line; printf \"%s\" \"\$line\" > \"$capture\"" >/dev/null 2>&1 &
     native_pid=$!
-    window=""
-    for _ in $(seq 1 30); do
-      window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
-      [[ -n "$window" ]] && break
-      sleep 0.1
-    done
-    [[ -n "$window" ]]
+    window="$(wait_for_window)"
     xdotool windowfocus --sync "$window"
-    # Escape is a terminal byte, not a close command. Backspace and Unicode
-    # are then sent through the same focused PTY input path.
-    xdotool key --window "$window" Escape
+    # Exercise the native editor itself: middle insertion, Home/End, and
+    # UTF-8 all arrive at the child as one exact completed line.
+    xdotool type --window "$window" --clearmodifiers "abc"
+    xdotool key --window "$window" Left
+    xdotool type --window "$window" --clearmodifiers "X"
+    xdotool key --window "$window" Home
+    xdotool type --window "$window" --clearmodifiers "Y"
+    xdotool key --window "$window" End
+    printf "%s" " — unicode" | xclip -selection clipboard -in -loops 1 &
+    clipboard_pid=$!
     sleep 0.1
-    xdotool type --window "$window" --clearmodifiers "hellp"
-    xdotool key --window "$window" BackSpace
-    xdotool type --window "$window" --clearmodifiers "o"
-    xdotool type --window "$window" --clearmodifiers " — unicode"
+    xdotool key --window "$window" ctrl+shift+v
+    wait "$clipboard_pid" || true
+    # SelectionNotify is asynchronous; let the native event loop consume it
+    # before Enter commits the line.
+    sleep 0.2
     xdotool key --window "$window" Return
     wait "$native_pid"
-    printf "%s\\n" "native-input-smoke: PASS — focus, Escape, text, Backspace, Unicode, Enter"
-  ' -- "$repo_root/native/target/debug/athena-terminal"
+    [[ "$(<"$capture")" == "YabXc — unicode" ]]
+
+    cancel_capture="$3"
+    "$native_bin" --command "trap \"printf interrupted > \\\"$cancel_capture\\\"\" INT; while :; do IFS= read -r line || continue; [ \"\$line\" = ok ] && break; done" >/dev/null 2>&1 &
+    native_pid=$!
+    window="$(wait_for_window)"
+    xdotool windowfocus --sync "$window"
+    xdotool key --window "$window" ctrl+c
+    sleep 0.2
+    # Ctrl-C cancels the foreground read/task but does not close the native
+    # session; the same window must accept the follow-up line.
+    xdotool search --name "ATHENA" | rg -q "$window"
+    xdotool type --window "$window" --clearmodifiers "ok"
+    xdotool key --window "$window" Return
+    wait "$native_pid"
+    [[ "$(<"$cancel_capture")" == interrupted ]]
+    printf "%s\\n" "native-input-smoke: PASS — exact native editing, Unicode, Ctrl-C cancellation, Enter"
+  ' -- "$repo_root/native/target/debug/athena-terminal" "$tmp_dir/line" "$tmp_dir/cancel"

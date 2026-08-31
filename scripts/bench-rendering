@@ -136,6 +136,32 @@ def _native_render_metrics(*, required: bool) -> dict[str, object]:
         if required:
             raise
         return {"available": False, "reason": "native probe unavailable"}
+    if shutil.which("xdpyinfo") is None:
+        if required:
+            raise RuntimeError("native rendering gate requires xdpyinfo")
+        return {"available": False, "reason": "xdpyinfo unavailable"}
+    display_probe = subprocess.run(
+        [
+            xvfb_run,
+            "-a",
+            "-s",
+            "-screen 0 1024x768x24 -nolisten tcp",
+            "xdpyinfo",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10.0,
+    )
+    if display_probe.returncode != 0:
+        if required:
+            raise RuntimeError(
+                "native rendering gate could not create an Xvfb display:\n"
+                f"{display_probe.stdout}"
+            )
+        return {"available": False, "reason": "Xvfb display unavailable"}
     with tempfile.TemporaryDirectory(prefix="athena-render-stats-") as directory:
         directory_path = Path(directory)
         idle = _run_native_render(binary, xvfb_run, "sleep 1", directory_path / "idle.json")
@@ -159,6 +185,7 @@ def main() -> int:
     parser.add_argument("--max-idle-redraws-per-second", type=float, default=0.1)
     parser.add_argument("--max-idle-cpu-percent", type=float, default=2.0)
     parser.add_argument("--max-active-fps", type=float, default=25.0)
+    parser.add_argument("--max-active-cpu-percent", type=float, default=30.0)
     parser.add_argument("--max-cache-bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--require-native", action="store_true")
     args = parser.parse_args()
@@ -322,6 +349,16 @@ def main() -> int:
             print(
                 f"bench-rendering: active native redraw rate "
                 f"{active['redraws_per_second']:.2f}/s exceeds {args.max_active_fps:.2f}/s",
+                file=sys.stderr,
+            )
+            return 1
+        if (
+            active.get("cpu_percent") is not None
+            and float(active["cpu_percent"]) > args.max_active_cpu_percent
+        ):
+            print(
+                f"bench-rendering: active native CPU {active['cpu_percent']:.2f}% exceeds "
+                f"{args.max_active_cpu_percent:.2f}%",
                 file=sys.stderr,
             )
             return 1
