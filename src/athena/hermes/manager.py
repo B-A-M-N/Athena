@@ -80,8 +80,7 @@ class HermesRefereeManager:
             configured = Path(env_root).expanduser() if env_root else None
         if configured is None:
             raise HermesRefereeManagerError(
-                "Hermes runtime root is required; pass --hermes-root or set "
-                "ATHENA_HERMES_ROOT"
+                "Hermes runtime root is required; pass --hermes-root or set ATHENA_HERMES_ROOT"
             )
         root = configured.resolve()
         required = (
@@ -89,9 +88,7 @@ class HermesRefereeManager:
             root / "gateway" / "platforms" / "api_server.py",
         )
         if not root.is_dir() or not all(path.is_file() for path in required):
-            raise HermesRefereeManagerError(
-                f"invalid Hermes runtime root: {root}"
-            )
+            raise HermesRefereeManagerError(f"invalid Hermes runtime root: {root}")
         api_server = required[1].read_text(encoding="utf-8", errors="replace")
         if '"tool_execution": "disabled"' not in api_server or "_referee_mode" not in api_server:
             raise HermesRefereeManagerError(
@@ -169,7 +166,9 @@ class HermesRefereeManager:
                 )
                 verdict = await HermesReferee(adapter).review(packet)
                 if verdict.packet_hash != packet.digest():
-                    raise HermesRefereeManagerError("Hermes setup probe returned the wrong packet hash")
+                    raise HermesRefereeManagerError(
+                        "Hermes setup probe returned the wrong packet hash"
+                    )
                 if verdict.rationale.startswith(
                     (
                         "Hermes preflight/evaluator failed:",
@@ -270,7 +269,9 @@ class HermesRefereeManager:
         try:
             report = await HermesRefereeManager(
                 config_path=self._config_file(),
-                runtime_root=Path(settings.runtime_root) if settings.runtime_root else self.runtime_root,
+                runtime_root=Path(settings.runtime_root)
+                if settings.runtime_root
+                else self.runtime_root,
                 profile=settings.profile,
                 endpoint=settings.endpoint,
                 credential_id=settings.credential_id or self.credential_id,
@@ -284,7 +285,9 @@ class HermesRefereeManager:
 
     async def repair(self) -> Mapping[str, Any]:
         settings = self._settings().hermes_referee
-        configured_root = Path(settings.runtime_root).expanduser() if settings.runtime_root else None
+        configured_root = (
+            Path(settings.runtime_root).expanduser() if settings.runtime_root else None
+        )
         configured_profile = settings.profile or self.profile
         configured_endpoint = settings.endpoint or self.endpoint
         configured_host, configured_port = HermesRefereeManager(
@@ -327,7 +330,9 @@ class HermesRefereeManager:
 
     async def disable(self) -> None:
         settings = self._settings().hermes_referee
-        root = Path(settings.runtime_root).expanduser() if settings.runtime_root else self.runtime_root
+        root = (
+            Path(settings.runtime_root).expanduser() if settings.runtime_root else self.runtime_root
+        )
         manager = HermesRefereeManager(
             config_path=self._config_file(),
             runtime_root=root,

@@ -28,51 +28,180 @@ command -v xdpyinfo >/dev/null || {
   printf '%s\n' 'native-visual-smoke: SKIP — xdpyinfo is unavailable' >&2
   exit 0
 }
-if ! xvfb-run -a -s '-screen 0 1280x800x24 -ac' xdpyinfo >/dev/null 2>&1; then
-  printf '%s\n' 'native-visual-smoke: SKIP — Xvfb cannot create a usable display' >&2
-  exit 0
+golden_dir="${NATIVE_VISUAL_GOLDEN_DIR:-}"
+update_goldens="${NATIVE_VISUAL_UPDATE_GOLDENS:-0}"
+if [[ -n "$golden_dir" && "$update_goldens" != "1" ]]; then
+  command -v compare >/dev/null || {
+    printf '%s\n' 'native-visual-smoke: FAIL — ImageMagick compare is required for golden checks' >&2
+    exit 1
+  }
 fi
-
 cargo build --manifest-path native/Cargo.toml --offline >/dev/null
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
-projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
 
-PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" \
-  IMAGE_PATH="$tmp_dir/native.png" \
+# Validate the geometry contract without requiring a display server. The
+# native process emits the same rectangle model used by its renderer, so this
+# catches aperture drift and prompt/rail overlap independently of OCR.
+layout_json="$("$repo_root/native/target/debug/athena-terminal" --dump-layout)"
+LAYOUT_JSON="$layout_json" python3 -c '
+import json
+import os
+
+layout = json.loads(os.environ["LAYOUT_JSON"])
+assert layout["metrics_source"] in {"live_xft", "fallback_static"}
+assert "metrics" in layout
+assert layout["scale"] > 0
+assert layout["canvas"]["width"] > 0
+assert layout["operator_outer"]["width"] == layout["oi_outer"]["width"]
+assert layout["operator_inner"]["width"] == layout["oi_inner"]["width"]
+assert layout["operator_inner"]["height"] == layout["oi_inner"]["height"]
+rail = layout["rail"]
+prompt = layout["prompt_layout"]
+assert rail["operator_status"]["y"] >= layout["prompt"]["y"]
+assert rail["operator_input"]["y"] >= rail["operator_status"]["y"]
+assert rail["operator_input"]["y"] + rail["operator_input"]["height"] <= layout["prompt"]["y"] + layout["prompt"]["height"] + 0.01
+status = prompt.get("status_row")
+hint = prompt.get("hint_row")
+if status is not None:
+    assert status["top"] + status["height"] <= prompt["input_row"]["top"] + 0.01
+if hint is not None:
+    assert prompt["input_row"]["top"] + prompt["input_row"]["height"] <= hint["top"] + 0.01
+assert prompt["input_row"]["top"] >= layout["prompt"]["y"]
+last_row = hint or prompt["input_row"]
+assert last_row["top"] + last_row["height"] <= layout["prompt"]["y"] + layout["prompt"]["height"] + 0.01
+for name in ("speaker", "operator_panel", "system_status", "primary_encoder", "brightness", "focus", "power", "identity_plate"):
+    rect = rail[name]
+    assert rect["x"] >= rail["rail"]["x"] - 0.01
+    assert rect["x"] + rect["width"] <= rail["rail"]["x"] + rail["rail"]["width"] + 0.01
+'
+
+if ! xvfb-run -a -s '-screen 0 1280x800x24 -ac' xdpyinfo >/dev/null 2>&1; then
+  printf '%s\n' 'native-visual-smoke: SKIP — Xvfb unavailable after layout invariants passed' >&2
+  exit 0
+fi
+
+projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
+
+PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" TMP_DIR="$tmp_dir" \
+  GOLDEN_DIR="$golden_dir" UPDATE_GOLDENS="$update_goldens" \
   xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -c '
-    printf "%s\n" "$PROJECTION" | "$NATIVE_BIN" --bridge-stdin --no-animations --command "printf '\''ATHENA // OPERATOR\\nready > _\\n'\''; sleep 4" &
-    native_pid=$!
-    window=""
-    for _ in $(seq 1 50); do
-      window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
-      [[ -n "$window" ]] && break
-      sleep 0.1
+    set -euo pipefail
+
+    wait_for_window() {
+      local window=""
+      for _ in $(seq 1 50); do
+        window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
+        [[ -n "$window" ]] && { printf "%s" "$window"; return; }
+        sleep 0.1
+      done
+      return 1
+    }
+
+    capture_fixture() {
+      local label="$1"
+      local scene_mode="$2"
+      local mascot="$3"
+      local input="$4"
+      local fixture_projection="${PROJECTION//\"search\"/\"$scene_mode\"}"
+      local upper_mode="${scene_mode^^}"
+      fixture_projection="${fixture_projection//\"SEARCH\"/\"$upper_mode\"}"
+      fixture_projection="${fixture_projection//\"owl\"/\"$mascot\"}"
+      fixture_projection="$(FIXTURE_PROJECTION="$fixture_projection" SCENE_MODE="$scene_mode" python3 -c "import json, os; f=json.loads(os.environ[\"FIXTURE_PROJECTION\"]); m=os.environ[\"SCENE_MODE\"]; f[\"attention_items\"] = ([{\"id\":\"approval:visual-smoke\",\"kind\":\"approval\",\"severity\":\"warning\",\"title\":\"APPROVAL REQUIRED\",\"summary\":\"write workspace\",\"requires_action\":True,\"related_object_id\":\"op-01\"}] if m == \"approval\" else [{\"id\":\"event:visual-smoke\",\"kind\":\"notification\",\"severity\":\"failure\",\"title\":\"EVENT\",\"summary\":\"visual verification failed\",\"requires_action\":False,\"related_object_id\":\"op-01\"}] if m == \"failure\" else f[\"attention_items\"]); print(json.dumps(f))")"
+      local image_path="$TMP_DIR/${label}-${mascot}.png"
+      local layout_path="$TMP_DIR/${label}-${mascot}.layout.json"
+      local oi_path="$TMP_DIR/${label}-${mascot}.oi.png"
+
+      printf "%s\\n" "$fixture_projection" | ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" ATHENA_NATIVE_OI_DUMP="$oi_path" "$NATIVE_BIN" --bridge-stdin --no-animations \
+        --mascot "$mascot" --command "printf native-ok; sleep 3" >/dev/null 2>&1 &
+      local native_pid=$!
+      local window
+      window="$(wait_for_window)"
+      xdotool windowfocus --sync "$window"
+      if [[ -n "$input" ]]; then
+        xdotool type --window "$window" --clearmodifiers "$input"
+        xdotool key --window "$window" Left Left
+        sleep 0.25
+      else
+        sleep 0.15
+      fi
+      import -window "$window" "$image_path"
+      kill "$native_pid" 2>/dev/null || true
+      wait "$native_pid" 2>/dev/null || true
+
+      [[ -s "$layout_path" ]] || {
+        printf "native-visual-smoke: FAIL — missing live layout dump %s\\n" "$layout_path" >&2
+        return 1
+      }
+      LAYOUT_PATH="$layout_path" python3 -c "import json, os; l=json.loads(open(os.environ[\"LAYOUT_PATH\"], encoding=\"utf-8\").read()); assert l[\"metrics_source\"] == \"live_xft\"; assert all(l[\"metrics\"][r][\"height\"] > 0 for r in (\"body\", \"input\", \"heading\", \"instrument\")); p=l[\"prompt_layout\"]; last=p.get(\"hint_row\") or p[\"input_row\"]; assert last[\"top\"] + last[\"height\"] <= l[\"prompt\"][\"y\"] + l[\"prompt\"][\"height\"] + 0.01"
+      [[ -s "$oi_path" ]] || {
+        printf "native-visual-smoke: FAIL — missing 384x256 OI dump %s\\n" "$oi_path" >&2
+        return 1
+      }
+      [[ "$(identify -format "%wx%h" "$oi_path")" == "384x256" ]] || {
+        printf "native-visual-smoke: FAIL — OI dump has unexpected dimensions\\n" >&2
+        return 1
+      }
+
+      if [[ -n "$GOLDEN_DIR" ]]; then
+        local golden_path="$GOLDEN_DIR/${label}-${mascot}.png"
+        if [[ "$UPDATE_GOLDENS" == "1" ]]; then
+          mkdir -p "$GOLDEN_DIR"
+          cp "$image_path" "$golden_path"
+        elif [[ -f "$golden_path" ]]; then
+          local rmse normalized
+          rmse="$(compare -metric RMSE "$golden_path" "$image_path" null: 2>&1 || true)"
+          normalized="$(printf "%s\\n" "$rmse" | cut -d "(" -f 2 | cut -d ")" -f 1 | tr -d "[:space:]")"
+          awk -v rmse="$normalized" "BEGIN { exit !(rmse != \"\" && rmse <= 0.08) }" || {
+            printf "native-visual-smoke: FAIL — %s exceeds golden RMSE tolerance (%s)\\n" "$label-$mascot" "$normalized" >&2
+            return 1
+          }
+        else
+          printf "native-visual-smoke: FAIL — missing golden %s\\n" "$golden_path" >&2
+          return 1
+        fi
+      fi
+
+      local dimensions colors stddev
+      dimensions="$(identify -format "%wx%h" "$image_path")"
+      [[ "$dimensions" == "1280x800" ]] || {
+        printf "native-visual-smoke: FAIL — %s has dimensions %s\\n" "$label-$mascot" "$dimensions" >&2
+        return 1
+      }
+      [[ -s "$image_path" ]] || {
+        printf "native-visual-smoke: FAIL — %s is empty\\n" "$label-$mascot" >&2
+        return 1
+      }
+      colors="$(identify -format "%k" "$image_path")"
+      [[ "$colors" -ge 100 ]] || {
+        printf "native-visual-smoke: FAIL — %s has only %s colors\\n" "$label-$mascot" "$colors" >&2
+        return 1
+      }
+      stddev="$(convert "$image_path" -colorspace Gray -format "%[standard_deviation]" info:)"
+      awk -v stddev="$stddev" "BEGIN { exit !(stddev > 0.01) }" || {
+        printf "native-visual-smoke: FAIL — %s contrast invariant failed (%s)\\n" "$label-$mascot" "$stddev" >&2
+        return 1
+      }
+    }
+
+    # 9 scene/input fixtures × 3 built-in sprites. Layout symmetry and
+    # non-overlap are additionally asserted by NativePixelLayout unit tests.
+    capture_fixture idle idle owl ""
+    capture_fixture idle idle cat ""
+    capture_fixture idle idle bot ""
+    capture_fixture typing-short idle owl "hi"
+    capture_fixture typing-short idle cat "hi"
+    capture_fixture typing-short idle bot "hi"
+    long_input="inspect the entire workspace tree and report every changed file with paths, states, and the next safe action"
+    [[ "${#long_input}" -ge 80 ]]
+    capture_fixture typing-long idle owl "$long_input"
+    capture_fixture typing-long idle cat "$long_input"
+    capture_fixture typing-long idle bot "$long_input"
+    for scene_mode in search read code test approval failure; do
+      for mascot in owl cat bot; do
+        capture_fixture "$scene_mode" "$scene_mode" "$mascot" ""
+      done
     done
-    [[ -n "$window" ]]
-    sleep 0.5
-    import -window "$window" "$IMAGE_PATH"
-    kill "$native_pid" 2>/dev/null || true
-    wait "$native_pid" 2>/dev/null || true
   '
 
-dimensions="$(identify -format '%wx%h' "$tmp_dir/native.png")"
-if [[ "$dimensions" != "1280x800" ]]; then
-  printf 'native-visual-smoke: FAIL — screenshot dimensions %s\n' "$dimensions" >&2
-  exit 1
-fi
-if [[ ! -s "$tmp_dir/native.png" ]]; then
-  printf '%s\n' 'native-visual-smoke: FAIL — empty screenshot' >&2
-  exit 1
-fi
-colors="$(identify -format '%k' "$tmp_dir/native.png")"
-if [[ "$colors" -lt 100 ]]; then
-  printf 'native-visual-smoke: FAIL — exact window screenshot has only %s colors\n' "$colors" >&2
-  exit 1
-fi
-stddev="$(convert "$tmp_dir/native.png" -colorspace Gray -format '%[standard_deviation]' info:)"
-awk -v stddev="$stddev" 'BEGIN { exit !(stddev > 0.01) }' || {
-  printf 'native-visual-smoke: FAIL — screenshot contrast invariant failed (%s)\n' "$stddev" >&2
-  exit 1
-}
-printf '%s\n' "native-visual-smoke: PASS — exact AthenaBOX window frame (${colors} colors)"
+printf '%s\n' 'native-visual-smoke: PASS — 27 exact-window fixtures (idle, typing, semantic modes × owl/cat/bot)'

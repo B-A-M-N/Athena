@@ -20,9 +20,10 @@ def test_user_secret_writer_is_owner_only_and_resolvable(tmp_path, monkeypatch):
     assert path.read_text() == "test-only-secret"
     assert path.stat().st_mode & 0o077 == 0
     assert path.parent.stat().st_mode & 0o077 == 0
-    assert FileSource(str(path.parent), require_private=True).resolve(
-        "HERMES_REFEREE_API_KEY"
-    ) == "test-only-secret"
+    assert (
+        FileSource(str(path.parent), require_private=True).resolve("HERMES_REFEREE_API_KEY")
+        == "test-only-secret"
+    )
 
 
 def test_private_file_source_rejects_loose_secret(tmp_path):

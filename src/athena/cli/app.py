@@ -1247,9 +1247,7 @@ def _arg_parse(argv: list[str]) -> Options:
     for action in ("setup", "status", "repair", "disable"):
         referee_parser = referee_sub.add_parser(action)
         referee_parser.add_argument("--hermes-root", default=None)
-        referee_parser.add_argument(
-            "--profile", dest="referee_profile", default="athena-referee"
-        )
+        referee_parser.add_argument("--profile", dest="referee_profile", default="athena-referee")
         referee_parser.add_argument("--endpoint", dest="referee_endpoint", default="")
         referee_parser.add_argument("--host", dest="referee_host", default="127.0.0.1")
         referee_parser.add_argument("--port", dest="referee_port", default=8643, type=int)

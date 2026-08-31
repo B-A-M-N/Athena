@@ -141,8 +141,6 @@ class NativeSession:
         input_attrs = self._disable_input_echo()
         try:
             await self.start()
-            print("ATHENA // NATIVE TERMINAL")
-            print("Type a request. /help for commands; /exit to close.")
             while True:
                 try:
                     line = await self._readline()

@@ -20,8 +20,9 @@ use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
 use serde::Deserialize;
 
-use athena_terminal::NativeTerminalCore;
+use athena_terminal::{NativePixelLayout, NativeTerminalCore, PromptLayout, UiFontMetrics};
 
+mod buddy;
 mod input;
 #[cfg(unix)]
 mod x11;
@@ -50,6 +51,8 @@ struct ProjectionFrame {
     runtime_entities: Option<Vec<ProjectionEntity>>,
     #[serde(default)]
     alerts: Option<Vec<String>>,
+    #[serde(default)]
+    attention_items: Option<Vec<ProjectionAttention>>,
     #[serde(default)]
     active_operation: Option<ProjectionOperation>,
     #[serde(default)]
@@ -131,11 +134,35 @@ struct ProjectionEntity {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionAttention {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    severity: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    requires_action: bool,
+    #[serde(default)]
+    related_object_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
 struct ProjectionOperation {
     #[serde(default)]
     id: String,
     #[serde(default)]
+    capability: String,
+    #[serde(default)]
     label: String,
+    #[serde(default)]
+    operation: String,
+    #[serde(default)]
+    command: String,
     #[serde(default)]
     target: String,
     #[serde(default)]
@@ -263,6 +290,7 @@ struct Projection {
     workspace_entities: Vec<ProjectionEntity>,
     runtime_entities: Vec<ProjectionEntity>,
     alerts: Vec<String>,
+    attention_items: Vec<ProjectionAttention>,
     active_operation: Option<ProjectionOperation>,
     current_action: Option<ProjectionAction>,
     code_view: Option<ProjectionCodeView>,
@@ -394,6 +422,7 @@ impl Projection {
         if let Some(alerts) = frame.alerts {
             self.alerts = alerts;
         }
+        self.attention_items = frame.attention_items.unwrap_or_default();
         self.active_operation = frame.active_operation;
         self.current_action = frame.current_action;
         self.code_view = frame.code_view;
@@ -418,6 +447,7 @@ impl Projection {
 #[derive(Debug, Default)]
 struct Args {
     headless: bool,
+    dump_layout: bool,
     bridge_stdin: bool,
     bridge_socket: Option<String>,
     command: Option<String>,
@@ -440,6 +470,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = values.next() {
         match arg.as_str() {
             "--headless" => args.headless = true,
+            "--dump-layout" => args.dump_layout = true,
             "--bridge-stdin" => args.bridge_stdin = true,
             "--bridge-socket" => {
                 args.bridge_socket = Some(values.next().ok_or("--bridge-socket needs a path")?);
@@ -468,10 +499,16 @@ fn parse_args() -> Result<Args, String> {
             "--reduced-motion" => args.reduced_motion = true,
             "--help" | "-h" => {
                 println!(
-                    "athena-terminal [--headless] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot NAME] [--no-animations] [--reduced-motion]"
+                    "athena-terminal [--headless] [--dump-layout] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot owl|cat|bot|off] [--no-animations] [--reduced-motion]"
                 );
                 println!("  --headless       run the PTY/core slice without opening a window");
+                println!(
+                    "  --dump-layout    print 1280×800 layout JSON; use live Xft metrics when DISPLAY is available"
+                );
                 println!("  --bridge-stdin   read JSON projection frames from stdin");
+                println!(
+                    "  --mascot         select Buddy (default: owl; built-ins: owl, cat, bot, off)"
+                );
                 return Err(String::new());
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -479,6 +516,15 @@ fn parse_args() -> Result<Args, String> {
     }
     args.columns = args.columns.max(1);
     args.rows = args.rows.max(1);
+    if !matches!(
+        args.mascot.to_ascii_lowercase().as_str(),
+        "owl" | "cat" | "bot" | "off"
+    ) {
+        return Err(format!(
+            "unknown mascot {:?}; choose owl, cat, bot, or off",
+            args.mascot
+        ));
+    }
     Ok(args)
 }
 
@@ -488,6 +534,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) if error.is_empty() => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+
+    if args.dump_layout {
+        #[cfg(unix)]
+        {
+            match x11::dump_live_layout_json(1280, 800) {
+                Ok(dump) => {
+                    println!("{}", serde_json::to_string_pretty(&dump)?);
+                    return Ok(());
+                }
+                Err(error) => {
+                    eprintln!("live layout probe unavailable: {error}");
+                }
+            }
+        }
+        let metrics = UiFontMetrics::fallback();
+        let layout = NativePixelLayout::for_window(1280, 800, metrics);
+        let prompt_layout = PromptLayout::from_rect(
+            layout.prompt,
+            metrics.input,
+            metrics.instrument,
+            layout.prompt_padding_y,
+            layout.prompt_gap,
+            layout.prompt_bottom_padding,
+            !layout.compact,
+        );
+        let mut dump = serde_json::to_value(layout)?;
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert(
+                "metrics_source".to_owned(),
+                serde_json::json!("fallback_static"),
+            );
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert("metrics".to_owned(), serde_json::to_value(metrics)?);
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert(
+                "prompt_layout".to_owned(),
+                serde_json::to_value(prompt_layout)?,
+            );
+        println!("{}", serde_json::to_string_pretty(&dump)?);
+        return Ok(());
+    }
 
     #[cfg(unix)]
     let bridge_socket = args
@@ -893,6 +983,7 @@ mod tests {
         let frame: ProjectionFrame = serde_json::from_str(
             r#"{
                 "status":"EXECUTING",
+                "attention_items":[{"id":"approval:1","kind":"approval","severity":"warning","title":"APPROVAL REQUIRED","summary":"write workspace","requires_action":true}],
                 "entities":[
                     {"id":"call-1","kind":"operation","label":"executor","status":"active"}
                 ],
@@ -912,6 +1003,8 @@ mod tests {
         assert_eq!(projection.entities.len(), 1);
         assert_eq!(projection.entities[0].label, "executor");
         assert_eq!(projection.alerts, vec!["test pulse"]);
+        assert_eq!(projection.attention_items.len(), 1);
+        assert!(projection.attention_items[0].requires_action);
         assert_eq!(
             projection
                 .model_request

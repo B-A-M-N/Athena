@@ -37,6 +37,15 @@ class _AsyncSQLiteConnection:
         self._closed = False
         self._poll_fallback = poll_fallback
         self._started = False
+        self._wake_read: int | None = None
+        self._wake_write: int | None = None
+        self._wake_loop: asyncio.AbstractEventLoop | None = None
+        try:
+            self._wake_read, self._wake_write = os.pipe()
+            os.set_blocking(self._wake_read, False)
+            os.set_blocking(self._wake_write, False)
+        except OSError:
+            self._close_wakeup_pipe()
         self._thread = threading.Thread(
             target=self._worker_loop,
             name="athena-sqlite",
@@ -64,14 +73,16 @@ class _AsyncSQLiteConnection:
         if self._closed:
             raise RuntimeError("SQLite connection is closed")
         loop = asyncio.get_running_loop()
+        self._install_wakeup(loop)
         future: asyncio.Future[Any] = loop.create_future()
         self._queue.put((operation, future))
-        # ``call_soon_threadsafe`` wakes the owning event loop and completes
-        # the Future.  The normal path has no timer or polling overhead.
-        if self._poll_fallback:
+        # ``call_soon_threadsafe`` completes the loop-owned Future. The pipe
+        # is a second wakeup path because embedded/sandboxed event loops may
+        # deny writes to asyncio's private socketpair.
+        if self._poll_fallback or self._wake_loop is None:
             # Explicit compatibility mode for embedded adapters that violate
-            # the asyncio thread-safe wakeup contract.  It is opt-in so the
-            # ordinary Athena runtime never pays this cost.
+            # the asyncio thread-safe wakeup contract, or platforms without a
+            # selector reader API. The ordinary path has no timer polling.
             while True:
                 try:
                     await asyncio.wait_for(asyncio.shield(future), timeout=0.001)
@@ -93,8 +104,32 @@ class _AsyncSQLiteConnection:
             else:
                 self._publish_future(future, value=value)
 
-    @staticmethod
+    def _install_wakeup(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._wake_loop is loop or self._wake_read is None:
+            return
+        if self._wake_loop is not None:
+            try:
+                self._wake_loop.remove_reader(self._wake_read)
+            except (OSError, RuntimeError):
+                pass
+        if not hasattr(loop, "add_reader"):
+            return
+        try:
+            loop.add_reader(self._wake_read, self._drain_wakeup)
+        except (NotImplementedError, OSError):
+            return
+        self._wake_loop = loop
+
+    def _drain_wakeup(self) -> None:
+        if self._wake_read is None:
+            return
+        try:
+            os.read(self._wake_read, 4096)
+        except (BlockingIOError, OSError):
+            pass
+
     def _publish_future(
+        self,
         future: asyncio.Future[Any],
         *,
         value: Any = None,
@@ -113,17 +148,31 @@ class _AsyncSQLiteConnection:
 
         try:
             loop.call_soon_threadsafe(complete)
-            # CPython's public method normally performs this wakeup itself.
-            # Keep the explicit nudge for embedded event-loop adapters that
-            # enqueue the callback but do not wake a selector blocked in
-            # ``select`` (the callback remains the only completion path).
-            wake_self = getattr(loop, "_write_to_self", None)
-            if callable(wake_self):
-                wake_self()
         except RuntimeError:
             # The owning loop is already gone; no consumer can observe this
             # result and the daemon worker must still be allowed to exit.
             return
+        if self._wake_write is not None:
+            try:
+                os.write(self._wake_write, b"\\0")
+            except (BlockingIOError, OSError):
+                pass
+
+    def _close_wakeup_pipe(self) -> None:
+        if self._wake_loop is not None and self._wake_read is not None:
+            try:
+                self._wake_loop.remove_reader(self._wake_read)
+            except (OSError, RuntimeError):
+                pass
+        for fd in (self._wake_read, self._wake_write):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._wake_read = None
+        self._wake_write = None
+        self._wake_loop = None
 
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> "_AsyncSQLiteCursor":
         def operation() -> tuple[sqlite3.Cursor, int]:
@@ -175,6 +224,7 @@ class _AsyncSQLiteConnection:
         finally:
             self._closed = True
             self._queue.put(None)
+            self._close_wakeup_pipe()
 
 
 class _AsyncSQLiteCursor:

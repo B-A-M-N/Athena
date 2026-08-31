@@ -22,9 +22,13 @@ async def test_setup_enables_only_after_probe_and_keeps_key_in_user_store(tmp_pa
     (tmp_path / "hermes" / "hermes_cli" / "main.py").write_text("", encoding="utf-8")
     api_server.write_text('"tool_execution": "disabled"\n_referee_mode = True\n', encoding="utf-8")
     monkeypatch.setattr(HermesRefereeManager, "_run_hermes", AsyncMock())
-    monkeypatch.setattr(HermesRefereeManager, "_probe", AsyncMock(  # noqa: SLF001
-        return_value={"preflight": {"safety_verified": True}, "e2e_decision": "PASS"}
-    ))
+    monkeypatch.setattr(
+        HermesRefereeManager,
+        "_probe",
+        AsyncMock(  # noqa: SLF001
+            return_value={"preflight": {"safety_verified": True}, "e2e_decision": "PASS"}
+        ),
+    )
 
     result = await manager.setup()
 
@@ -53,9 +57,13 @@ async def test_setup_does_not_enable_when_live_probe_fails(tmp_path, monkeypatch
     (tmp_path / "hermes" / "hermes_cli" / "main.py").write_text("", encoding="utf-8")
     api_server.write_text('"tool_execution": "disabled"\n_referee_mode = True\n', encoding="utf-8")
     monkeypatch.setattr(HermesRefereeManager, "_run_hermes", AsyncMock())
-    monkeypatch.setattr(HermesRefereeManager, "_probe", AsyncMock(  # noqa: SLF001
-        side_effect=HermesRefereeManagerError("capability contract mismatch")
-    ))
+    monkeypatch.setattr(
+        HermesRefereeManager,
+        "_probe",
+        AsyncMock(  # noqa: SLF001
+            side_effect=HermesRefereeManagerError("capability contract mismatch")
+        ),
+    )
 
     with pytest.raises(HermesRefereeManagerError, match="contract mismatch"):
         await manager.setup()

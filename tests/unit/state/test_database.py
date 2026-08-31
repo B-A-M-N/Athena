@@ -24,6 +24,11 @@ async def test_in_memory_connect_and_migrations_run(db):
     assert "workflow_step_item_runs" in names
 
 
+async def test_worker_completion_wakes_the_default_event_loop(db):
+    await asyncio.wait_for(db._ensure_ready(), timeout=0.5)
+    await asyncio.wait_for(db.close(), timeout=0.5)
+
+
 async def test_transaction_commits_on_success(db):
     await db._ensure_ready()
     async with db.transaction():

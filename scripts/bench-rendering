@@ -68,30 +68,41 @@ def _native_binary() -> Path:
 
 
 def _run_native_render(
-    binary: Path, xvfb_run: str, command: str, stats_path: Path
+    binary: Path,
+    xvfb_run: str,
+    command: str,
+    stats_path: Path,
+    projection: str | None = None,
 ) -> dict[str, object]:
     environment = dict(os.environ)
     environment["LIBGL_ALWAYS_SOFTWARE"] = "1"
     environment["ATHENA_NATIVE_RENDER_STATS"] = str(stats_path)
     started = time.perf_counter()
+    argv = [
+        xvfb_run,
+        "-a",
+        "-s",
+        "-screen 0 1024x768x24 -nolisten tcp",
+        str(binary),
+        "--command",
+        command,
+    ]
+    if projection is not None:
+        argv.append("--bridge-stdin")
     process = subprocess.Popen(
-        [
-            xvfb_run,
-            "-a",
-            "-s",
-            "-screen 0 1024x768x24 -nolisten tcp",
-            str(binary),
-            "--command",
-            command,
-        ],
+        argv,
         cwd=REPO_ROOT,
         env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        stdin=subprocess.PIPE if projection is not None else None,
     )
     try:
-        output, _ = process.communicate(timeout=10.0)
+        output, _ = process.communicate(
+            input=f"{projection}\n" if projection is not None else None,
+            timeout=10.0,
+        )
     except subprocess.TimeoutExpired:
         process.kill()
         output, _ = process.communicate()
@@ -171,7 +182,27 @@ def _native_render_metrics(*, required: bool) -> dict[str, object]:
             "for i in $(seq 1 80); do printf 'tick %s\\n' \"$i\"; sleep 0.01; done; sleep 0.5",
             directory_path / "active.json",
         )
-    return {"available": True, "binary": str(binary), "idle": idle, "active": active}
+        animation_state = ProjectionState()
+        animation_state.status = "SEARCHING"
+        animation_state.reduce("SearchStarted", {"query": "render benchmark"})
+        animation_frame = json.dumps(
+            native_projection_frame(animation_state, width=96, height=32),
+            ensure_ascii=False,
+        )
+        oi_animation = _run_native_render(
+            binary,
+            xvfb_run,
+            "sleep 1",
+            directory_path / "oi-animation.json",
+            projection=animation_frame,
+        )
+    return {
+        "available": True,
+        "binary": str(binary),
+        "idle": idle,
+        "active": active,
+        "oi_animation": oi_animation,
+    }
 
 
 def main() -> int:
@@ -186,6 +217,7 @@ def main() -> int:
     parser.add_argument("--max-idle-cpu-percent", type=float, default=2.0)
     parser.add_argument("--max-active-fps", type=float, default=25.0)
     parser.add_argument("--max-active-cpu-percent", type=float, default=30.0)
+    parser.add_argument("--max-oi-animation-cpu-percent", type=float, default=10.0)
     parser.add_argument("--max-cache-bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--require-native", action="store_true")
     args = parser.parse_args()
@@ -359,6 +391,17 @@ def main() -> int:
             print(
                 f"bench-rendering: active native CPU {active['cpu_percent']:.2f}% exceeds "
                 f"{args.max_active_cpu_percent:.2f}%",
+                file=sys.stderr,
+            )
+            return 1
+        oi_animation = native["oi_animation"]
+        if (
+            oi_animation.get("steady_cpu_percent") is not None
+            and float(oi_animation["steady_cpu_percent"]) > args.max_oi_animation_cpu_percent
+        ):
+            print(
+                f"bench-rendering: OI animation CPU {oi_animation['steady_cpu_percent']:.2f}% exceeds "
+                f"{args.max_oi_animation_cpu_percent:.2f}%",
                 file=sys.stderr,
             )
             return 1

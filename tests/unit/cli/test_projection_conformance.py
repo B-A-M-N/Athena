@@ -222,6 +222,28 @@ def test_native_bridge_preserves_current_action_query_context():
     assert frame["current_action"]["target"] == "context cache invalidation"
 
 
+def test_native_bridge_projects_approval_as_non_modal_attention_item():
+    state = ProjectionState()
+    state.reduce(
+        "ApprovalRequested",
+        {
+            "approval_id": "approval-1",
+            "capability_id": "fs.write",
+            "target": "native/src/render/oi.rs",
+            "reason": "workspace mutation",
+            "scopes": ["workspace"],
+        },
+    )
+
+    frame = native_projection_frame(state)
+
+    item = frame["attention_items"][0]
+    assert item["kind"] == "approval"
+    assert item["requires_action"] is True
+    assert "native/src/render/oi.rs" in item["summary"]
+    assert frame["progress"]["approval"]["capability_id"] == "fs.write"
+
+
 def test_code_mutation_content_is_projected_to_ansi_and_native_surfaces():
     state = ProjectionState()
     state.reduce(

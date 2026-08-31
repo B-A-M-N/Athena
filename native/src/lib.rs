@@ -169,7 +169,7 @@ impl NativeTerminalCore {
 
 /// Font-derived metrics shared by layout, PTY sizing, input hit testing, and
 /// glyph placement. The X11 frontend fills this from the selected Xft font.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct CellMetrics {
     pub width: f32,
     pub height: f32,
@@ -203,13 +203,160 @@ impl CellMetrics {
     }
 }
 
+/// The native compositor uses separate faces for terminal cells, editable
+/// input, headings, and small instrument labels. Keeping all four metrics in
+/// one value makes layout, clipping, and PTY sizing agree with the fonts that
+/// will actually be drawn.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct UiFontMetrics {
+    pub body: CellMetrics,
+    pub input: CellMetrics,
+    pub heading: CellMetrics,
+    pub instrument: CellMetrics,
+}
+
+impl UiFontMetrics {
+    pub fn fallback() -> Self {
+        Self {
+            body: CellMetrics::fallback(),
+            input: CellMetrics::new(9.0, 20.0, 15.0, 5.0),
+            heading: CellMetrics::new(7.0, 15.0, 12.0, 3.0),
+            instrument: CellMetrics::new(6.0, 12.0, 9.0, 3.0),
+        }
+    }
+}
+
 /// A physical-pixel rectangle in the native Athena compositor.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 pub struct PixelRect {
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+/// One metric-derived text row inside an instrument panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct TextRow {
+    pub top: f32,
+    pub baseline: f32,
+    pub height: f32,
+}
+
+impl TextRow {
+    pub fn new(top: f32, metrics: CellMetrics) -> Self {
+        Self {
+            top,
+            baseline: top + metrics.baseline,
+            height: metrics.height,
+        }
+    }
+
+    pub fn bottom(self) -> f32 {
+        self.top + self.height
+    }
+}
+
+/// The prompt is a three-row instrument, not a pile of offsets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct PromptLayout {
+    pub rect: PixelRect,
+    pub status_row: Option<TextRow>,
+    pub input_row: TextRow,
+    pub hint_row: Option<TextRow>,
+}
+
+/// Physical regions in the lower AthenaBOX instrument rail.
+///
+/// Keeping these regions typed prevents a control label, activity meter, or
+/// prompt row from silently borrowing space from a neighboring device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct RailLayout {
+    pub rail: PixelRect,
+    pub speaker: PixelRect,
+    pub operator_panel: PixelRect,
+    pub operator_status: PixelRect,
+    pub operator_input: PixelRect,
+    pub operator_hint: Option<PixelRect>,
+    pub system_status: PixelRect,
+    pub primary_encoder: PixelRect,
+    pub brightness: PixelRect,
+    pub focus: PixelRect,
+    pub power: PixelRect,
+    pub identity_plate: PixelRect,
+}
+
+impl PromptLayout {
+    pub fn required_height(
+        input: CellMetrics,
+        status: CellMetrics,
+        hint: CellMetrics,
+        padding: f32,
+        gap: f32,
+        bottom_padding: f32,
+        with_hint: bool,
+    ) -> f32 {
+        let rows = status.height + gap + input.height;
+        let rows = if with_hint {
+            rows + gap + hint.height
+        } else {
+            rows
+        };
+        padding + rows + bottom_padding
+    }
+
+    pub fn from_rect(
+        rect: PixelRect,
+        input: CellMetrics,
+        status: CellMetrics,
+        padding: f32,
+        gap: f32,
+        bottom_padding: f32,
+        with_hint: bool,
+    ) -> Self {
+        let safe_padding = padding.min((rect.height * 0.5).max(0.0));
+        let available = (rect.height - safe_padding - bottom_padding.max(0.0)).max(0.0);
+        let status_and_input = status.height + gap + input.height;
+        let full = status_and_input + gap + status.height <= available;
+        let status_fits = status_and_input <= available;
+        let input_top = rect.y + safe_padding;
+        let input_height = input.height.min((available).max(0.5));
+        let (status_row, input_row, hint_row) = if full && with_hint {
+            let status_row = TextRow::new(input_top, status);
+            let input_row = TextRow::new(status_row.bottom() + gap, input);
+            let hint_row = TextRow::new(input_row.bottom() + gap, status);
+            (Some(status_row), input_row, Some(hint_row))
+        } else if status_fits {
+            let status_row = TextRow::new(input_top, status);
+            let input_row = TextRow::new(status_row.bottom() + gap, input);
+            (Some(status_row), input_row, None)
+        } else {
+            (
+                None,
+                TextRow {
+                    top: input_top,
+                    baseline: input_top + input.baseline.min(input_height),
+                    height: input_height,
+                },
+                None,
+            )
+        };
+        Self {
+            rect,
+            status_row,
+            input_row,
+            hint_row,
+        }
+    }
+
+    pub fn content_bottom(self) -> f32 {
+        self.hint_row
+            .map_or(self.input_row.bottom(), TextRow::bottom)
+    }
+
+    pub fn rows_fit(self, bottom_padding: f32) -> bool {
+        self.content_bottom() + bottom_padding <= self.rect.bottom() + 0.01
+    }
 }
 
 impl PixelRect {
@@ -233,7 +380,7 @@ impl PixelRect {
 /// Every native surface and PTY resize derives from this value. The layout
 /// deliberately owns a compact mode instead of allowing minimum rectangles to
 /// extend outside a small window.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct NativePixelLayout {
     pub width: i32,
     pub height: i32,
@@ -241,143 +388,167 @@ pub struct NativePixelLayout {
     pub left_x: f32,
     pub cell_width: f32,
     pub cell_height: f32,
+    pub prompt_cell_width: f32,
     pub prompt_padding_x: f32,
+    pub prompt_padding_y: f32,
+    pub prompt_gap: f32,
+    pub prompt_bottom_padding: f32,
+    pub scale: f32,
+    pub canvas: PixelRect,
     pub chassis: PixelRect,
     pub header: PixelRect,
     pub operator_outer: PixelRect,
     pub oi_outer: PixelRect,
     pub operator_inner: PixelRect,
+    pub operator_viewport: PixelRect,
     pub oi_inner: PixelRect,
     pub controls: PixelRect,
     pub prompt: PixelRect,
+    pub rail: RailLayout,
 }
 
 impl NativePixelLayout {
     pub fn new(width: i32, height: i32) -> Self {
-        Self::for_window(width, height, CellMetrics::fallback())
+        Self::for_window(width, height, UiFontMetrics::fallback())
     }
 
-    pub fn for_window(width: i32, height: i32, metrics: CellMetrics) -> Self {
+    pub fn for_window(width: i32, height: i32, metrics: UiFontMetrics) -> Self {
         let width = width.max(1);
         let height = height.max(1);
-        let compact = width < 900 || height < 620;
         let width_f = width as f32;
         let height_f = height as f32;
-        let margin_ratio = if compact { 0.022 } else { 0.028 };
-        let margin_limit = (width_f / 3.0).max(0.0);
-        let margin = (width_f * margin_ratio).min(margin_limit);
-        let gap_ratio = if compact { 0.018 } else { 0.022 };
-        let gap = (width_f * gap_ratio).min((width_f - margin * 2.0).max(0.0) / 3.0);
-        let available_width = (width_f - margin * 2.0 - gap).max(0.0);
-        let aperture_width = (available_width / 2.0).max(0.0);
-        let left_x = margin;
-        let right_x = left_x + aperture_width + gap;
-        let header_y = (if compact { 16.0_f32 } else { 24.0_f32 }).min(height_f * 0.08);
-        let header_height = (if compact { 44.0_f32 } else { 52.0_f32 }).min(height_f * 0.14);
-        let body_y = (if compact { 88.0_f32 } else { 112.0_f32 }).min(height_f * 0.30);
-        let rail_gap = (if compact { 10.0_f32 } else { 16.0_f32 }).min(height_f * 0.04);
-        let controls_height = (if compact { 42.0_f32 } else { 88.0_f32 })
-            .min(height_f * if compact { 0.12 } else { 0.15 });
-        let bottom = (if compact { 12.0_f32 } else { 24.0_f32 }).min(height_f * 0.04);
-        let body_height = (height_f - body_y - rail_gap - controls_height - bottom).max(0.0);
-        let operator_outer = PixelRect {
-            x: left_x,
-            y: body_y,
-            width: aperture_width,
-            height: body_height,
+        const DESIGN_WIDTH: f32 = 1672.0;
+        const DESIGN_HEIGHT: f32 = 941.0;
+        let scale = (width_f / DESIGN_WIDTH).min(height_f / DESIGN_HEIGHT);
+        let canvas = PixelRect {
+            x: (width_f - DESIGN_WIDTH * scale) * 0.5,
+            y: (height_f - DESIGN_HEIGHT * scale) * 0.5,
+            width: DESIGN_WIDTH * scale,
+            height: DESIGN_HEIGHT * scale,
         };
-        let oi_outer = PixelRect {
-            x: right_x,
-            y: body_y,
-            width: aperture_width,
-            height: body_height,
+        let compact = scale < 0.66 || width < 900 || height < 620;
+        let map = |x: f32, y: f32, width: f32, height: f32| PixelRect {
+            x: canvas.x + x * scale,
+            y: canvas.y + y * scale,
+            width: width * scale,
+            height: height * scale,
         };
-        // The reference console uses a deep bezel around both displays. Keep
-        // the logical apertures equal, but leave enough metal around them to
-        // make the two screens read as embedded hardware rather than cards.
-        let desired_inset_x: f32 = if compact { 16.0 } else { 44.0 };
-        let inset_x = desired_inset_x.min(aperture_width / 4.0);
-        let desired_top: f32 = if compact { 30.0 } else { 48.0 };
-        let desired_bottom: f32 = if compact { 30.0 } else { 46.0 };
-        let inset_top = desired_top.min(body_height / 3.0);
-        let inset_bottom = desired_bottom.min((body_height - inset_top).max(0.0) / 2.0);
-        let inner_width = (aperture_width - inset_x * 2.0).max(0.0);
-        let inner_height = (body_height - inset_top - inset_bottom).max(0.0);
-        let operator_inner = PixelRect {
-            x: operator_outer.x + inset_x,
-            y: operator_outer.y + inset_top,
-            width: inner_width,
-            height: inner_height,
-        };
-        let oi_inner = PixelRect {
-            x: oi_outer.x + inset_x,
-            y: oi_outer.y + inset_top,
-            width: inner_width,
-            height: inner_height,
-        };
-        let rail_y = operator_outer.bottom() + rail_gap;
-        let controls = PixelRect {
-            x: margin,
-            y: rail_y,
-            width: (width_f - margin * 2.0).max(0.0),
-            height: controls_height,
-        };
-        let prompt_height = (if compact { 28.0 } else { 62.0_f32 }).min(controls_height);
-        let speaker_width = if compact {
-            controls.width.min(72.0)
+        // Canonical AthenaBox design space. The lower deck is deliberately a
+        // substantial part of the object, so a larger monitor grows the whole
+        // device instead of leaving a tiny fixed-height control strip.
+        let header = map(88.0, 42.0, 1496.0, 80.0);
+        let operator_outer = map(88.0, 158.0, 728.0, 522.0);
+        let oi_outer = map(856.0, 158.0, 728.0, 522.0);
+        let operator_inner = map(128.0, 210.0, 648.0, 430.0);
+        let operator_viewport = map(144.0, 246.0, 616.0, 378.0);
+        let oi_inner = map(896.0, 210.0, 648.0, 430.0);
+        let controls = map(88.0, 704.0, 1496.0, 186.0);
+        let left_x = operator_outer.x;
+        let input_metrics = if compact {
+            metrics.instrument
         } else {
-            144.0
+            metrics.input
         };
-        let right_control_width = if compact {
-            controls.width.min(88.0)
+        let prompt_padding_y = if compact { 4.0 } else { 8.0 };
+        let prompt_gap = if compact { 2.0 } else { 4.0 };
+        let prompt_bottom_padding = if compact { 4.0 } else { 8.0 };
+        let prompt_required = PromptLayout::required_height(
+            input_metrics,
+            metrics.instrument,
+            metrics.instrument,
+            prompt_padding_y,
+            prompt_gap,
+            prompt_bottom_padding,
+            !compact,
+        );
+        let prompt_rect = map(334.0, 726.0, 584.0, 142.0);
+        let prompt_height = if compact {
+            prompt_rect.height.min(controls.height)
         } else {
-            360.0
+            prompt_rect.height.max(prompt_required).min(controls.height)
         };
-        let prompt_gap = if compact { 4.0 } else { 12.0 };
-        let prompt_reserve = if compact { prompt_gap } else { 100.0 };
-        let prompt_x = (controls.x + speaker_width + prompt_gap).min(controls.right());
-        let prompt_right = (controls.right() - right_control_width - prompt_reserve).max(prompt_x);
         let prompt = PixelRect {
-            x: prompt_x,
-            y: controls.y + (controls.height - prompt_height) / 2.0,
-            width: (prompt_right - prompt_x).max(0.0),
+            y: controls.y + (controls.height - prompt_height).max(0.0) * 0.5,
             height: prompt_height,
+            ..prompt_rect
+        };
+        let prompt_layout = PromptLayout::from_rect(
+            prompt,
+            input_metrics,
+            metrics.instrument,
+            prompt_padding_y,
+            prompt_gap,
+            prompt_bottom_padding,
+            !compact,
+        );
+        let row_rect = |row: Option<TextRow>| {
+            row.map(|row| PixelRect {
+                x: prompt.x,
+                y: row.top,
+                width: prompt.width,
+                height: row.height,
+            })
+            .unwrap_or_default()
+        };
+        let rail = RailLayout {
+            rail: controls,
+            speaker: map(106.0, 716.0, 188.0, 162.0),
+            operator_panel: map(314.0, 716.0, 620.0, 162.0),
+            operator_status: PixelRect {
+                x: prompt.x,
+                y: prompt_layout.status_row.map_or(prompt.y, |row| row.top),
+                width: prompt.width,
+                height: prompt_layout.status_row.map_or(0.0, |row| row.height),
+            },
+            operator_input: row_rect(Some(prompt_layout.input_row)),
+            operator_hint: prompt_layout.hint_row.map(|row| PixelRect {
+                x: prompt.x,
+                y: row.top,
+                width: prompt.width,
+                height: row.height,
+            }),
+            system_status: map(950.0, 716.0, 164.0, 162.0),
+            primary_encoder: map(1130.0, 716.0, 170.0, 162.0),
+            brightness: map(1312.0, 716.0, 82.0, 162.0),
+            focus: map(1408.0, 716.0, 82.0, 162.0),
+            power: map(1504.0, 716.0, 66.0, 162.0),
+            identity_plate: map(1138.0, 850.0, 154.0, 20.0),
         };
         let layout = Self {
             width,
             height,
             compact,
             left_x,
-            cell_width: metrics.width.max(1.0),
-            cell_height: metrics.height.max(1.0),
-            prompt_padding_x: if compact { 12.0 } else { 20.0 },
-            chassis: PixelRect {
-                x: 0.0,
-                y: 0.0,
-                width: width as f32,
-                height: height as f32,
-            },
-            header: PixelRect {
-                x: margin,
-                y: header_y,
-                width: (width_f - margin * 2.0).max(0.0),
-                height: header_height,
-            },
+            cell_width: metrics.body.width.max(1.0),
+            cell_height: metrics.body.height.max(1.0),
+            prompt_cell_width: input_metrics.width.max(1.0),
+            prompt_padding_x: if compact { 12.0 * scale } else { 20.0 * scale },
+            prompt_padding_y,
+            prompt_gap,
+            prompt_bottom_padding,
+            scale,
+            canvas,
+            chassis: canvas,
+            header,
             operator_outer,
             oi_outer,
             operator_inner,
+            operator_viewport,
             oi_inner,
             controls,
             prompt,
+            rail,
         };
         for rect in [
             layout.header,
             layout.operator_outer,
             layout.oi_outer,
             layout.operator_inner,
+            layout.operator_viewport,
             layout.oi_inner,
             layout.controls,
             layout.prompt,
+            layout.rail.rail,
         ] {
             debug_assert!(rect.x >= -0.01);
             debug_assert!(rect.y >= -0.01);
@@ -389,10 +560,10 @@ impl NativePixelLayout {
 
     pub fn terminal_size(&self) -> TerminalSize {
         TerminalSize::new(
-            (self.operator_inner.width / self.cell_width)
+            (self.operator_viewport.width / self.cell_width)
                 .floor()
                 .max(1.0) as usize,
-            (self.operator_inner.height / self.cell_height)
+            (self.operator_viewport.height / self.cell_height)
                 .floor()
                 .max(1.0) as usize,
         )
@@ -400,38 +571,57 @@ impl NativePixelLayout {
 
     pub fn operator_origin(&self) -> (i32, i32) {
         (
-            self.operator_inner.x.round() as i32,
-            self.operator_inner.y.round() as i32,
+            self.operator_viewport.x.ceil() as i32,
+            self.operator_viewport.y.ceil() as i32,
         )
     }
 
     pub fn cell_at(&self, x: i32, y: i32) -> Option<(usize, usize)> {
-        if !self.operator_inner.contains(x, y) {
+        let x_f = x as f32;
+        let y_f = y as f32;
+        const HIT_TOLERANCE: f32 = 0.01;
+        if x_f + HIT_TOLERANCE < self.operator_viewport.x
+            || x_f >= self.operator_viewport.right()
+            || y_f + HIT_TOLERANCE < self.operator_viewport.y
+            || y_f >= self.operator_viewport.bottom()
+        {
             return None;
         }
         Some((
-            ((x as f32 - self.operator_inner.x) / self.cell_width) as usize,
-            ((y as f32 - self.operator_inner.y) / self.cell_height) as usize,
+            ((x_f - self.operator_viewport.x).max(0.0) / self.cell_width) as usize,
+            ((y_f - self.operator_viewport.y).max(0.0) / self.cell_height) as usize,
         ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CellMetrics, NativePixelLayout, NativeTerminalCore, TerminalSize};
+    use super::{
+        CellMetrics, NativePixelLayout, NativeTerminalCore, PixelRect, PromptLayout, TerminalSize,
+        UiFontMetrics,
+    };
     use alacritty_terminal::term::TermMode;
 
     #[test]
     fn equal_surface_geometry_is_content_independent() {
-        let layout = NativePixelLayout::for_window(1280, 800, CellMetrics::fallback());
+        let layout = NativePixelLayout::for_window(1280, 800, UiFontMetrics::fallback());
         assert_eq!(layout.operator_outer.width, layout.oi_outer.width);
         assert_eq!(layout.operator_inner.width, layout.oi_inner.width);
         assert_eq!(layout.operator_inner.height, layout.oi_inner.height);
+        assert_eq!(layout.rail.rail, layout.controls);
+        assert!(layout.rail.speaker.right() <= layout.rail.rail.right());
+        assert!(layout.rail.operator_status.bottom() <= layout.prompt.bottom());
+        assert!(layout.rail.operator_input.bottom() <= layout.prompt.bottom());
+        assert!(layout.rail.system_status.right() <= layout.rail.primary_encoder.x);
+        assert!(layout.rail.primary_encoder.right() <= layout.rail.brightness.x);
+        assert!(layout.rail.brightness.right() <= layout.rail.focus.x);
+        assert!(layout.rail.focus.right() <= layout.rail.power.x);
+        assert!(layout.rail.power.right() <= layout.rail.rail.right());
     }
 
     #[test]
     fn narrow_terminal_keeps_both_apertures_symmetric() {
-        let layout = NativePixelLayout::for_window(320, 240, CellMetrics::fallback());
+        let layout = NativePixelLayout::for_window(320, 240, UiFontMetrics::fallback());
         assert_eq!(layout.operator_outer.width, layout.oi_outer.width);
         assert!(layout.oi_outer.right() <= 320.0);
     }
@@ -439,7 +629,7 @@ mod tests {
     #[test]
     fn layout_fits_supported_small_windows() {
         for (width, height) in [(1, 1), (80, 40), (320, 240), (640, 480), (1280, 800)] {
-            let layout = NativePixelLayout::for_window(width, height, CellMetrics::fallback());
+            let layout = NativePixelLayout::for_window(width, height, UiFontMetrics::fallback());
             for rect in [
                 layout.header,
                 layout.operator_outer,
@@ -454,6 +644,45 @@ mod tests {
                 assert!(rect.bottom() <= height as f32);
             }
         }
+    }
+
+    #[test]
+    fn prompt_rows_are_metric_derived_and_non_overlapping() {
+        let body = CellMetrics::fallback();
+        let micro = CellMetrics::new(6.0, 12.0, 9.0, 3.0);
+        let prompt = PromptLayout::from_rect(
+            PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 72.0,
+            },
+            body,
+            micro,
+            6.0,
+            4.0,
+            6.0,
+            true,
+        );
+        assert!(prompt.status_row.unwrap().bottom() + 4.0 <= prompt.input_row.top);
+        assert!(prompt.input_row.bottom() + 4.0 <= prompt.hint_row.unwrap().top);
+        assert!(prompt.rows_fit(6.0));
+
+        let compact = PromptLayout::from_rect(
+            PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 28.0,
+            },
+            CellMetrics::new(6.0, 10.0, 8.0, 2.0),
+            CellMetrics::new(6.0, 10.0, 8.0, 2.0),
+            4.0,
+            2.0,
+            0.0,
+            false,
+        );
+        assert!(compact.rows_fit(0.0));
     }
 
     #[test]

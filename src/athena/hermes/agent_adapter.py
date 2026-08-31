@@ -229,7 +229,10 @@ class HermesAgentEvaluator:
                 "Hermes referee safety verification failed: effective_tools is not empty"
             )
         build = capabilities.get("build")
-        if not isinstance(build, Mapping) or build.get("referee_contract") != _REFEREE_CONTRACT_VERSION:
+        if (
+            not isinstance(build, Mapping)
+            or build.get("referee_contract") != _REFEREE_CONTRACT_VERSION
+        ):
             raise HermesRefereeSafetyError(
                 "Hermes referee safety verification failed: required referee contract is absent "
                 f"or unsupported (observed {dict(build) if isinstance(build, Mapping) else '<missing>'!r}). "

@@ -7,10 +7,8 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::env;
-use std::ffi::{CString, c_char, c_int, c_long, c_ulong, c_void};
+use std::ffi::{CString, c_char, c_int, c_long, c_short, c_ulong, c_ushort, c_void};
 use std::io::Write;
 use std::ptr;
 use std::sync::mpsc::Receiver;
@@ -20,18 +18,25 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
-use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
 
-use athena_terminal::{CellMetrics, NativePixelLayout, NativeTerminalCore, PixelRect};
+use athena_terminal::{
+    NativePixelLayout, NativeTerminalCore, PixelRect, PromptLayout, UiFontMetrics,
+};
 
 use crate::input::InputBuffer;
-use crate::{
-    LatestProjection, Projection, ProjectionEntity, ProjectionOperation, ProjectionTreeNode,
-    VisualMode, apply_available,
-};
+use crate::{LatestProjection, Projection, VisualMode, apply_available};
+
+#[path = "platform/clipboard.rs"]
+mod clipboard;
+#[path = "platform/input_method.rs"]
+mod input_method;
+#[path = "render/mod.rs"]
+mod render;
+use clipboard::Clipboard;
+use input_method::{InputMethod, lookup_key, terminal_key_bytes};
+use render::chassis::PresentationSettings;
+use render::text::{FontRole, TextRenderer};
 
 type Display = c_void;
 type Window = c_ulong;
@@ -67,24 +72,50 @@ const GLX_RED_SIZE: c_int = 8;
 const GLX_GREEN_SIZE: c_int = 9;
 const GLX_BLUE_SIZE: c_int = 10;
 const GLX_DEPTH_SIZE: c_int = 12;
+const GLX_STENCIL_SIZE: c_int = 13;
 const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
+const GL_STENCIL_BUFFER_BIT: u32 = 0x0000_0400;
 const GL_QUADS: u32 = 0x0007;
-const GL_LINES: u32 = 0x0001;
 const GL_LINE_LOOP: u32 = 0x0002;
+const GL_LINES: u32 = 0x0001;
 const GL_POLYGON: u32 = 0x0009;
 const GL_PROJECTION: u32 = 0x1701;
 const GL_MODELVIEW: u32 = 0x1700;
 const GL_SCISSOR_TEST: u32 = 0x0c11;
+const GL_STENCIL_TEST: u32 = 0x0b90;
+const GL_ALWAYS: u32 = 0x0207;
+const GL_EQUAL: u32 = 0x0202;
+const GL_KEEP: u32 = 0x1e00;
+const GL_REPLACE: u32 = 0x1e01;
+const GL_FRAMEBUFFER: u32 = 0x8d40;
+const GL_COLOR_ATTACHMENT0: u32 = 0x8ce0;
+const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8cd5;
+const GL_TEXTURE_2D: u32 = 0x0de1;
+const GL_RGBA: u32 = 0x1908;
+const GL_RGB: u32 = 0x1907;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+const GL_TEXTURE_WRAP_S: u32 = 0x2802;
+const GL_TEXTURE_WRAP_T: u32 = 0x2803;
+const GL_NEAREST: c_int = 0x2600;
+const GL_LINEAR: c_int = 0x2601;
+const GL_REPEAT: c_int = 0x2901;
+const GL_CLAMP_TO_EDGE: c_int = 0x812f;
 const SHIFT_MASK: CUint = 1;
 const CONTROL_MASK: CUint = 1 << 2;
 const BUTTON1_MASK: CUint = 1 << 8;
 const CURRENT_TIME: c_ulong = 0;
 const PROP_MODE_REPLACE: c_int = 0;
+const P_MIN_SIZE: c_long = 1 << 4;
+const P_BASE_SIZE: c_long = 1 << 8;
+const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
+const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
 const X_BUFFER_OVERFLOW: c_int = -1;
 const MAX_XIM_BUFFER: usize = 16 * 1024;
 const MAX_CACHED_XFT_COLORS: usize = 256;
 const MAX_CACHED_TEXT_WIDTHS: usize = 512;
-const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(40);
+const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[repr(C)]
@@ -224,6 +255,28 @@ struct XClientMessageEvent {
 }
 
 #[repr(C)]
+struct XSizeHints {
+    flags: c_long,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+    min_width: c_int,
+    min_height: c_int,
+    max_width: c_int,
+    max_height: c_int,
+    width_inc: c_int,
+    height_inc: c_int,
+    min_aspect_x: c_int,
+    min_aspect_y: c_int,
+    max_aspect_x: c_int,
+    max_aspect_y: c_int,
+    base_width: c_int,
+    base_height: c_int,
+    win_gravity: c_int,
+}
+
+#[repr(C)]
 struct XSelectionRequestEvent {
     type_: c_int,
     serial: c_ulong,
@@ -298,6 +351,14 @@ struct XGlyphInfo {
     y_off: i16,
 }
 
+#[repr(C)]
+struct XRectangle {
+    x: c_short,
+    y: c_short,
+    width: c_ushort,
+    height: c_ushort,
+}
+
 type XftDraw = c_void;
 #[repr(C)]
 struct XftFont {
@@ -344,6 +405,9 @@ unsafe extern "C" {
     ) -> Option<unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int>;
     fn XDefaultScreen(display: *mut Display) -> c_int;
     fn XRootWindow(display: *mut Display, screen: c_int) -> Window;
+    fn XDefaultVisual(display: *mut Display, screen: c_int) -> *mut c_void;
+    fn XDefaultDepth(display: *mut Display, screen: c_int) -> c_int;
+    fn XDefaultColormap(display: *mut Display, screen: c_int) -> Colormap;
     fn XCreateColormap(
         display: *mut Display,
         window: Window,
@@ -365,6 +429,7 @@ unsafe extern "C" {
         attributes: *mut XSetWindowAttributes,
     ) -> Window;
     fn XStoreName(display: *mut Display, window: Window, name: *const c_char) -> c_int;
+    fn XSetWMNormalHints(display: *mut Display, window: Window, hints: *mut XSizeHints);
     fn XInternAtom(display: *mut Display, name: *const c_char, only_if_exists: c_int) -> Atom;
     fn XSetWMProtocols(
         display: *mut Display,
@@ -502,6 +567,13 @@ unsafe extern "C" {
         string: *const u8,
         length: c_int,
     );
+    fn XftDrawSetClipRectangles(
+        draw: *mut XftDraw,
+        x_origin: c_int,
+        y_origin: c_int,
+        rectangles: *mut XRectangle,
+        n_rectangles: c_int,
+    );
 }
 
 #[link(name = "GL")]
@@ -523,14 +595,59 @@ unsafe extern "C" {
     fn glXWaitX();
     fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32);
     fn glClear(mask: u32);
+    fn glClearStencil(value: c_int);
     fn glFinish();
     fn glEnable(cap: u32);
     fn glDisable(cap: u32);
+    fn glColorMask(red: u8, green: u8, blue: u8, alpha: u8);
+    fn glStencilMask(mask: u32);
+    fn glStencilFunc(function: u32, reference: c_int, mask: u32);
+    fn glStencilOp(sfail: u32, dpfail: u32, dppass: u32);
+    fn glGenFramebuffers(count: c_int, framebuffers: *mut u32);
+    fn glDeleteFramebuffers(count: c_int, framebuffers: *const u32);
+    fn glBindFramebuffer(target: u32, framebuffer: u32);
+    fn glCheckFramebufferStatus(target: u32) -> u32;
+    fn glFramebufferTexture2D(
+        target: u32,
+        attachment: u32,
+        textarget: u32,
+        texture: u32,
+        level: c_int,
+    );
+    fn glGenTextures(count: c_int, textures: *mut u32);
+    fn glDeleteTextures(count: c_int, textures: *const u32);
+    fn glBindTexture(target: u32, texture: u32);
+    fn glTexParameteri(target: u32, pname: u32, parameter: c_int);
+    fn glTexImage2D(
+        target: u32,
+        level: c_int,
+        internal_format: c_int,
+        width: c_int,
+        height: c_int,
+        border: c_int,
+        format: u32,
+        pixel_type: u32,
+        pixels: *const c_void,
+    );
+    fn glReadPixels(
+        x: c_int,
+        y: c_int,
+        width: c_int,
+        height: c_int,
+        format: u32,
+        pixel_type: u32,
+        pixels: *mut c_void,
+    );
+    fn glTexCoord2f(s: f32, t: f32);
     fn glScissor(x: c_int, y: c_int, width: c_int, height: c_int);
     fn glFlush();
     fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int);
     fn glMatrixMode(mode: u32);
     fn glLoadIdentity();
+    fn glPushMatrix();
+    fn glPopMatrix();
+    fn glTranslatef(x: f32, y: f32, z: f32);
+    fn glScalef(x: f32, y: f32, z: f32);
     fn glOrtho(left: f64, right: f64, bottom: f64, top: f64, near: f64, far: f64);
     fn glBegin(mode: u32);
     fn glEnd();
@@ -539,510 +656,7 @@ unsafe extern "C" {
     fn glVertex2f(x: f32, y: f32);
 }
 
-struct Clipboard {
-    clipboard: Atom,
-    primary: Atom,
-    utf8_string: Atom,
-    string: Atom,
-    targets: Atom,
-    atom: Atom,
-    property: Atom,
-    text: String,
-}
-
-type PanelRect = PixelRect;
 type FrameGeometry = NativePixelLayout;
-
-struct TextRenderer {
-    display: *mut Display,
-    draw: *mut XftDraw,
-    font: *mut XftFont,
-    visual: *mut c_void,
-    colormap: Colormap,
-    colors: RefCell<HashMap<(u8, u8, u8), XftColor>>,
-    widths: RefCell<HashMap<String, i32>>,
-    metrics: CellMetrics,
-}
-
-impl TextRenderer {
-    fn new(
-        display: *mut Display,
-        screen: c_int,
-        window: Window,
-        visual: *mut c_void,
-        colormap: Colormap,
-    ) -> Result<Self, String> {
-        let draw = unsafe { XftDrawCreate(display, window, visual, colormap) };
-        if draw.is_null() {
-            return Err("could not create the native Xft text surface".to_owned());
-        }
-        let font_name = CString::new("Fira Mono:size=13").expect("static font name");
-        let mut font = unsafe { XftFontOpenName(display, screen, font_name.as_ptr()) };
-        if font.is_null() {
-            let fallback = CString::new("monospace:size=13").expect("static font name");
-            font = unsafe { XftFontOpenName(display, screen, fallback.as_ptr()) };
-        }
-        if font.is_null() {
-            unsafe { XftDrawDestroy(draw) };
-            return Err("could not open a Fontconfig monospace font".to_owned());
-        }
-        let sample = CString::new("M").expect("static glyph sample");
-        let mut extents = XGlyphInfo {
-            width: 0,
-            height: 0,
-            x: 0,
-            y: 0,
-            x_off: 0,
-            y_off: 0,
-        };
-        unsafe {
-            XftTextExtentsUtf8(display, font, sample.as_ptr().cast(), 1, &mut extents);
-        }
-        let metrics = unsafe {
-            CellMetrics::new(
-                (*font)
-                    .max_advance_width
-                    .max(i32::from(extents.x_off))
-                    .max(1) as f32,
-                (*font).height as f32,
-                (*font).ascent as f32,
-                (*font).descent as f32,
-            )
-        };
-        Ok(Self {
-            display,
-            draw,
-            font,
-            visual,
-            colormap,
-            colors: RefCell::new(HashMap::new()),
-            widths: RefCell::new(HashMap::new()),
-            metrics,
-        })
-    }
-
-    fn metrics(&self) -> CellMetrics {
-        self.metrics
-    }
-
-    fn text_width(&self, text: &str) -> i32 {
-        let sanitized = text.replace('\0', "");
-        if let Some(width) = self.widths.borrow().get(&sanitized).copied() {
-            return width;
-        }
-        let Ok(value) = CString::new(sanitized) else {
-            return 0;
-        };
-        let mut extents = XGlyphInfo {
-            width: 0,
-            height: 0,
-            x: 0,
-            y: 0,
-            x_off: 0,
-            y_off: 0,
-        };
-        unsafe {
-            XftTextExtentsUtf8(
-                self.display,
-                self.font,
-                value.as_ptr().cast(),
-                value.as_bytes().len().min(c_int::MAX as usize) as c_int,
-                &mut extents,
-            );
-        }
-        let width = i32::from(extents.x_off.max(0));
-        let mut widths = self.widths.borrow_mut();
-        if widths.len() < MAX_CACHED_TEXT_WIDTHS {
-            widths.insert(value.to_string_lossy().into_owned(), width);
-        }
-        width
-    }
-
-    fn draw(&self, x: c_int, y: c_int, text: &str, color: (u8, u8, u8)) {
-        let sanitized = text.replace('\0', "");
-        if sanitized.is_empty() {
-            return;
-        }
-        let Ok(value) = CString::new(sanitized) else {
-            return;
-        };
-        if let Some((color, cached)) = self.cached_color(color) {
-            unsafe {
-                XftDrawStringUtf8(
-                    self.draw,
-                    &color,
-                    self.font,
-                    x,
-                    y,
-                    value.as_ptr().cast(),
-                    value.as_bytes().len().min(c_int::MAX as usize) as c_int,
-                );
-                if !cached {
-                    let mut color = color;
-                    XftColorFree(self.display, self.visual, self.colormap, &mut color);
-                }
-            }
-        }
-    }
-
-    fn cached_color(&self, color: (u8, u8, u8)) -> Option<(XftColor, bool)> {
-        if let Some(cached) = self.colors.borrow().get(&color).copied() {
-            return Some((cached, true));
-        }
-        let allocated = self.allocate_color(color)?;
-        let mut colors = self.colors.borrow_mut();
-        if colors.len() < MAX_CACHED_XFT_COLORS {
-            let cached = *colors.entry(color).or_insert(allocated);
-            if cached.pixel != allocated.pixel {
-                unsafe {
-                    let mut allocated = allocated;
-                    XftColorFree(self.display, self.visual, self.colormap, &mut allocated);
-                }
-            }
-            Some((cached, true))
-        } else {
-            Some((allocated, false))
-        }
-    }
-
-    fn allocate_color(&self, color: (u8, u8, u8)) -> Option<XftColor> {
-        let mut allocated = XftColor {
-            pixel: 0,
-            color: XRenderColor {
-                red: u16::from(color.0) * 257,
-                green: u16::from(color.1) * 257,
-                blue: u16::from(color.2) * 257,
-                alpha: u16::MAX,
-            },
-        };
-        unsafe {
-            (XftColorAllocValue(
-                self.display,
-                self.visual,
-                self.colormap,
-                &allocated.color,
-                &mut allocated,
-            ) != 0)
-                .then_some(allocated)
-        }
-    }
-}
-
-impl Drop for TextRenderer {
-    fn drop(&mut self) {
-        unsafe {
-            for color in self.colors.get_mut().values_mut() {
-                XftColorFree(self.display, self.visual, self.colormap, color);
-            }
-            XftFontClose(self.display, self.font);
-            XftDrawDestroy(self.draw);
-        }
-    }
-}
-
-struct InputMethod {
-    im: *mut Xim,
-    ic: *mut Xic,
-}
-
-struct KeyLookup {
-    keysym: c_ulong,
-    bytes: Vec<u8>,
-}
-
-fn terminal_key_bytes(keysym: c_ulong, mode: TermMode, fallback: &[u8]) -> Vec<u8> {
-    let arrow = |key: u8| {
-        if mode.contains(TermMode::APP_CURSOR) {
-            vec![0x1b, b'O', key]
-        } else {
-            vec![0x1b, b'[', key]
-        }
-    };
-    match keysym {
-        XK_LEFT => arrow(b'D'),
-        XK_RIGHT => arrow(b'C'),
-        XK_UP => arrow(b'A'),
-        XK_DOWN => arrow(b'B'),
-        XK_HOME => arrow(b'H'),
-        XK_END => arrow(b'F'),
-        XK_PAGE_UP => b"\x1b[5~".to_vec(),
-        XK_PAGE_DOWN => b"\x1b[6~".to_vec(),
-        XK_DELETE => b"\x1b[3~".to_vec(),
-        XK_BACKSPACE => vec![0x7f],
-        XK_TAB => vec![b'\t'],
-        XK_RETURN => vec![b'\r'],
-        _ => fallback.to_vec(),
-    }
-}
-
-impl InputMethod {
-    fn new(display: *mut Display, window: Window) -> Option<Self> {
-        let im = unsafe { XOpenIM(display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
-        if im.is_null() {
-            return None;
-        }
-        let input_style = CString::new("inputStyle").expect("static XIM attribute");
-        let client_window = CString::new("clientWindow").expect("static XIM attribute");
-        // XIMPreeditNothing | XIMStatusNothing. This lets the platform input
-        // method compose Unicode/IME text without asking the renderer to own
-        // composition state.
-        let style: c_ulong = 0x0008 | 0x0400;
-        let ic = unsafe {
-            XCreateIC(
-                im,
-                input_style.as_ptr(),
-                style,
-                client_window.as_ptr(),
-                window,
-                ptr::null::<c_char>(),
-            )
-        };
-        if ic.is_null() {
-            unsafe { XCloseIM(im) };
-            return None;
-        }
-        Some(Self { im, ic })
-    }
-
-    fn lookup(
-        &mut self,
-        event: *mut XKeyEvent,
-        buffer: *mut c_char,
-        length: c_int,
-        keysym: *mut c_ulong,
-        status: *mut c_int,
-    ) -> c_int {
-        unsafe { Xutf8LookupString(self.ic, event, buffer, length, keysym, status) }
-    }
-}
-
-fn lookup_key(input_method: Option<&mut InputMethod>, event: &mut XKeyEvent) -> KeyLookup {
-    if let Some(input_method) = input_method {
-        let mut capacity = 128_usize;
-        loop {
-            let mut buffer = vec![0_i8; capacity];
-            let mut keysym = 0 as c_ulong;
-            let mut status = 0;
-            let count = input_method.lookup(
-                event,
-                buffer.as_mut_ptr(),
-                buffer.len().min(c_int::MAX as usize) as c_int,
-                &mut keysym,
-                &mut status,
-            );
-            if status == X_BUFFER_OVERFLOW {
-                let required = usize::try_from(count).unwrap_or(capacity.saturating_mul(2));
-                let next = required.max(capacity.saturating_mul(2));
-                if next > MAX_XIM_BUFFER {
-                    return KeyLookup {
-                        keysym,
-                        bytes: Vec::new(),
-                    };
-                }
-                capacity = next;
-                continue;
-            }
-            let length = bounded_lookup_length(count, buffer.len()).unwrap_or(0);
-            return KeyLookup {
-                keysym,
-                bytes: buffer[..length].iter().map(|byte| *byte as u8).collect(),
-            };
-        }
-    }
-
-    let mut buffer = [0_i8; 128];
-    let mut keysym = 0 as c_ulong;
-    let mut compose = XComposeStatus {
-        compose_ptr: ptr::null_mut(),
-        chars_matched: 0,
-    };
-    let count = unsafe {
-        XLookupString(
-            event,
-            buffer.as_mut_ptr(),
-            buffer.len() as c_int,
-            &mut keysym,
-            &mut compose,
-        )
-    };
-    let length = bounded_lookup_length(count, buffer.len()).unwrap_or(0);
-    KeyLookup {
-        keysym,
-        bytes: buffer[..length].iter().map(|byte| *byte as u8).collect(),
-    }
-}
-
-fn bounded_lookup_length(count: c_int, capacity: usize) -> Option<usize> {
-    usize::try_from(count)
-        .ok()
-        .filter(|length| *length <= capacity)
-}
-
-impl Drop for InputMethod {
-    fn drop(&mut self) {
-        unsafe {
-            XDestroyIC(self.ic);
-            XCloseIM(self.im);
-        }
-    }
-}
-
-impl Clipboard {
-    fn new(display: *mut Display) -> Self {
-        Self {
-            clipboard: intern_atom(display, "CLIPBOARD"),
-            primary: intern_atom(display, "PRIMARY"),
-            utf8_string: intern_atom(display, "UTF8_STRING"),
-            string: intern_atom(display, "STRING"),
-            targets: intern_atom(display, "TARGETS"),
-            atom: intern_atom(display, "ATOM"),
-            property: intern_atom(display, "ATHENA_SELECTION"),
-            text: String::new(),
-        }
-    }
-
-    fn own(&mut self, display: *mut Display, window: Window, text: String) {
-        self.text = text;
-        unsafe {
-            XSetSelectionOwner(display, self.primary, window, CURRENT_TIME);
-            XSetSelectionOwner(display, self.clipboard, window, CURRENT_TIME);
-        }
-    }
-
-    fn request(&self, display: *mut Display, window: Window) {
-        unsafe {
-            XConvertSelection(
-                display,
-                self.clipboard,
-                self.utf8_string,
-                self.property,
-                window,
-                CURRENT_TIME,
-            );
-            XFlush(display);
-        }
-    }
-
-    fn handle_event(
-        &mut self,
-        display: *mut Display,
-        window: Window,
-        event: &mut XEvent,
-    ) -> Option<Vec<u8>> {
-        match event.type_ {
-            SELECTION_REQUEST => {
-                let request =
-                    unsafe { &*((&mut *event) as *mut XEvent as *const XSelectionRequestEvent) };
-                self.respond(display, request);
-                None
-            }
-            SELECTION_NOTIFY => {
-                let notification =
-                    unsafe { &*((&mut *event) as *mut XEvent as *const XSelectionEvent) };
-                if notification.requestor != window || notification.property == 0 {
-                    return None;
-                }
-                let mut actual_type = 0;
-                let mut actual_format = 0;
-                let mut nitems = 0;
-                let mut bytes_after = 0;
-                let mut data: *mut u8 = ptr::null_mut();
-                let status = unsafe {
-                    XGetWindowProperty(
-                        display,
-                        window,
-                        notification.property,
-                        0,
-                        1_048_576,
-                        1,
-                        self.utf8_string,
-                        &mut actual_type,
-                        &mut actual_format,
-                        &mut nitems,
-                        &mut bytes_after,
-                        &mut data,
-                    )
-                };
-                if status != 0 || actual_format != 8 || data.is_null() {
-                    if !data.is_null() {
-                        unsafe { XFree(data.cast()) };
-                    }
-                    return None;
-                }
-                let bytes = unsafe { std::slice::from_raw_parts(data, nitems as usize).to_vec() };
-                unsafe {
-                    XFree(data.cast());
-                    XDeleteProperty(display, window, notification.property);
-                }
-                Some(bytes)
-            }
-            SELECTION_CLEAR => {
-                self.text.clear();
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn respond(&self, display: *mut Display, request: &XSelectionRequestEvent) {
-        let property = if request.property == 0 {
-            request.target
-        } else {
-            request.property
-        };
-        let mut accepted = property;
-        unsafe {
-            if request.target == self.targets {
-                let targets = [self.utf8_string, self.string, self.targets];
-                XChangeProperty(
-                    display,
-                    request.requestor,
-                    property,
-                    self.atom,
-                    32,
-                    PROP_MODE_REPLACE,
-                    targets.as_ptr().cast(),
-                    targets.len() as c_int,
-                );
-            } else if request.target == self.utf8_string || request.target == self.string {
-                XChangeProperty(
-                    display,
-                    request.requestor,
-                    property,
-                    request.target,
-                    8,
-                    PROP_MODE_REPLACE,
-                    self.text.as_bytes().as_ptr(),
-                    self.text.len().min(c_int::MAX as usize) as c_int,
-                );
-            } else {
-                accepted = 0;
-            }
-            let response = XSelectionEvent {
-                type_: SELECTION_NOTIFY,
-                serial: 0,
-                send_event: 1,
-                display,
-                requestor: request.requestor,
-                selection: request.selection,
-                target: request.target,
-                property: accepted,
-                time: request.time,
-            };
-            let mut event = XEvent {
-                type_: 0,
-                pad: [0; 24],
-            };
-            ptr::write(
-                (&mut event as *mut XEvent).cast::<XSelectionEvent>(),
-                response,
-            );
-            XSendEvent(display, request.requestor, 0, 0, &mut event);
-            XFlush(display);
-        }
-    }
-}
-
 fn intern_atom(display: *mut Display, name: &str) -> Atom {
     let Ok(value) = CString::new(name) else {
         return 0;
@@ -1089,6 +703,105 @@ pub fn run(
     result
 }
 
+/// Probe the same Xft font roles used by the live compositor and serialize
+/// their metric-derived geometry without opening the native event loop.
+///
+/// CI machines without an X server deliberately fall back in `main.rs`, but
+/// that output is tagged as static so a layout dump can never masquerade as a
+/// live font measurement.
+pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_json::Value, String> {
+    let display = unsafe { XOpenDisplay(ptr::null()) };
+    if display.is_null() {
+        return Err("could not open an X11 display for live layout metrics".to_owned());
+    }
+    let screen = unsafe { XDefaultScreen(display) };
+    let visual = unsafe { XDefaultVisual(display, screen) };
+    if visual.is_null() {
+        unsafe { XCloseDisplay(display) };
+        return Err("X11 display has no compatible visual for live layout metrics".to_owned());
+    }
+    let root = unsafe { XRootWindow(display, screen) };
+    let colormap = unsafe { XDefaultColormap(display, screen) };
+    let mut window_attributes = XSetWindowAttributes {
+        background_pixmap: 0,
+        background_pixel: 0,
+        border_pixmap: 0,
+        border_pixel: 0,
+        bit_gravity: 0,
+        win_gravity: 0,
+        backing_store: 0,
+        backing_planes: 0,
+        backing_pixel: 0,
+        save_under: 0,
+        event_mask: 0,
+        do_not_propagate_mask: 0,
+        override_redirect: 0,
+        colormap,
+        cursor: 0,
+    };
+    let window = unsafe {
+        XCreateWindow(
+            display,
+            root,
+            0,
+            0,
+            width.max(1) as CUint,
+            height.max(1) as CUint,
+            0,
+            XDefaultDepth(display, screen),
+            INPUT_OUTPUT as CUint,
+            visual,
+            CW_COLORMAP,
+            &mut window_attributes,
+        )
+    };
+    if window == 0 {
+        unsafe {
+            XCloseDisplay(display);
+        }
+        return Err("could not create an X11 drawable for live layout metrics".to_owned());
+    }
+    let result = (|| {
+        let text = TextRenderer::new(display, screen, window, visual, colormap)?;
+        let metrics = UiFontMetrics {
+            body: text.metrics_for(FontRole::Body),
+            input: text.metrics_for(FontRole::Input),
+            heading: text.metrics_for(FontRole::Heading),
+            instrument: text.metrics_for(FontRole::Instrument),
+        };
+        let layout = FrameGeometry::for_window(width, height, metrics);
+        let prompt = PromptLayout::from_rect(
+            layout.prompt,
+            if layout.compact {
+                metrics.instrument
+            } else {
+                metrics.input
+            },
+            metrics.instrument,
+            layout.prompt_padding_y,
+            layout.prompt_gap,
+            layout.prompt_bottom_padding,
+            !layout.compact,
+        );
+        let mut dump = serde_json::to_value(layout).map_err(|error| error.to_string())?;
+        let object = dump
+            .as_object_mut()
+            .ok_or_else(|| "native layout did not serialize as an object".to_owned())?;
+        object.insert("metrics_source".to_owned(), serde_json::json!("live_xft"));
+        object.insert("metrics".to_owned(), serde_json::to_value(metrics).unwrap());
+        object.insert(
+            "prompt_layout".to_owned(),
+            serde_json::to_value(prompt).unwrap(),
+        );
+        Ok(dump)
+    })();
+    unsafe {
+        XDestroyWindow(display, window);
+        XCloseDisplay(display);
+    }
+    result
+}
+
 fn run_window(
     display: *mut Display,
     core: &mut NativeTerminalCore,
@@ -1099,7 +812,21 @@ fn run_window(
     options: &RendererOptions,
 ) -> Result<(), String> {
     let screen = unsafe { XDefaultScreen(display) };
-    let attributes = [
+    let stencil_attributes = [
+        GLX_RGBA,
+        GLX_RED_SIZE,
+        8,
+        GLX_GREEN_SIZE,
+        8,
+        GLX_BLUE_SIZE,
+        8,
+        GLX_DEPTH_SIZE,
+        0,
+        GLX_STENCIL_SIZE,
+        8,
+        0,
+    ];
+    let fallback_attributes = [
         GLX_RGBA,
         GLX_RED_SIZE,
         8,
@@ -1111,7 +838,13 @@ fn run_window(
         0,
         0,
     ];
-    let visual = unsafe { glXChooseVisual(display, screen, attributes.as_ptr() as *mut c_int) };
+    let mut visual =
+        unsafe { glXChooseVisual(display, screen, stencil_attributes.as_ptr() as *mut c_int) };
+    let stencil_available = !visual.is_null();
+    if visual.is_null() {
+        visual =
+            unsafe { glXChooseVisual(display, screen, fallback_attributes.as_ptr() as *mut c_int) };
+    }
     if visual.is_null() {
         return Err("X11 display has no compatible OpenGL visual".to_owned());
     }
@@ -1161,6 +894,7 @@ fn run_window(
     }
     let title = CString::new(projection.title.as_str()).map_err(|_| "invalid window title")?;
     unsafe { XStoreName(display, window, title.as_ptr()) };
+    set_window_hints(display, window);
     let delete_atom = unsafe {
         XInternAtom(
             display,
@@ -1191,6 +925,8 @@ fn run_window(
             return Err(error);
         }
     };
+    let oi_target = render::oi::OiTarget::new();
+    let chassis_material = render::chassis::ChassisMaterial::new();
     let mut input_method = InputMethod::new(display, window);
     if let Some(input_method) = input_method.as_ref() {
         unsafe { XSetICFocus(input_method.ic) };
@@ -1201,11 +937,18 @@ fn run_window(
         .map_err(|error| format!("could not clone PTY writer: {error}"))?;
     let mut clipboard = Clipboard::new(display);
     let mut input_buffer = InputBuffer::default();
+    let mut presentation = PresentationSettings::default();
     let mut selection: Option<((usize, usize), (usize, usize))> = None;
     let mut width = 1280_i32;
     let mut height = 800_i32;
-    let metrics = text.metrics();
+    let metrics = UiFontMetrics {
+        body: text.metrics_for(FontRole::Body),
+        input: text.metrics_for(FontRole::Input),
+        heading: text.metrics_for(FontRole::Heading),
+        instrument: text.metrics_for(FontRole::Instrument),
+    };
     resize_terminal(core, pty, width, height, metrics);
+    write_runtime_layout_dump(width, height, metrics);
     unsafe { XSetInputFocus(display, window, 1, CURRENT_TIME) };
     let mut focused = true;
     let mut running = true;
@@ -1219,6 +962,7 @@ fn run_window(
     let mut event_redraws = 0_u64;
     let mut idle_redraws = 0_u64;
     let mut redraws = 0_u64;
+    let mut oi_dumped = false;
     let render_started = Instant::now();
     let cpu_started = process_cpu_seconds();
     let mut last_draw: Option<Instant> = None;
@@ -1373,10 +1117,18 @@ fn run_window(
                         unsafe { XSetInputFocus(display, window, 1, CURRENT_TIME) };
                         focused = true;
                         let geometry = FrameGeometry::for_window(width, height, metrics);
-                        if geometry.prompt.contains(button.x, button.y) {
+                        if geometry.header.contains(button.x, button.y) {
+                            begin_window_move(display, window, button);
+                        } else if let Some(control) =
+                            PresentationSettings::control_at(&geometry, button.x, button.y)
+                        {
+                            presentation.activate(control, button.x, &geometry);
+                            dirty = true;
+                            activity_dirty = true;
+                        } else if geometry.prompt.contains(button.x, button.y) {
                             let offset =
                                 ((button.x as f32 - geometry.prompt.x - geometry.prompt_padding_x)
-                                    / geometry.cell_width)
+                                    / geometry.prompt_cell_width)
                                     .max(0.0) as usize;
                             input_buffer.set_cursor_chars(offset, button.state & SHIFT_MASK != 0);
                             dirty = true;
@@ -1496,7 +1248,7 @@ fn run_window(
             .map(|last| now.duration_since(last) >= ACTIVE_FRAME_INTERVAL)
             .unwrap_or(true);
         if (dirty || terminal_dirty || oi_motion_dirty) && draw_ready {
-            draw_frame(
+            render::frame::draw_frame(
                 display,
                 width,
                 height,
@@ -1507,6 +1259,10 @@ fn run_window(
                 focused,
                 &input_buffer,
                 options,
+                presentation,
+                stencil_available,
+                &oi_target,
+                &chassis_material,
                 DirtyDomains {
                     full: dirty,
                     terminal: terminal_dirty,
@@ -1518,6 +1274,14 @@ fn run_window(
                     0.0
                 },
             );
+            if !oi_dumped {
+                if let Ok(path) = env::var("ATHENA_NATIVE_OI_DUMP") {
+                    if let Err(error) = render::oi::dump_framebuffer(&oi_target, &path) {
+                        eprintln!("could not write OI framebuffer dump: {error}");
+                    }
+                    oi_dumped = true;
+                }
+            }
             redraws += 1;
             if last_draw.is_none() {
                 initial_redraws += 1;
@@ -1590,6 +1354,8 @@ fn run_window(
     // to destroy resources whose drawable no longer exists.
     if window_destroyed {
         std::mem::forget(input_method);
+        std::mem::forget(oi_target);
+        std::mem::forget(chassis_material);
         std::mem::forget(text);
         // The display close in `run` will reclaim the context and any server
         // resources. Calling GLX unbind/destroy here can itself query the
@@ -1597,6 +1363,8 @@ fn run_window(
         return Ok(());
     } else {
         drop(input_method);
+        drop(oi_target);
+        drop(chassis_material);
         drop(text);
     }
     unsafe {
@@ -1607,6 +1375,122 @@ fn run_window(
         }
     }
     Ok(())
+}
+
+fn set_window_hints(display: *mut Display, window: Window) {
+    let mut hints = XSizeHints {
+        flags: P_MIN_SIZE | P_BASE_SIZE,
+        x: 0,
+        y: 0,
+        width: 1280,
+        height: 800,
+        min_width: 900,
+        min_height: 620,
+        max_width: 0,
+        max_height: 0,
+        width_inc: 1,
+        height_inc: 1,
+        min_aspect_x: 0,
+        min_aspect_y: 0,
+        max_aspect_x: 0,
+        max_aspect_y: 0,
+        base_width: 900,
+        base_height: 620,
+        win_gravity: 0,
+    };
+    unsafe { XSetWMNormalHints(display, window, &mut hints) };
+
+    // `_MOTIF_WM_HINTS` is the broadly supported X11 decoration switch. It
+    // leaves the surface managed and movable while removing the OS titlebar
+    // that would otherwise break the physical AthenaBox illusion.
+    let atom = intern_atom(display, "_MOTIF_WM_HINTS");
+    let decorations: [c_long; 5] = [2, 0, 0, 0, 0];
+    unsafe {
+        XChangeProperty(
+            display,
+            window,
+            atom,
+            atom,
+            32,
+            PROP_MODE_REPLACE,
+            decorations.as_ptr().cast(),
+            decorations.len() as c_int,
+        );
+    }
+}
+
+fn write_runtime_layout_dump(width: i32, height: i32, metrics: UiFontMetrics) {
+    let Ok(path) = env::var("ATHENA_NATIVE_LAYOUT_DUMP") else {
+        return;
+    };
+    let layout = FrameGeometry::for_window(width, height, metrics);
+    let prompt = PromptLayout::from_rect(
+        layout.prompt,
+        if layout.compact {
+            metrics.instrument
+        } else {
+            metrics.input
+        },
+        metrics.instrument,
+        layout.prompt_padding_y,
+        layout.prompt_gap,
+        layout.prompt_bottom_padding,
+        !layout.compact,
+    );
+    let mut value = match serde_json::to_value(layout) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("could not serialize native layout dump: {error}");
+            return;
+        }
+    };
+    let Some(object) = value.as_object_mut() else {
+        eprintln!("could not serialize native layout dump as an object");
+        return;
+    };
+    object.insert("metrics_source".to_owned(), serde_json::json!("live_xft"));
+    object.insert(
+        "metrics".to_owned(),
+        serde_json::to_value(metrics).expect("font metrics serialize"),
+    );
+    object.insert(
+        "prompt_layout".to_owned(),
+        serde_json::to_value(prompt).expect("prompt layout serialize"),
+    );
+    if let Err(error) = std::fs::write(path, value.to_string()) {
+        eprintln!("could not write native layout dump: {error}");
+    }
+}
+
+fn begin_window_move(display: *mut Display, window: Window, button: &XButtonEvent) {
+    let root = unsafe { XRootWindow(display, XDefaultScreen(display)) };
+    let message_type = intern_atom(display, "_NET_WM_MOVERESIZE");
+    let mut event = XEvent {
+        type_: CLIENT_MESSAGE,
+        pad: [0; 24],
+    };
+    let message = unsafe { &mut *(&mut event as *mut XEvent as *mut XClientMessageEvent) };
+    message.display = display;
+    message.window = window;
+    message.message_type = message_type;
+    message.format = 32;
+    message.data = [
+        button.x_root as c_long,
+        button.y_root as c_long,
+        8,
+        button.button as c_long,
+        0,
+    ];
+    unsafe {
+        XSendEvent(
+            display,
+            root,
+            0,
+            SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
+            &mut event,
+        );
+        XFlush(display);
+    }
 }
 
 fn process_cpu_seconds() -> Option<f64> {
@@ -1673,7 +1557,7 @@ fn resize_terminal(
     pty: &mut tty::Pty,
     width: i32,
     height: i32,
-    metrics: CellMetrics,
+    metrics: UiFontMetrics,
 ) {
     let layout = FrameGeometry::for_window(width, height, metrics);
     let terminal_size = layout.terminal_size();
@@ -1683,972 +1567,22 @@ fn resize_terminal(
     pty.on_resize(WindowSize {
         num_cols: columns.min(u16::MAX as usize) as u16,
         num_lines: rows.min(u16::MAX as usize) as u16,
-        cell_width: metrics.width.round().max(1.0) as u16,
-        cell_height: metrics.height.round().max(1.0) as u16,
+        cell_width: metrics.body.width.round().max(1.0) as u16,
+        cell_height: metrics.body.height.round().max(1.0) as u16,
     });
 }
 
 fn projection_is_animated(projection: &Projection) -> bool {
     VisualMode::from_projection(projection).is_animated()
 }
-fn operation_progress(operation: &ProjectionOperation) -> String {
-    if !operation.progress_determinate {
-        return if operation.progress.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", operation.progress)
-        };
-    }
-    let Some(value) = operation.progress_value else {
-        return String::new();
-    };
-    let ratio = value.clamp(0.0, 1.0);
-    if ratio.is_nan() {
-        return String::new();
-    }
-    const BAR_WIDTH: usize = 12;
-    let filled = (BAR_WIDTH as f64 * ratio).round() as usize;
-    let filled = filled.min(BAR_WIDTH);
-    format!(
-        " [{}{}]{:.0}%",
-        "\u{2588}".repeat(filled),
-        "\u{2592}".repeat(BAR_WIDTH - filled),
-        ratio * 100.0
-    )
-}
-
-fn diagnostic_text(diagnostic: &crate::ProjectionDiagnostic, message: &str) -> String {
-    let location = if diagnostic.path.is_empty() {
-        diagnostic
-            .line
-            .map_or_else(String::new, |line| format!("line {line}"))
-    } else {
-        format!(
-            "{}{}",
-            diagnostic.path,
-            diagnostic
-                .line
-                .map_or_else(String::new, |line| format!(":{line}"))
-        )
-    };
-    let severity = if diagnostic.severity.is_empty() {
-        String::new()
-    } else {
-        format!("[{}]", diagnostic.severity)
-    };
-    let mut detail = Vec::new();
-    if !diagnostic.detail.is_empty() && diagnostic.detail != message {
-        detail.push(diagnostic.detail.clone());
-    }
-    if let Some(expected) = diagnostic.expected.as_ref() {
-        detail.push(format!("expected={expected}"));
-    }
-    if let Some(actual) = diagnostic.actual.as_ref() {
-        detail.push(format!("actual={actual}"));
-    }
-    let mut fields = vec!["!".to_owned()];
-    if !severity.is_empty() {
-        fields.push(severity);
-    }
-    if !location.is_empty() {
-        fields.push(location);
-    }
-    if !message.is_empty() {
-        fields.push(message.to_owned());
-    }
-    fields.extend(detail);
-    fields.join(" ")
-}
-
-fn draw_frame(
-    display: *mut Display,
-    width: i32,
-    height: i32,
-    core: &NativeTerminalCore,
-    projection: &Projection,
-    selection: Option<((usize, usize), (usize, usize))>,
-    text: &TextRenderer,
-    focused: bool,
-    input_buffer: &InputBuffer,
-    options: &RendererOptions,
-    dirty: DirtyDomains,
-    phase: f32,
-) {
-    let geometry = FrameGeometry::for_window(width, height, text.metrics());
-    let semantic_mode = VisualMode::from_projection(projection).as_str();
-    unsafe { glXWaitX() };
-    unsafe {
-        glViewport(0, 0, width, height);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0.0, width as f64, height as f64, 0.0, -1.0, 1.0);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
-    }
-
-    if dirty.full {
-        unsafe {
-            glDisable(GL_SCISSOR_TEST);
-            glClearColor(0.026, 0.028, 0.048, 1.0);
-            glClear(GL_COLOR_BUFFER_BIT);
-        }
-        draw_chassis(&geometry, projection, focused, phase);
-        with_scissor(height, geometry.operator_inner, || {
-            draw_terminal_background(core, &geometry, selection);
-        });
-        with_scissor(height, geometry.oi_inner, || {
-            draw_oi_scene(
-                geometry.oi_inner.x,
-                geometry.oi_inner.y,
-                geometry.oi_inner.width,
-                geometry.oi_inner.height,
-                projection,
-                phase,
-                options,
-            );
-        });
-    } else if dirty.terminal {
-        with_scissor(height, geometry.operator_inner, || {
-            draw_terminal_background(core, &geometry, selection);
-        });
-    } else if dirty.oi_motion {
-        with_scissor(height, geometry.oi_inner, || {
-            draw_rect(
-                geometry.oi_inner.x,
-                geometry.oi_inner.y,
-                geometry.oi_inner.width,
-                geometry.oi_inner.height,
-                (0.010, 0.028, 0.037),
-            );
-            draw_oi_scene(
-                geometry.oi_inner.x,
-                geometry.oi_inner.y,
-                geometry.oi_inner.width,
-                geometry.oi_inner.height,
-                projection,
-                phase,
-                options,
-            );
-        });
-    }
-
-    if dirty.full {
-        // Complete the OpenGL writes before Xft submits text to the same
-        // single-buffer drawable. GLX and Xlib have separate request paths;
-        // glFlush alone does not establish the ordering Xft needs here.
-        unsafe {
-            glFinish();
-            glXWaitGL();
-        }
-        // Xft renders UTF-8 after the OpenGL scene on the same single-buffer
-        // X11 drawable. The frame is flushed only after both layers are done.
-        let header_baseline = geometry.header.y as c_int
-            + ((geometry.header.height - text.metrics().height) / 2.0 + text.metrics().baseline)
-                as c_int;
-        text.draw(
-            geometry.header.x as c_int + 22,
-            header_baseline,
-            &fit_text(text, "ATHENA", (geometry.header.width as c_int - 44).max(1)),
-            (229, 239, 247),
-        );
-        text.draw(
-            geometry.header.x as c_int + 145,
-            header_baseline,
-            &fit_text(
-                text,
-                "//  OPERATOR INSTRUMENT",
-                (geometry.header.width as c_int - 190).max(1),
-            ),
-            (112, 145, 174),
-        );
-        let bridge_label = if projection.bridge_status.is_empty() {
-            "WAITING"
-        } else {
-            projection.bridge_status.as_str()
-        };
-        let bridge_text = format!("BRIDGE / {bridge_label}");
-        text.draw(
-            (geometry.header.right() - text.text_width(&bridge_text) as f32 - 22.0) as c_int,
-            header_baseline,
-            &bridge_text,
-            if bridge_label.starts_with("ERROR") {
-                (235, 112, 116)
-            } else if bridge_label == "CONNECTED" {
-                (103, 198, 181)
-            } else {
-                (239, 194, 105)
-            },
-        );
-        let panel_baseline =
-            |panel: PixelRect| panel.y as c_int + text.metrics().baseline as c_int + 12;
-        text.draw(
-            geometry.operator_outer.x as c_int + 24,
-            panel_baseline(geometry.operator_outer),
-            &fit_text(
-                text,
-                "ATHENA // OPERATOR CONSOLE",
-                (geometry.operator_outer.width as c_int - 48).max(1),
-            ),
-            (164, 189, 211),
-        );
-        text.draw(
-            geometry.oi_outer.x as c_int + 24,
-            panel_baseline(geometry.oi_outer),
-            &fit_text(
-                text,
-                "ATHENA OI // GLASS COMPUTE",
-                (geometry.oi_outer.width as c_int - 48).max(1),
-            ),
-            mode_color(semantic_mode),
-        );
-        with_scissor(height, geometry.operator_inner, || {
-            draw_terminal_text(text, core, &geometry);
-        });
-        draw_status_text(
-            text,
-            &geometry,
-            projection,
-            semantic_mode,
-            focused,
-            options,
-            input_buffer,
-        );
-    } else if dirty.terminal {
-        unsafe {
-            glFinish();
-            glXWaitGL();
-        }
-        with_scissor(height, geometry.operator_inner, || {
-            draw_terminal_text(text, core, &geometry);
-        });
-    }
-    unsafe {
-        if !dirty.full {
-            glFlush();
-        }
-        XFlush(display);
-    }
-}
-
-fn draw_chassis(geometry: &FrameGeometry, projection: &Projection, focused: bool, _phase: f32) {
-    let width = geometry.chassis.width;
-    let height = geometry.chassis.height;
-    draw_rect(
-        geometry.chassis.x,
-        geometry.chassis.y,
-        width,
-        height,
-        (0.026, 0.028, 0.048),
-    );
-    draw_round_rect(
-        geometry.left_x - 10.0,
-        14.0,
-        width - (geometry.left_x - 10.0) * 2.0,
-        height - 28.0,
-        24.0,
-        (0.135, 0.145, 0.180),
-    );
-    draw_round_outline(
-        geometry.left_x - 10.0,
-        14.0,
-        width - (geometry.left_x - 10.0) * 2.0,
-        height - 28.0,
-        (0.25, 0.29, 0.37),
-    );
-    draw_round_rect(
-        geometry.left_x,
-        24.0,
-        width - geometry.left_x * 2.0,
-        height - 48.0,
-        18.0,
-        (0.060, 0.068, 0.096),
-    );
-    draw_round_outline(
-        geometry.left_x,
-        24.0,
-        width - geometry.left_x * 2.0,
-        height - 48.0,
-        (0.13, 0.17, 0.23),
-    );
-    draw_round_rect(
-        geometry.header.x,
-        geometry.header.y,
-        geometry.header.width,
-        geometry.header.height,
-        14.0,
-        (0.170, 0.180, 0.220),
-    );
-    draw_round_outline(
-        geometry.header.x,
-        geometry.header.y,
-        geometry.header.width,
-        geometry.header.height,
-        (0.28, 0.32, 0.40),
-    );
-    // The ventilation slots are deliberately kept clear of the title so the
-    // header reads as designed hardware instead of text with artifacts behind
-    // it.
-    for index in 0..7 {
-        let x = geometry.header.x + geometry.header.width * 0.50 + index as f32 * 14.0;
-        draw_round_rect(
-            x,
-            geometry.header.y + geometry.header.height * 0.31,
-            8.0,
-            3.0,
-            2.0,
-            (0.025, 0.030, 0.048),
-        );
-        draw_rect(
-            x + 1.0,
-            geometry.header.y + geometry.header.height * 0.31,
-            6.0,
-            1.0,
-            (0.13, 0.15, 0.20),
-        );
-    }
-    let indicator = if projection.status.to_ascii_lowercase().contains("fail") {
-        (0.82, 0.24, 0.27)
-    } else if projection.status.to_ascii_lowercase().contains("approval") {
-        (0.88, 0.59, 0.20)
-    } else {
-        (0.27, 0.78, 0.68)
-    };
-    for (index, color) in [indicator, (0.31, 0.52, 0.70), (0.29, 0.37, 0.50)]
-        .into_iter()
-        .enumerate()
-    {
-        let x = geometry.header.right() - 72.0 + index as f32 * 24.0;
-        draw_round_rect(
-            x - 4.0,
-            geometry.header.y + geometry.header.height * 0.27,
-            17.0,
-            17.0,
-            8.5,
-            (0.045, 0.055, 0.080),
-        );
-        draw_round_rect(
-            x,
-            geometry.header.y + geometry.header.height * 0.35,
-            9.0,
-            9.0,
-            4.5,
-            color,
-        );
-    }
-    draw_beveled_panel(
-        geometry.operator_outer,
-        (0.165, 0.175, 0.205),
-        (0.018, 0.027, 0.044),
-    );
-    draw_beveled_panel(
-        geometry.oi_outer,
-        (0.180, 0.190, 0.220),
-        (0.015, 0.042, 0.060),
-    );
-    draw_rect(
-        geometry.operator_outer.x + 22.0,
-        geometry.operator_outer.y + 40.0,
-        (geometry.operator_outer.width - 44.0).max(0.0),
-        1.0,
-        (0.10, 0.17, 0.23),
-    );
-    draw_rect(
-        geometry.oi_outer.x + 22.0,
-        geometry.oi_outer.y + 40.0,
-        (geometry.oi_outer.width - 44.0).max(0.0),
-        1.0,
-        (0.12, 0.27, 0.31),
-    );
-    draw_round_rect(
-        geometry.operator_inner.x - 7.0,
-        geometry.operator_inner.y - 7.0,
-        geometry.operator_inner.width + 14.0,
-        geometry.operator_inner.height + 14.0,
-        8.0,
-        if focused {
-            (0.022, 0.052, 0.074)
-        } else {
-            (0.028, 0.035, 0.054)
-        },
-    );
-    draw_rect(
-        geometry.operator_inner.x + 10.0,
-        geometry.operator_inner.y + 10.0,
-        (geometry.operator_inner.width - 20.0).max(0.0),
-        1.0,
-        if focused {
-            (0.10, 0.29, 0.34)
-        } else {
-            (0.08, 0.14, 0.19)
-        },
-    );
-    draw_round_rect(
-        geometry.oi_inner.x - 11.0,
-        geometry.oi_inner.y - 11.0,
-        geometry.oi_inner.width + 22.0,
-        geometry.oi_inner.height + 22.0,
-        24.0,
-        (0.008, 0.024, 0.038),
-    );
-    draw_round_rect(
-        geometry.oi_inner.x - 4.0,
-        geometry.oi_inner.y - 4.0,
-        geometry.oi_inner.width + 8.0,
-        geometry.oi_inner.height + 8.0,
-        19.0,
-        (0.012, 0.060, 0.076),
-    );
-    draw_round_outline(
-        geometry.oi_inner.x - 4.0,
-        geometry.oi_inner.y - 4.0,
-        geometry.oi_inner.width + 8.0,
-        geometry.oi_inner.height + 8.0,
-        (0.08, 0.25, 0.30),
-    );
-    let seam_x = (geometry.operator_outer.right() + geometry.oi_outer.x) * 0.5;
-    let seam_y = geometry.operator_outer.y + geometry.operator_outer.height * 0.52;
-    draw_rect(
-        seam_x,
-        geometry.operator_outer.y + 34.0,
-        1.0,
-        (geometry.operator_outer.height - 68.0).max(0.0),
-        (0.10, 0.14, 0.20),
-    );
-    draw_round_outline(seam_x - 7.0, seam_y - 12.0, 14.0, 24.0, (0.35, 0.54, 0.60));
-    draw_rect(seam_x - 4.0, seam_y - 3.0, 3.0, 3.0, (0.36, 0.82, 0.78));
-    draw_rect(seam_x + 1.0, seam_y - 3.0, 3.0, 3.0, (0.36, 0.82, 0.78));
-    draw_beveled_panel(
-        geometry.controls,
-        (0.155, 0.170, 0.205),
-        (0.026, 0.035, 0.058),
-    );
-    let speaker_width: f32 = if geometry.compact {
-        geometry.controls.width.min(72.0)
-    } else {
-        144.0
-    };
-    let speaker = PixelRect {
-        x: geometry.controls.x + 7.0,
-        y: geometry.controls.y + 6.0,
-        width: (speaker_width - 14.0).max(0.0),
-        height: (geometry.controls.height - 12.0).max(0.0),
-    };
-    draw_beveled_panel(speaker, (0.075, 0.087, 0.116), (0.020, 0.025, 0.042));
-    if !geometry.compact {
-        for row in 0..4 {
-            for column in 0..8 {
-                draw_round_rect(
-                    speaker.x + 24.0 + column as f32 * 10.0,
-                    speaker.y + 11.0 + row as f32 * 7.0,
-                    5.0,
-                    4.0,
-                    1.5,
-                    (0.008, 0.012, 0.022),
-                );
-            }
-        }
-    }
-    draw_beveled_panel(geometry.prompt, (0.082, 0.098, 0.14), (0.018, 0.026, 0.046));
-    draw_rect(
-        geometry.prompt.x + 16.0,
-        geometry.prompt.y + 4.0,
-        (geometry.prompt.width - 32.0).max(0.0),
-        1.0,
-        (0.12, 0.22, 0.30),
-    );
-    let right_start = geometry.controls.right() - if geometry.compact { 92.0 } else { 360.0 };
-    draw_rect(
-        right_start,
-        geometry.controls.y + 7.0,
-        1.0,
-        (geometry.controls.height - 14.0).max(0.0),
-        (0.14, 0.19, 0.26),
-    );
-    if !geometry.compact {
-        for offset in [112.0, 224.0] {
-            draw_rect(
-                right_start + offset,
-                geometry.controls.y + 7.0,
-                1.0,
-                (geometry.controls.height - 14.0).max(0.0),
-                (0.14, 0.19, 0.26),
-            );
-        }
-    }
-    let meter_width = (right_start - geometry.prompt.right() - 28.0).max(0.0);
-    let meter_count = (meter_width / 12.0).floor() as usize;
-    for index in 0..meter_count {
-        let x = geometry.prompt.right() + 14.0 + index as f32 * 12.0;
-        draw_round_rect(
-            x,
-            geometry.controls.y + geometry.controls.height * 0.34,
-            7.0,
-            geometry.controls.height * 0.30,
-            2.0,
-            if index % 4 == 0 {
-                (0.18, 0.41, 0.48)
-            } else {
-                (0.035, 0.060, 0.090)
-            },
-        );
-    }
-    let knob_start = right_start + if geometry.compact { 25.0 } else { 30.0 };
-    let knob_step = if geometry.compact { 28.0 } else { 112.0 };
-    let knob_count = if geometry.compact { 2 } else { 3 };
-    for index in 0..knob_count {
-        let x = knob_start + index as f32 * knob_step;
-        let knob_size = if geometry.compact { 16.0 } else { 24.0 };
-        let top = geometry.controls.y + (geometry.controls.height - knob_size) / 2.0;
-        if !geometry.compact && index == 2 {
-            draw_round_rect(
-                x - knob_size / 2.0,
-                top,
-                knob_size,
-                knob_size,
-                4.0,
-                (0.045, 0.058, 0.086),
-            );
-            draw_round_outline(
-                x - knob_size / 2.0 + 3.0,
-                top + 3.0,
-                knob_size - 6.0,
-                knob_size - 6.0,
-                (0.27, 0.38, 0.48),
-            );
-            draw_round_rect(x - 5.0, top + 7.0, 10.0, 10.0, 2.0, (0.47, 0.70, 0.82));
-        } else {
-            draw_round_rect(
-                x - knob_size / 2.0,
-                top,
-                knob_size,
-                knob_size,
-                knob_size / 2.0,
-                (0.045, 0.058, 0.086),
-            );
-            draw_round_outline(
-                x - knob_size / 2.0 + 3.0,
-                top + 3.0,
-                knob_size - 6.0,
-                knob_size - 6.0,
-                (0.27, 0.38, 0.48),
-            );
-            draw_rect(
-                x - 1.0,
-                top + 5.0,
-                2.0,
-                knob_size * 0.42,
-                (0.31, 0.46, 0.53),
-            );
-        }
-    }
-}
-
-fn draw_status_text(
-    text: &TextRenderer,
-    geometry: &FrameGeometry,
-    projection: &Projection,
-    semantic_mode: &str,
-    focused: bool,
-    options: &RendererOptions,
-    input: &InputBuffer,
-) {
-    let input_state = input_state(projection);
-    let detail = projection
-        .active_operation
-        .as_ref()
-        .map(|operation| {
-            format!(
-                "{} {} ({}) -> {} [{}] {}{}",
-                operation.action_kind.to_ascii_uppercase(),
-                operation.label,
-                operation.id,
-                operation.target,
-                operation.state.to_ascii_uppercase(),
-                operation.mutation_state.to_ascii_uppercase(),
-                operation_progress(operation)
-            )
-        })
-        .unwrap_or_else(|| "NO ACTIVE OPERATION".to_owned());
-    text.draw(
-        geometry.oi_outer.x as c_int + 24,
-        geometry.oi_outer.y as c_int + geometry.oi_outer.height as c_int - 12,
-        &fit_text(
-            text,
-            &format!("{}  ·  {}", detail, options.mascot.to_ascii_uppercase()),
-            (geometry.oi_outer.width as c_int - 48).max(1),
-        ),
-        mode_color(semantic_mode),
-    );
-    let prompt_color = if focused {
-        (206, 220, 230)
-    } else {
-        (132, 145, 156)
-    };
-    let state_label = format!("  [{input_state}]");
-    let prompt_x = geometry.prompt.x as c_int + geometry.prompt_padding_x as c_int;
-    let prompt_y = geometry.prompt.y as c_int + geometry.prompt.height as c_int - 6;
-    let available = (geometry.prompt.width as c_int
-        - geometry.prompt_padding_x as c_int * 2
-        - text.text_width(&state_label)
-        - text.text_width("> "))
-    .max(1);
-    let input_value = format!("{}{}", input.text(), input.composition());
-    let (displayed, display_cursor) = fit_input(text, &input_value, input.cursor(), available);
-    let prompt_value = format!("> {displayed}{state_label}");
-    text.draw(prompt_x, prompt_y, &prompt_value, prompt_color);
-    if focused {
-        let cursor_prefix: String = displayed.chars().take(display_cursor).collect();
-        let cursor_text = format!("> {cursor_prefix}");
-        let cursor_x = prompt_x + text.text_width(&cursor_text);
-        draw_rect(
-            cursor_x as f32,
-            geometry.prompt.y + 5.0,
-            2.0,
-            geometry.prompt.height - 10.0,
-            (0.36, 0.76, 0.72),
-        );
-    }
-    if !geometry.compact {
-        let hint_y = geometry.prompt.y as c_int + geometry.prompt.height as c_int - 22;
-        text.draw(
-            geometry.prompt.x as c_int + 18,
-            hint_y,
-            "↑↓ SCROLL   ←→ EDIT   CTRL-C CANCEL",
-            (94, 126, 153),
-        );
-        text.draw(
-            geometry.controls.x as c_int + 20,
-            geometry.controls.y as c_int + geometry.controls.height as c_int - 12,
-            "AUDIO OUT",
-            (99, 123, 145),
-        );
-        let right_start = geometry.controls.right() - 360.0;
-        for (index, label) in ["BRIGHTNESS", "FOCUS", "POWER"].into_iter().enumerate() {
-            let label_x = right_start as c_int + 10 + index as c_int * 112;
-            text.draw(
-                label_x,
-                geometry.controls.y as c_int + 18,
-                &fit_text(text, label, 98),
-                (105, 132, 153),
-            );
-        }
-    }
-    let line_height = text.metrics().height.max(1.0);
-    let mut annotation_y = geometry.oi_inner.y as c_int + text.metrics().baseline as c_int;
-    let mut annotations: Vec<(String, (u8, u8, u8))> = Vec::new();
-    if projection.active_operation.is_some() {
-        annotations.push(("ACTIVE OPERATION".to_owned(), (157, 193, 214)));
-    }
-    if let Some(request) = projection.model_request.as_ref() {
-        annotations.push((
-            format!(
-                "MODEL  {}/{}  {}",
-                if request.provider.is_empty() {
-                    "—"
-                } else {
-                    &request.provider
-                },
-                if request.model.is_empty() {
-                    "—"
-                } else {
-                    &request.model
-                },
-                request.status.to_ascii_uppercase()
-            ),
-            (166, 191, 211),
-        ));
-    }
-    if let Some(buddy) = projection.buddy.as_ref() {
-        let state = if !buddy.state.is_empty() {
-            buddy.state.as_str()
-        } else if !buddy.status.is_empty() {
-            buddy.status.as_str()
-        } else {
-            "active"
-        };
-        let label = format!("BUDDY · {}", state.to_ascii_uppercase());
-        text.draw(
-            geometry.oi_inner.right() as c_int - text.text_width(&label) - 18,
-            geometry.oi_inner.y as c_int
-                + text.metrics().baseline as c_int
-                + text.metrics().height as c_int,
-            &label,
-            (157, 193, 214),
-        );
-    }
-    if semantic_mode.eq_ignore_ascii_case("code") {
-        if let Some(code) = projection.code_view.as_ref() {
-            annotations.push((
-                format!(
-                    "CODE  {}  {}  {}",
-                    code.path,
-                    code.language.to_ascii_uppercase(),
-                    code.mutation_state.to_ascii_uppercase()
-                ),
-                (103, 202, 212),
-            ));
-            let preview_lines: Vec<String> = if !code.diff.is_empty() {
-                code.diff.iter().take(2).cloned().collect()
-            } else if !code.lines.is_empty() {
-                code.lines.iter().take(2).cloned().collect()
-            } else {
-                code.text.lines().take(2).map(str::to_owned).collect()
-            };
-            annotations.extend(preview_lines.into_iter().map(|line| {
-                (
-                    line.clone(),
-                    if line.starts_with('+') {
-                        (103, 202, 212)
-                    } else if line.starts_with('-') {
-                        (235, 112, 116)
-                    } else {
-                        (192, 208, 220)
-                    },
-                )
-            }));
-            if code.preview_truncated {
-                annotations.push(("… PREVIEW BOUNDED".to_owned(), (239, 194, 105)));
-            }
-        }
-    } else if semantic_mode.eq_ignore_ascii_case("failure") {
-        annotations.extend(projection.diagnostics.iter().take(3).map(|diagnostic| {
-            let message = if diagnostic.message.is_empty() {
-                &diagnostic.detail
-            } else {
-                &diagnostic.message
-            };
-            (diagnostic_text(diagnostic, message), (235, 112, 116))
-        }));
-    } else if semantic_mode.eq_ignore_ascii_case("verify") {
-        annotations.push((
-            format!(
-                "VERIFY  {}  {} CHECKS",
-                projection.verification.status.to_ascii_uppercase(),
-                projection.verification.checks.len()
-            ),
-            (239, 194, 105),
-        ));
-    } else {
-        if let Some(action) = projection.current_action.as_ref() {
-            let action_name = if action.kind.is_empty() {
-                semantic_mode
-            } else {
-                action.kind.as_str()
-            };
-            annotations.push((
-                format!("{}  {}", action_name.to_ascii_uppercase(), action.label),
-                (176, 205, 220),
-            ));
-            if !action.query.is_empty() {
-                annotations.push((format!("QUERY  {}", action.query), (192, 208, 220)));
-            } else if !action.target.is_empty() {
-                annotations.push((format!("TARGET  {}", action.target), (192, 208, 220)));
-            }
-            if !action.detail.is_empty()
-                && action.detail != action.query
-                && action.detail != action.target
-            {
-                annotations.push((action.detail.clone(), (176, 205, 220)));
-            }
-            if !action.progress.is_empty() {
-                annotations.push((
-                    if action.progress_determinate {
-                        action.progress_value.map_or_else(
-                            || format!("PROGRESS  {}", action.progress),
-                            |value| format!("PROGRESS  {}  {:.0}%", action.progress, value * 100.0),
-                        )
-                    } else {
-                        format!("PROGRESS  {}", action.progress)
-                    },
-                    (239, 194, 105),
-                ));
-            }
-        }
-        if annotations.is_empty() {
-            annotations.extend(
-                projection
-                    .oi
-                    .iter()
-                    .take(3)
-                    .map(|line| (line.clone(), (176, 205, 220))),
-            );
-        }
-    }
-    if let Some(entity) = projection.runtime_entities.first() {
-        annotations.push((
-            format!(
-                "NODE  {}  [{}]",
-                projection_entity_label(entity),
-                entity.status
-            ),
-            (129, 176, 193),
-        ));
-    }
-    for (line, color) in annotations.into_iter().take(4) {
-        text.draw(
-            geometry.oi_inner.x as c_int + 18,
-            annotation_y,
-            &fit_text(text, &line, (geometry.oi_inner.width as c_int - 36).max(1)),
-            color,
-        );
-        annotation_y += line_height as c_int;
-    }
-    let workspace_lines = tree_lines_or_entities(
-        &projection.workspace_tree,
-        &projection.workspace_entities,
-        &[],
-    );
-    let runtime_lines = tree_lines_or_entities(
-        &projection.runtime_tree,
-        &projection.runtime_entities,
-        &projection.entities,
-    );
-    let column_gap = 24;
-    let column_width = ((geometry.oi_inner.width as c_int - column_gap - 36) / 2).max(1);
-    let column_y = geometry.oi_inner.y as c_int + line_height as c_int * 5 + 18;
-    draw_tree_column(
-        text,
-        geometry.oi_inner.x as c_int + 18,
-        column_y,
-        column_width,
-        "WORKSPACE MAP",
-        &workspace_lines,
-        (146, 183, 204),
-    );
-    draw_tree_column(
-        text,
-        geometry.oi_inner.x as c_int + 18 + column_width + column_gap,
-        column_y,
-        column_width,
-        "RUNTIME TREE",
-        &runtime_lines,
-        (146, 183, 204),
-    );
-    if let Some(alert) = projection.alerts.first() {
-        text.draw(
-            geometry.oi_inner.x as c_int + 18,
-            (geometry.oi_inner.y + geometry.oi_inner.height - 24.0) as c_int,
-            &fit_text(text, alert, (geometry.oi_inner.width as c_int - 36).max(1)),
-            (235, 154, 105),
-        );
-    }
-    let trace = projection
-        .trace
-        .first()
-        .or_else(|| projection.stream_tail.first())
-        .cloned()
-        .unwrap_or_default();
-    let status_line = if !trace.is_empty() {
-        trace.as_str()
-    } else if projection.bridge_status.starts_with("ERROR") {
-        projection.bridge_status.as_str()
-    } else if projection.status.is_empty() {
-        "NO STREAM EVENTS"
-    } else {
-        projection.status.as_str()
-    };
-    text.draw(
-        geometry.prompt.x as c_int + 18,
-        geometry.prompt.y as c_int + 16,
-        &fit_text(
-            text,
-            status_line,
-            (geometry.prompt.width as c_int - 36).max(1),
-        ),
-        (110, 150, 174),
-    );
-}
-
-fn tree_lines_or_entities(
-    tree: &[ProjectionTreeNode],
-    entities: &[ProjectionEntity],
-    fallback: &[ProjectionEntity],
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    if !tree.is_empty() {
-        append_tree_lines(tree, 0, &mut lines);
-    } else {
-        let source = if entities.is_empty() {
-            fallback
-        } else {
-            entities
-        };
-        lines.extend(source.iter().take(7).map(|entity| {
-            let status = if entity.status.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", entity.status.to_ascii_uppercase())
-            };
-            format!("|- {}{}", projection_entity_label(entity), status)
-        }));
-    }
-    if lines.is_empty() {
-        lines.push("|- NO SNAPSHOT".to_owned());
-    }
-    lines
-}
-
-fn append_tree_lines(nodes: &[ProjectionTreeNode], depth: usize, output: &mut Vec<String>) {
-    for (index, node) in nodes.iter().enumerate() {
-        let label = if node.label.is_empty() {
-            if node.kind.is_empty() {
-                "unnamed".to_owned()
-            } else {
-                node.kind.clone()
-            }
-        } else {
-            node.label.clone()
-        };
-        let status = if node.status.is_empty() {
-            String::new()
-        } else {
-            format!("  [{}]", node.status.to_ascii_uppercase())
-        };
-        let branch = if index + 1 == nodes.len() { "`-" } else { "|-" };
-        output.push(format!(
-            "{}{} {}{}",
-            "  ".repeat(depth),
-            branch,
-            label,
-            status
-        ));
-        append_tree_lines(&node.children, depth + 1, output);
-    }
-}
-
-fn draw_tree_column(
-    text: &TextRenderer,
-    x: c_int,
-    y: c_int,
-    width: c_int,
-    title: &str,
-    lines: &[String],
-    color: (u8, u8, u8),
-) {
-    text.draw(x, y, &fit_text(text, title, width), color);
-    let line_height = text.metrics().height.max(1.0) as c_int;
-    for (index, line) in lines.iter().take(7).enumerate() {
-        text.draw(
-            x,
-            y + line_height * (index as c_int + 1),
-            &fit_text(text, line, width),
-            (177, 202, 216),
-        );
-    }
-}
-
-fn input_state(projection: &Projection) -> &'static str {
-    VisualMode::from_projection(projection).prompt_state(projection)
-}
-
-fn fit_text(text: &TextRenderer, value: &str, available: i32) -> String {
-    if text.text_width(value) <= available {
+fn fit_text_in(text: &TextRenderer, role: FontRole, value: &str, available: i32) -> String {
+    if text.text_width_in(role, value) <= available {
         return value.to_owned();
     }
     let mut result = String::new();
     for character in value.chars() {
         let candidate = format!("{result}{character}…");
-        if text.text_width(&candidate) > available {
+        if text.text_width_in(role, &candidate) > available {
             break;
         }
         result.push(character);
@@ -2660,8 +1594,14 @@ fn fit_text(text: &TextRenderer, value: &str, available: i32) -> String {
     }
 }
 
-fn fit_input(text: &TextRenderer, value: &str, cursor: usize, available: i32) -> (String, usize) {
-    if text.text_width(value) <= available {
+fn fit_input_in(
+    text: &TextRenderer,
+    role: FontRole,
+    value: &str,
+    cursor: usize,
+    available: i32,
+) -> (String, usize) {
+    if text.text_width_in(role, value) <= available {
         return (value.to_owned(), value[..cursor].chars().count());
     }
     let characters: Vec<char> = value.chars().collect();
@@ -2673,7 +1613,7 @@ fn fit_input(text: &TextRenderer, value: &str, cursor: usize, available: i32) ->
         let suffix = if end < characters.len() { "…" } else { "" };
         let middle: String = characters[start..end].iter().collect();
         let candidate = format!("{prefix}{middle}{suffix}");
-        if text.text_width(&candidate) <= available {
+        if text.text_width_in(role, &candidate) <= available {
             let display_cursor = usize::from(start > 0) + cursor_chars.saturating_sub(start);
             return (candidate, display_cursor);
         }
@@ -2689,218 +1629,6 @@ fn fit_input(text: &TextRenderer, value: &str, cursor: usize, available: i32) ->
             return ("…".to_owned(), 0);
         }
     }
-}
-
-fn draw_terminal_background(
-    core: &NativeTerminalCore,
-    geometry: &FrameGeometry,
-    selection: Option<((usize, usize), (usize, usize))>,
-) {
-    let content = core.renderable_content();
-    let columns = core.size().columns.max(1);
-    for (index, indexed) in content.display_iter.enumerate() {
-        let cell = indexed.cell;
-        let row = index / columns;
-        let column = index % columns;
-        let mut background = resolve_term_color(cell.bg, content.colors, false);
-        if cell.flags.contains(Flags::INVERSE) {
-            background = resolve_term_color(cell.fg, content.colors, true);
-        }
-        if background != (7, 12, 19) {
-            draw_rect(
-                geometry.operator_inner.x + column as f32 * geometry.cell_width,
-                geometry.operator_inner.y + row as f32 * geometry.cell_height,
-                geometry.cell_width,
-                geometry.cell_height,
-                rgb_f32(background),
-            );
-        }
-    }
-    draw_selection(
-        geometry.operator_inner.x,
-        geometry.operator_inner.y,
-        selection,
-        geometry.cell_width,
-        geometry.cell_height,
-    );
-}
-
-fn draw_terminal_text(text: &TextRenderer, core: &NativeTerminalCore, geometry: &FrameGeometry) {
-    let content = core.renderable_content();
-    let columns = core.size().columns.max(1);
-    let mut run_text = String::new();
-    let mut run_row = 0;
-    let mut run_start_column = 0;
-    let mut run_next_column = 0;
-    let mut run_color = (0, 0, 0);
-    let mut has_run = false;
-    for (index, indexed) in content.display_iter.enumerate() {
-        let cell = indexed.cell;
-        if cell
-            .flags
-            .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
-            || cell.c == ' '
-        {
-            if has_run {
-                draw_terminal_run(
-                    text,
-                    geometry,
-                    run_row,
-                    run_start_column,
-                    &run_text,
-                    run_color,
-                );
-                run_text.clear();
-                has_run = false;
-            }
-            continue;
-        }
-        let row = index / columns;
-        let column = index % columns;
-        let mut foreground = resolve_term_color(cell.fg, content.colors, true);
-        if cell.flags.contains(Flags::INVERSE) {
-            foreground = resolve_term_color(cell.bg, content.colors, false);
-        }
-        if cell.flags.contains(Flags::DIM) {
-            foreground = (
-                foreground.0.saturating_mul(2) / 3,
-                foreground.1.saturating_mul(2) / 3,
-                foreground.2.saturating_mul(2) / 3,
-            );
-        }
-        if !has_run || run_row != row || run_next_column != column || run_color != foreground {
-            if has_run {
-                draw_terminal_run(
-                    text,
-                    geometry,
-                    run_row,
-                    run_start_column,
-                    &run_text,
-                    run_color,
-                );
-                run_text.clear();
-            }
-            run_row = row;
-            run_start_column = column;
-            run_color = foreground;
-            has_run = true;
-        }
-        run_text.push(cell.c);
-        run_next_column = column + 1;
-    }
-    if has_run {
-        draw_terminal_run(
-            text,
-            geometry,
-            run_row,
-            run_start_column,
-            &run_text,
-            run_color,
-        );
-    }
-}
-
-fn draw_terminal_run(
-    text: &TextRenderer,
-    geometry: &FrameGeometry,
-    row: usize,
-    column: usize,
-    value: &str,
-    color: (u8, u8, u8),
-) {
-    if value.is_empty() {
-        return;
-    }
-    text.draw(
-        geometry.operator_inner.x as c_int + column as c_int * geometry.cell_width as c_int,
-        geometry.operator_inner.y as c_int
-            + row as c_int * geometry.cell_height as c_int
-            + text.metrics().baseline as c_int,
-        value,
-        color,
-    );
-}
-
-fn resolve_term_color(color: TermColor, colors: &Colors, foreground: bool) -> (u8, u8, u8) {
-    let fallback = if foreground {
-        (211, 225, 234)
-    } else {
-        (7, 12, 19)
-    };
-    match color {
-        TermColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-        TermColor::Named(name) => colors[name]
-            .map(|rgb| (rgb.r, rgb.g, rgb.b))
-            .unwrap_or_else(|| named_color(name, fallback)),
-        TermColor::Indexed(index) => colors[index as usize]
-            .map(|rgb| (rgb.r, rgb.g, rgb.b))
-            .unwrap_or_else(|| indexed_color(index, fallback)),
-    }
-}
-
-fn named_color(name: NamedColor, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
-    match name {
-        NamedColor::Black | NamedColor::DimBlack => (18, 24, 31),
-        NamedColor::Red | NamedColor::DimRed => (231, 102, 111),
-        NamedColor::Green | NamedColor::DimGreen => (100, 205, 159),
-        NamedColor::Yellow | NamedColor::DimYellow => (235, 190, 106),
-        NamedColor::Blue | NamedColor::DimBlue => (112, 165, 232),
-        NamedColor::Magenta | NamedColor::DimMagenta => (205, 132, 221),
-        NamedColor::Cyan | NamedColor::DimCyan => (92, 199, 216),
-        NamedColor::White | NamedColor::DimWhite => (205, 218, 229),
-        NamedColor::BrightBlack => (87, 105, 119),
-        NamedColor::BrightRed => (255, 133, 140),
-        NamedColor::BrightGreen => (130, 240, 186),
-        NamedColor::BrightYellow => (255, 216, 125),
-        NamedColor::BrightBlue => (145, 193, 255),
-        NamedColor::BrightMagenta => (232, 165, 245),
-        NamedColor::BrightCyan => (125, 232, 240),
-        NamedColor::BrightWhite => (244, 248, 251),
-        NamedColor::Background => (7, 12, 19),
-        NamedColor::Cursor => (128, 220, 209),
-        NamedColor::Foreground | NamedColor::DimForeground | NamedColor::BrightForeground => {
-            fallback
-        }
-    }
-}
-
-fn indexed_color(index: u8, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
-    if index < 16 {
-        return named_color(
-            match index {
-                0 => NamedColor::Black,
-                1 => NamedColor::Red,
-                2 => NamedColor::Green,
-                3 => NamedColor::Yellow,
-                4 => NamedColor::Blue,
-                5 => NamedColor::Magenta,
-                6 => NamedColor::Cyan,
-                7 => NamedColor::White,
-                8 => NamedColor::BrightBlack,
-                9 => NamedColor::BrightRed,
-                10 => NamedColor::BrightGreen,
-                11 => NamedColor::BrightYellow,
-                12 => NamedColor::BrightBlue,
-                13 => NamedColor::BrightMagenta,
-                14 => NamedColor::BrightCyan,
-                _ => NamedColor::BrightWhite,
-            },
-            fallback,
-        );
-    }
-    if (16..=231).contains(&index) {
-        let value = index - 16;
-        let r = value / 36;
-        let g = (value % 36) / 6;
-        let b = value % 6;
-        let channel = |value: u8| if value == 0 { 0 } else { value * 40 + 55 };
-        return (channel(r), channel(g), channel(b));
-    }
-    if (232..=255).contains(&index) {
-        let value = 8 + (index - 232) * 10;
-        return (value, value, value);
-    }
-    fallback
 }
 
 fn rgb_f32(color: (u8, u8, u8)) -> (f32, f32, f32) {
@@ -2921,39 +1649,6 @@ fn mode_color(mode: &str) -> (u8, u8, u8) {
     }
 }
 
-fn draw_selection(
-    x: f32,
-    y: f32,
-    selection: Option<((usize, usize), (usize, usize))>,
-    cell_width: f32,
-    cell_height: f32,
-) {
-    let Some((anchor, extent)) = selection else {
-        return;
-    };
-    let (start, end) = selection_bounds(anchor, extent);
-    unsafe {
-        glColor3f(0.42, 0.68, 0.80);
-        glLineWidth(1.0);
-    }
-    for row in start.1..=end.1 {
-        let first = if row == start.1 { start.0 } else { 0 };
-        let last = if row == end.1 {
-            end.0.saturating_add(1).max(first + 1)
-        } else {
-            // A middle row spans the visible terminal content width. The
-            // viewport clips the outline naturally at the aperture edge.
-            end.0.max(first + 1)
-        };
-        draw_outline_rect(
-            x + first as f32 * cell_width,
-            y + row as f32 * cell_height,
-            (last.saturating_sub(first)) as f32 * cell_width,
-            cell_height,
-        );
-    }
-}
-
 fn selection_bounds(
     anchor: (usize, usize),
     extent: (usize, usize),
@@ -2965,562 +1660,10 @@ fn selection_bounds(
     }
 }
 
-fn draw_outline_rect(x: f32, y: f32, width: f32, height: f32) {
-    unsafe {
-        glBegin(GL_LINE_LOOP);
-        glVertex2f(x, y);
-        glVertex2f(x + width, y);
-        glVertex2f(x + width, y + height);
-        glVertex2f(x, y + height);
-        glEnd();
-    }
-}
-
-fn draw_round_rect(x: f32, y: f32, width: f32, height: f32, radius: f32, color: (f32, f32, f32)) {
-    let radius = radius.min(width / 2.0).min(height / 2.0).max(0.0);
-    unsafe {
-        glColor3f(color.0, color.1, color.2);
-        glBegin(GL_POLYGON);
-        for corner in 0..4 {
-            let center = match corner {
-                0 => (x + radius, y + radius),
-                1 => (x + width - radius, y + radius),
-                2 => (x + width - radius, y + height - radius),
-                _ => (x + radius, y + height - radius),
-            };
-            let start = corner as f32 * std::f32::consts::FRAC_PI_2 - std::f32::consts::PI;
-            for step in 0..=5 {
-                let angle = start + step as f32 * std::f32::consts::FRAC_PI_2 / 5.0;
-                glVertex2f(
-                    center.0 + radius * angle.cos(),
-                    center.1 + radius * angle.sin(),
-                );
-            }
-        }
-        glEnd();
-    }
-}
-
-fn draw_round_outline(x: f32, y: f32, width: f32, height: f32, color: (f32, f32, f32)) {
-    // Keep large panels rectangular with softened corners. Using half the
-    // short side here turns a wide CRT into a capsule and creates the giant
-    // arcs that read as rendering artifacts rather than hardware.
-    let radius = (width.min(height) / 2.0).min(18.0);
-    unsafe {
-        glColor3f(color.0, color.1, color.2);
-        glLineWidth(1.0);
-        glBegin(GL_LINE_LOOP);
-        for corner in 0..4 {
-            let center = match corner {
-                0 => (x + radius, y + radius),
-                1 => (x + width - radius, y + radius),
-                2 => (x + width - radius, y + height - radius),
-                _ => (x + radius, y + height - radius),
-            };
-            let start = corner as f32 * std::f32::consts::FRAC_PI_2 - std::f32::consts::PI;
-            for step in 0..=5 {
-                let angle = start + step as f32 * std::f32::consts::FRAC_PI_2 / 5.0;
-                glVertex2f(
-                    center.0 + radius * angle.cos(),
-                    center.1 + radius * angle.sin(),
-                );
-            }
-        }
-        glEnd();
-    }
-}
-
-fn draw_beveled_panel(rect: PanelRect, outer: (f32, f32, f32), inner: (f32, f32, f32)) {
-    let width = rect.width.max(0.0);
-    let height = rect.height.max(0.0);
-    draw_round_rect(
-        rect.x + 6.0,
-        rect.y + 8.0,
-        width,
-        height,
-        16.0,
-        (0.008, 0.010, 0.020),
-    );
-    draw_round_rect(rect.x, rect.y, width, height, 16.0, outer);
-    draw_round_outline(rect.x, rect.y, width, height, (0.27, 0.31, 0.38));
-    draw_round_rect(
-        rect.x + 10.0,
-        rect.y + 10.0,
-        (width - 20.0).max(0.0),
-        (height - 20.0).max(0.0),
-        10.0,
-        inner,
-    );
-    draw_round_outline(
-        rect.x + 11.0,
-        rect.y + 11.0,
-        (width - 22.0).max(0.0),
-        (height - 22.0).max(0.0),
-        (0.07, 0.13, 0.19),
-    );
-    draw_rect(
-        rect.x + 16.0,
-        rect.y + 2.0,
-        (width - 32.0).max(0.0),
-        1.0,
-        (0.38, 0.42, 0.49),
-    );
-}
-
-fn draw_rect(x: f32, y: f32, width: f32, height: f32, color: (f32, f32, f32)) {
-    unsafe {
-        glColor3f(color.0, color.1, color.2);
-        glBegin(GL_QUADS);
-        glVertex2f(x, y);
-        glVertex2f(x + width, y);
-        glVertex2f(x + width, y + height);
-        glVertex2f(x, y + height);
-        glEnd();
-    }
-}
-
-fn with_scissor(draw_height: i32, rect: PixelRect, draw: impl FnOnce()) {
-    let x = rect.x.max(0.0).round() as c_int;
-    let width = rect.width.max(0.0).round() as c_int;
-    let height = rect.height.max(0.0).round() as c_int;
-    let y = (draw_height as f32 - rect.bottom()).max(0.0).round() as c_int;
-    unsafe {
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(x, y, width, height);
-    }
-    draw();
-    unsafe { glDisable(GL_SCISSOR_TEST) };
-}
-
-fn draw_oi_scene(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    projection: &Projection,
-    phase: f32,
-    options: &RendererOptions,
-) {
-    let visual_mode = VisualMode::from_projection(projection);
-    let semantic_mode = visual_mode.as_str();
-    let scene_color = mode_color(semantic_mode);
-    // The OI is a CRT-like instrument, not a second text pane: a horizon,
-    // converging floor, sparse phosphor points, and semantic graph links give
-    // it a readable depth field while keeping all state authoritative in the
-    // projection frame.
-    let structured_scene = !projection.workspace_tree.is_empty()
-        || !projection.runtime_tree.is_empty()
-        || !projection.workspace_entities.is_empty()
-        || !projection.runtime_entities.is_empty();
-    let horizon = y + height * 0.58;
-    let grid_color = (
-        scene_color.0 as f32 / 255.0 * 0.30,
-        scene_color.1 as f32 / 255.0 * 0.30,
-        scene_color.2 as f32 / 255.0 * 0.30,
-    );
-    if !structured_scene {
-        unsafe {
-            glColor3f(grid_color.0, grid_color.1, grid_color.2);
-            glLineWidth(1.0);
-            glBegin(GL_LINES);
-            for index in 0..7 {
-                let t = index as f32 / 7.0;
-                let gy = horizon + (height - (horizon - y)) * t * t;
-                glVertex2f(x, gy);
-                glVertex2f(x + width, gy);
-            }
-            let vanishing_x = x + width * 0.5;
-            for index in 0..9 {
-                let bottom_x = x + width * index as f32 / 8.0;
-                glVertex2f(vanishing_x, horizon);
-                glVertex2f(bottom_x, y + height);
-            }
-            glEnd();
-        }
-    }
-    // A very quiet scanline texture gives the CRT depth without competing
-    // with the semantic graph or making motion look like a full-screen flash.
-    let scanline_count = (height / 9.0).floor() as usize;
-    for index in 1..scanline_count {
-        draw_rect(
-            x + 10.0,
-            y + index as f32 * 9.0,
-            (width - 20.0).max(0.0),
-            1.0,
-            (0.018, 0.054, 0.066),
-        );
-    }
-    let horizon_color = (
-        scene_color.0 as f32 / 255.0 * 0.72,
-        scene_color.1 as f32 / 255.0 * 0.72,
-        scene_color.2 as f32 / 255.0 * 0.72,
-    );
-    if !structured_scene {
-        draw_rect(
-            x + 10.0,
-            horizon,
-            (width - 20.0).max(0.0),
-            1.0,
-            horizon_color,
-        );
-    }
-    // Four corner ticks make the aperture feel like an instrument viewport
-    // and give the eye a stable frame around the animated content.
-    let tick_color = (0.20, 0.42, 0.48);
-    draw_rect(x + 12.0, y + 12.0, 26.0, 1.0, tick_color);
-    draw_rect(x + 12.0, y + 12.0, 1.0, 18.0, tick_color);
-    draw_rect(x + width - 38.0, y + 12.0, 26.0, 1.0, tick_color);
-    draw_rect(x + width - 13.0, y + 12.0, 1.0, 18.0, tick_color);
-    draw_rect(x + 12.0, y + height - 13.0, 26.0, 1.0, tick_color);
-    draw_rect(x + 12.0, y + height - 30.0, 1.0, 18.0, tick_color);
-    draw_rect(x + width - 38.0, y + height - 13.0, 26.0, 1.0, tick_color);
-    draw_rect(x + width - 13.0, y + height - 30.0, 1.0, 18.0, tick_color);
-    if structured_scene {
-        let split = x + width * 0.5;
-        let box_top = y + height * 0.25;
-        let box_bottom = y + height - 34.0;
-        unsafe {
-            glColor3f(0.16, 0.32, 0.38);
-            glLineWidth(1.0);
-        }
-        draw_outline_rect(x + 14.0, box_top, width * 0.46 - 20.0, box_bottom - box_top);
-        draw_outline_rect(
-            split + 6.0,
-            box_top,
-            width * 0.46 - 20.0,
-            box_bottom - box_top,
-        );
-        draw_rect(
-            split,
-            box_top + 6.0,
-            1.0,
-            (box_bottom - box_top - 12.0).max(0.0),
-            (0.11, 0.24, 0.30),
-        );
-    }
-    let vanishing_x = x + width * 0.5;
-    if !structured_scene {
-        draw_rect(vanishing_x - 12.0, horizon - 1.0, 24.0, 1.0, horizon_color);
-        draw_rect(vanishing_x, horizon - 12.0, 1.0, 24.0, horizon_color);
-    }
-    for index in 0..if structured_scene { 12 } else { 22 } {
-        let px = x + ((index * 37 % 97) as f32 / 97.0) * width;
-        let py = y + ((index * 19 % 89) as f32 / 89.0) * height * 0.72;
-        let twinkle = 0.55 + 0.35 * ((phase * 1.7 + index as f32).sin().abs());
-        draw_rect(
-            px,
-            py,
-            1.5,
-            1.5,
-            (0.12 * twinkle, 0.36 * twinkle, 0.44 * twinkle),
-        );
-    }
-    let mut tree_entities = Vec::new();
-    if !projection.runtime_tree.is_empty() {
-        flatten_tree(&projection.runtime_tree, None, &mut tree_entities);
-    }
-    let runtime_source = if tree_entities.is_empty() {
-        if projection.runtime_entities.is_empty() {
-            &projection.entities
-        } else {
-            &projection.runtime_entities
-        }
-    } else {
-        &tree_entities
-    };
-    let runtime: Vec<&ProjectionEntity> = runtime_source
-        .iter()
-        .filter(|entity| {
-            matches!(
-                entity.kind.as_str(),
-                "operation"
-                    | "workflow"
-                    | "verification"
-                    | "child_task"
-                    | "task"
-                    | "execution"
-                    | "generated_tool"
-                    | "research"
-                    | "resource"
-                    | "artifact"
-            )
-        })
-        .take(6)
-        .collect();
-    let mut positions: Vec<(String, f32, f32)> = Vec::with_capacity(runtime.len());
-    for (index, entity) in runtime.iter().enumerate() {
-        let column = index % 2;
-        let row = index / 2;
-        let nx = x + width * (0.28 + column as f32 * 0.44);
-        let ny = y + height * (0.30 + row as f32 * 0.23);
-        positions.push((entity.id.clone(), nx, ny));
-    }
-    if !structured_scene {
-        unsafe {
-            glColor3f(
-                scene_color.0 as f32 / 255.0 * 0.82,
-                scene_color.1 as f32 / 255.0 * 0.82,
-                scene_color.2 as f32 / 255.0 * 0.82,
-            );
-            glLineWidth(1.5);
-            glBegin(GL_LINES);
-            for entity in runtime.iter() {
-                let Some(parent_id) = entity.parent_id.as_ref() else {
-                    continue;
-                };
-                let Some((_, px, py)) = positions.iter().find(|(id, _, _)| id == parent_id) else {
-                    continue;
-                };
-                let Some((_, cx, cy)) = positions.iter().find(|(id, _, _)| id == &entity.id) else {
-                    continue;
-                };
-                glVertex2f(*px, *py);
-                glVertex2f(*cx, *cy);
-            }
-            glEnd();
-        }
-    }
-    for (index, entity) in runtime.iter().enumerate() {
-        let (_, nx, ny) = &positions[index];
-        let color = if entity.status.eq_ignore_ascii_case("failed")
-            || entity.status.eq_ignore_ascii_case("failure")
-        {
-            (0.82, 0.33, 0.36)
-        } else if entity.status.eq_ignore_ascii_case("approval") {
-            (0.82, 0.62, 0.34)
-        } else {
-            rgb_f32(scene_color)
-        };
-        if structured_scene {
-            continue;
-        }
-        draw_node(*nx, *ny, 15.0, color);
-        if options.animations && !options.reduced_motion && index % 2 == 0 {
-            let pulse = ((phase * 2.0 + index as f32).sin() + 1.0) * 0.5;
-            draw_round_outline(
-                *nx - 19.0 - pulse * 3.0,
-                *ny - 19.0 - pulse * 3.0,
-                38.0 + pulse * 6.0,
-                38.0 + pulse * 6.0,
-                (color.0 * 0.34, color.1 * 0.34, color.2 * 0.34),
-            );
-        }
-    }
-    if !structured_scene && positions.len() > 1 {
-        for index in 0..positions.len() - 1 {
-            let t = (phase * 0.36 + index as f32 * 0.27).fract();
-            let sx = positions[index].1;
-            let sy = positions[index].2;
-            let ex = positions[index + 1].1;
-            let ey = positions[index + 1].2;
-            draw_round_rect(
-                sx + (ex - sx) * t - 3.0,
-                sy + (ey - sy) * t - 3.0,
-                6.0,
-                6.0,
-                3.0,
-                rgb_f32(scene_color),
-            );
-        }
-    }
-    let (buddy_x, buddy_y) = match visual_mode {
-        VisualMode::Read | VisualMode::Inspect | VisualMode::Search => {
-            (x + width * 0.80, y + height * 0.17)
-        }
-        VisualMode::Code | VisualMode::Test | VisualMode::Verify | VisualMode::Execute => {
-            (x + width * 0.80, y + height * 0.17)
-        }
-        VisualMode::Failure => (x + width * 0.78, y + height * 0.76),
-        VisualMode::Approval => (x + width * 0.72, y + height * 0.84),
-        VisualMode::Think | VisualMode::Respond | VisualMode::Generate | VisualMode::Recover => {
-            (x + width * 0.80, y + height * 0.17)
-        }
-        VisualMode::Idle => match projection
-            .buddy
-            .as_ref()
-            .map(|buddy| buddy.anchor.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("left") => (x + width * 0.80, y + height * 0.17),
-            Some("right") => (x + width * 0.80, y + height * 0.17),
-            _ => (x + width * 0.80, y + height * 0.17),
-        },
-    };
-    let buddy_status = projection
-        .buddy
-        .as_ref()
-        .filter(|buddy| !buddy.status.is_empty())
-        .map(|buddy| buddy.status.as_str())
-        .unwrap_or(projection.status.as_str());
-    let buddy_character = projection
-        .buddy
-        .as_ref()
-        .map(|buddy| buddy.character.as_str())
-        .filter(|character| !character.is_empty())
-        .unwrap_or(options.mascot.as_str());
-    if !buddy_character.eq_ignore_ascii_case("off") {
-        draw_buddy(buddy_x, buddy_y, buddy_status, buddy_character, phase);
-    }
-}
-
-fn flatten_tree(
-    nodes: &[ProjectionTreeNode],
-    parent_id: Option<&str>,
-    output: &mut Vec<ProjectionEntity>,
-) {
-    for node in nodes {
-        let id = if node.id.is_empty() {
-            format!("{}:{}", node.kind, node.label)
-        } else {
-            node.id.clone()
-        };
-        output.push(ProjectionEntity {
-            id: id.clone(),
-            kind: node.kind.clone(),
-            label: node.label.clone(),
-            status: node.status.clone(),
-            parent_id: parent_id.map(str::to_owned),
-            metadata: node.metadata.clone(),
-        });
-        flatten_tree(&node.children, Some(&id), output);
-    }
-}
-
-fn projection_entity_label(entity: &ProjectionEntity) -> String {
-    if !entity.label.is_empty() {
-        return entity.label.clone();
-    }
-    for key in ["canonical_path", "path", "uri", "resource"] {
-        if let Some(value) = entity.metadata.get(key).and_then(serde_json::Value::as_str) {
-            if !value.is_empty() {
-                return value.to_owned();
-            }
-        }
-    }
-    entity.id.clone()
-}
-
-fn draw_node(x: f32, y: f32, radius: f32, color: (f32, f32, f32)) {
-    draw_round_outline(
-        x - radius - 5.0,
-        y - radius - 5.0,
-        radius * 2.0 + 10.0,
-        radius * 2.0 + 10.0,
-        (color.0 * 0.28, color.1 * 0.28, color.2 * 0.28),
-    );
-    unsafe {
-        glColor3f(color.0, color.1, color.2);
-        glLineWidth(1.5);
-        glBegin(GL_LINE_LOOP);
-        for index in 0..8 {
-            let angle = std::f32::consts::TAU * index as f32 / 8.0;
-            glVertex2f(x + radius * angle.cos(), y + radius * angle.sin());
-        }
-        glEnd();
-    }
-    draw_rect(
-        x - 2.0,
-        y - 2.0,
-        4.0,
-        4.0,
-        (color.0 * 0.82, color.1 * 0.82, color.2 * 0.82),
-    );
-}
-
-fn draw_buddy(x: f32, y: f32, status: &str, character: &str, phase: f32) {
-    let color = match status.to_ascii_uppercase().as_str() {
-        "FAILURE" | "BLOCKED" => (0.92, 0.32, 0.36),
-        "APPROVAL" => (0.93, 0.69, 0.25),
-        _ => (0.36, 0.82, 0.78),
-    };
-    let scale = 5.0;
-    let left = x - scale * 5.0;
-    let top = y - scale * 4.0;
-    draw_round_outline(
-        left - 18.0,
-        top - 18.0,
-        scale * 10.0 + 36.0,
-        scale * 8.0 + 36.0,
-        (color.0 * 0.32, color.1 * 0.32, color.2 * 0.32),
-    );
-    if status.eq_ignore_ascii_case("failure") || status.eq_ignore_ascii_case("blocked") {
-        draw_round_outline(
-            left - 13.0,
-            top - 13.0,
-            scale * 10.0 + 26.0,
-            scale * 8.0 + 26.0,
-            color,
-        );
-    }
-    draw_round_rect(
-        left - 7.0,
-        top + scale * 7.0,
-        scale * 10.0 + 14.0,
-        9.0,
-        4.0,
-        (0.015, 0.043, 0.054),
-    );
-    let body = [
-        "  ### ###  ",
-        " ######### ",
-        "###########",
-        "##  ###  ##",
-        "###########",
-        " ######### ",
-        "  #######  ",
-        "   #####   ",
-    ];
-    for (row, line) in body.iter().enumerate() {
-        for (column, pixel) in line.chars().enumerate() {
-            if pixel == '#' {
-                let wobble = if row == 0 && character.eq_ignore_ascii_case("owl") {
-                    (phase * 3.0).sin().round()
-                } else {
-                    0.0
-                };
-                draw_rect(
-                    left + column as f32 * scale + wobble,
-                    top + row as f32 * scale,
-                    scale + 0.7,
-                    scale + 0.7,
-                    color,
-                );
-            }
-        }
-    }
-    draw_round_rect(
-        left + scale,
-        top + scale * 2.0,
-        scale * 8.0,
-        scale * 3.0,
-        4.0,
-        (0.015, 0.043, 0.054),
-    );
-    let eye = if character.eq_ignore_ascii_case("cat") {
-        (0.98, 0.84, 0.42)
-    } else {
-        (0.90, 0.96, 0.83)
-    };
-    draw_rect(left + scale * 2.0, top + scale * 3.0, scale, scale, eye);
-    draw_rect(left + scale * 7.0, top + scale * 3.0, scale, scale, eye);
-    if character.eq_ignore_ascii_case("cat") {
-        draw_rect(left - scale, top - scale, scale * 2.0, scale * 2.0, color);
-        draw_rect(
-            left + scale * 9.0,
-            top - scale,
-            scale * 2.0,
-            scale * 2.0,
-            color,
-        );
-    } else if character.eq_ignore_ascii_case("bot") {
-        draw_rect(x - 1.0, top - 13.0, 2.0, 8.0, color);
-        draw_round_rect(x - 3.0, top - 17.0, 6.0, 6.0, 3.0, color);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{FrameGeometry, Projection, input_state, is_wm_delete_message};
+    use super::render::chassis::{PresentationControl, PresentationSettings};
+    use super::{FrameGeometry, Projection, VisualMode, is_wm_delete_message};
     use crate::ProjectionView;
     use alacritty_terminal::term::TermMode;
 
@@ -3530,9 +1673,9 @@ mod tests {
         let left_end = geometry.operator_outer.x + geometry.operator_outer.width;
         assert!(geometry.oi_outer.x > left_end);
 
-        assert_eq!(left_end - geometry.left_x, geometry.oi_outer.width);
-        assert_eq!(geometry.operator_inner.width, geometry.oi_inner.width);
-        assert_eq!(geometry.operator_inner.height, geometry.oi_inner.height);
+        assert!((left_end - geometry.left_x - geometry.oi_outer.width).abs() < 0.01);
+        assert!((geometry.operator_inner.width - geometry.oi_inner.width).abs() < 0.01);
+        assert!((geometry.operator_inner.height - geometry.oi_inner.height).abs() < 0.01);
     }
 
     #[test]
@@ -3563,20 +1706,62 @@ mod tests {
     }
 
     #[test]
+    fn presentation_controls_change_only_their_owned_setting() {
+        let geometry = FrameGeometry::new(1280, 800);
+        let y = geometry.controls.y as i32 + 20;
+        let brightness = geometry.rail.brightness;
+        let focus = geometry.rail.focus;
+        let power = geometry.rail.power;
+        assert_eq!(
+            PresentationSettings::control_at(&geometry, brightness.x as i32 + 20, y),
+            Some(PresentationControl::Brightness)
+        );
+        assert_eq!(
+            PresentationSettings::control_at(&geometry, focus.x as i32 + 20, y),
+            Some(PresentationControl::Focus)
+        );
+        assert_eq!(
+            PresentationSettings::control_at(&geometry, power.x as i32 + 20, y),
+            Some(PresentationControl::Power)
+        );
+
+        let mut settings = PresentationSettings::default();
+        settings.activate(
+            PresentationControl::Brightness,
+            brightness.x as i32 + brightness.width as i32 / 2,
+            &geometry,
+        );
+        assert!((settings.brightness - 0.5).abs() < 0.02);
+        assert_eq!(settings.focus, PresentationSettings::default().focus);
+        assert!(settings.display_enabled);
+        settings.activate(PresentationControl::Power, power.x as i32 + 20, &geometry);
+        assert!(!settings.display_enabled);
+    }
+
+    #[test]
     fn prompt_state_is_explicit_and_projection_driven() {
         let mut projection = Projection {
             status: "Approval requested".to_owned(),
             ..Projection::default()
         };
-        assert_eq!(input_state(&projection), "APPROVAL");
+        assert_eq!(
+            VisualMode::from_projection(&projection).prompt_state(&projection),
+            "APPROVAL"
+        );
         projection.status = "Disconnected".to_owned();
-        assert_eq!(input_state(&projection), "DISCONNECTED");
+        assert_eq!(
+            VisualMode::from_projection(&projection).prompt_state(&projection),
+            "DISCONNECTED"
+        );
         projection.status = "Working".to_owned();
         projection.view = ProjectionView {
             mode: "search".to_owned(),
             ..ProjectionView::default()
         };
-        assert_eq!(input_state(&projection), "WORKING");
+        assert_eq!(
+            VisualMode::from_projection(&projection).prompt_state(&projection),
+            "WORKING"
+        );
     }
 
     #[test]
@@ -3605,9 +1790,9 @@ mod tests {
 
     #[test]
     fn xim_lookup_lengths_are_never_allowed_to_escape_the_buffer() {
-        assert_eq!(super::bounded_lookup_length(4, 8), Some(4));
-        assert_eq!(super::bounded_lookup_length(8, 8), Some(8));
-        assert_eq!(super::bounded_lookup_length(9, 8), None);
-        assert_eq!(super::bounded_lookup_length(-1, 8), None);
+        assert_eq!(super::input_method::bounded_lookup_length(4, 8), Some(4));
+        assert_eq!(super::input_method::bounded_lookup_length(8, 8), Some(8));
+        assert_eq!(super::input_method::bounded_lookup_length(9, 8), None);
+        assert_eq!(super::input_method::bounded_lookup_length(-1, 8), None);
     }
 }

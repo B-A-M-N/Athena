@@ -173,6 +173,52 @@ def native_projection_frame(
         "progress_value": active.progress_value if active else None,
         "progress_determinate": active.progress_determinate if active else False,
     }
+    attention_items: list[dict[str, Any]] = []
+    if state.pending_approval:
+        approval = state.pending_approval
+        approval_id = sanitize_terminal_text(
+            approval.get("approval_id") or approval.get("id") or "approval"
+        )
+        target = sanitize_terminal_text(
+            approval.get("target")
+            or approval.get("path")
+            or approval.get("resource")
+            or "governed operation"
+        )
+        reason = sanitize_terminal_text(
+            approval.get("reason")
+            or approval.get("policy_reason")
+            or "operator decision required"
+        )
+        attention_items.append(
+            {
+                "id": f"approval:{approval_id}",
+                "kind": "approval",
+                "severity": "warning",
+                "title": "APPROVAL REQUIRED",
+                "summary": f"{target} · {reason}",
+                "requires_action": True,
+                "related_object_id": active.id if active else None,
+            }
+        )
+    for index, (glyph, message) in enumerate(reversed(state.recent)):
+        if glyph not in {"!", "?"}:
+            continue
+        if state.pending_approval and message.lower().startswith("approval required"):
+            continue
+        attention_items.append(
+            {
+                "id": f"event:{state.event_count}:{index}",
+                "kind": "notification",
+                "severity": "failure" if glyph == "!" else "warning",
+                "title": "ATTENTION" if glyph == "?" else "EVENT",
+                "summary": sanitize_terminal_text(message),
+                "requires_action": False,
+                "related_object_id": active.id if active else None,
+            }
+        )
+        if len(attention_items) >= 4:
+            break
     frame = {
         "schema_version": NATIVE_BRIDGE_SCHEMA_VERSION,
         "title": "ATHENA OI // GLASS COMPUTE",
@@ -188,6 +234,7 @@ def native_projection_frame(
         "current_action": current_action,
         "code_view": serialized_code,
         "diagnostics": [dict(item) for item in scene.diagnostics],
+        "attention_items": attention_items,
         "instruments": [dict(item) for item in scene.instruments],
         "verification": {
             "status": sanitize_terminal_text(state.verification_status),

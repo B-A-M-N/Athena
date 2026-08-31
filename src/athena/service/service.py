@@ -4678,7 +4678,7 @@ class AthenaService:
         settings = self.config.hermes_referee
         if not settings.enabled:
             return
-        evaluator = self._hermes_adapter
+        evaluator: HermesAgentEvaluator | HermesReferee | None = self._hermes_adapter
         if evaluator is None:
             evaluator = self._hermes_referee
         preflight = getattr(evaluator, "preflight", None)
