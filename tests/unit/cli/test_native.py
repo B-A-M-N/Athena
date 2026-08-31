@@ -69,6 +69,34 @@ def test_native_session_parser_accepts_presentation_controls():
 
 
 @pytest.mark.asyncio
+async def test_native_transcript_does_not_expose_internal_task_id(capsys):
+    session = NativeSession(parse_args([]))
+
+    class Service:
+        async def submit(self, request, wait=False):
+            assert wait is False
+            return SimpleNamespace(id="internal-task-secret")
+
+        async def stream_events(self, task_id, after_sequence=0):
+            assert task_id == "internal-task-secret"
+            assert after_sequence == 0
+            if False:
+                yield None
+
+        async def get_result(self, task_id):
+            assert task_id == "internal-task-secret"
+            return SimpleNamespace(summary="completed")
+
+    session.service = Service()
+    await session._submit("inspect workspace")
+
+    output = capsys.readouterr().out
+    assert "internal-task-secret" not in output
+    assert "YOU\ninspect workspace" in output
+    assert "ATHENA\ncompleted" in output
+
+
+@pytest.mark.asyncio
 async def test_native_projection_debounce_drains_event_arriving_during_send():
     session = NativeSession(parse_args([]))
     session._projection_interval = 0.001

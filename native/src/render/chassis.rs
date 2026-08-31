@@ -382,21 +382,21 @@ pub(crate) fn draw_chassis(
         .into_iter()
         .enumerate()
     {
-        let x = system.x + 22.0 * scale + index as f32 * 42.0 * scale;
+        let x = system.x + 12.0 * scale + index as f32 * 38.0 * scale;
         draw_round_rect(
             x,
-            system.y + 42.0 * scale,
-            16.0 * scale,
-            16.0 * scale,
-            8.0 * scale,
+            system.y + 34.0 * scale,
+            14.0 * scale,
+            14.0 * scale,
+            7.0 * scale,
             (0.018, 0.020, 0.020),
         );
         draw_round_rect(
-            x + 4.0 * scale,
-            system.y + 46.0 * scale,
-            8.0 * scale,
-            8.0 * scale,
-            4.0 * scale,
+            x + 3.5 * scale,
+            system.y + 37.5 * scale,
+            7.0 * scale,
+            7.0 * scale,
+            3.5 * scale,
             color,
         );
     }
@@ -438,6 +438,317 @@ pub(crate) fn draw_chassis(
         plate.height,
         (0.26, 0.26, 0.26),
     );
+    draw_static_labels(geometry, projection);
+}
+
+fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
+    let scale = geometry.scale.max(0.08);
+    let glyph_scale = (1.35 * scale).max(0.72);
+    let instrument_color = (0.42, 0.54, 0.62);
+    let heading_color = (0.64, 0.74, 0.83);
+    let oi_color = rgb_f32(mode_color(VisualMode::from_projection(projection).as_str()));
+
+    with_scissor(geometry.height, geometry.header, || {
+        let header_y = geometry.header.y + (geometry.header.height - 7.0 * glyph_scale) * 0.5;
+        draw_bitmap_text(
+            geometry.header.x + geometry.u(22.0),
+            header_y,
+            "ATHENA",
+            glyph_scale,
+            (0.78, 0.86, 0.91),
+            geometry.header.right() - geometry.u(44.0),
+        );
+        draw_bitmap_text(
+            geometry.header.x + geometry.u(145.0),
+            header_y + geometry.u(1.0),
+            "// OPERATOR INSTRUMENT",
+            glyph_scale * 0.76,
+            instrument_color,
+            geometry.header.right() - geometry.u(310.0),
+        );
+        let glass = "GLASS COMPUTE ENGINE";
+        let glass_scale = glyph_scale * 0.76;
+        draw_bitmap_text(
+            geometry.header.right() - geometry.u(44.0) - bitmap_width(glass, glass_scale),
+            header_y + geometry.u(1.0),
+            glass,
+            glass_scale,
+            (0.72, 0.76, 0.72),
+            geometry.header.right() - geometry.u(44.0),
+        );
+    });
+
+    for (rect, label, color) in [
+        (
+            geometry.operator_outer,
+            "ATHENA // OPERATOR CONSOLE",
+            heading_color,
+        ),
+        (geometry.oi_outer, "ATHENA OI // GLASS COMPUTE", oi_color),
+    ] {
+        with_scissor(geometry.height, rect, || {
+            draw_bitmap_text(
+                rect.x + geometry.u(24.0),
+                rect.y + geometry.u(14.0),
+                label,
+                glyph_scale * 0.70,
+                color,
+                rect.right() - geometry.u(24.0),
+            );
+        });
+    }
+
+    let speaker = geometry.rail.speaker;
+    with_scissor(geometry.height, speaker, || {
+        draw_bitmap_text(
+            speaker.x + geometry.u(9.0),
+            speaker.bottom() - geometry.u(17.0),
+            "AUDIO OUT",
+            glyph_scale * 0.58,
+            instrument_color,
+            speaker.right() - geometry.u(9.0),
+        );
+    });
+
+    let system = geometry.rail.system_status;
+    with_scissor(geometry.height, system, || {
+        for (index, label) in ["SYS", "NET", "ACT"].into_iter().enumerate() {
+            draw_bitmap_text(
+                system.x + geometry.u(5.0) + index as f32 * geometry.u(32.0),
+                system.bottom() - geometry.u(17.0),
+                label,
+                glyph_scale * 0.56,
+                instrument_color,
+                system.x + geometry.u(5.0) + index as f32 * geometry.u(32.0) + geometry.u(26.0),
+            );
+        }
+    });
+
+    let encoder = geometry.rail.primary_encoder;
+    with_scissor(geometry.height, encoder, || {
+        draw_bitmap_text(
+            encoder.x + geometry.u(12.0),
+            encoder.y + geometry.u(11.0),
+            "ENC",
+            glyph_scale * 0.62,
+            instrument_color,
+            encoder.right() - geometry.u(8.0),
+        );
+    });
+
+    for (rect, label) in [
+        (geometry.rail.brightness, "BRI"),
+        (geometry.rail.focus, "FOCUS"),
+        (geometry.rail.power, "POWER"),
+    ] {
+        with_scissor(geometry.height, rect, || {
+            let label_scale = glyph_scale * 0.60;
+            let x = rect.x + (rect.width - bitmap_width(label, label_scale)) * 0.5;
+            draw_bitmap_text(
+                x,
+                rect.y + geometry.u(11.0),
+                label,
+                label_scale,
+                instrument_color,
+                rect.right() - geometry.u(6.0),
+            );
+        });
+    }
+
+    let plate = geometry.rail.identity_plate;
+    with_scissor(geometry.height, plate, || {
+        let plate_scale = glyph_scale * 0.62;
+        draw_bitmap_text(
+            plate.x + geometry.u(18.0),
+            plate.y + geometry.u(16.0),
+            "ATHENA",
+            plate_scale,
+            (0.70, 0.73, 0.70),
+            plate.right() - geometry.u(18.0),
+        );
+        draw_bitmap_text(
+            plate.x + geometry.u(18.0),
+            plate.y + geometry.u(34.0),
+            "OI // GLASS COMPUTE",
+            plate_scale * 0.72,
+            instrument_color,
+            plate.right() - geometry.u(18.0),
+        );
+        draw_bitmap_text(
+            plate.x + geometry.u(18.0),
+            plate.y + geometry.u(58.0),
+            "MODEL 001-A",
+            plate_scale * 0.62,
+            instrument_color,
+            plate.right() - geometry.u(18.0),
+        );
+        draw_bitmap_text(
+            plate.x + geometry.u(18.0),
+            plate.y + geometry.u(76.0),
+            "SERIAL 0001-A",
+            plate_scale * 0.62,
+            instrument_color,
+            plate.right() - geometry.u(18.0),
+        );
+    });
+}
+
+fn bitmap_width(value: &str, scale: f32) -> f32 {
+    value.chars().count() as f32 * 6.0 * scale
+}
+
+fn draw_bitmap_text(x: f32, y: f32, value: &str, scale: f32, color: (f32, f32, f32), right: f32) {
+    let scale = scale.max(0.5);
+    let start_x = x;
+    let mut x = x;
+    unsafe {
+        glColor3f(color.0, color.1, color.2);
+        glBegin(GL_QUADS);
+        for character in value.chars() {
+            if character == '\n' {
+                x = start_x;
+                continue;
+            }
+            if x + 5.0 * scale > right {
+                break;
+            }
+            for (row, bits) in static_glyph(character).into_iter().enumerate() {
+                for column in 0..5 {
+                    if bits & (1 << (4 - column)) == 0 {
+                        continue;
+                    }
+                    let px = x + column as f32 * scale;
+                    let py = y + row as f32 * scale;
+                    glVertex2f(px, py);
+                    glVertex2f(px + scale, py);
+                    glVertex2f(px + scale, py + scale);
+                    glVertex2f(px, py + scale);
+                }
+            }
+            x += 6.0 * scale;
+        }
+        glEnd();
+    }
+}
+
+fn static_glyph(character: char) -> [u8; 7] {
+    match character.to_ascii_uppercase() {
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10011, 0b10101, 0b10101, 0b10101, 0b11001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        '/' => [
+            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        _ => [0; 7],
+    }
 }
 
 fn inset(rect: PixelRect, amount: f32) -> PixelRect {
@@ -572,7 +883,11 @@ fn draw_encoder(rect: PixelRect, scale: f32, value: f32, power: bool) {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
     }
-    let size = rect.height.min(rect.width * 0.72).max(8.0 * scale);
+    let size = rect
+        .height
+        .min(rect.width * 0.72)
+        .min(rect.height * 0.52)
+        .max(8.0 * scale);
     let x = rect.x + rect.width * 0.5;
     let y = rect.y + rect.height * 0.52;
     draw_round_rect(

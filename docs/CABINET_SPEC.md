@@ -14,6 +14,12 @@ authoritative for the live scene inside the right CRT.
 - The native window advertises a usable minimum size of 900 × 620. The
   internal layout remains safe and compact if a window manager supplies a
   smaller surface.
+- The borderless surface keeps a 12-pixel interactive perimeter: eight
+  edge/corner zones provide directional resize cursors and EWMH moveresize
+  requests, while the header fascia remains the move handle.
+- The five acceptance surfaces are 1672 × 941, 1920 × 1080, 1280 × 800,
+  1280 × 720, and 1170 × 659. A live process must survive the sequence
+  1280 × 800 → 1672 × 941 → 1170 × 659 → 1920 × 1080 → 1280 × 720.
 
 ## Authoritative physical hierarchy
 
@@ -30,6 +36,9 @@ The left well is a comparatively flat rectangular operator display. The right
 well is a deeper, rounder CRT assembly with a dark inner rim and restrained
 blue-gray glass. Hardware is neutral graphite; blue/green/amber light belongs
 to screens, lamps, and engraved labels.
+The display assembly is dominant and the lower control rail is intentionally
+shallow; the identity/data plate is an independent far-right module after the
+power control.
 
 ## Reference-space feature groups
 
@@ -46,6 +55,9 @@ The prompt module is a rectangular recessed equipment bay. Its status, input,
 and hint rows are measured from the live Xft role metrics. At small sizes the
 hint is omitted first, then status; the input row is clamped as a last resort.
 No row may draw outside the prompt rectangle.
+Physical module labels use a clipped bitmap design layer and are placed in
+reference units. Dynamic Xft text is limited to live transcript/prompt/status
+content.
 
 ## Dynamic ownership
 
@@ -76,3 +88,11 @@ athena native
 The layout dump includes `metrics_source: "live_xft"` when produced by a live
 X11 renderer; `fallback_static` is explicitly marked when no X display is
 available. The OI dump is always 384 × 256 when the OpenGL target is active.
+The deterministic physical-shell evidence command is:
+
+```bash
+scripts/native-cabinet-golden
+```
+
+It compares `native/assets/athenabox/cabinet-golden.png` at 1672 × 941; the
+baseline is mandatory whenever Xvfb/ImageMagick are available.

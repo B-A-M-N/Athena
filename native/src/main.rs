@@ -448,6 +448,9 @@ impl Projection {
 struct Args {
     headless: bool,
     dump_layout: bool,
+    dump_width: i32,
+    dump_height: i32,
+    cabinet_only: bool,
     bridge_stdin: bool,
     bridge_socket: Option<String>,
     command: Option<String>,
@@ -459,18 +462,33 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         columns: 100,
         rows: 32,
+        dump_width: 1280,
+        dump_height: 800,
         mascot: "owl".to_owned(),
         animations: true,
         ..Args::default()
     };
-    let mut values = env::args().skip(1);
+    let mut values = values.into_iter();
     while let Some(arg) = values.next() {
         match arg.as_str() {
             "--headless" => args.headless = true,
             "--dump-layout" => args.dump_layout = true,
+            "--dump-layout-size" => {
+                let value = values
+                    .next()
+                    .ok_or("--dump-layout-size needs WIDTHxHEIGHT")?;
+                let (width, height) = parse_layout_size(&value)?;
+                args.dump_width = width;
+                args.dump_height = height;
+            }
+            "--cabinet-only" => args.cabinet_only = true,
             "--bridge-stdin" => args.bridge_stdin = true,
             "--bridge-socket" => {
                 args.bridge_socket = Some(values.next().ok_or("--bridge-socket needs a path")?);
@@ -499,12 +517,14 @@ fn parse_args() -> Result<Args, String> {
             "--reduced-motion" => args.reduced_motion = true,
             "--help" | "-h" => {
                 println!(
-                    "athena-terminal [--headless] [--dump-layout] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot owl|cat|bot|off] [--no-animations] [--reduced-motion]"
+                    "athena-terminal [--headless] [--dump-layout] [--cabinet-only] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot owl|cat|bot|off] [--no-animations] [--reduced-motion]"
                 );
                 println!("  --headless       run the PTY/core slice without opening a window");
                 println!(
-                    "  --dump-layout    print 1280×800 layout JSON; use live Xft metrics when DISPLAY is available"
+                    "  --dump-layout    print layout JSON; use live Xft metrics when DISPLAY is available"
                 );
+                println!("  --dump-layout-size WIDTHxHEIGHT  choose layout probe dimensions");
+                println!("  --cabinet-only   render the deterministic physical cabinet baseline");
                 println!("  --bridge-stdin   read JSON projection frames from stdin");
                 println!(
                     "  --mascot         select Buddy (default: owl; built-ins: owl, cat, bot, off)"
@@ -528,6 +548,23 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
+fn parse_layout_size(value: &str) -> Result<(i32, i32), String> {
+    let (width, height) = value
+        .split_once('x')
+        .or_else(|| value.split_once('X'))
+        .ok_or("--dump-layout-size must be WIDTHxHEIGHT")?;
+    let width: i32 = width
+        .parse()
+        .map_err(|_| "--dump-layout-size width must be an integer")?;
+    let height: i32 = height
+        .parse()
+        .map_err(|_| "--dump-layout-size height must be an integer")?;
+    if width <= 0 || height <= 0 {
+        return Err("--dump-layout-size dimensions must be positive".to_owned());
+    }
+    Ok((width, height))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = match parse_args() {
         Ok(args) => args,
@@ -538,7 +575,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.dump_layout {
         #[cfg(unix)]
         {
-            match x11::dump_live_layout_json(1280, 800) {
+            match x11::dump_live_layout_json(args.dump_width, args.dump_height) {
                 Ok(dump) => {
                     println!("{}", serde_json::to_string_pretty(&dump)?);
                     return Ok(());
@@ -549,7 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let metrics = UiFontMetrics::fallback();
-        let layout = NativePixelLayout::for_window(1280, 800, metrics);
+        let layout = NativePixelLayout::for_window(args.dump_width, args.dump_height, metrics);
         let prompt_layout = PromptLayout::from_rect(
             layout.prompt,
             metrics.input,
@@ -569,6 +606,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dump.as_object_mut()
             .expect("NativePixelLayout serializes as an object")
             .insert("metrics".to_owned(), serde_json::to_value(metrics)?);
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert(
+                "terminal_size".to_owned(),
+                serde_json::to_value(layout.terminal_size())?,
+            );
         dump.as_object_mut()
             .expect("NativePixelLayout serializes as an object")
             .insert(
@@ -644,6 +687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mascot: args.mascot,
                     animations: args.animations,
                     reduced_motion: args.reduced_motion,
+                    cabinet_only: args.cabinet_only,
                 },
             )
             .map_err(|error| error.into())
@@ -962,6 +1006,14 @@ mod tests {
             ..ProjectionFrame::default()
         };
         assert!(frame.normalize().is_err());
+    }
+
+    #[test]
+    fn cabinet_only_is_a_parseable_deterministic_render_mode() {
+        let args = super::parse_args_from(vec!["--cabinet-only".to_owned()])
+            .expect("cabinet-only should parse");
+        assert!(args.cabinet_only);
+        assert!(args.animations);
     }
 
     #[test]

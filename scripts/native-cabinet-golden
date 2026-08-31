@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+for command in xvfb-run import identify xdotool; do
+  command -v "$command" >/dev/null || {
+    printf 'native-cabinet-golden: SKIP — %s is unavailable\n' "$command" >&2
+    exit 0
+  }
+done
+if [[ "${NATIVE_CABINET_UPDATE_GOLDEN:-0}" != "1" ]]; then
+  command -v compare >/dev/null || {
+    printf '%s\n' 'native-cabinet-golden: FAIL — ImageMagick compare is required' >&2
+    exit 1
+  }
+fi
+
+cargo build --manifest-path native/Cargo.toml --offline >/dev/null
+golden_path="${NATIVE_CABINET_GOLDEN:-$repo_root/native/assets/athenabox/cabinet-golden.png}"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+capture_path="$tmp_dir/cabinet.png"
+
+xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
+  env NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" \
+  CAPTURE_PATH="$capture_path" GOLDEN_PATH="$golden_path" \
+  bash -c '
+    set -euo pipefail
+    "$NATIVE_BIN" --cabinet-only --no-animations --command "sleep 8" >/dev/null 2>&1 &
+    native_pid=$!
+    window=""
+    for _ in $(seq 1 50); do
+      window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
+      [[ -n "$window" ]] && break
+      sleep 0.1
+    done
+    [[ -n "$window" ]] || {
+      printf "%s\n" "native-cabinet-golden: FAIL — native window did not appear" >&2
+      kill "$native_pid" 2>/dev/null || true
+      wait "$native_pid" 2>/dev/null || true
+      exit 1
+    }
+    xdotool windowfocus --sync "$window"
+    xdotool windowsize --sync "$window" 1672 941
+    sleep 0.25
+    import -window "$window" "$CAPTURE_PATH"
+    kill "$native_pid" 2>/dev/null || true
+    wait "$native_pid" 2>/dev/null || true
+    [[ "$(identify -format "%wx%h" "$CAPTURE_PATH")" == "1672x941" ]] || {
+      printf "%s\n" "native-cabinet-golden: FAIL — capture is not 1672x941" >&2
+      exit 1
+    }
+    if [[ "${NATIVE_CABINET_UPDATE_GOLDEN:-0}" == "1" ]]; then
+      mkdir -p "$(dirname "$GOLDEN_PATH")"
+      cp "$CAPTURE_PATH" "$GOLDEN_PATH"
+    elif [[ -f "$GOLDEN_PATH" ]]; then
+      rmse="$(compare -metric RMSE "$GOLDEN_PATH" "$CAPTURE_PATH" null: 2>&1 || true)"
+      normalized="$(printf "%s\n" "$rmse" | cut -d "(" -f 2 | cut -d ")" -f 1 | tr -d "[:space:]")"
+      awk -v rmse="$normalized" "BEGIN { exit !(rmse != \"\" && rmse <= 0.03) }" || {
+        printf "native-cabinet-golden: FAIL — baseline RMSE exceeds tolerance (%s)\n" "$normalized" >&2
+        exit 1
+      }
+    else
+      printf "native-cabinet-golden: FAIL — missing approved baseline %s\n" "$GOLDEN_PATH" >&2
+      exit 1
+    fi
+  '
+
+printf 'native-cabinet-golden: PASS — deterministic 1672x941 cabinet baseline (%s)\n' "$golden_path"

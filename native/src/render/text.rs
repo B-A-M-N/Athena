@@ -23,8 +23,10 @@ struct FontFace {
 
 pub(crate) struct TextRenderer {
     display: *mut Display,
+    screen: c_int,
     draw: *mut XftDraw,
     fonts: [FontFace; 4],
+    font_pixel_sizes: [i32; 4],
     visual: *mut c_void,
     colormap: Colormap,
     colors: RefCell<HashMap<(u8, u8, u8), XftColor>>,
@@ -38,30 +40,66 @@ impl TextRenderer {
         window: Window,
         visual: *mut c_void,
         colormap: Colormap,
+        scale: f32,
     ) -> Result<Self, String> {
         let draw = unsafe { XftDrawCreate(display, window, visual, colormap) };
         if draw.is_null() {
             return Err("could not create the native Xft text surface".to_owned());
         }
-        let specs = [
-            (FontRole::Body, "Fira Mono:size=13"),
-            (FontRole::Input, "Fira Mono:size=15"),
-            (FontRole::Heading, "Fira Mono:bold:size=11"),
-            (FontRole::Instrument, "Fira Mono:size=9"),
+        let (fonts, font_pixel_sizes) = match Self::open_fonts(display, screen, scale) {
+            Ok(fonts) => fonts,
+            Err(error) => {
+                unsafe { XftDrawDestroy(draw) };
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            display,
+            screen,
+            draw,
+            fonts,
+            font_pixel_sizes,
+            visual,
+            colormap,
+            colors: RefCell::new(HashMap::new()),
+            widths: RefCell::new(HashMap::new()),
+        })
+    }
+
+    fn open_fonts(
+        display: *mut Display,
+        screen: c_int,
+        scale: f32,
+    ) -> Result<([FontFace; 4], [i32; 4]), String> {
+        let pixel_sizes = Self::pixel_sizes(scale);
+        let roles = [
+            (FontRole::Body, false),
+            (FontRole::Input, false),
+            (FontRole::Heading, true),
+            (FontRole::Instrument, false),
         ];
-        let mut faces: Vec<FontFace> = Vec::with_capacity(specs.len());
-        for (_, name) in specs {
-            let font_name = CString::new(name).expect("static font name");
+        let mut faces: Vec<FontFace> = Vec::with_capacity(roles.len());
+        for ((_, bold), pixel_size) in roles.into_iter().zip(pixel_sizes) {
+            let family = if bold {
+                format!("Fira Mono:style=Bold:pixelsize={pixel_size}")
+            } else {
+                format!("Fira Mono:pixelsize={pixel_size}")
+            };
+            let font_name = CString::new(family).expect("dynamic font name");
             let mut font = unsafe { XftFontOpenName(display, screen, font_name.as_ptr()) };
             if font.is_null() {
-                let fallback_name = CString::new("monospace:size=11").expect("static font name");
+                let fallback = if bold {
+                    format!("monospace:style=Bold:pixelsize={pixel_size}")
+                } else {
+                    format!("monospace:pixelsize={pixel_size}")
+                };
+                let fallback_name = CString::new(fallback).expect("dynamic fallback font name");
                 font = unsafe { XftFontOpenName(display, screen, fallback_name.as_ptr()) };
             }
             if font.is_null() {
                 for face in faces {
                     unsafe { XftFontClose(display, face.font) };
                 }
-                unsafe { XftDrawDestroy(draw) };
                 return Err("could not open a Fontconfig monospace font".to_owned());
             }
             let sample = CString::new("M").expect("static glyph sample");
@@ -89,15 +127,36 @@ impl TextRenderer {
             };
             faces.push(FontFace { font, metrics });
         }
-        Ok(Self {
-            display,
-            draw,
-            fonts: [faces[0], faces[1], faces[2], faces[3]],
-            visual,
-            colormap,
-            colors: RefCell::new(HashMap::new()),
-            widths: RefCell::new(HashMap::new()),
-        })
+        Ok(([faces[0], faces[1], faces[2], faces[3]], pixel_sizes))
+    }
+
+    fn pixel_sizes(scale: f32) -> [i32; 4] {
+        let scale = scale.max(0.1);
+        [
+            (14.0 * scale).round().max(10.0) as i32,
+            (15.0 * scale).round().max(10.0) as i32,
+            (12.0 * scale).round().max(9.0) as i32,
+            (9.0 * scale).round().max(7.0) as i32,
+        ]
+    }
+
+    /// Reopen Xft faces only when quantized pixel sizes change. The returned
+    /// boolean tells the window loop whether the PTY/layout metrics changed.
+    pub(crate) fn reconfigure_for_scale(&mut self, scale: f32) -> Result<bool, String> {
+        let desired = Self::pixel_sizes(scale);
+        if desired == self.font_pixel_sizes {
+            return Ok(false);
+        }
+        let (fonts, font_pixel_sizes) = Self::open_fonts(self.display, self.screen, scale)?;
+        unsafe {
+            for face in self.fonts {
+                XftFontClose(self.display, face.font);
+            }
+        }
+        self.fonts = fonts;
+        self.font_pixel_sizes = font_pixel_sizes;
+        self.widths.borrow_mut().clear();
+        Ok(true)
     }
 
     pub(crate) fn metrics(&self) -> CellMetrics {
@@ -106,6 +165,10 @@ impl TextRenderer {
 
     pub(crate) fn metrics_for(&self, role: FontRole) -> CellMetrics {
         self.face(role).metrics
+    }
+
+    pub(crate) fn font_pixel_sizes(&self) -> [i32; 4] {
+        self.font_pixel_sizes
     }
 
     fn face(&self, role: FontRole) -> FontFace {

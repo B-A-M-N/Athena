@@ -69,7 +69,7 @@ pub(crate) fn draw_status_text(
             draw_rect(
                 cursor_x as f32,
                 prompt_layout.input_row.top,
-                2.0,
+                geometry.u(2.0).max(1.0),
                 prompt_layout.input_row.height,
                 (0.36, 0.76, 0.72),
             );
@@ -93,56 +93,4 @@ fn human_status(projection: &Projection) -> &str {
         "READY" => "Athena is ready.",
         _ => "Athena is working through the request.",
     }
-}
-
-pub(crate) fn draw_instrument_labels(text: &TextRenderer, geometry: &FrameGeometry) {
-    text.draw_in(
-        FontRole::Instrument,
-        geometry.rail.speaker.x as c_int + 13,
-        geometry.rail.speaker.bottom() as c_int - 6,
-        "SPEAKER GRILLE",
-        (99, 123, 145),
-    );
-    for (rect, label) in [
-        (geometry.rail.brightness, "BRI"),
-        (geometry.rail.focus, "FOCUS"),
-        (geometry.rail.power, "POWER"),
-    ]
-    .into_iter()
-    {
-        text.draw_in(
-            FontRole::Instrument,
-            rect.x as c_int + 10,
-            geometry.controls.y as c_int + 18,
-            &super::super::fit_text_in(text, FontRole::Instrument, label, rect.width as c_int - 16),
-            (105, 132, 153),
-        );
-    }
-    let system = geometry.rail.system_status;
-    for (index, label) in ["SYS", "NET", "ACT"].into_iter().enumerate() {
-        let x = system.x as c_int + 18 + index as c_int * 42;
-        text.draw_in(
-            FontRole::Instrument,
-            x,
-            (system.y + system.height * 0.72) as c_int,
-            label,
-            (108, 132, 136),
-        );
-    }
-    let encoder = geometry.rail.primary_encoder;
-    text.draw_in(
-        FontRole::Instrument,
-        encoder.x as c_int + 12,
-        (encoder.y + encoder.height * 0.18) as c_int,
-        "ENC",
-        (112, 136, 138),
-    );
-    let plate = geometry.rail.identity_plate;
-    text.draw_in(
-        FontRole::Instrument,
-        plate.x as c_int + 10,
-        (plate.y + plate.height * 0.75) as c_int,
-        "ATHENA BOX",
-        (184, 187, 181),
-    );
 }

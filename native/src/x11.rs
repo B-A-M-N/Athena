@@ -42,6 +42,7 @@ type Display = c_void;
 type Window = c_ulong;
 type Atom = c_ulong;
 type Colormap = c_ulong;
+type Cursor = c_ulong;
 type GLXContext = *mut c_void;
 
 const KEY_PRESS: c_int = 2;
@@ -117,6 +118,7 @@ const MAX_CACHED_XFT_COLORS: usize = 256;
 const MAX_CACHED_TEXT_WIDTHS: usize = 512;
 const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RESIZE_EDGE: i32 = 12;
 
 #[repr(C)]
 struct XVisualInfo {
@@ -378,6 +380,7 @@ pub struct RendererOptions {
     pub mascot: String,
     pub animations: bool,
     pub reduced_motion: bool,
+    pub cabinet_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -393,6 +396,7 @@ impl Default for RendererOptions {
             mascot: "owl".to_owned(),
             animations: true,
             reduced_motion: false,
+            cabinet_only: false,
         }
     }
 }
@@ -444,6 +448,10 @@ unsafe extern "C" {
         revert_to: c_int,
         time: c_ulong,
     ) -> c_int;
+    fn XCreateFontCursor(display: *mut Display, shape: CUint) -> Cursor;
+    fn XDefineCursor(display: *mut Display, window: Window, cursor: Cursor) -> c_int;
+    fn XUndefineCursor(display: *mut Display, window: Window) -> c_int;
+    fn XFreeCursor(display: *mut Display, cursor: Cursor) -> c_int;
     fn XSetSelectionOwner(display: *mut Display, selection: Atom, owner: Window, time: c_ulong);
     fn XConvertSelection(
         display: *mut Display,
@@ -657,6 +665,134 @@ unsafe extern "C" {
 }
 
 type FrameGeometry = NativePixelLayout;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeZone {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+}
+
+impl ResizeZone {
+    fn direction(self) -> c_long {
+        match self {
+            Self::TopLeft => 0,
+            Self::Top => 1,
+            Self::TopRight => 2,
+            Self::Right => 3,
+            Self::BottomRight => 4,
+            Self::Bottom => 5,
+            Self::BottomLeft => 6,
+            Self::Left => 7,
+        }
+    }
+
+    fn cursor_shape(self) -> CUint {
+        match self {
+            Self::TopLeft => 134,
+            Self::Top => 138,
+            Self::TopRight => 136,
+            Self::Right => 96,
+            Self::BottomRight => 14,
+            Self::Bottom => 16,
+            Self::BottomLeft => 12,
+            Self::Left => 70,
+        }
+    }
+}
+
+fn resize_zone(x: i32, y: i32, width: i32, height: i32) -> Option<ResizeZone> {
+    let left = x <= RESIZE_EDGE;
+    let right = x >= width.saturating_sub(RESIZE_EDGE + 1);
+    let top = y <= RESIZE_EDGE;
+    let bottom = y >= height.saturating_sub(RESIZE_EDGE + 1);
+    match (left, top, right, bottom) {
+        (true, true, _, _) => Some(ResizeZone::TopLeft),
+        (_, true, true, _) => Some(ResizeZone::TopRight),
+        (true, _, _, true) => Some(ResizeZone::BottomLeft),
+        (_, _, true, true) => Some(ResizeZone::BottomRight),
+        (_, true, _, _) => Some(ResizeZone::Top),
+        (_, _, _, true) => Some(ResizeZone::Bottom),
+        (true, _, _, _) => Some(ResizeZone::Left),
+        (_, _, true, _) => Some(ResizeZone::Right),
+        _ => None,
+    }
+}
+
+struct ResizeCursors {
+    display: *mut Display,
+    cursors: [Cursor; 8],
+    active: Option<ResizeZone>,
+}
+
+impl ResizeCursors {
+    fn new(display: *mut Display) -> Self {
+        let zones = [
+            ResizeZone::TopLeft,
+            ResizeZone::Top,
+            ResizeZone::TopRight,
+            ResizeZone::Right,
+            ResizeZone::BottomRight,
+            ResizeZone::Bottom,
+            ResizeZone::BottomLeft,
+            ResizeZone::Left,
+        ];
+        let cursors = zones.map(|zone| unsafe { XCreateFontCursor(display, zone.cursor_shape()) });
+        Self {
+            display,
+            cursors,
+            active: None,
+        }
+    }
+
+    fn set(&mut self, window: Window, zone: Option<ResizeZone>) {
+        if self.active == zone {
+            return;
+        }
+        unsafe {
+            if let Some(zone) = zone {
+                let cursor = self.cursors[cursor_index(zone)];
+                if cursor != 0 {
+                    XDefineCursor(self.display, window, cursor);
+                }
+            } else {
+                XUndefineCursor(self.display, window);
+            }
+        }
+        self.active = zone;
+    }
+}
+
+impl Drop for ResizeCursors {
+    fn drop(&mut self) {
+        unsafe {
+            for cursor in self.cursors {
+                if cursor != 0 {
+                    XFreeCursor(self.display, cursor);
+                }
+            }
+        }
+    }
+}
+
+fn cursor_index(zone: ResizeZone) -> usize {
+    match zone {
+        ResizeZone::TopLeft => 0,
+        ResizeZone::Top => 1,
+        ResizeZone::TopRight => 2,
+        ResizeZone::Right => 3,
+        ResizeZone::BottomRight => 4,
+        ResizeZone::Bottom => 5,
+        ResizeZone::BottomLeft => 6,
+        ResizeZone::Left => 7,
+    }
+}
+
 fn intern_atom(display: *mut Display, name: &str) -> Atom {
     let Ok(value) = CString::new(name) else {
         return 0;
@@ -762,7 +898,8 @@ pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_jso
         return Err("could not create an X11 drawable for live layout metrics".to_owned());
     }
     let result = (|| {
-        let text = TextRenderer::new(display, screen, window, visual, colormap)?;
+        let scale = FrameGeometry::scale_for_window(width, height);
+        let text = TextRenderer::new(display, screen, window, visual, colormap, scale)?;
         let metrics = UiFontMetrics {
             body: text.metrics_for(FontRole::Body),
             input: text.metrics_for(FontRole::Input),
@@ -789,6 +926,14 @@ pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_jso
             .ok_or_else(|| "native layout did not serialize as an object".to_owned())?;
         object.insert("metrics_source".to_owned(), serde_json::json!("live_xft"));
         object.insert("metrics".to_owned(), serde_json::to_value(metrics).unwrap());
+        object.insert(
+            "font_pixel_sizes".to_owned(),
+            serde_json::to_value(text.font_pixel_sizes()).unwrap(),
+        );
+        object.insert(
+            "terminal_size".to_owned(),
+            serde_json::to_value(layout.terminal_size()).unwrap(),
+        );
         object.insert(
             "prompt_layout".to_owned(),
             serde_json::to_value(prompt).unwrap(),
@@ -914,17 +1059,21 @@ fn run_window(
     }
     unsafe { glXMakeCurrent(display, window, context) };
     let visual_ptr = unsafe { (*visual).visual };
-    let text = match TextRenderer::new(display, screen, window, visual_ptr, colormap) {
-        Ok(text) => text,
-        Err(error) => {
-            unsafe {
-                glXMakeCurrent(display, 0, ptr::null_mut());
-                glXDestroyContext(display, context);
-                XDestroyWindow(display, window);
+    let initial_scale = FrameGeometry::scale_for_window(1280, 800);
+    let mut resize_cursors = ResizeCursors::new(display);
+    let mut text =
+        match TextRenderer::new(display, screen, window, visual_ptr, colormap, initial_scale) {
+            Ok(text) => text,
+            Err(error) => {
+                drop(resize_cursors);
+                unsafe {
+                    glXMakeCurrent(display, 0, ptr::null_mut());
+                    glXDestroyContext(display, context);
+                    XDestroyWindow(display, window);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     let oi_target = render::oi::OiTarget::new();
     let chassis_material = render::chassis::ChassisMaterial::new();
     let mut input_method = InputMethod::new(display, window);
@@ -941,14 +1090,15 @@ fn run_window(
     let mut selection: Option<((usize, usize), (usize, usize))> = None;
     let mut width = 1280_i32;
     let mut height = 800_i32;
-    let metrics = UiFontMetrics {
+    let mut metrics = UiFontMetrics {
         body: text.metrics_for(FontRole::Body),
         input: text.metrics_for(FontRole::Input),
         heading: text.metrics_for(FontRole::Heading),
         instrument: text.metrics_for(FontRole::Instrument),
     };
     resize_terminal(core, pty, width, height, metrics);
-    write_runtime_layout_dump(width, height, metrics);
+    write_runtime_layout_dump(width, height, metrics, text.font_pixel_sizes(), 0);
+    resize_cursors.set(window, None);
     unsafe { XSetInputFocus(display, window, 1, CURRENT_TIME) };
     let mut focused = true;
     let mut running = true;
@@ -962,6 +1112,7 @@ fn run_window(
     let mut event_redraws = 0_u64;
     let mut idle_redraws = 0_u64;
     let mut redraws = 0_u64;
+    let mut configure_events = 0_u64;
     let mut oi_dumped = false;
     let render_started = Instant::now();
     let cpu_started = process_cpu_seconds();
@@ -1116,33 +1267,45 @@ fn run_window(
                     } else if button.button == 1 {
                         unsafe { XSetInputFocus(display, window, 1, CURRENT_TIME) };
                         focused = true;
-                        let geometry = FrameGeometry::for_window(width, height, metrics);
-                        if geometry.header.contains(button.x, button.y) {
-                            begin_window_move(display, window, button);
-                        } else if let Some(control) =
-                            PresentationSettings::control_at(&geometry, button.x, button.y)
-                        {
-                            presentation.activate(control, button.x, &geometry);
-                            dirty = true;
-                            activity_dirty = true;
-                        } else if geometry.prompt.contains(button.x, button.y) {
-                            let offset =
-                                ((button.x as f32 - geometry.prompt.x - geometry.prompt_padding_x)
+                        if let Some(zone) = resize_zone(button.x, button.y, width, height) {
+                            selection = None;
+                            resize_cursors.set(window, Some(zone));
+                            begin_window_resize(display, window, button, zone);
+                        } else {
+                            let geometry = FrameGeometry::for_window(width, height, metrics);
+                            if geometry.header.contains(button.x, button.y) {
+                                begin_window_move(display, window, button);
+                            } else if let Some(control) =
+                                PresentationSettings::control_at(&geometry, button.x, button.y)
+                            {
+                                presentation.activate(control, button.x, &geometry);
+                                dirty = true;
+                                activity_dirty = true;
+                            } else if geometry.prompt.contains(button.x, button.y) {
+                                let offset = ((button.x as f32
+                                    - geometry.prompt.x
+                                    - geometry.prompt_padding_x)
                                     / geometry.prompt_cell_width)
                                     .max(0.0) as usize;
-                            input_buffer.set_cursor_chars(offset, button.state & SHIFT_MASK != 0);
-                            dirty = true;
-                            activity_dirty = true;
-                        } else if let Some(cell) = geometry.cell_at(button.x, button.y) {
-                            selection = Some((cell, cell));
-                            dirty = true;
-                            activity_dirty = true;
+                                input_buffer
+                                    .set_cursor_chars(offset, button.state & SHIFT_MASK != 0);
+                                dirty = true;
+                                activity_dirty = true;
+                            } else if let Some(cell) = geometry.cell_at(button.x, button.y) {
+                                selection = Some((cell, cell));
+                                dirty = true;
+                                activity_dirty = true;
+                            }
                         }
                     }
                 }
                 MOTION_NOTIFY => {
                     let motion = unsafe { &*((&event as *const XEvent).cast::<XMotionEvent>()) };
-                    if motion.state & BUTTON1_MASK != 0 {
+                    let zone = resize_zone(motion.x, motion.y, width, height);
+                    if motion.state & BUTTON1_MASK == 0 {
+                        resize_cursors.set(window, zone);
+                    }
+                    if motion.state & BUTTON1_MASK != 0 && zone.is_none() {
                         if let (Some((anchor, _)), Some(cell)) = (
                             selection,
                             FrameGeometry::for_window(width, height, metrics)
@@ -1166,6 +1329,7 @@ fn run_window(
                             dirty = true;
                             activity_dirty = true;
                         }
+                        resize_cursors.set(window, resize_zone(button.x, button.y, width, height));
                     }
                 }
                 CONFIGURE_NOTIFY => {
@@ -1173,7 +1337,29 @@ fn run_window(
                         unsafe { &*(&event as *const XEvent as *const XConfigureEvent) };
                     width = configure.width.max(1);
                     height = configure.height.max(1);
+                    let scale = FrameGeometry::scale_for_window(width, height);
+                    match text.reconfigure_for_scale(scale) {
+                        Ok(_) => {
+                            metrics = UiFontMetrics {
+                                body: text.metrics_for(FontRole::Body),
+                                input: text.metrics_for(FontRole::Input),
+                                heading: text.metrics_for(FontRole::Heading),
+                                instrument: text.metrics_for(FontRole::Instrument),
+                            };
+                        }
+                        Err(error) => {
+                            eprintln!("could not reconfigure native fonts: {error}");
+                        }
+                    }
                     resize_terminal(core, pty, width, height, metrics);
+                    configure_events = configure_events.saturating_add(1);
+                    write_runtime_layout_dump(
+                        width,
+                        height,
+                        metrics,
+                        text.font_pixel_sizes(),
+                        configure_events,
+                    );
                     dirty = true;
                     activity_dirty = true;
                 }
@@ -1353,6 +1539,7 @@ fn run_window(
     // window, leaking these process-local handles is safer than asking Xft/XIM
     // to destroy resources whose drawable no longer exists.
     if window_destroyed {
+        std::mem::forget(resize_cursors);
         std::mem::forget(input_method);
         std::mem::forget(oi_target);
         std::mem::forget(chassis_material);
@@ -1362,6 +1549,7 @@ fn run_window(
         // drawable after a window manager has removed it.
         return Ok(());
     } else {
+        drop(resize_cursors);
         drop(input_method);
         drop(oi_target);
         drop(chassis_material);
@@ -1419,7 +1607,13 @@ fn set_window_hints(display: *mut Display, window: Window) {
     }
 }
 
-fn write_runtime_layout_dump(width: i32, height: i32, metrics: UiFontMetrics) {
+fn write_runtime_layout_dump(
+    width: i32,
+    height: i32,
+    metrics: UiFontMetrics,
+    font_pixel_sizes: [i32; 4],
+    configure_events: u64,
+) {
     let Ok(path) = env::var("ATHENA_NATIVE_LAYOUT_DUMP") else {
         return;
     };
@@ -1454,6 +1648,18 @@ fn write_runtime_layout_dump(width: i32, height: i32, metrics: UiFontMetrics) {
         serde_json::to_value(metrics).expect("font metrics serialize"),
     );
     object.insert(
+        "font_pixel_sizes".to_owned(),
+        serde_json::to_value(font_pixel_sizes).expect("font sizes serialize"),
+    );
+    object.insert(
+        "terminal_size".to_owned(),
+        serde_json::to_value(layout.terminal_size()).expect("terminal size serialize"),
+    );
+    object.insert(
+        "configure_events".to_owned(),
+        serde_json::json!(configure_events),
+    );
+    object.insert(
         "prompt_layout".to_owned(),
         serde_json::to_value(prompt).expect("prompt layout serialize"),
     );
@@ -1463,6 +1669,24 @@ fn write_runtime_layout_dump(width: i32, height: i32, metrics: UiFontMetrics) {
 }
 
 fn begin_window_move(display: *mut Display, window: Window, button: &XButtonEvent) {
+    begin_window_moveresize(display, window, button, 8);
+}
+
+fn begin_window_resize(
+    display: *mut Display,
+    window: Window,
+    button: &XButtonEvent,
+    zone: ResizeZone,
+) {
+    begin_window_moveresize(display, window, button, zone.direction());
+}
+
+fn begin_window_moveresize(
+    display: *mut Display,
+    window: Window,
+    button: &XButtonEvent,
+    direction: c_long,
+) {
     let root = unsafe { XRootWindow(display, XDefaultScreen(display)) };
     let message_type = intern_atom(display, "_NET_WM_MOVERESIZE");
     let mut event = XEvent {
@@ -1477,7 +1701,7 @@ fn begin_window_move(display: *mut Display, window: Window, button: &XButtonEven
     message.data = [
         button.x_root as c_long,
         button.y_root as c_long,
-        8,
+        direction,
         button.button as c_long,
         0,
     ];
@@ -1663,7 +1887,9 @@ fn selection_bounds(
 #[cfg(test)]
 mod tests {
     use super::render::chassis::{PresentationControl, PresentationSettings};
-    use super::{FrameGeometry, Projection, VisualMode, is_wm_delete_message};
+    use super::{
+        FrameGeometry, Projection, ResizeZone, VisualMode, is_wm_delete_message, resize_zone,
+    };
     use crate::ProjectionView;
     use alacritty_terminal::term::TermMode;
 
@@ -1770,6 +1996,54 @@ mod tests {
         assert!(!is_wm_delete_message(10, 32, 21, 10, 20));
         assert!(!is_wm_delete_message(11, 32, 20, 10, 20));
         assert!(!is_wm_delete_message(10, 16, 20, 10, 20));
+    }
+
+    #[test]
+    fn resize_zones_cover_all_edges_and_corners() {
+        let width = 1280;
+        let height = 800;
+        assert_eq!(resize_zone(0, 0, width, height), Some(ResizeZone::TopLeft));
+        assert_eq!(
+            resize_zone(width - 1, 0, width, height),
+            Some(ResizeZone::TopRight)
+        );
+        assert_eq!(
+            resize_zone(0, height - 1, width, height),
+            Some(ResizeZone::BottomLeft)
+        );
+        assert_eq!(
+            resize_zone(width - 1, height - 1, width, height),
+            Some(ResizeZone::BottomRight)
+        );
+        assert_eq!(
+            resize_zone(width / 2, 0, width, height),
+            Some(ResizeZone::Top)
+        );
+        assert_eq!(
+            resize_zone(width / 2, height - 1, width, height),
+            Some(ResizeZone::Bottom)
+        );
+        assert_eq!(
+            resize_zone(0, height / 2, width, height),
+            Some(ResizeZone::Left)
+        );
+        assert_eq!(
+            resize_zone(width - 1, height / 2, width, height),
+            Some(ResizeZone::Right)
+        );
+        assert_eq!(resize_zone(width / 2, height / 2, width, height), None);
+    }
+
+    #[test]
+    fn resize_zones_use_ewmh_moveresize_directions() {
+        assert_eq!(ResizeZone::TopLeft.direction(), 0);
+        assert_eq!(ResizeZone::Top.direction(), 1);
+        assert_eq!(ResizeZone::TopRight.direction(), 2);
+        assert_eq!(ResizeZone::Right.direction(), 3);
+        assert_eq!(ResizeZone::BottomRight.direction(), 4);
+        assert_eq!(ResizeZone::Bottom.direction(), 5);
+        assert_eq!(ResizeZone::BottomLeft.direction(), 6);
+        assert_eq!(ResizeZone::Left.direction(), 7);
     }
 
     #[test]

@@ -260,17 +260,16 @@ class NativeSession:
         task = await self.service.submit(request, wait=False)
         task_id = getattr(task, "id", task)
         self._foreground_task_id = str(task_id)
-        print(f"ATHENA · task {task_id}")
         async for event in self.service.stream_events(task_id, after_sequence=0):
             if event.type == "ApprovalRequested":
                 approval_id = (event.payload or {}).get("approval_id", "?")
-                print(f"APPROVAL REQUIRED · /approve {approval_id}")
+                print(f"\nAPPROVAL REQUIRED\n/approve {approval_id}")
         result = await self.service.get_result(task_id)
         if result is None:
-            print(f"ATHENA · task {task_id} has no final result")
+            print("\nATHENA\nThe request has no final result yet.")
             return
-        status = getattr(result.status, "value", result.status)
-        print(f"ATHENA [{status.upper()}]\n{getattr(result, 'summary', '') or ''}")
+        summary = getattr(result, "summary", "") or "The request finished without a summary."
+        print(f"\nATHENA\n{summary}")
 
     async def _approve(self, approval_id: str) -> None:
         if not approval_id:

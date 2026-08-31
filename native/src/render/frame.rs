@@ -4,7 +4,7 @@ use super::oi::{OiTarget, draw_oi_scene};
 use super::primitives::{draw_rect, with_crt_mask, with_scissor};
 use super::prompt::draw_status_text;
 use super::terminal::{draw_terminal_background, draw_terminal_text};
-use super::text::{FontRole, TextRenderer};
+use super::text::TextRenderer;
 
 /// Compose the platform-owned terminal and the Athena-owned visual surfaces.
 /// Event handling stays in x11.rs; this module owns render ordering and dirty
@@ -34,7 +34,6 @@ pub(crate) fn draw_frame(
         instrument: text.metrics_for(FontRole::Instrument),
     };
     let geometry = FrameGeometry::for_window(width, height, metrics);
-    let semantic_mode = VisualMode::from_projection(projection).as_str();
     unsafe { glXWaitX() };
     unsafe {
         glViewport(0, 0, width, height);
@@ -59,30 +58,32 @@ pub(crate) fn draw_frame(
             presentation,
             chassis_material,
         );
+        if !options.cabinet_only {
+            with_scissor(height, geometry.operator_inner, || {
+                draw_terminal_background(core, &geometry, selection);
+            });
+            with_crt_mask(height, geometry.oi_inner, stencil_available, || {
+                draw_oi_scene(
+                    oi_target,
+                    width,
+                    height,
+                    geometry.oi_inner.x,
+                    geometry.oi_inner.y,
+                    geometry.oi_inner.width,
+                    geometry.oi_inner.height,
+                    projection,
+                    phase,
+                    options,
+                    presentation,
+                    stencil_available,
+                );
+            });
+        }
+    } else if dirty.terminal && !options.cabinet_only {
         with_scissor(height, geometry.operator_inner, || {
             draw_terminal_background(core, &geometry, selection);
         });
-        with_crt_mask(height, geometry.oi_inner, stencil_available, || {
-            draw_oi_scene(
-                oi_target,
-                width,
-                height,
-                geometry.oi_inner.x,
-                geometry.oi_inner.y,
-                geometry.oi_inner.width,
-                geometry.oi_inner.height,
-                projection,
-                phase,
-                options,
-                presentation,
-                stencil_available,
-            );
-        });
-    } else if dirty.terminal {
-        with_scissor(height, geometry.operator_inner, || {
-            draw_terminal_background(core, &geometry, selection);
-        });
-    } else if dirty.oi_motion {
+    } else if dirty.oi_motion && !options.cabinet_only {
         with_crt_mask(height, geometry.oi_inner, stencil_available, || {
             draw_rect(
                 geometry.oi_inner.x,
@@ -108,78 +109,11 @@ pub(crate) fn draw_frame(
         });
     }
 
-    if dirty.full {
+    if dirty.full && !options.cabinet_only {
         unsafe {
             glFinish();
             glXWaitGL();
         }
-        let heading_metrics = text.metrics_for(FontRole::Heading);
-        let header_baseline = geometry.header.y as c_int
-            + ((geometry.header.height - heading_metrics.height) / 2.0 + heading_metrics.baseline)
-                as c_int;
-        text.with_clip(geometry.header, || {
-            text.draw_in(
-                FontRole::Heading,
-                geometry.header.x as c_int + 22,
-                header_baseline,
-                &fit_text_in(
-                    text,
-                    FontRole::Heading,
-                    "ATHENA",
-                    (geometry.header.width as c_int - 44).max(1),
-                ),
-                (229, 239, 247),
-            );
-            text.draw_in(
-                FontRole::Instrument,
-                geometry.header.x as c_int + 145,
-                header_baseline,
-                &fit_text_in(
-                    text,
-                    FontRole::Instrument,
-                    "//  OPERATOR INSTRUMENT",
-                    (geometry.header.width as c_int - 190).max(1),
-                ),
-                (112, 145, 174),
-            );
-            let glass_label = "GLASS COMPUTE ENGINE";
-            text.draw_in(
-                FontRole::Instrument,
-                (geometry.header.right()
-                    - text.text_width_in(FontRole::Instrument, glass_label) as f32
-                    - 44.0) as c_int,
-                header_baseline,
-                glass_label,
-                (184, 192, 184),
-            );
-        });
-        let panel_metrics = text.metrics_for(FontRole::Instrument);
-        let panel_baseline =
-            |panel: PixelRect| panel.y as c_int + panel_metrics.baseline as c_int + 12;
-        text.draw_in(
-            FontRole::Instrument,
-            geometry.operator_outer.x as c_int + 24,
-            panel_baseline(geometry.operator_outer),
-            &fit_text_in(
-                text,
-                FontRole::Instrument,
-                "ATHENA // OPERATOR CONSOLE",
-                (geometry.operator_outer.width as c_int - 48).max(1),
-            ),
-            (164, 189, 211),
-        );
-        text.draw_in(
-            FontRole::Instrument,
-            geometry.oi_outer.x as c_int + 24,
-            panel_baseline(geometry.oi_outer),
-            &fit_text_in(
-                text,
-                FontRole::Instrument,
-                "ATHENA OI // GLASS COMPUTE",
-                (geometry.oi_outer.width as c_int - 48).max(1),
-            ),
-            mode_color(semantic_mode),
-        );
         with_scissor(height, geometry.operator_viewport, || {
             text.with_clip(geometry.operator_viewport, || {
                 draw_terminal_text(text, core, &geometry);
@@ -188,10 +122,7 @@ pub(crate) fn draw_frame(
         text.with_clip(geometry.prompt, || {
             draw_status_text(text, &geometry, projection, focused, input_buffer);
         });
-        text.with_clip(geometry.controls, || {
-            super::prompt::draw_instrument_labels(text, &geometry);
-        });
-    } else if dirty.terminal {
+    } else if dirty.terminal && !options.cabinet_only {
         unsafe {
             glFinish();
             glXWaitGL();
@@ -203,9 +134,7 @@ pub(crate) fn draw_frame(
         });
     }
     unsafe {
-        if !dirty.full {
-            glFlush();
-        }
+        glFlush();
         XFlush(display);
     }
 }

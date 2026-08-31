@@ -90,7 +90,13 @@ operator prompt/status, system lamps, primary encoder, brightness, focus,
 power, and identity plate. Brightness and focus change OI presentation, while
 power toggles the OI display without affecting the agent session. The window
 uses a borderless Motif hint while preserving header-fascia drag through the
-WM moveresize protocol.
+WM moveresize protocol. The invisible 12-pixel perimeter is divided into eight
+edge/corner resize zones; each zone supplies the matching X cursor and EWMH
+moveresize direction. A `ConfigureNotify` remeasures the scale-aware Xft pixel
+sizes, refreshes metrics, recomputes the layout, and resizes the PTY before
+repainting. Static cabinet engraving is a clipped bitmap layer, so labels
+cannot bleed across physical modules; dynamic Xft is reserved for transcript,
+prompt, status, and live conversation text.
 
 During development, `athena native` launches the native executable with a
 Python Athena service session as its PTY child. The child publishes the same
@@ -145,7 +151,14 @@ fixtures against reviewed ImageMagick RMSE goldens; set
 `NATIVE_VISUAL_UPDATE_GOLDENS=1` only when intentionally refreshing that
 directory. No goldens are treated as approved until a human reviews the
 captures. All X11 checks skip with an explicit reason when a usable Xvfb
-display is unavailable.
+display is unavailable. The same visual command additionally validates all
+five supported review sizes (`1672×941`, `1920×1080`, `1280×800`, `1280×720`,
+`1170×659`), resizes one native process through `1280×800 → 1672×941 →
+1170×659 → 1920×1080 → 1280×720`, and compares the deterministic cabinet-only
+`1672×941` capture against the approved
+`native/assets/athenabox/cabinet-golden.png` baseline. Use `--cabinet-only` and
+`scripts/native-cabinet-golden` when reviewing a physical-shell change
+independently of terminal or OI content.
 
 The native frontend must preserve these boundaries:
 

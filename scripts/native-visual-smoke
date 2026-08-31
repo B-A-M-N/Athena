@@ -76,16 +76,32 @@ for name in ("speaker", "operator_panel", "system_status", "primary_encoder", "b
     assert rect["x"] + rect["width"] <= rail["rail"]["x"] + rail["rail"]["width"] + 0.01
 '
 
-if ! xvfb-run -a -s '-screen 0 1280x800x24 -ac' xdpyinfo >/dev/null 2>&1; then
+if ! xvfb-run -a -s '-screen 0 1920x1080x24 -ac' xdpyinfo >/dev/null 2>&1; then
   printf '%s\n' 'native-visual-smoke: SKIP — Xvfb unavailable after layout invariants passed' >&2
   exit 0
 fi
 
+# Exercise the exact five review surfaces against live Xft metrics. This is a
+# separate probe from the screenshot fixtures so every supported aspect ratio
+# is checked even when a fixture is added or removed later.
+for size in 1672x941 1920x1080 1280x800 1280x720 1170x659; do
+  IFS=x read -r matrix_width matrix_height <<< "$size"
+  matrix_layout="$tmp_dir/matrix-${size}.layout.json"
+  xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
+    "$repo_root/native/target/debug/athena-terminal" --dump-layout \
+    --dump-layout-size "$size" > "$matrix_layout"
+  "$repo_root/scripts/check-native-layout.py" "$matrix_layout" "$matrix_width" "$matrix_height"
+done
+
+# The physical cabinet has a mandatory reviewed baseline. Dynamic terminal and
+# OI fixtures remain separate so a content change cannot hide a shell drift.
+"$repo_root/scripts/native-cabinet-golden"
+
 projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
 
 PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" TMP_DIR="$tmp_dir" \
-  GOLDEN_DIR="$golden_dir" UPDATE_GOLDENS="$update_goldens" \
-  xvfb-run -a -s '-screen 0 1280x800x24 -ac' bash -c '
+  GOLDEN_DIR="$golden_dir" UPDATE_GOLDENS="$update_goldens" CHECK_LAYOUT="$repo_root/scripts/check-native-layout.py" \
+  xvfb-run -a -s '-screen 0 1920x1080x24 -ac' bash -c '
     set -euo pipefail
 
     wait_for_window() {
@@ -96,6 +112,23 @@ PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-termi
         sleep 0.1
       done
       return 1
+    }
+
+    resize_sequence() {
+      local layout_path="$TMP_DIR/live-resize.layout.json"
+      ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" "$NATIVE_BIN" --no-animations --command "sleep 8" >/dev/null 2>&1 &
+      local native_pid=$!
+      local window
+      window="$(wait_for_window)"
+      xdotool windowfocus --sync "$window"
+      for size in 1280x800 1672x941 1170x659 1920x1080 1280x720; do
+        IFS=x read -r resize_width resize_height <<< "$size"
+        xdotool windowsize --sync "$window" "$resize_width" "$resize_height"
+        sleep 0.15
+        "$CHECK_LAYOUT" "$layout_path" "$resize_width" "$resize_height"
+      done
+      kill "$native_pid" 2>/dev/null || true
+      wait "$native_pid" 2>/dev/null || true
     }
 
     capture_fixture() {
@@ -183,6 +216,8 @@ PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-termi
         return 1
       }
     }
+
+    resize_sequence
 
     # 9 scene/input fixtures × 3 built-in sprites. Layout symmetry and
     # non-overlap are additionally asserted by NativePixelLayout unit tests.

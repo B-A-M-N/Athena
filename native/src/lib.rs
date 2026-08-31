@@ -14,7 +14,7 @@ use alacritty_terminal::term::{Config as TerminalConfig, TermMode};
 use alacritty_terminal::{Term, vte};
 
 /// Dimensions passed to the upstream terminal core.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct TerminalSize {
     pub columns: usize,
     pub rows: usize,
@@ -412,6 +412,18 @@ impl NativePixelLayout {
         Self::for_window(width, height, UiFontMetrics::fallback())
     }
 
+    pub fn scale_for_window(width: i32, height: i32) -> f32 {
+        const DESIGN_WIDTH: f32 = 1672.0;
+        const DESIGN_HEIGHT: f32 = 941.0;
+        (width.max(1) as f32 / DESIGN_WIDTH).min(height.max(1) as f32 / DESIGN_HEIGHT)
+    }
+
+    /// Convert a measurement from the 1672×941 AthenaBOX reference space to
+    /// the current native surface.
+    pub fn u(&self, reference_pixels: f32) -> f32 {
+        reference_pixels * self.scale
+    }
+
     pub fn for_window(width: i32, height: i32, metrics: UiFontMetrics) -> Self {
         let width = width.max(1);
         let height = height.max(1);
@@ -419,7 +431,7 @@ impl NativePixelLayout {
         let height_f = height as f32;
         const DESIGN_WIDTH: f32 = 1672.0;
         const DESIGN_HEIGHT: f32 = 941.0;
-        let scale = (width_f / DESIGN_WIDTH).min(height_f / DESIGN_HEIGHT);
+        let scale = Self::scale_for_window(width, height);
         let canvas = PixelRect {
             x: (width_f - DESIGN_WIDTH * scale) * 0.5,
             y: (height_f - DESIGN_HEIGHT * scale) * 0.5,
@@ -433,25 +445,25 @@ impl NativePixelLayout {
             width: width * scale,
             height: height * scale,
         };
-        // Canonical AthenaBox design space. The lower deck is deliberately a
-        // substantial part of the object, so a larger monitor grows the whole
-        // device instead of leaving a tiny fixed-height control strip.
-        let header = map(88.0, 42.0, 1496.0, 80.0);
-        let operator_outer = map(88.0, 158.0, 728.0, 522.0);
-        let oi_outer = map(856.0, 158.0, 728.0, 522.0);
-        let operator_inner = map(128.0, 210.0, 648.0, 430.0);
-        let operator_viewport = map(144.0, 246.0, 616.0, 378.0);
-        let oi_inner = map(896.0, 210.0, 648.0, 430.0);
-        let controls = map(88.0, 704.0, 1496.0, 186.0);
+        // Measured AthenaBOX reference geometry. The display assembly is the
+        // dominant mass; the lower instrument deck is a shallow physical
+        // control rail, not a second dashboard.
+        let header = map(48.0, 48.0, 1576.0, 64.0);
+        let operator_outer = map(72.0, 132.0, 740.0, 614.0);
+        let oi_outer = map(860.0, 132.0, 740.0, 614.0);
+        let operator_inner = map(112.0, 182.0, 660.0, 534.0);
+        let operator_viewport = map(128.0, 224.0, 628.0, 474.0);
+        let oi_inner = map(900.0, 182.0, 660.0, 534.0);
+        let controls = map(48.0, 750.0, 1576.0, 142.0);
         let left_x = operator_outer.x;
         let input_metrics = if compact {
             metrics.instrument
         } else {
             metrics.input
         };
-        let prompt_padding_y = if compact { 4.0 } else { 8.0 };
-        let prompt_gap = if compact { 2.0 } else { 4.0 };
-        let prompt_bottom_padding = if compact { 4.0 } else { 8.0 };
+        let prompt_padding_y = (if compact { 4.0 } else { 8.0 }) * scale;
+        let prompt_gap = (if compact { 2.0 } else { 4.0 }) * scale;
+        let prompt_bottom_padding = (if compact { 4.0 } else { 8.0 }) * scale;
         let prompt_required = PromptLayout::required_height(
             input_metrics,
             metrics.instrument,
@@ -461,7 +473,7 @@ impl NativePixelLayout {
             prompt_bottom_padding,
             !compact,
         );
-        let prompt_rect = map(334.0, 726.0, 584.0, 142.0);
+        let prompt_rect = map(214.0, 765.0, 416.0, 108.0);
         let prompt_height = if compact {
             prompt_rect.height.min(controls.height)
         } else {
@@ -492,8 +504,8 @@ impl NativePixelLayout {
         };
         let rail = RailLayout {
             rail: controls,
-            speaker: map(106.0, 716.0, 188.0, 162.0),
-            operator_panel: map(314.0, 716.0, 620.0, 162.0),
+            speaker: map(48.0, 758.0, 132.0, 126.0),
+            operator_panel: map(196.0, 758.0, 650.0, 126.0),
             operator_status: PixelRect {
                 x: prompt.x,
                 y: prompt_layout.status_row.map_or(prompt.y, |row| row.top),
@@ -507,12 +519,12 @@ impl NativePixelLayout {
                 width: prompt.width,
                 height: row.height,
             }),
-            system_status: map(950.0, 716.0, 164.0, 162.0),
-            primary_encoder: map(1130.0, 716.0, 170.0, 162.0),
-            brightness: map(1312.0, 716.0, 82.0, 162.0),
-            focus: map(1408.0, 716.0, 82.0, 162.0),
-            power: map(1504.0, 716.0, 66.0, 162.0),
-            identity_plate: map(1138.0, 850.0, 154.0, 20.0),
+            system_status: map(638.0, 758.0, 102.0, 126.0),
+            primary_encoder: map(748.0, 758.0, 90.0, 126.0),
+            brightness: map(870.0, 758.0, 120.0, 126.0),
+            focus: map(1000.0, 758.0, 120.0, 126.0),
+            power: map(1130.0, 758.0, 138.0, 126.0),
+            identity_plate: map(1286.0, 758.0, 240.0, 126.0),
         };
         let layout = Self {
             width,
