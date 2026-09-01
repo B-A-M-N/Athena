@@ -85,20 +85,17 @@ jobs:
           name: athena-release-certified-${{ github.sha }}
           path: ${{ runner.temp }}/athena-release-evidence
 
-  publish:
-    # A skipped protected lane must make publication impossible.  The
-    # publisher consumes the exact artifact uploaded by that lane; it never
-    # rebuilds from the tag checkout.
+  verify-release:
+    # Verification is deliberately separate from the OIDC publisher. It may
+    # execute repository verification code, but it has no publish identity.
     if: >-
       github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/') &&
       needs.protected-release.result == 'success'
     needs: [protected-release]
     runs-on: ubuntu-latest
-    environment: pypi-production
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -118,8 +115,32 @@ jobs:
             --evidence-dir release-evidence \
             --sha "$GITHUB_SHA" \
             --tag "$GITHUB_REF_NAME"
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: athena-release-verified-${{ github.sha }}
+          path: release-evidence/distributions
+
+  publish:
+    # The OIDC publisher consumes only the distributions emitted by the
+    # unprivileged verification job. It never checks out or executes repo code.
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.verify-release.result == 'success'
+    needs: [verify-release]
+    runs-on: ubuntu-latest
+    environment: pypi-production
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: athena-release-verified-${{ github.sha }}
+          path: verified-distributions
       - name: Publish exact certified distributions
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: release-evidence/release-artifacts
+          packages-dir: verified-distributions
           skip-existing: false

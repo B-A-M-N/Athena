@@ -44,7 +44,12 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
             check=True,
         )
 
-    artifacts = sorted(artifact_dir.iterdir())
+    distributions_dir = artifact_dir / "distributions"
+    if not distributions_dir.is_dir():
+        # Keep local acceptance useful with pre-boundary artifacts while the
+        # release lane uses the explicit distributions/ publish boundary.
+        distributions_dir = artifact_dir
+    artifacts = sorted(path for path in distributions_dir.iterdir() if path.is_file())
     wheel = next(
         (path for path in artifacts if path.suffix == ".whl" and "native" not in path.name),
         None,
@@ -61,7 +66,8 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
     assert manifest.is_file(), "release manifest missing; acceptance must consume exact artifacts"
     manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
     manifest_hashes = {
-        Path(item["path"]).resolve(): item["sha256"] for item in manifest_data["artifacts"]
+        (artifact_dir / item["path"]).resolve(): item["sha256"]
+        for item in manifest_data["artifacts"]
     }
     expected_artifacts = {wheel.resolve(), sdist.resolve(), native_wheel.resolve()}
     assert set(manifest_hashes) == expected_artifacts
@@ -89,6 +95,7 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
         assert any(name.endswith("/athena-terminal") for name in archive.namelist())
     assert "-py3-none-" in native_wheel.name
     assert not native_wheel.name.endswith("-py3-none-any.whl")
+    assert manifest_data.get("native_abi_policy", {}).get("status") == "PASS"
     offline_demo_config = tmp_path / "offline-demo.toml"
     offline_demo_config.write_text(
         """[[providers]]
@@ -432,6 +439,9 @@ def _installed_acceptance_program() -> str:
                 terminal("RELEASE_ACP"),
                 terminal("RELEASE_PERSIST"),
                 terminal("RELEASE_MCP_BOOT"),
+                terminal("RELEASE_SCHEDULE"),
+                terminal("RELEASE_WATCH"),
+                terminal("RELEASE_DELEGATE_CHILD"),
             ]
             service = AthenaService.in_memory(extra_scripts=scripts)
             try:
@@ -469,6 +479,205 @@ def _installed_acceptance_program() -> str:
                 )
                 assert mcp_result.status is CapabilityResultStatus.OK
                 assert mcp_result.output == "MCP_OK"
+
+                async def dispatch_trusted(
+                    capability_id,
+                    arguments,
+                    *,
+                    task_id,
+                    session_id=None,
+                    call_id,
+                ):
+                    request = CapabilityRequest(
+                        capability_id=capability_id,
+                        arguments=arguments,
+                        task_id=task_id,
+                        session_id=session_id,
+                        call_id=call_id,
+                        origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+                    )
+                    result = await service._dispatcher.dispatch(
+                        request,
+                        workspace=service._default_workspace,
+                        profile=AutonomyLevel.AUTONOMOUS.value,
+                    )
+                    if isinstance(result, SuspendedCall):
+                        assert result.approval_id
+                        await service.approve(
+                            result.approval_id,
+                            granted=True,
+                            scope="task",
+                        )
+                        result = await service._dispatcher.dispatch(
+                            request,
+                            workspace=service._default_workspace,
+                            profile=AutonomyLevel.AUTONOMOUS.value,
+                        )
+                    assert isinstance(result, CapabilityResult), result
+                    return result
+
+                # Keep a live non-terminal parent for the delegate composition
+                # below. This task uses the same durable TaskStore as the
+                # scheduler-created and installed child tasks.
+                composition_task_id = "release-composition-task"
+                composition_session_id = "release-composition-session"
+                await service._sessions.create(composition_session_id)
+                await service._store_tasks.insert_task(
+                    composition_task_id,
+                    composition_session_id,
+                    None,
+                    "release compositional capability scenario",
+                    autonomy="autonomous",
+                    workspace=service._default_workspace,
+                )
+
+                # Schedule composition: a capability-created occurrence must
+                # enter the same durable scheduler claim path, then the shared
+                # worker/kernel must execute the resulting ordinary Task.
+                scheduled = await dispatch_trusted(
+                    "schedule",
+                    {
+                        "operation": "create",
+                        "name": "release-schedule",
+                        "objective": "RELEASE_SCHEDULE",
+                        "session_id": composition_session_id,
+                        "trigger": {
+                            "type": "once",
+                            "at": "2000-01-01T00:00:00+00:00",
+                        },
+                    },
+                    task_id=mcp_task.id,
+                    session_id=composition_session_id,
+                    call_id="release-schedule-create",
+                )
+                assert scheduled.status is CapabilityResultStatus.OK, scheduled.error
+                scheduled_job_id = json.loads(scheduled.output)["job_id"]
+                scheduled_run = None
+                for _ in range(100):
+                    await service._scheduler.tick()
+                    scheduled_run = await service._store_schedules.last_run(scheduled_job_id)
+                    if scheduled_run and scheduled_run.get("task_id"):
+                        break
+                    await asyncio.sleep(0.02)
+                assert scheduled_run and scheduled_run.get("task_id"), scheduled_run
+                assert (
+                    await wait_status(
+                        service,
+                        scheduled_run["task_id"],
+                        TaskStatus.COMPLETE.value,
+                    )
+                    == TaskStatus.COMPLETE.value
+                )
+
+                # Watch/Maintain composition: a file mutation emits a durable
+                # WatchObserved event, the event-triggered maintenance job is
+                # claimed, and that job executes through the ordinary worker.
+                maintained_file = Path(service._default_workspace.root) / "release-maintained.txt"
+                maintained_file.write_text("before", encoding="utf-8")
+                maintained = await dispatch_trusted(
+                    "maintain",
+                    {
+                        "operation": "create",
+                        "claim": "RELEASE_WATCH",
+                        "observe": {
+                            "kind": "file",
+                            "path": ".",
+                            "pattern": "release-maintained.txt",
+                        },
+                        "verify": {
+                            "path": "release-maintained.txt",
+                            "predicate": "exists",
+                        },
+                        "trigger": {
+                            "type": "interval",
+                            "at": "2099-01-01T00:00:00+00:00",
+                            "interval_seconds": 3600,
+                        },
+            },
+            task_id=mcp_task.id,
+            session_id=composition_session_id,
+                    call_id="release-maintain-create",
+                )
+                assert maintained.status is CapabilityResultStatus.OK, maintained.error
+                contract = json.loads(maintained.output)
+                contract_id = contract["contract_id"]
+                watch_id = contract["observe"]["watch_id"]
+                raw_jobs = await service._store_schedules.list_jobs(enabled_only=False)
+                observer_job = next(
+                    job
+                    for job in raw_jobs
+                    if (
+                        (job.get("payload") or {}).get("template", {})
+                        .get("metadata", {})
+                        .get("maintenance_contract", {})
+                        .get("contract_id")
+                        == contract_id
+                        and (job.get("payload") or {}).get("template", {})
+                        .get("metadata", {})
+                        .get("maintenance_role")
+                        == "observer"
+                    )
+                )
+                maintained_file.write_text("after", encoding="utf-8")
+
+                async def watch_sink(event_type, payload, *, task_id):
+                    await service._store_events.append_event(
+                        event_type,
+                        payload,
+                        task_id=task_id,
+                    )
+
+                assert await service._watch_registry.poll_all(watch_sink) == 1
+                watch_rows = await service._db.fetch_all(
+                    "SELECT payload FROM events WHERE type = 'WatchObserved'"
+                )
+                assert any(
+                    json.loads(row["payload"]).get("watch") == watch_id for row in watch_rows
+                )
+                observer_run = await service._store_schedules.last_run(observer_job["id"])
+                assert observer_run and observer_run.get("task_id"), observer_run
+                observer_status = await wait_status(
+                    service,
+                    observer_run["task_id"],
+                    TaskStatus.COMPLETE.value,
+                )
+                observer_row = await service._store_tasks.get(observer_run["task_id"])
+                assert observer_status == TaskStatus.COMPLETE.value, observer_row
+
+                # Delegate composition: spawn through the capability, let the
+                # shared worker/kernel execute the real child, then collect its
+                # canonical persisted result through the same parent boundary.
+                delegate_spawn = await dispatch_trusted(
+                    "delegate",
+                    {
+                        "operation": "spawn",
+                        "objective": "RELEASE_DELEGATE_CHILD",
+                    },
+                    task_id=composition_task_id,
+                    call_id="release-delegate-spawn",
+                )
+                assert delegate_spawn.status is CapabilityResultStatus.OK, delegate_spawn.error
+                child_task_id = delegate_spawn.metadata["child_task_id"]
+                assert (
+                    await wait_status(
+                        service,
+                        child_task_id,
+                        TaskStatus.COMPLETE.value,
+                    )
+                    == TaskStatus.COMPLETE.value
+                )
+                delegate_collect = await dispatch_trusted(
+                    "delegate",
+                    {
+                        "operation": "collect",
+                        "child_task_id": child_task_id,
+                        "timeout": 5,
+                    },
+                    task_id=composition_task_id,
+                    call_id="release-delegate-collect",
+                )
+                assert delegate_collect.status is CapabilityResultStatus.OK, delegate_collect.error
+                assert delegate_collect.metadata["status"] == TaskStatus.COMPLETE.value
 
                 # Installed-artifact capability wiring: inventory the effective
                 # fabric, then exercise one harmless operation per registered
@@ -674,24 +883,6 @@ def _installed_acceptance_program() -> str:
                     assert "unowned debugger session" in (
                         debugger_probe.error or ""
                     ).lower()
-
-                # Release-level compositional nervous-system scenario. Keep
-                # every seam in this one started service: task-local scratch
-                # observations feed synthesis, the validated generated tool
-                # is reached through the fabric and dispatcher, and a
-                # workflow invokes a nested capability through that same
-                # dispatcher boundary. The workflow uses a read-only native
-                # child so its own approval does not obscure the composition
-                # assertion with a second independent approval continuation.
-                composition_task_id = "release-composition-task"
-                await service._store_tasks.insert_task(
-                    composition_task_id,
-                    None,
-                    None,
-                    "release compositional capability scenario",
-                    autonomy="autonomous",
-                    workspace=service._default_workspace,
-                )
 
                 async def dispatch_composed(capability_id, arguments, call_id):
                     def request():
@@ -961,7 +1152,7 @@ def _installed_acceptance_program() -> str:
                     service._task_manager,
                     service._sessions,
                     event_store=service._store_events,
-                    admission=service.require_agent_ready,
+                    admission=service.require_task_ready,
                     stream_poll_interval=0.01,
                     stream_timeout=5.0,
                 )
@@ -971,7 +1162,11 @@ def _installed_acceptance_program() -> str:
                 )
                 await asyncio.sleep(0)
                 accepted = await acp.submit(
-                    ACPRequest(objective="RELEASE_ACP", task_id=acp_task_id)
+                    ACPRequest(
+                        objective="RELEASE_ACP",
+                        task_id=acp_task_id,
+                        model_policy={"role": "primary", "allowed": ["fake-1"]},
+                    )
                 )
                 assert accepted.type == "task.accepted"
                 assert accepted.task_id == acp_task_id
@@ -981,6 +1176,35 @@ def _installed_acceptance_program() -> str:
                 acp_events = await asyncio.wait_for(acp_stream, timeout=10.0)
                 assert any(event.type == "task.finished" for event in acp_events)
                 assert all(event.task_id == acp_task_id for event in acp_events)
+
+                # A typed but unavailable ACP route must fail before the
+                # adapter allocates a session or persists a Task.
+                rejected_acp = ACPAdapter(
+                    service._task_manager,
+                    service._sessions,
+                    event_store=service._store_events,
+                    admission=service.require_task_ready,
+                )
+                rejected_id = "release-acp-unavailable"
+                sessions_before = len(await service._sessions.list_all())
+                try:
+                    await rejected_acp.submit(
+                        ACPRequest(
+                            objective="RELEASE_ACP_UNAVAILABLE",
+                            task_id=rejected_id,
+                            model_policy={
+                                "role": "primary",
+                                "allowed": ["model-that-is-not-configured"],
+                            },
+                        )
+                    )
+                except Exception as exc:
+                    rejected = exc
+                else:
+                    raise AssertionError("unavailable ACP model route was accepted")
+                assert getattr(rejected, "code", "") == "model_provider_unconfigured"
+                assert len(await service._sessions.list_all()) == sessions_before
+                assert await service._store_tasks.get(rejected_id) is None
 
                 # Durable persistence/restart keeps the completed Task visible.
                 persist_root = Path.cwd() / ("persist-" + expected_artifact_digest[:12])

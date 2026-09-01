@@ -15,6 +15,7 @@ import os
 import time
 from typing import Any
 
+from athena.protocol.messages import utcnow
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
@@ -166,6 +167,111 @@ class WatchRegistry:
         self.process_watches: dict[str, dict] = {}  # watch id -> info
         self.sink: Any = None
         self.observer_runner = observer_runner
+        self._health: dict[str, Any] = {
+            "last_poll_success": None,
+            "last_poll_error": None,
+            "consecutive_poll_errors": 0,
+            "restored_watch_count": 0,
+            "failed_rehydrations": 0,
+            "last_rehydration_error": None,
+            "poll_health": "stopped",
+            "rehydration_health": "healthy",
+            "overall_health": "stopped",
+            "health": "stopped",
+        }
+        self._poll_had_error = False
+        self._rehydration_failures: dict[str, dict[str, Any]] = {}
+
+    def health(self) -> dict[str, Any]:
+        self._refresh_health()
+        report = dict(self._health)
+        report["active_file_watches"] = len(self.file_watches)
+        report["active_process_watches"] = len(self.process_watches)
+        report["unresolved_rehydrations"] = [
+            dict(value) for value in self._rehydration_failures.values()
+        ]
+        return report
+
+    def record_poll_success(self) -> None:
+        self._health["last_poll_success"] = utcnow().isoformat()
+        self._health["last_poll_error"] = None
+        self._health["consecutive_poll_errors"] = 0
+        self._health["poll_health"] = "healthy"
+        self._refresh_health()
+
+    @property
+    def poll_had_error(self) -> bool:
+        return self._poll_had_error
+
+    def record_poll_error(self, error: BaseException) -> None:
+        self._health["last_poll_error"] = str(error)
+        self._health["consecutive_poll_errors"] = (
+            int(self._health.get("consecutive_poll_errors", 0)) + 1
+        )
+        self._health["poll_health"] = (
+            "failed" if self._health["consecutive_poll_errors"] >= 3 else "degraded"
+        )
+        self._refresh_health()
+
+    def record_rehydration(
+        self,
+        restored: int,
+        *,
+        watch_id: str | None = None,
+        contract_id: str | None = None,
+    ) -> None:
+        self._health["restored_watch_count"] = int(
+            self._health.get("restored_watch_count", 0)
+        ) + max(0, int(restored))
+        self.record_rehydration_resolved(watch_id=watch_id, contract_id=contract_id)
+
+    def record_rehydration_failure(
+        self,
+        error: BaseException,
+        *,
+        watch_id: str | None = None,
+        contract_id: str | None = None,
+    ) -> None:
+        self._health["failed_rehydrations"] = int(self._health.get("failed_rehydrations", 0)) + 1
+        self._health["last_rehydration_error"] = str(error)
+        # Keep the legacy diagnostic field populated for operators while the
+        # health calculation itself remains independent from poll health.
+        self._health["last_poll_error"] = str(error)
+        key = str(watch_id or (f"contract:{contract_id}" if contract_id else "global"))
+        self._rehydration_failures[key] = {
+            "id": key,
+            "watch_id": watch_id,
+            "contract_id": contract_id,
+            "error": str(error),
+        }
+        self._refresh_health()
+
+    def record_rehydration_resolved(
+        self, *, watch_id: str | None = None, contract_id: str | None = None
+    ) -> None:
+        if watch_id is None and contract_id is None:
+            return
+        for key, failure in list(self._rehydration_failures.items()):
+            if (watch_id is not None and failure.get("watch_id") == watch_id) or (
+                contract_id is not None and failure.get("contract_id") == contract_id
+            ):
+                self._rehydration_failures.pop(key, None)
+        self._refresh_health()
+
+    def _refresh_health(self) -> None:
+        rehydration_health = "degraded" if self._rehydration_failures else "healthy"
+        self._health["rehydration_health"] = rehydration_health
+        poll_health = str(self._health.get("poll_health") or "stopped")
+        self._health["overall_health"] = (
+            "failed"
+            if poll_health == "failed"
+            else "degraded"
+            if poll_health == "degraded" or rehydration_health == "degraded"
+            else "healthy"
+            if self.file_watches or self.process_watches or poll_health == "healthy"
+            else "stopped"
+        )
+        self._health["health"] = self._health["overall_health"]
 
     def bind_observer_runner(self, runner) -> None:
         self.observer_runner = runner
@@ -254,10 +360,12 @@ class WatchRegistry:
         """Remove one watcher, returning whether it existed."""
         removed = self.file_watches.pop(watch_id, None) is not None
         removed = self.process_watches.pop(watch_id, None) is not None or removed
+        self.record_rehydration_resolved(watch_id=watch_id)
         return removed
 
     async def poll_all(self, sink) -> int:
         """Emit WatchObserved events for anything that changed. Returns count."""
+        self._poll_had_error = False
         emitted = 0
         for w in list(self.file_watches.values()):
             try:
@@ -266,8 +374,10 @@ class WatchRegistry:
                 # whose asyncio executor cannot create worker threads does
                 # not silently stop delivering observations.
                 changed = w.poll()
-            except (OSError, RuntimeError) as exc:
+            except Exception as exc:
                 _logger.warning("file watch %s poll failed: %s", w.id, exc)
+                self._poll_had_error = True
+                self.record_poll_error(exc)
                 continue
             if changed or w.degraded:
                 emitted += 1
@@ -367,6 +477,8 @@ class WatchRegistry:
             )
         except Exception as exc:  # noqa: BLE001 - observation must not kill polling
             _logger.warning("generated observer %s failed: %s", observer_id, exc)
+            self._poll_had_error = True
+            self.record_poll_error(exc)
             return {"status": "failed", "error": str(exc)}
 
     def remove_task(self, task_id: str | None) -> None:
@@ -374,14 +486,20 @@ class WatchRegistry:
         for wid, watch in list(self.file_watches.items()):
             if watch.task_id == task_id:
                 self.file_watches.pop(wid, None)
+                self.record_rehydration_resolved(watch_id=wid)
         for wid, info in list(self.process_watches.items()):
             if info.get("task_id") == task_id:
                 self.process_watches.pop(wid, None)
+                self.record_rehydration_resolved(watch_id=wid)
 
     def close(self) -> None:
         """Drop all subscriptions during service shutdown."""
         self.file_watches.clear()
         self.process_watches.clear()
+        self._rehydration_failures.clear()
+        self._health["rehydration_health"] = "healthy"
+        self._health["health"] = "stopped"
+        self._health["overall_health"] = "stopped"
 
 
 class WatchCapability:

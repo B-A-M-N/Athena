@@ -61,8 +61,12 @@ TERMINAL_STATUSES = FINAL_STATUSES
 
 
 LEGAL_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.CREATED: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
-    TaskStatus.QUEUED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
+    TaskStatus.CREATED: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
+    TaskStatus.QUEUED: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
     TaskStatus.RUNNING: frozenset(
         {
             TaskStatus.WAITING_APPROVAL,
@@ -79,8 +83,12 @@ LEGAL_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.WAITING_APPROVAL: frozenset(
         {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
     ),
-    TaskStatus.WAITING_INPUT: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
-    TaskStatus.BLOCKED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
+    TaskStatus.WAITING_INPUT: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
+    TaskStatus.BLOCKED: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
     TaskStatus.INTERRUPTED: frozenset(
         {
             TaskStatus.RUNNING,

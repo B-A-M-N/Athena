@@ -349,6 +349,35 @@ async def test_reflection_environment_passport_explains_unconfigured_machine(tmp
 
 
 @pytest.mark.asyncio
+async def test_reflection_environment_passport_includes_service_runtime_health(tmp_path):
+    health = {
+        "scheduler": {"health": "healthy", "running": True},
+        "watch": {
+            "health": "degraded",
+            "rehydration_health": "degraded",
+            "unresolved_rehydrations": [{"watch_id": "watch-1"}],
+        },
+    }
+    reflection = CapabilityReflection(
+        CapabilityFabric(CapabilityRegistry()),
+        runtime_health_provider=lambda: health,
+    )
+    result = await reflection.invoke(
+        CapabilityRequest(
+            capability_id="capabilities",
+            task_id="task-runtime-health",
+            call_id="call-runtime-health",
+            arguments={"operation": "availability"},
+        ),
+        context=SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path))),
+    )
+
+    passport = json.loads(result.output)
+    assert passport["subsystems"] == health
+    assert passport["status"] == "PARTIAL"
+
+
+@pytest.mark.asyncio
 async def test_reflection_availability_reports_missing_generated_prerequisite(tmp_path):
     from athena.affordances.models import AffordanceScope, GeneratedCapability
 

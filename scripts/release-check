@@ -255,13 +255,16 @@ def main(argv: list[str] | None = None) -> int:
                         evidence_dir / "release-manifest.json",
                         manifest_path.read_text(encoding="utf-8"),
                     )
-                    artifact_evidence = evidence_dir / "release-artifacts"
+                    artifact_evidence = evidence_dir / "distributions"
                     if artifact_evidence.exists():
                         raise RuntimeError(
-                            "release artifact evidence path already exists; "
+                            "release distributions evidence path already exists; "
                             "use a fresh --evidence-dir"
                         )
-                    shutil.copytree(checkout / "release-artifacts", artifact_evidence)
+                    shutil.copytree(
+                        checkout / "release-artifacts" / "distributions",
+                        artifact_evidence,
+                    )
             if evidence_dir is not None:
                 _write_text(
                     evidence_dir

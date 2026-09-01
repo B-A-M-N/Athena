@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from athena.protocol.ids import new_id
-from athena.protocol.tasks import ResourceBudget, TaskSpec
+from athena.protocol.tasks import ResourceBudget, TaskSpec, TaskStatus
 from athena.state.database import Database
 from athena.state.events import EventStore
 from athena.state.sessions import SessionRepository
@@ -106,3 +106,38 @@ async def test_child_budget_derived_from_parent(env):
     assert child.resource_budget.max_agent_iterations == 5
     # Merge semantics: the parent's depth ceiling transmits to the child.
     assert child.resource_budget.max_child_depth == 1
+
+
+async def test_hierarchy_count_failure_refuses_child_creation(env, monkeypatch):
+    manager, delegation, sessions = env
+    parent = await _create(manager, sessions, "parent")
+    create_called = False
+
+    async def forbidden_create(spec):
+        nonlocal create_called
+        create_called = True
+        raise AssertionError("TaskManager.create must not run")
+
+    async def fail_count(parent_id):
+        raise RuntimeError("hierarchy unavailable")
+
+    monkeypatch.setattr(manager, "create", forbidden_create)
+    monkeypatch.setattr(manager._store, "count_children", fail_count)
+    with pytest.raises(Exception, match="cannot count children"):
+        await delegation.delegate(parent_task=parent, child_spec=_spec("child", new_id("session")))
+    assert create_called is False
+
+
+async def test_delegated_cancel_failure_does_not_fallback_to_cancelled(env):
+    manager, delegation, sessions = env
+    parent = await _create(manager, sessions, "parent")
+    child = await _create(manager, sessions, "child", parent=parent.id)
+
+    class FailingCancellation:
+        async def cancel(self, task_id, *, reason):
+            raise RuntimeError("runtime still alive")
+
+    delegation._cancellations = FailingCancellation()
+    with pytest.raises(RuntimeError, match="runtime still alive"):
+        await delegation.cancel_child(child.id)
+    assert (await manager.get(child.id)).metadata["status"] == TaskStatus.CREATED.value

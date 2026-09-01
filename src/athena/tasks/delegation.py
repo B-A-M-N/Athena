@@ -66,6 +66,7 @@ class DelegationManager:
         budgets: Any = None,
         sessions: Any = None,
         cancellations: Any = None,
+        execution_manager: Any = None,
         default_max_depth: int = _DEFAULT_MAX_DEPTH,
         default_max_children: int = _DEFAULT_MAX_CHILDREN,
     ) -> None:
@@ -79,6 +80,11 @@ class DelegationManager:
             cancellations
             if cancellations is not None
             else getattr(task_manager, "_cancellations", None)
+        )
+        self._execution = (
+            execution_manager
+            if execution_manager is not None
+            else getattr(task_manager, "_execution", None)
         )
         self._default_max_depth = default_max_depth
         self._default_max_children = default_max_children
@@ -100,7 +106,6 @@ class DelegationManager:
         # lineage root so ancestry is preserved without inheriting the parent's
         # full live transcript.
         child_session = new_id("session")
-        await self._ensure_session(child_session, parent_id=parent.session_id)
         context_refs = (
             ContextRef(
                 kind="task",
@@ -212,11 +217,18 @@ class DelegationManager:
     ) -> TaskStatus:
         """Cancel a child task (P0-17/cancel)."""
         if self._cancellations is not None:
-            try:
-                return await self._cancellations.cancel(child_task_id, reason=reason)
-            except Exception:
-                pass
+            # CancellationManager is the canonical runtime + task-state
+            # authority. Never downgrade its uncertain result to a direct
+            # status write that can leave a live child process behind.
+            return await self._cancellations.cancel(child_task_id, reason=reason)
+        if self._execution is not None:
+            raise DelegationError(
+                "child cancellation has no canonical CancellationManager; "
+                "refusing to mark a runtime-owned child CANCELLED"
+            )
         task = await self._tasks.get(child_task_id)
+        if task is None:
+            raise DelegationError(f"child task not found: {child_task_id}")
         status = _status_of(task)
         if status not in TERMINAL_STATUSES:
             await self._tasks.transition(child_task_id, TaskStatus.CANCELLED)
@@ -283,10 +295,15 @@ class DelegationManager:
             seen.add(cur)
             try:
                 spec = await self._tasks.get(cur)
-            except Exception:
-                break
+            except Exception as exc:
+                raise DelegationError(
+                    f"cannot establish delegation root for {parent_id}: {exc}",
+                    cause=exc,
+                ) from exc
             if spec is None:
-                break
+                raise DelegationError(
+                    f"cannot establish delegation root for {parent_id}: task {cur} is missing"
+                )
             if spec.resource_budget is not None:
                 root_budget = spec.resource_budget
             cur = spec.parent_task_id
@@ -299,19 +316,32 @@ class DelegationManager:
         if store is not None:
             try:
                 return await store.count_children(parent_id)
-            except Exception:
-                return 0
+            except Exception as exc:
+                raise DelegationError(
+                    f"cannot count children for {parent_id}: {exc}",
+                    cause=exc,
+                ) from exc
         if self._budgets is None:
-            return 0
+            raise DelegationError(
+                f"cannot establish child count for {parent_id}: no durable hierarchy store"
+            )
         count = getattr(self._budgets, "child_count", None)
         if callable(count):
-            return int(count(parent_id))
+            try:
+                return int(count(parent_id))
+            except Exception as exc:
+                raise DelegationError(
+                    f"cannot count children for {parent_id}: {exc}",
+                    cause=exc,
+                ) from exc
         ledgers = getattr(self._budgets, "_ledger", None)
         if isinstance(ledgers, dict):
             entry = ledgers.get(parent_id)
             if entry is not None:
                 return int(getattr(entry, "children", 0))
-        return 0
+        raise DelegationError(
+            f"cannot establish child count for {parent_id}: no authoritative count"
+        )
 
     async def _depth_of(self, task_id: str) -> int:
         depth = 0
@@ -321,9 +351,16 @@ class DelegationManager:
             seen.add(cur)
             try:
                 spec = await self._tasks.get(cur)
-            except Exception:
-                break
-            if spec is None or not spec.parent_task_id:
+            except Exception as exc:
+                raise DelegationError(
+                    f"cannot establish delegation depth for {task_id}: {exc}",
+                    cause=exc,
+                ) from exc
+            if spec is None:
+                raise DelegationError(
+                    f"cannot establish delegation depth for {task_id}: task {cur} is missing"
+                )
+            if not spec.parent_task_id:
                 break
             depth += 1
             cur = spec.parent_task_id

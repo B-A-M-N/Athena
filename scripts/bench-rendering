@@ -33,6 +33,44 @@ def _percentile(values: list[float], percentile: float) -> float:
     return statistics.quantiles(values, n=100, method="inclusive")[int(percentile) - 1]
 
 
+def _measure_projection_batches(
+    state: ProjectionState,
+    *,
+    batch_count: int = 5,
+    batch_size: int = 100,
+) -> dict[str, object]:
+    """Measure warmed, independent projection batches.
+
+    A single p95 is too sensitive to process scheduling and allocator state.
+    Keep the normal gate at the median batch p95 and retain the maximum batch
+    p95 as a larger hard-stop for genuine pathological regressions.
+    """
+    warmup_count = max(8, min(batch_size, 32))
+    for _ in range(warmup_count):
+        native_projection_frame(state, width=96, height=32)
+    p50_samples: list[float] = []
+    p95_samples: list[float] = []
+    for _ in range(batch_count):
+        samples: list[float] = []
+        for _ in range(batch_size):
+            started = time.perf_counter()
+            native_projection_frame(state, width=96, height=32)
+            samples.append((time.perf_counter() - started) * 1000.0)
+        p50_samples.append(_percentile(samples, 50))
+        p95_samples.append(_percentile(samples, 95))
+    return {
+        "warmup_iterations": warmup_count,
+        "batch_count": batch_count,
+        "batch_size": batch_size,
+        "p50_ms": round(statistics.median(p50_samples), 6),
+        "p95_ms": round(statistics.median(p95_samples), 6),
+        "p50_hard_max_ms": round(max(p50_samples), 6),
+        "p95_hard_max_ms": round(max(p95_samples), 6),
+        "p50_samples_ms": [round(value, 6) for value in p50_samples],
+        "p95_samples_ms": [round(value, 6) for value in p95_samples],
+    }
+
+
 def _xvfb_run() -> str:
     executable = shutil.which("xvfb-run")
     if executable is None:
@@ -219,8 +257,7 @@ def _native_render_metrics(*, required: bool, trials: int) -> dict[str, object]:
     if display_probe.returncode != 0:
         if required:
             raise RuntimeError(
-                "native rendering gate could not create an Xvfb display:\n"
-                f"{display_probe.stdout}"
+                f"native rendering gate could not create an Xvfb display:\n{display_probe.stdout}"
             )
         return {"available": False, "reason": "Xvfb display unavailable"}
     with tempfile.TemporaryDirectory(prefix="athena-render-stats-") as directory:
@@ -272,6 +309,7 @@ def main() -> int:
     parser.add_argument("--min-frames-per-second", type=float, default=100.0)
     parser.add_argument("--max-scene-p95-ms", type=float, default=2.0)
     parser.add_argument("--max-native-projection-p95-ms", type=float, default=5.0)
+    parser.add_argument("--hard-max-native-projection-p95-ms", type=float, default=10.0)
     parser.add_argument("--max-serialization-p95-ms", type=float, default=5.0)
     parser.add_argument("--max-motion-p95-ms", type=float, default=250.0)
     parser.add_argument("--max-idle-redraws-per-second", type=float, default=0.1)
@@ -366,6 +404,7 @@ def main() -> int:
             "cache_bytes": framebuffer._base_frame_bytes + framebuffer._base_png_bytes,
         }
     native = _native_render_metrics(required=args.require_native, trials=args.native_trials)
+    projection = _measure_projection_batches(state)
     result = {
         "frames": args.frames,
         "elapsed_seconds": round(elapsed, 6),
@@ -373,6 +412,7 @@ def main() -> int:
         "scene_build_p50_ms": round(_percentile(scene_times, 50), 3),
         "scene_build_p95_ms": round(_percentile(scene_times, 95), 3),
         "native_projection_p95_ms": round(_percentile(native_times, 95), 3),
+        "native_projection": projection,
         "json_serialization_p95_ms": round(_percentile(serialization_times, 95), 3),
         "frame_bytes_p50": round(_percentile([float(value) for value in frame_bytes], 50)),
         "retained_entities": len(glass_scene.entities)
@@ -404,11 +444,21 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    if _percentile(native_times, 95) > args.max_native_projection_p95_ms:
+    projection_p95 = float(projection["p95_ms"])
+    projection_hard_max = float(projection["p95_hard_max_ms"])
+    if projection_p95 > args.max_native_projection_p95_ms:
         print(
             f"bench-rendering: native projection p95 "
-            f"{_percentile(native_times, 95):.2f}ms exceeds "
+            f"{projection_p95:.2f}ms exceeds "
             f"{args.max_native_projection_p95_ms:.2f}ms",
+            file=sys.stderr,
+        )
+        return 1
+    if projection_hard_max > args.hard_max_native_projection_p95_ms:
+        print(
+            f"bench-rendering: native projection batch p95 "
+            f"{projection_hard_max:.2f}ms exceeds hard max "
+            f"{args.hard_max_native_projection_p95_ms:.2f}ms",
             file=sys.stderr,
         )
         return 1

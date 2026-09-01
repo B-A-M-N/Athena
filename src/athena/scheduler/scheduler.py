@@ -230,15 +230,27 @@ class Scheduler:
         store: ScheduleStore,
         task_manager: Any,
         *,
+        admission: Any = None,
         max_concurrent: int = 0,
         loop_interval_seconds: float = 1.0,
     ) -> None:
         self._store = store
         self._tm = task_manager
+        self._admission = admission
         self._max_concurrent = max_concurrent
         self._loop_interval = loop_interval_seconds
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._health: dict[str, Any] = {
+            "started_at": None,
+            "last_tick_at": None,
+            "last_success_at": None,
+            "last_error_at": None,
+            "last_error": None,
+            "consecutive_failures": 0,
+            "reconciliation_failures": 0,
+            "health": "stopped",
+        }
 
     async def tick(self, now: datetime | None = None) -> int:
         """Claim and enqueue due jobs for this tick. Returns number fired."""
@@ -258,6 +270,13 @@ class Scheduler:
         return fires
 
     async def notify_event(self, event: Any) -> int:
+        try:
+            return await self._notify_event(event)
+        except Exception as exc:
+            self._record_error(exc)
+            raise
+
+    async def _notify_event(self, event: Any) -> int:
         """Fire matching EVENT jobs using the same durable claim path.
 
         The event ID is the occurrence identity. Replayed or multiply-delivered
@@ -297,6 +316,7 @@ class Scheduler:
                 continue
             await self._fire_claim(job, _to_claim(claim), event=event)
             fired += 1
+        self._record_success()
         return fired
 
     async def _fire_claim(self, job: dict, claim: Claim, *, event: Any = None) -> None:
@@ -311,14 +331,24 @@ class Scheduler:
             }
         template = replace(template, metadata=metadata)
         spec = template.build_task_spec(job["id"], occurrence_key=occurrence_key)
+        created = None
         try:
+            if self._admission is not None:
+                result = self._admission(spec)
+                if asyncio.iscoroutine(result):
+                    await result
             created = await self._tm.create(spec)
+            if created is None:
+                raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")
+            await self._tm.enqueue(created.id)
         except Exception:
-            await self._store.release_claim(claim.claim_id, job["id"], claim.scheduled_for)
+            # A successful create followed by enqueue failure leaves a real
+            # CREATED task that reconciliation can enqueue. Releasing that
+            # claim would permit a duplicate Task for the same occurrence.
+            if created is None:
+                await self._store.release_claim(claim.claim_id, job["id"], claim.scheduled_for)
             raise
-        task_id = created.id if created is not None else None
-        if task_id is not None:
-            await self._tm.enqueue(task_id)
+        task_id = created.id
         trigger = _trigger_from_job(job)
         disable = bool(
             trigger is not None
@@ -360,7 +390,14 @@ class Scheduler:
         """Start the background tick loop."""
         if self._task is not None and not self._task.done():
             return
-        await self.reconcile()
+        self._health["started_at"] = utcnow().isoformat()
+        self._health["health"] = "recovering"
+        try:
+            await self.reconcile()
+        except Exception as exc:
+            self._record_error(exc, reconciliation=True)
+            self._health["health"] = "failed"
+            raise
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
 
@@ -373,7 +410,29 @@ class Scheduler:
         its metadata) the occurrence is marked FIRED; otherwise it is released
         so the next tick reclaims and retries it.
         """
-        await self._store.reconcile_stale_occurrences()
+        reconcile = self._store.reconcile_stale_occurrences
+        if isinstance(self._store, ScheduleStore):
+            await reconcile(
+                task_manager=self._tm,
+                next_run_resolver=self._recovery_schedule,
+            )
+        else:
+            # Keep small test/embedding stores compatible with the original
+            # zero-argument reconciliation protocol.
+            await reconcile()
+
+    async def _recovery_schedule(
+        self, job: dict[str, Any], scheduled_for: str
+    ) -> tuple[str | None, bool]:
+        next_run, exhausted = self._next_run(
+            job,
+            Claim(claim_id="recovery", job_id=str(job["id"]), scheduled_for=scheduled_for),
+        )
+        trigger = _trigger_from_job(job)
+        disable = exhausted
+        if trigger is not None and trigger.times is not None:
+            disable = disable or await self._store.count_runs(job["id"]) >= trigger.times
+        return next_run, disable
 
     async def stop(self) -> None:
         self._stop.set()
@@ -383,6 +442,7 @@ class Scheduler:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
             self._task = None
+        self._health["health"] = "stopped"
 
     def is_running(self) -> bool:
         """True iff the background tick loop task exists and is not done.
@@ -396,28 +456,67 @@ class Scheduler:
             self._task.done() if hasattr(self._task, "done") else True
         )
 
+    def health(self) -> dict[str, Any]:
+        """Return scheduler health independently of coroutine liveness."""
+        report = dict(self._health)
+        report["running"] = self.is_running()
+        # Compatibility for embedders that install a live loop task directly;
+        # a real start() always moves the state to recovering first.
+        if report["running"] and report["health"] == "stopped":
+            report["health"] = "healthy"
+        return report
+
+    def _record_error(self, exc: Exception, *, reconciliation: bool = False) -> None:
+        now = utcnow().isoformat()
+        self._health["last_error_at"] = now
+        self._health["last_error"] = str(exc)
+        self._health["consecutive_failures"] = int(self._health.get("consecutive_failures", 0)) + 1
+        if reconciliation:
+            self._health["reconciliation_failures"] = (
+                int(self._health.get("reconciliation_failures", 0)) + 1
+            )
+        self._health["health"] = (
+            "failed" if self._health["consecutive_failures"] >= 3 else "degraded"
+        )
+
+    def _record_success(self) -> None:
+        previous = str(self._health.get("health") or "")
+        self._health["last_success_at"] = utcnow().isoformat()
+        self._health["consecutive_failures"] = 0
+        self._health["health"] = "recovering" if previous == "failed" else "healthy"
+
     async def _run(self) -> None:
         # Give callers one scheduling turn after startup to finish durable
         # setup or perform an explicit tick.  Immediate first-pass polling
         # makes a due occurrence race with recovery/bootstrap code.
         try:
-            await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
-        except asyncio.TimeoutError:
-            pass
-        while not self._stop.is_set():
-            try:
-                await self.tick()
-            except Exception as exc:
-                _logger.warning("scheduler tick failed: %s", exc)
-                # If a claim was left open, attempt immediate reconciliation
-                try:
-                    await self.reconcile()
-                except Exception:
-                    pass
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
             except asyncio.TimeoutError:
-                continue
+                pass
+            while not self._stop.is_set():
+                self._health["last_tick_at"] = utcnow().isoformat()
+                try:
+                    await self.tick()
+                except Exception as exc:
+                    self._record_error(exc)
+                    _logger.warning("scheduler tick failed: %s", exc)
+                    # If a claim was left open, attempt immediate reconciliation
+                    try:
+                        await self.reconcile()
+                    except Exception as reconcile_error:
+                        self._record_error(reconcile_error, reconciliation=True)
+                        _logger.warning("scheduler reconciliation failed: %s", reconcile_error)
+                else:
+                    self._record_success()
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
+                except asyncio.TimeoutError:
+                    continue
+        except Exception as exc:
+            self._record_error(exc)
+            self._health["health"] = "failed"
+            raise
 
 
 def _filters_match(filters: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:

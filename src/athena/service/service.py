@@ -504,6 +504,7 @@ class AthenaService:
             events=events,
             sessions=sessions,
             budgets=budgets,
+            admission=self.require_task_ready,
         )
         self._task_manager = task_manager
 
@@ -638,7 +639,13 @@ class AthenaService:
         self._kernel = kernel
 
         # 11. Delegation (needs kernel).
-        delegation = DelegationManager(task_manager=task_manager, kernel=kernel, budgets=budgets)
+        delegation = DelegationManager(
+            task_manager=task_manager,
+            kernel=kernel,
+            budgets=budgets,
+            cancellations=cancellations,
+            execution_manager=execution,
+        )
         self._delegation = delegation
 
         # 12. Register core capabilities (bind executors to current handles).
@@ -718,6 +725,7 @@ class AthenaService:
         scheduler = Scheduler(
             store=schedules,
             task_manager=task_manager,
+            admission=self.require_task_ready,
             max_concurrent=cfg.scheduler_max_concurrent,
             loop_interval_seconds=cfg.scheduler_interval_seconds,
         )
@@ -750,6 +758,9 @@ class AthenaService:
             if restored:
                 _logger.info("rehydrated %d maintenance observers", restored)
         except Exception as exc:
+            self._watch_registry.record_rehydration_failure(
+                exc, contract_id="maintenance_contracts"
+            )
             _logger.warning("maintenance observer rehydration failed: %s", exc)
 
         # 12.5 Crash recovery: reconcile orphaned state before claiming new work.
@@ -1114,6 +1125,15 @@ class AthenaService:
             "status": self._startup_health.get("status", "not_started"),
             "checks": checks,
             "blocking_failures": list(self._startup_health.get("blocking_failures") or ()),
+        }
+
+    def runtime_health(self) -> dict[str, Any]:
+        """Return live subsystem health for reflection and operator APIs."""
+        scheduler = getattr(self, "_scheduler", None)
+        watches = getattr(self, "_watch_registry", None)
+        return {
+            "scheduler": scheduler.health() if scheduler is not None else {"health": "stopped"},
+            "watch": watches.health() if watches is not None else {"health": "stopped"},
         }
 
     async def hermes_referee_status(self) -> dict[str, Any]:
@@ -4242,6 +4262,7 @@ class AthenaService:
                 policy_engine=self._policy,
                 approval_store=self._store_approvals,
                 health_provider=self._capability_health,
+                runtime_health_provider=self.runtime_health,
                 model_provider=lambda: self._model_registry,
                 mcp_status_provider=lambda: {
                     **{client.connection_id: "connected" for client in self._mcp_clients},
@@ -4460,7 +4481,8 @@ class AthenaService:
             if events is None:
                 try:
                     events = self._require_events()
-                except Exception:
+                except Exception as exc:
+                    registry.record_poll_error(exc)
                     continue
 
             async def sink(type_, payload, task_id=None):
@@ -4475,7 +4497,11 @@ class AthenaService:
             try:
                 await registry.poll_all(sink)
             except Exception as exc:
-                _logger.debug("watch poll error: %s", exc)
+                registry.record_poll_error(exc)
+                _logger.warning("watch poll error: %s", exc)
+            else:
+                if not registry.poll_had_error:
+                    registry.record_poll_success()
 
     async def _invalidate_watch_claims(self, payload: Mapping[str, Any]) -> None:
         """Invalidate claims affected by an observed external change."""
@@ -4948,6 +4974,30 @@ class AthenaService:
         state when no provider is configured. That state is not an admission
         state: every caller must pass through this service-owned predicate.
         """
+        await self._require_provider_ready()
+        if request is None:
+            return
+        base_policy = request.model_policy or _default_model_policy()
+        criteria = (
+            request.metadata.get("acceptance_criteria")
+            if isinstance(request.metadata, Mapping)
+            else None
+        )
+        await self._admit_model_roles(
+            base_policy,
+            self._required_model_roles(base_policy, request.metadata, criteria=criteria),
+        )
+
+    async def require_task_ready(self, spec: TaskSpec) -> None:
+        """Admit every model-backed Task before it enters durable state."""
+        await self._require_provider_ready()
+        policy = spec.model_policy or _default_model_policy()
+        await self._admit_model_roles(
+            policy,
+            self._required_model_roles(policy, spec.metadata, criteria=spec.acceptance_criteria),
+        )
+
+    async def _require_provider_ready(self) -> None:
         registry = self._model_registry
         if registry is None:
             readiness = {"state": "unconfigured"}
@@ -4967,24 +5017,55 @@ class AthenaService:
                 "No usable model provider is ready. Configure credentials and provider readiness before submitting agent work.",
                 provider_state=readiness.get("state", "unconfigured"),
             )
-        if request is None:
-            return
+
+    async def _admit_model_roles(self, base_policy, roles: set[str]) -> None:
         router = self._router
         if router is None:
             raise ModelProviderUnconfigured(
                 "Model routing is not initialized; agent work cannot be admitted.",
                 provider_state="unconfigured",
             )
-        try:
-            await router.select(policy=request.model_policy)
-        except ProviderError as exc:
-            allowed = list((request.model_policy.allowed if request.model_policy else ()) or ())
-            raise ModelProviderUnconfigured(
-                "No ready model satisfies this request's provider, role, capability, or policy constraints.",
-                provider_state="request_unavailable",
-                allowed_models=allowed,
-                role=(request.model_policy.role if request.model_policy else "primary"),
-            ) from exc
+        for role in sorted(roles, key=lambda value: (value != "primary", value)):
+            policy = base_policy if role == base_policy.role else replace(base_policy, role=role)
+            try:
+                await router.select(policy=policy)
+            except ProviderError as exc:
+                raise ModelProviderUnconfigured(
+                    "No ready model satisfies this task's provider, role, capability, or policy constraints.",
+                    provider_state="request_unavailable",
+                    allowed_models=list(policy.allowed or ()),
+                    role=role,
+                ) from exc
+
+    @staticmethod
+    def _required_model_roles(
+        policy,
+        metadata: Mapping[str, Any] | None = None,
+        *,
+        criteria: Any = None,
+    ) -> set[str]:
+        roles = {"primary"}
+        role = str(getattr(policy, "role", "primary") or "primary")
+        if role:
+            roles.add(role)
+        for item in criteria or ():
+            if isinstance(item, str):
+                if not item.strip().lower().startswith("command:"):
+                    roles.add("judge")
+                continue
+            verification = getattr(item, "verification", None)
+            raw_type = getattr(getattr(verification, "type", None), "value", None)
+            raw_type = raw_type or getattr(verification, "type", None)
+            if str(raw_type or "").casefold() == "model_judgment":
+                roles.add("judge")
+        data = metadata or {}
+        for key in ("mandatory_model_roles", "required_model_roles", "mandatory_roles"):
+            raw_roles = data.get(key) if isinstance(data, Mapping) else None
+            if isinstance(raw_roles, str):
+                raw_roles = (raw_roles,)
+            if isinstance(raw_roles, (list, tuple, set, frozenset)):
+                roles.update(str(value).strip() for value in raw_roles if str(value).strip())
+        return roles
 
     def _require_task_manager(self) -> TaskManager:
         if self._task_manager is None:

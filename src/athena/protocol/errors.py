@@ -109,6 +109,13 @@ class RequestCancelled(AthenaError):
     code = "request_cancelled"
 
 
+class CancellationUncertain(TaskError):
+    """Cancellation was requested but terminal cancellation is unproven."""
+
+    code = "cancellation_uncertain"
+    retryable = True
+
+
 class Cancelled(RequestCancelled):
     code = "cancelled"
 
@@ -175,6 +182,7 @@ __all__ = [
     "TaskBudgetExceeded",
     "TaskDeadlineExceeded",
     "IllegalStateTransition",
+    "CancellationUncertain",
     "ProviderError",
     "ProviderAuthenticationError",
     "ProviderRateLimitError",

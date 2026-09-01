@@ -18,16 +18,19 @@ mkdir -p "$output_dir"
 # A release directory is an exact-artifact boundary. Remove only its direct
 # files so an earlier build cannot be mistaken for a publishable artifact.
 find "$output_dir" -mindepth 1 -maxdepth 1 -type f -delete
+distributions_dir="$output_dir/distributions"
+mkdir -p "$distributions_dir"
+find "$distributions_dir" -mindepth 1 -maxdepth 1 -type f -delete
 
 # Build every publish artifact once into one immutable directory. Acceptance
 # receives these exact paths and the manifest below records their inputs.
-scripts/build-native-package --output-dir "$output_dir"
+scripts/build-native-package --output-dir "$distributions_dir"
 # setuptools reuses ``build/`` and can otherwise carry a removed native
 # payload from an earlier developer build into the universal wheel.
 rm -rf "$repo_root/build"
-"${build_python[@]}" -m build --no-isolation --wheel --sdist --outdir "$output_dir" .
+"${build_python[@]}" -m build --no-isolation --wheel --sdist --outdir "$distributions_dir" .
 
-"${build_python[@]}" - "$output_dir" <<'PY'
+"${build_python[@]}" - "$output_dir" "$distributions_dir" <<'PY'
 import hashlib
 import json
 import os
@@ -40,7 +43,11 @@ from pathlib import Path
 import tomllib
 
 out = Path(sys.argv[1]).resolve()
+distributions = Path(sys.argv[2]).resolve()
 root = Path.cwd()
+import sys as _sys
+_sys.path.insert(0, str(root / "src"))
+from athena.release.native_abi import inspect_native_abi
 
 
 def run(*args: str) -> str:
@@ -108,12 +115,19 @@ host = (
     else platform.machine()
 )
 artifacts = [
-    {"path": str(path), "sha256": sha(path), "size": path.stat().st_size}
-    for path in sorted(out.iterdir())
-    if path.is_file() and path.name != "release-manifest.json"
+    {
+        "path": str(Path("distributions") / path.name),
+        "sha256": sha(path),
+        "size": path.stat().st_size,
+    }
+    for path in sorted(distributions.iterdir())
+    if path.is_file()
 ]
 native_dynamic = run("readelf", "-d", str(binary))
 needed = re.findall(r"Shared library: \[([^]]+)\]", native_dynamic)
+native_abi = inspect_native_abi(binary)
+if native_abi["status"] != "PASS":
+    raise SystemExit("native ABI policy failed: " + "; ".join(native_abi["violations"]))
 alacritty_match = re.search(
     r'name = "alacritty_terminal"\nversion = "[^"]+"\n'
     r'source = "git\+[^#]+#([0-9a-f]+)"',
@@ -145,6 +159,7 @@ record = {
         "needed": needed,
         "dynamic_section": native_dynamic,
     },
+    "native_abi_policy": native_abi,
     "bridge_schema_version": int(bridge_version),
     "artifacts": artifacts,
 }

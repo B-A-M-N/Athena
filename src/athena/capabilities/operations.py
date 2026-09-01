@@ -224,6 +224,7 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "enable": frozenset({EffectClass.WRITE_LOCAL}),
         "disable": frozenset({EffectClass.WRITE_LOCAL}),
         "delete": frozenset({EffectClass.WRITE_LOCAL}),
+        "reconcile": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
     },
     "skills": {
         "search": frozenset({EffectClass.READ_LOCAL}),

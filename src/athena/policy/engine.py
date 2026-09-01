@@ -37,6 +37,7 @@ _READ_OPS = frozenset({"read", "list", "stat", "read_text", "get", "exists", "op
 _PATHLESS_WRITE_CAPABILITIES = frozenset(
     {
         "memory",
+        "maintain",
         "schedule",
         "synthesis",
         "workflow",

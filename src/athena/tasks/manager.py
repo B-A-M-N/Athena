@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
@@ -86,12 +87,14 @@ class TaskManager:
         sessions: SessionRepository | None = None,
         budgets: Any = None,
         cancellations: Any = None,
+        admission: Any = None,
     ) -> None:
         self._store = task_store
         self._events = events
         self._sessions = sessions
         self._budgets = budgets
         self._cancellations = cancellations
+        self._admission = admission
         self._running_emitted: set[str] = set()
         # Optional post-finalization observers (knowledge pipeline). Each is an
         # async callable ``(task, result)`` invoked AFTER the terminal state is
@@ -116,6 +119,10 @@ class TaskManager:
         """Late-bind the cancellation authority (construction-order tolerant, §20)."""
         self._cancellations = cancellations
 
+    def set_admission(self, admission: Any) -> None:
+        """Late-bind the service-owned task admission predicate."""
+        self._admission = admission
+
     def set_wakeup_callback(self, callback: Any) -> None:
         """Bind the local worker wakeup without making it task authority."""
         self._wakeup_callback = callback
@@ -132,6 +139,13 @@ class TaskManager:
     # Creation / intake (BHV-002, BHV-011..013)
     # ------------------------------------------------------------------ #
     async def create(self, spec: TaskSpec) -> Task:
+        # Admission must precede session allocation and the durable Task row.
+        # This is the canonical boundary shared by API, scheduler, delegation,
+        # ACP, self-host, and future Task producers.
+        if self._admission is not None:
+            result = self._admission(spec)
+            if inspect.isawaitable(result):
+                await result
         await self._ensure_session(spec)
         await self._store.insert_task(
             spec.id,
@@ -162,7 +176,12 @@ class TaskManager:
             return
         existing = await self._sessions.get(spec.session_id)
         if existing is None:
-            await self._sessions.create(spec.session_id)
+            parent_session_id = None
+            if spec.parent_task_id:
+                parent = await self._store.get(spec.parent_task_id)
+                if parent is not None:
+                    parent_session_id = parent.get("session_id")
+            await self._sessions.create(spec.session_id, parent_id=parent_session_id)
 
     async def enqueue(self, task_id: str) -> Task:
         await self.transition(task_id, TaskStatus.QUEUED)

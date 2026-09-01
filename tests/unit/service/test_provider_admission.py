@@ -74,3 +74,41 @@ async def test_role_pinned_unready_provider_fails_then_admits_when_ready():
 
     missing.state = "ready"
     await service.require_agent_ready(request)
+
+
+@pytest.mark.asyncio
+async def test_model_judgment_preflights_unready_judge_role():
+    service, _ = _service_with_routes()
+    request = AgentRequest(
+        prompt="judge this",
+        metadata={"acceptance_criteria": ["the result is correct"]},
+    )
+
+    with pytest.raises(ModelProviderUnconfigured) as error:
+        await service.require_agent_ready(request)
+    assert error.value.data["role"] == "judge"
+
+
+@pytest.mark.asyncio
+async def test_mandatory_judge_does_not_hide_unready_primary_role():
+    primary = _ReadinessFake("model-a", "auth_missing", provider="provider-a")
+    judge = _ReadinessFake("model-b", "ready", provider="provider-b")
+    registry = ProviderRegistry()
+    registry.register("provider-a", primary)
+    registry.register("provider-b", judge)
+    service = AthenaService()
+    service._model_registry = registry
+    service._router = ModelRouter(
+        registry,
+        role_policies={"judge": ModelPolicy(role="judge", allowed=("provider-b/model-b",))},
+    )
+
+    with pytest.raises(ModelProviderUnconfigured) as error:
+        await service.require_agent_ready(
+            AgentRequest(
+                prompt="judge this",
+                model_policy=ModelPolicy(allowed=("provider-a/model-a",)),
+                metadata={"acceptance_criteria": ["the result is correct"]},
+            )
+        )
+    assert error.value.data["role"] == "primary"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import inspect
 import os
 import platform
 import re
@@ -76,6 +77,7 @@ class CapabilityReflection:
         policy_engine=None,
         approval_store=None,
         health_provider=None,
+        runtime_health_provider=None,
         model_provider=None,
         mcp_status_provider=None,
         delegate_provider=None,
@@ -88,6 +90,7 @@ class CapabilityReflection:
         self._policy = policy_engine
         self._approvals = approval_store
         self._health = health_provider
+        self._runtime_health = runtime_health_provider
         self._models = model_provider
         self._mcp_status = mcp_status_provider
         self._delegates = delegate_provider
@@ -740,6 +743,24 @@ class CapabilityReflection:
         context=None,
     ) -> dict:
         """Summarize the effective machine/task surface in one graph."""
+        subsystem_health: dict[str, Any] = {}
+        if self._runtime_health is not None:
+            try:
+                raw_health = self._runtime_health()
+                if inspect.isawaitable(raw_health):
+                    raw_health = await raw_health
+                if isinstance(raw_health, Mapping):
+                    subsystem_health = {
+                        str(name): dict(value) if isinstance(value, Mapping) else value
+                        for name, value in raw_health.items()
+                    }
+            except Exception as exc:  # noqa: BLE001 - reflection is advisory
+                subsystem_health = {
+                    "service_runtime": {
+                        "health": "unavailable",
+                        "error": str(exc),
+                    }
+                }
         capabilities = []
         for descriptor in self._fabric.list_descriptors(
             task_id=task_id,
@@ -1067,6 +1088,12 @@ class CapabilityReflection:
             and any(item["availability"] == "available" for item in backend_records)
             and any(item["availability"] == "available" for item in runtime_records)
             and self._execution is not None
+            and not any(
+                isinstance(item, Mapping)
+                and str(item.get("health") or "").casefold()
+                in {"degraded", "failed", "unavailable"}
+                for item in subsystem_health.values()
+            )
             else "PARTIAL"
         )
         return {
@@ -1113,6 +1140,7 @@ class CapabilityReflection:
             "environment": environment_record,
             "workspace": workspace_record,
             "environment_fingerprint": environment_fingerprint,
+            "subsystems": subsystem_health,
         }
 
     async def _describe_workflow(self, workflow_id: str, *, task_id, project_id, user_id) -> dict:

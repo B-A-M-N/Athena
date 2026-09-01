@@ -34,12 +34,12 @@ def main(argv: list[str] | None = None) -> int:
     result_path = evidence / "final-release-result.json"
     manifest_path = evidence / "release-manifest.json"
     identity_path = evidence / "release-identity.json"
-    artifact_dir = evidence / "release-artifacts"
+    artifact_dir = evidence / "distributions"
     for path in (result_path, manifest_path, identity_path):
         if not path.is_file():
             return fail(f"missing evidence file {path.name}")
     if not artifact_dir.is_dir():
-        return fail("missing release-artifacts directory")
+        return fail("missing distributions directory")
 
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -72,7 +72,10 @@ def main(argv: list[str] | None = None) -> int:
     for entry in entries:
         if not isinstance(entry, dict):
             return fail("artifact manifest contains a malformed entry")
-        source_name = Path(str(entry.get("path", ""))).name
+        source_path = Path(str(entry.get("path", "")))
+        if source_path.parent != Path("distributions"):
+            return fail(f"artifact is outside distributions boundary: {source_path}")
+        source_name = source_path.name
         if source_name in expected_names or not source_name.endswith((".whl", ".tar.gz")):
             return fail(f"invalid or duplicate artifact name {source_name!r}")
         expected_names.add(source_name)
@@ -84,13 +87,16 @@ def main(argv: list[str] | None = None) -> int:
         if sha256(path) != entry.get("sha256"):
             return fail(f"SHA-256 mismatch for {source_name}")
 
-    actual_names = {
-        path.name
-        for path in artifact_dir.iterdir()
-        if path.is_file() and path.name != "release-manifest.json"
-    }
+    actual_entries = list(artifact_dir.iterdir())
+    if any(not path.is_file() for path in actual_entries):
+        return fail("distributions directory contains a non-file entry")
+    actual_names = {path.name for path in actual_entries}
     if actual_names != expected_names:
         return fail("downloaded artifacts differ from the certified manifest")
+    if any("native" in name for name in expected_names):
+        abi = manifest.get("native_abi_policy")
+        if not isinstance(abi, dict) or abi.get("status") != "PASS":
+            return fail("native artifact is missing a passing ABI policy result")
     print(f"verify-release-evidence: PASS {args.sha} {manifest['python_version']}")
     return 0
 

@@ -176,6 +176,7 @@ def release_commands(
                     "-p",
                     "no:cacheprovider",
                     "tests/e2e/test_artifact_store_wiring.py",
+                    "tests/e2e/test_failure_semantics.py",
                     "tests/e2e/test_release_black_box.py",
                     "tests/e2e/test_real_execution.py",
                     "tests/e2e/test_session_resume.py",

@@ -194,7 +194,13 @@ class ACPAdapter:
             raise RuntimeError(
                 "ACPAdapter requires the service-owned admission callback before task intake"
             )
-        admitted = self._admission(request)
+        # Decode the mapping-form policy before admission. A provisional
+        # typed TaskSpec lets the service validate the actual requested model
+        # roles before ACP allocates a session or persists a Task.
+        provisional = self.to_task_spec(
+            replace(request, task_id=task_id, session_id=request.session_id)
+        )
+        admitted = self._admission(provisional)
         if inspect.isawaitable(admitted):
             await admitted
         session_id = request.session_id or await self._ensure_session(request)

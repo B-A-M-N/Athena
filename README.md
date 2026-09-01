@@ -562,10 +562,14 @@ active TTY and falls back safely when graphics support is not confirmed.
 is unavailable. ANSI is the safe default/fallback and keeps the same scene
 semantics in cell text. The native Athena terminal frontend is documented in
 [`docs/NATIVE_TERMINAL_FRONTEND.md`](docs/NATIVE_TERMINAL_FRONTEND.md). A
-release emits one universal Python wheel/sdist plus a Python-ABI-neutral but
-Linux/architecture-specific platform-tagged `athena-agent-native` companion
-wheel containing the native executable. Python-ABI-neutral does not mean
-OS-, libc-, CPU-, or platform-neutral; install the exact matching pair with
+release emits one universal Python wheel/sdist plus a Linux/architecture-specific
+platform-tagged `athena-agent-native` companion wheel containing the native
+executable. The companion uses a `py3-none` wheel tag because it is not a
+CPython extension, but its ELF ABI is explicitly Linux x86_64 GNU/glibc >= 2.34
+and requires X11, Xft, and OpenGL; the release linker policy separately caps
+imported GLIBC symbols at 2.34 and requires those libraries to remain linked.
+It is not OS-, libc-, CPU-, or platform-neutral.
+Install the exact matching pair with
 `pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`. It remains separate from the
 default hosted Glass CLI surface.
 `athena native` launches the native AthenaBOX frontend with a Python service session inside

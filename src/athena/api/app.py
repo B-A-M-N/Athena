@@ -448,6 +448,15 @@ def _health_handler(service: Any) -> Any:
                 database_error = str(exc)
         worker = getattr(service, "_worker", None)
         worker_health = worker.health() if worker is not None and hasattr(worker, "health") else {}
+        runtime_health = service.runtime_health() if hasattr(service, "runtime_health") else {}
+        scheduler = getattr(service, "_scheduler", None)
+        scheduler_health = runtime_health.get("scheduler") or (
+            scheduler.health() if scheduler is not None and hasattr(scheduler, "health") else {}
+        )
+        scheduler_running = scheduler is not None and bool(
+            getattr(scheduler, "is_running", lambda: False)()
+        )
+        scheduler_state = str(scheduler_health.get("health") or "")
         startup = service.startup_health() if hasattr(service, "startup_health") else None
         # Optional startup integrations may be degraded while the core
         # service remains ready.  Their state is returned below for operators;
@@ -462,8 +471,8 @@ def _health_handler(service: Any) -> Any:
                 and not getattr(service._worker_task, "done", lambda: True)()
             ),
             "scheduler": (
-                getattr(service, "_scheduler", None) is not None
-                and bool(getattr(service._scheduler, "is_running", lambda: False)())
+                scheduler_running
+                and (not scheduler_health or scheduler_state in {"healthy", "recovering"})
             ),
             "providers": _providers_ready(getattr(service, "_model_registry", None)),
             "worker_persistence": worker_health.get("status", "ok") == "ok",
@@ -475,6 +484,8 @@ def _health_handler(service: Any) -> Any:
         details = {
             "checks": checks,
             "worker": worker_health,
+            "scheduler": scheduler_health,
+            "subsystems": runtime_health,
             "provider_readiness": _provider_readiness(getattr(service, "_model_registry", None)),
         }
         if startup is not None:

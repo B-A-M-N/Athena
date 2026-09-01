@@ -49,6 +49,7 @@ class MaintenanceCapability:
                         "enable",
                         "disable",
                         "delete",
+                        "reconcile",
                     ],
                 },
                 "contract_id": {"type": "string", "minLength": 1, "maxLength": 128},
@@ -90,6 +91,9 @@ class MaintenanceCapability:
                     },
                     "required": ["contract_id"],
                 },
+                {
+                    "properties": {"operation": {"const": "reconcile"}},
+                },
             ],
             "additionalProperties": False,
         },
@@ -130,18 +134,36 @@ class MaintenanceCapability:
             contracts = await self._contracts(owner)
         except Exception as exc:
             _logger.warning("maintenance contract rehydration lookup failed: %s", exc)
+            self._watch_registry.record_rehydration_failure(
+                exc, contract_id="maintenance_contracts"
+            )
             return 0
+        # A successful durable-contract lookup proves the aggregate lookup
+        # failure has been reconciled; individual watcher failures remain
+        # tracked by their exact contract/watch identity below.
+        self._watch_registry.record_rehydration_resolved(contract_id="maintenance_contracts")
         for contract in contracts:
             if contract.get("status") != "ACTIVE":
                 continue
+            contract_id = str(contract.get("contract_id") or "") or None
+            observe = contract.get("observe") or {}
+            watch_id = str(observe.get("watch_id") or "") or None
             try:
                 if await self._ensure_watch(contract, workspace=self._workspace):
                     restored += 1
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    self._watch_registry.record_rehydration(
+                        1, watch_id=watch_id, contract_id=contract_id
+                    )
+                else:
+                    raise ValueError("active maintenance observer was not restored")
+            except Exception as exc:
                 _logger.warning(
                     "maintenance observer %s could not be restored: %s",
                     contract.get("contract_id"),
                     exc,
+                )
+                self._watch_registry.record_rehydration_failure(
+                    exc, watch_id=watch_id, contract_id=contract_id
                 )
         return restored
 
@@ -156,6 +178,9 @@ class MaintenanceCapability:
         try:
             if operation == "create":
                 return await self._create(request, args, owner, context=context)
+            if operation == "reconcile":
+                restored = await self.rehydrate()
+                return _result(request, output=json.dumps({"restored": restored}))
             contracts = await self._contracts(owner)
             contract_id = str(args.get("contract_id") or "")
             selected = next(
@@ -417,6 +442,10 @@ class MaintenanceCapability:
                 workspace=workspace,
                 observer_id=observer_id,
             )
+            self._watch_registry.record_rehydration_resolved(
+                watch_id=watch_id,
+                contract_id=str(contract.get("contract_id") or "") or None,
+            )
             return True
 
         pid = int(values.get("pid") or 0)
@@ -440,6 +469,10 @@ class MaintenanceCapability:
             watch_id=watch_id,
             workspace=workspace,
             observer_id=observer_id,
+        )
+        self._watch_registry.record_rehydration_resolved(
+            watch_id=watch_id,
+            contract_id=str(contract.get("contract_id") or "") or None,
         )
         return True
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import inspect
 from typing import Any
 
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
+from athena.protocol.tasks import TaskStatus
 from athena.state.database import Database
 
 
@@ -119,26 +121,23 @@ class ScheduleStore:
             return None
         claim_id = new_id("job")
         now = self._now_iso()
-        try:
-            async with self._db.transaction():
-                await self._db.execute_raw(
-                    "UPDATE scheduled_jobs SET last_run = ? WHERE id = ?",
-                    (scheduled_for, job_id),
-                )
-                exists = await self._db.fetch_one_raw(
-                    "SELECT id FROM job_runs WHERE job_id = ? AND scheduled_for = ?",
-                    (job_id, scheduled_for),
-                )
-                if exists is not None:
-                    return None
-                await self._db.execute_raw(
-                    "INSERT INTO job_runs("
-                    "id, job_id, scheduled_for, claim_id, started_at, status"
-                    ") VALUES (?, ?, ?, ?, ?, ?)",
-                    (claim_id, job_id, scheduled_for, claim_id, now, "CLAIMED"),
-                )
-        except Exception:
-            return None
+        async with self._db.transaction():
+            await self._db.execute_raw(
+                "UPDATE scheduled_jobs SET last_run = ? WHERE id = ?",
+                (scheduled_for, job_id),
+            )
+            exists = await self._db.fetch_one_raw(
+                "SELECT id FROM job_runs WHERE job_id = ? AND scheduled_for = ?",
+                (job_id, scheduled_for),
+            )
+            if exists is not None:
+                return None
+            await self._db.execute_raw(
+                "INSERT INTO job_runs("
+                "id, job_id, scheduled_for, claim_id, started_at, status"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (claim_id, job_id, scheduled_for, claim_id, now, "CLAIMED"),
+            )
         return {
             "id": claim_id,
             "job_id": job_id,
@@ -187,15 +186,12 @@ class ScheduleStore:
         no occurrence is silently lost (§77).
         """
         now = self._now_iso()
-        try:
-            async with self._db.transaction():
-                await self._db.execute_raw("DELETE FROM job_runs WHERE id = ?", (claim_id,))
-                await self._db.execute_raw(
-                    "UPDATE scheduled_jobs SET next_run = ?, updated_at = ? WHERE id = ?",
-                    (scheduled_for, now, job_id),
-                )
-        except Exception:
-            return
+        async with self._db.transaction():
+            await self._db.execute_raw("DELETE FROM job_runs WHERE id = ?", (claim_id,))
+            await self._db.execute_raw(
+                "UPDATE scheduled_jobs SET next_run = ?, updated_at = ? WHERE id = ?",
+                (scheduled_for, now, job_id),
+            )
 
     async def mark_failed(
         self, claim_id: str, task_id: str | None = None, error: str | None = None
@@ -206,7 +202,12 @@ class ScheduleStore:
             ("FAILED", task_id, now, error, claim_id),
         )
 
-    async def reconcile_stale_occurrences(self) -> int:
+    async def reconcile_stale_occurrences(
+        self,
+        *,
+        task_manager: Any = None,
+        next_run_resolver: Any = None,
+    ) -> int:
         """Recover CLAIMED occurrences left orphaned by a crash mid-fire.
 
         Uses json_extract on the explicit _occurrence metadata key for reliable
@@ -225,13 +226,57 @@ class ScheduleStore:
             occurrence_key = f"{job_id}|{scheduled_for}"
             # Use json_extract for reliable metadata key matching
             task = await self._db.fetch_one(
-                "SELECT id FROM tasks "
+                "SELECT id, status FROM tasks "
                 "WHERE json_extract(metadata, '$._occurrence') = ? "
                 "ORDER BY created_at ASC LIMIT 1",
                 (occurrence_key,),
             )
             if task is not None:
-                await self.mark_fired(claim_id, task["id"])
+                task_id = str(task["id"])
+                try:
+                    status = TaskStatus(str(task.get("status") or ""))
+                except ValueError:
+                    await self.mark_failed(
+                        claim_id,
+                        task_id,
+                        f"occurrence-linked task has invalid status: {task.get('status')!r}",
+                    )
+                    reconciled += 1
+                    continue
+                if status is TaskStatus.CREATED:
+                    enqueue = getattr(task_manager, "enqueue", None)
+                    if not callable(enqueue):
+                        await self.mark_failed(
+                            claim_id,
+                            task_id,
+                            "occurrence-linked CREATED task cannot be re-enqueued",
+                        )
+                        reconciled += 1
+                        continue
+                    # Leave the claim CLAIMED if enqueue fails. The caller can
+                    # retry reconciliation without creating a duplicate Task.
+                    await enqueue(task_id)
+                if next_run_resolver is None:
+                    await self.mark_fired(claim_id, task_id)
+                else:
+                    job = await self.get_job_id(job_id)
+                    if job is None:
+                        await self.mark_failed(
+                            claim_id, task_id, f"scheduled job {job_id!r} is missing"
+                        )
+                        reconciled += 1
+                        continue
+                    schedule = next_run_resolver(job, scheduled_for)
+                    if inspect.isawaitable(schedule):
+                        schedule = await schedule
+                    next_run, disable = schedule
+                    await self.complete_claim(
+                        claim_id,
+                        job_id,
+                        task_id,
+                        next_run=next_run,
+                        disable=bool(disable),
+                    )
             else:
                 await self.release_claim(claim_id, job_id, scheduled_for)
             reconciled += 1
