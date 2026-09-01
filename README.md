@@ -9,10 +9,11 @@ into one durable kernel. The normative contracts live in `SPEC.md`,
 `BUILDSPEC.md`, `BEHAVIORSPEC.md`, and `RESEARCHSPEC.md`; the architectural
 overview is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-> **Status: pre-release beta.** Linux is the primary verification host; macOS
-> and Windows are compatibility targets. A release stamp requires the core
-> release gate and real X11 desktop acceptance described below. Hermes live
-> evidence is an optional integration certification.
+> **Status: Athena 0.1 stable support scope.** Linux is the certified native
+> and isolation platform. macOS and Windows native/isolation parity and other
+> unlisted integrations are outside the 0.1 support contract. A release stamp
+> requires the core release gate and real X11 desktop acceptance described
+> below. Hermes live evidence is an optional integration certification.
 
 ## Why this exists
 
@@ -26,16 +27,23 @@ checked and reused. Athena is an attempt to make that behavior durable: one
 reasoning loop, explicit authority, retained evidence, and an auditable path
 from decision to execution.
 
-This is a pre-release beta with a deliberately bounded core: capability
-should expand through evidence and disciplined construction, not through an
-unbounded collection of loosely coordinated agents.
+Athena 0.1 has a deliberately bounded core: capability should expand through
+evidence and disciplined construction, not through an unbounded collection of
+loosely coordinated agents.
 
 ## Install
 
 Requires Python 3.12 or newer.
 
 ```bash
-pip install -e ".[dev,cli,glass]"
+pip install athena-agent==0.1.0
+```
+
+On a supported Linux host, install the optional native companion alongside the
+matching runtime:
+
+```bash
+pip install "athena-agent==0.1.0" "athena-agent-native==0.1.0"
 ```
 
 The optional `glass` extra installs Pillow for the hosted raster OI renderer;
@@ -47,6 +55,7 @@ Athena is easiest to work on from an editable install. The repository provides
 small, repeatable gates for the main development loop:
 
 ```bash
+pip install -e ".[dev,cli,glass]"
 make format          # apply Ruff formatting
 make lint            # correctness-focused Ruff checks
 make typecheck       # run Mypy
@@ -508,9 +517,9 @@ the optional demo wrapper.
 ### Optional host-terminal compatibility smoke test
 
 The Termux script is an optional ANSI/PTY compatibility probe, not an
-Athena stable-beta support target or release gate. Athena's supported terminal
+Athena 0.1 stable support target or release gate. Athena's supported terminal
 surfaces are hosted Glass over Kitty Graphics Protocol (Kitty and WezTerm),
-the ANSI fallback, and the Linux native Alacritty-core beta frontend. From a
+the ANSI fallback, and the Linux native Alacritty-core frontend. From a
 checkout, run the optional probe manually:
 
 ```bash
@@ -582,7 +591,7 @@ and requires X11, Xft, and OpenGL; the release linker policy separately caps
 imported GLIBC symbols at 2.34 and requires those libraries to remain linked.
 It is not OS-, libc-, CPU-, or platform-neutral.
 Install the exact matching pair with
-`pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`. It remains separate from the
+`pip install "athena-agent==0.1.0" "athena-agent-native==0.1.0"`. It remains separate from the
 default hosted Glass CLI surface.
 `athena native` launches the native AthenaBOX frontend with a Python service session inside
 its PTY and a Unix-socket projection bridge; build the native release binary first with

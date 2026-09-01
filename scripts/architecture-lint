@@ -2,7 +2,7 @@
 """Architecture lint: mechanically check the audit's prohibited structural
 patterns in src/athena (audit item P1.32).
 
-The stable-beta audit requires that a handful of authority boundaries be
+The 0.1 stable audit requires that a handful of authority boundaries be
 enforceable by tooling, not just convention.  This script scans the source
 tree with simple, reviewable rules and exits non-zero listing every
 violation with file:line.  It never edits files and never infers a violation

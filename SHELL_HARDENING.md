@@ -56,7 +56,7 @@
 ## Current implementation matrix (2026-08-29)
 
 The sections below intentionally retain the original visual critique. The
-following matrix is the authoritative status for this beta and points to the
+following matrix is the authoritative status for this release and points to the
 current code paths:
 
 | Surface | Current truth | Evidence |

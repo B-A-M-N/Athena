@@ -16,13 +16,13 @@ def test_verify_release_evidence_accepts_frozen_manifest(tmp_path: Path) -> None
     evidence = tmp_path / "evidence"
     artifact_dir = evidence / "distributions"
     artifact_dir.mkdir(parents=True)
-    artifact = artifact_dir / "athena_agent-0.1.0b1-py3-none-any.whl"
+    artifact = artifact_dir / "athena_agent-0.1.0-py3-none-any.whl"
     artifact.write_bytes(b"certified wheel")
 
     manifest = {
         "source_sha": sha,
         "source_status": "frozen-clean",
-        "python_version": "0.1.0b1",
+        "python_version": "0.1.0",
         "artifacts": [
             {
                 "path": f"distributions/{artifact.name}",
@@ -47,7 +47,7 @@ def test_verify_release_evidence_accepts_frozen_manifest(tmp_path: Path) -> None
                 "--sha",
                 sha,
                 "--tag",
-                "v0.1.0b1",
+                "v0.1.0",
             ]
         )
         == 0
@@ -63,7 +63,7 @@ def test_verify_release_evidence_rejects_non_frozen_source(tmp_path: Path) -> No
             {
                 "source_sha": "a" * 40,
                 "source_status": "dirty",
-                "python_version": "0.1.0b1",
+                "python_version": "0.1.0",
                 "artifacts": [],
             }
         )
@@ -83,7 +83,7 @@ def test_verify_release_evidence_rejects_non_frozen_source(tmp_path: Path) -> No
                 "--sha",
                 "a" * 40,
                 "--tag",
-                "v0.1.0b1",
+                "v0.1.0",
             ]
         )
         == 1
@@ -95,13 +95,13 @@ def test_verify_release_evidence_rejects_unexpected_distribution(tmp_path: Path)
     evidence = tmp_path / "evidence"
     artifact_dir = evidence / "distributions"
     artifact_dir.mkdir(parents=True)
-    artifact = artifact_dir / "athena_agent-0.1.0b1-py3-none-any.whl"
+    artifact = artifact_dir / "athena_agent-0.1.0-py3-none-any.whl"
     artifact.write_bytes(b"certified wheel")
     (artifact_dir / "release-manifest.json").write_text("not a distribution")
     manifest = {
         "source_sha": sha,
         "source_status": "frozen-clean",
-        "python_version": "0.1.0b1",
+        "python_version": "0.1.0",
         "artifacts": [
             {
                 "path": f"distributions/{artifact.name}",
@@ -117,6 +117,4 @@ def test_verify_release_evidence_rejects_unexpected_distribution(tmp_path: Path)
     (evidence / "final-release-result.json").write_text(
         json.dumps({"commit_sha": sha, "status": "PASS", "releasable": True})
     )
-    assert (
-        _VERIFY["main"](["--evidence-dir", str(evidence), "--sha", sha, "--tag", "v0.1.0b1"]) == 1
-    )
+    assert _VERIFY["main"](["--evidence-dir", str(evidence), "--sha", sha, "--tag", "v0.1.0"])

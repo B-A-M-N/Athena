@@ -2,7 +2,7 @@
 """Run an optional ANSI/PTY compatibility probe.
 
 This tests Athena *inside a host terminal*. It does not test the native Athena
-window, and it is not a stable-beta support or release-gate target. It is a
+window, and it is not a stable support or release-gate target. It is a
 manual preview compatibility probe for Termux, tmux, CI PTYs, and ordinary
 terminals.
 

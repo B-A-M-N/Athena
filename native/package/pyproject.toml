@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "athena-agent-native"
-version = "0.1.0b1"
+version = "0.1.0"
 description = "Linux native terminal frontend for Athena Agent"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = ["athena-agent==0.1.0b1"]
+dependencies = ["athena-agent==0.1.0"]
 
 [tool.setuptools]
 packages = ["athena_native"]

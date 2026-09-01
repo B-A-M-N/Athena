@@ -1,4 +1,4 @@
-# Athena Linux terminal frontend (beta)
+# Athena Linux terminal frontend
 
 This directory contains the first native frontend boundary for the Athena
 terminal application. It is not a second agent runtime and it is not a copy of

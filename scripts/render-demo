@@ -208,7 +208,7 @@ if command -v ffmpeg >/dev/null 2>&1; then
     echo "render-demo: validated ${TMP_PATH} — ${WIDTH_HEX}x${HEIGHT_HEX}, ${DURATION_TOTAL}s, ${FRAMES} frames"
 else
     # No ffmpeg available — surface that as a validation failure rather than
-    # silently accepting an unchecked file.  Stable-beta must not accept
+    # silently accepting an unchecked file.  The stable release must not accept
     # file-existence alone as completion.
     echo "render-demo: ffmpeg not on PATH; cannot verify frame count + duration" >&2
     exit 5

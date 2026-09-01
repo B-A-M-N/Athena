@@ -1,6 +1,6 @@
 """Scenario registry: named release-gate families bound to real evidence.
 
-The stable-beta audit (items P1.29/P1.30) requires that the release gate be
+The 0.1 stable audit (items P1.29/P1.30) requires that the release gate be
 expressed as *named scenario families* with *machine-readable* pass/fail
 evidence, rather than an opaque pytest exit code.  This module is the
 declarative mapping the runner (``scripts/scenarios``) executes; it contains
