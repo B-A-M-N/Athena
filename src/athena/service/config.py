@@ -20,6 +20,7 @@ Config layering (deterministic precedence, lowest to highest):
 from __future__ import annotations
 
 import json
+from enum import StrEnum
 from importlib import import_module
 import os
 import re
@@ -38,12 +39,14 @@ except ModuleNotFoundError:  # pragma: no cover - legacy/minimal Python builds
 
 __all__ = [
     "AthenaConfig",
+    "HermesSupervisionMode",
     "HermesRefereeConfig",
     "ProviderConfig",
     "MCPConfig",
     "DEFAULT_DB_PATH",
     "load_config",
     "merge_configs",
+    "write_toml_atomic_private",
 ]
 
 
@@ -146,6 +149,14 @@ class MCPConfig:
     connect_timeout: float = 10.0
 
 
+class HermesSupervisionMode(StrEnum):
+    """Operator-selected strength of the optional Hermes boundary."""
+
+    OFF = "off"
+    ADVISORY = "advisory"
+    REQUIRED = "required"
+
+
 @dataclass(frozen=True)
 class HermesRefereeConfig:
     """Optional operator-configured Hermes Agent governance endpoint."""
@@ -161,7 +172,43 @@ class HermesRefereeConfig:
     allow_insecure_remote: bool = False
     managed: bool = False
     runtime_root: str | None = None
-    required_for_self_host: bool = True
+    # ``enabled`` controls the transport lifecycle.  Supervision policy is a
+    # separate explicit choice so an optional referee cannot become a core
+    # Athena dependency by accident.
+    self_host_supervision: str | HermesSupervisionMode | None = None
+    # Deprecated compatibility input for pre-policy config files.  It is
+    # normalized to ``self_host_supervision`` and is not serialized.
+    required_for_self_host: bool | None = None
+
+    def __post_init__(self) -> None:
+        raw_mode = self.self_host_supervision
+        if raw_mode is None:
+            if not self.enabled:
+                mode = HermesSupervisionMode.OFF
+            elif self.required_for_self_host is False:
+                mode = HermesSupervisionMode.ADVISORY
+            else:
+                mode = HermesSupervisionMode.REQUIRED
+        else:
+            try:
+                mode = HermesSupervisionMode(str(raw_mode).strip().lower())
+            except ValueError as exc:
+                valid = ", ".join(item.value for item in HermesSupervisionMode)
+                raise ValueError(
+                    f"hermes_referee.self_host_supervision must be one of: {valid}"
+                ) from exc
+        object.__setattr__(self, "self_host_supervision", mode.value)
+        object.__setattr__(self, "required_for_self_host", mode is HermesSupervisionMode.REQUIRED)
+
+    @property
+    def supervision_mode(self) -> HermesSupervisionMode:
+        """Return the normalized self-host supervision policy."""
+        return HermesSupervisionMode(str(self.self_host_supervision))
+
+    @property
+    def transport_enabled(self) -> bool:
+        """Whether the configured Hermes transport should be constructed."""
+        return self.enabled
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +385,23 @@ def _parse_hermes_referee(data: Any) -> HermesRefereeConfig:
     if timeout <= 0:
         raise ValueError("hermes_referee.timeout_seconds must be positive")
     credential_id = data.get("credential_id")
+    raw_mode = data.get("self_host_supervision")
+    legacy_required = data.get("required_for_self_host")
+    if raw_mode is None:
+        # Preserve the old configuration's secure behavior while making the
+        # new policy explicit in the normalized object.
+        enabled = bool(data.get("enabled", False))
+        mode = None
+        required_for_self_host = bool(legacy_required) if legacy_required is not None else None
+    else:
+        mode = str(raw_mode).strip().lower()
+        # Policy selection must not provision or connect a transport.  The
+        # lifecycle is enabled only by an explicit setting (or by the
+        # manager's successful setup/repair transaction).
+        enabled = bool(data.get("enabled", False))
+        required_for_self_host = None
     return HermesRefereeConfig(
-        enabled=bool(data.get("enabled", False)),
+        enabled=enabled,
         endpoint=endpoint,
         profile=profile,
         timeout_seconds=timeout,
@@ -348,7 +410,8 @@ def _parse_hermes_referee(data: Any) -> HermesRefereeConfig:
         allow_insecure_remote=bool(data.get("allow_insecure_remote", False)),
         managed=bool(data.get("managed", False)),
         runtime_root=str(data.get("runtime_root")) if data.get("runtime_root") else None,
-        required_for_self_host=bool(data.get("required_for_self_host", True)),
+        self_host_supervision=mode,
+        required_for_self_host=required_for_self_host,
     )
 
 
@@ -434,7 +497,7 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
             "allow_remote": config.hermes_referee.allow_remote,
             "allow_insecure_remote": config.hermes_referee.allow_insecure_remote,
             "managed": config.hermes_referee.managed,
-            "required_for_self_host": config.hermes_referee.required_for_self_host,
+            "self_host_supervision": config.hermes_referee.supervision_mode.value,
             **(
                 {"credential_id": config.hermes_referee.credential_id}
                 if config.hermes_referee.credential_id
@@ -605,6 +668,7 @@ def _env_map() -> dict[str, Any]:
         ("ATHENA_HERMES_REFEREE_PROFILE", "profile", str),
         ("ATHENA_HERMES_REFEREE_TIMEOUT_SECONDS", "timeout_seconds", float),
         ("ATHENA_HERMES_REFEREE_CREDENTIAL_ID", "credential_id", str),
+        ("ATHENA_HERMES_REFEREE_SELF_HOST_SUPERVISION", "self_host_supervision", str),
     )
     for env_name, key, cast in hermes_env:
         value = os.environ.get(env_name)
@@ -714,10 +778,6 @@ def save_config(config: AthenaConfig, path: str | Path) -> None:
     credential name; callers that construct a config programmatically remain
     backward-compatible until they save it.
     """
-    try:
-        import tomli_w
-    except ImportError as exc:
-        raise RuntimeError("Saving config requires tomli_w (pip install tomli_w)") from exc
     providers = []
     for provider in config.providers:
         if provider.api_key:
@@ -727,20 +787,38 @@ def save_config(config: AthenaConfig, path: str | Path) -> None:
         providers.append(provider)
     if providers != list(config.providers):
         config = replace(config, providers=tuple(providers))
+    write_toml_atomic_private(path, config_to_dict(config))
+
+
+def write_toml_atomic_private(path: str | Path, data: Mapping[str, Any]) -> None:
+    """Write TOML through an owner-private, durable atomic replacement.
+
+    This is the common writer for operator configuration.  It refuses
+    symlinked destinations and parent traversal, creates Athena-owned config
+    directories privately, fsyncs both the temporary file and its directory,
+    and removes an incomplete temporary file on failure.
+    """
+    try:
+        import tomli_w
+    except ImportError as exc:
+        raise RuntimeError("Saving config requires tomli_w (pip install tomli_w)") from exc
+
     p = Path(path)
     if p.is_symlink():
         raise ValueError(f"refusing to replace symlinked config path: {p}")
     _reject_symlinked_parents(p.parent)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(p.parent, 0o700)
+    # New Athena-owned directories are private. An existing parent may be a
+    # deliberately shared project directory and must keep its operator-chosen
+    # permissions.
+    p.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     temp_fd, temp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent))
     try:
         os.fchmod(temp_fd, 0o600)
-        with os.fdopen(temp_fd, "wb") as f:
+        with os.fdopen(temp_fd, "wb") as handle:
             temp_fd = -1
-            tomli_w.dump(config_to_dict(config), f)
-            f.flush()
-            os.fsync(f.fileno())
+            tomli_w.dump(dict(data), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temp_name, p)
         directory_fd = os.open(str(p.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:

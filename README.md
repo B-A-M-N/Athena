@@ -10,8 +10,9 @@ into one durable kernel. The normative contracts live in `SPEC.md`,
 overview is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 > **Status: pre-release beta.** Linux is the primary verification host; macOS
-> and Windows are compatibility targets. A release stamp additionally requires
-> the live Hermes lane and real X11 desktop acceptance described below.
+> and Windows are compatibility targets. A release stamp requires the core
+> release gate and real X11 desktop acceptance described below. Hermes live
+> evidence is an optional integration certification.
 
 ## Why this exists
 
@@ -56,14 +57,16 @@ make check           # run the full local verification gate
 `make format-check` verifies formatting without changing files. The release
 gate requires it to be green for the complete `src` and `tests` trees.
 
-The full release gate is `scripts/release-check --sha <clean-commit>`. It
+The core release gate is `scripts/release-check --sha <clean-commit>`. It
 includes installed wheel/sdist acceptance, the actual Bubblewrap confinement
-matrix, nested workflow/strategy recovery, native input/visual checks, and
-live Hermes referee evidence. The native input and visual lanes require a
-usable X display for their automation, and the dedicated desktop lane also
-requires a real Linux X11 display plus `xdotool` and ImageMagick;
-headless/Xvfb-unavailable results fail the release gate. `--skip-e2e` is a
-partial developer gate and does not produce a releasable result.
+matrix, nested workflow/strategy recovery, and native input/visual checks. The
+native input and visual lanes require a usable X display for their automation,
+and the dedicated desktop lane also requires a real Linux X11 display plus
+`xdotool` and ImageMagick; headless/Xvfb-unavailable results fail the core
+release gate. `--skip-e2e` is a partial developer gate and does not produce a
+releasable result. To certify the optional operator-owned Hermes integration on
+the same commit, provide its endpoint and add `--include-hermes-live`; that
+lane is recorded separately and is never required for core publication.
 
 ## Quickstart
 
@@ -176,15 +179,19 @@ changes; it is not an infinite local prompt store.
 ### Hermes Agent self-host referee
 
 Athena can send one bounded review packet at the candidate and mission
-boundaries to a local Hermes Agent profile. Hermes is advisory only: Athena's
-deterministic proof remains authoritative, and human promotion is always
-required.
+boundaries to a local Hermes Agent profile. Self-host supervision is an explicit
+policy: `off` leaves the core path independent of Hermes, `advisory` records
+Hermes evidence without changing deterministic eligibility, and `required`
+fails closed when Hermes is unavailable or returns a subtractive verdict.
+Athena's deterministic proof remains authoritative, and human promotion is
+always required.
 
 Provision the dedicated service from the Hermes checkout (the command keeps the
 bearer key out of Athena's TOML and passes it to Hermes over stdin):
 
 ```bash
-athena referee setup --hermes-root /path/to/hermes-agent
+athena referee setup --hermes-root /path/to/hermes-agent \
+  --self-host-supervision required
 athena self status
 ```
 
@@ -194,7 +201,11 @@ disables messaging, MCP, multiplexing, and background helpers, installs the
 user service, and proves the live API before enabling Athena. The live contract
 also includes `build.referee_contract = 1`, which detects a stale or different
 Hermes checkout. Re-running setup is safe; use `athena referee repair` to
-reconcile a changed runtime and `athena referee status` to inspect it.
+reconcile a changed runtime and `athena referee status` to inspect it. The
+`athena referee disable` command stops/disables the Hermes transport while
+preserving the selected self-host policy; with `required` still selected,
+self-hosting remains fail-closed until the transport is repaired or the policy
+is explicitly changed to `off`.
 
 The equivalent TOML is:
 
@@ -206,7 +217,7 @@ endpoint = "http://127.0.0.1:8643"
 profile = "athena-referee"
 timeout_seconds = 60
 runtime_root = "/path/to/hermes-agent"
-required_for_self_host = true
+self_host_supervision = "required" # off, advisory, or required
 # allow_remote = true                 # required for a non-loopback endpoint
 # allow_insecure_remote = true        # development-only HTTP exception
 # credential_id = "HERMES_REFEREE_API_KEY"
@@ -229,12 +240,13 @@ disconnected, connected-but-unsafe, and safety-verified states.
 
 Hermes is called at semantic review checkpoints, not for every tool or model
 event. Its profile should be read-only, low-temperature, and free of mutation
-tools. A transport failure or malformed response produces a hold; it cannot
-apply, promote, or write Athena changes.
+tools. In advisory mode, a transport failure or malformed response is retained
+as a hold but does not veto deterministic eligibility. Required mode retains
+the fail-closed veto; Hermes can never apply, promote, or write Athena changes.
 
 For an opt-in live transport check, set `ATHENA_HERMES_E2E_ENDPOINT` (and,
 when required, `ATHENA_HERMES_E2E_API_KEY`) and run
-`uv run --frozen --no-sync pytest -q tests/e2e/test_hermes_agent.py`.
+`ATHENA_HERMES_INTEGRATION_GATE=1 uv run --frozen --no-sync pytest -q tests/e2e/test_hermes_agent.py`.
 
 ## Architecture at a glance
 

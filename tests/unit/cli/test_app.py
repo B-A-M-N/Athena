@@ -71,6 +71,14 @@ def test_argparse_config_set_preserves_operator_key_and_value():
     assert options.config_value == "true"
 
 
+def test_argparse_referee_accepts_explicit_supervision_policy():
+    options = _arg_parse(["referee", "setup", "--self-host-supervision", "advisory"])
+
+    assert options.command == "referee"
+    assert options.referee_action == "setup"
+    assert options.referee_supervision == "advisory"
+
+
 def test_config_set_writes_hermes_referee_section(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config-home"))
 
@@ -81,6 +89,17 @@ def test_config_set_writes_hermes_referee_section(tmp_path, monkeypatch):
                 config_action="set",
                 config_key="hermes-referee.enabled",
                 config_value="true",
+            )
+        )
+        == 0
+    )
+    assert (
+        _config_set(
+            Options(
+                command="config",
+                config_action="set",
+                config_key="hermes-referee.self-host-supervision",
+                config_value="advisory",
             )
         )
         == 0
@@ -103,7 +122,24 @@ def test_config_set_writes_hermes_referee_section(tmp_path, monkeypatch):
     assert data["hermes_referee"] == {
         "enabled": True,
         "endpoint": "http://127.0.0.1:8642",
+        "self_host_supervision": "advisory",
     }
+
+
+def test_config_set_reports_the_actual_boolean_field(capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config-home"))
+
+    result = _config_set(
+        Options(
+            command="config",
+            config_action="set",
+            config_key="hermes-referee.allow-remote",
+            config_value="sometimes",
+        )
+    )
+
+    assert result == 2
+    assert "hermes-referee.allow-remote expects true or false" in capsys.readouterr().err
 
 
 class _RunSurface:

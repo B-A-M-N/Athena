@@ -26,7 +26,6 @@ import asyncio
 import os
 import shutil
 import sys
-import tempfile
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -157,7 +156,11 @@ def build_service(config) -> Any:
 
 def _config_set(o: "Options") -> int:
     """Persist one supported operator setting without starting the service."""
-    from athena.service.config import global_config_path, load_toml_file
+    from athena.service.config import (
+        global_config_path,
+        load_toml_file,
+        write_toml_atomic_private,
+    )
 
     raw_key = str(o.config_key or "").strip().replace("_", "-")
     prefix = "hermes-referee."
@@ -166,7 +169,8 @@ def _config_set(o: "Options") -> int:
             "athena config: supported keys are hermes-referee.enabled, "
             "hermes-referee.endpoint, hermes-referee.profile, "
             "hermes-referee.timeout-seconds, hermes-referee.credential-id, "
-            "hermes-referee.allow-remote, and hermes-referee.allow-insecure-remote",
+            "hermes-referee.allow-remote, hermes-referee.allow-insecure-remote, "
+            "and hermes-referee.self-host-supervision",
             file=sys.stderr,
         )
         return 2
@@ -179,6 +183,7 @@ def _config_set(o: "Options") -> int:
         "credential_id",
         "allow_remote",
         "allow_insecure_remote",
+        "self_host_supervision",
     }:
         print(f"athena config: unsupported key {o.config_key!r}", file=sys.stderr)
         return 2
@@ -186,7 +191,7 @@ def _config_set(o: "Options") -> int:
     if field in {"enabled", "allow_remote", "allow_insecure_remote"}:
         lowered = value.lower()
         if lowered not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
-            print("athena config: enabled expects true or false", file=sys.stderr)
+            print(f"athena config: {raw_key} expects true or false", file=sys.stderr)
             return 2
         parsed: Any = lowered in {"true", "1", "yes", "on"}
     elif field == "timeout_seconds":
@@ -198,6 +203,14 @@ def _config_set(o: "Options") -> int:
         if parsed <= 0:
             print("athena config: timeout-seconds expects a positive number", file=sys.stderr)
             return 2
+    elif field == "self_host_supervision":
+        if value.lower() not in {"off", "advisory", "required"}:
+            print(
+                "athena config: self-host-supervision expects off, advisory, or required",
+                file=sys.stderr,
+            )
+            return 2
+        parsed = value.lower()
     else:
         if not value:
             print(f"athena config: {o.config_key} cannot be empty", file=sys.stderr)
@@ -212,16 +225,8 @@ def _config_set(o: "Options") -> int:
         return 2
     section[field] = parsed
     try:
-        import tomli_w
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "wb", dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as tmp:
-            tomli_w.dump(data, tmp)
-            temporary = Path(tmp.name)
-        os.replace(temporary, path)
-    except (ImportError, OSError) as exc:
+        write_toml_atomic_private(path, data)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
         print(f"athena config: could not write {path}: {exc}", file=sys.stderr)
         return 1
     print(f"updated {path}: hermes_referee.{field} = {parsed!r}")
@@ -243,7 +248,7 @@ def _cmd_config(o: "Options", config: Any) -> int:
         print(f"  allow_insecure_remote: {str(settings.allow_insecure_remote).lower()}")
         print(f"  managed: {str(settings.managed).lower()}")
         print(f"  runtime_root: {settings.runtime_root or '-'}")
-        print(f"  required_for_self_host: {str(settings.required_for_self_host).lower()}")
+        print(f"  self_host_supervision: {settings.supervision_mode.value}")
         return 0
     print("athena config: use 'set KEY VALUE' or 'show'", file=sys.stderr)
     return 2
@@ -262,6 +267,7 @@ def _cmd_referee(o: "Options") -> int:
         host=o.referee_host,
         port=o.referee_port,
         credential_id=o.referee_credential_id,
+        self_host_supervision=o.referee_supervision,
     )
 
 
@@ -294,6 +300,25 @@ def _doctor_display(o: "Options", config: Any) -> int:
     if requested in {"auto", "glass"} and selected != "glass":
         print("note: Glass needs a confirmed Kitty graphics transport; ANSI is safe.")
     return 0
+
+
+def _doctor_native(o: "Options", config: Any) -> int:
+    """Report native companion compatibility without launching it."""
+    del o, config
+    from athena.cli.native import NATIVE_REQUIREMENTS_MESSAGE, native_binary, native_preflight
+
+    preflight = native_preflight()
+    binary = native_binary()
+    binary_ok = binary.is_file() and os.access(binary, os.X_OK)
+    print(f"requirements: {NATIVE_REQUIREMENTS_MESSAGE}")
+    print(f"binary: {binary} ({'available' if binary_ok else 'missing'})")
+    if preflight.ok:
+        print("host: ready")
+    else:
+        print("host: incompatible")
+        for failure in preflight.failures:
+            print(f"  {failure}")
+    return 0 if preflight.ok and binary_ok else 1
 
 
 def _doctor_startup(o: "Options", config: Any) -> int:
@@ -389,6 +414,7 @@ class Options:
     referee_host: str = "127.0.0.1"
     referee_port: int = 8643
     referee_credential_id: str = "HERMES_REFEREE_API_KEY"
+    referee_supervision: str | None = None
     _providers: tuple[Any, ...] = ()
 
 
@@ -416,9 +442,11 @@ def dispatch(o: Options) -> int:
         target = o.args[0] if o.args else "startup"
         if target == "startup":
             return _doctor_startup(o, config)
+        if target == "native":
+            return _doctor_native(o, config)
         if target != "display":
             print(
-                "athena doctor: supported targets are 'startup' and 'display'",
+                "athena doctor: supported targets are 'startup', 'display', and 'native'",
                 file=sys.stderr,
             )
             return 2
@@ -1000,6 +1028,13 @@ def _click_cli(click: Any):
             click.option(
                 "--credential-id", "referee_credential_id", default="HERMES_REFEREE_API_KEY"
             ),
+            click.option(
+                "--self-host-supervision",
+                "referee_supervision",
+                type=click.Choice(["off", "advisory", "required"]),
+                default=None,
+                help="Hermes self-host policy (setup defaults to required).",
+            ),
         ):
             func = decorator(func)
         return func
@@ -1046,6 +1081,12 @@ def _click_cli(click: Any):
     def doctor_startup(ctx):
         """Check service startup health and readiness dependencies."""
         sys.exit(dispatch(base_options(ctx, "doctor", ["startup"])))
+
+    @doctor.command("native")
+    @click.pass_context
+    def doctor_native(ctx):
+        """Check native companion ABI, libraries, display, and binary."""
+        sys.exit(dispatch(base_options(ctx, "doctor", ["native"])))
 
     @cli.command()
     @click.argument("objective", required=False, nargs=-1)
@@ -1256,9 +1297,14 @@ def _arg_parse(argv: list[str]) -> Options:
     sp.add_argument("objective", nargs="?", default=None)
     sp = sub.add_parser("sessions", help="List sessions.")
     globals_(sp)
-    sp = sub.add_parser("doctor", help="Diagnose service startup and display support.")
+    sp = sub.add_parser("doctor", help="Diagnose startup, display, and native support.")
     globals_(sp)
-    sp.add_argument("target", nargs="?", choices=["startup", "display"], default="startup")
+    sp.add_argument(
+        "target",
+        nargs="?",
+        choices=["startup", "display", "native"],
+        default="startup",
+    )
     sp = sub.add_parser("config", help="Inspect or update operator configuration.")
     globals_(sp)
     config_sub = sp.add_subparsers(dest="config_action")
@@ -1277,6 +1323,13 @@ def _arg_parse(argv: list[str]) -> Options:
         referee_parser.add_argument("--port", dest="referee_port", default=8643, type=int)
         referee_parser.add_argument(
             "--credential-id", dest="referee_credential_id", default="HERMES_REFEREE_API_KEY"
+        )
+        referee_parser.add_argument(
+            "--self-host-supervision",
+            dest="referee_supervision",
+            choices=("off", "advisory", "required"),
+            default=None,
+            help="Hermes self-host policy (setup defaults to required).",
         )
     sp = sub.add_parser("oi-stream", help="Stream the live OI projection.")
     globals_(sp)
@@ -1309,6 +1362,7 @@ def _arg_parse(argv: list[str]) -> Options:
         referee_host=getattr(ns, "referee_host", "127.0.0.1"),
         referee_port=getattr(ns, "referee_port", 8643),
         referee_credential_id=getattr(ns, "referee_credential_id", "HERMES_REFEREE_API_KEY"),
+        referee_supervision=getattr(ns, "referee_supervision", None),
     )
     if command == "doctor":
         o.args = [ns.target]

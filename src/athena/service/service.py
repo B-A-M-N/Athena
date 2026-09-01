@@ -130,7 +130,12 @@ from athena.protocol.tasks import (
     WorkspaceSpec,
 )
 
-from athena.service.config import AthenaConfig, DEFAULT_DB_PATH, ProviderConfig
+from athena.service.config import (
+    AthenaConfig,
+    DEFAULT_DB_PATH,
+    HermesSupervisionMode,
+    ProviderConfig,
+)
 
 __all__ = ["AthenaService"]
 
@@ -1136,19 +1141,35 @@ class AthenaService:
             "watch": watches.health() if watches is not None else {"health": "stopped"},
         }
 
+    @property
+    def _hermes_supervision_mode(self) -> HermesSupervisionMode:
+        """Return the explicit operator policy for self-host supervision."""
+        return self.config.hermes_referee.supervision_mode
+
+    @property
+    def _hermes_supervision_active(self) -> bool:
+        """Whether Hermes may contribute evidence at self-host checkpoints."""
+        return (
+            self.config.hermes_referee.transport_enabled
+            and self._hermes_supervision_mode is not HermesSupervisionMode.OFF
+            and self._hermes_referee is not None
+        )
+
     async def hermes_referee_status(self) -> dict[str, Any]:
         """Return operator-safe Hermes configuration and connectivity status."""
         settings = self.config.hermes_referee
-        if not settings.enabled and self._hermes_referee is None:
+        if not settings.transport_enabled:
             return {
                 "enabled": False,
+                "self_host_supervision": settings.supervision_mode.value,
                 "state": "disabled",
                 "profile": settings.profile,
                 "endpoint": settings.endpoint,
             }
         if self._hermes_adapter is None:
             return {
-                "enabled": settings.enabled,
+                "enabled": settings.transport_enabled,
+                "self_host_supervision": settings.supervision_mode.value,
                 "state": (
                     "configured_unverified"
                     if self._hermes_referee is not None and self._hermes_status_error is None
@@ -1162,17 +1183,20 @@ class AthenaService:
             preflight = await self._hermes_adapter.preflight()
         except httpx.HTTPError as exc:
             return {
-                "enabled": True,
+                "enabled": settings.transport_enabled,
+                "self_host_supervision": settings.supervision_mode.value,
                 "state": "disconnected",
                 "profile": settings.profile,
                 "endpoint": settings.endpoint,
+                "safety_verified": False,
                 "error": str(exc),
             }
         except Exception as exc:
             from athena.hermes.agent_adapter import HermesRefereeSafetyError
 
             return {
-                "enabled": True,
+                "enabled": settings.transport_enabled,
+                "self_host_supervision": settings.supervision_mode.value,
                 "state": ("unsafe" if isinstance(exc, HermesRefereeSafetyError) else "error"),
                 "safety_verified": False,
                 "profile": settings.profile,
@@ -1180,7 +1204,8 @@ class AthenaService:
                 "error": str(exc),
             }
         return {
-            "enabled": True,
+            "enabled": settings.transport_enabled,
+            "self_host_supervision": settings.supervision_mode.value,
             "state": "safety_verified",
             "safety_verified": True,
             "profile": settings.profile,
@@ -1700,7 +1725,7 @@ class AthenaService:
             "missing_obligations": verdict["missing_obligations"],
             "performance_proofs": performance_evidence,
         }
-        if self._hermes_referee is not None:
+        if self._hermes_supervision_active:
             hermes = await self._run_hermes_mission_referee(
                 mission,
                 plan=plan,
@@ -1711,7 +1736,10 @@ class AthenaService:
                 task_id=task_id,
             )
             verification["hermes"] = hermes
-            if hermes.get("decision") != HermesDecision.MISSION_COMPLETE_SUPPORTED.value:
+            if (
+                self._hermes_supervision_mode is HermesSupervisionMode.REQUIRED
+                and hermes.get("decision") != HermesDecision.MISSION_COMPLETE_SUPPORTED.value
+            ):
                 return None, str(
                     hermes.get("rationale") or "Hermes did not support mission completion"
                 )
@@ -2888,11 +2916,11 @@ class AthenaService:
             isinstance(existing, dict)
             and existing.get("certificate_hash") == candidate.get("certificate_hash")
             and (candidate.get("integrity_review") or {}).get("eligible") is True
-            and (self._hermes_referee is None or isinstance(existing.get("hermes"), Mapping))
+            and (not self._hermes_supervision_active or isinstance(existing.get("hermes"), Mapping))
         ):
             return existing
         review = await self._run_self_host_reviewer(task_row or {}, candidate)
-        if self._hermes_referee is not None:
+        if self._hermes_supervision_active:
             review = await self._run_hermes_candidate_referee(
                 mission,
                 task_row or {},
@@ -3004,13 +3032,14 @@ class AthenaService:
             )
         result = dict(review)
         result["hermes"] = verdict.to_record()
-        if verdict.decision not in {
-            HermesDecision.PASS,
-            HermesDecision.READY_FOR_HUMAN_REVIEW,
-        }:
-            result["eligible"] = False
-        if verdict.decision == HermesDecision.READY_FOR_HUMAN_REVIEW:
-            result["requires_human_review"] = True
+        if self._hermes_supervision_mode is HermesSupervisionMode.REQUIRED:
+            if verdict.decision not in {
+                HermesDecision.PASS,
+                HermesDecision.READY_FOR_HUMAN_REVIEW,
+            }:
+                result["eligible"] = False
+            if verdict.decision == HermesDecision.READY_FOR_HUMAN_REVIEW:
+                result["requires_human_review"] = True
         result["evidence_hash"] = _json_hash(result)
         return result
 
@@ -4804,7 +4833,7 @@ class AthenaService:
     async def _preflight_hermes_referee(self) -> None:
         """Run the optional safety probe without blocking normal startup."""
         settings = self.config.hermes_referee
-        if not settings.enabled:
+        if not settings.transport_enabled:
             return
         evaluator: HermesAgentEvaluator | HermesReferee | None = self._hermes_adapter
         if evaluator is None:
@@ -4858,9 +4887,9 @@ class AthenaService:
         self._hermes_status_error = None
 
     async def _require_verified_hermes_referee(self) -> None:
-        """Refuse self-host work when an enabled referee is not proven safe."""
+        """Refuse self-host work only under required Hermes supervision."""
         settings = self.config.hermes_referee
-        if not settings.enabled or not settings.required_for_self_host:
+        if self._hermes_supervision_mode is not HermesSupervisionMode.REQUIRED:
             return
         if self._hermes_adapter is None:
             reason = self._hermes_status_error or "Hermes referee is not configured"
@@ -4898,7 +4927,7 @@ class AthenaService:
                 "state": "configured_unverified",
             }
             return
-        if not settings.enabled:
+        if not settings.transport_enabled:
             self._startup_health["checks"]["hermes_referee"] = {
                 "status": "ok",
                 "blocking": False,

@@ -97,12 +97,27 @@ def test_roundtrip_hermes_referee_config():
             credential_id="HERMES_API_KEY",
             allow_remote=True,
             allow_insecure_remote=True,
+            self_host_supervision="advisory",
         )
     )
 
     restored = config_from_dict(config_to_dict(config))
 
     assert restored.hermes_referee == config.hermes_referee
+
+
+def test_legacy_hermes_required_flag_normalizes_to_explicit_policy():
+    restored = config_from_dict(
+        {
+            "hermes_referee": {
+                "enabled": True,
+                "required_for_self_host": False,
+            }
+        }
+    )
+
+    assert restored.hermes_referee.supervision_mode.value == "advisory"
+    assert "required_for_self_host" not in config_to_dict(restored)["hermes_referee"]
 
 
 def test_save_config_migrates_legacy_provider_key_to_private_secret(tmp_path, monkeypatch):
@@ -155,6 +170,26 @@ def test_save_config_is_atomic_and_keeps_owner_only_file_on_write_failure(tmp_pa
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert not list(tmp_path.glob(".athena.toml.*.tmp"))
+
+
+@pytest.mark.parametrize("mode", (0o755, 0o770))
+def test_save_config_does_not_change_existing_parent_permissions(tmp_path, mode):
+    parent = tmp_path / "shared-config"
+    parent.mkdir()
+    os.chmod(parent, mode)
+
+    save_config(AthenaConfig(), parent / "athena.toml")
+
+    assert stat.S_IMODE(parent.stat().st_mode) == mode
+
+
+def test_save_config_makes_new_parent_private_and_file_owner_only(tmp_path):
+    path = tmp_path / "new-config" / "athena.toml"
+
+    save_config(AthenaConfig(), path)
+
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_save_config_rejects_destination_symlink(tmp_path):

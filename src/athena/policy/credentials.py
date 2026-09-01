@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -107,28 +108,56 @@ def write_user_secret(name: str, value: str) -> Path:
     if not value or "\n" in value or "\r" in value:
         raise ValueError("secret value must be non-empty and single-line")
     root = user_secret_dir()
-    root.mkdir(parents=True, exist_ok=True)
+    _reject_symlinked_path(root)
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    # ``mkdir`` follows a symlink if a path is swapped between the check and
+    # creation. Re-check before opening the directory used for the commit.
+    _reject_symlinked_path(root)
     root.chmod(0o700)
-    temporary = root / f".{name}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(temporary, flags, 0o600)
+    directory_fd = os.open(
+        str(root),
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    fd = -1
+    temporary: Path | None = None
     try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{name}.",
+            suffix=".tmp",
+            dir=str(root),
+        )
+        temporary = Path(temporary_name)
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.chmod(0o600)
         destination = root / str(name)
         os.replace(temporary, destination)
+        os.fsync(directory_fd)
         return destination
     finally:
         if fd != -1:
             os.close(fd)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+
+
+def _reject_symlinked_path(path: Path) -> None:
+    """Reject a secret-store path that redirects through a symlink."""
+    current = path
+    while True:
+        if current.is_symlink():
+            raise ValueError(f"refusing to use symlinked secret directory: {current}")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
 
 
 def delete_user_secret(name: str) -> None:

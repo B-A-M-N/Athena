@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 
 from athena.cli.app import Options, _arg_parse
-from athena.cli.native import native_binary, worker_command
+from athena.cli.native import (
+    NativePreflight,
+    native_binary,
+    native_preflight,
+    worker_command,
+)
 from athena.cli.native_session import NativeSession, parse_args
 
 
@@ -13,6 +18,48 @@ def test_native_command_is_available_in_argparse_fallback():
 
     assert options.command == "native"
     assert options.workspace == "/tmp/project"
+
+
+def test_native_doctor_target_is_available_in_argparse_fallback():
+    options = _arg_parse(["doctor", "native"])
+
+    assert options.command == "doctor"
+    assert options.args == ["native"]
+
+
+def test_native_preflight_reports_missing_display(monkeypatch):
+    monkeypatch.setenv("DISPLAY", "")
+    monkeypatch.setattr("athena.cli.native.platform.system", lambda: "Linux")
+    monkeypatch.setattr("athena.cli.native.platform.machine", lambda: "x86_64")
+    monkeypatch.setattr("athena.cli.native.platform.libc_ver", lambda: ("glibc", "2.36"))
+    monkeypatch.setattr("athena.cli.native.ctypes.util.find_library", lambda name: name)
+    monkeypatch.setattr("athena.cli.native._display_is_usable", lambda *_args: True)
+
+    result = native_preflight()
+
+    assert isinstance(result, NativePreflight)
+    assert not result.ok
+    assert result.failures == ("DISPLAY is not set",)
+
+
+def test_native_launch_rejects_incompatible_host_before_spawning(monkeypatch, tmp_path, capsys):
+    from athena.cli import native
+
+    binary = tmp_path / "athena-terminal"
+    binary.write_bytes(b"native")
+    binary.chmod(0o755)
+    monkeypatch.setattr(native, "native_binary", lambda: binary)
+    monkeypatch.setattr(
+        native, "native_preflight", lambda: NativePreflight(("DISPLAY is not set",))
+    )
+    monkeypatch.setattr(
+        native.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")),
+    )
+
+    assert native.launch(SimpleNamespace()) == 2
+    assert "requires Linux x86_64 GNU/glibc >= 2.34" in capsys.readouterr().err
 
 
 def test_native_worker_command_forwards_scope_without_credentials():

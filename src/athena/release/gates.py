@@ -9,6 +9,7 @@ def candidate_commands() -> tuple[str, ...]:
         "uv run --frozen --no-sync ruff format --check --no-cache src tests",
         "uv run --frozen --no-sync ruff check --no-cache src tests",
         "uv run --frozen --no-sync mypy --cache-dir /tmp/athena-mypy-cache src",
+        "uv --version",
         "uv run --frozen --no-sync python --version",
         "uv lock --check --offline",
         "uv run --frozen --no-sync python scripts/architecture-lint",
@@ -17,7 +18,7 @@ def candidate_commands() -> tuple[str, ...]:
         "cargo test --manifest-path native/Cargo.toml --locked --offline",
         "scripts/build-native-package",
         "cargo --version",
-        "rustc --version",
+        "rustc -vV",
         "scripts/native-smoke",
         "uv run --frozen --no-sync python scripts/bench-alacrity --events 5000 --min-producer-events-per-second 10000",
         "uv run --frozen --no-sync python scripts/bench-indexing --samples 3 --max-full-seconds 5 --hard-max-full-seconds 8 --max-cold-start-seconds 8 --max-incremental-seconds 0.5 --hard-max-incremental-seconds 1",
@@ -27,7 +28,6 @@ def candidate_commands() -> tuple[str, ...]:
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_release_black_box.py",
         "scripts/sandbox-release-matrix",
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_workflow_strategy.py",
-        "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_hermes_agent.py",
         "scripts/native-input-smoke",
         "scripts/native-visual-smoke",
         "scripts/native-desktop-acceptance",
@@ -39,10 +39,15 @@ def release_commands(
     *,
     skip_e2e: bool,
     bootstrap: bool,
+    include_hermes_live: bool = False,
 ) -> tuple[tuple[str, list[str]], ...]:
-    """Return the release lanes without duplicating them in shell glue."""
+    """Return core lanes, with live Hermes evidence opt-in."""
     prefix = [uv, "run", "--frozen", "--extra", "dev"]
     commands: list[tuple[str, list[str]]] = [
+        ("uv-version", [uv, "--version"]),
+        ("python-version", [*prefix, "python", "--version"]),
+        ("cargo-version", ["cargo", "--version"]),
+        ("rustc-version", ["rustc", "-vV"]),
         (
             "alacrity-benchmark",
             [
@@ -204,17 +209,6 @@ def release_commands(
                     ],
                 ),
                 (
-                    "hermes-live",
-                    [
-                        *prefix,
-                        "pytest",
-                        "-q",
-                        "-p",
-                        "no:cacheprovider",
-                        "tests/e2e/test_hermes_agent.py",
-                    ],
-                ),
-                (
                     "mcp-stdio",
                     [
                         uv,
@@ -236,6 +230,20 @@ def release_commands(
                 ("native-desktop-acceptance", ["scripts/native-desktop-acceptance"]),
             ]
         )
+        if include_hermes_live:
+            commands.append(
+                (
+                    "hermes-live",
+                    [
+                        *prefix,
+                        "pytest",
+                        "-q",
+                        "-p",
+                        "no:cacheprovider",
+                        "tests/e2e/test_hermes_agent.py",
+                    ],
+                )
+            )
     return tuple(commands)
 
 

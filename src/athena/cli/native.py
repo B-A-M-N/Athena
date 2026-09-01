@@ -9,14 +9,88 @@ of Athena rather than a second service or agent loop.
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.util
 import importlib.util
 import os
+import platform
 import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+NATIVE_REQUIREMENTS_MESSAGE = (
+    "Athena native frontend requires Linux x86_64 GNU/glibc >= 2.34, X11, Xft and OpenGL."
+)
+
+
+class NativePreflight:
+    """Deterministic host checks for the Linux native companion."""
+
+    def __init__(self, failures: tuple[str, ...] = ()) -> None:
+        self.failures = failures
+
+    @property
+    def ok(self) -> bool:
+        return not self.failures
+
+
+def native_preflight() -> NativePreflight:
+    """Check native frontend ABI and display prerequisites before launch."""
+    failures: list[str] = []
+    if platform.system() != "Linux":
+        failures.append(f"operating system is {platform.system() or 'unknown'}, not Linux")
+    machine = platform.machine().lower()
+    if machine not in {"x86_64", "amd64"}:
+        failures.append(f"CPU architecture is {machine or 'unknown'}, not x86_64")
+
+    libc_name, libc_version = platform.libc_ver()
+    if libc_name.lower() != "glibc":
+        failures.append(f"GNU/glibc is required (detected {libc_name or 'unknown'})")
+    elif _version_tuple(libc_version) < (2, 34):
+        failures.append(f"GNU/glibc >= 2.34 is required (detected {libc_version or 'unknown'})")
+
+    libraries = {
+        "X11": ctypes.util.find_library("X11"),
+        "Xft": ctypes.util.find_library("Xft"),
+        "OpenGL": ctypes.util.find_library("GL"),
+    }
+    missing = [name for name, library in libraries.items() if not library]
+    if missing:
+        failures.append(f"missing shared libraries: {', '.join(missing)}")
+
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display:
+        failures.append("DISPLAY is not set")
+    elif libraries["X11"] and not _display_is_usable(libraries["X11"], display):
+        failures.append(f"DISPLAY {display!r} is not usable")
+    return NativePreflight(tuple(failures))
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in value.split(".")[:2])
+    except (AttributeError, TypeError, ValueError):
+        return ()
+
+
+def _display_is_usable(library: str, display_name: str) -> bool:
+    """Open and close the configured X11 display without spawning a probe."""
+    try:
+        x11 = ctypes.CDLL(library)
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        handle = x11.XOpenDisplay(display_name.encode("utf-8"))
+        if not handle:
+            return False
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay(handle)
+        return True
+    except (AttributeError, OSError, UnicodeError):
+        return False
 
 
 def native_binary() -> Path:
@@ -74,6 +148,12 @@ def launch(options: Any) -> int:
             file=sys.stderr,
         )
         return 2
+    preflight = native_preflight()
+    if not preflight.ok:
+        print(f"athena native: {NATIVE_REQUIREMENTS_MESSAGE}", file=sys.stderr)
+        for failure in preflight.failures:
+            print(f"  {failure}", file=sys.stderr)
+        return 2
 
     with tempfile.TemporaryDirectory(prefix="athena-native-") as runtime:
         socket_path = str(Path(runtime) / "projection.sock")
@@ -110,4 +190,12 @@ async def launch_async(options: Any) -> int:
     return await asyncio.to_thread(launch, options)
 
 
-__all__ = ["launch", "launch_async", "native_binary", "worker_command"]
+__all__ = [
+    "NATIVE_REQUIREMENTS_MESSAGE",
+    "NativePreflight",
+    "launch",
+    "launch_async",
+    "native_binary",
+    "native_preflight",
+    "worker_command",
+]

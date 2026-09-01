@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from athena.hermes import HermesReferee
+from athena.service.config import HermesRefereeConfig
 from athena.service.service import AthenaService
 from athena.self_host.controller import SelfHostMissionController
 
@@ -98,13 +101,25 @@ async def test_self_host_plans_a_new_item_after_each_promotion():
     assert plan["phase"] == "PLAN"
 
 
-async def test_completion_requires_a_separate_verifier():
+@pytest.mark.parametrize(
+    ("mode", "hermes_decision", "expect_proof"),
+    (
+        ("required", "PASS", True),
+        ("advisory", "HOLD", True),
+        ("required", "HOLD", False),
+    ),
+)
+async def test_completion_requires_a_separate_verifier(mode, hermes_decision, expect_proof):
     class _Verifier:
         async def utility_inference(self, **kwargs: object) -> str:
             assert kwargs.get("role") == "completion_verifier"
             return json.dumps({"complete": True, "reason": "objective proven"})
 
     service = AthenaService.in_memory()
+    service.config.hermes_referee = HermesRefereeConfig(
+        enabled=True,
+        self_host_supervision=mode,
+    )
     service._kernel = _Verifier()  # noqa: SLF001 - exercise completion authority
 
     class _PerformanceVerifier:
@@ -114,7 +129,7 @@ async def test_completion_requires_a_separate_verifier():
     service._acceptance_verifier = _PerformanceVerifier()  # noqa: SLF001
     service._self_host_verification_environment = lambda *args, **kwargs: object()  # noqa: SLF001
     service._hermes_referee = HermesReferee(  # noqa: SLF001 - exercise external seam
-        lambda _packet: {"decision": "PASS", "rationale": "history is covered"}
+        lambda _packet: {"decision": hermes_decision, "rationale": "history is covered"}
     )
     index = SimpleNamespace(index_revision="index", source_revision="source")
     authority = _Authority()
@@ -151,8 +166,12 @@ async def test_completion_requires_a_separate_verifier():
         task_id="task-1",
     )
 
-    assert error is None
-    assert proof is not None
-    assert proof["completion_verification"]["complete"] is True
-    assert proof["completion_verification"]["hermes"]["decision"] == "MISSION_COMPLETE_SUPPORTED"
-    assert proof["proof_hash"]
+    assert (proof is not None) is expect_proof
+    assert (error is None) is expect_proof
+    if expect_proof:
+        assert proof["completion_verification"]["complete"] is True
+        expected_decision = (
+            "MISSION_COMPLETE_SUPPORTED" if hermes_decision == "PASS" else hermes_decision
+        )
+        assert proof["completion_verification"]["hermes"]["decision"] == expected_decision
+        assert proof["proof_hash"]
