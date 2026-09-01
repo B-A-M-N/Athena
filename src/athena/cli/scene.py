@@ -630,7 +630,9 @@ def build_oi_scene(
         )
     except ValueError:
         mode = VisualActionKind.IDLE
-    if state.status in {"FAILURE", "WARNING", "BLOCKED"}:
+    if state.runtime_state_lost:
+        mode = VisualActionKind.RECOVER
+    elif state.status in {"FAILURE", "WARNING", "BLOCKED"}:
         mode = VisualActionKind.FAILURE
     elif state.status == "APPROVAL":
         mode = VisualActionKind.APPROVAL

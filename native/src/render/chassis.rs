@@ -11,12 +11,14 @@ pub(crate) struct ChassisMaterial {
 
 impl ChassisMaterial {
     pub(crate) fn new() -> Self {
-        let Some((width, height, pixels)) = parse_ppm(CHASSIS_NOISE) else {
+        let Some((base_width, base_height, base_pixels)) = parse_ppm(CHASSIS_NOISE) else {
             return Self {
                 texture: 0,
                 enabled: false,
             };
         };
+        let (width, height, pixels) =
+            expand_graphite_material(base_width, base_height, &base_pixels);
         let mut texture = 0;
         unsafe {
             glGenTextures(1, &mut texture);
@@ -111,9 +113,42 @@ fn parse_ppm(bytes: &[u8]) -> Option<(c_int, c_int, Vec<u8>)> {
     Some((width, height, pixels))
 }
 
+fn expand_graphite_material(
+    base_width: c_int,
+    base_height: c_int,
+    base_pixels: &[u8],
+) -> (c_int, c_int, Vec<u8>) {
+    // The bundled PPM is the authored coarse grain. Expand it once at load
+    // time with deterministic mid/fine-frequency variation so the shell does
+    // not read as an 8-pixel checkerboard when scaled across the cabinet.
+    const WIDTH: usize = 32;
+    const HEIGHT: usize = 32;
+    let source_width = base_width.max(1) as usize;
+    let source_height = base_height.max(1) as usize;
+    let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 3);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let source_x = x * source_width / WIDTH;
+            let source_y = y * source_height / HEIGHT;
+            let source = (source_y * source_width + source_x) * 3;
+            let mid = ((x / 4 + y / 4) % 3) as i16 - 1;
+            let fine = ((x * 13 + y * 17 + x / 3 * 7) % 7) as i16 - 3;
+            let wear = if (x * 19 + y * 23) % 127 == 0 { -7 } else { 0 };
+            for channel in 0..3 {
+                let value = base_pixels.get(source + channel).copied().unwrap_or(32) as i16
+                    + mid
+                    + fine
+                    + wear;
+                pixels.push(value.clamp(8, 96) as u8);
+            }
+        }
+    }
+    (WIDTH as c_int, HEIGHT as c_int, pixels)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CHASSIS_NOISE, parse_ppm};
+    use super::{CHASSIS_NOISE, expand_graphite_material, parse_ppm};
 
     #[test]
     fn bundled_chassis_material_is_a_complete_rgb_texture() {
@@ -121,6 +156,18 @@ mod tests {
         assert_eq!((width, height), (8, 8));
         assert_eq!(pixels.len(), 8 * 8 * 3);
         assert!(pixels.iter().all(|value| *value > 0));
+    }
+
+    #[test]
+    fn expanded_graphite_material_has_bounded_multi_frequency_variation() {
+        let (width, height, pixels) = parse_ppm(CHASSIS_NOISE).expect("valid bundled PPM");
+        let (expanded_width, expanded_height, expanded) =
+            expand_graphite_material(width, height, &pixels);
+        assert_eq!((expanded_width, expanded_height), (32, 32));
+        assert_eq!(expanded.len(), 32 * 32 * 3);
+        assert!(expanded.iter().min() >= Some(&8));
+        assert!(expanded.iter().max() <= Some(&96));
+        assert!(expanded.windows(3).any(|window| window[0] != window[1]));
     }
 }
 
@@ -181,6 +228,18 @@ impl PresentationSettings {
             PresentationControl::Focus => {
                 let rect = geometry.rail.focus;
                 self.focus = ((x as f32 - rect.x) / rect.width.max(1.0)).clamp(0.15, 1.0);
+            }
+            PresentationControl::Power => self.display_enabled = !self.display_enabled,
+        }
+    }
+
+    pub(crate) fn adjust(&mut self, control: PresentationControl, delta: f32) {
+        match control {
+            PresentationControl::Brightness => {
+                self.brightness = (self.brightness + delta).clamp(0.15, 1.0);
+            }
+            PresentationControl::Focus => {
+                self.focus = (self.focus + delta).clamp(0.15, 1.0);
             }
             PresentationControl::Power => self.display_enabled = !self.display_enabled,
         }
@@ -263,20 +322,31 @@ pub(crate) fn draw_chassis(
         draw_round_rect(
             x,
             geometry.header.y + geometry.header.height * 0.38,
-            8.0 * scale,
             3.0 * scale,
+            12.0 * scale,
             1.5 * scale,
             (0.012, 0.014, 0.015),
         );
     }
 
-    let status_lower = projection.status.to_ascii_lowercase();
-    let indicator = if status_lower.contains("fail") {
+    let system_status = projection.system_status.to_ascii_lowercase();
+    let indicator = if projection.stale
+        || projection.bridge_status.contains("DISCONNECTED")
+        || projection.bridge_status.contains("ERROR")
+        || matches!(
+            system_status.as_str(),
+            "error" | "recovery_required" | "failed"
+        ) {
         (0.82, 0.24, 0.27)
-    } else if status_lower.contains("approval") {
+    } else if matches!(
+        system_status.as_str(),
+        "waiting" | "degraded" | "unknown" | "not_ready"
+    ) {
         (0.88, 0.59, 0.20)
-    } else {
+    } else if system_status == "ready" {
         (0.27, 0.78, 0.68)
+    } else {
+        (0.45, 0.48, 0.48)
     };
     let lamp_x = geometry.header.right() - 42.0 * scale;
     draw_round_rect(
@@ -300,18 +370,35 @@ pub(crate) fn draw_chassis(
     draw_glass_crt_well(geometry, scale);
     let seam_x = (geometry.operator_outer.right() + geometry.oi_outer.x) * 0.5;
     let seam_y = geometry.operator_outer.y + geometry.operator_outer.height * 0.52;
+    // Central structural mullion
     draw_rect(
-        seam_x,
-        geometry.operator_outer.y + 34.0 * scale,
+        seam_x - 3.0 * scale,
+        geometry.operator_outer.y + 20.0 * scale,
+        6.0 * scale,
+        (geometry.operator_outer.height - 40.0 * scale).max(0.0),
+        (0.045, 0.048, 0.050),
+    );
+    draw_rect(
+        seam_x - 0.5 * scale,
+        geometry.operator_outer.y + 24.0 * scale,
         1.0 * scale,
-        (geometry.operator_outer.height - 68.0 * scale).max(0.0),
-        (0.08, 0.09, 0.09),
+        (geometry.operator_outer.height - 48.0 * scale).max(0.0),
+        (0.09, 0.10, 0.11),
+    );
+    // Mechanical fastener latch plate
+    draw_round_rect(
+        seam_x - 8.0 * scale,
+        seam_y - 14.0 * scale,
+        16.0 * scale,
+        28.0 * scale,
+        4.0 * scale,
+        (0.060, 0.063, 0.065),
     );
     draw_round_outline(
-        seam_x - 7.0 * scale,
-        seam_y - 12.0 * scale,
-        14.0 * scale,
-        24.0 * scale,
+        seam_x - 8.0 * scale,
+        seam_y - 14.0 * scale,
+        16.0 * scale,
+        28.0 * scale,
         (0.24, 0.28, 0.28),
     );
     draw_rect(
@@ -378,7 +465,19 @@ pub(crate) fn draw_chassis(
 
     let system = geometry.rail.system_status;
     draw_recessed_panel(system, scale, (0.036, 0.038, 0.039), (0.010, 0.012, 0.013));
-    for (index, color) in [indicator, (0.25, 0.58, 0.67), (0.32, 0.34, 0.34)]
+    let network_indicator = match projection.network_status.to_ascii_lowercase().as_str() {
+        "available" => (0.25, 0.58, 0.67),
+        "restricted" => (0.88, 0.59, 0.20),
+        "blocked" => (0.82, 0.24, 0.27),
+        _ => (0.42, 0.45, 0.45),
+    };
+    let activity_indicator = match projection.activity_status.to_ascii_lowercase().as_str() {
+        "active" => (0.27, 0.78, 0.68),
+        "waiting" => (0.88, 0.59, 0.20),
+        "error" => (0.82, 0.24, 0.27),
+        _ => (0.32, 0.34, 0.34),
+    };
+    for (index, color) in [indicator, network_indicator, activity_indicator]
         .into_iter()
         .enumerate()
     {
@@ -411,7 +510,7 @@ pub(crate) fn draw_chassis(
     draw_encoder(
         geometry.rail.primary_encoder,
         scale,
-        presentation.focus,
+        projection.navigation_value(),
         false,
     );
     draw_encoder(
@@ -503,7 +602,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
         draw_bitmap_text(
             speaker.x + geometry.u(9.0),
             speaker.bottom() - geometry.u(17.0),
-            "AUDIO OUT",
+            "VENT // PASSIVE",
             glyph_scale * 0.58,
             instrument_color,
             speaker.right() - geometry.u(9.0),
@@ -539,7 +638,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
     for (rect, label) in [
         (geometry.rail.brightness, "BRI"),
         (geometry.rail.focus, "FOCUS"),
-        (geometry.rail.power, "POWER"),
+        (geometry.rail.power, "CRT"),
     ] {
         with_scissor(geometry.height, rect, || {
             let label_scale = glyph_scale * 0.60;
@@ -838,6 +937,21 @@ fn draw_operator_well(geometry: &FrameGeometry, focused: bool, scale: f32) {
             (0.010, 0.015, 0.016)
         },
     );
+    // Beveled inner aperture depth shading
+    draw_rect(
+        inner.x - 2.0 * scale,
+        inner.y - 2.0 * scale,
+        inner.width + 4.0 * scale,
+        2.0 * scale,
+        (0.003, 0.005, 0.006),
+    );
+    draw_rect(
+        inner.x - 2.0 * scale,
+        inner.y - 2.0 * scale,
+        2.0 * scale,
+        inner.height + 4.0 * scale,
+        (0.003, 0.005, 0.006),
+    );
     draw_round_outline(
         inner.x,
         inner.y,
@@ -862,6 +976,7 @@ fn draw_glass_crt_well(geometry: &FrameGeometry, scale: f32) {
     let outer = geometry.oi_outer;
     draw_recessed_panel(outer, scale, (0.057, 0.061, 0.062), (0.005, 0.017, 0.019));
     let inner = geometry.oi_inner;
+    // Deep bulbous cathode tube rim
     draw_round_rect(
         inner.x - 8.0 * scale,
         inner.y - 8.0 * scale,
@@ -869,6 +984,14 @@ fn draw_glass_crt_well(geometry: &FrameGeometry, scale: f32) {
         inner.height + 16.0 * scale,
         19.0 * scale,
         (0.003, 0.011, 0.013),
+    );
+    draw_round_rect(
+        inner.x - 4.0 * scale,
+        inner.y - 4.0 * scale,
+        inner.width + 8.0 * scale,
+        inner.height + 8.0 * scale,
+        16.0 * scale,
+        (0.002, 0.007, 0.009),
     );
     draw_round_outline(
         inner.x - 3.0 * scale,
@@ -890,6 +1013,22 @@ fn draw_encoder(rect: PixelRect, scale: f32, value: f32, power: bool) {
         .max(8.0 * scale);
     let x = rect.x + rect.width * 0.5;
     let y = rect.y + rect.height * 0.52;
+    // Outer dial tick markings
+    if !power && size > 16.0 * scale {
+        for i in 0..7 {
+            let tick_angle =
+                std::f32::consts::PI * 0.75 + i as f32 * (std::f32::consts::PI * 1.5 / 6.0);
+            let tick_r1 = size * 0.58;
+            let tick_r2 = size * 0.68;
+            draw_line(
+                x + tick_r1 * tick_angle.cos(),
+                y + tick_r1 * tick_angle.sin(),
+                x + tick_r2 * tick_angle.cos(),
+                y + tick_r2 * tick_angle.sin(),
+                (0.22, 0.26, 0.28),
+            );
+        }
+    }
     draw_round_rect(
         x - size * 0.5 + 3.0 * scale,
         y - size * 0.5 + 4.0 * scale,
@@ -937,7 +1076,18 @@ fn draw_encoder(rect: PixelRect, scale: f32, value: f32, power: bool) {
             tick_y,
             3.0 * scale,
             size * 0.18,
-            (0.29, 0.46, 0.45),
+            (0.36, 0.76, 0.72),
+        );
+        // Illuminated indicator pip
+        let angle = std::f32::consts::PI * 0.75 + value.clamp(0.0, 1.0) * std::f32::consts::PI * 1.5;
+        let pip_r = size * 0.32;
+        draw_round_rect(
+            x + pip_r * angle.cos() - 1.5 * scale,
+            y + pip_r * angle.sin() - 1.5 * scale,
+            3.0 * scale,
+            3.0 * scale,
+            1.5 * scale,
+            (0.36, 0.82, 0.78),
         );
     }
 }

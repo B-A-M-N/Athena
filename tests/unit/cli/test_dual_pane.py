@@ -161,6 +161,40 @@ async def test_approval_summary_does_not_erase_actionable_context(tty_surface):
 
 
 @pytest.mark.asyncio
+async def test_hosted_projection_keeps_all_pending_approvals_ordered(tty_surface):
+    surface, _ = tty_surface
+    await surface.render_event(
+        make_event(
+            "ApprovalRequested",
+            {
+                "approval_id": "approval-a",
+                "capability_id": "write_file",
+                "scopes": ["call", "task", "session"],
+                "reason": "first operation",
+            },
+        )
+    )
+    await surface.render_event(
+        make_event(
+            "ApprovalRequested",
+            {
+                "approval_id": "approval-b",
+                "capability_id": "execute",
+                "scopes": ["call", "project"],
+                "reason": "second operation",
+            },
+        )
+    )
+
+    surface._right_scroll = True
+    screen = "\n".join(surface._frame_lines())
+    assert screen.index("approval-a") < screen.index("approval-b")
+    assert "1:call 2:task 3:session" in screen
+    assert "1:call 2:project" in screen
+    assert list(surface.projection.pending_approvals) == ["approval-a", "approval-b"]
+
+
+@pytest.mark.asyncio
 async def test_completed_operations_move_to_history_and_keep_artifacts(tty_surface):
     surface, _ = tty_surface
     await surface.render_event(

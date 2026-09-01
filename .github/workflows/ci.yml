@@ -1,13 +1,14 @@
+---
 name: CI
 
-on:
+on:  # yamllint disable-line rule:truthy
   pull_request:
   push:
     branches: [main]
     tags: ["v*", "[0-9]+.[0-9]+.[0-9]+"]
 
 jobs:
-  release-check:
+  normal:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,8 +27,99 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            scripts/release-check --sha "$GITHUB_SHA" --skip-e2e
-          else
-            scripts/release-check --sha "$GITHUB_SHA"
-          fi
+          scripts/release-check --sha "$GITHUB_SHA" --skip-e2e
+
+  # This lane is intentionally protected: it needs an operator-owned Hermes
+  # endpoint and a real X11/WM environment for the desktop acceptance suite.
+  # Pull requests and ordinary pushes therefore cannot silently claim those
+  # external prerequisites were exercised.
+  protected-release:
+    # Secrets are intentionally not referenced from `if:`; GitHub Actions
+    # does not make the secrets context reliable in job conditionals. Enable
+    # this protected lane with the repository/environment variable below;
+    # credentials remain available only inside the protected environment.
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/')) &&
+      vars.ATHENA_HERMES_E2E_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: protected-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install protected desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick xdotool xvfb openbox
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Bootstrap locked Rust dependencies
+        run: cargo fetch --manifest-path native/Cargo.toml --locked
+      - name: Run protected release checks
+        env:
+          PYTHONUNBUFFERED: "1"
+          ATHENA_HERMES_E2E_ENDPOINT: ${{ secrets.ATHENA_HERMES_E2E_ENDPOINT }}
+          ATHENA_HERMES_E2E_API_KEY: ${{ secrets.ATHENA_HERMES_E2E_API_KEY }}
+          ATHENA_HERMES_E2E_PROFILE: >-
+            ${{ vars.ATHENA_HERMES_E2E_PROFILE || 'athena-referee' }}
+        run: |
+          xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
+            bash -ceu '
+              openbox --replace >/tmp/athena-openbox.log 2>&1 &
+              wm_pid=$!
+              trap "kill $wm_pid 2>/dev/null || true" EXIT
+              scripts/release-check \
+                --sha "$GITHUB_SHA" \
+                --evidence-dir "$RUNNER_TEMP/athena-release-evidence"
+            '
+      - name: Upload certified release artifacts and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: athena-release-certified-${{ github.sha }}
+          path: ${{ runner.temp }}/athena-release-evidence
+
+  publish:
+    # A skipped protected lane must make publication impossible.  The
+    # publisher consumes the exact artifact uploaded by that lane; it never
+    # rebuilds from the tag checkout.
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.protected-release.result == 'success'
+    needs: [protected-release]
+    runs-on: ubuntu-latest
+    environment: pypi-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download protected certified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: athena-release-certified-${{ github.sha }}
+          path: release-evidence
+      - name: Verify certified identity, manifest, and hashes
+        run: |
+          python scripts/verify-release-evidence \
+            --evidence-dir release-evidence \
+            --sha "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME"
+      - name: Publish exact certified distributions
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: release-evidence/release-artifacts
+          skip-existing: false

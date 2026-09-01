@@ -17,6 +17,7 @@ The transport is intentionally thin: ACP envelope <-> Athena Message/Event.
 
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -125,12 +126,14 @@ class ACPAdapter:
         sessions: Any,
         *,
         event_store: Any = None,
+        admission: Any = None,
         stream_poll_interval: float = 0.25,
         stream_timeout: float = 60.0,
     ) -> None:
         self.task_manager = task_manager
         self.sessions = sessions
         self.event_store = event_store
+        self._admission = admission
         self._stream_interval = stream_poll_interval
         self._stream_timeout = stream_timeout
         self._seq = 0
@@ -187,6 +190,13 @@ class ACPAdapter:
         the Task belongs to a single stable identity.
         """
         task_id = request.task_id or new_id("task")
+        if self._admission is None:
+            raise RuntimeError(
+                "ACPAdapter requires the service-owned admission callback before task intake"
+            )
+        admitted = self._admission(request)
+        if inspect.isawaitable(admitted):
+            await admitted
         session_id = request.session_id or await self._ensure_session(request)
         spec = self.to_task_spec(
             replace(

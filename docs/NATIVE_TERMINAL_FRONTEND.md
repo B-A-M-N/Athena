@@ -85,10 +85,10 @@ selection ownership in `native/src/platform/clipboard.rs`. Buddy data and
 pose vocabulary are isolated under `native/src/buddy/`, with separate Owl,
 Cat, and Bot sprite modules.
 Projection changes, resize, focus, selection, and prompt edits invalidate the
-full frame. The lower control deck follows the reference rail: speaker,
+full frame. The lower control deck follows the reference rail: passive vent,
 operator prompt/status, system lamps, primary encoder, brightness, focus,
-power, and identity plate. Brightness and focus change OI presentation, while
-power toggles the OI display without affecting the agent session. The window
+CRT, and identity plate. Brightness and focus change OI presentation, while
+CRT toggles the OI display without affecting the agent session. The window
 uses a borderless Motif hint while preserving header-fascia drag through the
 WM moveresize protocol. The invisible 12-pixel perimeter is divided into eight
 edge/corner resize zones; each zone supplies the matching X cursor and EWMH
@@ -98,17 +98,33 @@ repainting. Static cabinet engraving is a clipped bitmap layer, so labels
 cannot bleed across physical modules; dynamic Xft is reserved for transcript,
 prompt, status, and live conversation text.
 
-During development, `athena native` launches the native executable with a
+The physical controls also have keyboard alternatives when the pointer is
+unavailable: F1/F2 lower or raise brightness, F3/F4 lower or raise focus, and
+F5 toggles the CRT display. These shortcuts apply only to the native prompt;
+alternate-screen terminal applications retain their function keys.
+
+`athena native` launches the packaged or release native executable with a
 Python Athena service session as its PTY child. The child publishes the same
 projection state over `ATHENA_NATIVE_BRIDGE_SOCKET`; the bridge is local to the
 native process and carries no credentials. Build the binary with:
 
 ```bash
-cargo build --manifest-path native/Cargo.toml --offline
+cargo build --release --manifest-path native/Cargo.toml --locked --offline
 athena native
 ```
 
-The native binary must be built first. `athena native` starts the Python
+For a release artifact, run `scripts/build-release-artifacts`; the native
+executable is shipped in the platform-tagged `athena-agent-native` companion
+wheel as `athena_native/athena-terminal`, while the universal Python wheel and
+sdist remain binary-free. `make native-package` builds only that companion
+wheel for local inspection. For an installed release, use the exact matching
+pair: `pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`.
+The companion is Python-ABI-neutral but Linux/architecture-specific
+(`py3-none-<platform>`); this means it is independent of the CPython ABI,
+not independent of the operating system, architecture, libc, or native
+runtime. It is not a CPython-version extension wheel.
+`ATHENA_NATIVE_BIN` remains an explicit override for platform-specific
+installations. `athena native` starts the Python
 service session inside the PTY and connects its local Unix-socket projection
 bridge; credentials are read by the service configuration and are never
 serialized into the projection bridge.
@@ -122,6 +138,12 @@ athena native --mascot off
 athena native --no-animations
 athena native --reduced-motion
 ```
+
+The protected temporal release lane may set
+`ATHENA_PRESENTATION_CLOCK=fixed` (100 ms per presented frame) or
+`ATHENA_PRESENTATION_CLOCK=fixed:<seconds>`. This test-only clock pins DAGOAL
+phase to the presented-frame sequence, making fixed-timestamp transition
+evidence reproducible without changing the normal wall-clock renderer.
 
 Use `athena native` for the AthenaBOX window. `athena chat` remains the
 host-terminal conversation surface and does not open this native compositor.

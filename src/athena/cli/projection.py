@@ -35,6 +35,7 @@ _MAX_EXECUTIONS = 256
 _MAX_VERIFICATION_CHECKS = 64
 _MAX_PARTIAL_DISPLAY = 32 * 1024
 _PARTIAL_TRUNCATION_MARKER = "[… truncated …]"
+_SELF_HOST_PHASES = frozenset({"PLAN", "PATCH", "PROVE", "REVIEW", "REFEREE", "PROMOTION"})
 
 
 def _bounded_event_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -172,10 +173,16 @@ class ProjectionState:
     recent: deque[tuple[str, str]] = field(default_factory=lambda: deque(maxlen=24))
     stream: deque[str] = field(default_factory=lambda: deque(maxlen=500))
     stream_partial: str = ""
-    pending_approval: dict[str, Any] | None = None
+    # Approval requests are a durable ordered set, not a single mutable
+    # banner.  A projection must never overwrite request A when request B
+    # arrives, nor clear unrelated requests when one resolves.
+    pending_approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
+    runtime_state_lost: bool = False
+    runtime_recovery: dict[str, Any] = field(default_factory=dict)
     status: str = "READY"
     status_message: str = "Type a request below."
     semantic_state: str = "idle"
+    self_host_phase: str = ""
     thinking: bool = False
     event_count: int = 0
     diagnostics: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=80))
@@ -195,7 +202,65 @@ class ProjectionState:
     )
     _task_order: deque[str] = field(default_factory=deque, repr=False)
     _execution_order: deque[str] = field(default_factory=deque, repr=False)
+    _approval_order: deque[str] = field(default_factory=deque, repr=False)
     _stream_partial_truncated: bool = field(default=False, repr=False)
+
+    @property
+    def pending_approval(self) -> dict[str, Any] | None:
+        """Compatibility view of the oldest pending approval.
+
+        New consumers should use :attr:`pending_approvals` or
+        :meth:`ordered_pending_approvals`; keeping this view avoids making
+        older hosted widgets a second approval authority during migration.
+        """
+        for approval_id in self._approval_order:
+            approval = self.pending_approvals.get(approval_id)
+            if approval is not None:
+                return approval
+        return next(iter(self.pending_approvals.values()), None)
+
+    @pending_approval.setter
+    def pending_approval(self, value: dict[str, Any] | None) -> None:
+        # Compatibility setter for older presentation code.  Assignment of
+        # None means "clear the displayed compatibility item"; lifecycle
+        # reducers use the ID-keyed helpers below and never clear the set.
+        if value is None:
+            self.pending_approvals.clear()
+            self._approval_order.clear()
+            return
+        approval_id = self._approval_id(value)
+        if approval_id:
+            self.pending_approvals[approval_id] = dict(value)
+            self._touch(self._approval_order, approval_id)
+
+    @staticmethod
+    def _approval_id(payload: Mapping[str, Any]) -> str | None:
+        value = payload.get("approval_id") or payload.get("id")
+        clean = sanitize_terminal_text(value).strip() if value is not None else ""
+        return clean or None
+
+    def ordered_pending_approvals(self) -> list[dict[str, Any]]:
+        """Return pending approvals in creation/event order."""
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for approval_id in self._approval_order:
+            approval = self.pending_approvals.get(approval_id)
+            if approval is not None:
+                result.append(approval)
+                seen.add(approval_id)
+        result.extend(
+            approval
+            for approval_id, approval in self.pending_approvals.items()
+            if approval_id not in seen
+        )
+        return result
+
+    def _remove_pending_approval(self, approval_id: str) -> None:
+        self.pending_approvals.pop(approval_id, None)
+        try:
+            self._approval_order.remove(approval_id)
+        except ValueError:
+            pass
 
     def add_recent(self, glyph: str, text: object) -> None:
         clean = sanitize_terminal_text(text).strip()
@@ -229,7 +294,13 @@ class ProjectionState:
             self.stream_partial = ""
             self._stream_partial_truncated = False
 
-    def acknowledge_approval(self, *, granted: bool, scope: str | None = None) -> None:
+    def acknowledge_approval(
+        self,
+        *,
+        granted: bool,
+        scope: str | None = None,
+        approval_id: str | None = None,
+    ) -> None:
         """Project a local approval choice before its durable event arrives.
 
         Approval input is an interaction, not a second source of task state.
@@ -237,8 +308,13 @@ class ProjectionState:
         consistently while the service is resuming the task; the subsequent
         ``ApprovalResolved`` event remains authoritative and may refine it.
         """
-        approval = self.pending_approval
-        self.pending_approval = None
+        approval = self.pending_approvals.get(approval_id) if approval_id else self.pending_approval
+        if approval_id:
+            self._remove_pending_approval(approval_id)
+        elif approval is not None:
+            oldest_id = self._approval_id(approval)
+            if oldest_id:
+                self._remove_pending_approval(oldest_id)
         if approval is not None and scope:
             approval = dict(approval)
             approval["selected_scope"] = scope
@@ -251,8 +327,7 @@ class ProjectionState:
 
     def ignore_approval_summary(self) -> None:
         """Discard a count-only approval summary after its request was handled."""
-        self.pending_approval = None
-        if self.status == "APPROVAL":
+        if self.status == "APPROVAL" and not self.pending_approvals:
             self.status = "EXECUTING"
             self.status_message = "Approval accepted; resuming."
 
@@ -513,6 +588,13 @@ class ProjectionState:
         self.raw_events.append((etype, _bounded_event_payload(payload)))
         if task_id:
             payload.setdefault("_event_task_id", task_id)
+        raw_phase = payload.get("self_host_phase") or payload.get("phase")
+        phase = sanitize_terminal_text(raw_phase).upper()
+        if phase == "PROMOTE":
+            phase = "PROMOTION"
+        if phase in _SELF_HOST_PHASES:
+            self.self_host_phase = phase
+            self.add_recent("·", f"Self-host · {phase}")
         self._reduce_task(etype, payload)
         self._reduce_execution(etype, payload)
         action = classify_event(etype, payload)
@@ -617,8 +699,10 @@ class ProjectionState:
             operation = self._operation(payload)
             if operation:
                 operation.state = "approval"
-            if payload.get("approval_id") or self.pending_approval is None:
-                self.pending_approval = payload
+            approval_id = self._approval_id(payload)
+            if approval_id:
+                self.pending_approvals[approval_id] = dict(payload)
+                self._touch(self._approval_order, approval_id)
             self.status, self.status_message = "APPROVAL", "Paused until you choose a scope."
             self.add_recent(
                 "?", f"Approval required · {operation.label if operation else 'capability'}"
@@ -629,7 +713,9 @@ class ProjectionState:
             denied = decision in {"deny", "denied", "rejected"}
             if operation:
                 operation.state = "denied" if denied else "approved"
-            self.pending_approval = None
+            approval_id = self._approval_id(payload)
+            if approval_id:
+                self._remove_pending_approval(approval_id)
             self.status = "WARNING" if denied else "TOOLS"
             self.add_recent("!" if denied else "✓", f"Approval {decision}")
         elif etype in {
@@ -688,13 +774,22 @@ class ProjectionState:
             self.status = "EXECUTING"
             self.feed_stream(f"$ {payload.get('runtime') or 'runtime'}\n")
         elif etype == "RuntimeStateLost":
+            self.runtime_state_lost = True
+            self.runtime_recovery = {
+                "runtime_session_id": payload.get("runtime_session_id"),
+                "task_id": task_id,
+                "backend": payload.get("backend"),
+                "route": payload.get("recovery_route") or "execute",
+                "action": payload.get("recovery_action") or "reestablish_runtime",
+                "reason": payload.get("reason") or "runtime process was not reattachable",
+            }
             self.status = "WARNING"
             self.status_message = (
-                "A runtime session was lost across restart; state was not guessed."
+                "RUNTIME STATE LOST · invoke execute with a fresh runtime; state was not guessed."
             )
             self.add_recent(
                 "!",
-                f"Runtime state lost · {payload.get('runtime_session_id') or 'session'}",
+                f"RUNTIME STATE LOST · {payload.get('runtime_session_id') or 'session'}",
             )
         elif etype in {"StdoutChunk", "StderrChunk"}:
             data = sanitize_terminal_text(payload.get("data") or "")
@@ -846,6 +941,9 @@ class ProjectionState:
             "RuntimeSessionCreated",
             "MutationRolledBack",
         }:
+            if etype == "RuntimeSessionCreated":
+                self.runtime_state_lost = False
+                self.runtime_recovery = {}
             labels = {
                 "ToolRepaired": "Tool input repaired",
                 "MutationRecorded": "Mutation recorded",

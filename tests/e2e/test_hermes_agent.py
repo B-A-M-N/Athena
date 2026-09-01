@@ -24,6 +24,8 @@ async def test_live_hermes_referee_transport() -> None:
     """Exercise the actual Hermes HTTP endpoint when the operator opts in."""
     endpoint = os.environ.get("ATHENA_HERMES_E2E_ENDPOINT")
     if not endpoint:
+        if os.environ.get("ATHENA_RELEASE_GATE") == "1":
+            pytest.fail("release gate requires ATHENA_HERMES_E2E_ENDPOINT for live Hermes evidence")
         pytest.skip("set ATHENA_HERMES_E2E_ENDPOINT to run the live Hermes check")
 
     adapter = HermesAgentEvaluator(

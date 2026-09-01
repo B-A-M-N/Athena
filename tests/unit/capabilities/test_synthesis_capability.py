@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,16 +17,43 @@ from athena.protocol.capabilities import (
     CapabilityRequestOrigin,
     CapabilityResultStatus,
 )
+from athena.protocol.events import make_event
 from athena.protocol.tasks import AutonomyLevel, WorkspaceSpec
 from athena.state.database import Database
 from athena.synthesis.engine import SynthesisEngine
+
+
+async def _record_passing_verifications(
+    engine: SynthesisEngine,
+    capability_id: str,
+    task_id: str,
+    call_ids: list[str],
+) -> None:
+    """Feed the same canonical proof events production observes."""
+    for call_id in call_ids:
+        await engine.observe_event(
+            make_event(
+                "CapabilityCompleted",
+                {"call_id": call_id, "capability_id": capability_id},
+                task_id=task_id,
+            )
+        )
+        await engine.observe_event(
+            make_event(
+                "VerificationCompleted",
+                {"passed": True},
+                task_id=task_id,
+            )
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.athena_scenario("SYNTH-005")
 async def test_model_can_create_task_local_tool(tmp_path):
     fabric = CapabilityFabric(CapabilityRegistry())
-    capability = SynthesisCapability(SynthesisEngine(), fabric)
+    engine = SynthesisEngine()
+    engine.bind_proof_sink(fabric.update_generated_proof)
+    capability = SynthesisCapability(engine, fabric)
     request = CapabilityRequest(
         capability_id="synthesis",
         task_id="task-1",
@@ -81,6 +110,12 @@ async def test_model_can_create_task_local_tool(tmp_path):
         )
         assert invocation.status is CapabilityResultStatus.OK
         assert json.loads(invocation.output) == {"echo": message}
+    await _record_passing_verifications(
+        engine,
+        generated_id,
+        "task-1",
+        ["call-1", "call-2", "call-3"],
+    )
 
     promoted = await capability.invoke(
         CapabilityRequest(
@@ -109,7 +144,15 @@ async def test_model_can_create_task_local_tool(tmp_path):
 @pytest.mark.asyncio
 async def test_model_can_declare_composed_capability_ceiling():
     fabric = CapabilityFabric(CapabilityRegistry())
-    capability = SynthesisCapability(SynthesisEngine(), fabric)
+
+    class _Registry:
+        def resolve(self, capability_id):
+            if capability_id in {"fs", "execute"}:
+                return SimpleNamespace(availability=SimpleNamespace(value="available"))
+            raise KeyError(capability_id)
+
+    engine = SynthesisEngine(dispatcher=SimpleNamespace(registry=_Registry()))
+    capability = SynthesisCapability(engine, fabric)
     result = await capability.invoke(
         CapabilityRequest(
             capability_id="synthesis",
@@ -214,8 +257,200 @@ async def test_synthesis_repair_creates_provenanced_superseding_candidate():
     repaired_id = repaired_payload["capability_id"]
     assert repaired_id != target_id
     assert repaired_payload["proof"]["supersedes"] == [target_id]
+    assert repaired_payload["proof"]["validation"]["cases_total"] == 2
+    assert repaired_payload["proof"]["validation"]["cases_passed"] == 2
     assert fabric.has(repaired_id, task_id="task-repair")
-    assert fabric.has(target_id, task_id="task-repair")
+    assert not fabric.has(target_id, task_id="task-repair")
+
+
+@pytest.mark.asyncio
+async def test_synthesis_revalidate_restores_same_task_capability_identity(tmp_path):
+    fabric = CapabilityFabric(CapabilityRegistry())
+    engine = SynthesisEngine()
+    capability = SynthesisCapability(engine, fabric)
+    created = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-revalidate",
+            call_id="create-revalidate",
+            arguments={
+                "operation": "create",
+                "name": "revalidatable_helper",
+                "description": "a helper that can regain current proof",
+                "code": "def run(args):\n    return {'ok': True}\n",
+                "input_schema": {"type": "object", "additionalProperties": False},
+                "output_schema": {
+                    "type": "object",
+                    "required": ["ok"],
+                    "properties": {"ok": {"type": "boolean"}},
+                    "additionalProperties": False,
+                },
+                "validation_cases": [{"args": {}}],
+            },
+        )
+    )
+    target_id = json.loads(created.output)["capability_id"]
+    target_cap = engine.synthetic_for(target_id)
+    assert target_cap is not None
+    identity = (
+        target_cap.id,
+        target_cap.code,
+        dict(target_cap.input_schema),
+        dict(target_cap.output_schema or {}),
+        target_cap.revision,
+        target_cap.parent_revision,
+        target_cap.family_id,
+    )
+    target_cap.lifecycle_state = "REVALIDATION_REQUIRED"
+    fabric._records[target_id] = replace(
+        fabric._records[target_id], lifecycle_state="REVALIDATION_REQUIRED"
+    )
+
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-revalidate",
+            call_id="revalidate-1",
+            arguments={"operation": "revalidate", "capability_id": target_id},
+        ),
+        context=type(
+            "Context",
+            (),
+            {"workspace": WorkspaceSpec(id="repo", root=str(tmp_path))},
+        )(),
+    )
+
+    assert result.status is CapabilityResultStatus.OK, result.error
+    assert json.loads(result.output)["status"] == "revalidated"
+    restored = engine.synthetic_for(target_id)
+    assert restored is not None
+    assert (
+        restored.id,
+        restored.code,
+        dict(restored.input_schema),
+        dict(restored.output_schema or {}),
+        restored.revision,
+        restored.parent_revision,
+        restored.family_id,
+    ) == identity
+    assert restored.lifecycle_state == "VALIDATED"
+    assert fabric.has(target_id, task_id="task-revalidate")
+
+
+@pytest.mark.asyncio
+async def test_synthesis_migrate_contract_is_explicit_and_revisioned():
+    fabric = CapabilityFabric(CapabilityRegistry())
+    engine = SynthesisEngine()
+    capability = SynthesisCapability(engine, fabric)
+    created = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-migrate",
+            call_id="create-migrate",
+            arguments={
+                "operation": "create",
+                "name": "contract_helper",
+                "description": "a helper with a stable contract",
+                "code": "def run(args):\n    return {'value': args['value']}\n",
+                "input_schema": {"type": "object"},
+                "validation_cases": [{"args": {"value": "old"}}],
+            },
+        )
+    )
+    target_id = json.loads(created.output)["capability_id"]
+    predecessor = engine.synthetic_for(target_id)
+
+    migrated = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-migrate",
+            call_id="migrate-1",
+            arguments={
+                "operation": "migrate_contract",
+                "capability_id": target_id,
+                "name": "contract_helper",
+                "description": "a helper with a revised contract",
+                "code": "def run(args):\n    return {'value': args['value'], 'version': 2}\n",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["value"],
+                    "properties": {"value": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+                "output_schema": {
+                    "type": "object",
+                    "required": ["value", "version"],
+                    "properties": {
+                        "value": {"type": "string"},
+                        "version": {"type": "integer"},
+                    },
+                    "additionalProperties": False,
+                },
+                "validation_cases": [{"args": {"value": "new"}}],
+            },
+        )
+    )
+
+    assert migrated.status is CapabilityResultStatus.OK, migrated.error
+    payload = json.loads(migrated.output)
+    successor = engine.synthetic_for(payload["capability_id"])
+    assert successor is not None
+    assert predecessor is not None
+    assert successor.family_id == predecessor.family_id
+    assert successor.revision == predecessor.revision + 1
+    assert successor.parent_revision == predecessor.revision
+    assert successor.supersedes == (target_id,)
+    assert successor.input_schema != predecessor.input_schema
+    migrated_inputs = [case["args"] for case in successor.validation_cases or []]
+    assert {"value": "old"} in migrated_inputs
+    assert {"value": "new"} in migrated_inputs
+
+
+@pytest.mark.asyncio
+async def test_breaking_contract_migration_requires_trusted_operator_confirmation():
+    fabric = CapabilityFabric(CapabilityRegistry())
+    engine = SynthesisEngine()
+    capability = SynthesisCapability(engine, fabric)
+    created = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-breaking-migrate",
+            call_id="create-breaking-migrate",
+            arguments={
+                "operation": "create",
+                "name": "breaking_helper",
+                "description": "a helper to migrate explicitly",
+                "code": "def run(args):\n    return args['value']\n",
+                "input_schema": {"type": "object"},
+                "validation_cases": [{"args": {"value": "old"}}],
+            },
+        )
+    )
+    target_id = json.loads(created.output)["capability_id"]
+    rejected = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-breaking-migrate",
+            call_id="breaking-migrate-1",
+            arguments={
+                "operation": "migrate_contract",
+                "capability_id": target_id,
+                "name": "breaking_helper",
+                "description": "a breaking helper migration",
+                "code": "def run(args):\n    return args['value']\n",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["value"],
+                    "properties": {"value": {"type": "integer"}},
+                },
+                "validation_cases": [{"args": {"value": 1}}],
+                "compatibility": "breaking",
+                "operator_confirmation": True,
+            },
+        )
+    )
+    assert rejected.status is CapabilityResultStatus.FAILED
+    assert "trusted caller" in (rejected.error or "")
 
 
 @pytest.mark.asyncio
@@ -260,6 +495,12 @@ async def test_synthesis_promotion_is_policy_checked(tmp_path):
             )
         )
         assert live.status is CapabilityResultStatus.OK
+    await _record_passing_verifications(
+        engine,
+        generated_id,
+        "task-4",
+        [f"promotion-proof-{index}" for index in range(3)],
+    )
     result = await dispatcher.dispatch(
         CapabilityRequest(
             capability_id="synthesis",
@@ -319,7 +560,7 @@ async def test_engine_promotion_cannot_bypass_target_tier_validation(tmp_path):
         )
         assert live.status is CapabilityResultStatus.OK
 
-    assert not engine.promote(
+    assert not await engine.promote(
         fabric,
         generated_id,
         scope=AffordanceScope.PROJECT,
@@ -518,6 +759,7 @@ async def test_promoted_capability_usage_proof_survives_restart(tmp_path):
     store = GeneratedCapabilityStore(db)
     fabric = CapabilityFabric(CapabilityRegistry(), store=store)
     engine = SynthesisEngine()
+    engine.bind_proof_sink(fabric.update_generated_proof)
     capability = SynthesisCapability(engine, fabric)
 
     created = await capability.invoke(
@@ -561,6 +803,12 @@ async def test_promoted_capability_usage_proof_survives_restart(tmp_path):
             context=context,
         )
         assert live.status is CapabilityResultStatus.OK
+    await _record_passing_verifications(
+        engine,
+        generated_id,
+        "task-proof",
+        [f"proof-seed-{index}" for index in range(3)],
+    )
     promoted = await capability.invoke(
         CapabilityRequest(
             capability_id="synthesis",
@@ -602,6 +850,91 @@ async def test_promoted_capability_usage_proof_survives_restart(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_promotion_persistence_failure_keeps_task_overlay_live(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "promotion-failure.db"))
+    store = GeneratedCapabilityStore(db)
+    fabric = CapabilityFabric(CapabilityRegistry(), store=store)
+    engine = SynthesisEngine()
+    engine.bind_proof_sink(fabric.update_generated_proof)
+    capability = SynthesisCapability(engine, fabric)
+    created = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-promotion-failure",
+            call_id="create-promotion-failure",
+            arguments={
+                "operation": "create",
+                "name": "promotion_failure_helper",
+                "description": "a helper whose failed promotion must remain task-live",
+                "code": "def run(args):\n    return {'ok': args['ok']}\n",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["ok"],
+                    "properties": {"ok": {"type": "boolean"}},
+                    "additionalProperties": False,
+                },
+                "validation_cases": [{"args": {"ok": True}}],
+            },
+        )
+    )
+    capability_id = json.loads(created.output)["capability_id"]
+    context = type(
+        "Context",
+        (),
+        {"workspace": WorkspaceSpec(id="repo", root=str(tmp_path))},
+    )()
+    original_executor = fabric.executor_for(capability_id, task_id="task-promotion-failure")
+    for index, value in enumerate((True, False, True)):
+        result = await original_executor.invoke(
+            CapabilityRequest(
+                capability_id=capability_id,
+                task_id="task-promotion-failure",
+                call_id=f"promotion-failure-use-{index}",
+                session_id=f"promotion-failure-session-{index % 2}",
+                arguments={"ok": value},
+            ),
+            context=context,
+        )
+        assert result.status is CapabilityResultStatus.OK
+    await _record_passing_verifications(
+        engine,
+        capability_id,
+        "task-promotion-failure",
+        [f"promotion-failure-use-{index}" for index in range(3)],
+    )
+
+    async def fail_save(*args, **kwargs):
+        del args, kwargs
+        raise OSError("durable store unavailable")
+
+    monkeypatch.setattr(store, "save", fail_save)
+    promoted = await capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-promotion-failure",
+            call_id="promote-promotion-failure",
+            arguments={
+                "operation": "promote",
+                "capability_id": capability_id,
+                "scope": "project",
+            },
+        ),
+        context=context,
+    )
+
+    assert promoted.status is CapabilityResultStatus.FAILED
+    assert "promotion persistence failed" in (promoted.error or "")
+    assert fabric.has(capability_id, task_id="task-promotion-failure")
+    assert not fabric.has(capability_id, project_id="repo")
+    assert fabric.executor_for(capability_id, task_id="task-promotion-failure") is original_executor
+    current = engine.synthetic_for(capability_id)
+    assert current is not None
+    assert current.task_id == "task-promotion-failure"
+    assert current.lifecycle_state != "PROMOTED"
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_candidate_can_be_rehydrated_and_promoted_after_restart(tmp_path):
     db = Database(str(tmp_path / "candidate.db"))
     store = GeneratedCapabilityStore(db)
@@ -609,6 +942,7 @@ async def test_candidate_can_be_rehydrated_and_promoted_after_restart(tmp_path):
     registry = CapabilityRegistry()
     fabric = CapabilityFabric(registry, store=store)
     engine = SynthesisEngine()
+    engine.bind_proof_sink(fabric.update_generated_proof)
     capability = SynthesisCapability(engine, fabric)
     created = await capability.invoke(
         CapabilityRequest(
@@ -646,6 +980,12 @@ async def test_candidate_can_be_rehydrated_and_promoted_after_restart(tmp_path):
             )
         )
         assert result.status is CapabilityResultStatus.OK
+    await _record_passing_verifications(
+        engine,
+        capability_id,
+        "task-candidate",
+        [f"candidate-use-{value}" for value in (10, 11, 12)],
+    )
     await fabric.flush()
     candidate = await store.get(capability_id, task_id="task-candidate")
     assert candidate is not None

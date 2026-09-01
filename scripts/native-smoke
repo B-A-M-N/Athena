@@ -5,7 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 projection='{"title":"ATHENA OI // BRIDGE","status":"ACTIVE","oi":["operation=verify-release","event=CapabilityCompleted"],"model_request":{"provider":"openrouter","model":"configured/model","role":"planner","request_id":"req-smoke","status":"active"},"workspace_tree":[{"id":"workspace:src","kind":"directory","label":"src","status":"active","children":[{"id":"workspace:src/main.rs","kind":"resource","label":"main.rs","status":"active","metadata":{"canonical_path":"src/main.rs"},"children":[]}]}],"trace":["> NEXT STEP · verify-release"]}'
-output="$({ printf '%s\n' "$projection"; } | cargo run --manifest-path native/Cargo.toml --offline -- \
+cargo build --release --manifest-path native/Cargo.toml --locked --offline >/dev/null
+native_bin="$repo_root/native/target/release/athena-terminal"
+output="$({ printf '%s\n' "$projection"; } | "$native_bin" \
   --headless --bridge-stdin --command 'printf "native-pty-ok\\n"' 2>&1)"
 
 printf '%s\n' "$output"

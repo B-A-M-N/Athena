@@ -1,6 +1,12 @@
-"""CLI composition-root configuration tests."""
+"""CLI composition-root and run-status tests."""
 
-from athena.cli.app import Options, _arg_parse, _config_set, build_config
+from types import SimpleNamespace
+
+import pytest
+
+from athena.cli.app import Options, _arg_parse, _cmd_run, _config_set, build_config
+from athena.protocol.errors import ModelProviderUnconfigured
+from athena.protocol.tasks import TaskStatus
 
 
 def test_build_config_auto_wires_openrouter_free_router(monkeypatch):
@@ -98,3 +104,88 @@ def test_config_set_writes_hermes_referee_section(tmp_path, monkeypatch):
         "enabled": True,
         "endpoint": "http://127.0.0.1:8642",
     }
+
+
+class _RunSurface:
+    def open(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def render_user_message(self, text: str) -> None:
+        del text
+
+    def render_notice(self, text: str, **kwargs) -> None:
+        del text, kwargs
+
+    def render_result(self, text: str, **kwargs) -> None:
+        del text, kwargs
+
+
+class _RunService:
+    def __init__(self, status: TaskStatus | None = None, *, ready: bool = True) -> None:
+        self.status = status
+        self.ready = ready
+        self.submit_calls = 0
+
+    def require_agent_ready(self, request=None) -> None:
+        del request
+        if not self.ready:
+            raise ModelProviderUnconfigured("No model provider is configured.")
+
+    async def submit(self, request, *, wait=False):
+        del request, wait
+        self.submit_calls += 1
+        return SimpleNamespace(id="task-run")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_exit"),
+    [
+        (TaskStatus.COMPLETE, 0),
+        (TaskStatus.FAILED, 1),
+        (TaskStatus.PARTIAL, 1),
+        (TaskStatus.CANCELLED, 130),
+    ],
+)
+async def test_run_maps_terminal_status_to_exit_code(monkeypatch, tmp_path, status, expected_exit):
+    import athena.cli.chat as chat
+
+    monkeypatch.setattr(chat, "_make_surface", lambda **kwargs: _RunSurface())
+
+    async def fake_stream_task(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(summary="done", status=status, usage=None)
+
+    monkeypatch.setattr(chat, "stream_task", fake_stream_task)
+    service = _RunService(status)
+    code = await _cmd_run(
+        Options(command="run", args=["hello"], workspace=str(tmp_path)),
+        service,
+    )
+
+    assert code == expected_exit
+    assert service.submit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_unconfigured_service_before_constructing_surface(
+    monkeypatch, tmp_path, capsys
+):
+    import athena.cli.chat as chat
+
+    constructed = []
+    monkeypatch.setattr(chat, "_make_surface", lambda **kwargs: constructed.append(kwargs))
+    service = _RunService(ready=False)
+
+    code = await _cmd_run(
+        Options(command="run", args=["hello"], workspace=str(tmp_path)),
+        service,
+    )
+
+    assert code == 2
+    assert service.submit_calls == 0
+    assert constructed == []
+    assert "No model provider is configured" in capsys.readouterr().err

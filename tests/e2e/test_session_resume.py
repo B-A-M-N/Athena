@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 
+from athena.cli.native_session import NativeSession, parse_args
 from athena.protocol.tasks import (
     AgentRequest,
     AutonomyLevel,
@@ -99,3 +100,61 @@ async def test_resume_session_sees_prior_transcript(make_durable_service, durabl
         blocks.extend(msg.blocks)
     texts = [getattr(b, "output", "") or getattr(b, "text", "") or "" for b in blocks]
     assert any(_MARKER in t for t in texts), "prior transcript not in the session store"
+
+
+@pytest.mark.athena_claim("BHV-026")
+@pytest.mark.athena_evidence("test", "e2e")
+@pytest.mark.asyncio
+async def test_native_turns_reuse_session_until_new_clears_context(tmp_path):
+    """The headless native controller preserves and then clears durable context."""
+    from athena.service.service import AthenaService
+
+    first_fact = "NATIVE_DURABLE_FACT_456"
+    service = AthenaService.in_memory(
+        extra_scripts=[
+            {
+                "match": {"user_contains": "NATIVE_TURN_ONE"},
+                "respond": {"text": first_fact, "done": True},
+            },
+            {
+                "match": {"user_contains": "NATIVE_TURN_TWO"},
+                "respond": {"text": "NATIVE_SECOND_REPLY", "done": True},
+            },
+            {
+                "match": {"user_contains": "NATIVE_TURN_THREE"},
+                "respond": {"text": "NATIVE_THIRD_REPLY", "done": True},
+            },
+        ]
+    )
+    await service.start()
+    try:
+        session = NativeSession(
+            parse_args(["--workspace", str(tmp_path), "--autonomy", "autonomous"])
+        )
+        session.service = service
+        provider = service._model_registry.provider_for("fake")
+        original_complete = provider.complete
+        captured: list[str] = []
+
+        async def spy(request):
+            captured.append("\n".join(msg.text() or "" for msg in request.messages))
+            async for event in original_complete(request):
+                yield event
+
+        provider.complete = spy
+
+        await session._submit("NATIVE_TURN_ONE store this fact")
+        first_session = session.session_id
+        assert first_session is not None
+        await session._submit("NATIVE_TURN_TWO recall the fact")
+        assert session.session_id == first_session
+        assert first_fact in captured[-1]
+
+        assert await session._dispatch_command("/new")
+        assert session.session_id is None
+        captured_before_new_turn = len(captured)
+        await session._submit("NATIVE_TURN_THREE do not reuse the old fact")
+        assert len(captured) == captured_before_new_turn + 1
+        assert first_fact not in captured[-1]
+    finally:
+        await service.stop()

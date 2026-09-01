@@ -194,6 +194,8 @@ class TaskStore:
         *,
         runtime_session_id: str,
         backend: str | None = None,
+        runtime: str | None = None,
+        cwd: str | None = None,
     ) -> None:
         """Persist a fail-closed hint for the next context compilation.
 
@@ -213,9 +215,16 @@ class TaskStore:
         metadata["_runtime_recovery_hint"] = {
             "runtime_session_id": str(runtime_session_id),
             "backend": str(backend or "unknown"),
+            "runtime": str(runtime or backend or "unknown"),
+            "cwd": str(cwd) if cwd else None,
+            "recovery_route": "execute",
+            "replay_command": False,
+            "recovery_action": "reestablish_runtime",
             "message": (
                 "Runtime state was lost across restart. Do not assume prior "
-                "process variables or session state exist; re-establish state explicitly."
+                "process variables or session state exist; invoke execute with a fresh "
+                "task-owned runtime and reconstruct required state explicitly. Do not "
+                "replay a stale command automatically."
             ),
         }
         await self._db.execute(

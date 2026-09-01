@@ -20,6 +20,7 @@ from athena.protocol.capabilities import (
 from athena.workflows.models import Workflow, WorkflowStep
 from athena.workflows.validation import WorkflowValidator
 from athena.protocol.tasks import MutationMode, NetworkPolicy
+from athena.workspace_manifest import copy_workspace_tree
 
 
 class WorkflowCapability:
@@ -250,15 +251,28 @@ class WorkflowCapability:
                     dict(args["output_schema"]) if args.get("output_schema") is not None else None
                 ),
             )
-            validation = WorkflowValidator(
-                lambda capability_id: (
-                    self._fabric.executor_for(
-                        capability_id,
-                        task_id=request.task_id,
-                        project_id=getattr(getattr(context, "workspace", None), "id", None),
-                    ).descriptor
-                )
-            ).validate(workflow)
+            # Resolve nested workflow references from the same owner-scoped
+            # graph used by execution.  Creation must validate composition as
+            # data, not reject a valid child merely because it is not a native
+            # capability in the fabric.
+            graph = await self._load_graph(
+                workflow,
+                task_id=request.task_id,
+                project_id=getattr(getattr(context, "workspace", None), "id", None),
+                user_id="athena",
+            )
+
+            def create_resolver(identifier):
+                nested = graph.get(identifier)
+                if nested is not None:
+                    return nested
+                return self._fabric.executor_for(
+                    identifier,
+                    task_id=request.task_id,
+                    project_id=getattr(getattr(context, "workspace", None), "id", None),
+                ).descriptor
+
+            validation = WorkflowValidator(create_resolver).validate(workflow)
             if not validation.ok:
                 return _result(request, ok=False, error="; ".join(validation.errors))
             await self._store.save(workflow)
@@ -298,14 +312,10 @@ class WorkflowCapability:
         execution_workspace = context.workspace
         if operation == "trial":
             trial_root = tempfile.mkdtemp(prefix="athena-workflow-trial-")
-            shutil.copytree(
+            copy_workspace_tree(
                 context.workspace.root,
                 trial_root,
                 dirs_exist_ok=True,
-                # Never reproduce links into the candidate workspace. A
-                # trial must not be able to follow a workspace symlink back
-                # into an unrelated host path.
-                symlinks=False,
             )
             execution_workspace = replace(
                 context.workspace,
@@ -423,11 +433,10 @@ class WorkflowCapability:
 
         trial_root = tempfile.mkdtemp(prefix="athena-workflow-replay-")
         try:
-            shutil.copytree(
+            copy_workspace_tree(
                 context.workspace.root,
                 trial_root,
                 dirs_exist_ok=True,
-                symlinks=False,
             )
             execution_workspace = replace(
                 context.workspace,

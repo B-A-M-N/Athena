@@ -9,6 +9,7 @@ of Athena rather than a second service or agent loop.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import shlex
 import subprocess
@@ -19,12 +20,23 @@ from typing import Any
 
 
 def native_binary() -> Path:
-    """Return the development binary, with an explicit override for installs."""
+    """Resolve a packaged/release native binary without guessing a debug path."""
     configured = os.environ.get("ATHENA_NATIVE_BIN")
     if configured:
         return Path(configured).expanduser()
+    try:
+        spec = importlib.util.find_spec("athena_native")
+        if spec is not None and spec.origin is not None:
+            companion = Path(spec.origin).resolve().parent / "athena-terminal"
+            if companion.is_file():
+                return companion
+    except (ImportError, OSError, RuntimeError, ValueError):
+        pass
+    installed = Path(sys.prefix) / "bin" / "athena-terminal"
+    if installed.is_file():
+        return installed
     repository = Path(__file__).resolve().parents[3]
-    return repository / "native" / "target" / "debug" / "athena-terminal"
+    return repository / "native" / "target" / "release" / "athena-terminal"
 
 
 def worker_command(options: Any) -> list[str]:
@@ -57,8 +69,8 @@ def launch(options: Any) -> int:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         print(
             "athena native: native binary not found; build it with "
-            "`cargo build --manifest-path native/Cargo.toml --offline` or "
-            "set ATHENA_NATIVE_BIN",
+            "`cargo build --release --manifest-path native/Cargo.toml --offline`, "
+            "install the packaged native asset, or set ATHENA_NATIVE_BIN",
             file=sys.stderr,
         )
         return 2

@@ -13,6 +13,8 @@ from collections.abc import Iterable
 from importlib.util import find_spec
 from typing import Any
 
+_TREE_SITTER_AVAILABLE = find_spec("tree_sitter") is not None
+
 
 class SemanticProjectAnalyzer:
     """Extract bounded semantic facts without making indexing fail closed."""
@@ -222,7 +224,10 @@ def _unique_records(
 
 
 def _tree_sitter_available() -> bool:
-    return find_spec("tree_sitter") is not None
+    # Resolve optional parser availability once at import time. Repeated
+    # importlib spec discovery from an asyncio executor thread can contend
+    # with Python's import lock on some 3.12 builds and stall indexing.
+    return _TREE_SITTER_AVAILABLE
 
 
 __all__ = ["SemanticProjectAnalyzer"]

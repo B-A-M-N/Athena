@@ -5,9 +5,9 @@ The fake model only scripts WHICH capability calls to make; the code itself
 ``PythonRuntime`` subprocesses through ``ExecutionManager``.
 
 Multi-call scenarios are driven by a small script progression: the fake model
-picks a script based on the accumulated user/result text, so an action script
-runs first (no prior result) and a *terminal* script runs once its output
-marker is present.
+selects the first action from the user message, then advances from explicit
+markers in the latest capability result. This keeps runtime state transitions
+independent from unrelated accumulated transcript text.
 """
 
 from __future__ import annotations
@@ -105,16 +105,19 @@ async def test_persistent_python_session_keeps_state(make_service):
     """Two execute calls in one task/session preserve runtime state: x=10 -> x*2==20."""
     svc = await make_service(
         scripts=[
-            # Step 3 (final): "20" appears only after the read executes and prints it.
-            {"match": {"user_contains": "20"}, "respond": {"text": "", "done": True}},
-            # Step 2: "SET" comes from step-1 output, so it runs only on turn 2.
+            # Step 3 (final): "20" appears only in the latest read result.
             {
-                "match": {"user_contains": "SET"},
+                "match": {"last_capability_result_contains": "20"},
+                "respond": {"text": "", "done": True},
+            },
+            # Step 2: "SET" comes from the latest step-1 result.
+            {
+                "match": {"last_capability_result_contains": "SET"},
                 "respond": {"capability_call": _cap_call("python", "print(x*2)")},
             },
             # Step 1: writes x=10 in the persistent python session.
             {
-                "match": {"user_contains": "PYPERSIST"},
+                "match": {"last_user_message_contains": "PYPERSIST"},
                 "respond": {"capability_call": _cap_call("python", "x=10; print('SET')")},
             },
         ]

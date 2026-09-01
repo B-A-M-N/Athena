@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+[[ -n "${DISPLAY:-}" ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — DISPLAY is required for real desktop acceptance' >&2
+  exit 1
+}
+for command in xdotool import identify compare python3 xclip xmessage rg; do
+  command -v "$command" >/dev/null || {
+    printf 'native-desktop-acceptance: FAIL — %s is unavailable\n' "$command" >&2
+    exit 1
+  }
+done
+
+cargo build --release --manifest-path native/Cargo.toml --locked --offline >/dev/null
+native_bin="$repo_root/native/target/release/athena-terminal"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+resize_dump="$tmp_dir/resize-layout.json"
+before="$tmp_dir/before.png"
+brightness="$tmp_dir/brightness.png"
+focus="$tmp_dir/focus.png"
+crt="$tmp_dir/crt.png"
+focus_lost="$tmp_dir/focus-lost.png"
+focus_return="$tmp_dir/focus-return.png"
+clipboard_capture="$tmp_dir/clipboard.txt"
+
+layout_json="$($native_bin --dump-layout)"
+read -r brightness_x brightness_y focus_x focus_y crt_x crt_y header_x header_y prompt_x prompt_y < <(
+  LAYOUT_JSON="$layout_json" python3 -c '
+import json, os
+layout = json.loads(os.environ["LAYOUT_JSON"])
+rail = layout["rail"]
+def center(name):
+    rect = rail[name]
+    return round(rect["x"] + rect["width"] / 2), round(rect["y"] + rect["height"] / 2)
+header = layout["header"]
+print(*center("brightness"), *center("focus"), *center("power"),
+      round(header["x"] + header["width"] / 2),
+      round(header["y"] + header["height"] / 2),
+      round(layout["prompt"]["x"] + layout["prompt"]["width"] / 2),
+      round(layout["prompt"]["y"] + layout["prompt"]["height"] / 2))
+'
+)
+
+ATHENA_NATIVE_LAYOUT_DUMP="$resize_dump" \
+  "$native_bin" --no-animations --command \
+  "IFS= read -r line; printf '%s' \"\$line\" > $(printf '%q' "$clipboard_capture"); sleep 30" \
+  >/dev/null 2>&1 &
+native_pid=$!
+cleanup_native() {
+  if [[ -n "${native_pid:-}" ]]; then
+    kill "$native_pid" 2>/dev/null || true
+    wait "$native_pid" 2>/dev/null || true
+    native_pid=""
+  fi
+  if [[ -n "${clipboard_pid:-}" ]]; then
+    kill "$clipboard_pid" 2>/dev/null || true
+    wait "$clipboard_pid" 2>/dev/null || true
+    clipboard_pid=""
+  fi
+  if [[ -n "${focus_probe_pid:-}" ]]; then
+    kill "$focus_probe_pid" 2>/dev/null || true
+    wait "$focus_probe_pid" 2>/dev/null || true
+    focus_probe_pid=""
+  fi
+}
+trap 'cleanup_native; rm -rf "$tmp_dir"' EXIT
+
+find_window_for_pid() {
+  local candidate candidate_pid
+  while read -r candidate; do
+    candidate_pid="$(xdotool getwindowpid "$candidate" 2>/dev/null || true)"
+    if [[ "$candidate_pid" == "$native_pid" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done < <(xdotool search --name 'ATHENA' 2>/dev/null || true)
+  return 1
+}
+
+window=""
+for _ in $(seq 1 100); do
+  window="$(find_window_for_pid || true)"
+  [[ -n "$window" ]] && break
+  sleep 0.1
+done
+[[ -n "$window" ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window did not appear' >&2
+  exit 1
+}
+xdotool windowfocus --sync "$window"
+sleep 0.3
+import -window "$window" "$before"
+xdotool mousemove --window "$window" "$prompt_x" "$prompt_y"
+xdotool click --window "$window" 1
+
+window_geometry() {
+  local geometry
+  geometry="$(xdotool getwindowgeometry --shell "$window")"
+  window_x="$(awk -F= '$1 == "X" {print $2}' <<< "$geometry")"
+  window_y="$(awk -F= '$1 == "Y" {print $2}' <<< "$geometry")"
+  window_width="$(awk -F= '$1 == "WIDTH" {print $2}' <<< "$geometry")"
+  window_height="$(awk -F= '$1 == "HEIGHT" {print $2}' <<< "$geometry")"
+}
+
+# Clipboard is a real X11 selection round-trip, not only a key-event smoke
+# test. The native editor must deliver the selected text to its PTY child.
+clipboard_text='real desktop clipboard — Athena'
+printf '%s' "$clipboard_text" | xclip -selection clipboard -in &
+clipboard_pid=$!
+xdotool key --window "$window" ctrl+shift+v
+sleep 0.25
+xdotool key --window "$window" Return
+kill "$clipboard_pid" 2>/dev/null || true
+wait "$clipboard_pid" 2>/dev/null || true
+clipboard_pid=""
+for _ in $(seq 1 30); do
+  [[ -f "$clipboard_capture" ]] && break
+  sleep 0.1
+done
+[[ -f "$clipboard_capture" && "$(<"$clipboard_capture")" == "$clipboard_text" ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — real X11 clipboard paste did not reach the PTY child' >&2
+  exit 1
+}
+
+# The borderless fascia owns window movement through _NET_WM_MOVERESIZE.
+window_geometry
+original_x="$window_x"
+original_y="$window_y"
+header_drag_verified=0
+xdotool mousemove --window "$window" "$header_x" "$header_y"
+xdotool mousedown --window "$window" 1
+xdotool mousemove_relative -- 48 32
+xdotool mouseup --window "$window" 1
+sleep 0.2
+window_geometry
+if [[ "$window_x" == "$original_x" && "$window_y" == "$original_y" ]]; then
+  if [[ "${ATHENA_RELEASE_GATE:-0}" == "1" ]]; then
+    printf '%s\n' 'native-desktop-acceptance: FAIL — release gate requires Athena header moveresize; host WM ignored it' >&2
+    exit 1
+  fi
+  printf '%s\n' 'native-desktop-acceptance: INFO — host WM ignored synthetic header moveresize; testing managed move directly' >&2
+else
+  header_drag_verified=1
+  printf '%s\n' 'native-desktop-acceptance: PASS — header fascia moveresize' >&2
+fi
+xdotool windowmove --sync "$window" "$original_x" "$original_y"
+sleep 0.1
+
+# A managed borderless window must remain movable even when the host desktop
+# does not accept synthetic _NET_WM_MOVERESIZE gestures (some remote X11 WMs
+# intentionally ignore them). This still proves the supported window-manager
+# move contract without masking the header result above.
+xdotool windowmove --sync "$window" "$((original_x + 32))" "$((original_y + 24))"
+sleep 0.1
+window_geometry
+[[ "$window_x" != "$original_x" || "$window_y" != "$original_y" ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — managed window move did not change geometry' >&2
+  exit 1
+}
+xdotool windowmove --sync "$window" "$original_x" "$original_y"
+sleep 0.1
+
+# Exercise physical controls through X11 mouse input. These controls are
+# presentation-only: they must change the frame, never task/PTY authority.
+xdotool mousemove --window "$window" "$brightness_x" "$brightness_y"
+xdotool mousedown --window "$window" 1
+xdotool mousemove --window "$window" "$((brightness_x + 40))" "$brightness_y"
+xdotool mouseup --window "$window" 1
+sleep 0.15
+import -window "$window" "$brightness"
+xdotool mousemove --window "$window" "$focus_x" "$focus_y"
+xdotool mousedown --window "$window" 1
+xdotool mousemove --window "$window" "$((focus_x + 40))" "$focus_y"
+xdotool mouseup --window "$window" 1
+sleep 0.15
+import -window "$window" "$focus"
+xdotool mousemove --window "$window" "$crt_x" "$crt_y"
+xdotool click --window "$window" 1
+sleep 0.15
+import -window "$window" "$crt"
+
+for capture in "$brightness" "$focus" "$crt"; do
+  [[ "$(identify -format '%wx%h' "$capture")" == '1280x800' ]] || {
+    printf 'native-desktop-acceptance: FAIL — unexpected capture dimensions for %s\n' "$capture" >&2
+    exit 1
+  }
+done
+brightness_rmse="$(compare -metric RMSE "$before" "$brightness" null: 2>&1 || true)"
+focus_rmse="$(compare -metric RMSE "$brightness" "$focus" null: 2>&1 || true)"
+crt_rmse="$(compare -metric RMSE "$before" "$crt" null: 2>&1 || true)"
+[[ "$brightness_rmse" != *'(0)'* && "$brightness_rmse" != '0'* ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — brightness/focus controls produced no frame change' >&2
+  exit 1
+}
+[[ "$focus_rmse" != *'(0)'* && "$focus_rmse" != '0'* ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — focus drag produced no frame change' >&2
+  exit 1
+}
+[[ "$crt_rmse" != *'(0)'* && "$crt_rmse" != '0'* ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — CRT control produced no frame change' >&2
+  exit 1
+}
+
+# Focus loss/return must be handled by the native event loop and must not
+# terminate the PTY session. Use a real second X11 client as the focus peer.
+xmessage -name ATHENA_FOCUS_PROBE 'Athena focus probe' >/dev/null 2>&1 &
+focus_probe_pid=$!
+focus_probe=""
+for _ in $(seq 1 50); do
+  focus_probe="$(xdotool search --name 'ATHENA_FOCUS_PROBE' 2>/dev/null | head -1 || true)"
+  [[ -n "$focus_probe" ]] && break
+  sleep 0.1
+done
+[[ -n "$focus_probe" ]] || {
+  kill "$focus_probe_pid" 2>/dev/null || true
+  printf '%s\n' 'native-desktop-acceptance: FAIL — focus probe window did not appear' >&2
+  exit 1
+}
+xdotool windowfocus --sync "$focus_probe"
+sleep 0.2
+import -window "$window" "$focus_lost"
+xdotool windowfocus --sync "$window"
+sleep 0.2
+import -window "$window" "$focus_return"
+kill "$focus_probe_pid" 2>/dev/null || true
+wait "$focus_probe_pid" 2>/dev/null || true
+focus_probe_pid=""
+focus_lost_rmse="$(compare -metric RMSE "$before" "$focus_lost" null: 2>&1 || true)"
+focus_return_rmse="$(compare -metric RMSE "$focus_lost" "$focus_return" null: 2>&1 || true)"
+[[ "$focus_lost_rmse" != *'(0)'* && "$focus_lost_rmse" != '0'* ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — focus loss produced no native frame change' >&2
+  exit 1
+}
+[[ "$focus_return_rmse" != *'(0)'* && "$focus_return_rmse" != '0'* ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — focus return produced no native frame change' >&2
+  exit 1
+}
+
+# Exercise the native perimeter's eight EWMH resize directions. The expected
+# sign is asserted rather than an exact pixel delta because WMs may apply
+# resize increments or minimum-size hints.
+for resize_case in \
+  'top-left 2 2 - -' \
+  'top 640 2 0 -' \
+  'top-right 1278 2 1 -' \
+  'right 1278 400 1 0' \
+  'bottom-right 1278 798 1 1' \
+  'bottom 640 798 0 1' \
+  'bottom-left 2 798 - 1' \
+  'left 2 400 - 0'; do
+  read -r resize_name resize_x resize_y width_sign height_sign <<< "$resize_case"
+  xdotool windowsize --sync "$window" 1280 800
+  sleep 0.1
+  window_geometry
+  resize_before_width="$window_width"
+  resize_before_height="$window_height"
+  xdotool mousemove --window "$window" "$resize_x" "$resize_y"
+  xdotool mousedown --window "$window" 1
+  sleep 0.1
+  case "$resize_name" in
+    top-left|top-right) xdotool mousemove_relative -- 24 24 ;;
+    top) xdotool mousemove_relative -- 0 24 ;;
+    right) xdotool mousemove_relative -- 24 0 ;;
+    bottom-right) xdotool mousemove_relative -- 24 24 ;;
+    bottom) xdotool mousemove_relative -- 0 24 ;;
+    bottom-left) xdotool mousemove_relative -- 24 24 ;;
+    left) xdotool mousemove_relative -- 24 0 ;;
+  esac
+  xdotool mouseup --window "$window" 1
+  sleep 0.2
+  window_geometry
+  if [[ "$width_sign" == '1' && "$window_width" -le "$resize_before_width" ]] \
+    || [[ "$width_sign" == '-' && "$window_width" -ge "$resize_before_width" ]] \
+    || [[ "$height_sign" == '1' && "$window_height" -le "$resize_before_height" ]] \
+    || [[ "$height_sign" == '-' && "$window_height" -ge "$resize_before_height" ]]; then
+    printf 'native-desktop-acceptance: FAIL — %s resize direction was not honored\n' "$resize_name" >&2
+    exit 1
+  fi
+done
+
+# Unmap/remap exercises the supported managed-window lifecycle without losing
+# the native process or the PTY child. EWMH minimize is WM policy, so it is
+# deliberately not treated as an Athena product invariant.
+xdotool windowsize --sync "$window" 1280 800
+xdotool windowunmap "$window"
+sleep 0.25
+if xdotool search --onlyvisible --name 'ATHENA' 2>/dev/null | rg -q "$window"; then
+  printf '%s\n' 'native-desktop-acceptance: FAIL — native surface remained visible after unmap' >&2
+  exit 1
+fi
+xdotool windowmap --sync "$window"
+xdotool windowfocus --sync "$window"
+sleep 0.2
+xdotool search --onlyvisible --name 'ATHENA' 2>/dev/null | rg -q "$window" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — native window did not restore after remap' >&2
+  exit 1
+}
+
+# Exercise live ConfigureNotify handling at several real window sizes.
+for size in 1280x800 1170x659 1920x1080; do
+  IFS=x read -r resize_width resize_height <<< "$size"
+  xdotool windowsize --sync "$window" "$resize_width" "$resize_height"
+  sleep 0.2
+  "$repo_root/scripts/check-native-layout.py" "$resize_dump" "$resize_width" "$resize_height"
+done
+
+# WM_DELETE_WINDOW must close the surface cleanly after controls and resizes.
+xdotool windowclose "$window"
+for _ in $(seq 1 100); do
+if ! kill -0 "$native_pid" 2>/dev/null; then
+    wait "$native_pid"
+    if [[ "$header_drag_verified" == "1" ]]; then
+      printf '%s\n' 'native-desktop-acceptance: PASS — live X11 controls, clipboard, focus, header moveresize, eight-way resize, unmap/remap, CRT, and close'
+    else
+      printf '%s\n' 'native-desktop-acceptance: PASS — live X11 controls, clipboard, focus, generic window move, unmap/remap, CRT, and close (desktop fallback; not release evidence)'
+    fi
+    exit 0
+  fi
+  sleep 0.1
+done
+printf '%s\n' 'native-desktop-acceptance: FAIL — WM close did not terminate native process' >&2
+exit 1

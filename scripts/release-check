@@ -226,6 +226,8 @@ def main(argv: list[str] | None = None) -> int:
         env.pop("PYTHONHOME", None)
         env["ATHENA_RELEASE_SHA"] = resolved
         env["ATHENA_FROZEN_SOURCE"] = "1"
+        env["ATHENA_RELEASE_GATE"] = "1"
+        env["ATHENA_RELEASE_UV"] = args.uv
         # Keep uv's environment outside the checkout. Otherwise the first
         # ``uv run`` can create an untracked .venv and make the later
         # scenarios --require-clean assertion fail for the wrong reason.
@@ -239,6 +241,27 @@ def main(argv: list[str] | None = None) -> int:
             record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
             record["name"] = name
             lanes.append(record)
+            if name == "release-artifacts" and int(record.get("exit_code") or 0) == 0:
+                manifest_path = checkout / "release-artifacts" / "release-manifest.json"
+                if not manifest_path.is_file():
+                    raise RuntimeError("release artifact manifest was not produced")
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest.get("source_sha") != resolved:
+                    raise RuntimeError(
+                        "release artifact manifest source_sha does not match frozen commit"
+                    )
+                if evidence_dir is not None:
+                    _write_text(
+                        evidence_dir / "release-manifest.json",
+                        manifest_path.read_text(encoding="utf-8"),
+                    )
+                    artifact_evidence = evidence_dir / "release-artifacts"
+                    if artifact_evidence.exists():
+                        raise RuntimeError(
+                            "release artifact evidence path already exists; "
+                            "use a fresh --evidence-dir"
+                        )
+                    shutil.copytree(checkout / "release-artifacts", artifact_evidence)
             if evidence_dir is not None:
                 _write_text(
                     evidence_dir
@@ -256,7 +279,13 @@ def main(argv: list[str] | None = None) -> int:
                     f"command failed with exit {record['exit_code']}: {' '.join(command)}"
                 )
         if evidence_dir is not None:
-            static_names = {"ruff-format", "ruff-check", "mypy", "compileall"}
+            static_names = {
+                "ruff-format",
+                "ruff-check",
+                "mypy",
+                "compileall",
+                "dependency-audit",
+            }
             _write_json(
                 evidence_dir / "static-checks.json",
                 {

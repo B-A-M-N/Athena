@@ -17,25 +17,50 @@ if [[ "${NATIVE_CABINET_UPDATE_GOLDEN:-0}" != "1" ]]; then
   }
 fi
 
-cargo build --manifest-path native/Cargo.toml --offline >/dev/null
+cargo build --release --manifest-path native/Cargo.toml --locked --offline >/dev/null
+native_bin="$repo_root/native/target/release/athena-terminal"
 golden_path="${NATIVE_CABINET_GOLDEN:-$repo_root/native/assets/athenabox/cabinet-golden.png}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 capture_path="$tmp_dir/cabinet.png"
 
 xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
-  env NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" \
+  env NATIVE_BIN="$native_bin" \
   CAPTURE_PATH="$capture_path" GOLDEN_PATH="$golden_path" \
   bash -c '
     set -euo pipefail
-    "$NATIVE_BIN" --cabinet-only --no-animations --command "sleep 8" >/dev/null 2>&1 &
+    wait_for_presentation() {
+      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" python3 - <<'PY'
+import json
+import os
+import time
+from pathlib import Path
+
+path = Path(os.environ["PRESENTATION_PATH"])
+minimum = int(os.environ["MIN_SEQUENCE"])
+width = int(os.environ["EXPECTED_WIDTH"])
+height = int(os.environ["EXPECTED_HEIGHT"])
+deadline = time.monotonic() + 10.0
+while time.monotonic() < deadline:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        value = None
+    if (
+        isinstance(value, dict)
+        and int(value.get("presented_frame_sequence", 0)) >= minimum
+        and int(value.get("width", 0)) == width
+        and int(value.get("height", 0)) == height
+    ):
+        raise SystemExit(0)
+    time.sleep(0.01)
+raise SystemExit(f"presentation sync timeout: sequence >= {minimum}, {width}x{height}")
+PY
+    }
+    sync_path="${CAPTURE_PATH%/*}/presentation.json"
+    ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --cabinet-only --no-animations --command "tail -f /dev/null" >/dev/null 2>&1 &
     native_pid=$!
-    window=""
-    for _ in $(seq 1 50); do
-      window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
-      [[ -n "$window" ]] && break
-      sleep 0.1
-    done
+    window="$(timeout 10s xdotool search --sync --name "ATHENA" 2>/dev/null | head -1 || true)"
     [[ -n "$window" ]] || {
       printf "%s\n" "native-cabinet-golden: FAIL — native window did not appear" >&2
       kill "$native_pid" 2>/dev/null || true
@@ -43,8 +68,17 @@ xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
       exit 1
     }
     xdotool windowfocus --sync "$window"
+    wait_for_presentation "$sync_path" 1 1280 800
+    sequence="$(SYNC_PATH="$sync_path" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+print(json.loads(Path(os.environ["SYNC_PATH"]).read_text())["presented_frame_sequence"])
+PY
+    )"
     xdotool windowsize --sync "$window" 1672 941
-    sleep 0.25
+    wait_for_presentation "$sync_path" "$((sequence + 1))" 1672 941
     import -window "$window" "$CAPTURE_PATH"
     kill "$native_pid" 2>/dev/null || true
     wait "$native_pid" 2>/dev/null || true

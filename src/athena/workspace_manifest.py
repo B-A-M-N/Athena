@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
@@ -162,10 +163,140 @@ def tree_paths(root: Path) -> list[Path]:
     return sorted(result)
 
 
+def copy_workspace_tree(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    ignore=None,
+    dirs_exist_ok: bool = False,
+) -> None:
+    """Copy a workspace without dereferencing links outside that workspace.
+
+    ``shutil.copytree(..., symlinks=False)`` follows links and can copy an
+    arbitrary external file or directory into a supposedly isolated shadow.
+    This helper preflights every visible link with ``lstat``/``readlink``,
+    rejects broken or external targets, and recreates safe internal links as
+    relative links in the clone.  The target is resolved only for validation;
+    its bytes are never read through the source link.
+    """
+    src = Path(source).resolve(strict=True)
+    dst = Path(destination)
+    if not src.is_dir():
+        raise NotADirectoryError(f"workspace root does not exist: {source}")
+    ignored_cache: dict[Path, set[str]] = {}
+
+    def ignored_names(directory: Path, names: list[str]) -> set[str]:
+        if ignore is None:
+            return set()
+        cached = ignored_cache.get(directory)
+        if cached is None:
+            cached = set(str(name) for name in ignore(str(directory), sorted(names)))
+            ignored_cache[directory] = cached
+        return cached
+
+    def inside(path: Path) -> bool:
+        try:
+            path.relative_to(src)
+        except ValueError:
+            return False
+        return True
+
+    def omitted(path: Path) -> bool:
+        """Return whether a resolved target would be absent from the clone."""
+        try:
+            parts = path.relative_to(src).parts
+        except ValueError:
+            return True
+        directory = src
+        for part in parts:
+            if part in ignored_names(directory, [part]):
+                return True
+            directory = directory / part
+        return False
+
+    def validate(directory: Path) -> None:
+        with os.scandir(directory) as scanner:
+            entries = sorted(list(scanner), key=lambda entry: entry.name)
+            ignored = ignored_names(directory, [entry.name for entry in entries])
+            for entry in entries:
+                if entry.name in ignored:
+                    continue
+                path = Path(entry.path)
+                if entry.is_symlink():
+                    try:
+                        target = path.resolve(strict=True)
+                    except (OSError, RuntimeError) as exc:
+                        raise ValueError(f"broken workspace symlink: {path}") from exc
+                    if not inside(target):
+                        raise ValueError(f"workspace symlink escapes source: {path}")
+                    if omitted(target):
+                        raise ValueError(f"workspace symlink targets an omitted path: {path}")
+                    if not (target.is_file() or target.is_dir()):
+                        raise ValueError(f"unsupported workspace symlink target: {path}")
+                elif entry.is_dir(follow_symlinks=False):
+                    validate(path)
+
+    def remove_existing(path: Path) -> None:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            path.unlink()
+        elif path.is_dir():
+            if not dirs_exist_ok:
+                raise FileExistsError(path)
+        elif path.exists():
+            raise FileExistsError(path)
+
+    def copy_directory(directory: Path, target_directory: Path) -> None:
+        if target_directory.exists() and not target_directory.is_dir():
+            if not dirs_exist_ok:
+                raise FileExistsError(target_directory)
+            target_directory.unlink()
+        target_directory.mkdir(parents=True, exist_ok=dirs_exist_ok)
+        with os.scandir(directory) as scanner:
+            entries = sorted(list(scanner), key=lambda entry: entry.name)
+            ignored = ignored_names(directory, [entry.name for entry in entries])
+            for entry in entries:
+                if entry.name in ignored:
+                    continue
+                source_path = Path(entry.path)
+                destination_path = target_directory / entry.name
+                if entry.is_symlink():
+                    try:
+                        resolved = source_path.resolve(strict=True)
+                    except (OSError, RuntimeError) as exc:
+                        raise ValueError(f"broken workspace symlink: {source_path}") from exc
+                    target_relative = resolved.relative_to(src)
+                    destination_target = dst / target_relative
+                    link_target = os.path.relpath(
+                        destination_target,
+                        start=destination_path.parent,
+                    )
+                    if destination_path.exists() or destination_path.is_symlink():
+                        if not dirs_exist_ok:
+                            raise FileExistsError(destination_path)
+                        remove_existing(destination_path)
+                    destination_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(link_target, destination_path)
+                elif entry.is_dir(follow_symlinks=False):
+                    copy_directory(source_path, destination_path)
+                elif entry.is_file(follow_symlinks=False):
+                    if destination_path.exists() or destination_path.is_symlink():
+                        if not dirs_exist_ok:
+                            raise FileExistsError(destination_path)
+                        remove_existing(destination_path)
+                    destination_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_path, destination_path, follow_symlinks=False)
+                else:
+                    raise ValueError(f"unsupported workspace entry: {source_path}")
+
+    validate(src)
+    copy_directory(src, dst)
+
+
 __all__ = [
     "IGNORED_DIRECTORY_NAMES",
     "ManifestPolicy",
     "copy_ignore",
+    "copy_workspace_tree",
     "ignored_name",
     "tree_paths",
 ]

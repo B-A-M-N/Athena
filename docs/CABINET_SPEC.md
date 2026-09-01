@@ -1,8 +1,8 @@
 # AthenaBOX cabinet contract
 
 This is the visual contract for the native AthenaBOX compositor. The attached
-AthenaBOX(6) reference is authoritative for the physical enclosure; DAGOAL is
-authoritative for the live scene inside the right CRT.
+AthenaBOX(7) reference is authoritative for the physical enclosure; DAGOAL
+version 8 is authoritative for the live scene inside the right CRT.
 
 ## Reference and resize behavior
 
@@ -38,7 +38,7 @@ blue-gray glass. Hardware is neutral graphite; blue/green/amber light belongs
 to screens, lamps, and engraved labels.
 The display assembly is dominant and the lower control rail is intentionally
 shallow; the identity/data plate is an independent far-right module after the
-power control.
+CRT control.
 
 ## Reference-space feature groups
 
@@ -48,8 +48,8 @@ The normalized geometry is owned by `NativePixelLayout` and `RailLayout`:
 - equal-sized operator and OI apertures;
 - operator transcript viewport inside its bezel;
 - 384 × 256 logical DAGOAL scene inside the right CRT;
-- lower speaker, operator prompt module, system lamps, primary encoder,
-  brightness, focus, power, and identity plate.
+- lower passive vent, operator prompt module, system lamps, primary encoder,
+  brightness, focus, CRT, and identity plate.
 
 The prompt module is a rectangular recessed equipment bay. Its status, input,
 and hint rows are measured from the live Xft role metrics. At small sizes the

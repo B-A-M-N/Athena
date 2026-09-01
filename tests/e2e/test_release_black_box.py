@@ -10,11 +10,13 @@ paths.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import textwrap
+import zipfile
 
 import pytest
 
@@ -24,29 +26,79 @@ import pytest
 @pytest.mark.athena_claim("ATHENA-EXT-016")
 @pytest.mark.athena_evidence("e2e")
 def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> None:
-    """Build, install, and exercise both release artifacts outside the tree."""
+    """Install the exact hashed artifacts and exercise application entry paths."""
     repo = Path(__file__).resolve().parents[2]
-    artifact_dir = tmp_path / "dist"
-    artifact_dir.mkdir()
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "build",
-            "--wheel",
-            "--sdist",
-            "--outdir",
-            str(artifact_dir),
-        ],
-        cwd=repo,
-        check=True,
+    configured_artifacts = os.environ.get("ATHENA_RELEASE_ARTIFACT_DIR")
+    artifact_dir = (
+        Path(configured_artifacts).resolve() if configured_artifacts else repo / "release-artifacts"
     )
+    if not artifact_dir.is_dir():
+        artifact_dir = tmp_path / "dist"
+        subprocess.run(
+            [
+                str(repo / "scripts" / "build-release-artifacts"),
+                "--output-dir",
+                str(artifact_dir),
+            ],
+            cwd=repo,
+            check=True,
+        )
 
     artifacts = sorted(artifact_dir.iterdir())
-    wheel = next((path for path in artifacts if path.suffix == ".whl"), None)
+    wheel = next(
+        (path for path in artifacts if path.suffix == ".whl" and "native" not in path.name),
+        None,
+    )
     sdist = next((path for path in artifacts if path.suffix == ".gz"), None)
+    native_wheel = next(
+        (path for path in artifacts if path.suffix == ".whl" and "native" in path.name), None
+    )
+    assert wheel is not None and "native" not in wheel.name
     assert wheel is not None, f"wheel missing from {artifacts!r}"
     assert sdist is not None, f"sdist missing from {artifacts!r}"
+    assert native_wheel is not None, f"native companion wheel missing from {artifacts!r}"
+    manifest = artifact_dir / "release-manifest.json"
+    assert manifest.is_file(), "release manifest missing; acceptance must consume exact artifacts"
+    manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest_hashes = {
+        Path(item["path"]).resolve(): item["sha256"] for item in manifest_data["artifacts"]
+    }
+    expected_artifacts = {wheel.resolve(), sdist.resolve(), native_wheel.resolve()}
+    assert set(manifest_hashes) == expected_artifacts
+    assert {path.resolve() for path in artifacts if path.name != "release-manifest.json"} == (
+        expected_artifacts
+    )
+    for artifact in (wheel, sdist, native_wheel):
+        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == manifest_hashes.get(
+            artifact.resolve()
+        )
+
+    def assert_wheel_contract(path: Path) -> None:
+        with zipfile.ZipFile(path) as archive:
+            contains_native = any(name.endswith("/athena-terminal") for name in archive.namelist())
+        if contains_native and path.name.endswith("-py3-none-any.whl"):
+            raise AssertionError(
+                f"native payload must not be embedded in a universal wheel: {path.name}"
+            )
+
+    assert_wheel_contract(wheel)
+    assert_wheel_contract(native_wheel)
+    with zipfile.ZipFile(wheel) as archive:
+        assert not any(name.endswith("/athena-terminal") for name in archive.namelist())
+    with zipfile.ZipFile(native_wheel) as archive:
+        assert any(name.endswith("/athena-terminal") for name in archive.namelist())
+    assert "-py3-none-" in native_wheel.name
+    assert not native_wheel.name.endswith("-py3-none-any.whl")
+    offline_demo_config = tmp_path / "offline-demo.toml"
+    offline_demo_config.write_text(
+        """[[providers]]
+kind = "fake"
+name = "fake"
+model = "fake-1"
+scripts = [{match = {user_contains = "2+2"}, respond = {text = "4", done = true}}]
+""",
+        encoding="utf-8",
+    )
 
     for artifact in (wheel, sdist):
         prefix = tmp_path / (artifact.stem.replace(".", "-") + "-env")
@@ -71,6 +123,7 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
                 "pip",
                 "install",
                 f"{artifact}[cli]",
+                str(native_wheel),
             ],
             cwd=tmp_path,
             env=install_env,
@@ -99,6 +152,74 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
         assert "Usage" in cli_help.stdout
         cli_workspace = tmp_path / f"{artifact.stem}.cli-workspace"
         cli_workspace.mkdir()
+        empty_config = tmp_path / f"{artifact.stem}.empty.toml"
+        empty_config.write_text("", encoding="utf-8")
+        no_config_doctor = subprocess.run(
+            [
+                str(cli),
+                "--db",
+                str(tmp_path / f"{artifact.stem}.doctor.db"),
+                "--workspace",
+                str(cli_workspace),
+                "--config",
+                str(empty_config),
+                "doctor",
+                "startup",
+            ],
+            cwd=tmp_path,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        # A clean install must diagnose missing configuration explicitly. It
+        # is a readiness failure, not a startup crash or silent fake-provider
+        # substitution.
+        assert no_config_doctor.returncode == 1, no_config_doctor.stderr
+        assert "model_provider: unconfigured" in no_config_doctor.stdout
+
+        invalid_config = tmp_path / f"{artifact.stem}.invalid.toml"
+        invalid_config.write_text(
+            '[[providers]]\nkind = "not-a-provider"\nname = "broken"\nmodel = "broken-1"\n',
+            encoding="utf-8",
+        )
+        invalid_provider = subprocess.run(
+            [
+                str(cli),
+                "--db",
+                str(tmp_path / f"{artifact.stem}.invalid.db"),
+                "--workspace",
+                str(cli_workspace),
+                "--config",
+                str(invalid_config),
+                "doctor",
+                "startup",
+            ],
+            cwd=tmp_path,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert invalid_provider.returncode != 0
+        diagnostic = f"{invalid_provider.stdout}\n{invalid_provider.stderr}".lower()
+        assert "error" in diagnostic or "failed" in diagnostic
+
+        packaged_native = purelib / "athena_native" / "athena-terminal"
+        assert packaged_native.is_file() and os.access(packaged_native, os.X_OK)
+        native_headless = subprocess.run(
+            [str(packaged_native), "--headless", "--command", "printf installed-native"],
+            cwd=tmp_path,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert native_headless.returncode == 0, native_headless.stderr
+        assert "installed-native" in native_headless.stdout
         cli_sessions = subprocess.run(
             [
                 str(cli),
@@ -123,6 +244,8 @@ def test_installed_artifacts_cover_application_entry_paths(tmp_path: Path) -> No
                 str(tmp_path / f"{artifact.stem}.cli-task.db"),
                 "--workspace",
                 str(cli_workspace),
+                "--config",
+                str(offline_demo_config),
                 "run",
                 "2+2",
             ],
@@ -175,11 +298,13 @@ def _installed_acceptance_program() -> str:
         r'''
         import asyncio
         import hashlib
+        import importlib.util
         import json
         import os
         from pathlib import Path
         import re
         import socket
+        import sqlite3
         import subprocess
         import sys
         from importlib.metadata import distribution
@@ -208,10 +333,16 @@ def _installed_acceptance_program() -> str:
         from athena.acp.adapter import ACPAdapter, ACPRequest
         from athena.api.app import create_app
         from athena.artifacts.store import ArtifactStore
+        from athena.capabilities.dispatcher import SuspendedCall
         from athena.mcp.adapter import MCPAdapter
         from athena.mcp.client import MCPToolRef, MCPToolResult
         from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskStatus
-        from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus
+        from athena.protocol.capabilities import (
+            CapabilityRequest,
+            CapabilityRequestOrigin,
+            CapabilityResult,
+            CapabilityResultStatus,
+        )
         from athena.service.config import AthenaConfig, ProviderConfig
         from athena.service.service import AthenaService
 
@@ -220,6 +351,12 @@ def _installed_acceptance_program() -> str:
         metadata = distribution("athena-agent")
         requires = {re.split(r"[<=>!~;\[]", requirement, maxsplit=1)[0].strip().lower() for requirement in metadata.requires or ()}
         assert {"starlette", "click", "uvicorn"} <= requires
+        native_metadata = distribution("athena-agent-native")
+        native_requires = {
+            requirement.strip().lower()
+            for requirement in native_metadata.requires or ()
+        }
+        assert f"athena-agent=={metadata.version}" in native_requires
         assert purelib in Path(click.__file__).resolve().parents
         assert purelib in Path(starlette.__file__).resolve().parents
         assert purelib in Path(uvicorn.__file__).resolve().parents
@@ -332,6 +469,334 @@ def _installed_acceptance_program() -> str:
                 )
                 assert mcp_result.status is CapabilityResultStatus.OK
                 assert mcp_result.output == "MCP_OK"
+
+                # Installed-artifact capability wiring: inventory the effective
+                # fabric, then exercise one harmless operation per registered
+                # family through the dispatcher. This intentionally uses the
+                # installed service's fabric rather than importing capability
+                # classes from the checkout or calling executors directly.
+                expected_matrix = {
+                    "core": {
+                        "artifacts",
+                        "capabilities",
+                        "capability_health",
+                        "context_blocks",
+                        "diagnostics",
+                        "execute",
+                        "fs",
+                        "git",
+                        "memory",
+                        "packs",
+                        "skills",
+                        "delegate",
+                        "delegate.external",
+                    },
+                    "computational": {
+                        "capsule",
+                        "dependency",
+                        "machine",
+                        "observer",
+                        "process",
+                        "research",
+                        "scratch",
+                        "synthesis",
+                        "truth",
+                        "workflow",
+                    },
+                    "environment": {
+                        "database",
+                        "fusion",
+                        "maintain",
+                        "network",
+                        "schedule",
+                        "service",
+                        "watch",
+                        "workspace",
+                    },
+                }
+                expected_core = set().union(*expected_matrix.values())
+                assert len(expected_core) == sum(len(ids) for ids in expected_matrix.values())
+                optional_capabilities = {
+                    "terminal_session": {
+                        "available": all(
+                            importlib.util.find_spec(module) is not None
+                            for module in ("pexpect", "pyte")
+                        ),
+                        "reason": "requires both pexpect and pyte",
+                    },
+                    "debugger": {
+                        "available": importlib.util.find_spec("debugpy") is not None,
+                        "reason": "requires the optional debugpy package",
+                    },
+                }
+                effective = {
+                    descriptor.id: descriptor
+                    for descriptor in service._fabric.list_descriptors()
+                }
+                expected_effective = expected_core | {
+                    capability_id
+                    for capability_id, condition in optional_capabilities.items()
+                    if condition["available"]
+                }
+                expected_effective.add(mcp_descriptor.id)
+                assert set(effective) == expected_effective, {
+                    "missing": sorted(expected_effective - set(effective)),
+                    "unexpected": sorted(set(effective) - expected_effective),
+                    "optional": optional_capabilities,
+                }
+                for capability_id, condition in optional_capabilities.items():
+                    if not condition["available"]:
+                        assert capability_id not in effective
+                        assert condition["reason"]
+
+                workspace_root = Path(service._default_workspace.root)
+                sqlite_path = workspace_root / "release-capability-wiring.sqlite"
+                sqlite3.connect(sqlite_path).close()
+                subprocess.run(
+                    ["git", "init", "--quiet", str(workspace_root)],
+                    check=True,
+                )
+                capsule_body = {
+                    "format": 1,
+                    "capabilities": [],
+                    "workflows": [],
+                    "root_workflow_id": "",
+                }
+                capsule = dict(capsule_body)
+                capsule["capsule_id"] = (
+                    "capsule_"
+                    + hashlib.sha256(
+                        json.dumps(
+                            capsule_body,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()[:24]
+                )
+                probes = {
+                    "artifacts": {"operation": "list"},
+                    "capabilities": {"operation": "search", "query": ""},
+                    "capability_health": {"operation": "list"},
+                    "capsule": {"operation": "inspect", "capsule": capsule},
+                    "context_blocks": {"operation": "list"},
+                    "database": {
+                        "operation": "tables",
+                        "path": str(sqlite_path),
+                    },
+                    "dependency": {"operation": "inspect", "name": "python"},
+                    "diagnostics": {"operation": "normalize", "text": ""},
+                    "execute": {
+                        "language": "shell",
+                        "code": "printf capability-wiring",
+                    },
+                    "fs": {"operation": "list", "path": "."},
+                    "git": {"operation": "status"},
+                    "machine": {"operation": "overview"},
+                    "maintain": {"operation": "list"},
+                    "memory": {"operation": "recall", "query": ""},
+                    "network": {"operation": "listeners"},
+                    "observer": {"operation": "list"},
+                    "packs": {"operation": "search", "query": ""},
+                    "process": {"operation": "list"},
+                    "research": {"operation": "sources"},
+                    "schedule": {"operation": "list"},
+                    "scratch": {
+                        "operation": "run",
+                        "code": "def run(args):\n    return {'ok': True}",
+                    },
+                    "service": {"operation": "list"},
+                    "skills": {"operation": "search", "query": ""},
+                    "synthesis": {"operation": "candidates"},
+                    "terminal_session": {"operation": "list"},
+                    "truth": {"operation": "status"},
+                    "watch": {"operation": "list"},
+                    "workflow": {"operation": "list"},
+                    "workspace": {"operation": "status"},
+                }
+                for capability_id, arguments in probes.items():
+                    if capability_id not in effective:
+                        continue
+                    probe = await service._dispatcher.dispatch(
+                        CapabilityRequest(
+                            capability_id=capability_id,
+                            arguments=arguments,
+                            task_id=mcp_task.id,
+                            origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+                        ),
+                        workspace=service._default_workspace,
+                        profile=AutonomyLevel.AUTONOMOUS.value,
+                    )
+                    if capability_id == "service" and probe.status is CapabilityResultStatus.FAILED:
+                        error = (probe.error or "").lower()
+                        assert any(
+                            marker in error
+                            for marker in (
+                                "system has not been booted with systemd",
+                                "failed to connect to bus",
+                            )
+                        ), probe.error
+                        continue
+                    assert probe.status is CapabilityResultStatus.OK, {
+                        "capability": capability_id,
+                        "error": probe.error,
+                    }
+                if "delegate" in effective:
+                    delegate_probe = await service._dispatcher.dispatch(
+                        CapabilityRequest(
+                            capability_id="delegate",
+                            arguments={
+                                "operation": "status",
+                                "child_task_id": "missing-release-probe-child",
+                            },
+                            task_id=mcp_task.id,
+                            origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+                        ),
+                        workspace=service._default_workspace,
+                        profile=AutonomyLevel.AUTONOMOUS.value,
+                    )
+                    assert delegate_probe.status is CapabilityResultStatus.FAILED
+                    assert "missing-release-probe-child" in (delegate_probe.error or "")
+                if "debugger" in effective:
+                    debugger_probe = await service._dispatcher.dispatch(
+                        CapabilityRequest(
+                            capability_id="debugger",
+                            arguments={
+                                "operation": "status",
+                                "session": "missing-release-probe-session",
+                            },
+                            task_id=mcp_task.id,
+                            origin=CapabilityRequestOrigin.TRUSTED_ORCHESTRATION,
+                        ),
+                        workspace=service._default_workspace,
+                        profile=AutonomyLevel.AUTONOMOUS.value,
+                    )
+                    assert debugger_probe.status is CapabilityResultStatus.FAILED
+                    assert "unowned debugger session" in (
+                        debugger_probe.error or ""
+                    ).lower()
+
+                # Release-level compositional nervous-system scenario. Keep
+                # every seam in this one started service: task-local scratch
+                # observations feed synthesis, the validated generated tool
+                # is reached through the fabric and dispatcher, and a
+                # workflow invokes a nested capability through that same
+                # dispatcher boundary. The workflow uses a read-only native
+                # child so its own approval does not obscure the composition
+                # assertion with a second independent approval continuation.
+                composition_task_id = "release-composition-task"
+                await service._store_tasks.insert_task(
+                    composition_task_id,
+                    None,
+                    None,
+                    "release compositional capability scenario",
+                    autonomy="autonomous",
+                    workspace=service._default_workspace,
+                )
+
+                async def dispatch_composed(capability_id, arguments, call_id):
+                    def request():
+                        return CapabilityRequest(
+                            capability_id=capability_id,
+                            arguments=arguments,
+                            task_id=composition_task_id,
+                            call_id=call_id,
+                            origin=CapabilityRequestOrigin.MODEL,
+                        )
+
+                    result = await service._dispatcher.dispatch(
+                        request(),
+                        workspace=service._default_workspace,
+                        profile=service.config.autonomy_level,
+                    )
+                    if isinstance(result, SuspendedCall):
+                        assert result.approval_id
+                        await service.approve(
+                            result.approval_id,
+                            granted=True,
+                            scope="task",
+                        )
+                        result = await service._dispatcher.dispatch(
+                            request(),
+                            workspace=service._default_workspace,
+                            profile=service.config.autonomy_level,
+                        )
+                    assert isinstance(result, CapabilityResult), result
+                    return result
+
+                scratch_code = (
+                    "def run(args):\n"
+                    "    return {'value': args['value']}\n"
+                )
+                scratch_first = await dispatch_composed(
+                    "scratch",
+                    {
+                        "operation": "run",
+                        "code": scratch_code,
+                        "args": {"value": "release-one"},
+                    },
+                    "release-compose-scratch-1",
+                )
+                assert scratch_first.status is CapabilityResultStatus.OK
+                scratch_id = scratch_first.metadata["scratch_id"]
+                scratch_second = await dispatch_composed(
+                    "scratch",
+                    {
+                        "operation": "run",
+                        "scratch_id": scratch_id,
+                        "args": {"value": "release-two"},
+                    },
+                    "release-compose-scratch-2",
+                )
+                assert scratch_second.status is CapabilityResultStatus.OK
+                promoted = await dispatch_composed(
+                    "synthesis",
+                    {"operation": "promote_scratch", "scratch_id": scratch_id},
+                    "release-compose-promote",
+                )
+                assert promoted.status is CapabilityResultStatus.OK
+                promoted_payload = json.loads(promoted.output)
+                assert promoted_payload["capability_id"] == scratch_id
+                assert promoted_payload["status"] == "task_reusable"
+
+                generated = await dispatch_composed(
+                    scratch_id,
+                    {"value": "release-generated"},
+                    "release-compose-generated",
+                )
+                assert generated.status is CapabilityResultStatus.OK
+                assert json.loads(generated.output) == {"value": "release-generated"}
+
+                workflow_created = await dispatch_composed(
+                    "workflow",
+                    {
+                        "operation": "create",
+                        "name": "release_nested_capability",
+                        "description": "release compositional nested capability",
+                        "steps": [
+                            {
+                                "id": "inventory",
+                                "capability": "capabilities",
+                                "arguments": {
+                                    "operation": "search",
+                                    "query": "",
+                                },
+                            }
+                        ],
+                    },
+                    "release-compose-workflow-create",
+                )
+                assert workflow_created.status is CapabilityResultStatus.OK
+                workflow_id = workflow_created.metadata["workflow_id"]
+                workflow_run = await dispatch_composed(
+                    "workflow",
+                    {"operation": "run", "workflow_id": workflow_id},
+                    "release-compose-workflow-run",
+                )
+                assert workflow_run.status is CapabilityResultStatus.OK
+                workflow_payload = json.loads(workflow_run.output)
+                assert workflow_payload["status"] == "completed"
+                assert workflow_payload["outputs"]["inventory"]
+
                 # Exercise the installed API through an external uvicorn
                 # process as well as the in-process ASGI projection below.
                 with socket.socket() as probe_socket:
@@ -496,6 +961,7 @@ def _installed_acceptance_program() -> str:
                     service._task_manager,
                     service._sessions,
                     event_store=service._store_events,
+                    admission=service.require_agent_ready,
                     stream_poll_interval=0.01,
                     stream_timeout=5.0,
                 )
@@ -517,9 +983,7 @@ def _installed_acceptance_program() -> str:
                 assert all(event.task_id == acp_task_id for event in acp_events)
 
                 # Durable persistence/restart keeps the completed Task visible.
-                persist_root = Path(artifact_path).parent / (
-                    "persist-" + expected_artifact_digest[:12]
-                )
+                persist_root = Path.cwd() / ("persist-" + expected_artifact_digest[:12])
                 persist_root.mkdir()
                 persist_config = AthenaConfig(
                     db_path=str(persist_root / "athena.db"),
@@ -549,7 +1013,7 @@ def _installed_acceptance_program() -> str:
                 artifact_bytes = artifact_path.read_bytes()
                 artifact_digest = hashlib.sha256(artifact_bytes).hexdigest()
                 assert artifact_digest == expected_artifact_digest
-                store = ArtifactStore(root=Path(artifact_path).parent / "artifact-store")
+                store = ArtifactStore(root=Path.cwd() / "artifact-store")
                 ref = await store.save(
                     content=artifact_bytes,
                     metadata={"candidate_artifact_digest": expected_artifact_digest},

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import subprocess
+import pytest
 
-from athena.workspace_manifest import copy_ignore, tree_paths
+from athena.workspace_manifest import copy_ignore, copy_workspace_tree, tree_paths
 
 
 def _git_repo(root):
@@ -87,3 +88,55 @@ def test_tracked_manifest_cache_refreshes_after_git_add(tmp_path):
 
     paths = {path.relative_to(tmp_path).as_posix() for path in tree_paths(tmp_path)}
     assert "target/second.txt" in paths
+
+
+def _symlink_or_skip(link, target, *, target_is_directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError:
+        pytest.skip("symlinks not supported")
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "chain", "broken", "sibling-prefix"])
+def test_copy_workspace_tree_rejects_unsafe_symlinks(tmp_path, kind):
+    source = tmp_path / "workspace"
+    source.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret\n")
+
+    if kind == "file":
+        target = outside / "secret.txt"
+    elif kind == "directory":
+        target = outside
+    elif kind == "chain":
+        first = source / "first"
+        _symlink_or_skip(first, outside / "secret.txt")
+        target = first
+    elif kind == "broken":
+        target = outside / "does-not-exist"
+    else:
+        sibling = tmp_path / "workspace-sibling"
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("secret\n")
+        target = sibling / "secret.txt"
+    _symlink_or_skip(source / "link", target, target_is_directory=kind == "directory")
+
+    with pytest.raises(ValueError, match="symlink"):
+        copy_workspace_tree(source, tmp_path / f"clone-{kind}")
+
+
+def test_copy_workspace_tree_rewrites_safe_internal_symlinks(tmp_path):
+    source = tmp_path / "workspace"
+    source.mkdir()
+    target = source / "data.txt"
+    target.write_text("inside\n")
+    _symlink_or_skip(source / "link.txt", target)
+
+    clone = tmp_path / "clone"
+    copy_workspace_tree(source, clone)
+
+    link = clone / "link.txt"
+    assert link.is_symlink()
+    assert link.resolve() == clone / "data.txt"
+    assert link.read_text(encoding="utf-8") == "inside\n"

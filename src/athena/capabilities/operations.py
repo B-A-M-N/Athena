@@ -272,6 +272,8 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
     "synthesis": {
         "create": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
         "repair": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        "revalidate": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        "migrate_contract": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
         "promote_scratch": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
         "candidates": frozenset({EffectClass.READ_LOCAL}),
         "inspect": frozenset({EffectClass.READ_LOCAL}),

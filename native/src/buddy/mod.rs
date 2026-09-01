@@ -18,13 +18,15 @@ pub(crate) enum BuddyKind {
 pub(crate) const SPRITE_FRAME_COUNT: usize = 2;
 pub(crate) const SPRITE_WIDTH: f32 = 14.0;
 pub(crate) const SPRITE_HEIGHT: f32 = 11.0;
-pub(crate) const SPRITE_SCALE: f32 = 5.2;
+// A larger phosphor dot scale makes Buddy legible against the dense
+// perspective grid and matches the high-quality DAGOAL reference silhouette.
+pub(crate) const SPRITE_SCALE: f32 = 6.8;
 
 // Covers the enlarged body plus every pose marker/effect. All built-in
 // sprites use this same compositor footprint, so a mascot choice cannot
 // change scene collision, clamping, or dirty-region behavior.
-pub(crate) const SPRITE_DIRTY_WIDTH: f32 = 94.0;
-pub(crate) const SPRITE_DIRTY_HEIGHT: f32 = 78.0;
+pub(crate) const SPRITE_DIRTY_WIDTH: f32 = 122.0;
+pub(crate) const SPRITE_DIRTY_HEIGHT: f32 = 102.0;
 
 impl BuddyKind {
     pub(crate) fn parse(value: &str) -> Option<Self> {

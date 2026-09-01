@@ -36,6 +36,56 @@ class GeneratedCapabilityStore:
             "CREATE INDEX IF NOT EXISTS idx_generated_scope_owner "
             "ON generated_capabilities(scope, owner)"
         )
+        await self._db.execute(
+            "CREATE TABLE IF NOT EXISTS generated_active_families ("
+            "scope TEXT NOT NULL, owner TEXT NOT NULL, family_id TEXT NOT NULL, "
+            "capability_id TEXT NOT NULL, revision INTEGER NOT NULL, "
+            "PRIMARY KEY(scope, owner, family_id))"
+        )
+        # Backfill the normalized active-family index for databases created by
+        # earlier releases. Existing duplicate rows are left untouched for
+        # auditability; the newest active revision is retained by the CAS
+        # index until an explicit successor resolves the family.
+        rows = await self._db.fetch_all(
+            "SELECT scope, owner, id, definition FROM generated_capabilities"
+        )
+        backfill: list[tuple[str, str, str, int, str]] = []
+        for row in rows:
+            definition = json.loads(row["definition"])
+            if str(definition.get("lifecycle_state") or "").upper() in {
+                "SUPERSEDED",
+                "DEPRECATED",
+            }:
+                continue
+            family_id = str(definition.get("family_id") or "")
+            if not family_id:
+                continue
+            backfill.append(
+                (
+                    str(row["scope"]),
+                    str(row["owner"]),
+                    family_id,
+                    int(definition.get("revision") or 1),
+                    str(row["id"]),
+                )
+            )
+        # Retain the newest active revision when repairing a database that
+        # predates the normalized family index. The primary key then makes
+        # the choice deterministic even if legacy rows were inserted in an
+        # arbitrary order.
+        backfill.sort(key=lambda item: (item[0], item[1], item[2], -item[3], item[4]))
+        for scope, owner, family_id, revision, capability_id in backfill:
+            await self._db.execute(
+                "INSERT OR IGNORE INTO generated_active_families "
+                "(scope, owner, family_id, capability_id, revision) VALUES (?, ?, ?, ?, ?)",
+                (
+                    scope,
+                    owner,
+                    family_id,
+                    capability_id,
+                    revision,
+                ),
+            )
         self._ready = True
 
     async def save(self, capability: GeneratedCapability, *, owner: str) -> None:
@@ -126,29 +176,187 @@ class GeneratedCapabilityStore:
                     "at": now,
                 }
             ]
-        await self._db.execute(
-            "INSERT INTO generated_capabilities("
-            "id, scope, owner, project_scope, user_scope, definition, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET scope=excluded.scope, "
-            "owner=excluded.owner, project_scope=excluded.project_scope, "
-            "user_scope=excluded.user_scope, definition=excluded.definition, "
-            "updated_at=excluded.updated_at",
-            (
-                capability.id,
-                capability.scope.value,
-                owner,
-                (capability.project_scope or owner)
-                if capability.scope is AffordanceScope.PROJECT
-                else None,
-                (capability.user_scope or owner)
-                if capability.scope is AffordanceScope.USER
-                else None,
-                json.dumps(definition, sort_keys=True),
-                now,
-                now,
-            ),
-        )
+        predecessors: list[tuple[str, dict]] = []
+        for predecessor_id in capability.supersedes:
+            if predecessor_id == capability.id:
+                continue
+            predecessor_row = await self._db.fetch_one(
+                "SELECT scope, owner, definition FROM generated_capabilities WHERE id = ?",
+                (predecessor_id,),
+            )
+            if predecessor_row is None:
+                raise ValueError(
+                    f"generated capability {capability.id} names missing predecessor "
+                    f"{predecessor_id}"
+                )
+            if (
+                predecessor_row["scope"] != capability.scope.value
+                or predecessor_row["owner"] != owner
+            ):
+                raise ValueError(
+                    f"generated capability {capability.id} predecessor {predecessor_id} "
+                    "is outside the owner boundary"
+                )
+            predecessor = json.loads(predecessor_row["definition"])
+            previous_family = str(predecessor.get("family_id") or "")
+            if previous_family and capability.family_id and previous_family != capability.family_id:
+                raise ValueError(
+                    f"generated capability {capability.id} cannot supersede a different family"
+                )
+            previous_revision = int(predecessor.get("revision") or 1)
+            if capability.parent_revision != previous_revision:
+                raise ValueError(
+                    f"generated capability {capability.id} must name predecessor revision "
+                    f"{previous_revision}"
+                )
+            if capability.revision <= previous_revision:
+                raise ValueError(
+                    f"generated capability {capability.id} must advance predecessor revision "
+                    f"{previous_revision}"
+                )
+            predecessors.append((predecessor_id, predecessor))
+
+        # Activation is one database transaction: the replacement becomes
+        # visible in the same commit that removes each predecessor from the
+        # active revision set. Superseded definitions stay enabled for audit
+        # history and explicit rollback inspection.
+        await self._db.execute_raw("BEGIN IMMEDIATE")
+        try:
+            # Re-read the predecessor and active family while holding the
+            # write lock. The earlier read is only a fast validation; it must
+            # not decide a successor after another writer has committed.
+            fresh_predecessors: list[tuple[str, dict]] = []
+            for predecessor_id in capability.supersedes:
+                if predecessor_id == capability.id:
+                    continue
+                predecessor_row = await self._db.fetch_one_raw(
+                    "SELECT scope, owner, definition FROM generated_capabilities WHERE id = ?",
+                    (predecessor_id,),
+                )
+                if predecessor_row is None:
+                    raise ValueError(
+                        f"generated capability {capability.id} names missing predecessor "
+                        f"{predecessor_id}"
+                    )
+                if (
+                    predecessor_row["scope"] != capability.scope.value
+                    or predecessor_row["owner"] != owner
+                ):
+                    raise ValueError(
+                        f"generated capability {capability.id} predecessor {predecessor_id} "
+                        "is outside the owner boundary"
+                    )
+                predecessor = json.loads(predecessor_row["definition"])
+                previous_family = str(predecessor.get("family_id") or "")
+                if (
+                    previous_family
+                    and capability.family_id
+                    and previous_family != capability.family_id
+                ):
+                    raise ValueError(
+                        f"generated capability {capability.id} cannot supersede a different family"
+                    )
+                previous_revision = int(predecessor.get("revision") or 1)
+                if capability.parent_revision != previous_revision:
+                    raise ValueError(
+                        f"generated capability {capability.id} must name predecessor revision "
+                        f"{previous_revision}"
+                    )
+                if capability.revision <= previous_revision:
+                    raise ValueError(
+                        f"generated capability {capability.id} must advance predecessor revision "
+                        f"{previous_revision}"
+                    )
+                fresh_predecessors.append((predecessor_id, predecessor))
+            predecessors = fresh_predecessors
+
+            active_row = await self._db.fetch_one_raw(
+                "SELECT capability_id, revision FROM generated_active_families "
+                "WHERE scope = ? AND owner = ? AND family_id = ?",
+                (capability.scope.value, owner, capability.family_id),
+            )
+            if active_row is not None and active_row["capability_id"] != capability.id:
+                active_id = str(active_row["capability_id"])
+                if active_id not in capability.supersedes:
+                    raise ValueError(
+                        "stale generated capability successor: active family revision "
+                        f"{active_id} is not the declared predecessor"
+                    )
+            for predecessor_id, predecessor in predecessors:
+                history = list(predecessor.get("lifecycle_history") or ())
+                history.append(
+                    {
+                        "event": "lifecycle_transition",
+                        "from": predecessor.get("lifecycle_state", "ACTIVE"),
+                        "to": "SUPERSEDED",
+                        "replacement": capability.id,
+                        "at": now,
+                    }
+                )
+                predecessor.update(
+                    {
+                        "lifecycle_state": "SUPERSEDED",
+                        "active_revision": capability.revision,
+                        "superseded_by": capability.id,
+                        "lifecycle_history": history[-100:],
+                    }
+                )
+                await self._db.execute_raw(
+                    "UPDATE generated_capabilities SET definition = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(predecessor, sort_keys=True), now, predecessor_id),
+                )
+            await self._db.execute_raw(
+                "DELETE FROM generated_active_families WHERE scope = ? AND owner = ? "
+                "AND family_id = ? AND capability_id IN ("
+                + ",".join("?" for _ in predecessors)
+                + ")"
+                if predecessors
+                else "DELETE FROM generated_active_families WHERE 1 = 0",
+                (capability.scope.value, owner, capability.family_id, *[p[0] for p in predecessors])
+                if predecessors
+                else (),
+            )
+            await self._db.execute_raw(
+                "INSERT INTO generated_capabilities("
+                "id, scope, owner, project_scope, user_scope, definition, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET scope=excluded.scope, "
+                "owner=excluded.owner, project_scope=excluded.project_scope, "
+                "user_scope=excluded.user_scope, definition=excluded.definition, "
+                "updated_at=excluded.updated_at",
+                (
+                    capability.id,
+                    capability.scope.value,
+                    owner,
+                    (capability.project_scope or owner)
+                    if capability.scope is AffordanceScope.PROJECT
+                    else None,
+                    (capability.user_scope or owner)
+                    if capability.scope is AffordanceScope.USER
+                    else None,
+                    json.dumps(definition, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            if capability.lifecycle_state not in {"SUPERSEDED", "DEPRECATED"}:
+                await self._db.execute_raw(
+                    "INSERT INTO generated_active_families "
+                    "(scope, owner, family_id, capability_id, revision) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(scope, owner, family_id) DO UPDATE SET "
+                    "capability_id=excluded.capability_id, revision=excluded.revision",
+                    (
+                        capability.scope.value,
+                        owner,
+                        capability.family_id,
+                        capability.id,
+                        capability.revision,
+                    ),
+                )
+            await self._db.execute_raw("COMMIT")
+        except BaseException:
+            await self._db.execute_raw("ROLLBACK")
+            raise
 
     async def update_proof(
         self,

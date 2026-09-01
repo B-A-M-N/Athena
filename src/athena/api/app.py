@@ -193,6 +193,8 @@ def _status_for_error(exc: BaseException) -> HTTPError:
 
     if isinstance(exc, errs.IllegalStateTransition):
         return HTTPError(409, code, message, **data)
+    if isinstance(exc, errs.ServiceNotReady):
+        return HTTPError(503, code, message, **data)
     if isinstance(exc, errs.Cancelled):
         return HTTPError(409, code, message, **data)
     if isinstance(exc, errs.ProviderError):
@@ -463,14 +465,18 @@ def _health_handler(service: Any) -> Any:
                 getattr(service, "_scheduler", None) is not None
                 and bool(getattr(service._scheduler, "is_running", lambda: False)())
             ),
-            "providers": bool(getattr(service, "_model_registry", None)),
+            "providers": _providers_ready(getattr(service, "_model_registry", None)),
             "worker_persistence": worker_health.get("status", "ok") == "ok",
             "recovery": getattr(service, "_recovery_status", "healthy") in {"healthy", "recovered"},
         }
         if startup is not None:
             checks["startup"] = startup_ok
         ready = all(checks.values())
-        details = {"checks": checks, "worker": worker_health}
+        details = {
+            "checks": checks,
+            "worker": worker_health,
+            "provider_readiness": _provider_readiness(getattr(service, "_model_registry", None)),
+        }
         if startup is not None:
             details["startup"] = startup
         if database_error is not None:
@@ -481,6 +487,41 @@ def _health_handler(service: Any) -> Any:
         )
 
     return handler
+
+
+def _providers_ready(registry: Any) -> bool:
+    """Return provider readiness without relying on object truthiness."""
+    if registry is None:
+        return False
+    readiness = getattr(registry, "readiness", None)
+    if callable(readiness):
+        try:
+            return readiness().get("state") == "ready"
+        except Exception:
+            return False
+    names = getattr(registry, "names", None)
+    if callable(names):
+        return bool(names())
+    # Preserve compatibility with small transport-test doubles that expose a
+    # truthy registry object but no ProviderRegistry.names() method.
+    return bool(registry)
+
+
+def _provider_readiness(registry: Any) -> dict[str, Any]:
+    if registry is None:
+        return {"state": "unconfigured", "providers": {}}
+    readiness = getattr(registry, "readiness", None)
+    if callable(readiness):
+        try:
+            value = readiness()
+            return dict(value) if isinstance(value, dict) else {"state": "unverified"}
+        except Exception as exc:
+            return {"state": "degraded", "error": str(exc), "providers": {}}
+    names = getattr(registry, "names", None)
+    return {
+        "state": "configured" if callable(names) and names() else "unconfigured",
+        "providers": {},
+    }
 
 
 def _live_handler(service: Any) -> Any:

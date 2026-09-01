@@ -275,7 +275,10 @@ class ProcedureCapsuleCapability:
                 generated = GeneratedCapability.from_record(generated_record)
                 if generated.lifecycle_state in {
                     "STALE",
+                    "DEGRADED",
                     "REVALIDATION_REQUIRED",
+                    "REJECTED",
+                    "SUPERSEDED",
                     "DEPRECATED",
                 }:
                     return False, f"generated capability {capability_id} is unavailable"

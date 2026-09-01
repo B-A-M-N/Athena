@@ -249,7 +249,7 @@ class TaskManager:
     async def transition(self, task_id: str, to: TaskStatus, *, reason: str = "") -> None:
         await self._store.transition(task_id, to)
         spec = await self.get(task_id)
-        await self._emit(spec, to)
+        await self._emit(spec, to, reason=reason)
 
     # ------------------------------------------------------------------ #
     # Finalization (§18; §72 TaskResult)
@@ -431,10 +431,18 @@ class TaskManager:
             usage=usage,
         )
 
-    async def _emit(self, task: Task, status: TaskStatus) -> None:
+    async def _emit(self, task: Task, status: TaskStatus, *, reason: str = "") -> None:
         if self._events is None:
             return
         payload: dict[str, Any] = {"status": status.value}
+        if reason:
+            payload["reason"] = reason
+        mission_plan = (task.metadata or {}).get("_athena_mission_plan")
+        if isinstance(mission_plan, dict) and mission_plan.get("phase"):
+            # Self-host phase is durable mission state, not a renderer guess.
+            # Repeating it on lifecycle events lets every projection recover
+            # the operator-visible phase after a restart or replay.
+            payload["self_host_phase"] = str(mission_plan["phase"])
         # Scheduler event triggers are durable observations. Preserve the
         # bounded trigger envelope on the task lifecycle event so the task's
         # world-state view can explain what caused this maintenance run.
@@ -481,6 +489,7 @@ def _event_type(status: TaskStatus) -> str:
         TaskStatus.INTERRUPTED: "TaskInterrupted",
         TaskStatus.BLOCKED: "TaskBlocked",
         TaskStatus.QUEUED: "TaskQueued",
+        TaskStatus.RECOVERY_REQUIRED: "TaskRecoveryRequired",
     }.get(status, "TaskStateChanged")
 
 

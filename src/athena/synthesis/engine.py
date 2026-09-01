@@ -28,6 +28,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from typing import Any, cast
 
 from athena.affordances.models import (
     AffordanceScope,
@@ -36,22 +37,41 @@ from athena.affordances.models import (
     GeneratedCapability,
 )
 from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
+from athena.capabilities.registry import validate_schema
 from athena.execution.process_tree import kill_tree, kill_tree_async, sandbox_argv, spawn_owned
+from athena.workspace_manifest import copy_workspace_tree
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
+    CapabilityRequest,
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
 )
 from athena.protocol.events import EV, Event
+from athena.protocol.errors import CapabilityUnavailable
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import MutationMode, WorkspaceSpec
 from athena.synthesis.runtime import GeneratedToolHost, PersistentGeneratedSession
 
-__all__ = ["SynthesisEngine", "SyntheticCapability"]
+__all__ = [
+    "RegressionCase",
+    "SynthesisEngine",
+    "SyntheticCapability",
+    "canonical_generated_identity",
+]
 
 _logger = logging.getLogger("athena.synthesis")
+_UNUSABLE_LIFECYCLE_STATES = frozenset(
+    {
+        "STALE",
+        "DEGRADED",
+        "REVALIDATION_REQUIRED",
+        "REJECTED",
+        "SUPERSEDED",
+        "DEPRECATED",
+    }
+)
 
 # Generated Python is an untrusted implementation, not an authority
 # declaration.  It may compute over the task workspace inside the restricted
@@ -162,9 +182,84 @@ class SyntheticCapability:
     effective_effects: frozenset[str] = _GENERATED_EFFECTIVE_AUTHORITY
     output_schema: dict | None = None
     lifecycle_state: str = "DRAFT"
+    family_id: str = ""
+    revision: int = 1
+    parent_revision: int | None = None
+    active_revision: int | None = None
     supersedes: tuple[str, ...] = ()
+    superseded_by: str | None = None
     dependency_lock: dict = field(default_factory=dict)
     last_used_at: str | None = None
+    id_generated: bool = False
+
+
+@dataclass(frozen=True)
+class RegressionCase:
+    """Durable, revision-aware record of a live generated failure.
+
+    ``args`` remains in the serialized form for replay compatibility, while
+    ``input`` is the canonical audit field.  A repair inherits only cases
+    whose ``resolved_by_revision`` is empty; old records are normalized with
+    the predecessor's identity rather than being silently discarded.
+    """
+
+    id: str
+    capability_family: str
+    revision_first_seen: int
+    source: str
+    input: Mapping[str, object]
+    environment_fingerprint: str | None
+    expected_contract: Mapping[str, object]
+    observed_failure: str
+    failure_class: str
+    resolved_by_revision: int | None = None
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "capability_family": self.capability_family,
+            "revision_first_seen": self.revision_first_seen,
+            "source": self.source,
+            "input": dict(self.input),
+            # ``args`` is the stable replay alias used by pre-existing repair
+            # requests and by the validation runner.
+            "args": dict(self.input),
+            "environment_fingerprint": self.environment_fingerprint,
+            "expected_contract": dict(self.expected_contract),
+            "observed_failure": self.observed_failure,
+            "failure_class": self.failure_class,
+            "resolved_by_revision": self.resolved_by_revision,
+        }
+
+    @classmethod
+    def from_record(
+        cls,
+        record: Mapping[str, object],
+        *,
+        capability_family: str,
+        revision: int,
+    ) -> "RegressionCase":
+        raw_input = record.get("input", record.get("args", {}))
+        input_value = dict(raw_input) if isinstance(raw_input, Mapping) else {}
+        raw_revision = record.get("revision_first_seen")
+        raw_resolved = record.get("resolved_by_revision")
+        raw_contract = record.get("expected_contract")
+        return cls(
+            id=str(record.get("id") or ""),
+            capability_family=str(record.get("capability_family") or capability_family),
+            revision_first_seen=(int(str(raw_revision)) if raw_revision is not None else revision),
+            source=str(record.get("source") or "live_failure"),
+            input=input_value,
+            environment_fingerprint=(
+                str(record["environment_fingerprint"])
+                if record.get("environment_fingerprint")
+                else None
+            ),
+            expected_contract=dict(raw_contract) if isinstance(raw_contract, Mapping) else {},
+            observed_failure=str(record.get("observed_failure") or ""),
+            failure_class=str(record.get("failure_class") or "implementation_failure"),
+            resolved_by_revision=(int(str(raw_resolved)) if raw_resolved is not None else None),
+        )
 
 
 def _generated_failure(
@@ -181,20 +276,154 @@ def _generated_failure(
         "failure_class": failure_class,
         "repairable": repairable,
         "repair_operation": "synthesis.repair" if repairable else None,
+        "recovery_action": (
+            "source_repair"
+            if repairable
+            else {
+                "environment_changed": "dependency_refresh_and_revalidation",
+                "provenance_stale": "evidence_reacquisition_and_revalidation",
+                "governance_failure": "request_authority_or_fail",
+                "missing_authority": "request_authority_or_fail",
+            }.get(failure_class, "inspect_and_revalidate")
+        ),
         "evidence": evidence or {},
     }
 
 
+def _failure_lifecycle_state(failure_class: str) -> str:
+    """Return the service-owned state for a live generated-tool failure."""
+    if failure_class in {"environment_changed", "dependency_changed", "provenance_stale"}:
+        return "REVALIDATION_REQUIRED"
+    return "DEGRADED"
+
+
+def _remember_live_failure(
+    cap: SyntheticCapability,
+    arguments: Mapping | None,
+    *,
+    failure_class: str,
+    observed_failure: str,
+    environment_fingerprint: str | None = None,
+) -> None:
+    """Retain repairable live failures as deterministic regression inputs."""
+    raw_input = dict(arguments or {})
+    expected_contract = {
+        "input_schema": dict(cap.input_schema),
+        "output_schema": dict(cap.output_schema or {}),
+        "schema_hash": hashlib.sha256(
+            json.dumps(
+                {"input": cap.input_schema, "output": cap.output_schema or {}},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+    }
+    identity = {
+        "capability_family": cap.family_id,
+        "revision_first_seen": cap.revision,
+        "input": raw_input,
+        "environment_fingerprint": environment_fingerprint,
+        "expected_contract": expected_contract,
+        "failure_class": failure_class,
+        "observed_failure": observed_failure[-1000:],
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str)
+    fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
+    case = RegressionCase(
+        id=f"regression:{fingerprint[:24]}",
+        capability_family=cap.family_id,
+        revision_first_seen=cap.revision,
+        source="live_failure",
+        input=raw_input,
+        environment_fingerprint=environment_fingerprint,
+        expected_contract=expected_contract,
+        observed_failure=observed_failure[-1000:],
+        failure_class=failure_class,
+    ).to_record()
+    for key in ("live_failure_cases", "regression_cases"):
+        cases = cap.validation.setdefault(key, [])
+        if not any(str(existing.get("id")) == case["id"] for existing in cases):
+            cases.append(dict(case))
+            del cases[:-128]
+
+
 def _candidate_ready(cap: SyntheticCapability) -> bool:
-    """Require meaningful live evidence before retaining a candidate."""
+    """Require proof scaled to the capability's actual effect risk."""
+    if cap.validation.get("all_passed") is not True or cap.failures != 0:
+        return False
+    risk_tier = _risk_tier(cap)
+    minimum_uses = {"low": 3, "medium": 4, "high": 5}[risk_tier]
+    minimum_contexts = 2 if risk_tier in {"medium", "high"} else 1
     return bool(
-        cap.validation.get("all_passed") is True
-        and cap.uses >= 3
-        and cap.successes >= 3
-        and cap.failures == 0
-        and len(cap.input_signatures) >= 2
-        and len(cap.task_context_signatures) >= 1
+        cap.uses >= minimum_uses
+        and cap.successes >= minimum_uses
+        and len(cap.input_signatures) >= (2 if risk_tier != "low" else 1)
+        and len(cap.task_context_signatures) >= minimum_contexts
     )
+
+
+def canonical_generated_identity(cap: SyntheticCapability) -> str:
+    """Serialize the resolved generated-capability identity canonically.
+
+    This is evaluated after source formatting, schema inference, dependency
+    resolution, effect resolution, and lineage assignment. Request fields are
+    not sufficient identity because repair/merge operations can change the
+    effective contract.
+    """
+    effects = sorted(getattr(effect, "value", str(effect)) for effect in cap.effects)
+    dependencies = [
+        {
+            "name": dependency.name,
+            "manager": dependency.manager,
+            "version": dependency.version,
+            "reason": dependency.reason,
+            "required_for": dependency.required_for,
+        }
+        for dependency in cap.required_dependencies
+    ]
+    evidence = [dependency.to_record() for dependency in cap.evidence_dependencies]
+    dependency_lock = {
+        key: value for key, value in dict(cap.dependency_lock or {}).items() if key != "target"
+    }
+    return json.dumps(
+        {
+            "source": cap.code,
+            "runtime": cap.runtime,
+            "input_schema": cap.input_schema,
+            "output_schema": cap.output_schema or {},
+            "effects": effects,
+            "effective_authority": sorted(cap.effective_effects),
+            "required_capabilities": sorted(cap.required_capabilities),
+            "packages": dependencies,
+            "dependency_lock": dependency_lock,
+            "evidence": evidence,
+            "family_id": cap.family_id,
+            "revision": cap.revision,
+            "parent_revision": cap.parent_revision,
+            "active_revision": cap.active_revision,
+            "supersedes": sorted(cap.supersedes),
+            "superseded_by": cap.superseded_by,
+            "compatibility": cap.provenance.get("compatibility"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _risk_tier(cap: SyntheticCapability) -> str:
+    """Classify promotion proof by the capability's declared native effects."""
+    effects = {getattr(effect, "value", str(effect)) for effect in cap.effects}
+    if effects == {"READ_LOCAL"}:
+        return "low"
+    if effects and effects <= {"READ_LOCAL", "EXECUTE"} and "EXECUTE" in effects:
+        return "medium"
+    return "high"
+
+
+def _admit_generated_input(cap: SyntheticCapability, arguments: object) -> list[str]:
+    """Apply the same input admission boundary used by live executors."""
+    return validate_schema(cap.input_schema, arguments)
 
 
 def _promotion_proof_error(
@@ -202,14 +431,44 @@ def _promotion_proof_error(
     tier: ValidationTier,
 ) -> str | None:
     """Return the missing proof required to widen a capability's lifetime."""
-    if not _candidate_ready(cap):
-        return "diverse live proof is incomplete"
+    risk_tier = _risk_tier(cap)
+    if cap.validation.get("all_passed") is not True:
+        return "target-tier behavioral validation did not pass"
+    if cap.failures:
+        return "unresolved live failures remain"
+    minimum_uses = {"low": 1, "medium": 2, "high": 3}[risk_tier]
+    if cap.uses < minimum_uses or cap.successes < minimum_uses:
+        return f"{risk_tier}-risk promotion requires {minimum_uses} verified uses"
+    minimum_contexts = 2 if risk_tier in {"medium", "high"} else 1
+    if len(cap.task_context_signatures) < minimum_contexts:
+        return f"{risk_tier}-risk promotion requires {minimum_contexts} task contexts"
+    if risk_tier != "low" and len(cap.input_signatures) < 2:
+        return f"{risk_tier}-risk promotion requires two distinct inputs"
     if cap.validation.get("tier") != tier.value:
         return f"behavioral validation at {tier.value} tier is required"
     if cap.validation.get("all_passed") is not True:
         return "target-tier behavioral validation did not pass"
     if cap.failures:
         return "unresolved live failures remain"
+    negative_total = int(cap.validation.get("negative_cases_total") or 0)
+    negative_passed = int(cap.validation.get("negative_cases_passed") or 0)
+    if negative_total < 1 or negative_passed != negative_total:
+        return "service-generated negative input cases are incomplete"
+    minimum_verifications = {"low": 1, "medium": 2, "high": 3}[risk_tier]
+    if cap.downstream_verifications < minimum_verifications:
+        return (
+            f"{risk_tier}-risk promotion requires {minimum_verifications} canonical "
+            "passing VerificationCompleted events"
+        )
+    risk_tier = str(cap.validation.get("risk_tier") or risk_tier)
+    if risk_tier in {"medium", "high"}:
+        invariant_cases = sum(
+            1
+            for case in (cap.validation_cases or [])
+            if case.get("invariants") or case.get("verification_requirements")
+        )
+        if invariant_cases < 1:
+            return f"{risk_tier}-risk promotion requires an invariant verification case"
     if (
         tier in {ValidationTier.PROJECT, ValidationTier.USER}
         and len(cap.task_context_signatures) < 2
@@ -771,7 +1030,12 @@ class SynthesisEngine:
         required_dependencies: tuple[DependencyRequirement, ...] = (),
         required_capabilities: tuple[str, ...] = (),
         evidence_dependencies: tuple[EvidenceDependency, ...] = (),
+        family_id: str | None = None,
+        revision: int = 1,
+        parent_revision: int | None = None,
+        active_revision: int | None = None,
         supersedes: tuple[str, ...] = (),
+        superseded_by: str | None = None,
     ) -> SyntheticCapability:
         """Create (but do not yet trust) a synthetic capability.
 
@@ -780,7 +1044,7 @@ class SynthesisEngine:
         """
         if runtime not in {"python", "python_persistent"}:
             raise ValueError(f"unsupported generated runtime: {runtime}")
-        return SyntheticCapability(
+        cap = SyntheticCapability(
             id=capability_id or f"synth_{name}",
             name=name,
             description=description,
@@ -798,9 +1062,21 @@ class SynthesisEngine:
             required_dependencies=required_dependencies,
             required_capabilities=tuple(sorted(set(required_capabilities))),
             evidence_dependencies=tuple(evidence_dependencies),
+            family_id=family_id or str((provenance or {}).get("family_id") or f"generated:{name}"),
+            revision=revision,
+            parent_revision=parent_revision,
+            active_revision=active_revision,
             supersedes=tuple(str(item) for item in supersedes),
+            superseded_by=superseded_by,
             effective_effects=_GENERATED_EFFECTIVE_AUTHORITY,
+            id_generated=capability_id is None,
         )
+        if capability_id is None:
+            cap.id = (
+                "synth_"
+                + hashlib.sha256(canonical_generated_identity(cap).encode()).hexdigest()[:20]
+            )
+        return cap
 
     async def validate(
         self,
@@ -831,6 +1107,28 @@ class SynthesisEngine:
         # later promotion, repair, or procedure-capsule import must be able
         # to rerun the same behavioral evidence.
         cap.validation_cases = [dict(case) for case in cases or []]
+        historical_failures: list[dict] = []
+        historical_ids: set[str] = set()
+        for key in ("live_failure_cases", "regression_cases"):
+            for raw_case in cap.validation.get(key) or ():
+                case = RegressionCase.from_record(
+                    dict(raw_case),
+                    capability_family=cap.family_id,
+                    revision=cap.revision,
+                ).to_record()
+                if not case["id"]:
+                    fingerprint = hashlib.sha256(
+                        json.dumps(
+                            case, sort_keys=True, separators=(",", ":"), default=str
+                        ).encode()
+                    ).hexdigest()
+                    case["id"] = f"regression:{fingerprint[:24]}"
+                identity = str(case.get("id") or json.dumps(case, sort_keys=True, default=str))
+                if identity in historical_ids:
+                    continue
+                historical_ids.add(identity)
+                historical_failures.append(case)
+        historical_by_id = {str(case["id"]): case for case in historical_failures if case.get("id")}
         passed = 0
         details = []
         observed_values: list[object] = []
@@ -855,6 +1153,8 @@ class SynthesisEngine:
                     for check in source_validation.checks
                     if check.status == "failed"
                 ],
+                "live_failure_cases": historical_failures,
+                "regression_cases": historical_failures,
             }
             return cap
 
@@ -881,8 +1181,93 @@ class SynthesisEngine:
                 "details": [
                     {"case": "static", "passed": False, "error": f"static validation: {exc}"}
                 ],
+                "live_failure_cases": historical_failures,
+                "regression_cases": historical_failures,
             }
             return cap
+
+        # The service owns a small, deterministic negative corpus for every
+        # schema it admits.  Keep this separate from authored fixture counts so
+        # existing proof remains comparable while promotion can require the
+        # stronger malformed-input evidence explicitly.
+        negative_cases = _service_negative_cases(cap.input_schema)
+        negative_details: list[dict[str, object]] = []
+        negative_executor = self._build_executor(cap)
+        for index, negative_case in enumerate(negative_cases):
+            invalid_input = negative_case.get("input")
+            errors = _admit_generated_input(cap, invalid_input)
+            probe = await negative_executor.invoke(
+                CapabilityRequest(
+                    capability_id=cap.id,
+                    arguments=cast(Mapping[str, Any], invalid_input),
+                    task_id=task_id,
+                    call_id=f"synthesis-negative-{cap.id}-{index}",
+                )
+            )
+            probe_metadata = dict(probe.metadata or {})
+            admitted_rejection = (
+                probe.status is CapabilityResultStatus.FAILED
+                and probe_metadata.get("admission_rejected") is True
+            )
+            negative_details.append(
+                {
+                    "source": "service_negative",
+                    "mutator": negative_case.get("mutator", "wrong_root_type"),
+                    "field": negative_case.get("field"),
+                    "passed": bool(errors) and admitted_rejection,
+                    "admission_boundary": probe_metadata.get(
+                        "admission_boundary", "generated_input_schema"
+                    ),
+                    "executor_invoked": not admitted_rejection,
+                    "errors": errors,
+                }
+            )
+
+        # A declared native capability is part of the generated contract even
+        # when a fixture does not exercise the corresponding branch. Resolve
+        # every declaration before running fixtures so admission cannot hide a
+        # missing or unavailable dependency behind partial coverage.
+        if cap.required_capabilities:
+            registry = getattr(self._dispatcher, "registry", None) if self._dispatcher else None
+            unavailable: list[str] = []
+            if registry is None:
+                unavailable.append("dispatcher registry is unavailable")
+            else:
+                for capability_id in cap.required_capabilities:
+                    try:
+                        descriptor = registry.resolve(capability_id)
+                    except (
+                        CapabilityUnavailable,
+                        KeyError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        unavailable.append(f"{capability_id}: {exc}")
+                        continue
+                    if getattr(descriptor, "availability", None) is not None:
+                        availability = getattr(descriptor.availability, "value", "")
+                        if availability != "available":
+                            unavailable.append(f"{capability_id}: {availability}")
+            if unavailable:
+                cap.lifecycle_state = "REJECTED"
+                cap.validation = {
+                    "tier": source_validation.tier.value,
+                    "cases_total": len(cases or []),
+                    "cases_passed": 0,
+                    "all_passed": False,
+                    "source": source_record,
+                    "details": [
+                        {
+                            "case": "required_capabilities",
+                            "passed": False,
+                            "error": "; ".join(unavailable),
+                        }
+                    ],
+                    "live_failure_cases": historical_failures,
+                    "regression_cases": historical_failures,
+                }
+                return cap
 
         validation_parent: str | None = None
         base_workspace_root = workspace.root if workspace is not None else workspace_root
@@ -909,6 +1294,8 @@ class SynthesisEngine:
                             "error": f"validation workspace: {exc}",
                         }
                     ],
+                    "live_failure_cases": historical_failures,
+                    "regression_cases": historical_failures,
                 }
                 return cap
 
@@ -933,6 +1320,8 @@ class SynthesisEngine:
                         "error": str(exc),
                     }
                 ],
+                "live_failure_cases": historical_failures,
+                "regression_cases": historical_failures,
             }
             return cap
         cap.dependency_lock = {
@@ -941,8 +1330,6 @@ class SynthesisEngine:
         }
 
         child = _child_code(repr(cap.code))
-        from athena.capabilities.registry import validate_schema
-
         hosts: list[GeneratedToolHost] = []
 
         async def _run_case(case: dict):
@@ -952,7 +1339,7 @@ class SynthesisEngine:
                 if base_workspace_root is None:
                     raise ValueError("validation workspace root is unavailable")
                 execution_root = tempfile.mkdtemp(dir=validation_parent)
-                shutil.copytree(
+                copy_workspace_tree(
                     base_workspace_root,
                     execution_root,
                     dirs_exist_ok=True,
@@ -995,9 +1382,10 @@ class SynthesisEngine:
                 execution_root,
                 expected_fingerprint=None,
             )
+            case_input = case["input"] if "input" in case else case.get("args") or {}
             output = await self._run_child_async(
                 child,
-                json.dumps(case.get("args") or {}),
+                json.dumps(case_input),
                 timeout=timeout,
                 workspace_root=execution_root,
                 effects=self._authority_values(cap),
@@ -1008,16 +1396,22 @@ class SynthesisEngine:
 
         for i, case in enumerate(cases or []):
             try:
-                case_args = case.get("args") or {}
+                case_args = case["input"] if "input" in case else case.get("args") or {}
                 input_errors = validate_schema(cap.input_schema, case_args)
                 if input_errors:
+                    regression_id = str(case.get("id") or "")
+                    if case.get("expect_invalid_input") and regression_id in historical_by_id:
+                        historical_by_id[regression_id]["resolved_by_revision"] = cap.revision
                     details.append(
                         {
                             "case": i,
-                            "passed": False,
+                            "passed": bool(case.get("expect_invalid_input")),
                             "error": "input contract: " + "; ".join(input_errors),
+                            **({"regression_id": regression_id} if regression_id else {}),
                         }
                     )
+                    if case.get("expect_invalid_input"):
+                        passed += 1
                     continue
                 out, err, rc, case_root, before, case_host = await _run_case(case)
                 ok = rc == 0
@@ -1067,13 +1461,17 @@ class SynthesisEngine:
                 )
                 if resource_error:
                     ok = False
+                raw_invariants = case.get("invariants")
+                raw_verification_requirements = case.get("verification_requirements")
+                combined_invariants: list[object] = []
+                if isinstance(raw_invariants, (list, tuple)):
+                    combined_invariants.extend(raw_invariants)
+                if isinstance(raw_verification_requirements, (list, tuple)):
+                    combined_invariants.extend(raw_verification_requirements)
                 invariant_errors = await _check_invariants(
                     {
                         **case,
-                        "invariants": [
-                            *(case.get("invariants") or []),
-                            *(case.get("verification_requirements") or []),
-                        ],
+                        "invariants": combined_invariants,
                     },
                     host,
                 )
@@ -1089,6 +1487,11 @@ class SynthesisEngine:
                         "rc": rc,
                         "changed_resources": changed_resources,
                         **(
+                            {"regression_id": str(case["id"])}
+                            if case.get("id") in historical_by_id
+                            else {}
+                        ),
+                        **(
                             {"error": "output contract: " + "; ".join(output_errors)}
                             if output_errors
                             else {}
@@ -1097,6 +1500,13 @@ class SynthesisEngine:
                         **({"stderr": err[-300:]} if err else {}),
                     }
                 )
+                if ok and case.get("id") in historical_by_id:
+                    # A successor resolves a historical live failure only
+                    # after the inherited fixture itself passes.  Keeping the
+                    # revision marker makes future repairs inherit unresolved
+                    # failures while preserving the proof trail for resolved
+                    # ones.
+                    historical_by_id[str(case["id"])]["resolved_by_revision"] = cap.revision
             except (KeyError, OSError, TypeError, ValueError) as exc:
                 details.append({"case": i, "passed": False, "error": str(exc)})
             finally:
@@ -1111,15 +1521,16 @@ class SynthesisEngine:
             shutil.rmtree(validation_parent, ignore_errors=True)
 
         if hosts:
+            observed_capabilities = {
+                str(call.get("capability_id"))
+                for host in hosts
+                for call in host.calls
+                if call.get("capability_id")
+            }
+            # Declared dependencies are part of the capability contract even
+            # when a fixture does not exercise every branch.
             cap.required_capabilities = tuple(
-                sorted(
-                    {
-                        str(call.get("capability_id"))
-                        for host in hosts
-                        for call in host.calls
-                        if call.get("capability_id")
-                    }
-                )
+                sorted(set(cap.required_capabilities) | observed_capabilities)
             )
 
         output_schema_inferred = False
@@ -1135,12 +1546,33 @@ class SynthesisEngine:
             "tier": source_validation.tier.value,
             "cases_total": total,
             "cases_passed": passed,
-            "all_passed": total > 0 and passed == total,
+            "all_passed": (
+                total > 0
+                and passed == total
+                and all(detail["passed"] is True for detail in negative_details)
+            ),
             "output_schema_inferred": output_schema_inferred,
             "source": source_record,
             "details": details,
+            "risk_tier": _risk_tier(cap),
+            "negative_cases_total": len(negative_details),
+            "negative_cases_passed": sum(
+                1 for detail in negative_details if detail["passed"] is True
+            ),
+            "negative_cases": negative_details,
+            "live_failure_cases": historical_failures,
+            "regression_cases": historical_failures,
         }
         cap.lifecycle_state = "VALIDATED" if cap.validation["all_passed"] else "REJECTED"
+        if cap.id_generated and cap.validation["all_passed"]:
+            # Assign the public id only after source normalization, dependency
+            # resolution, observed capability requirements, and output-schema
+            # inference have completed.  Request-side names are not identity.
+            cap.id = (
+                "synth_"
+                + hashlib.sha256(canonical_generated_identity(cap).encode()).hexdigest()[:20]
+            )
+            cap.id_generated = False
         return cap
 
     async def _emit_validation_progress(
@@ -1253,6 +1685,35 @@ class SynthesisEngine:
             )
 
             async def invoke(self, request, output_accumulator=None, context=None):
+                input_errors = _admit_generated_input(cap, request.arguments)
+                if input_errors:
+                    return CapabilityResult(
+                        request.call_id,
+                        request.capability_id,
+                        CapabilityResultStatus.FAILED,
+                        error="generated input rejected at admission: " + "; ".join(input_errors),
+                        metadata={
+                            "admission_rejected": True,
+                            "admission_boundary": "generated_input_schema",
+                        },
+                    )
+                if cap.lifecycle_state in _UNUSABLE_LIFECYCLE_STATES:
+                    return CapabilityResult(
+                        request.call_id,
+                        request.capability_id,
+                        CapabilityResultStatus.FAILED,
+                        error=(
+                            f"synthetic capability {cap.id} requires revalidation "
+                            f"({cap.lifecycle_state.lower()})"
+                        ),
+                        metadata={
+                            "generated_failure": _generated_failure(
+                                cap,
+                                "lifecycle_unavailable",
+                                repairable=False,
+                            )
+                        },
+                    )
                 # P1-18: enforce task scoping — a task-scoped synthetic must
                 # not be callable by another task.
                 if cap.task_id and request.task_id != cap.task_id:
@@ -1268,7 +1729,7 @@ class SynthesisEngine:
                         self.engine._research_store,
                     )
                     if evidence["status"] != "CURRENT":
-                        cap.lifecycle_state = "STALE"
+                        cap.lifecycle_state = "REVALIDATION_REQUIRED"
                         cap.validation["evidence"] = evidence
                         if self.proof_sink is not None:
                             try:
@@ -1291,7 +1752,7 @@ class SynthesisEngine:
                                 "generated_failure": _generated_failure(
                                     cap,
                                     "provenance_stale",
-                                    repairable=True,
+                                    repairable=False,
                                     evidence=evidence,
                                 ),
                             },
@@ -1323,17 +1784,53 @@ class SynthesisEngine:
 
                 try:
                     stdout, stderr, returncode = await _run()
-                except ValueError as exc:
+                except (OSError, RuntimeError, ValueError) as exc:
+                    failure_class = "environment_changed"
+                    cap.failures += 1
+                    cap.lifecycle_state = _failure_lifecycle_state(failure_class)
+                    environment_signature = self.engine._environment_signature(
+                        context,
+                        cap,
+                    )
+                    cap.environment_fingerprints.add(environment_signature)
+                    from athena.protocol.messages import utcnow
+
+                    cap.last_used_at = utcnow().isoformat()
+                    _remember_live_failure(
+                        cap,
+                        request.arguments,
+                        failure_class=failure_class,
+                        observed_failure=str(exc),
+                        environment_fingerprint=environment_signature,
+                    )
+                    proof_error = None
+                    if self.proof_sink is not None:
+                        try:
+                            await self.proof_sink(cap.id, self.engine._proof_record(cap))
+                        except (
+                            KeyError,
+                            OSError,
+                            RuntimeError,
+                            TypeError,
+                            ValueError,
+                        ) as proof_exc:
+                            _logger.error(
+                                "generated capability proof persistence failed for %s: %s",
+                                cap.id,
+                                proof_exc,
+                            )
+                            proof_error = str(proof_exc)
                     return CapabilityResult(
                         request.call_id,
                         request.capability_id,
                         CapabilityResultStatus.FAILED,
-                        error=f"dependency environment unavailable: {exc}",
+                        error=f"generated execution environment unavailable: {exc}",
                         metadata={
+                            **({"proof_persistence_error": proof_error} if proof_error else {}),
                             "generated_failure": _generated_failure(
                                 cap,
-                                "environment_changed",
-                                repairable=True,
+                                failure_class,
+                                repairable=False,
                             ),
                         },
                     )
@@ -1401,6 +1898,14 @@ class SynthesisEngine:
                         value = json.loads(stdout.split("__RESULT__", 1)[1].splitlines()[0])
                     except (IndexError, json.JSONDecodeError) as exc:
                         cap.failures += 1
+                        cap.lifecycle_state = _failure_lifecycle_state("implementation_failure")
+                        _remember_live_failure(
+                            cap,
+                            request.arguments,
+                            failure_class="implementation_failure",
+                            observed_failure=str(exc),
+                            environment_fingerprint=environment_signature,
+                        )
                         proof_error = await _persist_proof()
                         return CapabilityResult(
                             request.call_id,
@@ -1412,7 +1917,7 @@ class SynthesisEngine:
                                 "generated_failure": _generated_failure(
                                     cap,
                                     "implementation_failure",
-                                    repairable=False,
+                                    repairable=True,
                                 ),
                             },
                         )
@@ -1422,6 +1927,14 @@ class SynthesisEngine:
                         errors = validate_schema(cap.output_schema, value)
                         if errors:
                             cap.failures += 1
+                            cap.lifecycle_state = _failure_lifecycle_state("contract_mismatch")
+                            _remember_live_failure(
+                                cap,
+                                request.arguments,
+                                failure_class="contract_mismatch",
+                                observed_failure="; ".join(errors),
+                                environment_fingerprint=environment_signature,
+                            )
                             proof_error = await _persist_proof()
                             return CapabilityResult(
                                 request.call_id,
@@ -1453,6 +1966,20 @@ class SynthesisEngine:
                         metadata=({"proof_persistence_error": proof_error} if proof_error else {}),
                     )
                 cap.failures += 1
+                failure_class = (
+                    "governance_failure"
+                    if "host call" in (stderr or "").lower()
+                    else "implementation_failure"
+                )
+                cap.lifecycle_state = _failure_lifecycle_state(failure_class)
+                if failure_class == "implementation_failure":
+                    _remember_live_failure(
+                        cap,
+                        request.arguments,
+                        failure_class=failure_class,
+                        observed_failure=(stderr or "synthetic failed")[-500:],
+                        environment_fingerprint=environment_signature,
+                    )
                 proof_error = await _persist_proof()
                 return CapabilityResult(
                     request.call_id,
@@ -1463,12 +1990,8 @@ class SynthesisEngine:
                         **({"proof_persistence_error": proof_error} if proof_error else {}),
                         "generated_failure": _generated_failure(
                             cap,
-                            (
-                                "governance_failure"
-                                if "host call" in (stderr or "").lower()
-                                else "implementation_failure"
-                            ),
-                            repairable="host call" not in (stderr or "").lower(),
+                            failure_class,
+                            repairable=failure_class == "implementation_failure",
                         ),
                     },
                 )
@@ -1499,7 +2022,7 @@ class SynthesisEngine:
                 descriptor = registry.resolve(capability_id)
             except (KeyError, RuntimeError, TypeError, ValueError):
                 continue
-            for effect in descriptor.effects:
+            for effect in getattr(descriptor, "effects", ()):
                 value = getattr(effect, "value", str(effect))
                 if value in declared:
                     effects.add(value)
@@ -1592,6 +2115,11 @@ class SynthesisEngine:
                 "turns_saved": "not_measured",
             },
             "validation_strength": cap.validation.get("tier", "unknown"),
+            "family_id": cap.family_id,
+            "revision": cap.revision,
+            "parent_revision": cap.parent_revision,
+            "active_revision": cap.active_revision,
+            "superseded_by": cap.superseded_by,
             "usage": {
                 "uses": cap.uses,
                 "successes": cap.successes,
@@ -1659,7 +2187,12 @@ class SynthesisEngine:
             validation_state="VALIDATED",
             proof_record=proof,
             lifecycle_state=cap.lifecycle_state,
+            family_id=cap.family_id,
+            revision=cap.revision,
+            parent_revision=cap.parent_revision,
+            active_revision=cap.active_revision,
             supersedes=cap.supersedes,
+            superseded_by=cap.superseded_by,
             dependency_lock=self._dependency_lock(cap),
             validation_cases=tuple(dict(case) for case in (cap.validation_cases or [])),
             last_used_at=cap.last_used_at,
@@ -1790,7 +2323,12 @@ class SynthesisEngine:
             # current Athena profile so old records cannot widen execution.
             effective_effects=_GENERATED_EFFECTIVE_AUTHORITY,
             lifecycle_state=generated.lifecycle_state,
+            family_id=generated.family_id,
+            revision=generated.revision,
+            parent_revision=generated.parent_revision,
+            active_revision=generated.active_revision,
             supersedes=generated.supersedes,
+            superseded_by=generated.superseded_by,
             dependency_lock=dict(generated.dependency_lock),
             last_used_at=generated.last_used_at,
         )
@@ -1824,6 +2362,11 @@ class SynthesisEngine:
             "quality_score": self._proof_record(cap).get("quality_score", 0.0),
             "last_used_at": cap.last_used_at,
             "supersedes": list(cap.supersedes),
+            "family_id": cap.family_id,
+            "revision": cap.revision,
+            "parent_revision": cap.parent_revision,
+            "active_revision": cap.active_revision,
+            "superseded_by": cap.superseded_by,
             "dependency_lock": self._dependency_lock(cap),
         }
 
@@ -1831,7 +2374,7 @@ class SynthesisEngine:
         """Return the in-memory capability record for lifecycle operations."""
         return self._synthetic.get(cap_id)
 
-    def promote(
+    async def promote(
         self,
         surface,
         cap_id: str,
@@ -1886,54 +2429,78 @@ class SynthesisEngine:
                 promotion_tier.value,
             )
             return False
-        cap.code = source_validation.code
-        cap.lifecycle_state = "PROMOTED"
-        cap.validation["tier"] = promotion_tier.value
-        cap.validation["source"] = source_validation.to_dict()
+        promoted_validation = dict(cap.validation)
+        promoted_validation["tier"] = promotion_tier.value
+        promoted_validation["source"] = source_validation.to_dict()
+        # Keep the task-scoped record untouched until durable activation has
+        # committed.  A failed promotion must leave the prior live executor
+        # callable and its lifecycle/proof state intact.
+        promoted_cap = replace(
+            cap,
+            code=source_validation.code,
+            lifecycle_state="PROMOTED",
+            validation=promoted_validation,
+        )
         # Formatting is part of the canonical source contract. Rebuild the
         # executor if promotion normalized the source bytes.
         proof_sink = getattr(surface, "update_generated_proof", None)
-        executor = self._build_executor(cap, proof_sink=proof_sink)
+        executor = self._build_executor(promoted_cap, proof_sink=proof_sink)
         source_task_id = cap.task_id
-        proof = self._proof_record(cap)
+        proof = self._proof_record(promoted_cap)
         generated = GeneratedCapability(
-            id=cap.id,
-            name=cap.name,
-            description=cap.description,
-            implementation=cap.code,
-            input_schema=cap.input_schema,
-            runtime=cap.runtime,
-            output_schema=cap.output_schema,
-            required_dependencies=cap.required_dependencies,
-            required_capabilities=cap.required_capabilities,
-            evidence_dependencies=cap.evidence_dependencies,
-            declared_effects=frozenset(self._effect_values(cap)),
-            effective_authority=frozenset(self._authority_values(cap)),
+            id=promoted_cap.id,
+            name=promoted_cap.name,
+            description=promoted_cap.description,
+            implementation=promoted_cap.code,
+            input_schema=promoted_cap.input_schema,
+            runtime=promoted_cap.runtime,
+            output_schema=promoted_cap.output_schema,
+            required_dependencies=promoted_cap.required_dependencies,
+            required_capabilities=promoted_cap.required_capabilities,
+            evidence_dependencies=promoted_cap.evidence_dependencies,
+            declared_effects=frozenset(self._effect_values(promoted_cap)),
+            effective_authority=frozenset(self._authority_values(promoted_cap)),
             scope=scope,
             project_scope=project_id,
             user_scope=user_id if scope is AffordanceScope.USER else None,
-            provenance={**cap.provenance, "promoted_from": "task"},
+            provenance={**promoted_cap.provenance, "promoted_from": "task"},
             validation_state="PROMOTED",
             proof_record=proof,
             lifecycle_state="PROMOTED",
-            supersedes=cap.supersedes,
-            dependency_lock=self._dependency_lock(cap),
-            use_count=cap.uses,
-            success_count=cap.successes,
-            failure_count=cap.failures,
+            family_id=promoted_cap.family_id,
+            revision=promoted_cap.revision,
+            parent_revision=promoted_cap.parent_revision,
+            active_revision=promoted_cap.active_revision,
+            supersedes=promoted_cap.supersedes,
+            superseded_by=promoted_cap.superseded_by,
+            dependency_lock=self._dependency_lock(promoted_cap),
+            use_count=promoted_cap.uses,
+            success_count=promoted_cap.successes,
+            failure_count=promoted_cap.failures,
             quality_score=float(proof.get("quality_score") or 0.0),
-            last_used_at=cap.last_used_at,
-            validation_cases=tuple(dict(case) for case in (cap.validation_cases or [])),
+            last_used_at=promoted_cap.last_used_at,
+            validation_cases=tuple(dict(case) for case in (promoted_cap.validation_cases or [])),
         )
-        if scope is AffordanceScope.PROJECT:
-            surface.register_project(project_id, executor, generated=generated)
+        if hasattr(surface, "activate_generated_revision"):
+            await surface.activate_generated_revision(
+                generated,
+                executor,
+                owner=project_id if scope is AffordanceScope.PROJECT else user_id,
+            )
         else:
-            surface.register_user(user_id, executor, generated=generated)
+            if scope is AffordanceScope.PROJECT:
+                surface.register_project(project_id, executor, generated=generated)
+            else:
+                surface.register_user(user_id, executor, generated=generated)
+            flush = getattr(surface, "flush", None)
+            if flush is not None:
+                await flush()
+        self._synthetic[cap_id] = promoted_cap
+        self._executors[cap_id] = executor
         # The executor's closure enforced the task owner until the explicit
         # promotion succeeded. Remove the old overlay before widening it.
-        cap.task_id = None
         if source_task_id and hasattr(surface, "unregister_task_capability"):
-            surface.unregister_task_capability(source_task_id, cap.id)
+            surface.unregister_task_capability(source_task_id, promoted_cap.id)
         return True
 
     def to_skill_candidate(self, cap_id: str):
@@ -1978,6 +2545,133 @@ def _input_signature(arguments: object) -> str:
     """Return a stable bounded identity for live-use diversity evidence."""
     encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _service_negative_cases(schema: Mapping[str, object]) -> list[dict[str, object]]:
+    """Generate deterministic contract-negative inputs from JSON Schema.
+
+    These are service-owned checks, not model-authored examples.  They never
+    execute generated code: the admission boundary must prove that malformed
+    input is rejected by the same validator used by the dispatcher.  The
+    root-type mutation gives every object contract at least one negative case;
+    constrained properties add representative required/type/bounds cases.
+    """
+    schema_type = schema.get("type")
+    invalid_root: object | None = None
+    if schema_type == "object":
+        invalid_root = []
+    elif schema_type == "array":
+        invalid_root = {}
+    elif schema_type == "string":
+        invalid_root = 1
+    elif schema_type in {"integer", "number"}:
+        invalid_root = "not-a-number"
+    elif schema_type == "boolean":
+        invalid_root = "not-a-boolean"
+    elif schema_type == "null":
+        invalid_root = {}
+
+    candidates: list[dict[str, object]] = []
+    if invalid_root is not None:
+        candidates.append(
+            {
+                "input": invalid_root,
+                "source": "service_negative",
+                "expect_invalid_input": True,
+            }
+        )
+    if schema_type != "object":
+        return candidates
+
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        properties = {}
+    required = schema.get("required")
+    if isinstance(required, Sequence) and not isinstance(required, (str, bytes)):
+        required_names = [str(name) for name in required]
+        if required_names:
+            candidates.append(
+                {
+                    "input": {},
+                    "source": "service_negative",
+                    "expect_invalid_input": True,
+                    "mutator": "remove_required",
+                    "field": required_names[0],
+                }
+            )
+    if schema.get("additionalProperties") is False:
+        candidates.append(
+            {
+                "input": {"__athena_unknown_field__": True},
+                "source": "service_negative",
+                "expect_invalid_input": True,
+                "mutator": "add_unknown_property",
+            }
+        )
+
+    for raw_name, raw_spec in properties.items():
+        name = str(raw_name)
+        if not isinstance(raw_spec, Mapping):
+            continue
+        value: object | None = None
+        has_value = True
+        value_type = raw_spec.get("type")
+        if value_type == "string":
+            value = 1
+            if isinstance(raw_spec.get("minLength"), int) and raw_spec["minLength"] > 0:
+                value = ""
+        elif value_type in {"integer", "number"}:
+            value = "not-a-number"
+        elif value_type == "boolean":
+            value = "not-a-boolean"
+        elif value_type == "array":
+            value = {}
+        elif value_type == "object":
+            value = []
+        elif value_type == "null":
+            value = True
+        elif isinstance(raw_spec.get("enum"), Sequence) and raw_spec["enum"]:
+            value = "__athena_invalid_enum__"
+        else:
+            has_value = False
+        if has_value:
+            candidates.append(
+                {
+                    "input": {name: value},
+                    "source": "service_negative",
+                    "expect_invalid_input": True,
+                    "mutator": "wrong_type_or_enum",
+                    "field": name,
+                }
+            )
+
+    # Schemas expressed through composition (oneOf/anyOf/not/const, or a
+    # schema without an explicit root type) may not expose a property-level
+    # mutation. Probe a small fixed corpus and retain the first value that the
+    # same validator rejects. This keeps negative proof service-owned without
+    # inventing a case that is actually valid for the contract.
+    probe_values: tuple[object, ...] = (None, [], {}, "", 0, False)
+    for value in probe_values:
+        if validate_schema(dict(schema), value):
+            candidates.append(
+                {
+                    "input": value,
+                    "source": "service_negative",
+                    "expect_invalid_input": True,
+                    "mutator": "schema_constraint",
+                }
+            )
+            break
+
+    unique: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for case in candidates:
+        identity = json.dumps(case, sort_keys=True, separators=(",", ":"), default=str)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(case)
+    return unique
 
 
 def _apply_workspace_fixture(case: Mapping[str, object], root: str) -> None:

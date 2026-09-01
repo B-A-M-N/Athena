@@ -1,4 +1,4 @@
-# Athena terminal frontend (development preview)
+# Athena Linux terminal frontend (beta)
 
 This directory contains the first native frontend boundary for the Athena
 terminal application. It is not a second agent runtime and it is not a copy of
@@ -9,7 +9,7 @@ semantics. An
 Athena-owned compositor adds the reference-space graphite instrument chassis,
 distinct flat operator and rounded Glass Compute wells, central divider,
 physical lower control deck, and OpenGL OI scene. Structured projections drive
-a semantic 384×256 DAGOAL world with contextual pixel information, task-object
+a semantic 384×256 DAGOAL version 8 world with contextual pixel information, task-object
 continuity, Buddy pose changes, verification gates, and non-modal attention
 overlays. The compositor consumes the shared projection contracts from
 `src/athena/cli/` through a semantic bridge rather than reimplementing task
@@ -49,7 +49,7 @@ cargo run --manifest-path native/Cargo.toml --offline -- \
 For the native window:
 
 ```bash
-cargo build --manifest-path native/Cargo.toml --offline
+cargo build --release --manifest-path native/Cargo.toml --locked --offline
 athena native
 ```
 
@@ -96,7 +96,9 @@ Shared Buddy pose vocabulary and the three distinct sprite sets live under
 
 `athena chat` is not the native window; it selects a host-terminal surface.
 Use `--no-animations` or `--reduced-motion` for deterministic/static OI
-presentation.
+presentation. Protected temporal release checks may set
+`ATHENA_PRESENTATION_CLOCK=fixed` (or `fixed:<seconds>`); this pins the
+presentation phase to the presented-frame sequence instead of wall time.
 
 For the current hosted paths, use:
 

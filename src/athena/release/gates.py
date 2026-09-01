@@ -15,14 +15,22 @@ def candidate_commands() -> tuple[str, ...]:
         "uv run --frozen --no-sync python scripts/scenarios --exclude-family VHS --output /tmp/athena-self-scenarios.json",
         "cargo check --manifest-path native/Cargo.toml --locked --offline",
         "cargo test --manifest-path native/Cargo.toml --locked --offline",
+        "scripts/build-native-package",
         "cargo --version",
         "rustc --version",
         "scripts/native-smoke",
         "uv run --frozen --no-sync python scripts/bench-alacrity --events 5000 --min-producer-events-per-second 10000",
-        "uv run --frozen --no-sync python scripts/bench-indexing --samples 3 --max-full-seconds 5 --hard-max-full-seconds 8 --max-incremental-seconds 0.5 --hard-max-incremental-seconds 1",
+        "uv run --frozen --no-sync python scripts/bench-indexing --samples 3 --max-full-seconds 5 --hard-max-full-seconds 8 --max-cold-start-seconds 8 --max-incremental-seconds 0.5 --hard-max-incremental-seconds 1",
         "uv run --frozen --no-sync python scripts/bench-rendering --max-scene-p95-ms 2 --max-native-projection-p95-ms 5 --max-idle-redraws-per-second 0.1 --max-idle-cpu-percent 2 --max-active-fps 25 --max-cache-bytes 16777216 --require-native",
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q",
+        "uv run --frozen --no-sync --extra dev python scripts/dependency-audit",
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_release_black_box.py",
+        "scripts/sandbox-release-matrix",
+        "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_workflow_strategy.py",
+        "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_hermes_agent.py",
+        "scripts/native-input-smoke",
+        "scripts/native-visual-smoke",
+        "scripts/native-desktop-acceptance",
     )
 
 
@@ -58,6 +66,8 @@ def release_commands(
                 "--max-full-seconds",
                 "5",
                 "--hard-max-full-seconds",
+                "8",
+                "--max-cold-start-seconds",
                 "8",
                 "--max-incremental-seconds",
                 "0.5",
@@ -96,6 +106,10 @@ def release_commands(
         ("ruff-check", [*prefix, "ruff", "check", "--no-cache", "src", "tests"]),
         ("uv-lock-check", ["uv", "lock", "--check", "--offline"]),
         ("mypy", [*prefix, "mypy", "src/athena"]),
+        (
+            "dependency-audit",
+            [*prefix, "python", "scripts/dependency-audit"],
+        ),
         ("compileall", [*prefix, "python", "-m", "compileall", "-q", "src", "tests"]),
         ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "--ignore=tests/e2e"]),
         (
@@ -144,6 +158,10 @@ def release_commands(
                     "--offline",
                 ],
             ),
+            (
+                "release-artifacts",
+                ["scripts/build-release-artifacts", "--output-dir", "release-artifacts"],
+            ),
             ("native-smoke", ["scripts/native-smoke"]),
         ]
     )
@@ -157,10 +175,65 @@ def release_commands(
                     "-q",
                     "-p",
                     "no:cacheprovider",
+                    "tests/e2e/test_artifact_store_wiring.py",
                     "tests/e2e/test_release_black_box.py",
+                    "tests/e2e/test_real_execution.py",
+                    "tests/e2e/test_session_resume.py",
                     "tests/e2e/test_self_host_continuation.py",
                 ],
             )
+        )
+        commands.extend(
+            [
+                (
+                    "sandbox-matrix",
+                    [
+                        "scripts/sandbox-release-matrix",
+                    ],
+                ),
+                (
+                    "workflow-strategy",
+                    [
+                        *prefix,
+                        "pytest",
+                        "-q",
+                        "-p",
+                        "no:cacheprovider",
+                        "tests/e2e/test_workflow_strategy.py",
+                    ],
+                ),
+                (
+                    "hermes-live",
+                    [
+                        *prefix,
+                        "pytest",
+                        "-q",
+                        "-p",
+                        "no:cacheprovider",
+                        "tests/e2e/test_hermes_agent.py",
+                    ],
+                ),
+                (
+                    "mcp-stdio",
+                    [
+                        uv,
+                        "run",
+                        "--frozen",
+                        "--extra",
+                        "dev",
+                        "--extra",
+                        "mcp",
+                        "pytest",
+                        "-q",
+                        "-p",
+                        "no:cacheprovider",
+                        "tests/e2e/test_mcp_transport.py",
+                    ],
+                ),
+                ("native-input-smoke", ["scripts/native-input-smoke"]),
+                ("native-visual-smoke", ["scripts/native-visual-smoke"]),
+                ("native-desktop-acceptance", ["scripts/native-desktop-acceptance"]),
+            ]
         )
     return tuple(commands)
 

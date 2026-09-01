@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from athena.execution.process_tree import kill_tree_async
 from athena.hermes.agent_adapter import HermesAgentEvaluator
 from athena.hermes.referee import HermesReferee, ReviewPacket
 from athena.policy.credentials import SecretManager, write_user_secret
@@ -121,13 +122,14 @@ class HermesRefereeManager:
         root = self._root()
         argv = [str(self._python(root)), "-m", "hermes_cli.main", *args]
         stdin = asyncio.subprocess.PIPE if secret is not None else asyncio.subprocess.DEVNULL
-        process = await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=owned Hermes referee service
             *argv,
             cwd=str(root),
             env=self._environment(root),
             stdin=stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         payload = (secret + "\n").encode("utf-8") if secret is not None else None
         try:
@@ -135,9 +137,13 @@ class HermesRefereeManager:
                 process.communicate(payload), timeout=self.timeout_seconds
             )
         except asyncio.TimeoutError as exc:
-            process.kill()
+            await kill_tree_async(process, timeout=1.0)
             await process.communicate()
             raise HermesRefereeManagerError("Hermes provisioning timed out") from exc
+        except asyncio.CancelledError:
+            await kill_tree_async(process, timeout=1.0)
+            await process.communicate()
+            raise
         if process.returncode:
             # Never include child stdout: a future Hermes version must not be
             # able to make a provisioning failure echo the bearer credential.

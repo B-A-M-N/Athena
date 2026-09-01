@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The first file is the invariant probe: every restricted process must keep
+# workspace writes local, deny network and ambient secrets, keep toolchains
+# read-only, and fail closed without Bubblewrap.  The remaining suites are
+# the actual product routes that must reach that same boundary:
+#
+#   normal execute              -> test_real_execution.py
+#   scratch                     -> test_scratch.py
+#   generated validation/live   -> test_synthesis.py
+#   shadow                      -> test_shadow_and_worldstate.py
+#   fusion branch               -> test_orchestrator.py
+#   verification               -> test_reality_coordinator.py
+#   self-host verification     -> test_self_host_continuation.py
+#   workflow nested execution  -> test_workflow_strategy.py
+matrix_repeats="${ATHENA_SANDBOX_MATRIX_REPEATS:-5}"
+[[ "$matrix_repeats" =~ ^[1-9][0-9]*$ ]] || {
+  printf '%s\n' 'sandbox-release-matrix: ATHENA_SANDBOX_MATRIX_REPEATS must be a positive integer' >&2
+  exit 2
+}
+if [[ "${ATHENA_SANDBOX_NO_SYNC:-0}" == "1" ]]; then
+  uv_run=(uv run --frozen --no-sync)
+else
+  uv_run=(uv run --frozen --extra dev)
+fi
+matrix_tests=(
+  tests/e2e/test_release_sandbox_matrix.py
+  tests/e2e/test_real_execution.py
+  tests/unit/capabilities/test_scratch.py
+  tests/unit/synthesis/test_synthesis.py
+  tests/unit/shadow/test_shadow_and_worldstate.py
+  tests/unit/fusion/test_orchestrator.py
+  tests/unit/capabilities/test_reality_coordinator.py
+  tests/e2e/test_self_host_continuation.py
+  tests/e2e/test_workflow_strategy.py
+)
+for iteration in $(seq "$matrix_repeats"); do
+  printf 'sandbox-release-matrix: complete pass %s/%s\n' "$iteration" "$matrix_repeats"
+  "${uv_run[@]}" pytest -q -p no:cacheprovider \
+    "${matrix_tests[@]}"
+done

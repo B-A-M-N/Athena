@@ -533,15 +533,15 @@ complete.
 | --- | --- |
 | One AgentKernel, Task, policy, execution, and durable event model | **Mostly aligned**; existing core contracts support this model. |
 | Affordance Fabric and task/project/user overlays | **Live for beta scope**; fabric search carries readiness/proof evidence, task-scoped synthesis, durable project/user/candidate records, ownership filtering, lifecycle history, and explicit CLI review/promotion/deprecation exist. Broader host-resource discovery remains incomplete. |
-| Scratch lifecycle | **Partial**; records exist, but the kernel does not yet choose scratch/composition/synthesis through one explicit strategy surface. |
+| Scratch lifecycle | **Live for beta scope**; the kernel emits bounded `StrategySelected` guidance across direct, compose, synthesize, evidence, and fusion routes while retaining model authority over actual calls. |
 | GeneratedCapability | **Live for beta scope**; model-visible task-scoped creation, hashes, dependency locks, proof evolution, candidate retention, project/user rehydration, and explicit promotion/deprecation exist. Native-window and platform-specific sandbox parity remain incomplete. |
-| Declarative nested workflows | **Partial**; models, SQLite storage, validation, execution, and a capability route exist; kernel-level strategy integration and full conformance are incomplete. |
+| Declarative nested workflows | **Live for beta scope**; models, SQLite storage, validation, nested execution, approval/failure handling, replay, and strategy-to-workflow release evidence are covered. Broader workflow authoring ergonomics remain. |
 | Reflection | **Partial**; scoped/ranked capability reflection, workflow/skill search and description, runtime/dependency/permission/device inventories, and availability passports are live; broader resource discovery and fuller dependency-manager coverage are incomplete. |
 | Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, and deterministic plan/assess/bundle/run operations are live; semantic retrieval, autonomous acquisition/critique, and full completion verification remain incomplete. |
 | Dependency acquisition | **Partial**; a governed Python route records resolved versions, source metadata, file hashes, exact runtime identity, and environment fingerprints, and rejects lock replay on mismatch; manager breadth and full policy coverage remain. |
 | Tiered validation | **Partial**; task admission now records parse/interface/security/format/lint checks, candidate/project/user tiers can require Ruff/Mypy, and exact JSON Schema is compiled; generated-test planning, independent evidence, and optional Semgrep remain incomplete. |
 | Promotion and retention | **Live for beta scope**; `/candidates`, `/candidate`, `/promote`, and `/deprecate` provide explicit project/user review and lifecycle control with durable proof, history, quality scoring, and garbage collection. Richer review/supersession UX remains. |
-| Authority inheritance and isolation | **Not release-ready** until every generated/shadow/verification path is backed by a real restricted backend. |
+| Authority inheritance and isolation | **Beta-evidenced on Linux**; generated, scratch, shadow, verification, workflow, and self-host paths inherit the canonical restricted backend, with an explicit Bubblewrap confinement/process-tree release matrix. Platform parity remains incomplete. |
 
 This table is an alignment guard. It prevents class names, comments, or
 documentation from being treated as evidence that a subsystem is complete.

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/athena-uv-cache}"
+# The release/check lane has already provisioned this locked environment.
+# Avoid a second editable-project build or network sync while packaging the
+# companion artifact itself.
+build_python=(uv run --frozen --no-sync --extra dev python)
+
+output_dir="dist"
+if [[ "${1:-}" == "--output-dir" ]]; then
+  [[ -n "${2:-}" ]] || {
+    printf '%s\n' 'build-native-package: --output-dir needs a path' >&2
+    exit 2
+  }
+  output_dir="$2"
+fi
+mkdir -p "$output_dir"
+tmp_dir="$(mktemp -d -t athena-native-package.XXXXXX)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+cargo build --release --manifest-path native/Cargo.toml --locked --offline
+cp -R native/package "$tmp_dir/package"
+cp native/target/release/athena-terminal "$tmp_dir/package/athena_native/athena-terminal"
+chmod 0755 "$tmp_dir/package/athena_native/athena-terminal"
+"${build_python[@]}" -m build --no-isolation --wheel --outdir "$output_dir" "$tmp_dir/package"
+printf '%s\n' "native-package: built companion wheel in $output_dir"

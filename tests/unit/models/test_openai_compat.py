@@ -83,6 +83,21 @@ def _user_request(text: str = "hello") -> ModelRequest:
     )
 
 
+def test_openai_compatible_authentication_policy_is_explicit_and_topology_aware():
+    loopback = OpenAICompatProvider(base_url="http://127.0.0.1:11434", api_key="")
+    private = OpenAICompatProvider(base_url="http://10.1.2.3:11434", api_key="")
+    explicitly_open = OpenAICompatProvider(
+        base_url="http://10.1.2.3:11434", api_key="", authentication="none"
+    )
+
+    assert loopback.readiness()["state"] == "ready"
+    assert loopback.readiness()["authentication"] == "none"
+    assert private.readiness()["state"] == "auth_missing"
+    assert private.readiness()["local"] is True
+    assert explicitly_open.readiness()["state"] == "ready"
+    assert explicitly_open.readiness()["authentication"] == "none"
+
+
 def test_openai_compatible_hosted_profile_emits_prompt_cache_key():
     provider = _provider()
     base = _user_request()

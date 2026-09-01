@@ -26,6 +26,7 @@ import re
 import shutil
 import time
 from typing import Any
+import warnings
 
 from athena.execution.async_call import run_blocking
 from athena.execution.process_tree import sandbox_argv
@@ -159,16 +160,27 @@ class _Session:
         self.id = session_id
         self.task_id = task_id
         self.workspace_root = workspace_root
-        child = pexpect.spawn(
-            command[0],
-            command[1:],
-            encoding="utf-8",
-            codec_errors="replace",
-            dimensions=(rows, cols),
-            env=_terminal_env(env),
-            cwd=None,
-            timeout=None,
-        )
+        # pexpect's PTY implementation necessarily uses forkpty. Python 3.12
+        # warns when that call happens in a process with the event-loop worker
+        # threads that own this blocking capability. Keep the warning scoped
+        # to this unavoidable platform boundary; runtime failures still
+        # propagate normally and are surfaced by the capability result.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=DeprecationWarning,
+                message=r"This process .* is multi-threaded, use of forkpty\(\)",
+            )
+            child = pexpect.spawn(
+                command[0],
+                command[1:],
+                encoding="utf-8",
+                codec_errors="replace",
+                dimensions=(rows, cols),
+                env=_terminal_env(env),
+                cwd=None,
+                timeout=None,
+            )
         self.child = child
         self.cmd_text = cmd
         self.rows = rows

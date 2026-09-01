@@ -9,9 +9,9 @@ into one durable kernel. The normative contracts live in `SPEC.md`,
 `BUILDSPEC.md`, `BEHAVIORSPEC.md`, and `RESEARCHSPEC.md`; the architectural
 overview is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-> **Status: stable public beta.** The verified release host is Linux; macOS and
-> Windows are compatibility targets, and the native X11 frontend remains a
-> development preview. Interfaces and subsystem boundaries may still change.
+> **Status: pre-release beta.** Linux is the primary verification host; macOS
+> and Windows are compatibility targets. A release stamp additionally requires
+> the live Hermes lane and real X11 desktop acceptance described below.
 
 ## Why this exists
 
@@ -25,7 +25,7 @@ checked and reused. Athena is an attempt to make that behavior durable: one
 reasoning loop, explicit authority, retained evidence, and an auditable path
 from decision to execution.
 
-This is a stable public beta with a deliberately bounded core: capability
+This is a pre-release beta with a deliberately bounded core: capability
 should expand through evidence and disciplined construction, not through an
 unbounded collection of loosely coordinated agents.
 
@@ -53,8 +53,17 @@ make compile         # catch import and bytecode errors
 make check           # run the full local verification gate
 ```
 
-`make format-check` verifies formatting without changing files. The broader
-formatter baseline is being normalized incrementally while the project evolves.
+`make format-check` verifies formatting without changing files. The release
+gate requires it to be green for the complete `src` and `tests` trees.
+
+The full release gate is `scripts/release-check --sha <clean-commit>`. It
+includes installed wheel/sdist acceptance, the actual Bubblewrap confinement
+matrix, nested workflow/strategy recovery, native input/visual checks, and
+live Hermes referee evidence. The native input and visual lanes require a
+usable X display for their automation, and the dedicated desktop lane also
+requires a real Linux X11 display plus `xdotool` and ImageMagick;
+headless/Xvfb-unavailable results fail the release gate. `--skip-e2e` is a
+partial developer gate and does not produce a releasable result.
 
 ## Quickstart
 
@@ -68,7 +77,7 @@ athena --display glass chat
 # universal terminal fallback
 athena --display ansi chat
 
-# development native Athena terminal (Alacritty core + Athena compositor)
+# native Athena terminal (Alacritty core + Athena compositor)
 athena native
 
 # inspect the host terminal and renderer decision
@@ -446,8 +455,7 @@ The repository exposes the same discipline as repeatable developer gates:
 Ruff rules, `make typecheck` runs Mypy, `make compile` catches import/bytecode
 syntax failures, and `make check` runs those static gates plus the highest-risk
 generated-machinery and model/tool contract tests. The broader formatter check
-is available as `make format-check`; existing legacy formatting is being
-normalized incrementally rather than hidden behind a false clean claim.
+is available as `make format-check` and is part of the complete release gate.
 
 ## Demo (work in progress)
 
@@ -490,7 +498,7 @@ the optional demo wrapper.
 The Termux script is an optional ANSI/PTY compatibility probe, not an
 Athena stable-beta support target or release gate. Athena's supported terminal
 surfaces are hosted Glass over Kitty Graphics Protocol (Kitty and WezTerm),
-the ANSI fallback, and the native Alacritty-core development frontend. From a
+the ANSI fallback, and the Linux native Alacritty-core beta frontend. From a
 checkout, run the optional probe manually:
 
 ```bash
@@ -529,9 +537,9 @@ and autonomous research planning remain in development.
 Athena is not a giant predefined-tool agent, a collection of independently
 reasoning subagents, or a claim that every present backend is production-ready.
 The architecture document records the current alignment boundary. In
-particular, full host isolation, process reattachment after restart, semantic
-research/indexing, the native terminal frontend, and some specialized
-runtime/UI backends remain active implementation work. A restart deliberately
+particular, full cross-platform host isolation, process reattachment after
+restart, semantic research/indexing, macOS/Windows native parity, and some
+specialized runtime/UI backends remain active implementation work. A restart deliberately
 marks in-process runtime sessions lost and emits `RuntimeStateLost`; Athena
 does not guess that an old process is still safe to reuse. Types, registries,
 and documentation are not by themselves evidence that a subsystem is complete.
@@ -552,12 +560,17 @@ WezTerm are the primary supported hosts for this path; Athena probes the
 active TTY and falls back safely when graphics support is not confirmed.
 `ATHENA_KITTY_CONFIRMED=1` may be used in a controlled launcher when probing
 is unavailable. ANSI is the safe default/fallback and keeps the same scene
-semantics in cell text. The native Athena terminal development slice is documented in
-[`docs/NATIVE_TERMINAL_FRONTEND.md`](docs/NATIVE_TERMINAL_FRONTEND.md); it is
-separate from the Python package and is not yet the default shipped frontend.
+semantics in cell text. The native Athena terminal frontend is documented in
+[`docs/NATIVE_TERMINAL_FRONTEND.md`](docs/NATIVE_TERMINAL_FRONTEND.md). A
+release emits one universal Python wheel/sdist plus a Python-ABI-neutral but
+Linux/architecture-specific platform-tagged `athena-agent-native` companion
+wheel containing the native executable. Python-ABI-neutral does not mean
+OS-, libc-, CPU-, or platform-neutral; install the exact matching pair with
+`pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`. It remains separate from the
+default hosted Glass CLI surface.
 `athena native` launches the native AthenaBOX frontend with a Python service session inside
-its PTY and a Unix-socket projection bridge; build the native binary first with
-`cargo build --manifest-path native/Cargo.toml --offline`.
+its PTY and a Unix-socket projection bridge; build the native release binary first with
+`cargo build --release --manifest-path native/Cargo.toml --locked --offline`.
 Noisy deltas are coalesced, animation is presentation-only, and reduced motion
 is available with `ATHENA_REDUCED_MOTION=1` or `--reduced-motion`.
 

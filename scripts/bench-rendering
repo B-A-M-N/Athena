@@ -41,10 +41,11 @@ def _xvfb_run() -> str:
 
 
 def _native_binary() -> Path:
-    binary = REPO_ROOT / "native" / "target" / "debug" / "athena-terminal"
+    binary = REPO_ROOT / "native" / "target" / "release" / "athena-terminal"
     command = [
         "cargo",
         "build",
+        "--release",
         "--manifest-path",
         "native/Cargo.toml",
         "--locked",
@@ -135,7 +136,56 @@ def _run_native_render(
     return stats
 
 
-def _native_render_metrics(*, required: bool) -> dict[str, object]:
+def _run_native_trials(
+    binary: Path,
+    xvfb_run: str,
+    command: str,
+    stats_dir: Path,
+    label: str,
+    trials: int,
+    projection: str | None = None,
+) -> dict[str, object]:
+    """Warm the native path, then aggregate independent runs robustly."""
+    warmup_path = stats_dir / f"{label}-warmup.json"
+    _run_native_render(binary, xvfb_run, "printf native-warmup", warmup_path)
+    samples = [
+        _run_native_render(
+            binary,
+            xvfb_run,
+            command,
+            stats_dir / f"{label}-{index}.json",
+            projection=projection,
+        )
+        for index in range(trials)
+    ]
+    aggregate: dict[str, object] = {
+        "trial_count": trials,
+        "trials": samples,
+    }
+    keys = (
+        "elapsed_seconds",
+        "redraws",
+        "initial_redraws",
+        "event_redraws",
+        "idle_redraws",
+        "cpu_seconds",
+        "steady_elapsed_seconds",
+        "steady_cpu_seconds",
+        "wall_seconds",
+        "redraws_per_second",
+        "cpu_percent",
+        "steady_cpu_percent",
+        "idle_redraws_per_second",
+    )
+    for key in keys:
+        values = [float(sample[key]) for sample in samples if sample.get(key) is not None]
+        if values:
+            aggregate[key] = round(statistics.median(values), 6)
+            aggregate[f"{key}_samples"] = [round(value, 6) for value in values]
+    return aggregate
+
+
+def _native_render_metrics(*, required: bool, trials: int) -> dict[str, object]:
     if os.name != "posix" or shutil.which("xvfb-run") is None:
         if required:
             raise RuntimeError("native rendering gate requires a POSIX host with xvfb-run")
@@ -175,12 +225,21 @@ def _native_render_metrics(*, required: bool) -> dict[str, object]:
         return {"available": False, "reason": "Xvfb display unavailable"}
     with tempfile.TemporaryDirectory(prefix="athena-render-stats-") as directory:
         directory_path = Path(directory)
-        idle = _run_native_render(binary, xvfb_run, "sleep 1", directory_path / "idle.json")
-        active = _run_native_render(
+        idle = _run_native_trials(
+            binary,
+            xvfb_run,
+            "sleep 1",
+            directory_path,
+            "idle",
+            trials,
+        )
+        active = _run_native_trials(
             binary,
             xvfb_run,
             "for i in $(seq 1 80); do printf 'tick %s\\n' \"$i\"; sleep 0.01; done; sleep 0.5",
-            directory_path / "active.json",
+            directory_path,
+            "active",
+            trials,
         )
         animation_state = ProjectionState()
         animation_state.status = "SEARCHING"
@@ -189,11 +248,13 @@ def _native_render_metrics(*, required: bool) -> dict[str, object]:
             native_projection_frame(animation_state, width=96, height=32),
             ensure_ascii=False,
         )
-        oi_animation = _run_native_render(
+        oi_animation = _run_native_trials(
             binary,
             xvfb_run,
             "sleep 1",
-            directory_path / "oi-animation.json",
+            directory_path,
+            "oi-animation",
+            trials,
             projection=animation_frame,
         )
     return {
@@ -219,10 +280,18 @@ def main() -> int:
     parser.add_argument("--max-active-cpu-percent", type=float, default=30.0)
     parser.add_argument("--max-oi-animation-cpu-percent", type=float, default=10.0)
     parser.add_argument("--max-cache-bytes", type=int, default=16 * 1024 * 1024)
+    parser.add_argument(
+        "--native-trials",
+        type=int,
+        default=3,
+        help="independent native runs after one warm-up run",
+    )
     parser.add_argument("--require-native", action="store_true")
     args = parser.parse_args()
     if args.frames < 1 or args.frames > 10_000:
         parser.error("--frames must be between 1 and 10000")
+    if args.native_trials < 1 or args.native_trials > 10:
+        parser.error("--native-trials must be between 1 and 10")
 
     state = ProjectionState()
     for index in range(12):
@@ -296,7 +365,7 @@ def main() -> int:
             "overlay_bytes": round(statistics.mean(overlay_bytes)),
             "cache_bytes": framebuffer._base_frame_bytes + framebuffer._base_png_bytes,
         }
-    native = _native_render_metrics(required=args.require_native)
+    native = _native_render_metrics(required=args.require_native, trials=args.native_trials)
     result = {
         "frames": args.frames,
         "elapsed_seconds": round(elapsed, 6),

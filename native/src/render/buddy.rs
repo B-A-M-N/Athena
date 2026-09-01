@@ -1,4 +1,4 @@
-use super::primitives::draw_rect;
+use super::primitives::{draw_rect, draw_round_rect};
 use crate::buddy::{
     BuddyKind, BuddyPose, REQUIRED_POSES, SPRITE_FRAME_COUNT, SPRITE_HEIGHT, SPRITE_SCALE,
     SPRITE_WIDTH, pose_for_state, sprite_frame,
@@ -19,7 +19,17 @@ pub(crate) fn draw_buddy(x: f32, y: f32, state: &str, status: &str, character: &
         BuddyPose::Success => (0.46, 0.91, 0.67),
         _ => (0.36, 0.82, 0.78),
     };
-    let frame = if phase.sin() >= 0.0 { 0 } else { 1 };
+    // Actor cadence is authored per pose and slower than the 10 fps scene
+    // renderer.  It is deterministic and keyed by the semantic transition
+    // phase supplied by the compositor, not by a process-global sine wave.
+    let frame_period = match pose {
+        BuddyPose::Idle => 0.85,
+        BuddyPose::Approval => 0.42,
+        BuddyPose::Failure => 0.34,
+        BuddyPose::Success => 0.70,
+        _ => 0.24,
+    };
+    let frame = ((phase.max(0.0) / frame_period).floor() as usize) % SPRITE_FRAME_COUNT;
     // The actor is deliberately legible at the CRT's logical resolution.
     // Its footprint is bounded by the OI scene, not by projection geometry;
     // nodes and semantic edges remain owned by the scene renderer.
@@ -28,6 +38,11 @@ pub(crate) fn draw_buddy(x: f32, y: f32, state: &str, status: &str, character: &
     let top = y - SPRITE_HEIGHT * scale / 2.0;
     let (sprite_width, _sprite_height) = kind.sprite_bounds();
     let rows = sprite_frame(kind, pose, frame);
+    // Render each sprite cell as a distinct phosphor dot with visible gaps
+    // between cells. The dot is smaller than the cell so the matrix reads as
+    // individual phosphors rather than a solid block.
+    let dot_size = (scale * 0.72).max(1.0);
+    let dot_offset = (scale - dot_size) * 0.5;
     for (row, line) in rows.iter().enumerate() {
         for (column, pixel) in line.iter().copied().enumerate() {
             if pixel == ' ' {
@@ -38,7 +53,7 @@ pub(crate) fn draw_buddy(x: f32, y: f32, state: &str, status: &str, character: &
                 pixel_color = if kind == BuddyKind::Cat {
                     (0.98, 0.84, 0.42)
                 } else {
-                    (0.90, 0.96, 0.83)
+                    (0.92, 0.98, 0.88)
                 };
             } else if pixel == '-' || pixel == '^' || pixel == '_' {
                 pixel_color = (color.0 * 0.76, color.1 * 0.76, color.2 * 0.76);
@@ -48,13 +63,37 @@ pub(crate) fn draw_buddy(x: f32, y: f32, state: &str, status: &str, character: &
             } else {
                 0.0
             };
-            draw_rect(
-                left + column as f32 * scale + wobble,
-                top + row as f32 * scale,
-                scale + 0.3,
-                scale + 0.3,
+            let px = left + column as f32 * scale + wobble + dot_offset;
+            let py = top + row as f32 * scale + dot_offset;
+            // Soft phosphor bloom halo
+            draw_round_rect(
+                px - 0.8,
+                py - 0.8,
+                dot_size + 1.6,
+                dot_size + 1.6,
+                dot_size * 0.55,
+                (pixel_color.0 * 0.34, pixel_color.1 * 0.34, pixel_color.2 * 0.34),
+            );
+            // Core phosphor dot
+            draw_round_rect(
+                px,
+                py,
+                dot_size,
+                dot_size,
+                dot_size * 0.45,
                 pixel_color,
             );
+            // High-luminance eye pupil specular glint
+            if pixel == 'o' {
+                draw_round_rect(
+                    px + dot_size * 0.25,
+                    py + dot_size * 0.25,
+                    dot_size * 0.50,
+                    dot_size * 0.50,
+                    dot_size * 0.25,
+                    (1.0, 1.0, 1.0),
+                );
+            }
         }
     }
     draw_pose_effect(left, top, scale, pose, color, frame);

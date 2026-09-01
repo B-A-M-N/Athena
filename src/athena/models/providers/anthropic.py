@@ -228,6 +228,7 @@ class AnthropicProvider:
         self._cost = cost
         self._latency_class = latency_class
         self._api_key = api_key
+        self._api_key_configured = bool(api_key)
         self._timeout = timeout
         self._headers = dict(headers or {})
         self._anthropic = _load_anthropic() if use_sdk else None
@@ -264,6 +265,11 @@ class AnthropicProvider:
                 latency_class=self._latency_class,
             )
         ]
+
+    def readiness(self) -> dict[str, str | bool]:
+        if not self._api_key_configured:
+            return {"state": "auth_missing", "kind": "anthropic", "local": False}
+        return {"state": "ready", "kind": "anthropic", "local": False}
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         if self._anthropic is not None:

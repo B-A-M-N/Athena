@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from athena.protocol.ids import new_id
-from athena.workspace_manifest import copy_ignore, tree_paths
+from athena.workspace_manifest import copy_ignore, copy_workspace_tree, tree_paths
 
 _logger = logging.getLogger(__name__)
 _IGNORE_PATTERNS = copy_ignore
@@ -230,12 +230,11 @@ class CheckpointManager:
         self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._root.chmod(0o700)
         dest = self._root / checkpoint_id
-        shutil.copytree(
+        copy_workspace_tree(
             src,
             dest,
             ignore=_IGNORE_PATTERNS,
             dirs_exist_ok=False,
-            symlinks=True,
         )
         dest.chmod(0o700)
         file_manifest = _tree_manifest(dest)

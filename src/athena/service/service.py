@@ -77,7 +77,7 @@ from athena.models.providers.anthropic import AnthropicProvider
 from athena.models.providers.fake import FakeModelProvider
 from athena.models.providers.openai_compat import OpenAICompatProvider
 from athena.models.registry import ProviderRegistry
-from athena.policy.credentials import SecretManager
+from athena.policy.credentials import SecretError, SecretManager
 from athena.policy.engine import PolicyEngine
 from athena.scheduler.scheduler import Scheduler
 from athena.skills.lifecycle import SkillLifecycle, SkillStore
@@ -114,7 +114,7 @@ from athena.tasks.worker import TaskWorker, WorkerConfig
 
 from athena.protocol.events import Event, make_event
 from athena.protocol.ids import new_id
-from athena.protocol.errors import PersistenceError
+from athena.protocol.errors import ModelProviderUnconfigured, PersistenceError, ProviderError
 from athena.protocol.policy import ApprovalScope, Principal
 from athena.protocol.tasks import (
     AgentRequest,
@@ -537,6 +537,34 @@ class AthenaService:
         model_registry = ProviderRegistry()
         self._register_providers(model_registry)
         self._model_registry = model_registry
+        provider_readiness = model_registry.readiness()
+        if provider_readiness.get("state") == "ready":
+            self._startup_health["checks"]["model_provider"] = {
+                "status": "ok",
+                "blocking": False,
+                "providers": list(model_registry.names()),
+                "readiness": provider_readiness,
+            }
+        else:
+            # A production service must never pretend that a built-in fake
+            # model is configured. Starting without a provider is useful for
+            # setup/inspection, but every interface must expose the explicit
+            # first-run state and model requests must fail clearly.
+            model_provider_check: dict[str, Any] = {
+                "status": "unconfigured"
+                if provider_readiness.get("state") == "unconfigured"
+                else "degraded",
+                "blocking": False,
+                "providers": list(model_registry.names()),
+                "reason": (
+                    "configure a model provider before submitting agent work"
+                    if provider_readiness.get("state") == "unconfigured"
+                    else "no configured model provider is ready for submission"
+                ),
+            }
+            if provider_readiness.get("state") != "unconfigured":
+                model_provider_check["readiness"] = provider_readiness
+            self._startup_health["checks"]["model_provider"] = model_provider_check
         router = ModelRouter(
             model_registry,
             role_policies=self._role_policies(cfg.model_roles),
@@ -855,7 +883,7 @@ class AthenaService:
         worker = TaskWorker(
             task_manager=task_manager,
             kernel=kernel,
-            config=WorkerConfig(max_parallel=cfg.worker_max_parallel),
+            config=WorkerConfig(max_parallel=cfg.max_parallel_tasks),
         )
         self._worker = worker
         task_manager.set_wakeup_callback(worker.notify)
@@ -1101,7 +1129,11 @@ class AthenaService:
         if self._hermes_adapter is None:
             return {
                 "enabled": settings.enabled,
-                "state": "configured" if self._hermes_referee is not None else "unavailable",
+                "state": (
+                    "configured_unverified"
+                    if self._hermes_referee is not None and self._hermes_status_error is None
+                    else "error"
+                ),
                 "profile": settings.profile,
                 "endpoint": settings.endpoint,
                 "error": self._hermes_status_error,
@@ -1121,7 +1153,7 @@ class AthenaService:
 
             return {
                 "enabled": True,
-                "state": ("unsafe" if isinstance(exc, HermesRefereeSafetyError) else "connected"),
+                "state": ("unsafe" if isinstance(exc, HermesRefereeSafetyError) else "error"),
                 "safety_verified": False,
                 "profile": settings.profile,
                 "endpoint": settings.endpoint,
@@ -1217,6 +1249,7 @@ class AthenaService:
         """Turn an :class:`AgentRequest` into a Task and optionally drive it
         through the worker to completion (BHV-002: all work becomes a Task)."""
         tm = self._require_task_manager()
+        await self.require_agent_ready(request)
         self._validate_request_metadata(request.metadata)
         session_id = request.session_id or new_id("session")
         spec = self._build_task_spec(request, session_id)
@@ -1240,6 +1273,7 @@ class AthenaService:
         verification mounts or review boundary.  The CLI is only a caller of
         this service-owned orchestration entrypoint.
         """
+        await self.require_agent_ready()
         await self._require_verified_hermes_referee()
         tm = self._require_task_manager()
         root = str(Path(workspace_root or os.getcwd()).resolve())
@@ -2323,39 +2357,47 @@ class AthenaService:
         arguments) passes policy on resume; a denied call records the denial and
         wakes the task with no effect (BHV-043).
         """
-        task_id = None
-        metadata: dict = {}
-        if self._store_approvals is not None:
-            try:
-                rec = await self._store_approvals.get(approval_id)
-                if isinstance(rec, dict):
-                    task_id = rec.get("task_id")
-                    metadata = rec.get("metadata") or {}
-            except Exception:
-                task_id = None
+        approvals = self._store_approvals
+        if approvals is None:
+            raise RuntimeError("approval persistence is unavailable")
+        rec = await approvals.get(approval_id)
+        if not isinstance(rec, dict):
+            raise KeyError(f"Approval not found: {approval_id}")
+        if rec.get("status") != ApprovalStore.PENDING:
+            raise ValueError(f"Approval already resolved: {approval_id}")
+        task_id = rec.get("task_id")
+        metadata = rec.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Approval metadata is invalid: {approval_id}")
 
+        effective_scope: ApprovalScope | None = None
         if granted:
             effective_scope = self._clamp_approval_scope(scope, metadata)
-            if effective_scope is not None and self._store_approvals is not None:
-                try:
-                    await self._store_approvals.record_grant(
-                        approval_id,
-                        resolver="user",
-                        scope=effective_scope.value,
-                        expires_at=metadata.get("expires_at"),
-                        metadata={"resolved_by_service": True},
-                    )
-                except Exception as exc:
-                    _logger.warning("record_grant failed for %s: %s", approval_id, exc)
-            if effective_scope is not None:
-                self._install_grant(approval_id, task_id, metadata, first=effective_scope)
-        elif self._store_approvals is not None:
-            try:
-                await self._store_approvals.record_deny(
-                    approval_id, resolver="user", metadata={"resolved_by_service": True}
-                )
-            except Exception as exc:
-                _logger.warning("record_deny failed for %s: %s", approval_id, exc)
+            if effective_scope is None:
+                raise ValueError(f"Unsupported approval scope for {approval_id}")
+            if (
+                effective_scope is ApprovalScope.CALL
+                and not metadata.get("args_digest")
+                and not metadata.get("candidate_apply")
+            ):
+                raise ValueError(f"CALL approval has no argument binding: {approval_id}")
+
+        # This is the authority boundary.  Nothing below may install a grant,
+        # resolve a continuation, or wake a task until this durable CAS has
+        # committed successfully.  Persistence failure therefore leaves the
+        # request parked and observable as PENDING.
+        if granted:
+            await approvals.record_grant(
+                approval_id,
+                resolver="user",
+                scope=effective_scope.value if effective_scope else None,
+                expires_at=metadata.get("expires_at"),
+                metadata={"resolved_by_service": True},
+            )
+        else:
+            await approvals.record_deny(
+                approval_id, resolver="user", metadata={"resolved_by_service": True}
+            )
 
         # Candidate deletion approvals are operator decisions over a durable
         # ShadowEngine commit plan, not parked kernel capability calls. Apply
@@ -2366,11 +2408,8 @@ class AthenaService:
                 try:
                     await self.apply_candidate(task_id, approval_id=approval_id)
                 except Exception as exc:  # preserve the candidate for recovery
-                    _logger.warning(
-                        "candidate apply after approval failed for %s: %s",
-                        approval_id,
-                        exc,
-                    )
+                    await self._mark_approval_recovery(task_id, approval_id, exc)
+                    raise
             return
 
         # Durable continuation: retain the canonical call until the kernel
@@ -2378,24 +2417,42 @@ class AthenaService:
         # no coroutine exists, so transition the same task back to RUNNING and
         # launch the normal kernel entry point, which claims the stored call.
         store_cont = getattr(self, "_store_continuations", None)
-        if store_cont is not None and metadata.get("call_id"):
+        if metadata.get("call_id"):
             try:
+                if store_cont is None:
+                    raise RuntimeError("durable continuation store is unavailable")
+                resolved = False
                 for cont in await store_cont.pending(task_id):
                     if cont.get("call_id") == metadata.get("call_id"):
                         await store_cont.mark_resolved(
                             cont["id"], "granted" if granted else "denied"
                         )
+                        resolved = True
+                        break
+                if not resolved:
+                    raise LookupError(
+                        f"continuation not found for approval {approval_id} "
+                        f"and call {metadata.get('call_id')}"
+                    )
             except Exception as exc:
-                _logger.warning("continuation resolve failed for %s: %s", approval_id, exc)
+                await self._mark_approval_recovery(task_id, approval_id, exc)
+                raise
+
+        if granted:
+            try:
+                self._install_grant(approval_id, task_id, metadata, first=effective_scope)
+            except Exception as exc:
+                await self._mark_approval_recovery(task_id, approval_id, exc)
+                raise
 
         kernel = self._kernel
         active = bool(
             task_id is not None and kernel is not None and task_id in getattr(kernel, "_runs", {})
         )
-        if active and kernel is not None and task_id is not None:
-            await kernel.notify_approval_resolved(task_id, "granted" if granted else "denied")
-        elif task_id is not None and kernel is not None and self._task_manager is not None:
-            try:
+        try:
+            if active and kernel is not None and task_id is not None:
+                await kernel.notify_approval_resolved(task_id, "granted" if granted else "denied")
+            elif task_id is not None and kernel is not None and self._task_manager is not None:
                 row = await self._store_tasks.get(task_id) if self._store_tasks else None
                 if row and row.get("status") == TaskStatus.WAITING_APPROVAL.value:
                     await self._task_manager.transition(task_id, TaskStatus.RUNNING)
@@ -2403,8 +2460,34 @@ class AthenaService:
                     recovery.add_done_callback(
                         self._log_background_failure(f"approval recovery {task_id}")
                     )
-            except Exception as exc:
-                _logger.warning("approval recovery failed for %s: %s", approval_id, exc)
+        except Exception as exc:
+            await self._mark_approval_recovery(task_id, approval_id, exc)
+            raise
+
+    async def _mark_approval_recovery(
+        self, task_id: str | None, approval_id: str, error: BaseException
+    ) -> None:
+        """Make post-persistence approval uncertainty explicit and durable."""
+        if task_id is None or self._task_manager is None:
+            _logger.error("approval %s requires recovery: %s", approval_id, error)
+            return
+        try:
+            row = await self._store_tasks.get(task_id) if self._store_tasks else None
+            current = row.get("status") if row else None
+            if current in {
+                TaskStatus.WAITING_APPROVAL.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.INTERRUPTED.value,
+            }:
+                await self._task_manager.transition(
+                    task_id,
+                    TaskStatus.RECOVERY_REQUIRED,
+                    reason=f"approval {approval_id} resolution requires recovery: {error}",
+                )
+        except Exception as recovery_error:
+            # Preserve the original resolution error while making the failed
+            # recovery transition visible in logs for an operator.
+            _logger.error("approval %s recovery transition failed: %s", approval_id, recovery_error)
 
     def _install_grant(
         self,
@@ -2417,14 +2500,14 @@ class AthenaService:
     ) -> None:
         """Install an exact scoped ApprovalGrant so the approved call passes on resume."""
         if self._policy is None or getattr(self._policy, "approvals", None) is None:
-            return
+            raise RuntimeError("runtime approval manager is unavailable")
         manager = self._policy.approvals
         digest = metadata.get("args_digest")
         scope_choice = first or self._clamp_approval_scope(scope, metadata)
         if scope_choice is None:
-            return
+            raise ValueError("approval scope is not offered by the request")
         if scope_choice == ApprovalScope.CALL and not digest:
-            return
+            raise ValueError("CALL approval requires an exact argument digest")
         cap = metadata.get("capability_id")
         call_id = metadata.get("call_id")
         effects = metadata.get("effects") or []
@@ -2439,26 +2522,23 @@ class AthenaService:
             pinned_digest = None
             pinned_call = None
 
-        try:
-            if manager.state(approval_id) is None:
-                manager.create_request(
-                    Principal("agent", "athena"),
-                    scope_choice,
-                    capability=cap,
-                    effect=str(primary_name) if primary_name else None,
-                    task_id=task_id,
-                    # SESSION-scoped grants are keyed on session_id in
-                    # ApprovalManager._covers_locked; omitting it makes every
-                    # session grant unmatchable and forces re-approval.
-                    session_id=metadata.get("session_id"),
-                    approval_id=approval_id,
-                    args_digest=pinned_digest,
-                    call_id=pinned_call,
-                    expires_at=expires_at,
-                )
-            manager.grant(approval_id, resolver="user")
-        except Exception:
-            pass
+        if manager.state(approval_id) is None:
+            manager.create_request(
+                Principal("agent", "athena"),
+                scope_choice,
+                capability=cap,
+                effect=str(primary_name) if primary_name else None,
+                task_id=task_id,
+                # SESSION-scoped grants are keyed on session_id in
+                # ApprovalManager._covers_locked; omitting it makes every
+                # session grant unmatchable and forces re-approval.
+                session_id=metadata.get("session_id"),
+                approval_id=approval_id,
+                args_digest=pinned_digest,
+                call_id=pinned_call,
+                expires_at=expires_at,
+            )
+        manager.grant(approval_id, resolver="user")
 
     async def _rehydrate_approval_grants(
         self,
@@ -2547,6 +2627,8 @@ class AthenaService:
         if choice in (None, ""):
             if default:
                 try:
+                    if supported and str(default) not in supported:
+                        return None
                     return ApprovalScope(default)
                 except (ValueError, KeyError):
                     return None
@@ -2800,6 +2882,12 @@ class AthenaService:
         plan = dict(mission.get("plan") or {})
         plan["review"] = review
         await mission_store.update(mission["id"], status="review", plan=plan)
+        await self._candidate_review_event(
+            "CANDIDATE_READY_FOR_REVIEW",
+            task_id,
+            candidate,
+            review,
+        )
         return review
 
     async def _run_hermes_candidate_referee(
@@ -3318,6 +3406,20 @@ class AthenaService:
             "changed_resources": list(review.get("changed_resources") or []),
             "outcome": dict(outcome),
         }
+        task_row = await self._store_tasks.get(task_id) if self._store_tasks is not None else None
+        metadata = (task_row or {}).get("metadata") or {}
+        if isinstance(metadata, Mapping) and metadata.get("_athena_self_host"):
+            phase = {
+                "CANDIDATE_READY_FOR_REVIEW": "REVIEW",
+                "CANDIDATE_APPLY_REQUESTED": "PROMOTION",
+                "CANDIDATE_APPLIED": "PROMOTION",
+                "CANDIDATE_APPLY_FAILED": "REVIEW",
+                "CANDIDATE_DISCARDED": "PATCH",
+            }.get(event_key)
+            if isinstance(outcome.get("hermes"), Mapping):
+                phase = "REFEREE"
+            if phase:
+                payload["self_host_phase"] = phase
         from athena.protocol.events import EV
 
         await events.append_event(
@@ -4140,6 +4242,12 @@ class AthenaService:
                 policy_engine=self._policy,
                 approval_store=self._store_approvals,
                 health_provider=self._capability_health,
+                model_provider=lambda: self._model_registry,
+                mcp_status_provider=lambda: {
+                    **{client.connection_id: "connected" for client in self._mcp_clients},
+                    **getattr(self, "_mcp_connection_status", {}),
+                },
+                delegate_provider=lambda: self._delegate_registry,
             )
         )
         registry.register(TruthCapability(self))
@@ -4554,21 +4662,6 @@ class AthenaService:
     def _register_providers(self, registry: ProviderRegistry) -> None:
         pcs = tuple(self.config.providers)
         if not pcs:
-            registry.register(
-                "fake",
-                FakeModelProvider(
-                    # Keep the dependency-free default useful for local CLI smoke
-                    # runs and packaged installs.  Explicit provider entries still
-                    # control their own scripts; this only covers an otherwise
-                    # unconfigured service.
-                    scripts=list(_DEFAULT_ANSWER_SCRIPTS),
-                    tool_calling=True,
-                    model="fake-1",
-                    provider="fake",
-                ),
-            )
-            registry.set_profile("fake", resolve_profile("fake", model_id="fake-1"))
-            registry.set_model_profile("fake", "fake-1", ModelProfile(model_pattern="fake-1"))
             return
         provider: Any = None
         for pc in pcs:
@@ -4606,6 +4699,7 @@ class AthenaService:
                     headers=pc.extra.get("headers"),
                     timeout=float(pc.extra.get("timeout", 60.0)),
                     http2=bool(pc.extra.get("http2", False)),
+                    authentication=pc.authentication,
                     cost=pc.extra.get("cost"),
                     latency_class=pc.latency_class or pc.extra.get("latency_class"),
                 )
@@ -4668,7 +4762,15 @@ class AthenaService:
         ``api_key`` field remains a backward-compatible fallback.
         """
         if pc.credential_id and self._secrets is not None:
-            return self._secrets.resolve(pc.credential_id)
+            try:
+                return self._secrets.resolve(pc.credential_id)
+            except SecretError as exc:
+                # Provider registration is diagnostic and must not turn a
+                # missing credential into a half-started service. The adapter
+                # remains registered and reports ``auth_missing`` readiness;
+                # admission then fails closed through require_agent_ready().
+                _logger.warning("provider credential %s unavailable: %s", pc.credential_id, exc)
+                return ""
         if pc.api_key is not None:
             return pc.api_key
         return ""
@@ -4688,7 +4790,7 @@ class AthenaService:
             self._startup_health["checks"]["hermes_referee"] = {
                 "status": "degraded",
                 "blocking": False,
-                "state": "unverified",
+                "state": "injected",
                 "profile": settings.profile,
                 "endpoint": settings.endpoint,
                 "error": reason,
@@ -4699,12 +4801,18 @@ class AthenaService:
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
+            from athena.hermes.agent_adapter import HermesRefereeSafetyError
+
             reason = str(exc)
             self._hermes_status_error = reason
             self._startup_health["checks"]["hermes_referee"] = {
                 "status": "degraded",
                 "blocking": False,
-                "state": "unsafe",
+                "state": (
+                    "unsafe"
+                    if isinstance(exc, HermesRefereeSafetyError)
+                    else ("disconnected" if isinstance(exc, httpx.HTTPError) else "error")
+                ),
                 "profile": settings.profile,
                 "endpoint": settings.endpoint,
                 "error": reason,
@@ -4761,7 +4869,7 @@ class AthenaService:
             self._startup_health["checks"]["hermes_referee"] = {
                 "status": "ok",
                 "blocking": False,
-                "state": "injected",
+                "state": "configured_unverified",
             }
             return
         if not settings.enabled:
@@ -4790,7 +4898,7 @@ class AthenaService:
                 self._startup_health["checks"]["hermes_referee"] = {
                     "status": "degraded",
                     "blocking": False,
-                    "state": "credential_unavailable",
+                    "state": "error",
                     "error": reason,
                 }
                 return
@@ -4815,7 +4923,7 @@ class AthenaService:
             self._startup_health["checks"]["hermes_referee"] = {
                 "status": "degraded",
                 "blocking": False,
-                "state": "invalid",
+                "state": "error",
                 "error": reason,
             }
             return
@@ -4833,6 +4941,51 @@ class AthenaService:
     # ------------------------------------------------------------------ #
     # Internal accessors
     # ------------------------------------------------------------------ #
+    async def require_agent_ready(self, request: AgentRequest | None = None) -> None:
+        """Admit model-backed work before any Task or session is created.
+
+        Startup intentionally remains inspectable in a degraded, first-run
+        state when no provider is configured. That state is not an admission
+        state: every caller must pass through this service-owned predicate.
+        """
+        registry = self._model_registry
+        if registry is None:
+            readiness = {"state": "unconfigured"}
+        else:
+            probe = getattr(registry, "readiness", None)
+            if callable(probe):
+                readiness = probe()
+            else:
+                # Keep small host/test registries fail-closed without making
+                # them implement the richer diagnostic surface immediately.
+                names = getattr(registry, "names", None)
+                readiness = {"state": "ready" if callable(names) and names() else "unconfigured"}
+        if not isinstance(readiness, Mapping):
+            readiness = {"state": "degraded"}
+        if readiness.get("state") != "ready":
+            raise ModelProviderUnconfigured(
+                "No usable model provider is ready. Configure credentials and provider readiness before submitting agent work.",
+                provider_state=readiness.get("state", "unconfigured"),
+            )
+        if request is None:
+            return
+        router = self._router
+        if router is None:
+            raise ModelProviderUnconfigured(
+                "Model routing is not initialized; agent work cannot be admitted.",
+                provider_state="unconfigured",
+            )
+        try:
+            await router.select(policy=request.model_policy)
+        except ProviderError as exc:
+            allowed = list((request.model_policy.allowed if request.model_policy else ()) or ())
+            raise ModelProviderUnconfigured(
+                "No ready model satisfies this request's provider, role, capability, or policy constraints.",
+                provider_state="request_unavailable",
+                allowed_models=allowed,
+                role=(request.model_policy.role if request.model_policy else "primary"),
+            ) from exc
+
     def _require_task_manager(self) -> TaskManager:
         if self._task_manager is None:
             raise RuntimeError("AthenaService not started")

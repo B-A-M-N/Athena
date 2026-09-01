@@ -152,7 +152,11 @@ class RecoveryManager:
                             {
                                 "runtime_session_id": sid,
                                 "backend": row.get("backend"),
+                                "runtime": row.get("runtime"),
+                                "cwd": row.get("cwd"),
                                 "reason": "Athena restarted without a reattachable runtime process",
+                                "recovery_action": "reestablish_runtime",
+                                "recovery_route": "execute",
                             },
                             task_id=row.get("task_id"),
                         )
@@ -169,6 +173,8 @@ class RecoveryManager:
                                 str(row["task_id"]),
                                 runtime_session_id=str(sid),
                                 backend=row.get("backend"),
+                                runtime=row.get("runtime"),
+                                cwd=row.get("cwd"),
                             )
                     except Exception as exc:
                         raise RuntimeError(

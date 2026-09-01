@@ -35,7 +35,7 @@ from athena.policy.engine import PolicyEngine
 from athena.execution.dependencies import environment_fingerprint
 from athena.reality import RealityGate
 from athena.shadow.engine import ShadowEngine
-from athena.synthesis.engine import SynthesisEngine
+from athena.synthesis.engine import SynthesisEngine, _risk_tier
 from athena.synthesis.runtime import GeneratedHostError, GeneratedToolHost
 from athena.research.models import EvidenceObject, SourceRecord
 from athena.research.store import ResearchStore
@@ -43,6 +43,32 @@ from athena.state.database import Database
 
 GOOD_CODE = "def run(args):\n    return {'echo': args.get('msg', '')}\n"
 BAD_CODE = "def run(args):\n    raise RuntimeError('boom')\n"
+
+
+@pytest.mark.parametrize(
+    ("effects", "expected"),
+    [
+        ({"READ_LOCAL"}, "low"),
+        ({"EXECUTE"}, "medium"),
+        ({"READ_LOCAL", "EXECUTE"}, "medium"),
+        *(
+            ({effect.value}, "high")
+            for effect in EffectClass
+            if effect.value not in {"READ_LOCAL", "EXECUTE"}
+        ),
+        ({"READ_LOCAL", "WRITE_LOCAL"}, "high"),
+        ({"READ_LOCAL", "NETWORK_READ"}, "high"),
+        ({"EXECUTE", "WRITE_LOCAL"}, "high"),
+    ],
+)
+def test_generated_promotion_risk_tier_is_exhaustive(effects, expected):
+    cap = SynthesisEngine().synthesize(
+        name="risk_probe",
+        description="risk classification probe",
+        code=GOOD_CODE,
+        effects=effects,
+    )
+    assert _risk_tier(cap) == expected
 
 
 class _HostDispatcher:
@@ -119,6 +145,10 @@ async def test_validate_passes_good_capability():
     assert result.validation["all_passed"] is True, json.dumps(
         result.validation, indent=2, default=str
     )
+    negative_cases = result.validation["negative_cases"]
+    assert negative_cases
+    assert all(case["passed"] for case in negative_cases)
+    assert all(case["executor_invoked"] is False for case in negative_cases)
     assert result.validation["cases_passed"] == 1
 
 
@@ -618,11 +648,11 @@ async def test_persistent_generated_runtime_retains_state_and_reenters_host(
 
 
 @pytest.mark.asyncio
-async def test_persistent_generated_runtime_restarts_after_process_exit(
+async def test_persistent_generated_runtime_fails_closed_after_process_exit(
     tmp_path,
     monkeypatch,
 ):
-    """A crashed generated process cannot poison later calls."""
+    """A crashed generated process is degraded instead of being retried directly."""
     engine = SynthesisEngine()
     monkeypatch.setattr(
         "athena.synthesis.engine.sandbox_argv",
@@ -675,8 +705,8 @@ async def test_persistent_generated_runtime_restarts_after_process_exit(
             ),
             context=context,
         )
-        assert recovered.status is CapabilityResultStatus.OK
-        assert json.loads(recovered.output) == {"count": 1}
+        assert recovered.status is CapabilityResultStatus.FAILED
+        assert recovered.metadata["generated_failure"]["failure_class"] == ("lifecycle_unavailable")
     finally:
         await engine.close_persistent_sessions()
 
@@ -753,6 +783,38 @@ async def test_validation_supports_negative_fixtures_without_false_success():
     assert result.validation["all_passed"] is True, json.dumps(
         result.validation, indent=2, default=str
     )
+
+
+@pytest.mark.asyncio
+async def test_generated_invocation_rejects_invalid_input_before_executor():
+    engine = SynthesisEngine()
+    registry = CapabilityRegistry()
+    cap = engine.synthesize(
+        name="admission_probe",
+        description="proves generated input admission",
+        code="def run(args):\n    return {'ok': True}\n",
+        input_schema={
+            "type": "object",
+            "required": ["required"],
+            "properties": {"required": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    )
+    await engine.validate(cap, [{"args": {"required": "valid"}}])
+    assert engine.register_ephemeral(registry, cap) is True
+
+    result = await registry.executor_for(cap.id).invoke(
+        CapabilityRequest(
+            capability_id=cap.id,
+            arguments={},
+            task_id="task-admission",
+            call_id="call-admission",
+        )
+    )
+    assert result.status is CapabilityResultStatus.FAILED
+    assert result.metadata["admission_rejected"] is True
+    assert result.metadata["admission_boundary"] == "generated_input_schema"
+    assert cap.uses == 0
 
 
 @pytest.mark.asyncio
@@ -921,9 +983,9 @@ async def test_required_dependencies_are_importable_only_from_verified_lock(tmp_
     assert validated.dependency_lock["environment_fingerprint"] == environment
     registry = CapabilityRegistry()
     assert engine.register_ephemeral(registry, validated) is True
-    result = await registry.executor_for("synth_dependency_helper").invoke(
+    result = await registry.executor_for(validated.id).invoke(
         CapabilityRequest(
-            capability_id="synth_dependency_helper",
+            capability_id=validated.id,
             arguments={},
             task_id="task-deps",
             call_id="call-deps",
@@ -1057,10 +1119,10 @@ async def test_register_ephemeral_registers_validated_and_invokes():
     cap = _make_cap(engine)
     await engine.validate(cap, [{"args": {"msg": "hi"}}])
     assert engine.register_ephemeral(registry, cap) is True
-    descriptor = registry.resolve("synth_greeter")
-    assert descriptor.id == "synth_greeter"
+    descriptor = registry.resolve(cap.id)
+    assert descriptor.id == cap.id
 
-    executor = registry.executor_for("synth_greeter")
+    executor = registry.executor_for(cap.id)
     request = CapabilityRequest(
         capability_id=cap.id, arguments={"msg": "hello"}, task_id="task_1", call_id="call_1"
     )

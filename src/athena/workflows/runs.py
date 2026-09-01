@@ -256,19 +256,30 @@ class WorkflowRunStore:
             )
         if row.get("task_id") != task_id:
             raise WorkflowRunIdentityError(f"workflow run {identifier} belongs to a different task")
-        if parent_call_id is not None and str(row.get("parent_call_id") or "") != parent_call_id:
+        prior_status = str(row.get("status") or "running")
+        # A completed run is an immutable replay receipt. A new caller may
+        # present the same explicit run_id after restart, so the original
+        # parent call is no longer an identity constraint. In-progress runs
+        # remain bound to their initiating call to prevent two continuations
+        # from racing the same step receipt.
+        if (
+            parent_call_id is not None
+            and str(row.get("parent_call_id") or "") != parent_call_id
+            and prior_status not in {"completed", "failed", "aborted"}
+        ):
             raise WorkflowRunIdentityError(
                 f"workflow run {identifier} belongs to a different parent call"
             )
         if (
             parent_workflow_id is not None
             and str(row.get("parent_workflow_id") or "") != parent_workflow_id
+            and prior_status not in {"completed", "failed", "aborted"}
         ):
             raise WorkflowRunIdentityError(
                 f"workflow run {identifier} belongs to a different parent workflow"
             )
         self._check_identity(identifier, row, expected)
-        status = str(row.get("status") or "running")
+        status = prior_status
         outputs = _decode(row.get("outputs"))
         if not isinstance(outputs, dict):
             raise WorkflowRunIdentityError(

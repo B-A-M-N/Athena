@@ -4,29 +4,32 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-command -v xvfb-run >/dev/null || {
-  printf '%s\n' 'native-visual-smoke: SKIP — xvfb-run is unavailable' >&2
+unavailable() {
+  if [[ "${ATHENA_RELEASE_GATE:-0}" == "1" ]]; then
+    printf 'native-visual-smoke: FAIL — %s\n' "$1" >&2
+    exit 1
+  fi
+  printf 'native-visual-smoke: SKIP — %s\n' "$1" >&2
   exit 0
+}
+
+command -v xvfb-run >/dev/null || {
+  unavailable 'xvfb-run is unavailable'
 }
 command -v import >/dev/null || {
-  printf '%s\n' 'native-visual-smoke: SKIP — ImageMagick import is unavailable' >&2
-  exit 0
+  unavailable 'ImageMagick import is unavailable'
 }
 command -v identify >/dev/null || {
-  printf '%s\n' 'native-visual-smoke: SKIP — ImageMagick identify is unavailable' >&2
-  exit 0
+  unavailable 'ImageMagick identify is unavailable'
 }
 command -v convert >/dev/null || {
-  printf '%s\n' 'native-visual-smoke: SKIP — ImageMagick convert is unavailable' >&2
-  exit 0
+  unavailable 'ImageMagick convert is unavailable'
 }
 command -v xdotool >/dev/null || {
-  printf '%s\n' 'native-visual-smoke: SKIP — xdotool is unavailable' >&2
-  exit 0
+  unavailable 'xdotool is unavailable'
 }
 command -v xdpyinfo >/dev/null || {
-  printf '%s\n' 'native-visual-smoke: SKIP — xdpyinfo is unavailable' >&2
-  exit 0
+  unavailable 'xdpyinfo is unavailable'
 }
 golden_dir="${NATIVE_VISUAL_GOLDEN_DIR:-}"
 update_goldens="${NATIVE_VISUAL_UPDATE_GOLDENS:-0}"
@@ -36,14 +39,15 @@ if [[ -n "$golden_dir" && "$update_goldens" != "1" ]]; then
     exit 1
   }
 fi
-cargo build --manifest-path native/Cargo.toml --offline >/dev/null
+cargo build --release --manifest-path native/Cargo.toml --locked --offline >/dev/null
+native_bin="$repo_root/native/target/release/athena-terminal"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 # Validate the geometry contract without requiring a display server. The
 # native process emits the same rectangle model used by its renderer, so this
 # catches aperture drift and prompt/rail overlap independently of OCR.
-layout_json="$("$repo_root/native/target/debug/athena-terminal" --dump-layout)"
+layout_json="$("$native_bin" --dump-layout)"
 LAYOUT_JSON="$layout_json" python3 -c '
 import json
 import os
@@ -77,8 +81,7 @@ for name in ("speaker", "operator_panel", "system_status", "primary_encoder", "b
 '
 
 if ! xvfb-run -a -s '-screen 0 1920x1080x24 -ac' xdpyinfo >/dev/null 2>&1; then
-  printf '%s\n' 'native-visual-smoke: SKIP — Xvfb unavailable after layout invariants passed' >&2
-  exit 0
+  unavailable 'Xvfb unavailable after layout invariants passed'
 fi
 
 # Exercise the exact five review surfaces against live Xft metrics. This is a
@@ -88,7 +91,7 @@ for size in 1672x941 1920x1080 1280x800 1280x720 1170x659; do
   IFS=x read -r matrix_width matrix_height <<< "$size"
   matrix_layout="$tmp_dir/matrix-${size}.layout.json"
   xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
-    "$repo_root/native/target/debug/athena-terminal" --dump-layout \
+    "$native_bin" --dump-layout \
     --dump-layout-size "$size" > "$matrix_layout"
   "$repo_root/scripts/check-native-layout.py" "$matrix_layout" "$matrix_width" "$matrix_height"
 done
@@ -99,32 +102,76 @@ done
 
 projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
 
-PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-terminal" TMP_DIR="$tmp_dir" \
+PROJECTION="$projection" NATIVE_BIN="$native_bin" TMP_DIR="$tmp_dir" \
   GOLDEN_DIR="$golden_dir" UPDATE_GOLDENS="$update_goldens" CHECK_LAYOUT="$repo_root/scripts/check-native-layout.py" \
   xvfb-run -a -s '-screen 0 1920x1080x24 -ac' bash -c '
     set -euo pipefail
 
     wait_for_window() {
-      local window=""
-      for _ in $(seq 1 50); do
-        window="$(xdotool search --name "ATHENA" 2>/dev/null | head -1 || true)"
-        [[ -n "$window" ]] && { printf "%s" "$window"; return; }
-        sleep 0.1
-      done
-      return 1
+      timeout 10s xdotool search --sync --name "ATHENA" 2>/dev/null | head -1
+    }
+
+    presentation_sequence() {
+      PRESENTATION_PATH="$1" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["PRESENTATION_PATH"])
+print(json.loads(path.read_text(encoding="utf-8"))["presented_frame_sequence"] if path.is_file() else 0)
+PY
+    }
+
+    wait_for_presentation() {
+      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" EXPECTED_STATE="${5:-}" python3 - <<'PY'
+import json
+import os
+import time
+from pathlib import Path
+
+path = Path(os.environ["PRESENTATION_PATH"])
+minimum = int(os.environ["MIN_SEQUENCE"])
+width = int(os.environ["EXPECTED_WIDTH"])
+height = int(os.environ["EXPECTED_HEIGHT"])
+state = os.environ.get("EXPECTED_STATE")
+deadline = time.monotonic() + 10.0
+while time.monotonic() < deadline:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        value = None
+    if (
+        isinstance(value, dict)
+        and int(value.get("presented_frame_sequence", 0)) >= minimum
+        and int(value.get("width", 0)) == width
+        and int(value.get("height", 0)) == height
+        and (not state or value.get("semantic_state") == state)
+    ):
+        raise SystemExit(0)
+    time.sleep(0.01)
+raise SystemExit(
+    f"presentation sync timeout: sequence >= {minimum}, {width}x{height}, state={state!r}"
+)
+PY
     }
 
     resize_sequence() {
       local layout_path="$TMP_DIR/live-resize.layout.json"
-      ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" "$NATIVE_BIN" --no-animations --command "sleep 8" >/dev/null 2>&1 &
+      local sync_path="$TMP_DIR/live-resize.presentation.json"
+      ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --no-animations --command "tail -f /dev/null" >/dev/null 2>&1 &
       local native_pid=$!
       local window
       window="$(wait_for_window)"
       xdotool windowfocus --sync "$window"
-      for size in 1280x800 1672x941 1170x659 1920x1080 1280x720; do
+      wait_for_presentation "$sync_path" 1 1280 800
+      local last_sequence
+      last_sequence="$(presentation_sequence "$sync_path")"
+      "$CHECK_LAYOUT" "$layout_path" 1280 800
+      for size in 1672x941 1170x659 1920x1080 1280x720; do
         IFS=x read -r resize_width resize_height <<< "$size"
         xdotool windowsize --sync "$window" "$resize_width" "$resize_height"
-        sleep 0.15
+        wait_for_presentation "$sync_path" "$((last_sequence + 1))" "$resize_width" "$resize_height"
+        last_sequence="$(presentation_sequence "$sync_path")"
         "$CHECK_LAYOUT" "$layout_path" "$resize_width" "$resize_height"
       done
       kill "$native_pid" 2>/dev/null || true
@@ -140,23 +187,25 @@ PROJECTION="$projection" NATIVE_BIN="$repo_root/native/target/debug/athena-termi
       local upper_mode="${scene_mode^^}"
       fixture_projection="${fixture_projection//\"SEARCH\"/\"$upper_mode\"}"
       fixture_projection="${fixture_projection//\"owl\"/\"$mascot\"}"
-      fixture_projection="$(FIXTURE_PROJECTION="$fixture_projection" SCENE_MODE="$scene_mode" python3 -c "import json, os; f=json.loads(os.environ[\"FIXTURE_PROJECTION\"]); m=os.environ[\"SCENE_MODE\"]; f[\"attention_items\"] = ([{\"id\":\"approval:visual-smoke\",\"kind\":\"approval\",\"severity\":\"warning\",\"title\":\"APPROVAL REQUIRED\",\"summary\":\"write workspace\",\"requires_action\":True,\"related_object_id\":\"op-01\"}] if m == \"approval\" else [{\"id\":\"event:visual-smoke\",\"kind\":\"notification\",\"severity\":\"failure\",\"title\":\"EVENT\",\"summary\":\"visual verification failed\",\"requires_action\":False,\"related_object_id\":\"op-01\"}] if m == \"failure\" else f[\"attention_items\"]); print(json.dumps(f))")"
+      fixture_projection="$(FIXTURE_PROJECTION="$fixture_projection" SCENE_MODE="$scene_mode" python3 -c "import json, os; f=json.loads(os.environ[\"FIXTURE_PROJECTION\"]); m=os.environ[\"SCENE_MODE\"]; f[\"attention_items\"] = ([{\"id\":\"approval:visual-smoke\",\"approval_id\":\"apr-visual-smoke\",\"kind\":\"approval\",\"severity\":\"warning\",\"title\":\"APPROVAL REQUIRED\",\"summary\":\"write workspace\",\"requires_action\":True,\"scopes\":[\"call\",\"task\"],\"related_object_id\":\"op-01\"}] if m == \"approval\" else [{\"id\":\"event:visual-smoke\",\"kind\":\"notification\",\"severity\":\"failure\",\"title\":\"EVENT\",\"summary\":\"visual verification failed\",\"requires_action\":False,\"related_object_id\":\"op-01\"}] if m == \"failure\" else f[\"attention_items\"]); print(json.dumps(f))")"
       local image_path="$TMP_DIR/${label}-${mascot}.png"
       local layout_path="$TMP_DIR/${label}-${mascot}.layout.json"
       local oi_path="$TMP_DIR/${label}-${mascot}.oi.png"
+      local sync_path="$TMP_DIR/${label}-${mascot}.presentation.json"
 
-      printf "%s\\n" "$fixture_projection" | ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" ATHENA_NATIVE_OI_DUMP="$oi_path" "$NATIVE_BIN" --bridge-stdin --no-animations \
-        --mascot "$mascot" --command "printf native-ok; sleep 3" >/dev/null 2>&1 &
+      printf "%s\\n" "$fixture_projection" | ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" ATHENA_NATIVE_OI_DUMP="$oi_path" ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --bridge-stdin --no-animations \
+        --mascot "$mascot" --command "printf native-ok; tail -f /dev/null" >/dev/null 2>&1 &
       local native_pid=$!
       local window
       window="$(wait_for_window)"
       xdotool windowfocus --sync "$window"
+      wait_for_presentation "$sync_path" 1 1280 800 "$scene_mode"
+      local last_sequence
+      last_sequence="$(presentation_sequence "$sync_path")"
       if [[ -n "$input" ]]; then
         xdotool type --window "$window" --clearmodifiers "$input"
         xdotool key --window "$window" Left Left
-        sleep 0.25
-      else
-        sleep 0.15
+        wait_for_presentation "$sync_path" "$((last_sequence + 1))" 1280 800 "$scene_mode"
       fi
       import -window "$window" "$image_path"
       kill "$native_pid" 2>/dev/null || true

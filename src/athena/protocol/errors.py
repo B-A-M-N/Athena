@@ -34,6 +34,19 @@ class ConfigurationError(AthenaError):
     code = "configuration_error"
 
 
+class ServiceNotReady(ConfigurationError):
+    """The service is alive but cannot admit agent work yet."""
+
+    code = "service_not_ready"
+    http_status = 503
+
+
+class ModelProviderUnconfigured(ServiceNotReady):
+    """No model provider is configured for model-backed agent work."""
+
+    code = "model_provider_unconfigured"
+
+
 class TaskError(AthenaError):
     code = "task_error"
 
@@ -156,6 +169,8 @@ class RecoveryError(AthenaError):
 __all__ = [
     "AthenaError",
     "ConfigurationError",
+    "ServiceNotReady",
+    "ModelProviderUnconfigured",
     "TaskError",
     "TaskBudgetExceeded",
     "TaskDeadlineExceeded",

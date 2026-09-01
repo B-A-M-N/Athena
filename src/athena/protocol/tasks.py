@@ -76,7 +76,9 @@ LEGAL_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.RECOVERY_REQUIRED,
         }
     ),
-    TaskStatus.WAITING_APPROVAL: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
+    TaskStatus.WAITING_APPROVAL: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
     TaskStatus.WAITING_INPUT: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
     TaskStatus.BLOCKED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
     TaskStatus.INTERRUPTED: frozenset(

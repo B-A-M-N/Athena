@@ -28,6 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from athena.execution.async_call import run_blocking
 from athena.protocol.ids import new_id
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -509,6 +510,7 @@ class TaskWorldState:
                 return []
             return []
 
-        import asyncio
-
-        return await asyncio.get_running_loop().run_in_executor(None, _git)
+        # Do not initialize the process-wide default executor for this small
+        # observation.  Embedded/test hosts may hang while that executor is
+        # shut down even after the Git child has exited.
+        return await run_blocking(_git)

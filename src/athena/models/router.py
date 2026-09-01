@@ -82,6 +82,8 @@ class ModelSource(Protocol):
 
     def provider_for(self, provider_name: str) -> object: ...
 
+    def readiness(self) -> Mapping[str, object]: ...
+
 
 def _privacy_rank(cls: PrivacyClass) -> int:
     return _PRIVACY_RANK.get(cls, _PRIVACY_RANK[PrivacyClass.UNKNOWN])
@@ -192,6 +194,7 @@ class ModelRouter:
 
         if not models:
             raise ProviderUnavailable("no model providers registered")
+        ready_providers = self._ready_provider_names()
 
         offline = policy.privacy in _OFFLINE_PRIVACY
         allowed = tuple(policy.allowed or ())
@@ -200,6 +203,8 @@ class ModelRouter:
         candidates: list[ModelInfo] = []
         for info in models:
             if info.provider in exclude:
+                continue
+            if ready_providers is not None and info.provider not in ready_providers:
                 continue
             if allowed and not self._is_allowed(info, allowed):
                 continue
@@ -239,6 +244,29 @@ class ModelRouter:
                 history_used=history_used,
             ),
         )
+
+    def _ready_provider_names(self) -> set[str] | None:
+        """Return provider names currently admitted for model selection.
+
+        The readiness surface is optional for small compatibility registries;
+        the production ``ProviderRegistry`` always supplies it. When present,
+        only providers explicitly in ``ready`` state may contribute models.
+        """
+        probe = getattr(self._registry, "readiness", None)
+        if not callable(probe):
+            return None
+        try:
+            report = probe()
+        except Exception:
+            return set()
+        providers = report.get("providers") if isinstance(report, Mapping) else None
+        if not isinstance(providers, Mapping):
+            return None
+        return {
+            str(name)
+            for name, value in providers.items()
+            if isinstance(value, Mapping) and str(value.get("state")) == "ready"
+        }
 
     async def _historical_stats(
         self,

@@ -8,6 +8,7 @@ from athena.affordances import CapabilityFabric
 from athena.affordances.scratch import ScratchManager
 from athena.capabilities.registry import CapabilityRegistry
 from athena.capabilities.scratch import ScratchCapability
+from athena.capabilities.synthesis import SynthesisCapability
 from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus
 from athena.protocol.tasks import WorkspaceSpec
 from athena.synthesis.engine import SynthesisEngine
@@ -131,3 +132,54 @@ async def test_repeated_scratch_inputs_auto_elevate_to_task_capability():
     assert second.status is CapabilityResultStatus.OK
     assert second.metadata["promotion"]["status"] == "task_reusable"
     assert fabric.has(scratch_id, task_id="task-elevate")
+
+
+@pytest.mark.asyncio
+async def test_explicit_scratch_promotion_is_idempotent_after_auto_elevation():
+    scratch = ScratchManager()
+    fabric = CapabilityFabric(CapabilityRegistry())
+    engine = SynthesisEngine()
+    scratch_capability = ScratchCapability(engine, scratch, fabric)
+    synthesis_capability = SynthesisCapability(engine, fabric, scratch=scratch)
+    code = "def run(args):\n    return {'value': args['value']}\n"
+
+    first = await scratch_capability.invoke(
+        CapabilityRequest(
+            capability_id="scratch",
+            task_id="task-promote",
+            call_id="scratch-promote-1",
+            arguments={
+                "operation": "run",
+                "code": code,
+                "args": {"value": "one"},
+            },
+        )
+    )
+    scratch_id = first.metadata["scratch_id"]
+    await scratch_capability.invoke(
+        CapabilityRequest(
+            capability_id="scratch",
+            task_id="task-promote",
+            call_id="scratch-promote-2",
+            arguments={
+                "operation": "run",
+                "scratch_id": scratch_id,
+                "args": {"value": "two"},
+            },
+        )
+    )
+
+    result = await synthesis_capability.invoke(
+        CapabilityRequest(
+            capability_id="synthesis",
+            task_id="task-promote",
+            call_id="synthesis-promote-1",
+            arguments={"operation": "promote_scratch", "scratch_id": scratch_id},
+        )
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    payload = json.loads(result.output)
+    assert payload["capability_id"] == scratch_id
+    assert payload["status"] == "task_reusable"
+    assert fabric.has(scratch_id, task_id="task-promote")

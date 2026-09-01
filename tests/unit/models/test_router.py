@@ -25,6 +25,20 @@ def _fake(name: str, *, tool_calling=False, privacy=None):
     return FakeModelProvider(**kw)
 
 
+class _ReadinessFake(FakeModelProvider):
+    def __init__(self, name: str, readiness_state: str, *, provider: str | None = None) -> None:
+        super().__init__(
+            model=name,
+            provider=provider or name,
+            tool_calling=True,
+            privacy_class=PrivacyClass.LOCAL,
+        )
+        self.readiness_state = readiness_state
+
+    def readiness(self) -> dict[str, str]:
+        return {"state": self.readiness_state}
+
+
 @pytest.mark.athena_claim("BHV-035")
 @pytest.mark.athena_evidence("test", "invariant")
 async def test_selects_fake_provider_when_tools_required():
@@ -38,6 +52,27 @@ async def test_selects_fake_provider_when_tools_required():
     sel = await router.select(requirements=reqs)
 
     assert sel.info.tool_calling is True
+
+
+async def test_router_excludes_unready_providers_and_rechecks_readiness():
+    ready = _ReadinessFake("ready-model", "ready", provider="ready")
+    unavailable = _ReadinessFake("missing-auth", "auth_missing", provider="missing")
+    reg = _registry({"ready": ready, "missing": unavailable})
+    router = ModelRouter(reg)
+
+    selected = await router.select(policy=ModelPolicy(require_tools=True))
+    assert selected.provider == "ready"
+
+    with pytest.raises(ModelUnavailable):
+        await router.select(
+            policy=ModelPolicy(allowed=("missing/missing-auth",), require_tools=True)
+        )
+
+    unavailable.readiness_state = "ready"
+    selected = await router.select(
+        policy=ModelPolicy(allowed=("missing/missing-auth",), require_tools=True)
+    )
+    assert selected.provider == "missing"
 
 
 @pytest.mark.athena_claim("BHV-035", "BHV-037")

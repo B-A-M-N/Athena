@@ -1,6 +1,10 @@
 """Round-trip tests: AthenaConfig -> config_to_dict -> config_from_dict."""
 
 from pathlib import Path
+import os
+import stat
+
+import pytest
 
 from athena.service.config import (
     MCPConfig,
@@ -10,6 +14,7 @@ from athena.service.config import (
     config_from_dict,
     config_to_dict,
     project_config_paths,
+    save_config,
 )
 
 
@@ -57,7 +62,8 @@ def test_roundtrip_providers_mcp_model_roles():
     p = restored.providers[0]
     assert (p.kind, p.name, p.model) == ("openai", "main", "gpt-4o")
     assert p.credential_id == "cred-1"
-    assert p.api_key == "sk-test"
+    assert p.api_key is None
+    assert "api_key" not in d["providers"][0]
     assert p.base_url == "https://example.com/v1"
     assert p.cache_mode == "none"
     assert p.latency_class == "fast"
@@ -97,6 +103,80 @@ def test_roundtrip_hermes_referee_config():
     restored = config_from_dict(config_to_dict(config))
 
     assert restored.hermes_referee == config.hermes_referee
+
+
+def test_save_config_migrates_legacy_provider_key_to_private_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    config = AthenaConfig(
+        providers=(ProviderConfig(kind="openai", name="main", api_key="sk-test"),)
+    )
+
+    path = tmp_path / "athena.toml"
+    save_config(config, path)
+
+    text = path.read_text()
+    assert "sk-test" not in text
+    assert 'credential_id = "main_api_key"' in text
+    assert (tmp_path / "config" / "athena" / "secrets" / "main_api_key").read_text() == "sk-test"
+
+
+def test_save_config_sanitizes_generated_legacy_secret_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    config = AthenaConfig(
+        providers=(ProviderConfig(kind="openai", name="team/provider", api_key="sk-test"),)
+    )
+
+    save_config(config, tmp_path / "athena.toml")
+
+    assert 'credential_id = "team_provider_api_key"' in (tmp_path / "athena.toml").read_text()
+    assert (
+        tmp_path / "config" / "athena" / "secrets" / "team_provider_api_key"
+    ).read_text() == "sk-test"
+
+
+def test_save_config_is_atomic_and_keeps_owner_only_file_on_write_failure(tmp_path, monkeypatch):
+    import tomli_w
+
+    path = tmp_path / "athena.toml"
+    previous = b'autonomy = "supervised"\n'
+    path.write_bytes(previous)
+    os.chmod(path, 0o600)
+
+    def fail_after_partial_write(data, handle):
+        del data
+        handle.write(b"partial = ")
+        raise OSError("simulated config write failure")
+
+    monkeypatch.setattr(tomli_w, "dump", fail_after_partial_write)
+    with pytest.raises(OSError, match="simulated config write failure"):
+        save_config(AthenaConfig(), path)
+
+    assert path.read_bytes() == previous
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert not list(tmp_path.glob(".athena.toml.*.tmp"))
+
+
+def test_save_config_rejects_destination_symlink(tmp_path):
+    target = tmp_path / "target.toml"
+    target.write_text("keep = true\n")
+    link = tmp_path / "athena.toml"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlinked config path"):
+        save_config(AthenaConfig(), link)
+    assert target.read_text() == "keep = true\n"
+
+
+def test_save_config_rejects_symlinked_parent_directory(tmp_path):
+    target_dir = tmp_path / "real-config"
+    target_dir.mkdir()
+    link_dir = tmp_path / "config"
+    link_dir.symlink_to(target_dir, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlinked config directory"):
+        save_config(AthenaConfig(), link_dir / "athena.toml")
+    assert not (target_dir / "athena.toml").exists()
 
 
 def test_project_config_paths_root_most_first(tmp_path: Path):

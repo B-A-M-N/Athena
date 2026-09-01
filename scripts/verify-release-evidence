@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Verify the exact certified release artifacts before publication."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fail(message: str) -> int:
+    print(f"verify-release-evidence: FAIL {message}", file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--evidence-dir", required=True, type=Path)
+    parser.add_argument("--sha", required=True)
+    parser.add_argument("--tag", required=True)
+    args = parser.parse_args(argv)
+
+    evidence = args.evidence_dir.resolve()
+    result_path = evidence / "final-release-result.json"
+    manifest_path = evidence / "release-manifest.json"
+    identity_path = evidence / "release-identity.json"
+    artifact_dir = evidence / "release-artifacts"
+    for path in (result_path, manifest_path, identity_path):
+        if not path.is_file():
+            return fail(f"missing evidence file {path.name}")
+    if not artifact_dir.is_dir():
+        return fail("missing release-artifacts directory")
+
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return fail(f"invalid evidence JSON: {exc}")
+
+    if result.get("status") != "PASS" or result.get("releasable") is not True:
+        return fail("protected release result is not a releasable PASS")
+    if result.get("commit_sha") != args.sha:
+        return fail("result commit does not match certified SHA")
+    if manifest.get("source_sha") != args.sha:
+        return fail("manifest source does not match certified SHA")
+    if identity.get("commit_sha") != args.sha:
+        return fail("identity commit does not match certified SHA")
+    if identity.get("skip_e2e") is not False:
+        return fail("certified evidence skipped installed-artifact acceptance")
+    if manifest.get("source_status") != "frozen-clean":
+        return fail("artifact manifest does not identify a frozen clean source")
+
+    tag_version = args.tag.removeprefix("v")
+    if tag_version != manifest.get("python_version"):
+        return fail("release tag does not match the certified Python version")
+
+    entries = manifest.get("artifacts")
+    if not isinstance(entries, list) or not entries:
+        return fail("artifact manifest has no publishable artifacts")
+    expected_names: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return fail("artifact manifest contains a malformed entry")
+        source_name = Path(str(entry.get("path", ""))).name
+        if source_name in expected_names or not source_name.endswith((".whl", ".tar.gz")):
+            return fail(f"invalid or duplicate artifact name {source_name!r}")
+        expected_names.add(source_name)
+        path = artifact_dir / source_name
+        if not path.is_file():
+            return fail(f"missing certified artifact {source_name}")
+        if path.stat().st_size != entry.get("size"):
+            return fail(f"size mismatch for {source_name}")
+        if sha256(path) != entry.get("sha256"):
+            return fail(f"SHA-256 mismatch for {source_name}")
+
+    actual_names = {
+        path.name
+        for path in artifact_dir.iterdir()
+        if path.is_file() and path.name != "release-manifest.json"
+    }
+    if actual_names != expected_names:
+        return fail("downloaded artifacts differ from the certified manifest")
+    print(f"verify-release-evidence: PASS {args.sha} {manifest['python_version']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -54,6 +54,11 @@ class ProjectIndexBuilder:
         )
         self.max_files = max_files
         self.max_file_bytes = max_file_bytes
+        # Repeated snapshots in a long-lived service should reuse parsed
+        # semantic facts while still invalidating on any observable source
+        # change.  Keep one bounded entry per relative path so edits do not
+        # accumulate historical AST records in memory.
+        self._source_fact_cache: dict[str, dict[str, Any]] = {}
 
     def build(self, root: str) -> ProjectIndex:
         root_path = Path(os.path.realpath(os.path.abspath(root)))
@@ -93,15 +98,17 @@ class ProjectIndexBuilder:
             language = record.get("language")
             if not isinstance(language, str):
                 continue
-            imported = extract_imports(contents.get(relative, ""))
-            imports[relative] = tuple(imported)
-            names = extract_symbols(contents.get(relative, ""))
-            symbols[relative] = tuple(names)
-            semantic = analyzer.analyze(
-                path=relative,
+            imported, names, semantic = self._source_facts(
+                relative=relative,
                 content=contents.get(relative, ""),
                 language=language,
+                mtime_ns=int(record.get("mtime_ns") or 0),
+                size=int(record.get("size") or 0),
+                sha256=record.get("sha256"),
+                analyzer=analyzer,
             )
+            imports[relative] = imported
+            symbols[relative] = names
             semantic_files[relative] = semantic
             imports[relative] = tuple(
                 sorted(
@@ -126,6 +133,36 @@ class ProjectIndexBuilder:
             semantic_files=semantic_files,
             truncated=truncated,
         )
+
+    def _source_facts(
+        self,
+        *,
+        relative: str,
+        content: str,
+        language: str,
+        mtime_ns: int,
+        size: int,
+        sha256: object,
+        analyzer: SemanticProjectAnalyzer,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]:
+        cache_key = (mtime_ns, size, str(sha256) if sha256 is not None else None)
+        cached = self._source_fact_cache.get(relative)
+        if cached is not None and cached.get("key") == cache_key:
+            return (
+                tuple(cached["imports"]),
+                tuple(cached["symbols"]),
+                dict(cached["semantic"]),
+            )
+        imported = tuple(extract_imports(content))
+        names = tuple(extract_symbols(content))
+        semantic = analyzer.analyze(path=relative, content=content, language=language)
+        self._source_fact_cache[relative] = {
+            "key": cache_key,
+            "imports": imported,
+            "symbols": names,
+            "semantic": semantic,
+        }
+        return imported, names, dict(semantic)
 
     def incremental(
         self,

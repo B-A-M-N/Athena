@@ -11,10 +11,12 @@ wants a whole response.
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import math
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -65,6 +67,25 @@ _ROLE_MAP: dict[Role, str] = {
     Role.CAPABILITY: "tool",
     Role.SYSTEM: "system",
 }
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_local_host(host: str) -> bool:
+    if _is_loopback_host(host):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private or address.is_link_local
 
 
 def _reported_cost_usd(raw: Any) -> float | None:
@@ -197,6 +218,7 @@ class OpenAICompatProvider:
         model: str = "gpt-4o-mini",
         provider: str = "openai-compat",
         privacy_class: PrivacyClass = PrivacyClass.REMOTE,
+        authentication: str | None = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = 60.0,
         http2: bool = False,
@@ -207,6 +229,12 @@ class OpenAICompatProvider:
         self.model = model
         self.provider = provider
         self._privacy_class = privacy_class
+        self._api_key_configured = bool(api_key)
+        if authentication is not None:
+            authentication = authentication.strip().casefold()
+            if authentication not in {"none", "bearer", "required"}:
+                raise ValueError("authentication must be one of: none, bearer, required")
+        self._authentication = authentication
         if isinstance(cost, Mapping):
             cost = CostInfo(
                 per_1m_input=_optional_float(cost.get("per_1m_input")),
@@ -238,6 +266,29 @@ class OpenAICompatProvider:
                 latency_class=self._latency_class,
             )
         ]
+
+    def readiness(self) -> dict[str, str | bool]:
+        host = (urlsplit(self.base_url).hostname or "").lower()
+        local = _is_local_host(host)
+        authentication = self._authentication
+        if authentication is None:
+            # Loopback is the only automatic no-credential default. Private
+            # and link-local topology is reported as local but still requires
+            # explicit authentication policy or a bearer credential.
+            authentication = "none" if _is_loopback_host(host) else "required"
+        if authentication != "none" and not self._api_key_configured:
+            return {
+                "state": "auth_missing",
+                "kind": "openai-compatible",
+                "local": local,
+                "authentication": authentication,
+            }
+        return {
+            "state": "ready",
+            "kind": "openai-compatible",
+            "local": local,
+            "authentication": authentication,
+        }
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         payload = self._build_request(request)

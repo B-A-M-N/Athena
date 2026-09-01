@@ -171,6 +171,19 @@ impl TextRenderer {
         self.font_pixel_sizes
     }
 
+    /// Rebind the Xft picture when the unified offscreen presentation
+    /// drawable is resized.  Text and OpenGL therefore continue composing on
+    /// the same surface before it is copied to the visible window.
+    pub(crate) fn rebind_drawable(&mut self, drawable: Window) -> Result<(), String> {
+        let draw = unsafe { XftDrawCreate(self.display, drawable, self.visual, self.colormap) };
+        if draw.is_null() {
+            return Err("could not recreate the native Xft text surface".to_owned());
+        }
+        unsafe { XftDrawDestroy(self.draw) };
+        self.draw = draw;
+        Ok(())
+    }
+
     fn face(&self, role: FontRole) -> FontFace {
         match role {
             FontRole::Body => self.fonts[0],

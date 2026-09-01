@@ -2,9 +2,9 @@
 
 Defines :class:`AthenaConfig` — the dataclass that configures the application
 composition root (:class:`~athena.service.service.AthenaService`). Every field
-has a sane default so ``AthenaService(config=AthenaConfig())`` is a working
-in-memory/demo runtime, and ``AthenaService.in_memory()`` is specialised for
-tests.
+has a safe setup/inspection default; ``AthenaService(config=AthenaConfig())``
+starts without a model provider and reports an explicit unconfigured state.
+``AthenaService.in_memory()`` is the explicit deterministic test/demo factory.
 
 Config layering (deterministic precedence, lowest to highest):
 
@@ -22,11 +22,14 @@ from __future__ import annotations
 import json
 from importlib import import_module
 import os
-from dataclasses import dataclass, field
+import re
+import tempfile
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from athena.protocol.tasks import AutonomyLevel
+from athena.policy.credentials import write_user_secret
 
 try:
     tomllib = import_module("tomllib")
@@ -103,6 +106,11 @@ class ProviderConfig:
     credential_id: str | None = None
     api_key: str | None = None
     base_url: str | None = None
+    # Authentication is explicit route policy: ``none`` is appropriate for a
+    # deliberately unauthenticated local endpoint; ``bearer``/``required``
+    # require a configured credential. ``None`` lets the adapter choose its
+    # conservative topology-based default.
+    authentication: str | None = None
     # ``None`` uses the provider-profile default. Hosted OpenAI-compatible
     # routes default to automatic prefix caching; local presets default off.
     cache_mode: str | None = None
@@ -118,6 +126,8 @@ class ProviderConfig:
             kwargs.setdefault("api_key", self.api_key)
         if self.base_url is not None:
             kwargs.setdefault("base_url", self.base_url)
+        if self.authentication is not None:
+            kwargs.setdefault("authentication", self.authentication)
         if self.latency_class is not None:
             kwargs.setdefault("latency_class", self.latency_class)
         return kwargs
@@ -177,7 +187,11 @@ class AthenaConfig:
     # distinct between principals when one service process serves multiple
     # users; the value is hashed before it reaches a provider.
     cache_namespace: str = "athena"
-    worker_max_parallel: int = 16
+    # ``max_parallel_tasks`` is the canonical concurrency setting.  The
+    # legacy constructor/key remains accepted so old configs migrate without
+    # silently changing their limit.
+    worker_max_parallel: int | None = None
+    max_parallel_tasks: int = 4
     scheduler_interval_seconds: float = 1.0
     scheduler_max_concurrent: int = 0
     profile: str | None = None
@@ -202,6 +216,14 @@ class AthenaConfig:
     animations: bool = True
     reduced_motion: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.worker_max_parallel is not None:
+            self.max_parallel_tasks = int(self.worker_max_parallel)
+        self.max_parallel_tasks = max(1, int(self.max_parallel_tasks))
+        # Keep the legacy read surface truthful after a canonical setting is
+        # loaded; it is an alias, not a second concurrency authority.
+        self.worker_max_parallel = self.max_parallel_tasks
 
     @property
     def autonomy_level(self) -> AutonomyLevel:
@@ -262,6 +284,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         "credential_id",
         "api_key",
         "base_url",
+        "authentication",
         "cache_mode",
         "latency_class",
     ):
@@ -276,6 +299,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         credential_id=data.get("credential_id"),
         api_key=data.get("api_key"),
         base_url=data.get("base_url"),
+        authentication=data.get("authentication"),
         cache_mode=data.get("cache_mode"),
         latency_class=data.get("latency_class"),
         extra=extra,
@@ -353,8 +377,8 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["reserve_output"] = config.reserve_output
     if config.cache_namespace != "athena":
         d["cache_namespace"] = config.cache_namespace
-    if config.worker_max_parallel != 4:
-        d["worker_max_parallel"] = config.worker_max_parallel
+    if config.max_parallel_tasks != 4:
+        d["max_parallel_tasks"] = config.max_parallel_tasks
     if config.scheduler_interval_seconds != 1.0:
         d["scheduler_interval_seconds"] = config.scheduler_interval_seconds
     if config.scheduler_max_concurrent != 0:
@@ -364,28 +388,40 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
     if config.providers:
         d["providers"] = [
             {
-                "kind": p.kind,
-                "name": p.name,
-                "model": p.model,
-                "credential_id": p.credential_id,
-                "api_key": p.api_key,
-                "base_url": p.base_url,
-                "cache_mode": p.cache_mode,
-                "latency_class": p.latency_class,
-                **dict(p.extra),
+                key: value
+                for key, value in {
+                    "kind": p.kind,
+                    "name": p.name,
+                    "model": p.model,
+                    "credential_id": p.credential_id,
+                    "base_url": p.base_url,
+                    "authentication": p.authentication,
+                    "cache_mode": p.cache_mode,
+                    "latency_class": p.latency_class,
+                    **{
+                        key: value
+                        for key, value in p.extra.items()
+                        if str(key).casefold() not in {"api_key", "apikey", "access_token"}
+                    },
+                }.items()
+                if value is not None
             }
             for p in config.providers
         ]
     if config.mcp_servers:
         d["mcp_servers"] = [
             {
-                "name": m.name,
-                "command": m.command,
-                "args": list(m.args),
-                "url": m.url,
-                "env": dict(m.env),
-                "secret_env": dict(m.secret_env),
-                "connect_timeout": m.connect_timeout,
+                key: value
+                for key, value in {
+                    "name": m.name,
+                    "command": m.command,
+                    "args": list(m.args),
+                    "url": m.url,
+                    "env": dict(m.env),
+                    "secret_env": dict(m.secret_env),
+                    "connect_timeout": m.connect_timeout,
+                }.items()
+                if value is not None
             }
             for m in config.mcp_servers
         ]
@@ -466,7 +502,7 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         context_window=int(data.get("context_window", 128_000)),
         reserve_output=int(data.get("reserve_output", 4096)),
         cache_namespace=str(data.get("cache_namespace", "athena") or "athena").strip() or "athena",
-        worker_max_parallel=int(data.get("worker_max_parallel", 4)),
+        max_parallel_tasks=int(data.get("max_parallel_tasks", data.get("worker_max_parallel", 4))),
         scheduler_interval_seconds=float(data.get("scheduler_interval_seconds", 1.0)),
         scheduler_max_concurrent=int(data.get("scheduler_max_concurrent", 0)),
         profile=data.get("profile"),
@@ -513,7 +549,10 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_CONTEXT_WINDOW": ("context_window", int),
         "ATHENA_RESERVE_OUTPUT": ("reserve_output", int),
         "ATHENA_CACHE_NAMESPACE": ("cache_namespace", str),
-        "ATHENA_WORKER_MAX_PARALLEL": ("worker_max_parallel", int),
+        "ATHENA_MAX_PARALLEL_TASKS": ("max_parallel_tasks", int),
+        # Deprecated alias; canonical serialization always writes
+        # max_parallel_tasks.
+        "ATHENA_WORKER_MAX_PARALLEL": ("max_parallel_tasks", int),
         "ATHENA_SCHEDULER_INTERVAL_SECONDS": ("scheduler_interval_seconds", float),
         "ATHENA_SCHEDULER_MAX_CONCURRENT": ("scheduler_max_concurrent", int),
         "ATHENA_PROFILE": ("profile", str),
@@ -668,14 +707,69 @@ def _extract_profile(data: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def save_config(config: AthenaConfig, path: str | Path) -> None:
-    """Save an ``AthenaConfig`` to a TOML file."""
+    """Save an ``AthenaConfig`` without placing provider secrets in TOML.
+
+    A legacy in-memory ``api_key`` is migrated to the owner-only secret store
+    at the explicit save boundary.  The serialized config keeps only the
+    credential name; callers that construct a config programmatically remain
+    backward-compatible until they save it.
+    """
     try:
         import tomli_w
     except ImportError as exc:
         raise RuntimeError("Saving config requires tomli_w (pip install tomli_w)") from exc
+    providers = []
+    for provider in config.providers:
+        if provider.api_key:
+            credential_id = provider.credential_id or _generated_credential_id(provider.name)
+            write_user_secret(credential_id, provider.api_key)
+            provider = replace(provider, credential_id=credential_id, api_key=None)
+        providers.append(provider)
+    if providers != list(config.providers):
+        config = replace(config, providers=tuple(providers))
     p = Path(path)
+    if p.is_symlink():
+        raise ValueError(f"refusing to replace symlinked config path: {p}")
+    _reject_symlinked_parents(p.parent)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("wb") as f:
-        import tomli_w
+    os.chmod(p.parent, 0o700)
+    temp_fd, temp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent))
+    try:
+        os.fchmod(temp_fd, 0o600)
+        with os.fdopen(temp_fd, "wb") as f:
+            temp_fd = -1
+            tomli_w.dump(config_to_dict(config), f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_name, p)
+        directory_fd = os.open(str(p.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temp_fd != -1:
+            os.close(temp_fd)
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
 
-        tomli_w.dump(config_to_dict(config), f)
+
+def _generated_credential_id(provider_name: str) -> str:
+    """Create a valid private-store name for a legacy provider key."""
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(provider_name)).strip("._-")
+    safe_name = safe_name or "provider"
+    return f"{safe_name[:119]}_api_key"
+
+
+def _reject_symlinked_parents(path: Path) -> None:
+    """Reject a config destination whose directory path redirects elsewhere."""
+    current = path
+    while True:
+        if current.is_symlink():
+            raise ValueError(f"refusing to use symlinked config directory: {current}")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent

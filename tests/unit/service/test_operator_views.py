@@ -14,6 +14,7 @@ from athena.protocol.capabilities import (
 from athena.protocol.tasks import WorkspaceSpec
 from athena.service.config import AthenaConfig
 from athena.service.service import AthenaService
+from athena.models.registry import ProviderRegistry
 
 
 @pytest.fixture
@@ -38,6 +39,38 @@ async def test_startup_health_exposes_optional_degradation_boundary(service):
     assert health["blocking_failures"] == []
     assert health["checks"]
     assert all("blocking" in check for check in health["checks"].values())
+
+
+def test_production_service_does_not_register_an_implicit_fake_provider():
+    service = AthenaService(config=AthenaConfig(providers=()))
+    registry = ProviderRegistry()
+
+    service._register_providers(registry)
+
+    assert registry.names() == ()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_service_reports_first_run_model_state(tmp_path):
+    service = AthenaService(
+        config=AthenaConfig(
+            db_path=":memory:",
+            workspace_root=str(tmp_path),
+            providers=(),
+        )
+    )
+    await service.start()
+    try:
+        health = service.startup_health()
+        assert health["checks"]["model_provider"] == {
+            "status": "unconfigured",
+            "blocking": False,
+            "providers": [],
+            "reason": "configure a model provider before submitting agent work",
+        }
+        assert service._model_registry.names() == ()
+    finally:
+        await service.stop()
 
 
 async def test_operator_diff_empty(service):

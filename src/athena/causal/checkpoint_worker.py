@@ -137,9 +137,10 @@ def _clone_shadow(source: Path, root: Path, branch_id: str) -> dict:
     if target.exists() or target.is_symlink():
         raise FileExistsError(f"shadow destination already exists: {target}")
     from athena.shadow.engine import ShadowEngine
+    from athena.workspace_manifest import copy_workspace_tree
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(
+    copy_workspace_tree(
         source,
         target,
         dirs_exist_ok=True,

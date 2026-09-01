@@ -21,7 +21,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -40,7 +39,7 @@ from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
 from athena.protocol.tasks import MutationMode, NetworkPolicy, PathRule, WorkspaceSpec
 from athena.execution.environment import ProjectEnvironmentFingerprint
-from athena.workspace_manifest import IGNORED_DIRECTORY_NAMES, copy_ignore
+from athena.workspace_manifest import IGNORED_DIRECTORY_NAMES, copy_ignore, copy_workspace_tree
 from athena.verification.certificate import (
     VerificationCertificate,
     certificate_digest as _certificate_digest,
@@ -209,7 +208,7 @@ class ShadowEngine:
         # state.
         base_manifest = self._manifest(src)
         if os.path.isdir(src):
-            shutil.copytree(
+            copy_workspace_tree(
                 src,
                 root,
                 dirs_exist_ok=True,

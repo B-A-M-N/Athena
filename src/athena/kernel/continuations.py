@@ -142,10 +142,21 @@ class ContinuationStore:
     async def mark_resolved(self, id: str, decision: str = "granted") -> None:
         await self.ensure_table()
         now = utcnow().isoformat()
-        await self._db.execute(
-            "UPDATE continuations SET resolved_at = ?, decision = ? WHERE id = ?",
-            (now, decision, id),
-        )
+        async with self._db.transaction():
+            row = await self._db.fetch_one_raw(
+                "SELECT resolved_at FROM continuations WHERE id = ?", (id,)
+            )
+            if row is None:
+                raise KeyError(f"unknown continuation {id}")
+            if row.get("resolved_at") is not None:
+                raise ValueError(f"continuation {id} is already resolved")
+            cursor = await self._db.execute_raw(
+                "UPDATE continuations SET resolved_at = ?, decision = ? "
+                "WHERE id = ? AND resolved_at IS NULL",
+                (now, decision, id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"continuation {id} resolution compare-and-swap failed")
 
     async def claim_resolved(self, task_id: str) -> dict | None:
         """Atomically claim one approved continuation for post-restart work.

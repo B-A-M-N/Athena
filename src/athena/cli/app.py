@@ -509,6 +509,17 @@ async def _cmd_run(o: Options, service: Any) -> int:
         model_policy=_model_policy(o.model),
         metadata=_criteria_metadata(o),
     )
+    admit = getattr(service, "require_agent_ready", None)
+    if callable(admit):
+        try:
+            admit(request)
+        except Exception as exc:
+            from athena.protocol.errors import ServiceNotReady
+
+            if isinstance(exc, ServiceNotReady):
+                print(f"athena run: {exc.message}", file=sys.stderr)
+                return 2
+            raise
     surface = None
     from athena.cli.chat import _make_surface, _model_label
 
@@ -529,7 +540,15 @@ async def _cmd_run(o: Options, service: Any) -> int:
         # Start streaming before waiting so an interactive approval can wake
         # the parked task. Waiting first deadlocks supervised execution at the
         # service boundary and hides the OI-style operator surface.
-        task = await service.submit(request, wait=False)
+        try:
+            task = await service.submit(request, wait=False)
+        except Exception as exc:
+            from athena.protocol.errors import ServiceNotReady
+
+            if isinstance(exc, ServiceNotReady):
+                surface.render_notice(exc.message, status="NOT_READY")
+                return 2
+            raise
         task_id = getattr(task, "id", task)
         from athena.cli.chat import stream_task
 
@@ -551,10 +570,15 @@ async def _cmd_run(o: Options, service: Any) -> int:
                 status.value if status is not None and hasattr(status, "value") else str(status)
             )
             surface.render_result(summary, status=status_str)
-            return 0
+            normalized = status_str.strip().upper()
+            if normalized == "COMPLETE":
+                return 0
+            if normalized == "CANCELLED":
+                return 130
+            return 1
         # No result available: expose status anyway.
         surface.render_notice(f"[task {task_id} has no result yet]", status="PENDING")
-        return 0
+        return 1
     finally:
         async_closer = getattr(surface, "aclose", None)
         if callable(async_closer):
