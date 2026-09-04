@@ -400,3 +400,73 @@ async def test_kernel_selects_model_by_compiled_minimum_context():
 
     selection = await kernel._select_model(task=TaskStub(), compiled=compiled)
     assert (selection.provider, selection.model) == ("largeprov", "ctx-128k")
+
+
+# ---------------------------------------------------------------------- #
+# Model-granular fallback (task #12): excluding a failed (provider, model)
+# pair must NOT ban the provider's healthy sibling models. A bare provider
+# name in ``exclude`` still bans the whole provider (legacy behavior).
+# ---------------------------------------------------------------------- #
+
+
+class _MultiModelProvider(FakeModelProvider):
+    """One provider that offers several models under a single name."""
+
+    def __init__(self, provider: str, models: list[str], **kwargs) -> None:
+        super().__init__(provider=provider, model=models[0], **kwargs)
+        self._models = models
+
+    async def list_models(self) -> list:
+        from athena.protocol.models import ModelInfo
+
+        return [
+            ModelInfo(id=m, provider=self._provider, **self._info_kwargs)
+            for m in self._models
+        ]
+
+
+async def test_excluding_one_model_pair_keeps_healthy_sibling_models():
+    """Excluding (provider, bad) leaves (provider, good) eligible."""
+    provider = _MultiModelProvider("megaprov", ["model-good", "model-bad"])
+    reg = _registry({"megaprov": provider})
+    router = ModelRouter(reg)
+
+    sel = await router.select(exclude=frozenset({("megaprov", "model-bad")}))
+
+    assert sel.provider == "megaprov"
+    assert sel.model == "model-good"
+
+
+async def test_model_pair_exclusion_does_not_ban_provider_for_that_model_only():
+    """A healthy model survives even when a sibling pair is excluded."""
+    provider = _MultiModelProvider("megaprov", ["model-a", "model-b", "model-c"])
+    reg = _registry({"megaprov": provider})
+    router = ModelRouter(reg)
+
+    sel = await router.select(exclude=frozenset({("megaprov", "model-a")}))
+
+    assert sel.provider == "megaprov"
+    assert sel.model in {"model-b", "model-c"}
+    assert sel.model != "model-a"
+
+
+async def test_excluding_every_model_pair_exhausts_that_provider():
+    """When all of a provider's pairs are excluded, it cannot be selected."""
+    provider = _MultiModelProvider("megaprov", ["model-a", "model-b"])
+    reg = _registry({"megaprov": provider})
+    router = ModelRouter(reg)
+
+    with pytest.raises(ModelUnavailable):
+        await router.select(
+            exclude=frozenset({("megaprov", "model-a"), ("megaprov", "model-b")})
+        )
+
+
+async def test_bare_provider_name_still_excludes_the_whole_provider():
+    """Legacy whole-provider ban (bare provider string) is preserved."""
+    provider = _MultiModelProvider("megaprov", ["model-a", "model-b"])
+    reg = _registry({"megaprov": provider})
+    router = ModelRouter(reg)
+
+    with pytest.raises(ModelUnavailable):
+        await router.select(exclude=frozenset({"megaprov"}))

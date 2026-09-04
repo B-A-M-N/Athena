@@ -829,7 +829,11 @@ class AgentKernel:
         return compiled
 
     async def _select_model(
-        self, task: TaskSpec, compiled: CompiledContext, *, exclude: frozenset[str] = frozenset()
+        self,
+        task: TaskSpec,
+        compiled: CompiledContext,
+        *,
+        exclude: frozenset[str | tuple[str, str]] = frozenset(),
     ) -> ModelSelection:
         from athena.models.router import ModelRequirements
 
@@ -864,14 +868,22 @@ class AgentKernel:
     ) -> ModelResponse:
         role = getattr(task.model_policy, "role", None) or "primary"
         last_err: ProviderError | None = None
-        attempted: set[str] = set()
+        # Model-granular fallback (task #12): track failed (provider, model)
+        # pairs, NOT provider names, so a failing model on a multi-model
+        # provider does not ban that provider's healthy sibling models.
+        attempted: set[tuple[str, str]] = set()
         selection_for_attempt = selection
         for attempt in range(_FALLBACK_ATTEMPTS):
             if state.cancel.is_set():
                 raise RequestCancelled("task cancelled")
-            if selection_for_attempt.provider in attempted:
+            pair = (
+                selection_for_attempt.provider,
+                selection_for_attempt.model,
+            )
+            if pair in attempted:
                 raise last_err or ModelUnavailable(
-                    f"no candidate model excludes failed providers {sorted(attempted)}"
+                    f"no candidate model excludes failed model selections "
+                    f"{sorted(attempted)}"
                 )
             provider = self._registry.provider_for(selection_for_attempt.provider)
             attempt_metadata = await self._attempt_metadata(task, compiled, selection_for_attempt)
@@ -1107,7 +1119,11 @@ class AgentKernel:
                     raise
                 if attempt >= _FALLBACK_ATTEMPTS - 1:
                     break
-                attempted.add(selection_for_attempt.provider)
+                # Exclude the failed (provider, model) pair only; sibling
+                # models on the same provider remain candidates.
+                attempted.add(
+                    (selection_for_attempt.provider, selection_for_attempt.model)
+                )
                 selection_for_attempt = await self._select_model(
                     task, compiled, exclude=frozenset(attempted)
                 )

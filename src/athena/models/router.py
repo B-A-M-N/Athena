@@ -186,7 +186,7 @@ class ModelRouter:
         *,
         policy: ModelPolicy | None = None,
         requirements: ModelRequirements | None = None,
-        exclude: frozenset[str] = frozenset(),
+        exclude: frozenset[str | tuple[str, str]] = frozenset(),
     ) -> ModelSelection:
         policy = self._resolve_policy(policy or ModelPolicy())
         requirements = requirements or ModelRequirements()
@@ -202,7 +202,11 @@ class ModelRouter:
 
         candidates: list[ModelInfo] = []
         for info in models:
-            if info.provider in exclude:
+            # Exclusion is model-granular (task #12): a bare provider name
+            # excludes that provider entirely (legacy/whole-provider ban), while
+            # a ``(provider, model)`` pair excludes only that specific model so
+            # healthy sibling models on the same provider survive a retry.
+            if info.provider in exclude or (info.provider, info.id) in exclude:
                 continue
             if ready_providers is not None and info.provider not in ready_providers:
                 continue
