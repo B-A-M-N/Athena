@@ -139,3 +139,52 @@ async def test_action_task_with_observable_evidence_can_complete():
 
     assert decision.terminal is True
     assert decision.status is TaskStatus.COMPLETE
+
+
+# ---------------------------------------------------------------------- #
+# Verifier evidence reuse (task #13): ONE test/verification run counts once
+# and proves twice — a verified required criterion is itself the observable
+# work proof, so OBSERVABLE_WORK_REQUIRED is satisfied WITHOUT a separate
+# model execution (termination.verified_criteria_evidence reuse).
+# ---------------------------------------------------------------------- #
+
+
+class _CountingVerifier2:
+    """Records every verify() invocation and its view of the criteria."""
+
+    def __init__(self, outcome=True):
+        self.calls = 0
+        self.outcome = outcome
+
+    async def verify(self, task, criteria):
+        self.calls += 1
+        return [self.outcome for _ in criteria]
+
+
+async def test_verified_criteria_count_works_and_proves_twice():
+    """A single criteria-verification run satisfies BOTH the acceptance gate
+    and the observable-work gate (no separate model execution needed)."""
+    verifier = _CountingVerifier2(outcome=True)
+    evaluator = TerminationEvaluator(acceptance_verifier=verifier)
+
+    task = TaskSpec(
+        id="criteria-evidence",
+        objective="fix the failing test",
+        acceptance_criteria=(Criterion(id="c-tests", description="tests pass"),),
+    )
+
+    decision = await evaluator.evaluate(
+        task,
+        _response([TextBlock(type="text", text="all tests green")]),
+        iterations=1,
+        completion_mode=OBSERVABLE_WORK_REQUIRED,
+        observed_work=False,
+        work_evidence=(),
+    )
+
+    # COMPLETE not PARTIAL: the verified criterion is the work proof. The run
+    # counted once (criteria) and proved twice (the observable-work gate).
+    assert decision.terminal is True
+    assert decision.status is TaskStatus.COMPLETE
+    assert decision.unresolved == ()
+    assert verifier.calls == 1
