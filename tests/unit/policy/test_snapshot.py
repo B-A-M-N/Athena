@@ -148,6 +148,42 @@ def test_level_change_selects_different_snapshot():
     assert offline.rules.default == "deny"
 
 
+def test_path_rule_change_with_same_id_root_invalidates_snapshot():
+    """Two workspaces with the same id/root/revision but DIFFERENT path rules
+    must not share a snapshot — the guard compares rule CONTENT, not just the
+    preservation key, or the engine could serve a stale (wider or narrower)
+    authorization scope for a real workspace."""
+    unrestricted = WorkspaceSpec(
+        id="w1",
+        root="/tmp/ws",
+        writable=(),
+    )
+    narrow = WorkspaceSpec(
+        id="w1",
+        root="/tmp/ws",
+        writable=(PathRule("/tmp/ws/sub/**"),),
+    )
+    assert (unrestricted.root, unrestricted.revision) == (
+        narrow.root,
+        narrow.revision,
+    )
+    s1 = get_snapshot(level=AutonomyLevel.CODING, workspace=unrestricted, task_policy=None)
+    # Unrestricted writable compiles to an empty rule tuple...
+    assert s1.writable_rules == ()
+    # ...and the guard must REJECT it for the differently-scoped workspace.
+    assert not s1.guards_match(
+        level=AutonomyLevel.CODING,
+        workspace=narrow,
+        task_policy=None,
+        policy_revision="1",
+    )
+    # Writing under the narrow scope must now be denied, not served by an
+    # unrestricted stale snapshot.
+    s2 = get_snapshot(level=AutonomyLevel.CODING, workspace=narrow, task_policy=None)
+    assert s2 is not s1
+    assert s2.writable_rules == ("/tmp/ws/sub/**",)
+
+
 def test_workspace_revision_change_invalidates_snapshot():
     ws_v1 = WorkspaceSpec(
         id="w1",

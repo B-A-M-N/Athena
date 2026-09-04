@@ -95,6 +95,10 @@ class PolicySnapshot:
             and self.workspace_revision == workspace.revision
             and self.workspace_root_raw == workspace.root
             and self.network_policy == workspace.network_policy
+            and self.writable_rules == _rule_paths(workspace.writable)
+            and self.readable_rules == _rule_paths(
+                workspace.readable or workspace.writable
+            )
         )
 
 
@@ -183,19 +187,35 @@ def _canonical(path: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
 
 
+def _rule_paths(rules) -> tuple[str, ...]:
+    return tuple(_canonical_rule(r.path) for r in (rules or ()))
+
+
 def _canonical_rule(pattern: str) -> str:
     """Canonicalize a rule path at build time, preserving glob metacharacters.
 
     Globs canonicalize on their literal prefix (``/tmp/ws/*.log`` resolves
     to ``/tmp/ws`` + ``/*.log``) so fnmatch sees an absolute pattern without
-    re-realpathing on the hot path.
+    re-realpathing on the hot path. The separator before the first glob
+    metacharacter is preserved: ``/tmp/ws/**`` -> ``/tmp/ws`` + ``/**``, not
+    ``/tmp/ws**``.
     """
     text = os.path.expanduser(str(pattern))
     if "*" in text or "?" in text or "[" in text:
+        # Take the literal dirname preceding the first glob metacharacter,
+        # canonicalize it, then re-append the glob (which begins at the
+        # separator it originally followed). "/tmp/ws/**" -> "/tmp/ws" + "/**".
         for i, ch in enumerate(text):
             if ch in "*?[":
-                prefix = os.path.realpath(os.path.abspath(text[:i].rstrip("/\\") or "/"))
-                return prefix + text[i:]
+                # The glob starts at the separator that precedes the first
+                # metacharacter: "/tmp/ws/**" -> the literal prefix
+                # "/tmp/ws/" canonicalized as the directory "/tmp/ws", then
+                # + "/**".
+                cut_at = i - 1 if (i > 0 and text[i - 1] == "/") else i
+                canonical_dir = os.path.realpath(
+                    os.path.abspath(text[:cut_at] or "/")
+                ).rstrip("/\\")
+                return canonical_dir + text[cut_at:]
         return text
     return os.path.realpath(os.path.abspath(text))
 

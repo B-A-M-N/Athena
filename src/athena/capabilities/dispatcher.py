@@ -1109,6 +1109,7 @@ class CapabilityDispatcher:
                 )
                 return [result]
 
+        batch_lock = asyncio.Lock()
         results = await asyncio.gather(
             *[
                 self._dispatch_with_controls(
@@ -1123,6 +1124,7 @@ class CapabilityDispatcher:
                     verification_environment=verification_environment,
                     directives=(_directives_by_call_id or {}).get(r.call_id),
                     prepared=preflight,
+                    batch_order_lock=batch_lock,
                 )
                 for r in requests
             ],
@@ -1132,6 +1134,30 @@ class CapabilityDispatcher:
             _wrap_exception(r, requests[i]) if isinstance(r, BaseException) else r
             for i, r in enumerate(results)
         ]
+
+    def _batch_order(
+        self,
+        request: CapabilityRequest,
+        workspace: WorkspaceSpec,
+        effects: tuple[EffectClass, ...],
+        batch_order_lock: asyncio.Lock | None,
+    ) -> list[asyncio.Lock] | list[asyncio.Lock]:
+        """Ordering for one call, or [] when it may parallelize.
+
+        Resource-ambiguous dependency-bearing calls — a write/delete/child/
+        external with no concrete named resource — cannot prove independence
+        from siblings mutating ambient state, so they serialize against each
+        other in model order (asyncio.Lock is FIFO). Named-path calls
+        (already per-resource-locked, different paths independently parallel)
+        and pure reads bypass it.
+        """
+        if batch_order_lock is None:
+            return []
+        if not _is_ordering_sensitive(effects):
+            return []
+        if self._locks_for_request(request, workspace, effects):
+            return []
+        return [batch_order_lock]
 
     async def _dispatch_with_controls(
         self,
@@ -1147,6 +1173,7 @@ class CapabilityDispatcher:
         verification_environment: Any,
         directives: DispatchDirectives | None,
         prepared: bool,
+        batch_order_lock: asyncio.Lock | None = None,
     ):
         """Apply task concurrency and resource conflict controls.
 
@@ -1165,7 +1192,16 @@ class CapabilityDispatcher:
 
         locks = self._locks_for_request(request, workspace, effects)
 
+        # Resource-ambiguous dependency-bearing calls join a per-batch
+        # ordering lane; named-path calls (already in ``locks``) and pure
+        # reads do not. Ambiguous means: carries a dependency-bearing effect
+        # but resolved no concrete resource key, so it cannot prove
+        # independence from sibling mutations/executes on ambient state.
+        order = self._batch_order(request, workspace, effects, batch_order_lock)
+
         async def invoke_with_locks():
+            for lock in order:
+                await lock.acquire()
             for lock in locks:
                 await lock.acquire()
             try:
@@ -1184,6 +1220,8 @@ class CapabilityDispatcher:
                 )
             finally:
                 for lock in reversed(locks):
+                    lock.release()
+                for lock in reversed(order):
                     lock.release()
 
         lease = None
@@ -1796,6 +1834,33 @@ def _is_execution(effects: tuple[EffectClass, ...]) -> bool:
         & {
             EffectClass.EXECUTE,
             EffectClass.SPAWN_PROCESS,
+        }
+    )
+
+
+def _is_ordering_sensitive(effects: tuple[EffectClass, ...]) -> bool:
+    """Whether a resource-less call must serialize against sibling mutations.
+
+    Write/delete/external/network-write calls that name NO concrete resource
+    act on ambient state and cannot prove independence, so they join the batch
+    order lane. Named-path mutations already serialize per-resource (different
+    paths run parallel) — defined there, they bypass the lane. EXECUTE/SPAWN
+    are intentionally excluded: the execution-lease semaphore is their
+    concurrency-volume authority, and write-vs-execute ordering on a shared
+    named resource is already handled by the per-resource lock. Pure reads are
+    never ordering-sensitive.
+    """
+    return bool(
+        set(effects)
+        & {
+            EffectClass.WRITE_LOCAL,
+            EffectClass.DELETE,
+            EffectClass.NETWORK_WRITE,
+            EffectClass.EXTERNAL_PUBLISH,
+            EffectClass.EXTERNAL_MESSAGE,
+            EffectClass.FINANCIAL,
+            EffectClass.PRIVILEGED,
+            EffectClass.COMPUTER_INPUT,
         }
     )
 
