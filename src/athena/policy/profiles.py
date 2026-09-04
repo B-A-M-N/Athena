@@ -116,12 +116,28 @@ _BUILDERS = {
 }
 
 
+_RULESET_CACHE: dict[AutonomyLevel, RuleSet] = {}
+
+
 def profile_ruleset(level: AutonomyLevel | str) -> RuleSet:
+    """Return the profile's RuleSet.
+
+    RuleSets are immutable and the profile builders are pure, so the compiled
+    set is shared per level. This is a pure accelerator: the rule CONTENT is
+    unchanged and the builders remain the sole authority — a code change to a
+    builder produces a different RuleSet the next time this process builds
+    it, and tests that need isolation can clear ``_RULESET_CACHE``.
+    """
     key = level if isinstance(level, AutonomyLevel) else AutonomyLevel(level)
+    cached = _RULESET_CACHE.get(key)
+    if cached is not None:
+        return cached
     builder = _BUILDERS.get(key)
     if builder is None:
         raise KeyError(f"unknown autonomy profile: {key}")
-    return builder()
+    ruleset = builder()
+    _RULESET_CACHE[key] = ruleset
+    return ruleset
 
 
 def available_profiles() -> tuple[AutonomyLevel, ...]:

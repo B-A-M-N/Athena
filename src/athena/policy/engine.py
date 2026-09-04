@@ -25,8 +25,8 @@ import os
 from typing import Optional
 
 from athena.policy.approvals import ApprovalManager
-from athena.policy.profiles import profile_ruleset
 from athena.policy.rules import RuleSet
+from athena.policy.snapshot import get_snapshot
 from athena.protocol.capabilities import EffectClass
 from athena.protocol.policy import ApprovalScope, PolicyDecision, PolicyRequest, PolicyVerdict
 from athena.protocol.tasks import AutonomyLevel, NetworkPolicy, WorkspaceSpec
@@ -53,9 +53,13 @@ class PolicyEngine:
         self,
         profile: AutonomyLevel | str = AutonomyLevel.SUPERVISED,
         approvals: Optional[ApprovalManager] = None,
+        policy_revision: str = "1",
     ) -> None:
         self.profile: AutonomyLevel = _to_level(profile)
         self.approvals: ApprovalManager = approvals or ApprovalManager()
+        # Bumped by an authority holder when rule SOURCE changes out-of-band
+        # (external rule sources); profile builders are static per process.
+        self._policy_revision = str(policy_revision)
 
     # --------------------------------------------------------------- entry
     def evaluate(
@@ -85,7 +89,17 @@ class PolicyEngine:
         3. approval — an active grant converts ASK into ALLOW only.
         """
         level = _to_level(autonomy or self.profile)
-        rules = profile_ruleset(level)
+        # Compiled accelerator (P1): the snapshot carries the ordered ruleset
+        # and canonical workspace paths. It is validated against live
+        # revision guards on every use and holds no verdicts of its own —
+        # all authority stays in this method's composition.
+        snapshot = get_snapshot(
+            level=level,
+            workspace=request.workspace,
+            task_policy=None,
+            policy_revision=self._policy_revision,
+        )
+        rules = snapshot.rules
 
         # ---- 1. hard containment (structural, approval-proof) ------------ #
         structural = self._eval_containment(request, level)
@@ -301,15 +315,29 @@ class PolicyEngine:
         return os.path.realpath(os.path.abspath(os.path.join(ws.root, path)))
 
     def _within(self, target, ws: WorkspaceSpec, *, writable_only: bool) -> bool:
-        root = os.path.realpath(os.path.abspath(ws.root))
+        """Path-scope containment against precompiled workspace identity.
+
+        The canonical root and canonical rule paths come from the compiled
+        snapshot (guarded by revision, rebuilt on mismatch); only the
+        request's target is canonicalized per call.
+        """
+        target = os.path.realpath(os.path.abspath(target))
+        snapshot = get_snapshot(
+            level=self.profile,
+            workspace=ws,
+            task_policy=None,
+            policy_revision=self._policy_revision,
+        )
+        root = snapshot.workspace_root
         if target != root and not target.startswith(root + _SEP):
             return False
         rules = ws.writable if writable_only else (ws.readable if ws.readable else ws.writable)
         if not rules:
             return True
+        canonical_rules = snapshot.writable_rules if writable_only else snapshot.readable_rules
         matched = False
-        for rule in rules:
-            if _path_match(target, rule.path):
+        for rule, pattern_real in zip(rules, canonical_rules):
+            if _path_match_canonical(target, pattern_real):
                 if not rule.allow:
                     return False
                 matched = True
@@ -402,6 +430,23 @@ def _primary(effects) -> Optional[EffectClass]:
     return None
 
 
+def _canonical_rule_path(pattern: str) -> str:
+    """Canonicalize a rule path, keeping glob metacharacters intact.
+
+    Globs are canonicalized on their literal prefix so ``/tmp/ws/*.log``
+    resolves ``/tmp/ws`` but preserves the ``*`` for fnmatch at compare time.
+    """
+    text = os.path.expanduser(str(pattern))
+    if "*" in text or "?" in text or "[" in text:
+        # Canonicalize the longest glob-free prefix; fnmatch handles the rest.
+        for i, ch in enumerate(text):
+            if ch in "*?[":
+                prefix = os.path.realpath(os.path.abspath(text[:i].rstrip("/\\") or "/"))
+                return prefix + text[i:]
+        return text
+    return os.path.realpath(os.path.abspath(text))
+
+
 def _path_match(target: str, pattern: str) -> bool:
     """Match a canonical target against a workspace path rule.
 
@@ -411,12 +456,15 @@ def _path_match(target: str, pattern: str) -> bool:
     makes relative and ``~``-prefixed rules behave consistently at both
     authority boundaries.
     """
-    target_real = os.path.realpath(os.path.abspath(target))
-    pattern_text = os.path.expanduser(str(pattern))
-    if "*" in pattern_text or "?" in pattern_text or "[" in pattern_text:
-        return fnmatch.fnmatch(target_real, os.path.realpath(os.path.abspath(pattern_text)))
-    pattern_real = os.path.realpath(os.path.abspath(pattern_text))
-    return target_real == pattern_real or target_real.startswith(pattern_real + _SEP)
+    return _path_match_canonical(
+        os.path.realpath(os.path.abspath(target)), _canonical_rule_path(pattern)
+    )
+
+
+def _path_match_canonical(target: str, pattern_real: str) -> bool:
+    if "*" in pattern_real or "?" in pattern_real or "[" in pattern_real:
+        return fnmatch.fnmatch(target, pattern_real)
+    return target == pattern_real or target.startswith(pattern_real + _SEP)
 
 
 def _execute_granted(level: AutonomyLevel, req) -> bool:
