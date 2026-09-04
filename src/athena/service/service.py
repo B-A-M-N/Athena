@@ -175,6 +175,7 @@ class AthenaService:
         hermes_referee: HermesReferee | None = None,
     ) -> None:
         self.config = config or AthenaConfig()
+        self._background_tasks: set[asyncio.Task] = set()
         # Optional OI/device adapter surface.  Reflection must receive the
         # configured provider at registration time instead of silently
         # reporting "unsupported" for a provider owned by the host.
@@ -2080,10 +2081,37 @@ class AthenaService:
         # use the TaskSpec objective. This prevents same-session tasks from
         # inheriting whichever unrelated turn happened to be most recent.
         await self._record_canonical_user_turn(user_request or created, created)
+        # Precompute the revisioned static context concurrently with worker
+        # pickup (P1: precompute before first inference). The compile path
+        # remains the sole authority — this only warms its cache, guarded by
+        # the same revisions, so a stale warm entry is recomputed, never
+        # trusted. Failure is swallowed: prefetch must never fail admission.
+        self._spawn_static_prefetch(created)
         await task_manager.enqueue(created.id)
         if wait:
             await self.wait_for(created.id)
         return created
+
+    def _spawn_static_prefetch(self, task: TaskSpec) -> None:
+        compiler = self._compiler
+        if compiler is None or not hasattr(compiler, "precompute_static"):
+            return
+
+        async def _prefetch() -> None:
+            try:
+                await compiler.precompute_static(task)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        try:
+            worker = asyncio.create_task(_prefetch())
+        except Exception:  # pragma: no cover - no running loop
+            return
+        # Keep a strong ref until the task finishes (asyncio would otherwise
+        # GC it mid-await), then drop it so completed workers never
+        # accumulate.
+        self._background_tasks.add(worker)
+        worker.add_done_callback(self._background_tasks.discard)
 
     async def _record_canonical_user_turn(self, request: Any, task: TaskSpec) -> None:
         """Append the service-owned user turn exactly once before enqueueing."""

@@ -404,6 +404,30 @@ class ContextCompiler:
                 self._static_cache.popitem(last=False)
         return static
 
+    async def precompute_static(self, task: TaskSpec) -> bool:
+        """Warm the revisioned static context before the task's first turn.
+
+        Called between task admission and worker pickup so the first
+        inference's compile pays only the dynamic half (transcript loading,
+        binding, budgeting). Purely an accelerator over ``_load_static_context``:
+        same key, same content, same revision guards — a stale entry is
+        recomputed by the normal path, never trusted past its revision.
+
+        Returns whether a cacheable entry was produced (``False`` when the
+        task's stores expose no revision, in which case static context is
+        recomputed per turn by design).
+        """
+        try:
+            static = await self._load_static_context(task)
+        except Exception:
+            # Prefetch must never fail admission: the normal compile path
+            # owns error surfacing.
+            return False
+        return self._static_cache_key_hit(task)
+
+    def _static_cache_key_hit(self, task: TaskSpec) -> bool:
+        return self._static_context_key(task) is not None
+
     def _static_context_key(self, task: TaskSpec) -> tuple[Any, ...] | None:
         """Build a cache key only from stores that expose invalidation revisions."""
         revisions: list[Any] = []
@@ -766,7 +790,32 @@ class ContextCompiler:
                 {},
                 "miss",
             )
+        if selected and not is_explicit_response_turn(task.objective):
+            selected = self._ensure_reflection_visible(selected, descriptors)
         return selected, records, "resolved" if selected else "miss"
+
+    def _ensure_reflection_visible(
+        self,
+        selected: list[CapabilityDescriptor],
+        descriptors: list[CapabilityDescriptor],
+    ) -> list[CapabilityDescriptor]:
+        """Keep the ``capabilities`` reflection affordance on every
+        work-bearing surface.
+
+        Hierarchical disclosure contract: the compiled working set is small,
+        but reflection must always remain available on turns that can work,
+        so the model can expand the surface without a discovery round-trip
+        failing closed. Precomputation may shrink what is shown by default;
+        it may NOT decide what Athena is allowed to look for.
+        """
+        if any(descriptor.id == "capabilities" for descriptor in selected):
+            return selected
+        reflection = next(
+            (item for item in descriptors if item.id == "capabilities"), None
+        )
+        if reflection is None:
+            return selected
+        return [*selected, reflection]
 
     def _fallback_bundle(
         self,
