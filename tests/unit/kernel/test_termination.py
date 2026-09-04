@@ -9,6 +9,7 @@ from athena.kernel.termination import TerminationDecision, TerminationEvaluator
 from athena.protocol.models import ModelResponse, UsageInfo
 from athena.protocol.messages import CapabilityCallBlock, TextBlock
 from athena.protocol.tasks import Criterion, MutationMode, TaskSpec, TaskStatus, WorkspaceSpec
+from athena.strategy import OBSERVABLE_WORK_REQUIRED
 
 
 @pytest.fixture
@@ -107,3 +108,34 @@ async def test_reality_coordinator_owns_speculative_candidate_proof():
     assert decision.status is TaskStatus.COMPLETE
     assert "delegated" in decision.reason
     assert verifier.calls == 0
+
+
+async def test_action_task_without_observable_evidence_is_partial():
+    task = TaskSpec(id="action-no-proof", objective="read the project file")
+
+    decision = await TerminationEvaluator().evaluate(
+        task,
+        _response([TextBlock(type="text", text="I read it and it looks good")]),
+        iterations=1,
+        completion_mode=OBSERVABLE_WORK_REQUIRED,
+        observed_work=False,
+    )
+
+    assert decision.terminal is True
+    assert decision.status is TaskStatus.PARTIAL
+    assert decision.unresolved == ("observable_work",)
+
+
+async def test_action_task_with_observable_evidence_can_complete():
+    task = TaskSpec(id="action-proof", objective="read the project file")
+
+    decision = await TerminationEvaluator().evaluate(
+        task,
+        _response([TextBlock(type="text", text="The file contains the requested value")]),
+        iterations=1,
+        completion_mode=OBSERVABLE_WORK_REQUIRED,
+        observed_work=True,
+    )
+
+    assert decision.terminal is True
+    assert decision.status is TaskStatus.COMPLETE

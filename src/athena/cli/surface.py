@@ -262,13 +262,27 @@ class OperatorSurface:
             return
 
         if event_type in {
-            "MutationRecorded",
-            "MutationRecordFailed",
-            "MutationRolledBack",
             "MemoryCandidateCreated",
+            "MemoryCandidatesRecorded",
             "MemoryWritten",
             "SkillCandidateCreated",
             "SkillActivated",
+        }:
+            if self.details:
+                labels = {
+                    "MemoryCandidateCreated": "memory candidate recorded",
+                    "MemoryCandidatesRecorded": "memory candidates recorded",
+                    "MemoryWritten": "memory written",
+                    "SkillCandidateCreated": "skill candidate recorded",
+                    "SkillActivated": "skill activated",
+                }
+                self._write(f"  · {labels[event_type]}")
+            return
+
+        if event_type in {
+            "MutationRecorded",
+            "MutationRecordFailed",
+            "MutationRolledBack",
             "InterpreterProposalDispatched",
             "ToolInputCorrectionExhausted",
             "RecoveryStarted",
@@ -278,10 +292,6 @@ class OperatorSurface:
                 "MutationRecorded": "mutation recorded",
                 "MutationRecordFailed": "mutation record failed",
                 "MutationRolledBack": "mutation rolled back",
-                "MemoryCandidateCreated": "memory candidate captured",
-                "MemoryWritten": "knowledge saved",
-                "SkillCandidateCreated": "skill candidate captured",
-                "SkillActivated": "skill activated",
                 "InterpreterProposalDispatched": "computer proposal dispatched",
                 "ToolInputCorrectionExhausted": "tool repair budget exhausted",
                 "RecoveryStarted": "recovery started",

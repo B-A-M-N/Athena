@@ -30,6 +30,20 @@ class _Executor:
             id=capability_id,
             description=capability_id,
             input_schema={"type": "object"},
+            tags=frozenset(
+                [
+                    capability_id,
+                    *{
+                        "fs": "file read inspect fix",
+                        "execute": "run test tests command",
+                        "git": "diff repository",
+                        "research": "source latest release evidence",
+                        "diagnostics": "inspect broken debug",
+                    }
+                    .get(capability_id, "")
+                    .split(),
+                ]
+            ),
             origin=CapabilityOrigin.PROJECT,
         )
 
@@ -154,6 +168,31 @@ def test_search_uses_current_generated_prerequisite_evidence(tmp_path):
     item = next(item for item in result if item["id"] == generated.id)
     assert item["optimizer"]["dependency_available"] is False
     assert item["optimizer"]["environment_compatible"] is False
+
+
+def test_real_fabric_search_keeps_casual_prose_out_of_action_surface():
+    registry = CapabilityRegistry()
+    for capability_id in ("fs", "execute", "git", "research", "diagnostics"):
+        registry.register(_Executor(capability_id))
+    fabric = CapabilityFabric(registry)
+
+    cases = {
+        "hello": set(),
+        "thanks": set(),
+        "tell me a short joke": set(),
+        "explain recursion": set(),
+        "what is 2 + 2": set(),
+        "read pyproject.toml": {"fs"},
+        "show me the git diff": {"git"},
+        "run the tests": {"execute"},
+        "fix the failing tests": {"fs", "execute"},
+        "inspect why this app is broken": {"fs", "diagnostics"},
+        "research the latest release": {"research"},
+    }
+
+    for query, expected in cases.items():
+        actual = {item["id"] for item in fabric.search(query)}
+        assert actual == expected, query
 
 
 def test_search_rejects_missing_locked_generated_dependency(tmp_path):

@@ -332,28 +332,38 @@ class SessionRepository:
             "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
             (session_id, limit),
         )
-        result: list[Message] = []
-        for row in rows:
-            blocks_data = json.loads(row["blocks"]) if row.get("blocks") else []
-            blocks = tuple(_deserialize_block(b) for b in blocks_data)
-            prov_data = json.loads(row["provenance"]) if row.get("provenance") else None
-            prov = (
-                _deserialize_provenance(prov_data)
-                if prov_data
-                else Provenance(source_type=SourceType.RUNTIME)
-            )
-            meta = json.loads(row["metadata"]) if row.get("metadata") else {}
-            result.append(
-                Message(
-                    id=row["id"],
-                    role=Role(row["role"]),
-                    blocks=blocks,
-                    created_at=datetime.fromisoformat(row["created_at"]),
-                    provenance=prov,
-                    metadata=meta,
-                )
-            )
-        return result
+        return [_message_from_row(row) for row in rows]
+
+    async def list_recent_messages(self, session_id: str, limit: int = 100) -> list[Message]:
+        rows = await self._db.fetch_all(
+            "SELECT * FROM ("
+            "SELECT rowid AS _message_rowid, * FROM messages WHERE session_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?"
+            ") ORDER BY created_at ASC, _message_rowid ASC",
+            (session_id, limit),
+        )
+        return [_message_from_row(row) for row in rows]
+
+
+def _message_from_row(row: dict[str, Any]) -> Message:
+    """Decode one persisted message for both chronological list APIs."""
+    blocks_data = json.loads(row["blocks"]) if row.get("blocks") else []
+    blocks = tuple(_deserialize_block(b) for b in blocks_data)
+    prov_data = json.loads(row["provenance"]) if row.get("provenance") else None
+    prov = (
+        _deserialize_provenance(prov_data)
+        if prov_data
+        else Provenance(source_type=SourceType.RUNTIME)
+    )
+    meta = json.loads(row["metadata"]) if row.get("metadata") else {}
+    return Message(
+        id=row["id"],
+        role=Role(row["role"]),
+        blocks=blocks,
+        created_at=datetime.fromisoformat(row["created_at"]),
+        provenance=prov,
+        metadata=meta,
+    )
 
 
 def _serialize_workspace(ws: WorkspaceSpec | None) -> str | None:

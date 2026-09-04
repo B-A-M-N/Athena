@@ -7,10 +7,13 @@ version 8 is authoritative for the live scene inside the right CRT.
 ## Reference and resize behavior
 
 - Reference design space: **1672 × 941**.
-- The complete cabinet is uniformly scaled by `min(window_width / 1672,
-  window_height / 941)` and centered in the window.
-- Unused space is letterboxed. The cabinet is never independently stretched
-  horizontally or vertically.
+- The reference remains the authoring space, while the native chassis fills the
+  actual drawable. `scale_x` and `scale_y` map responsive anchors into the
+  window; `scale` remains the minimum axis scale for legibility and physical
+  stroke sizing.
+- There is no intentional letterbox or dead outer moat. The shell edge stays
+  close to the real window edge, while the two apertures retain their measured
+  relationship and the right CRT keeps its deeper, rounder treatment.
 - The native window advertises a usable minimum size of 900 × 620. The
   internal layout remains safe and compact if a window manager supplies a
   smaller surface.
@@ -56,16 +59,24 @@ and hint rows are measured from the live Xft role metrics. At small sizes the
 hint is omitted first, then status; the input row is clamped as a last resort.
 No row may draw outside the prompt rectangle.
 Physical module labels use a clipped bitmap design layer and are placed in
-reference units. Dynamic Xft text is limited to live transcript/prompt/status
-content.
+reference units. Dynamic transcript/prompt/status content prefers Xft and
+retains a clipped OpenGL bitmap fallback for GLX pixmaps where XRender text is
+not composited reliably.
 
 ## Dynamic ownership
 
+- AthenaBOX is authoritative for the physical enclosure: graphite shell,
+  fascia, seams, wells, controls, engraved labels, CRT recess, glass rim, and
+  material/wear treatment all belong to the native renderer.
+- DAGOAL is authoritative only for the live scene inside the right CRT. Its
+  semantic projection supplies workspace/runtime objects, code previews,
+  verification checks, state colors, attention items, and Buddy semantic
+  pose/frame selection; the native layer does not invent task truth.
 - The left display owns conversation/transcript history and uses the PTY size
   derived from its transcript viewport.
-- The right CRT owns current task state. Its low-resolution scene uses semantic
-  workspace/runtime objects, actual code previews, verification checks,
-  Buddy pose/frame state, and true perspective paths.
+- The right CRT renders the semantic projection as a live visual world. The
+  actor, dot-field perspective, state-specific object, and concise telemetry
+  are one composition; telemetry must not become a second dashboard.
 - Approvals and noteworthy notifications are derived from projection
   `attention_items`. They appear as a bounded right-edge rail inside the CRT;
   they never replace the live scene. Execution gating remains owned by the
@@ -96,3 +107,11 @@ scripts/native-cabinet-golden
 
 It compares `native/assets/athenabox/cabinet-golden.png` at 1672 × 941; the
 baseline is mandatory whenever Xvfb/ImageMagick are available.
+
+Dynamic visual goldens are mandatory release evidence, not an optional local
+directory. They live under `native/assets/oi/visual-goldens/` and cover the
+1672 × 941 idle/search/code/approval surfaces, 1280 × 800 idle/active
+surfaces, all three built-in Buddys, and fixed-clock temporal samples for
+idle, search, code, execute, failure, and recover. A change to the native
+renderer must update those images deliberately after human review; missing or
+unreviewed goldens fail the visual gate.

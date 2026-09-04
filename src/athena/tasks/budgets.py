@@ -111,7 +111,7 @@ def _duration_ms(u: Usage) -> int:
 
 @dataclass(frozen=True)
 class DefaultBudget:
-    max_agent_iterations: int = 100
+    max_agent_iterations: int = 50
     max_children: int = 4
     max_child_depth: int = 1
 

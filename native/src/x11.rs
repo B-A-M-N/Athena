@@ -89,6 +89,9 @@ const GL_PROJECTION: u32 = 0x1701;
 const GL_MODELVIEW: u32 = 0x1700;
 const GL_SCISSOR_TEST: u32 = 0x0c11;
 const GL_STENCIL_TEST: u32 = 0x0b90;
+const GL_BLEND: u32 = 0x0be2;
+const GL_SRC_ALPHA: u32 = 0x0302;
+const GL_ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
 const GL_ALWAYS: u32 = 0x0207;
 const GL_EQUAL: u32 = 0x0202;
 const GL_KEEP: u32 = 0x1e00;
@@ -126,6 +129,17 @@ const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RESIZE_EDGE: i32 = 12;
 const GRAB_MODE_ASYNC: c_int = 1;
+
+fn initial_window_size(display: *mut Display, screen: c_int) -> (i32, i32) {
+    let screen_width = unsafe { XDisplayWidth(display, screen) }.max(640);
+    let screen_height = unsafe { XDisplayHeight(display, screen) }.max(480);
+    // Leave a small amount of desktop context while opening large enough to
+    // expose the actual cabinet proportions immediately.
+    (
+        ((screen_width as f32 * 0.88).round() as i32).clamp(640, screen_width),
+        ((screen_height as f32 * 0.88).round() as i32).clamp(480, screen_height),
+    )
+}
 
 /// Supplies the phase used by the composed presentation.
 ///
@@ -473,6 +487,7 @@ pub struct RendererOptions {
     pub mascot: String,
     pub animations: bool,
     pub reduced_motion: bool,
+    pub text_scale: f32,
     pub cabinet_only: bool,
 }
 
@@ -489,6 +504,7 @@ impl Default for RendererOptions {
             mascot: "owl".to_owned(),
             animations: true,
             reduced_motion: false,
+            text_scale: 1.0,
             cabinet_only: false,
         }
     }
@@ -522,6 +538,8 @@ unsafe extern "C" {
         height: CUint,
     ) -> c_int;
     fn XDefaultVisual(display: *mut Display, screen: c_int) -> *mut c_void;
+    fn XDisplayWidth(display: *mut Display, screen: c_int) -> c_int;
+    fn XDisplayHeight(display: *mut Display, screen: c_int) -> c_int;
     fn XDefaultDepth(display: *mut Display, screen: c_int) -> c_int;
     fn XDefaultColormap(display: *mut Display, screen: c_int) -> Colormap;
     fn XCreateColormap(
@@ -925,6 +943,8 @@ unsafe extern "C" {
     fn glEnable(cap: u32);
     fn glDisable(cap: u32);
     fn glColorMask(red: u8, green: u8, blue: u8, alpha: u8);
+    fn glColor4f(red: f32, green: f32, blue: f32, alpha: f32);
+    fn glBlendFunc(source: u32, destination: u32);
     fn glStencilMask(mask: u32);
     fn glStencilFunc(function: u32, reference: c_int, mask: u32);
     fn glStencilOp(sfail: u32, dpfail: u32, dppass: u32);
@@ -1317,7 +1337,11 @@ pub fn run(
 /// CI machines without an X server deliberately fall back in `main.rs`, but
 /// that output is tagged as static so a layout dump can never masquerade as a
 /// live font measurement.
-pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_json::Value, String> {
+pub(crate) fn dump_live_layout_json(
+    width: i32,
+    height: i32,
+    text_scale: f32,
+) -> Result<serde_json::Value, String> {
     let display = unsafe { XOpenDisplay(ptr::null()) };
     if display.is_null() {
         return Err("could not open an X11 display for live layout metrics".to_owned());
@@ -1370,8 +1394,7 @@ pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_jso
         return Err("could not create an X11 drawable for live layout metrics".to_owned());
     }
     let result = (|| {
-        let scale = FrameGeometry::scale_for_window(width, height);
-        let text = TextRenderer::new(display, screen, window, visual, colormap, scale)?;
+        let text = TextRenderer::new(display, screen, window, visual, colormap, text_scale)?;
         let metrics = UiFontMetrics {
             body: text.metrics_for(FontRole::Body),
             input: text.metrics_for(FontRole::Input),
@@ -1397,6 +1420,7 @@ pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_jso
             .as_object_mut()
             .ok_or_else(|| "native layout did not serialize as an object".to_owned())?;
         object.insert("metrics_source".to_owned(), serde_json::json!("live_xft"));
+        object.insert("text_scale".to_owned(), serde_json::json!(text_scale));
         object.insert("metrics".to_owned(), serde_json::to_value(metrics).unwrap());
         object.insert(
             "font_pixel_sizes".to_owned(),
@@ -1491,14 +1515,15 @@ fn run_window(
         colormap,
         cursor: 0,
     };
+    let (initial_width, initial_height) = initial_window_size(display, screen);
     let window = unsafe {
         XCreateWindow(
             display,
             root,
             0,
             0,
-            1280,
-            800,
+            initial_width as CUint,
+            initial_height as CUint,
             0,
             (*visual).depth,
             INPUT_OUTPUT as CUint,
@@ -1531,8 +1556,8 @@ fn run_window(
         window,
         visual,
         unsafe { (*visual).depth as CUint },
-        1280,
-        800,
+        initial_width as CUint,
+        initial_height as CUint,
     ) {
         Ok(surface) => surface,
         Err(error) => {
@@ -1556,7 +1581,7 @@ fn run_window(
         return Err("could not make the native presentation surface current".to_owned());
     }
     let visual_ptr = unsafe { (*visual).visual };
-    let initial_scale = FrameGeometry::scale_for_window(1280, 800);
+    let mut text_zoom = options.text_scale.clamp(0.75, 2.5);
     let mut resize_cursors = ResizeCursors::new(display);
     let mut text = match TextRenderer::new(
         display,
@@ -1564,7 +1589,7 @@ fn run_window(
         presentation_surface.pixmap,
         visual_ptr,
         colormap,
-        initial_scale,
+        text_zoom,
     ) {
         Ok(text) => text,
         Err(error) => {
@@ -1589,8 +1614,8 @@ fn run_window(
     let mut input_buffer = InputBuffer::default();
     let mut presentation = PresentationSettings::default();
     let mut selection: Option<((usize, usize), (usize, usize))> = None;
-    let mut width = 1280_i32;
-    let mut height = 800_i32;
+    let mut width = initial_width;
+    let mut height = initial_height;
     let mut metrics = UiFontMetrics {
         body: text.metrics_for(FontRole::Body),
         input: text.metrics_for(FontRole::Input),
@@ -1598,7 +1623,14 @@ fn run_window(
         instrument: text.metrics_for(FontRole::Instrument),
     };
     resize_terminal(core, pty, width, height, metrics);
-    write_runtime_layout_dump(width, height, metrics, text.font_pixel_sizes(), 0);
+    write_runtime_layout_dump(
+        width,
+        height,
+        metrics,
+        text.font_pixel_sizes(),
+        text_zoom,
+        0,
+    );
     resize_cursors.set(window, None);
     // XSetInputFocus is a BadMatch until the WM has made the mapped window
     // viewable.  Defer the first request to MapNotify and only request focus
@@ -1665,16 +1697,17 @@ fn run_window(
             match event.type_ {
                 MAP_NOTIFY => {
                     mapped = true;
-                    if focus_pending && !window_destroyed {
-                        if set_input_focus_if_mapped(display, window, mapped) {
-                            if let Some(input_method) = input_method.as_ref() {
-                                unsafe { XSetICFocus(input_method.ic) };
-                            }
-                            focus_pending = false;
-                            focused = true;
-                            dirty = true;
-                            activity_dirty = true;
+                    if focus_pending
+                        && !window_destroyed
+                        && set_input_focus_if_mapped(display, window, mapped)
+                    {
+                        if let Some(input_method) = input_method.as_ref() {
+                            unsafe { XSetICFocus(input_method.ic) };
                         }
+                        focus_pending = false;
+                        focused = true;
+                        dirty = true;
+                        activity_dirty = true;
                     }
                 }
                 UNMAP_NOTIFY => {
@@ -1726,6 +1759,48 @@ fn run_window(
                         let _ = writer.flush();
                         dirty = true;
                         activity_dirty = true;
+                    } else if control
+                        && matches!(
+                            keysym,
+                            k if k == '+' as c_ulong || k == '=' as c_ulong || k == '-' as c_ulong
+                                || k == '_' as c_ulong || k == '0' as c_ulong
+                        )
+                    {
+                        // Native zoom is presentation-only: it reopens the
+                        // Xft faces and resizes the PTY from the same layout
+                        // contract without changing projection/backend state.
+                        text_zoom = match keysym {
+                            k if k == '+' as c_ulong || k == '=' as c_ulong => {
+                                (text_zoom * 1.10).min(2.5)
+                            }
+                            k if k == '-' as c_ulong || k == '_' as c_ulong => {
+                                (text_zoom / 1.10).max(0.75)
+                            }
+                            _ => options.text_scale.clamp(0.75, 2.5),
+                        };
+                        match text.reconfigure_for_scale(text_zoom) {
+                            Ok(_) => {
+                                metrics = UiFontMetrics {
+                                    body: text.metrics_for(FontRole::Body),
+                                    input: text.metrics_for(FontRole::Input),
+                                    heading: text.metrics_for(FontRole::Heading),
+                                    instrument: text.metrics_for(FontRole::Instrument),
+                                };
+                                resize_terminal(core, pty, width, height, metrics);
+                                configure_events = configure_events.saturating_add(1);
+                                write_runtime_layout_dump(
+                                    width,
+                                    height,
+                                    metrics,
+                                    text.font_pixel_sizes(),
+                                    text_zoom,
+                                    configure_events,
+                                );
+                                dirty = true;
+                                activity_dirty = true;
+                            }
+                            Err(error) => eprintln!("could not apply native text zoom: {error}"),
+                        }
                     } else if terminal_app {
                         let bytes = terminal_key_bytes(keysym, core.mode(), &lookup.bytes);
                         if !bytes.is_empty() {
@@ -2018,8 +2093,7 @@ fn run_window(
                         running = false;
                         continue;
                     }
-                    let scale = FrameGeometry::scale_for_window(width, height);
-                    match text.reconfigure_for_scale(scale) {
+                    match text.reconfigure_for_scale(text_zoom) {
                         Ok(_) => {
                             metrics = UiFontMetrics {
                                 body: text.metrics_for(FontRole::Body),
@@ -2039,6 +2113,7 @@ fn run_window(
                         height,
                         metrics,
                         text.font_pixel_sizes(),
+                        text_zoom,
                         configure_events,
                     );
                     dirty = true;
@@ -2162,6 +2237,11 @@ fn run_window(
                     0.0
                 },
             );
+            // Xft targets the same offscreen pixmap as GL. Force the XRender
+            // text requests to land before the pixmap is copied to the mapped
+            // window; without this fence the cabinet can present a complete
+            // GL frame while silently dropping the terminal glyph layer.
+            unsafe { XSync(display, 0) };
             presentation_surface.present(width as CUint, height as CUint);
             presented_frame_sequence = presented_frame_sequence.saturating_add(1);
             write_presentation_sync(presented_frame_sequence, width, height, projection);
@@ -2342,6 +2422,7 @@ fn write_runtime_layout_dump(
     height: i32,
     metrics: UiFontMetrics,
     font_pixel_sizes: [i32; 4],
+    text_scale: f32,
     configure_events: u64,
 ) {
     let Ok(path) = env::var("ATHENA_NATIVE_LAYOUT_DUMP") else {
@@ -2381,6 +2462,7 @@ fn write_runtime_layout_dump(
         "font_pixel_sizes".to_owned(),
         serde_json::to_value(font_pixel_sizes).expect("font sizes serialize"),
     );
+    object.insert("text_scale".to_owned(), serde_json::json!(text_scale));
     object.insert(
         "terminal_size".to_owned(),
         serde_json::to_value(layout.terminal_size()).expect("terminal size serialize"),

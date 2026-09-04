@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 import pytest
 
 from athena.state.database import Database
@@ -127,3 +129,51 @@ async def test_record_round_trips_section62_fields(store):
     assert got.supersedes == ("mem_old",)
     assert got.contradicted_by == ("mem_con",)
     assert got.valid_from == valid_from
+
+
+async def test_pending_candidate_has_promote_discard_and_expire_lifecycle(store):
+    pending = MemoryRecord(
+        id="mem_pending",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.TASK,
+        content="the project appears to use a bounded retry budget",
+        metadata={"pending_promotion": True, "task_id": "task-1"},
+    )
+    await store.save(pending)
+
+    assert [item.id for item in await store.list_pending_candidates()] == ["mem_pending"]
+    promoted = await store.promote_pending_candidate(
+        "mem_pending",
+        scope=MemoryScope.SESSION,
+        scope_id="session-1",
+    )
+    assert promoted is not None
+    assert promoted.scope is MemoryScope.SESSION
+    assert promoted.metadata["pending_promotion"] is False
+    assert await store.list_pending_candidates() == []
+
+    discarded = MemoryRecord(
+        id="mem_discard",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.TASK,
+        content="discard this inferred lesson",
+        metadata={"pending_promotion": True},
+    )
+    await store.save(discarded)
+    assert await store.discard_pending_candidate("mem_discard") is True
+    assert await store.get("mem_discard") is None
+
+    expiring = MemoryRecord(
+        id="mem_expire",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.TASK,
+        content="old inferred lesson",
+        metadata={"pending_promotion": True},
+    )
+    await store.save(expiring)
+    await store._db.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?",
+        ((utcnow() - timedelta(days=31)).isoformat(), "mem_expire"),
+    )
+    assert await store.expire_pending_candidates(utcnow() - timedelta(days=30)) == 1
+    assert await store.get("mem_expire") is None

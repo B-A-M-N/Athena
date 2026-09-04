@@ -60,6 +60,19 @@ class ResearchCapability:
             "deterministic and local; external fetching is a separate "
             "allowlisted operation."
         ),
+        tags=frozenset(
+            {
+                "research",
+                "evidence",
+                "source",
+                "sources",
+                "verify",
+                "verification",
+                "web",
+                "latest",
+                "release",
+            }
+        ),
         input_schema={
             "type": "object",
             "required": ["operation"],

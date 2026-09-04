@@ -118,11 +118,11 @@ fn expand_graphite_material(
     base_height: c_int,
     base_pixels: &[u8],
 ) -> (c_int, c_int, Vec<u8>) {
-    // The bundled PPM is the authored coarse grain. Expand it once at load
-    // time with deterministic mid/fine-frequency variation so the shell does
-    // not read as an 8-pixel checkerboard when scaled across the cabinet.
-    const WIDTH: usize = 32;
-    const HEIGHT: usize = 32;
+    // AthenaBOX reference is a fine graphite, not an 8px checkerboard.
+    // Expand to 64 with deterministic mid/fine variation so the DAGOAL
+    // phosphor and the BOX shell share one coherent material scale.
+    const WIDTH: usize = 64;
+    const HEIGHT: usize = 64;
     let source_width = base_width.max(1) as usize;
     let source_height = base_height.max(1) as usize;
     let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 3);
@@ -163,8 +163,8 @@ mod tests {
         let (width, height, pixels) = parse_ppm(CHASSIS_NOISE).expect("valid bundled PPM");
         let (expanded_width, expanded_height, expanded) =
             expand_graphite_material(width, height, &pixels);
-        assert_eq!((expanded_width, expanded_height), (32, 32));
-        assert_eq!(expanded.len(), 32 * 32 * 3);
+        assert_eq!((expanded_width, expanded_height), (64, 64));
+        assert_eq!(expanded.len(), 64 * 64 * 3);
         assert!(expanded.iter().min() >= Some(&8));
         assert!(expanded.iter().max() <= Some(&96));
         assert!(expanded.windows(3).any(|window| window[0] != window[1]));
@@ -264,13 +264,13 @@ pub(crate) fn draw_chassis(
         (0.016, 0.017, 0.018),
     );
 
-    let shell = inset(chassis, 18.0 * scale);
+    let shell = inset(chassis, 16.0 * scale);
     draw_round_rect(
         shell.x + 4.0 * scale,
-        shell.y + 6.0 * scale,
+        shell.y + 7.0 * scale,
         shell.width,
         shell.height,
-        24.0 * scale,
+        28.0 * scale,
         (0.006, 0.007, 0.008),
     );
     draw_round_rect(
@@ -278,7 +278,7 @@ pub(crate) fn draw_chassis(
         shell.y,
         shell.width,
         shell.height,
-        24.0 * scale,
+        28.0 * scale,
         (0.090, 0.093, 0.095),
     );
     material.draw_surface(inset(shell, 10.0 * scale));
@@ -290,7 +290,7 @@ pub(crate) fn draw_chassis(
         (0.20, 0.21, 0.21),
     );
 
-    let deck = inset(chassis, 38.0 * scale);
+    let deck = inset(chassis, 24.0 * scale);
     draw_round_rect(
         deck.x,
         deck.y,
@@ -318,7 +318,7 @@ pub(crate) fn draw_chassis(
         (0.22, 0.23, 0.23),
     );
     for index in 0..8 {
-        let x = geometry.header.x + geometry.header.width * 0.48 + index as f32 * 13.0 * scale;
+        let x = geometry.header.x + geometry.header.width * 0.48 + index as f32 * 11.0 * scale;
         draw_round_rect(
             x,
             geometry.header.y + geometry.header.height * 0.38,
@@ -542,7 +542,7 @@ pub(crate) fn draw_chassis(
 
 fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
     let scale = geometry.scale.max(0.08);
-    let glyph_scale = (1.35 * scale).max(0.72);
+    let glyph_scale = (1.35 * scale).round().max(2.0);
     let instrument_color = (0.42, 0.54, 0.62);
     let heading_color = (0.64, 0.74, 0.83);
     let oi_color = rgb_f32(mode_color(VisualMode::from_projection(projection).as_str()));
@@ -561,12 +561,12 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             geometry.header.x + geometry.u(145.0),
             header_y + geometry.u(1.0),
             "// OPERATOR INSTRUMENT",
-            glyph_scale * 0.76,
+            (glyph_scale * 0.76).round().max(2.0),
             instrument_color,
             geometry.header.right() - geometry.u(310.0),
         );
         let glass = "GLASS COMPUTE ENGINE";
-        let glass_scale = glyph_scale * 0.76;
+        let glass_scale = (glyph_scale * 0.76).round().max(2.0);
         draw_bitmap_text(
             geometry.header.right() - geometry.u(44.0) - bitmap_width(glass, glass_scale),
             header_y + geometry.u(1.0),
@@ -590,7 +590,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
                 rect.x + geometry.u(24.0),
                 rect.y + geometry.u(14.0),
                 label,
-                glyph_scale * 0.70,
+                (glyph_scale * 0.70).round().max(2.0),
                 color,
                 rect.right() - geometry.u(24.0),
             );
@@ -602,8 +602,8 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
         draw_bitmap_text(
             speaker.x + geometry.u(9.0),
             speaker.bottom() - geometry.u(17.0),
-            "VENT // PASSIVE",
-            glyph_scale * 0.58,
+            "VENT",
+            (glyph_scale * 0.58).round().max(2.0),
             instrument_color,
             speaker.right() - geometry.u(9.0),
         );
@@ -611,12 +611,15 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
 
     let system = geometry.rail.system_status;
     with_scissor(geometry.height, system, || {
-        for (index, label) in ["SYS", "NET", "ACT"].into_iter().enumerate() {
+        // The three compact indicators keep one crisp glyph each; the module
+        // itself carries the grouped SYS/NET/ACT meaning without clipping a
+        // long label into an unreadable fragment at compact sizes.
+        for (index, label) in ["S", "N", "A"].into_iter().enumerate() {
             draw_bitmap_text(
                 system.x + geometry.u(5.0) + index as f32 * geometry.u(32.0),
                 system.bottom() - geometry.u(17.0),
                 label,
-                glyph_scale * 0.56,
+                (glyph_scale * 0.56).round().max(2.0),
                 instrument_color,
                 system.x + geometry.u(5.0) + index as f32 * geometry.u(32.0) + geometry.u(26.0),
             );
@@ -629,7 +632,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             encoder.x + geometry.u(12.0),
             encoder.y + geometry.u(11.0),
             "ENC",
-            glyph_scale * 0.62,
+            (glyph_scale * 0.62).round().max(2.0),
             instrument_color,
             encoder.right() - geometry.u(8.0),
         );
@@ -641,7 +644,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
         (geometry.rail.power, "CRT"),
     ] {
         with_scissor(geometry.height, rect, || {
-            let label_scale = glyph_scale * 0.60;
+            let label_scale = (glyph_scale * 0.60).round().max(2.0);
             let x = rect.x + (rect.width - bitmap_width(label, label_scale)) * 0.5;
             draw_bitmap_text(
                 x,
@@ -656,7 +659,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
 
     let plate = geometry.rail.identity_plate;
     with_scissor(geometry.height, plate, || {
-        let plate_scale = glyph_scale * 0.62;
+        let plate_scale = (glyph_scale * 0.62).round().max(2.0);
         draw_bitmap_text(
             plate.x + geometry.u(18.0),
             plate.y + geometry.u(16.0),
@@ -668,8 +671,8 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
         draw_bitmap_text(
             plate.x + geometry.u(18.0),
             plate.y + geometry.u(34.0),
-            "OI // GLASS COMPUTE",
-            plate_scale * 0.72,
+            "OI // GLASS",
+            (plate_scale * 0.72).round().max(2.0),
             instrument_color,
             plate.right() - geometry.u(18.0),
         );
@@ -677,7 +680,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             plate.x + geometry.u(18.0),
             plate.y + geometry.u(58.0),
             "MODEL 001-A",
-            plate_scale * 0.62,
+            (plate_scale * 0.62).round().max(2.0),
             instrument_color,
             plate.right() - geometry.u(18.0),
         );
@@ -685,48 +688,81 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             plate.x + geometry.u(18.0),
             plate.y + geometry.u(76.0),
             "SERIAL 0001-A",
-            plate_scale * 0.62,
+            (plate_scale * 0.62).round().max(2.0),
             instrument_color,
             plate.right() - geometry.u(18.0),
         );
     });
 }
 
-fn bitmap_width(value: &str, scale: f32) -> f32 {
+pub(crate) fn bitmap_width(value: &str, scale: f32) -> f32 {
     value.chars().count() as f32 * 6.0 * scale
 }
 
-fn draw_bitmap_text(x: f32, y: f32, value: &str, scale: f32, color: (f32, f32, f32), right: f32) {
+pub(crate) fn draw_bitmap_text(
+    x: f32,
+    y: f32,
+    value: &str,
+    scale: f32,
+    color: (f32, f32, f32),
+    right: f32,
+) {
     let scale = scale.max(0.5);
     let start_x = x;
-    let mut x = x;
-    unsafe {
-        glColor3f(color.0, color.1, color.2);
-        glBegin(GL_QUADS);
-        for character in value.chars() {
-            if character == '\n' {
-                x = start_x;
-                continue;
-            }
-            if x + 5.0 * scale > right {
-                break;
-            }
-            for (row, bits) in static_glyph(character).into_iter().enumerate() {
-                for column in 0..5 {
-                    if bits & (1 << (4 - column)) == 0 {
-                        continue;
-                    }
-                    let px = x + column as f32 * scale;
-                    let py = y + row as f32 * scale;
-                    glVertex2f(px, py);
-                    glVertex2f(px + scale, py);
-                    glVertex2f(px + scale, py + scale);
-                    glVertex2f(px, py + scale);
+    let start_y = y;
+    let mut x;
+    let mut y;
+    let dot_size = (scale * 0.48).round().clamp(1.0, scale);
+    let dot_offset = ((scale - dot_size) * 0.5).round();
+    let glow_size = (dot_size + (scale * 0.68).round()).max(dot_size + 1.0);
+    let glow_offset = ((dot_size - glow_size) * 0.5).round();
+    let core_color = (
+        (color.0 * 1.08).min(1.0),
+        (color.1 * 1.08).min(1.0),
+        (color.2 * 1.08).min(1.0),
+    );
+
+    // Two crisp passes give each lit cell a small phosphor halo without
+    // turning the type into a soft web-font glow. The core remains square,
+    // snapped to the same matrix as the buddy and the OI scene.
+    for (glow, alpha) in [(true, 0.18_f32), (false, 1.0_f32)] {
+        x = start_x;
+        y = start_y;
+        unsafe {
+            let layer = if glow { color } else { core_color };
+            glColor3f(layer.0 * alpha, layer.1 * alpha, layer.2 * alpha);
+            glBegin(GL_QUADS);
+            for character in value.chars() {
+                if character == '\n' {
+                    x = start_x;
+                    y += 9.0 * scale;
+                    continue;
                 }
+                if x + 5.0 * scale > right {
+                    break;
+                }
+                for (row, bits) in static_glyph(character).into_iter().enumerate() {
+                    for column in 0..5 {
+                        if bits & (1 << (4 - column)) == 0 {
+                            continue;
+                        }
+                        let (offset, size) = if glow {
+                            (glow_offset, glow_size)
+                        } else {
+                            (dot_offset, dot_size)
+                        };
+                        let px = (x + column as f32 * scale + offset).round();
+                        let py = (y + row as f32 * scale + offset).round();
+                        glVertex2f(px, py);
+                        glVertex2f(px + size, py);
+                        glVertex2f(px + size, py + size);
+                        glVertex2f(px, py + size);
+                    }
+                }
+                x += 6.0 * scale;
             }
-            x += 6.0 * scale;
+            glEnd();
         }
-        glEnd();
     }
 }
 
@@ -874,7 +910,16 @@ fn draw_recessed_panel(
         9.0 * scale,
         (0.006, 0.007, 0.008),
     );
-    draw_round_rect(rect.x, rect.y, rect.width, rect.height, 9.0 * scale, outer);
+    draw_round_rect(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        (rect.width.min(rect.height) * 0.06)
+            .min(30.0 * scale)
+            .max(4.0 * scale),
+        outer,
+    );
     draw_round_outline(rect.x, rect.y, rect.width, rect.height, (0.17, 0.18, 0.18));
     let cavity = inset(rect, 8.0 * scale);
     draw_round_rect(
@@ -982,7 +1027,7 @@ fn draw_glass_crt_well(geometry: &FrameGeometry, scale: f32) {
         inner.y - 8.0 * scale,
         inner.width + 16.0 * scale,
         inner.height + 16.0 * scale,
-        19.0 * scale,
+        (inner.width.min(inner.height) * 0.09).min(48.0 * scale),
         (0.003, 0.011, 0.013),
     );
     draw_round_rect(
@@ -990,7 +1035,7 @@ fn draw_glass_crt_well(geometry: &FrameGeometry, scale: f32) {
         inner.y - 4.0 * scale,
         inner.width + 8.0 * scale,
         inner.height + 8.0 * scale,
-        16.0 * scale,
+        (inner.width.min(inner.height) * 0.075).min(40.0 * scale),
         (0.002, 0.007, 0.009),
     );
     draw_round_outline(
@@ -1079,7 +1124,8 @@ fn draw_encoder(rect: PixelRect, scale: f32, value: f32, power: bool) {
             (0.36, 0.76, 0.72),
         );
         // Illuminated indicator pip
-        let angle = std::f32::consts::PI * 0.75 + value.clamp(0.0, 1.0) * std::f32::consts::PI * 1.5;
+        let angle =
+            std::f32::consts::PI * 0.75 + value.clamp(0.0, 1.0) * std::f32::consts::PI * 1.5;
         let pip_r = size * 0.32;
         draw_round_rect(
             x + pip_r * angle.cos() - 1.5 * scale,

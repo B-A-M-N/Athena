@@ -67,7 +67,7 @@ def _owner_visible(job: Mapping[str, Any], owner: Mapping[str, str | None] | Non
     return any(
         value and stored.get(key) == value
         for key, value in dict(owner).items()
-        if key in {"task_id", "session_id", "project_id"}
+        if key in {"task_id", "session_id", "project_id", "principal_id"}
     )
 
 
@@ -93,6 +93,95 @@ def _criterion_record(criterion: Any) -> dict[str, Any]:
     }
 
 
+def _authority_snapshot(
+    *,
+    workspace: Any,
+    capability_policy: Any,
+    model_policy: Any,
+    resource_budget: Any,
+    autonomy: Any,
+    owner: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Serialize the service-owned ceiling captured at schedule creation."""
+    workspace_record: dict[str, Any] = {}
+    if workspace is not None:
+        workspace_record = {
+            "id": getattr(workspace, "id", None),
+            "root": getattr(workspace, "root", None),
+            "readable": [
+                {"path": rule.path, "allow": rule.allow}
+                for rule in getattr(workspace, "readable", ())
+            ],
+            "writable": [
+                {"path": rule.path, "allow": rule.allow}
+                for rule in getattr(workspace, "writable", ())
+            ],
+            "temp_root": getattr(workspace, "temp_root", None),
+            "execution_backend": getattr(workspace, "execution_backend", None),
+            "revision": getattr(workspace, "revision", None),
+            "network_policy": getattr(getattr(workspace, "network_policy", None), "value", getattr(workspace, "network_policy", None)),
+            "mutation_mode": getattr(getattr(workspace, "mutation_mode", None), "value", getattr(workspace, "mutation_mode", None)),
+        }
+    cp = capability_policy
+    if cp is None:
+        # Direct store/API callers have not presented a creator authority
+        # snapshot; a persisted schedule must not silently become unrestricted.
+        class _SafePolicy:
+            effects = ()
+            allow = ()
+            ask = ()
+            deny = ("*",)
+
+        cp = _SafePolicy()
+    mp = model_policy
+    budget = resource_budget
+    return {
+        "principal": dict(owner),
+        "workspace": workspace_record,
+        "capability_policy": {
+            "effects": sorted(str(getattr(value, "value", value)) for value in getattr(cp, "effects", ()) or ()),
+            "allow": list(getattr(cp, "allow", ()) or ()),
+            "ask": list(getattr(cp, "ask", ()) or ()),
+            "deny": list(getattr(cp, "deny", ()) or ()),
+        },
+        "model_policy": {
+            "role": getattr(mp, "role", "primary"),
+            "allowed": list(getattr(mp, "allowed", ()) or ()),
+            "require_tools": bool(getattr(mp, "require_tools", False)),
+            "privacy": getattr(mp, "privacy", "local-preferred"),
+            "max_cost_usd": (
+                str(getattr(mp, "max_cost_usd"))
+                if getattr(mp, "max_cost_usd", None) is not None
+                else None
+            ),
+            "routing_preference": getattr(mp, "routing_preference", "balanced"),
+        },
+        "resource_budget": {
+            name: (
+                value.total_seconds()
+                if hasattr(value, "total_seconds")
+                else str(value)
+                if name == "max_cost_usd" and value is not None
+                else value
+            )
+            for name in (
+                "max_agent_iterations",
+                "max_input_tokens",
+                "max_output_tokens",
+                "max_cost_usd",
+                "max_wall_time",
+                "max_children",
+                "max_child_depth",
+                "max_parallel_model_calls",
+                "max_parallel_executions",
+                "max_artifact_bytes",
+            )
+            if (value := getattr(budget, name, None)) is not None
+        },
+        "autonomy": getattr(autonomy, "value", autonomy) or "supervised",
+    }
+
+
 class ScheduleAPI:
     """Thin interface the capability wraps."""
 
@@ -112,6 +201,11 @@ class ScheduleAPI:
         acceptance_criteria: tuple[Any, ...] = (),
         owner: Mapping[str, str | None] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        capability_policy=None,
+        model_policy=None,
+        resource_budget=None,
+        autonomy=None,
+        reuse_session: bool = False,
     ) -> dict:
         job_id = new_id("job")
         trigger_spec = self._parse_trigger(trigger)
@@ -122,13 +216,36 @@ class ScheduleAPI:
         first_run = trigger_spec.at
         if first_run is None and trigger_spec.type is not TriggerType.EVENT:
             first_run = next_fire(trigger_spec, now - _small_delta())
+        authority = _authority_snapshot(
+            workspace=workspace,
+            capability_policy=capability_policy,
+            model_policy=model_policy,
+            resource_budget=resource_budget,
+            autonomy=autonomy,
+            owner=owner_data,
+        )
+        # Occurrences default to FRESH sessions: recurring autonomous work
+        # must not accumulate history inside the conversation that scheduled
+        # it, inherit stale user instructions, or grow unboundedly expensive.
+        # The scheduling task/session are carried as lineage, not as the
+        # execution session. A persistent shared session is an explicit
+        # opt-in through ``reuse_session``.
+        template_metadata = dict(metadata or {})
+        template_metadata.setdefault(
+            "_schedule_lineage",
+            {
+                "job_id": job_id,
+                "creator_task_id": owner_data.get("task_id"),
+                "creator_session_id": owner_data.get("session_id"),
+            },
+        )
         await self._scheduler._store.upsert_job(
             job_id,
             name,
             payload={
                 "template": {
                     "objective": objective,
-                    "session_id": session_id,
+                    "session_id": session_id if reuse_session else None,
                     "workspace_id": owner_data.get("project_id"),
                     "workspace_root": workspace_root,
                     "network_policy": getattr(
@@ -144,13 +261,13 @@ class ScheduleAPI:
                     "acceptance_criteria": [
                         _criterion_record(criterion) for criterion in acceptance_criteria
                     ],
-                    "metadata": dict(metadata or {}),
+                    "metadata": template_metadata,
                 }
             },
             trigger_spec=self._scheduler_trigger_spec(trigger_spec),
             enabled=True,
             next_run=first_run.isoformat() if first_run else None,
-            metadata={"_owner": owner_data},
+            metadata={"_owner": owner_data, "_authority_snapshot": authority},
         )
         return {"job_id": job_id, "name": name, "enabled": True}
 
@@ -307,6 +424,14 @@ class ScheduleCapability:
                 "objective": {"type": "string", "minLength": 1, "maxLength": 10000},
                 "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
                 "workspace_root": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "persistent_session": {
+                    "type": "boolean",
+                    "description": (
+                        "Opt in to running every occurrence in one persistent "
+                        "session. Default false: each occurrence gets a fresh "
+                        "session with lineage back to this schedule."
+                    ),
+                },
                 "trigger": {"type": "object", "maxProperties": 16},
             },
             "oneOf": [
@@ -340,6 +465,7 @@ class ScheduleCapability:
             "task_id": request.task_id,
             "session_id": request.session_id,
             "project_id": getattr(getattr(context, "workspace", None), "id", None),
+            "principal_id": getattr(context, "principal_id", None),
         }
         try:
             if op == "create":
@@ -382,17 +508,39 @@ class ScheduleCapability:
                     name=args.get("name", "scheduled task"),
                     objective=args.get("objective", ""),
                     trigger=args.get("trigger", {}),
-                    session_id=requested_session or request.session_id,
+                    # Fresh sessions per occurrence are the default: only an
+                    # explicit persistent_session flag reuses the requesting
+                    # session. The requesting task/session are carried as
+                    # lineage in the template metadata, never as the
+                    # execution session.
+                    session_id=(
+                        request.session_id
+                        if bool(args.get("persistent_session"))
+                        else None
+                    ),
+                    reuse_session=bool(args.get("persistent_session")),
                     workspace_root=workspace_root,
                     workspace=workspace,
                     owner=owner,
+                    capability_policy=getattr(context, "capability_policy", None),
+                    model_policy=getattr(context, "model_policy", None),
+                    resource_budget=getattr(context, "resource_budget", None),
+                    autonomy=getattr(context, "autonomy", None),
+                )
+                job_id = (
+                    result.get("id") or result.get("job_id")
+                    if isinstance(result, dict)
+                    else None
                 )
                 return CapabilityResult(
                     call_id,
                     self.descriptor.id,
                     CapabilityResultStatus.OK,
                     output=json.dumps(result),
-                    metadata={"operation": "create"},
+                    metadata={
+                        "operation": "create",
+                        **({"mutation_ref": str(job_id)} if job_id else {}),
+                    },
                 )
             elif op == "list":
                 jobs = await self._api.list_jobs(owner=owner)

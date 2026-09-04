@@ -414,7 +414,7 @@ class AnthropicProvider:
         if request.system:
             return request.system
         sys_msgs = [m for m in request.messages if m.role == Role.SYSTEM]
-        texts = [m.text() for m in sys_msgs if m.text()]
+        texts = [m.conversation_text() for m in sys_msgs if m.conversation_text()]
         return "\n\n".join(texts) if texts else None
 
     def _translate_messages(
@@ -425,8 +425,12 @@ class AnthropicProvider:
             if msg.role == Role.SYSTEM:
                 continue
             content: list[dict[str, Any]] = []
+            replay_reasoning = bool(msg.metadata.get("replay_reasoning", False))
             for block in msg.blocks:
-                if isinstance(block, (TextBlock, ReasoningBlock)) and block.text:
+                if (
+                    isinstance(block, TextBlock)
+                    or (replay_reasoning and isinstance(block, ReasoningBlock))
+                ) and block.text:
                     content.append({"type": "text", "text": block.text})
                 elif isinstance(block, ImageBlock) and block.data_path:
                     content.append(
@@ -492,7 +496,7 @@ class AnthropicProvider:
                     **content[-1],
                     "cache_control": {"type": "ephemeral"},
                 }
-            out.append({"role": role, "content": content or msg.text()})
+            out.append({"role": role, "content": content or msg.conversation_text()})
         return out
 
     async def _read_json(self, resp: httpx.Response) -> dict[str, Any]:

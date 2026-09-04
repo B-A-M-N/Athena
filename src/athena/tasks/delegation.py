@@ -392,20 +392,27 @@ def _scope_policy(parent: TaskSpec, child: CapabilityPolicy | None = None) -> Ca
     parent_allow = set(parent_cap.allow)
     parent_ask = set(parent_cap.ask)
     child_requested = set(child_cap.allow)
+    parent_restricted = bool(parent_allow or parent_ask)
     if child_requested:
-        # An empty parent allowlist is the protocol's unrestricted value. A
+        # An empty parent allowlist is the protocol's UNRESTRICTED value. A
         # child request narrows that open ceiling to the capabilities it asks
         # for; it must not become impossible merely because the parent did
-        # not enumerate every native capability.
-        allow_set = child_requested & parent_allow if parent_allow else child_requested
-        ask_set = parent_ask & child_requested
-        outside = child_requested - parent_allow - parent_ask
+        # not enumerate every native capability. Only when the parent
+        # actually declared a ceiling does the child's request intersect it.
+        if parent_restricted:
+            allow_set = child_requested & parent_allow
+            ask_set = parent_ask & child_requested
+            outside = child_requested - parent_allow - parent_ask
+        else:
+            allow_set = child_requested
+            ask_set = set()
+            outside = set()
     else:
         allow_set = parent_allow
         ask_set = parent_ask
         outside = set()
     deny_set = set(parent_cap.deny) | set(child_cap.deny) | outside
-    if (parent_allow or parent_ask) and not (allow_set or ask_set):
+    if parent_restricted and not (allow_set or ask_set):
         # Empty ``allow`` means unrestricted to the dispatcher, so use an
         # impossible sentinel when two non-empty ceilings have no overlap.
         allow_set = {_NO_CAPABILITY_INTERSECTION}
@@ -452,7 +459,7 @@ def _as_model_policy(value):
     return ModelPolicy(
         role=getattr(value, "role", "primary"),
         allowed=tuple(getattr(value, "allowed", ()) or ()),
-        require_tools=bool(getattr(value, "require_tools", True)),
+        require_tools=bool(getattr(value, "require_tools", False)),
         privacy=getattr(value, "privacy", "local-preferred"),
         max_cost_usd=getattr(value, "max_cost_usd", None),
         routing_preference=getattr(value, "routing_preference", "balanced"),

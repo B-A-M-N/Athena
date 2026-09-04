@@ -305,3 +305,98 @@ async def test_provider_registry_resolve_uses_cached_model_inventory():
 
     await registry.refresh_models()
     assert provider.list_calls == 2
+
+
+# ---------------------------------------------------------------------- #
+# Minimum-context regression (P0-5): the kernel used to read a field that
+# does not exist (``min_context_window``), silently dropping the compiler's
+# context requirement before routing. These tests pin the field name and
+# prove capacity filtering actually excludes too-small models.
+# ---------------------------------------------------------------------- #
+
+
+async def test_minimum_context_tokens_requirement_selects_the_large_model():
+    """model A context=8k, model B context=128k, requirement=20k -> B."""
+    small = FakeModelProvider(
+        model="ctx-8k",
+        provider="smallprov",
+        context_limit=8 * 1024,
+    )
+    large = FakeModelProvider(
+        model="ctx-128k",
+        provider="largeprov",
+        context_limit=128 * 1024,
+    )
+    router = ModelRouter(_registry({"smallprov": small, "largeprov": large}))
+
+    selection = await router.select(
+        policy=ModelPolicy(role="primary", require_tools=False),
+        requirements=ModelRequirements(minimum_context_tokens=20 * 1024),
+    )
+    assert (selection.provider, selection.model) == ("largeprov", "ctx-128k")
+
+
+async def test_minimum_context_tokens_rejects_undersized_only_model():
+    """When the only registered model cannot hold the request, selection
+    must fail loudly rather than silently route to an undersized context
+    (the old ``min_context_window`` getattr always got None and let it
+    through)."""
+    from athena.protocol.errors import ModelUnavailable
+
+    narrow = FakeModelProvider(
+        model="only-model",
+        provider="onlyprov",
+        context_limit=4 * 1024,
+    )
+    router = ModelRouter(_registry({"onlyprov": narrow}))
+
+    # Below the limit: selectable.
+    ok = await router.select(
+        policy=ModelPolicy(role="primary", require_tools=False),
+        requirements=ModelRequirements(minimum_context_tokens=2 * 1024),
+    )
+    assert (ok.provider, ok.model) == ("onlyprov", "only-model")
+
+    # Above the limit: loud failure, never a silent undersized route.
+    with pytest.raises(ModelUnavailable):
+        await router.select(
+            policy=ModelPolicy(role="primary", require_tools=False),
+            requirements=ModelRequirements(minimum_context_tokens=64 * 1024),
+        )
+
+
+async def test_kernel_selects_model_by_compiled_minimum_context():
+    """End-to-end P0-5 regression: AgentKernel._select_model must forward
+    the compiler's ``minimum_context_tokens`` (not the nonexistent
+    ``min_context_window``) so a 128k model is chosen when the compiled
+    request needs 20k and an 8k model is also registered."""
+    from athena.kernel.kernel import AgentKernel
+
+    field = ModelRequirements.__dataclass_fields__.get("minimum_context_tokens")
+    assert field is not None, "ModelRequirements.minimum_context_tokens must exist"
+
+    class Holder:
+        """Minimal stand-in for the kernel's compiled-context handle."""
+
+        def __init__(self, requirements: ModelRequirements):
+            self.requirements = requirements
+
+    class TaskStub:
+        model_policy = ModelPolicy(role="primary", require_tools=False)
+
+    kernel = AgentKernel.__new__(AgentKernel)
+    small = FakeModelProvider(
+        model="ctx-8k", provider="smallprov", context_limit=8 * 1024, tool_calling=True
+    )
+    large = FakeModelProvider(
+        model="ctx-128k", provider="largeprov", context_limit=128 * 1024, tool_calling=True
+    )
+    kernel._router = ModelRouter(
+        _registry({"smallprov": small, "largeprov": large})
+    )
+    compiled = Holder(
+        ModelRequirements(minimum_context_tokens=20 * 1024, needs_tools=True)
+    )
+
+    selection = await kernel._select_model(task=TaskStub(), compiled=compiled)
+    assert (selection.provider, selection.model) == ("largeprov", "ctx-128k")

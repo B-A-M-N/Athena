@@ -108,6 +108,7 @@ struct ProjectionNavigation {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionAction {
     #[serde(default)]
     kind: String,
@@ -180,6 +181,7 @@ struct ProjectionAttention {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionOperation {
     #[serde(default)]
     id: String,
@@ -208,6 +210,7 @@ struct ProjectionOperation {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionCodeView {
     #[serde(default)]
     path: String,
@@ -226,6 +229,7 @@ struct ProjectionCodeView {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionDiagnostic {
     #[serde(default)]
     path: String,
@@ -515,6 +519,7 @@ impl VisualMode {
     }
 }
 
+#[allow(dead_code)]
 impl Projection {
     fn apply(&mut self, frame: ProjectionFrame) {
         let animation_key = frame_animation_key(&frame);
@@ -626,12 +631,12 @@ impl Projection {
                 self.return_to_live_oi();
             }
             "up" => {
-                for _ in 0..navigation.amount.max(1).min(32) {
+                for _ in 0..navigation.amount.clamp(1, 32) {
                     self.cycle_oi_history(-1);
                 }
             }
             "down" => {
-                for _ in 0..navigation.amount.max(1).min(32) {
+                for _ in 0..navigation.amount.clamp(1, 32) {
                     self.cycle_oi_history(1);
                 }
             }
@@ -729,6 +734,7 @@ struct Args {
     mascot: String,
     animations: bool,
     reduced_motion: bool,
+    text_scale: f32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -743,6 +749,10 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
         dump_height: 800,
         mascot: "owl".to_owned(),
         animations: true,
+        text_scale: env::var("ATHENA_NATIVE_TEXT_SCALE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1.0),
         ..Args::default()
     };
     let mut values = values.into_iter();
@@ -785,9 +795,16 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
             }
             "--no-animations" => args.animations = false,
             "--reduced-motion" => args.reduced_motion = true,
+            "--text-scale" => {
+                args.text_scale = values
+                    .next()
+                    .ok_or("--text-scale needs a multiplier")?
+                    .parse()
+                    .map_err(|_| "--text-scale must be a number")?;
+            }
             "--help" | "-h" => {
                 println!(
-                    "athena-terminal [--headless] [--dump-layout] [--cabinet-only] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot owl|cat|bot|off] [--no-animations] [--reduced-motion]"
+                    "athena-terminal [--headless] [--dump-layout] [--cabinet-only] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot owl|cat|bot|off] [--no-animations] [--reduced-motion] [--text-scale MULTIPLIER]"
                 );
                 println!("  --headless       run the PTY/core slice without opening a window");
                 println!(
@@ -799,6 +816,9 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
                 println!(
                     "  --mascot         select Buddy (default: owl; built-ins: owl, cat, bot, off)"
                 );
+                println!(
+                    "  --text-scale     multiply native UI text size (also ATHENA_NATIVE_TEXT_SCALE)"
+                );
                 return Err(String::new());
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -806,6 +826,9 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
     }
     args.columns = args.columns.max(1);
     args.rows = args.rows.max(1);
+    if !args.text_scale.is_finite() || !(0.75..=2.5).contains(&args.text_scale) {
+        return Err("--text-scale must be between 0.75 and 2.5".to_owned());
+    }
     if !matches!(
         args.mascot.to_ascii_lowercase().as_str(),
         "owl" | "cat" | "bot" | "off"
@@ -845,7 +868,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.dump_layout {
         #[cfg(unix)]
         {
-            match x11::dump_live_layout_json(args.dump_width, args.dump_height) {
+            match x11::dump_live_layout_json(args.dump_width, args.dump_height, args.text_scale) {
                 Ok(dump) => {
                     println!("{}", serde_json::to_string_pretty(&dump)?);
                     return Ok(());
@@ -872,6 +895,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .insert(
                 "metrics_source".to_owned(),
                 serde_json::json!("fallback_static"),
+            );
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert("text_scale".to_owned(), serde_json::json!(args.text_scale));
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert(
+                "font_pixel_sizes".to_owned(),
+                serde_json::json!([16, 17, 13, 11]),
             );
         dump.as_object_mut()
             .expect("NativePixelLayout serializes as an object")
@@ -957,6 +989,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mascot: args.mascot,
                     animations: args.animations,
                     reduced_motion: args.reduced_motion,
+                    text_scale: args.text_scale,
                     cabinet_only: args.cabinet_only,
                 },
             )
@@ -1482,6 +1515,10 @@ mod tests {
         let reduced_motion = super::parse_args_from(vec!["--reduced-motion".to_owned()])
             .expect("reduced-motion should parse");
         assert!(reduced_motion.reduced_motion);
+        let zoomed = super::parse_args_from(vec!["--text-scale".to_owned(), "1.25".to_owned()])
+            .expect("text-scale should parse");
+        assert!((zoomed.text_scale - 1.25).abs() < f32::EPSILON);
+        assert!(super::parse_args_from(vec!["--text-scale".to_owned(), "0.5".to_owned()]).is_err());
     }
 
     #[test]

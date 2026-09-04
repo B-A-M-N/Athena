@@ -33,6 +33,9 @@ class CapabilityReflection:
             "available capabilities, inspect dependencies and provenance, "
             "review lifecycle history, and list machinery created this task."
         ),
+        tags=frozenset(
+            {"capability", "capabilities", "tool", "tools", "affordance", "discover", "discovery"}
+        ),
         input_schema={
             "type": "object",
             "required": ["operation"],
@@ -108,6 +111,10 @@ class CapabilityReflection:
         user_id = "athena"
         try:
             if operation == "search":
+                # Method-local import: fabric imports the capability registry,
+                # which re-enters this package at module load time.
+                from athena.affordances.fabric import EXPLICIT_REFLECTION_SEARCH
+
                 value = self._fabric.search(
                     str(args.get("query") or ""),
                     task_id=task_id,
@@ -118,6 +125,10 @@ class CapabilityReflection:
                     # one affordance family. Keep enough candidates from the
                     # capability surface for workflows and skills to compete.
                     limit=10_000,
+                    # An operator/model-initiated reflection search is an
+                    # explicit query: take it literally instead of applying
+                    # the conservative automatic-disclosure filter.
+                    mode=EXPLICIT_REFLECTION_SEARCH,
                 )
                 value = await self._search_other_affordances(
                     value,

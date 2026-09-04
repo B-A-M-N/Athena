@@ -171,6 +171,9 @@ class ProjectionState:
     last_operation_id: str | None = None
     chat: deque[dict[str, str]] = field(default_factory=lambda: deque(maxlen=160))
     recent: deque[tuple[str, str]] = field(default_factory=lambda: deque(maxlen=24))
+    # Learning/maintenance is deliberately separate from task activity. It is
+    # available to details/history views without displacing operational facts.
+    maintenance: deque[tuple[str, str]] = field(default_factory=lambda: deque(maxlen=24))
     stream: deque[str] = field(default_factory=lambda: deque(maxlen=500))
     stream_partial: str = ""
     # Approval requests are a durable ordered set, not a single mutable
@@ -266,6 +269,11 @@ class ProjectionState:
         clean = sanitize_terminal_text(text).strip()
         if clean and (not self.recent or self.recent[-1] != (glyph, clean)):
             self.recent.append((glyph, clean))
+
+    def add_maintenance(self, glyph: str, text: object) -> None:
+        clean = sanitize_terminal_text(text).strip()
+        if clean and (not self.maintenance or self.maintenance[-1] != (glyph, clean)):
+            self.maintenance.append((glyph, clean))
 
     def add_chat(self, role: str, text: object) -> None:
         clean = sanitize_terminal_text(text).strip()
@@ -929,13 +937,24 @@ class ProjectionState:
             )
             self.add_recent("!" if failed else "↗" if started else "✓", label)
         elif etype in {
-            "ToolRepaired",
-            "MutationRecorded",
-            "MutationRecordFailed",
+            "MemoryCandidatesRecorded",
             "MemoryCandidateCreated",
             "MemoryWritten",
             "SkillCandidateCreated",
             "SkillActivated",
+        }:
+            labels = {
+                "MemoryCandidatesRecorded": "Memory candidates recorded",
+                "MemoryCandidateCreated": "Memory candidate recorded",
+                "MemoryWritten": "Memory written",
+                "SkillCandidateCreated": "Skill candidate recorded",
+                "SkillActivated": "Skill activated",
+            }
+            self.add_maintenance("·", labels[etype])
+        elif etype in {
+            "ToolRepaired",
+            "MutationRecorded",
+            "MutationRecordFailed",
             "InterpreterProposalDispatched",
             "ToolInputCorrectionExhausted",
             "RuntimeSessionCreated",
@@ -948,10 +967,6 @@ class ProjectionState:
                 "ToolRepaired": "Tool input repaired",
                 "MutationRecorded": "Mutation recorded",
                 "MutationRecordFailed": "Mutation record failed",
-                "MemoryCandidateCreated": "Memory candidate captured",
-                "MemoryWritten": "Knowledge saved",
-                "SkillCandidateCreated": "Skill candidate captured",
-                "SkillActivated": "Skill activated",
                 "InterpreterProposalDispatched": "Computer proposal dispatched",
                 "ToolInputCorrectionExhausted": "Tool repair budget exhausted",
                 "RuntimeSessionCreated": "Runtime session created",

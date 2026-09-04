@@ -94,7 +94,16 @@ async def test_approve_denied_has_no_effect(make_service):
 
     await svc.approve(approval_id, granted=False)
     final = await svc.wait_for(task.id)
-    assert (final.metadata or {}).get("status") == TaskStatus.COMPLETE.value
+    # Denial is NOT completion: the requested execution never happened, so the
+    # evidence gate honestly reports PARTIAL with the unobserved work
+    # recorded. The old COMPLETE expectation predates evidence-gated
+    # completion and is intentionally not restored (BHV-043 keeps its meaning:
+    # the denial executed no effect).
+    assert (final.metadata or {}).get("status") == TaskStatus.PARTIAL.value
+    result = await svc.get_result(task.id)
+    assert result is not None
+    assert result.status == TaskStatus.PARTIAL
+    assert "observable_work" in result.unresolved
 
     # The persisted decision records the denial (BHV-043: no effect executed).
     recs = await svc._store_approvals.list_for_task(task.id)

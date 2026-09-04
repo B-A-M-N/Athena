@@ -25,6 +25,25 @@ def test_build_config_auto_wires_openrouter_free_router(monkeypatch):
     assert provider.api_key is None
 
 
+def test_build_config_auto_wires_freeinference_glm_flash(monkeypatch):
+    monkeypatch.setenv("FREEINFERENCE_API_KEY", "test-only-secret")
+    monkeypatch.delenv("FREEINFERENCE_MODEL", raising=False)
+    monkeypatch.delenv("FREEINFERENCE_API_BASE_URL", raising=False)
+    monkeypatch.delenv("FREEINFERENCE_API_ENDPOINT", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-fallback-secret")
+
+    config = build_config(Options(config_path="/tmp/athena-test-no-config.toml"))
+
+    assert len(config.providers) == 1
+    provider = config.providers[0]
+    assert provider.kind == "openai-compat"
+    assert provider.name == "freeinference"
+    assert provider.model == "glm-5.3-flash"
+    assert provider.base_url == "https://freeinference.org/v1"
+    assert provider.credential_id == "FREEINFERENCE_API_KEY"
+    assert provider.api_key is None
+
+
 def test_build_config_honors_openrouter_model_override(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
     monkeypatch.setenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")

@@ -373,9 +373,13 @@ class OpenAICompatProvider:
                     }
                     for b in results
                 ]
-            return {"role": "tool", "content": msg.text()}
+            return {"role": "tool", "content": msg.conversation_text()}
+        replay_reasoning = bool(msg.metadata.get("replay_reasoning", False))
         text = "\n".join(
-            b.text for b in msg.blocks if isinstance(b, (TextBlock, ReasoningBlock)) and b.text
+            b.text
+            for b in msg.blocks
+            if (isinstance(b, TextBlock) or (replay_reasoning and isinstance(b, ReasoningBlock)))
+            and b.text
         )
         content_parts: list[dict[str, Any]] = []
         if text:

@@ -1,5 +1,14 @@
 from athena.memory.candidates import candidates_from_task
 from athena.protocol.memory import MemoryKind
+from athena.protocol.messages import (
+    Message,
+    Provenance,
+    ReasoningBlock,
+    Role,
+    SourceType,
+    TextBlock,
+    utcnow,
+)
 from athena.protocol.tasks import TaskResult, TaskSpec, TaskStatus
 
 
@@ -30,3 +39,21 @@ async def test_episodic_candidate_has_promotion_flag():
     assert record.metadata.get("origin") == "episodic"
     assert record.metadata.get("task_id") == "task-2"
     assert record.scope.value == "task"
+
+
+async def test_greeting_and_hidden_reasoning_produce_no_memory_candidates():
+    task = TaskSpec(id="task-greeting", objective="hello", session_id="sess-greeting")
+    message = Message(
+        id="msg-greeting",
+        role=Role.ASSISTANT,
+        blocks=(
+            ReasoningBlock(text="The user greeted me; perhaps save this."),
+            TextBlock(text="Hello!"),
+        ),
+        created_at=utcnow(),
+        provenance=Provenance(source_type=SourceType.GENERATED),
+    )
+
+    candidates = await candidates_from_task(task, [message], None)
+
+    assert candidates == []

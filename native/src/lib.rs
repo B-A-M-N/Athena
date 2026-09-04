@@ -165,6 +165,17 @@ impl NativeTerminalCore {
     pub fn renderable_content(&self) -> RenderableContent<'_> {
         self.term.renderable_content()
     }
+
+    /// Tell the native compositor whether the operator aperture has any
+    /// visible application glyphs. A fresh PTY can be visually empty for a
+    /// short interval, so the renderer uses this only to show a quiet
+    /// readiness cue; real terminal output always takes precedence.
+    pub fn has_visible_text(&self) -> bool {
+        self.term
+            .renderable_content()
+            .display_iter
+            .any(|indexed| indexed.cell.c != ' ')
+    }
 }
 
 /// Font-derived metrics shared by layout, PTY sizing, input hit testing, and
@@ -218,10 +229,10 @@ pub struct UiFontMetrics {
 impl UiFontMetrics {
     pub fn fallback() -> Self {
         Self {
-            body: CellMetrics::fallback(),
-            input: CellMetrics::new(9.0, 20.0, 15.0, 5.0),
-            heading: CellMetrics::new(7.0, 15.0, 12.0, 3.0),
-            instrument: CellMetrics::new(6.0, 12.0, 9.0, 3.0),
+            body: CellMetrics::new(10.0, 20.0, 16.0, 4.0),
+            input: CellMetrics::new(11.0, 21.0, 17.0, 4.0),
+            heading: CellMetrics::new(8.0, 17.0, 13.0, 4.0),
+            instrument: CellMetrics::new(7.0, 14.0, 11.0, 3.0),
         }
     }
 }
@@ -394,6 +405,8 @@ pub struct NativePixelLayout {
     pub prompt_gap: f32,
     pub prompt_bottom_padding: f32,
     pub scale: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
     pub canvas: PixelRect,
     pub chassis: PixelRect,
     pub header: PixelRect,
@@ -432,18 +445,23 @@ impl NativePixelLayout {
         const DESIGN_WIDTH: f32 = 1672.0;
         const DESIGN_HEIGHT: f32 = 941.0;
         let scale = Self::scale_for_window(width, height);
+        // The reference remains the authoring coordinate system, but the
+        // native shell owns the whole drawable.  This prevents a 16:10
+        // window from growing a dead letterbox around the instrument.
+        let scale_x = width_f / DESIGN_WIDTH;
+        let scale_y = height_f / DESIGN_HEIGHT;
         let canvas = PixelRect {
-            x: (width_f - DESIGN_WIDTH * scale) * 0.5,
-            y: (height_f - DESIGN_HEIGHT * scale) * 0.5,
-            width: DESIGN_WIDTH * scale,
-            height: DESIGN_HEIGHT * scale,
+            x: 0.0,
+            y: 0.0,
+            width: width_f,
+            height: height_f,
         };
         let compact = scale < 0.66 || width < 900 || height < 620;
         let map = |x: f32, y: f32, width: f32, height: f32| PixelRect {
-            x: canvas.x + x * scale,
-            y: canvas.y + y * scale,
-            width: width * scale,
-            height: height * scale,
+            x: x * scale_x,
+            y: y * scale_y,
+            width: width * scale_x,
+            height: height * scale_y,
         };
         // Measured AthenaBOX reference geometry. The display assembly is the
         // dominant mass; the lower instrument deck is a shallow physical
@@ -539,6 +557,8 @@ impl NativePixelLayout {
             prompt_gap,
             prompt_bottom_padding,
             scale,
+            scale_x,
+            scale_y,
             canvas,
             chassis: canvas,
             header,

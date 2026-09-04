@@ -197,12 +197,14 @@ class WorkspaceSpec:
 
 @dataclass(frozen=True)
 class ResourceBudget:
-    max_agent_iterations: int = 500
+    # A bounded default keeps ordinary tasks in the tens; callers with a
+    # genuinely long mission must opt into a larger budget explicitly.
+    max_agent_iterations: int = 50
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     max_cost_usd: Decimal | None = None
     max_wall_time: timedelta | None = None
-    max_children: int = 16
+    max_children: int = 4
     max_child_depth: int = 1
     max_parallel_model_calls: int = 4
     max_parallel_executions: int = 16
@@ -241,7 +243,10 @@ def _min_opt(a, b):
 class ModelPolicy:
     role: str = "primary"
     allowed: tuple[str, ...] = ()
-    require_tools: bool = True
+    # Tool use is selected by the current task/context. This flag is an
+    # explicit requirement for callers that need a tool-capable route; it is
+    # not the default for ordinary conversational turns.
+    require_tools: bool = False
     privacy: str = "local-preferred"
     max_cost_usd: Decimal | None = None
     # Routing preference is advisory only; privacy, capability, and cost
@@ -257,6 +262,27 @@ class CapabilityPolicy:
     allow: tuple[str, ...] = ()
     ask: tuple[str, ...] = ()
     deny: tuple[str, ...] = ()
+
+
+def capability_id_permitted(capability_id: str, policy: CapabilityPolicy | None) -> bool:
+    """Return whether an id may enter a task's visible capability surface.
+
+    This is the same fail-closed ID ceiling the dispatcher enforces at call
+    time. Keeping the predicate beside the policy prevents context compilation
+    from advertising capabilities that the execution boundary will reject.
+
+    Semantics (P0): visible/callable = allow ∪ ask − deny. An ``ask`` entry
+    is callable but carries a task-level forced approval; it must not be
+    masked by the presence of an ``allow`` list. ``deny`` is a hard exclude
+    that wins over both.
+    """
+    if policy is None:
+        return True
+    if capability_id in policy.deny or "*" in policy.deny:
+        return False
+    if policy.allow or policy.ask:
+        return capability_id in policy.allow or capability_id in policy.ask
+    return True
 
 
 @dataclass(frozen=True)
@@ -351,6 +377,7 @@ __all__ = [
     "ResourceBudget",
     "ModelPolicy",
     "CapabilityPolicy",
+    "capability_id_permitted",
     "DeliverySpec",
     "TaskSpec",
     "UsageSummary",

@@ -697,6 +697,8 @@ def _installed_acceptance_program() -> str:
                         "memory",
                         "packs",
                         "skills",
+                        "request_input",
+                        "session_search",
                         "delegate",
                         "delegate.external",
                     },

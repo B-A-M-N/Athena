@@ -69,113 +69,207 @@ class PolicyEngine:
         ``request.effects`` holds the resolved effect classes (computed after
         argument resolution; BHV-041). ``autonomy`` overrides the engine
         default profile for this call.
+
+        Evaluation is COMPOSITIONAL and MONOTONIC over the resolved effect
+        set. Every effect is evaluated independently against the profile
+        rule set and the per-effect resource constraints; the verdicts are
+        then combined with DENY > ASK > ALLOW. Adding an effect can never
+        make a request easier to authorize.
+
+        Ordering (P0 authority boundary):
+
+        1. hard immutable constraints — workspace/path/backend/network
+           containment, privilege floors. A structural DENY is final: an
+           approval grant can never convert it into ALLOW.
+        2. profile policy over each resolved effect.
+        3. approval — an active grant converts ASK into ALLOW only.
         """
         level = _to_level(autonomy or self.profile)
         rules = profile_ruleset(level)
 
-        hit = self.approvals.covers_request(request)
-        if hit is not None:
-            return _decision(
-                "allow",
-                f"approved grant {hit.id} covers request",
-                f"approval:{hit.id}",
-                request,
+        # ---- 1. hard containment (structural, approval-proof) ------------ #
+        structural = self._eval_containment(request, level)
+        if structural is not None:
+            return structural
+
+        # ---- 2. per-effect profile verdicts, combined monotonically ------ #
+        combined, reasons = self._eval_effects(request, rules)
+        if combined is PolicyVerdict.DENY:
+            return PolicyDecision(
+                PolicyVerdict.DENY, "; ".join(reasons), None, ()
             )
 
-        if _has(EffectClass.WRITE_LOCAL, request.effects) or self._is_files_op(request, _WRITE_OPS):
-            # Process-spawning capabilities carry WRITE_LOCAL as a secondary
-            # effect but must be evaluated as EXECUTE (they run code, not
-            # write files). Only route to _eval_write when there is no
-            # execute/spawn effect present.
-            if not (
-                _has(EffectClass.EXECUTE, request.effects)
-                or _has(EffectClass.SPAWN_PROCESS, request.effects)
-            ):
-                # Database writes target DB files by path; they are workspace-
-                # scoped like file writes but resolved against the DB path.
-                if (
-                    not request.arguments.get("path")
-                    and request.capability_id in _PATHLESS_WRITE_CAPABILITIES
-                ):
-                    out = self._eval_rule(
-                        request,
-                        rules,
-                        EffectClass.WRITE_LOCAL,
-                        f"{request.capability_id}.write",
-                    )
-                else:
-                    out = (
-                        self._eval_database_write(request, rules)
-                        if request.capability_id == "database"
-                        else self._eval_write(request, rules)
-                    )
-            else:
-                out = self._eval_execute(request, rules, level)
-        elif _has(EffectClass.DELETE, request.effects) or self._is_files_op(request, _DELETE_OPS):
-            out = self._eval_delete(request, rules)
-        elif (
-            _has(EffectClass.EXECUTE, request.effects)
-            or _has(EffectClass.SPAWN_PROCESS, request.effects)
-            or self._is_exec(request)
+        # ---- 3. approval converts ASK -> ALLOW only ---------------------- #
+        if combined is PolicyVerdict.ASK:
+            hit = self.approvals.covers_request(request)
+            if hit is not None:
+                return _decision(
+                    "allow",
+                    f"approved grant {hit.id} covers request",
+                    f"approval:{hit.id}",
+                    request,
+                )
+        return _decision(combined.value, "; ".join(reasons), None, request)
+
+    def _eval_containment(
+        self, request: PolicyRequest, level: AutonomyLevel
+    ) -> PolicyDecision | None:
+        """Hard, approval-immutable constraints evaluated before policy.
+
+        Returns a DENY decision when the request structurally escapes the
+        workspace/authority envelope, or None when containment holds and
+        evaluation may proceed. These checks are deliberately insensitive to
+        the autonomy profile where the boundary is absolute (workspace
+        containment for writes/deletes, network hard-deny), and profile-aware
+        only where the profile itself defines the grant (out-of-workspace
+        execute).
+        """
+        # Structural checks are profile-independent except the explicit
+        # out-of-workspace execute grant the AUTONOMOUS profile carries.
+        if request.workspace is None:
+            return None
+        effects = set(request.effects)
+        execute_bearing = (
+            EffectClass.EXECUTE in effects or EffectClass.SPAWN_PROCESS in effects
+        )
+
+        # WRITE_LOCAL / DELETE target concrete filesystem paths unless the
+        # capability operates on Athena state rather than files (declared by
+        # the pathless-write classification). EXECUTE-bearing calls resolve
+        # their cwd/path through the execute containment check instead.
+        if (EffectClass.WRITE_LOCAL in effects or EffectClass.DELETE in effects) and not execute_bearing:
+            if request.capability_id == "database":
+                if not self._database_within(request):
+                    return _deny(f"database outside writable scope: {request.arguments.get('path')}")
+            elif request.arguments.get("path") or request.arguments.get("resource"):
+                out = self._eval_write(request) if EffectClass.WRITE_LOCAL in effects else self._eval_delete(request)
+                if out.decision is PolicyVerdict.DENY:
+                    return out
+            elif request.capability_id not in _PATHLESS_WRITE_CAPABILITIES:
+                return _deny("write call missing resolved path", "files.path")
+
+        if execute_bearing:
+            out = self._eval_execute_containment(request, level)
+            if out is not None:
+                return out
+        elif EffectClass.READ_LOCAL in effects and (
+            request.arguments.get("path") or request.arguments.get("resource")
         ):
-            out = self._eval_execute(request, rules, level)
-        elif _has(EffectClass.READ_LOCAL, request.effects) or self._is_files_op(request, _READ_OPS):
-            out = self._eval_read(request, rules)
-        else:
-            out = self._eval_rule(request, rules, _primary(request.effects), request.capability_id)
-        return out
+            out = self._eval_read(request)
+            if out.decision is PolicyVerdict.DENY:
+                return out
+        return None
+
+    def _eval_effects(self, request: PolicyRequest, rules: RuleSet) -> tuple[PolicyVerdict, list[str]]:
+        """Evaluate every resolved effect independently and combine strictly.
+
+        Each effect is evaluated against the rule set as a SINGLETON effect
+        set — that is the compositional semantics
+        ``verdict(E) = max(verdict({e}) for e in E)`` — which is what makes
+        the result monotonic: adding an effect adds a term to the max and can
+        never soften a stricter verdict. DENY > ASK > ALLOW. An effect with no
+        matching rule falls to the profile default.
+        """
+        effects = tuple(request.effects)
+        verdicts: list[tuple[PolicyVerdict, str]] = []
+        for effect in effects:
+            singleton = frozenset({effect})
+            hit = rules.evaluate(request.capability_id, singleton, dict(request.arguments))
+            if hit is None:
+                verdict, matched = (
+                    _verdict(rules.default),
+                    f"{request.capability_id}.{effect.value}",
+                )
+                reason = f"no rule matched {effect.value}; profile default {rules.default}"
+            else:
+                verdict, matched = hit
+                reason = f"rule {matched}"
+            verdicts.append((_verdict(verdict), reason))
+        if not verdicts:
+            hit = rules.evaluate(request.capability_id, frozenset(), dict(request.arguments))
+            if hit is None:
+                verdicts = [
+                    (_verdict(rules.default), "no resolved effects; profile default")
+                ]
+            else:
+                verdicts = [(_verdict(hit[0]), f"rule {hit[1]}")]
+        combined = max((v for v, _ in verdicts), key=_STRICTNESS_RANK.__getitem__)
+        reasons = [reason for v, reason in verdicts if v is combined]
+        return combined, reasons
 
     # ------------------------------------------------------------- workspace
-    def _eval_write(self, req, rules):
+    def _eval_write(self, req, rules=None):
+        """Structural containment for a filesystem write target."""
         path = req.arguments.get("path") or req.arguments.get("resource")
         if not path:
             return _deny("write call missing resolved path", "files.path")
         target = self._abs(path, req.workspace)
         if not self._within(target, req.workspace, writable_only=True):
             return _deny(f"write outside writable scope: {path}")
-        return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL, "files.write")
+        return _allow("write within writable scope")
 
-    def _eval_database_write(self, req, rules):
-        """Database write path check (BHV-041).
+    def _database_within(self, req) -> bool:
+        """Database write containment (BHV-041).
 
         A database file is a legitimate mutation target even outside the
         workspace when the caller was granted it; the policy question here
-        is workspace containment. DB paths outside the workspace require an
-        explicit approval grant (same rule as out-of-workspace execute).
+        is workspace containment. /tmp databases are scratch and stay
+        allowed under profile rules.
         """
         path = str(req.arguments.get("path") or "")
         if self._out_of_workspace(req) and os.path.realpath(os.path.abspath(path)).startswith(
             "/tmp/"
         ):
-            # /tmp databases are scratch; allow under profile rules.
-            return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL, "database.write")
-        if not self._within(self._abs(path, req.workspace), req.workspace, writable_only=True):
-            return _deny(f"database outside writable scope: {path}")
-        return self._eval_rule(req, rules, EffectClass.WRITE_LOCAL, "database.write")
+            return True
+        return self._within(self._abs(path, req.workspace), req.workspace, writable_only=True)
 
-    def _eval_delete(self, req, rules):
+    def _eval_delete(self, req, rules=None):
+        """Structural containment for a delete target."""
         path = req.arguments.get("path") or req.arguments.get("resource")
         if not path:
             return _deny("delete call missing resolved path")
         target = self._abs(path, req.workspace)
         if not self._within(target, req.workspace, writable_only=True):
             return _deny(f"delete outside writable scope: {path}")
-        return self._eval_rule(req, rules, EffectClass.DELETE, "files.delete")
+        return _allow("delete within writable scope")
 
-    def _eval_read(self, req, rules):
+    def _eval_read(self, req, rules=None):
+        """Structural containment for a read target."""
         path = req.arguments.get("path") or req.arguments.get("resource")
         if not path:
-            return self._eval_rule(req, rules, EffectClass.READ_LOCAL, "files.read")
+            return _allow("read: no path argument")
         target = self._abs(path, req.workspace)
         if not self._within(target, req.workspace, writable_only=False):
             return _deny(f"read outside readable scope: {path}")
-        return self._eval_rule(req, rules, EffectClass.READ_LOCAL, "files.read")
+        return _allow("read within readable scope")
 
-    def _eval_execute(self, req, rules, level):
+    def _eval_execute_containment(self, req, level=None) -> PolicyDecision | None:
+        """Structural execute checks: a DENY decision, or None to continue.
+
+        Out-of-workspace execute is granted only when the active profile
+        explicitly carries that grant (AUTONOMOUS build/test commands).
+        """
         # A normal local backend remains conservative: it cannot prove that
         # arbitrary code is network-confined.  The shadow backend is allowed
         # through only because its runtime contract invokes the fail-closed
         # namespace sandbox with a private network namespace.
+        if (
+            req.workspace.network_policy == NetworkPolicy.DENY
+            and req.execution_backend not in {"shadow", "sandbox", "sandboxed-local"}
+        ):
+            return _deny("execute denied: workspace network_policy is DENY")
+        if self._out_of_workspace(req) and not (
+            level is not None and _execute_granted(level, req)
+        ):
+            return _deny("execute outside workspace requires profile grant (INV-008)")
+        return None
+
+    def _eval_execute(self, req, rules, level):
+        """Legacy isolated-entry execute evaluation: containment then rule.
+
+        Kept for callers/tests that exercise the execute path directly.
+        ``level`` gates the out-of-workspace grant the profile may carry.
+        """
         if (
             req.workspace is not None
             and req.workspace.network_policy == NetworkPolicy.DENY
@@ -258,6 +352,29 @@ def _decision(
 
 def _deny(reason: str, matched: Optional[str] = None) -> PolicyDecision:
     return PolicyDecision(PolicyVerdict.DENY, reason, matched, ())
+
+
+def _allow(reason: str, matched: Optional[str] = None) -> PolicyDecision:
+    return PolicyDecision(PolicyVerdict.ALLOW, reason, matched, ())
+
+
+# STRICTNESS ranking for monotonic combination: ALLOW < ASK < DENY.
+_STRICTNESS_RANK = {
+    PolicyVerdict.ALLOW: 0,
+    PolicyVerdict.ASK: 1,
+    PolicyVerdict.DENY: 2,
+}
+
+
+def _verdict(value) -> PolicyVerdict:
+    if isinstance(value, PolicyVerdict):
+        return value
+    v = str(value or "").lower()
+    if v == "allow":
+        return PolicyVerdict.ALLOW
+    if v == "deny":
+        return PolicyVerdict.DENY
+    return PolicyVerdict.ASK
 
 
 def _has(cls, effects) -> bool:

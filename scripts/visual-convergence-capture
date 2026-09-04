@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ -n "${ATHENA_VISUAL_LOOP_DIR:-}" ]]; then
+  loop_dir="$ATHENA_VISUAL_LOOP_DIR"
+elif [[ -f "$repo_root/.ui-loop/state.json" ]]; then
+  loop_dir="$repo_root/.ui-loop"
+else
+  # Preserve an older project-local visual loop until /visual explicitly
+  # migrates or replaces it. Fresh projects use the v2 .ui-loop location.
+  loop_dir="$repo_root/.visual-loop"
+fi
+out_path="${ATHENA_VISUAL_CAPTURE_PATH:-$loop_dir/latest.png}"
+state_path="$loop_dir/state.json"
+expected_width="${ATHENA_VISUAL_WIDTH:-1280}"
+expected_height="${ATHENA_VISUAL_HEIGHT:-800}"
+mascot="${ATHENA_VISUAL_MASCOT:-owl}"
+scene_mode="${ATHENA_VISUAL_SCENE:-search}"
+
+mkdir -p "$loop_dir"
+
+for command in cargo xvfb-run import identify xdotool; do
+  command -v "$command" >/dev/null || {
+    printf 'visual-convergence-capture: FAIL — %s is unavailable\n' "$command" >&2
+    exit 1
+  }
+done
+
+cargo build --release --manifest-path "$repo_root/native/Cargo.toml" --locked --offline >/dev/null
+native_bin="$repo_root/native/target/release/athena-terminal"
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+capture_path="$tmp_dir/capture.png"
+sync_path="$tmp_dir/presentation.json"
+
+projection='{"schema_version":3,"title":"ATHENA // VISUAL CONVERGENCE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
+projection="${projection//\"search\"/\"$scene_mode\"}"
+projection="${projection//\"SEARCH\"/\"${scene_mode^^}\"}"
+projection="${projection//\"owl\"/\"$mascot\"}"
+
+wait_for_presentation() {
+  PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" python3 - <<'PY'
+import json
+import os
+import time
+from pathlib import Path
+
+path = Path(os.environ["PRESENTATION_PATH"])
+minimum = int(os.environ["MIN_SEQUENCE"])
+width = int(os.environ["EXPECTED_WIDTH"])
+height = int(os.environ["EXPECTED_HEIGHT"])
+deadline = time.monotonic() + 15.0
+while time.monotonic() < deadline:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        value = None
+    if (
+        isinstance(value, dict)
+        and int(value.get("presented_frame_sequence", 0)) >= minimum
+        and int(value.get("width", 0)) == width
+        and int(value.get("height", 0)) == height
+    ):
+        raise SystemExit(0)
+    time.sleep(0.01)
+raise SystemExit(f"presentation sync timeout: sequence >= {minimum}, {width}x{height}")
+PY
+}
+
+printf '%s\n' "$projection" | \
+  NATIVE_BIN="$native_bin" \
+  SYNC_PATH="$sync_path" \
+  CAPTURE_PATH="$capture_path" \
+  EXPECTED_WIDTH="$expected_width" \
+  EXPECTED_HEIGHT="$expected_height" \
+  MASCOT="$mascot" \
+  xvfb-run -a -s '-screen 0 1920x1080x24 -ac' bash -c '
+    set -euo pipefail
+    wait_for_window() {
+      timeout 10s xdotool search --sync --name "ATHENA" 2>/dev/null | head -1
+    }
+    wait_for_presentation() {
+      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" python3 - <<"PY"
+import json
+import os
+import time
+from pathlib import Path
+
+path = Path(os.environ["PRESENTATION_PATH"])
+minimum = int(os.environ["MIN_SEQUENCE"])
+width = int(os.environ["EXPECTED_WIDTH"])
+height = int(os.environ["EXPECTED_HEIGHT"])
+deadline = time.monotonic() + 15.0
+while time.monotonic() < deadline:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        value = None
+    if (
+        isinstance(value, dict)
+        and int(value.get("presented_frame_sequence", 0)) >= minimum
+        and int(value.get("width", 0)) == width
+        and int(value.get("height", 0)) == height
+    ):
+        raise SystemExit(0)
+    time.sleep(0.01)
+raise SystemExit(f"presentation sync timeout: sequence >= {minimum}, {width}x{height}")
+PY
+    }
+    ATHENA_PRESENTATION_CLOCK=fixed ATHENA_NATIVE_PRESENTATION_SYNC="$SYNC_PATH" "$NATIVE_BIN" \
+      --bridge-stdin --no-animations --mascot "$MASCOT" \
+      --command "printf native-ok; tail -f /dev/null" >/dev/null 2>&1 &
+    native_pid=$!
+    window="$(wait_for_window)"
+    xdotool windowfocus --sync "$window"
+    xdotool windowsize --sync "$window" "$EXPECTED_WIDTH" "$EXPECTED_HEIGHT"
+    wait_for_presentation "$SYNC_PATH" 1 "$EXPECTED_WIDTH" "$EXPECTED_HEIGHT"
+    import -window "$window" "$CAPTURE_PATH"
+    kill "$native_pid" 2>/dev/null || true
+    wait "$native_pid" 2>/dev/null || true
+  '
+
+[[ -s "$capture_path" ]] || {
+  printf '%s\n' "visual-convergence-capture: FAIL — capture is empty" >&2
+  exit 1
+}
+
+dimensions="$(identify -format "%wx%h" "$capture_path")"
+[[ "$dimensions" == "${expected_width}x${expected_height}" ]] || {
+  printf '%s\n' "visual-convergence-capture: FAIL — capture dimensions $dimensions" >&2
+  exit 1
+}
+
+cp "$capture_path" "$out_path"
+
+python3 - "$state_path" "$out_path" <<'PY'
+import fcntl
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+lock_path = state_path.with_name(f"{state_path.name}.lock")
+with lock_path.open("a+", encoding="utf-8") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    document = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
+    state = document.get("state")
+    if not isinstance(state, dict):
+        state = {}
+    # The visual hook owns render_epoch and phase transitions. This command
+    # only records the artifact location, so the PostToolUse hook advances
+    # the state exactly once after the command succeeds.
+    state["active"] = True
+    state["status"] = "active"
+    state["latest_screenshot"] = str(out_path)
+    state["capture_command"] = str(out_path)
+    document["state"] = state
+    document["active"] = True
+    document["status"] = "active"
+    document["latest_screenshot"] = str(out_path)
+    document["capture_command"] = str(out_path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{state_path.name}.", dir=state_path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            json.dump(document, tmp, indent=2)
+            tmp.write("\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, state_path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+PY
+
+printf 'visual-convergence-capture: PASS — %dx%d screenshot at %s\n' "$expected_width" "$expected_height" "$out_path"

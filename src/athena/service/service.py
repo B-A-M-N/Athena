@@ -349,6 +349,9 @@ class AthenaService:
         mutations = MutationStore(db)
         schedules = ScheduleStore(db)
         continuations = ContinuationStore(db)
+        from athena.state.input_requests import InputRequestStore
+
+        input_requests = InputRequestStore(db)
         self._sessions = sessions
         self._store_tasks = tasks
         self._store_events = events
@@ -358,6 +361,7 @@ class AthenaService:
         self._external_effect_store = ExternalEffectStore(db)
         self._store_schedules = schedules
         self._store_continuations = continuations
+        self._store_input_requests = input_requests
         from athena.worldstate import WorldStateStore
 
         self._world_state_store = WorldStateStore(db)
@@ -521,9 +525,9 @@ class AthenaService:
         self._cancellations = cancellations
         task_manager._cancellations = cancellations  # noqa: SLF001
 
-        # Post-finalization knowledge pipeline (BUILDSPEC 64/68): every
-        # completed/partial task feeds memory + skill candidates. Bound after
-        # all stores exist; the observer itself is failure-isolated.
+        # Post-finalization knowledge pipeline (BUILDSPEC 64/68): eligible
+        # completed/partial tasks may feed memory + skill candidates. Bound
+        # after all stores exist; the observer itself is failure-isolated.
         self._knowledge = KnowledgePipeline(
             messages=messages,
             memory_store=memory,
@@ -532,10 +536,6 @@ class AthenaService:
             events=events,
         )
         task_manager.add_finalize_observer(self._knowledge)
-
-        # Watch polling: file/process watchers push WatchObserved events
-        # into the durable stream while the service runs (P1 'watch').
-        self._watch_poll_task = asyncio.create_task(self._poll_watches())
 
         # 8. Models + router (with role-divided policies: "summarizer",
         # "judge", etc. can be pinned to specific models in config; roles
@@ -637,6 +637,7 @@ class AthenaService:
             dispatch_factory=self._dispatch_factory,
             continuation_store=continuations,
             workflow_run_store=self._workflow_run_store,
+            input_request_store=input_requests,
             provider_usage_store=self._provider_usage_store,
             interpreter=self._make_interpreter(),
             reality_coordinator=coordinator,
@@ -731,6 +732,7 @@ class AthenaService:
             store=schedules,
             task_manager=task_manager,
             admission=self.require_task_ready,
+            intake=self.submit_spec,
             max_concurrent=cfg.scheduler_max_concurrent,
             loop_interval_seconds=cfg.scheduler_interval_seconds,
         )
@@ -907,6 +909,10 @@ class AthenaService:
 
         # 15. Start background scheduler loop.
         await scheduler.start()
+        # Watch polling begins only after stores, capability registry, model
+        # routing, recovery, packs, and MCP integrations are ready. A watcher
+        # must never publish events into a half-constructed service.
+        self._watch_poll_task = asyncio.create_task(self._poll_watches())
         self._started = True
         degraded = any(
             value.get("status") != "ok"
@@ -1298,7 +1304,34 @@ class AthenaService:
         self._validate_request_metadata(request.metadata)
         session_id = request.session_id or new_id("session")
         spec = self._build_task_spec(request, session_id)
-        return await self._enqueue_spec(tm, spec, wait=wait)
+        return await self._enqueue_spec(tm, spec, wait=wait, user_request=request)
+
+    async def submit_spec(
+        self,
+        spec: TaskSpec,
+        *,
+        wait: bool = False,
+        user_request: Any | None = None,
+        trusted: bool = False,
+    ) -> TaskSpec:
+        """Submit an already-decoded task through the service intake.
+
+        Transports such as ACP may decode their wire envelope, but they do not
+        own admission, session allocation, canonical user persistence, task
+        creation, or enqueue ordering. Keeping those operations here makes all
+        transports share the same authority boundary.
+        """
+        tm = self._require_task_manager()
+        await self.require_task_ready(spec)
+        if not trusted:
+            self._validate_request_metadata(spec.metadata)
+        if not spec.session_id:
+            session_id = new_id("session")
+            spec = replace(spec, session_id=session_id)
+        if self._sessions is not None and spec.session_id:
+            if await self._sessions.get(spec.session_id) is None:
+                await self._sessions.create(spec.session_id, metadata={"origin": "service"})
+        return await self._enqueue_spec(tm, spec, wait=wait, user_request=user_request)
 
     async def submit_self_host(
         self,
@@ -1442,6 +1475,9 @@ class AthenaService:
                 current_gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
                 plan=plan,
             )
+        # Self-host plans are still user-initiated task turns. Persist their
+        # canonical service-owned prompt before the worker can observe them.
+        await self._record_canonical_user_turn(request, created)
         await tm.enqueue(created.id)
         if wait:
             await self.wait_for(created.id)
@@ -2030,12 +2066,94 @@ class AthenaService:
             return {"status": "started", "mission": mission, "task_id": created.id}
         return {"status": "pending", "mission": mission, "task_id": task_id}
 
-    async def _enqueue_spec(self, task_manager: TaskManager, spec: TaskSpec, *, wait: bool):
+    async def _enqueue_spec(
+        self,
+        task_manager: TaskManager,
+        spec: TaskSpec,
+        *,
+        wait: bool,
+        user_request: AgentRequest | None = None,
+    ):
         created = await task_manager.create(spec)
+        # Every task gets a durable causal root before it can run. Transport
+        # callers provide the original request; internal/scheduled callers
+        # use the TaskSpec objective. This prevents same-session tasks from
+        # inheriting whichever unrelated turn happened to be most recent.
+        await self._record_canonical_user_turn(user_request or created, created)
         await task_manager.enqueue(created.id)
         if wait:
             await self.wait_for(created.id)
         return created
+
+    async def _record_canonical_user_turn(self, request: Any, task: TaskSpec) -> None:
+        """Append the service-owned user turn exactly once before enqueueing."""
+        if self._store_messages is None or not task.session_id:
+            return
+        from athena.protocol.messages import (
+            ArtifactRefBlock,
+            FileRefBlock,
+            Message,
+            Provenance,
+            Role,
+            SourceType,
+            TextBlock,
+            TrustClass,
+            utcnow,
+        )
+
+        blocks: list[Any] = [
+            TextBlock(
+                text=str(getattr(request, "prompt", None) or getattr(request, "objective", "")),
+                provenance=Provenance(
+                    source_type=SourceType.USER,
+                    source_id=task.id,
+                    trust=TrustClass.USER_CONTENT,
+                    scope="session",
+                ),
+            )
+        ]
+        for attachment in getattr(request, "attachments", ()) or ():
+            if hasattr(attachment, "uri"):
+                blocks.append(
+                    ArtifactRefBlock(
+                        uri=str(attachment.uri),
+                        ref=attachment,
+                    )
+                )
+            elif isinstance(attachment, Mapping):
+                uri = str(attachment.get("uri") or attachment.get("ref") or "")
+                if uri:
+                    blocks.append(
+                        FileRefBlock(
+                            uri=uri,
+                            mime_type=attachment.get("mime_type"),
+                        )
+                    )
+        message = Message(
+            # Stable association makes retries idempotent without making the
+            # task/message identity part of normal opaque ID generation.
+            id=f"msg_user_{task.id}",
+            role=Role.USER,
+            blocks=tuple(blocks),
+            created_at=utcnow(),
+            provenance=Provenance(
+                source_type=SourceType.USER,
+                source_id=task.id,
+                trust=TrustClass.USER_CONTENT,
+                scope="session",
+            ),
+            metadata={
+                "session_id": task.session_id,
+                "task_id": task.id,
+                "message_kind": "user_turn",
+                "canonical_user_turn": True,
+            },
+        )
+        append_user_turn = getattr(self._store_messages, "append_user_turn", None)
+        if append_user_turn is not None:
+            await append_user_turn(task.session_id, message)
+        else:
+            await self._store_messages.append_to_session(task.session_id, message)
 
     @staticmethod
     def _self_host_verification_environment(
@@ -2396,6 +2514,27 @@ class AthenaService:
     async def interrupt(self, task_id: str, reason: str = "externally interrupted") -> TaskStatus:
         return await self._require_cancellations().interrupt(task_id, reason)
 
+    async def pending_input(self, task_id: str) -> dict | None:
+        """The open clarification request for a task, if any."""
+        if self._store_input_requests is None:
+            return None
+        return await self._store_input_requests.pending_for_task(task_id)
+
+    async def provide_input(self, task_id: str, answer: str) -> None:
+        """Answer a task's open clarification and resume the SAME task.
+
+        The question was persisted when the model issued ``request_input``;
+        this records the answer durably and wakes the parked kernel loop, which
+        continues the identical Task with the answer in its session.
+        """
+        if self._store_input_requests is None:
+            raise RuntimeError("operator input is unavailable in this deployment")
+        request = await self._store_input_requests.pending_for_task(task_id)
+        if request is None:
+            raise KeyError(f"No pending input request for task: {task_id}")
+        await self._store_input_requests.resolve(request["id"], str(answer))
+        await self._kernel.notify_input_provided(task_id, str(answer))
+
     async def approve(self, approval_id: str, *, granted: bool, scope: str | None = None) -> None:
         """Resolve a pending approval and wake the parked task, if any.
 
@@ -2576,6 +2715,10 @@ class AthenaService:
                 scope_choice,
                 capability=cap,
                 effect=str(primary_name) if primary_name else None,
+                # Authority envelope (P0): persist the COMPLETE effect set
+                # from the original request so the grant's ceiling is what
+                # the operator approved, never broader.
+                allowed_effects=tuple(effects) if effects else None,
                 task_id=task_id,
                 # SESSION-scoped grants are keyed on session_id in
                 # ApprovalManager._covers_locked; omitting it makes every
@@ -3729,6 +3872,21 @@ class AthenaService:
                 mutation_mode=MutationMode.SPECULATIVE,
             )
         raw_mutation_mode = meta.pop("mutation_mode", None)
+        # OFFLINE autonomy is a hard egress boundary (P0): the task's model
+        # routing is narrowed to local-only models, not merely biased toward
+        # them. Model calls do not pass through PolicyEngine; ModelRouter's
+        # privacy gate is the authority that owns this boundary, and it only
+        # enforces what the task's ModelPolicy carries. A network-DENY
+        # workspace pins model egress the same way.
+        model_policy = request.model_policy or _default_model_policy()
+        if autonomy is AutonomyLevel.OFFLINE or (
+            ws.network_policy is not None
+            and ws.network_policy == NetworkPolicy.DENY
+            and model_policy.privacy not in _OFFLINE_MODEL_PRIVACY
+        ):
+            if model_policy.privacy not in _OFFLINE_MODEL_PRIVACY:
+                model_policy = replace(model_policy, privacy="offline")
+                meta["_athena_offline_narrowed"] = True
         if self_host:
             # The service-enforced self-host boundary wins over any copied
             # request metadata, including an explicit direct-mode escape.
@@ -3814,7 +3972,7 @@ class AthenaService:
             objective=request.prompt,
             session_id=session_id,
             workspace=ws,
-            model_policy=request.model_policy or _default_model_policy(),
+            model_policy=model_policy,
             resource_budget=ResourceBudget(),
             context_refs=tuple(context_refs),
             metadata=meta,
@@ -4196,6 +4354,9 @@ class AthenaService:
             registry.register(DiagnosticsCapability(self._failure_memory))
         registry.register(MemoryCapability(memory))
         registry.register(SkillsCapability(skills_store))
+        from athena.capabilities.session_search import SessionSearchCapability
+
+        registry.register(SessionSearchCapability(self._store_messages))
         registry.register(DelegateCapability(self._delegation))
         from athena.capabilities.external_delegate import ExternalDelegateCapability
         from athena.delegates.sessions import ExternalDelegateManager
@@ -4302,6 +4463,15 @@ class AthenaService:
         )
         registry.register(TruthCapability(self))
         registry.register(DependencyCapability(execution))
+        if self._store_input_requests is not None:
+            # Descriptor-only registration: the kernel intercepts
+            # request_input calls before any dispatcher runs, so the bound
+            # executor is a truthful fallback that never runs on a healthy
+            # path. The fabric entry makes the affordance discoverable and
+            # compilable into the model's tool surface.
+            from athena.capabilities.input_request import InputRequestCapability
+
+            registry.register(InputRequestCapability())
         if research_store is not None:
             registry.register(
                 ResearchCapability(
@@ -5125,7 +5295,14 @@ class AthenaService:
 def _default_model_policy():
     from athena.protocol.tasks import ModelPolicy
 
-    return ModelPolicy(require_tools=True)
+    return ModelPolicy(require_tools=False)
+
+
+# Privacy values ModelRouter treats as a hard LOCAL-only gate. OFFLINE
+# autonomy and network-DENY workspaces narrow task model policy into this
+# set; "local-preferred" (the default) is deliberately NOT in it because the
+# router only biases, never hard-gates, under that value.
+_OFFLINE_MODEL_PRIVACY = frozenset({"offline", "local"})
 
 
 def _model_profile_from_config(

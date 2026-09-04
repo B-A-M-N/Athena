@@ -34,6 +34,7 @@ class WorkflowCapability:
             "ordinary runs can be retained as reviewable workflow candidates; "
             "promotion requires distinct successful observations and replay validation."
         ),
+        tags=frozenset({"workflow", "procedure", "pipeline", "reusable", "sequence"}),
         input_schema={
             "type": "object",
             "required": ["operation"],

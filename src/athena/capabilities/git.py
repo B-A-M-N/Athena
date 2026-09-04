@@ -81,6 +81,19 @@ class GitCapability:
             },
             "additionalProperties": False,
         },
+        tags=frozenset(
+            {
+                "git",
+                "repository",
+                "repo",
+                "vcs",
+                "diff",
+                "history",
+                "blame",
+                "branch",
+                "status",
+            }
+        ),
         effects=frozenset({EffectClass.READ_LOCAL}),
         origin=CapabilityOrigin.NATIVE,
     )

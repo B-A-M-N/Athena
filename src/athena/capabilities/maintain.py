@@ -173,6 +173,7 @@ class MaintenanceCapability:
             "task_id": request.task_id,
             "session_id": request.session_id,
             "project_id": getattr(getattr(context, "workspace", None), "id", None),
+            "principal_id": getattr(context, "principal_id", None),
         }
         operation = str(args.get("operation") or "")
         try:
@@ -244,13 +245,19 @@ class MaintenanceCapability:
         trigger = dict(args.get("trigger") or {})
         contract_id = new_id("maintenance")
         observe = dict(args["observe"])
+        requested_policy = str(args.get("policy") or "supervised").casefold()
+        creator_policy = str(
+            getattr(getattr(context, "autonomy", None), "value", getattr(context, "autonomy", "supervised"))
+            or "supervised"
+        ).casefold()
+        policy = _attenuate_autonomy(requested_policy, creator_policy)
         contract: dict[str, Any] = {
             "contract_id": contract_id,
             "claim": str(args["claim"]),
             "observe": observe,
             "verify": dict(args["verify"]),
             "remediation": dict(args.get("remediation") or {}),
-            "policy": str(args.get("policy") or "supervised"),
+            "policy": policy,
         }
         workspace = getattr(context, "workspace", None) or self._workspace
         if workspace is not None:
@@ -323,6 +330,14 @@ class MaintenanceCapability:
                         acceptance_criteria=acceptance_criteria,
                         owner=owner,
                         metadata={**metadata, "maintenance_role": role},
+                        capability_policy=getattr(context, "capability_policy", None),
+                        model_policy=getattr(context, "model_policy", None),
+                        resource_budget=getattr(context, "resource_budget", None),
+                        # Persist the contract's attenuated autonomy, not the
+                        # creator's broader runtime profile. A maintenance
+                        # request for supervised work must remain supervised
+                        # after restart and on every future occurrence.
+                        autonomy=policy,
                     )
                 )
         except Exception:
@@ -545,6 +560,14 @@ def _verification_criteria(verify: Mapping[str, Any]) -> tuple[Criterion, ...]:
             required=True,
         ),
     )
+
+
+def _attenuate_autonomy(requested: str, creator: str) -> str:
+    """A maintenance contract can only inherit or narrow creator authority."""
+    order = {"supervised": 0, "coding": 1, "autonomous": 2}
+    requested = requested if requested in order else "supervised"
+    creator = creator if creator in order else "supervised"
+    return requested if order[requested] <= order[creator] else creator
 
 
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):

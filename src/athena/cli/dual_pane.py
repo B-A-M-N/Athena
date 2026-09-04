@@ -553,7 +553,7 @@ class Mascot:
                 self.OBJ_FAIL,
                 "Background work needs attention.",
             )
-        elif event_type in {"ToolRepaired", "MutationRecorded", "MemoryWritten", "SkillActivated"}:
+        elif event_type in {"ToolRepaired", "MutationRecorded"}:
             self.state, self.object, self.speech = (
                 "tools",
                 self.OBJ_CODE,
@@ -561,12 +561,7 @@ class Mascot:
             )
         elif event_type in {"MutationRecordFailed", "ToolInputCorrectionExhausted"}:
             self.state, self.object, self.speech = "failure", self.OBJ_FAIL, "That needs attention."
-        elif event_type in {
-            "MemoryCandidateCreated",
-            "SkillCandidateCreated",
-            "InterpreterProposalDispatched",
-            "RuntimeSessionCreated",
-        }:
+        elif event_type in {"InterpreterProposalDispatched", "RuntimeSessionCreated"}:
             self.state, self.object, self.speech = (
                 "tools",
                 self.OBJ_CODE,
@@ -829,6 +824,10 @@ class DualPaneSurface(OperatorSurface):
     @property
     def _recent(self) -> deque[tuple[str, str]]:
         return self.projection.recent
+
+    @property
+    def _maintenance(self) -> deque[tuple[str, str]]:
+        return self.projection.maintenance
 
     @property
     def _pending_approval(self) -> dict[str, Any] | None:
@@ -1265,6 +1264,9 @@ class DualPaneSurface(OperatorSurface):
         secondary.extend(self._operation_history_lines())
         secondary.extend(["", "RECENT ACTIVITY"])
         secondary.extend(f"{glyph} {text}" for glyph, text in list(self._recent)[-6:])
+        if self.details and self._maintenance:
+            secondary.extend(["", "LEARNING / MAINTENANCE"])
+            secondary.extend(f"{glyph} {text}" for glyph, text in list(self._maintenance)[-6:])
         secondary.extend(["", "LIVE STREAM"])
         for item in self.window.snapshot(min(5, max(height, 1)), max(width - 2, 1))[-5:]:
             if item.strip():

@@ -1,4 +1,5 @@
 use super::super::*;
+use super::chassis::{bitmap_width, draw_bitmap_text};
 use super::primitives::{draw_rect, with_scissor};
 use super::text::{FontRole, TextRenderer};
 
@@ -10,6 +11,7 @@ pub(crate) fn draw_status_text(
     projection: &Projection,
     focused: bool,
     input: &InputBuffer,
+    phase: f32,
 ) {
     let input_role = if geometry.compact {
         // The lower rail collapses on small windows. Keep the prompt an
@@ -43,28 +45,62 @@ pub(crate) fn draw_status_text(
     let status = human_status(projection);
     let status = super::super::fit_text_in(text, FontRole::Instrument, status, content_width);
     if let Some(status_row) = prompt_layout.status_row {
+        with_scissor(geometry.height, geometry.prompt, || {
+            let scale = (text.metrics_for(FontRole::Instrument).height / 7.0)
+                .round()
+                .max(2.0);
+            draw_bitmap_text(
+                prompt_x as f32,
+                status_row.top,
+                &status,
+                fit_bitmap_scale(&status, scale, content_width as f32),
+                (0.43, 0.59, 0.68),
+                (prompt_x + content_width) as f32,
+            );
+        });
+    }
+    let input_bitmap = format!("> {displayed}");
+    if !input_bitmap.is_ascii() {
         text.draw_in(
-            FontRole::Instrument,
+            input_role,
             prompt_x,
-            status_row.baseline as c_int,
-            &status,
-            (110, 150, 174),
+            prompt_layout.input_row.baseline as c_int,
+            &input_bitmap,
+            if focused {
+                (206, 220, 230)
+            } else {
+                (132, 145, 156)
+            },
         );
     }
-    text.draw_in(
-        input_role,
-        prompt_x,
-        prompt_layout.input_row.baseline as c_int,
-        &format!("> {displayed}"),
-        if focused {
-            (206, 220, 230)
-        } else {
-            (132, 145, 156)
-        },
-    );
-    if focused {
+    if input_bitmap.is_ascii() {
+        with_scissor(geometry.height, geometry.prompt, || {
+            let scale = (text.metrics_for(input_role).height / 7.0).round().max(2.0);
+            draw_bitmap_text(
+                prompt_x as f32,
+                prompt_layout.input_row.top,
+                &input_bitmap,
+                fit_bitmap_scale(&input_bitmap, scale, content_width as f32),
+                if focused {
+                    (0.81, 0.86, 0.90)
+                } else {
+                    (0.52, 0.57, 0.61)
+                },
+                (prompt_x + content_width) as f32,
+            );
+        });
+    }
+    // Hardware cursor cadence is intentionally stepped: it reads as a
+    // terminal cursor, not a smooth web animation. A zero phase keeps the
+    // cursor visible for deterministic still captures.
+    if focused && (phase <= 0.0 || (phase * 2.0).floor() as i32 % 2 == 0) {
         let cursor_prefix: String = displayed.chars().take(display_cursor).collect();
-        let cursor_x = prompt_x + text.text_width_in(input_role, &format!("> {cursor_prefix}"));
+        let cursor_x = if input_bitmap.is_ascii() {
+            let cursor_scale = (text.metrics_for(input_role).height / 7.0).round().max(2.0);
+            prompt_x + bitmap_width(&format!("> {cursor_prefix}"), cursor_scale).round() as c_int
+        } else {
+            prompt_x + text.text_width_in(input_role, &format!("> {cursor_prefix}"))
+        };
         with_scissor(geometry.height, geometry.prompt, || {
             draw_rect(
                 cursor_x as f32,
@@ -76,14 +112,39 @@ pub(crate) fn draw_status_text(
         });
     }
     if let Some(hint_row) = prompt_layout.hint_row {
-        text.draw_in(
-            FontRole::Instrument,
-            prompt_x,
-            hint_row.baseline as c_int,
-            "↑↓ SCROLL   ←→ EDIT   CTRL-C CANCEL",
-            (94, 126, 153),
-        );
+        let hint = "↑↓ SCROLL   ←→ EDIT   CTRL-C CANCEL";
+        if hint.is_ascii() {
+            with_scissor(geometry.height, geometry.prompt, || {
+                let scale = (text.metrics_for(FontRole::Instrument).height / 7.0)
+                    .round()
+                    .max(2.0);
+                draw_bitmap_text(
+                    prompt_x as f32,
+                    hint_row.top,
+                    hint,
+                    fit_bitmap_scale(hint, scale, content_width as f32),
+                    (0.37, 0.49, 0.60),
+                    (prompt_x + content_width) as f32,
+                );
+            });
+        } else {
+            text.draw_in(
+                FontRole::Instrument,
+                prompt_x,
+                hint_row.baseline as c_int,
+                hint,
+                (94, 126, 153),
+            );
+        }
     }
+}
+
+fn fit_bitmap_scale(value: &str, preferred: f32, width: f32) -> f32 {
+    let glyph_count = value.chars().filter(|character| *character != '\n').count() as f32;
+    if glyph_count == 0.0 {
+        return preferred;
+    }
+    preferred.min(width / (glyph_count * 6.0)).max(1.0)
 }
 
 fn human_status(projection: &Projection) -> &str {

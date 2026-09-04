@@ -86,6 +86,7 @@ class DelegateCapability:
         ),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.SPAWN_PROCESS}),
+        tags=frozenset({"delegate", "parallel", "child", "specialist"}),
         origin=CapabilityOrigin.NATIVE,
     )
 

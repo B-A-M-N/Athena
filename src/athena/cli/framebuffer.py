@@ -104,6 +104,57 @@ class FrameBuffer:
 class OIFrameBuffer:
     """Render a restrained blue-black computational world as PNG."""
 
+    # Buddy is a fixed scene sprite.  The logical grid is intentionally
+    # stable across terminal sizes; Kitty receives exactly 64x80 source
+    # pixels (32x40 logical cells at 2px per cell).
+    BUDDY_LOGICAL_WIDTH = 32
+    BUDDY_LOGICAL_HEIGHT = 40
+    BUDDY_SCALE = 2
+    BUDDY_WIDTH = BUDDY_LOGICAL_WIDTH * BUDDY_SCALE
+    BUDDY_HEIGHT = BUDDY_LOGICAL_HEIGHT * BUDDY_SCALE
+    _BUDDY_SPRITE = (
+        "................................",
+        "..........#..........#..........",
+        ".........###........###.........",
+        ".........###........###.........",
+        "........#...............#.......",
+        ".......#.................#......",
+        "......#...................#.....",
+        ".....#....#..........#.....#....",
+        "....#....#.#........#.#.....#...",
+        "....#.....#..........#......#...",
+        "....#....#.#........#.#.....#...",
+        "....#.....#....#.#...#......#...",
+        "....#..#........#.......#...#...",
+        ".....#..#.......#......#...#....",
+        "......#....#.........#....#.....",
+        ".......#....#.......#....#......",
+        "....#...#...............#...#...",
+        "...#......#...........#......#..",
+        "...#.........................#..",
+        "...#........#.......#........#..",
+        "..#.#........#.....#.......#.#..",
+        ".....#........#...#........#....",
+        ".....#.........#.#........##....",
+        ".....#..........#..........#....",
+        ".....##..................#.#....",
+        ".....#......#.......#......#....",
+        ".....#.#......#...#.....#..#....",
+        ".....#..........#..........#....",
+        ".....#..#..............#...#....",
+        "......#....#.........#....#.....",
+        "......#..#...#.....#..#...#.....",
+        "......#........#.#........#.....",
+        "......#...................#.....",
+        "................................",
+        "..........###......###..........",
+        "..........###......###..........",
+        "..........###......###..........",
+        "........#####......#####........",
+        "................................",
+        "................................",
+    )
+
     _FONT_PATHS = (
         "/usr/share/fonts/opentype/fira/FiraMono-Regular.otf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
@@ -217,22 +268,115 @@ class OIFrameBuffer:
             self._trim_base_caches(protected_key=key)
         return base, key
 
-    @staticmethod
+    @classmethod
     def _buddy_position(
-        scene: OIScene, visual: OIVisualState, width: int, height: int
-    ) -> tuple[int, int, int]:
+        cls, scene: OIScene, visual: OIVisualState, width: int, height: int
+    ) -> tuple[int, int, int] | None:
         start_fx, start_fy = scene.anchors.get(visual.previous_anchor, scene.anchors["center"])
         end_fx, end_fy = scene.anchors.get(scene.buddy_anchor, scene.anchors["center"])
         progress = min(max(visual.transition, 0.0), 1.0)
         eased = progress * progress * (3.0 - 2.0 * progress)
         fx = start_fx + (end_fx - start_fx) * eased
         fy = start_fy + (end_fy - start_fy) * eased
-        scale = max(18, width // 28)
-        return (
+        desired = (
             int(width * fx),
             int(height * fy) + (0 if progress >= 1 else int((1 - progress) * 10)),
-            scale,
         )
+        for center_x, center_y in cls._buddy_candidates(desired, width, height):
+            left = center_x - cls.BUDDY_WIDTH // 2
+            top = center_y - cls.BUDDY_HEIGHT // 2
+            if (
+                left < 0
+                or top < 0
+                or left + cls.BUDDY_WIDTH > width
+                or top + cls.BUDDY_HEIGHT > height
+            ):
+                continue
+            if not cls._buddy_overlaps_content(scene, left, top, width, height):
+                return center_x, center_y, cls.BUDDY_SCALE
+        return None
+
+    @classmethod
+    def _buddy_candidates(
+        cls, desired: tuple[int, int], width: int, height: int
+    ) -> tuple[tuple[int, int], ...]:
+        """Return deterministic, cell-aligned positions around an anchor."""
+        desired_left = round((desired[0] - cls.BUDDY_WIDTH // 2) / 10) * 10
+        desired_top = round((desired[1] - cls.BUDDY_HEIGHT // 2) / 20) * 20
+        candidates: list[tuple[int, int, int, int]] = []
+        for radius in range(5):
+            for dy, dx in (
+                (0, 0),
+                (-radius * 20, 0),
+                (radius * 20, 0),
+                (0, -radius * 10),
+                (0, radius * 10),
+                (-radius * 20, -radius * 10),
+                (-radius * 20, radius * 10),
+                (radius * 20, -radius * 10),
+                (radius * 20, radius * 10),
+            ):
+                left, top = desired_left + dx, desired_top + dy
+                distance = abs(left - desired_left) + abs(top - desired_top)
+                candidate = (distance, top, left, 0)
+                candidates.append(candidate)
+        ordered: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for _distance, top, left, _ in sorted(candidates):
+            center = (left + cls.BUDDY_WIDTH // 2, top + cls.BUDDY_HEIGHT // 2)
+            if center not in seen:
+                seen.add(center)
+                ordered.append(center)
+        return tuple(ordered)
+
+    @classmethod
+    def _buddy_overlaps_content(
+        cls, scene: OIScene, left: int, top: int, width: int, height: int
+    ) -> bool:
+        right, bottom = left + cls.BUDDY_WIDTH, top + cls.BUDDY_HEIGHT
+        for region_left, region_top, region_right, region_bottom in cls._content_regions(
+            scene, width, height
+        ):
+            if (
+                left < region_right
+                and right > region_left
+                and top < region_bottom
+                and bottom > region_top
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _content_regions(
+        scene: OIScene, width: int, height: int
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Approximate occupied text/priority regions for collision-safe Buddy placement."""
+        margin = max(18, width // 24)
+        top = max(14, height // 22)
+        regions: list[tuple[int, int, int, int]] = [
+            (margin, top - 2, width - margin, top + 63),
+            (margin, height - 103, width - margin, height - 34),
+        ]
+        if scene.mode is VisualActionKind.IDLE:
+            body_top = top + 78
+            middle = width // 2
+            regions.append((middle - 2, body_top - 4, middle + 3, height - 52))
+            regions.extend(
+                (margin, body_top - 2 + index * 20, middle - 8, body_top + 16 + index * 20)
+                for index, _ in enumerate(tree_rows(scene.workspace_tree)[:8])
+            )
+            regions.extend(
+                (middle + 8, body_top - 2 + index * 20, width - margin, body_top + 16 + index * 20)
+                for index, _ in enumerate(tree_rows(scene.runtime_tree)[:8])
+            )
+            if not scene.workspace_tree:
+                regions.append((margin, body_top + 34, middle - 8, body_top + 58))
+            if not scene.runtime_tree:
+                regions.append((middle + 8, body_top + 34, width - margin, body_top + 58))
+        else:
+            body_top = top + 78
+            regions.append((margin, body_top - 2, width - margin, height - 106))
+        return tuple(regions)
 
     @staticmethod
     def _entity_color(entity: Any, ink: Color, accent: Color, warn: Color, bad: Color) -> Color:
@@ -605,21 +749,23 @@ class OIFrameBuffer:
         bad = (224, 119, 126, 235)
         # One buddy, one bounded anchor.  It is a scene entity, never a pane.
         if visual.semantic_state != "hidden":
-            bx, by, scale = self._buddy_position(scene, visual, width, height)
-            self._draw_buddy(
-                draw,
-                bx,
-                by,
-                scale,
-                scene.status,
-                visual.phase,
-                ink,
-                accent,
-                warn,
-                bad,
-                character=scene.character,
-                mode=scene.mode,
-            )
+            position = self._buddy_position(scene, visual, width, height)
+            if position is not None:
+                bx, by, scale = position
+                self._draw_buddy(
+                    draw,
+                    bx,
+                    by,
+                    scale,
+                    scene.status,
+                    visual.phase,
+                    ink,
+                    accent,
+                    warn,
+                    bad,
+                    character=scene.character,
+                    mode=scene.mode,
+                )
 
         encoded = io.BytesIO()
         # Animation ticks reuse the cached scene layer and use a low-latency
@@ -843,20 +989,20 @@ class OIFrameBuffer:
                 layer="overlay",
                 base_key=(width, height, self._scene_key(scene)),
             )
-        bx, by, scale = self._buddy_position(scene, visual, width, height)
-        margin = max(scale * 2, 8)
-        left = max(0, bx - scale * 5 - margin)
-        top = max(0, by - scale * 5 - margin)
-        right = min(width, bx + scale * 7 + margin)
-        bottom = min(height, by + scale * 5 + margin)
-        # Align to the approximate terminal cell grid used by the caller so a
-        # clipped image scales predictably in a cell placement.
-        cell_width, cell_height = 10, 20
-        left = (left // cell_width) * cell_width
-        top = (top // cell_height) * cell_height
-        right = min(width, max(right, left + cell_width))
-        bottom = min(height, max(bottom, top + cell_height))
-        image = Image.new("RGBA", (right - left, bottom - top), (0, 0, 0, 0))
+        position = self._buddy_position(scene, visual, width, height)
+        if position is None:
+            return FrameBuffer(
+                b"",
+                width,
+                height,
+                layer="overlay",
+                base_key=(width, height, self._scene_key(scene)),
+            )
+        bx, by, scale = position
+        left = bx - self.BUDDY_WIDTH // 2
+        top = by - self.BUDDY_HEIGHT // 2
+        right, bottom = left + self.BUDDY_WIDTH, top + self.BUDDY_HEIGHT
+        image = Image.new("RGBA", (self.BUDDY_WIDTH, self.BUDDY_HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image, "RGBA")
         ink = (177, 196, 225, 228)
         accent = (101, 183, 206, 220)
@@ -864,8 +1010,8 @@ class OIFrameBuffer:
         bad = (224, 119, 126, 235)
         self._draw_buddy(
             draw,
-            bx - left,
-            by - top,
+            self.BUDDY_WIDTH // 2,
+            self.BUDDY_HEIGHT // 2,
             scale,
             scene.status,
             visual.phase,
@@ -903,214 +1049,63 @@ class OIFrameBuffer:
         character: str = "owl",
         mode: VisualActionKind = VisualActionKind.IDLE,
     ) -> None:
-        """Draw one small scene character with restrained state cues.
-
-        Buddy is deliberately an entity in the OI scene, not a second pane or
-        a text dashboard.  The pose stays stable while the semantic state
-        chooses the accent and a few bounded presentation details.
-
-        Geometry is quantized to a fixed logical sprite grid before scaling
-        so the silhouette reads as a discrete CRT/pixel-grid treatment rather
-        than a smooth vector graphic.
-        """
+        """Draw the fixed 32x40 logical Buddy sprite inside its own box."""
+        del scale, character, mode
         status = str(status).upper()
-        color = (
+        signal = (
             bad if status in {"FAILURE", "BLOCKED"} else warn if status == "APPROVAL" else accent
         )
-        # Sprite grid: 16 wide x 12 tall logical cells.
-        grid_w, grid_h = 16, 12
-        cell = max(scale // 2, 4)
-        stroke = max(1, cell // 3)
-        body_w = grid_w * cell
-        body_h = grid_h * cell
-        # Quantize anchor to grid center.
-        gx, gy = x - body_w // 2, y - body_h // 2
+        body = (16, 28, 51, 242)
+        outline = signal
+        eye = bad if status in {"FAILURE", "BLOCKED"} else ink
+        left = x - self.BUDDY_WIDTH // 2
+        top = y - self.BUDDY_HEIGHT // 2
+        phase = float(phase) % 1.0
+        blink = status not in {"FAILURE", "BLOCKED"} and phase > 0.86
+        scan_row = 10 + int(phase * 16)
+        for row, line in enumerate(self._BUDDY_SPRITE):
+            for column, marker in enumerate(line):
+                if marker != "#":
+                    continue
+                edge = (
+                    row == 0
+                    or row == self.BUDDY_LOGICAL_HEIGHT - 1
+                    or column == 0
+                    or column == self.BUDDY_LOGICAL_WIDTH - 1
+                    or row == 2
+                    or row == 35
+                )
+                fill = outline if edge else body
+                draw.rectangle(
+                    (
+                        left + column * self.BUDDY_SCALE,
+                        top + row * self.BUDDY_SCALE,
+                        left + column * self.BUDDY_SCALE + self.BUDDY_SCALE - 1,
+                        top + row * self.BUDDY_SCALE + self.BUDDY_SCALE - 1,
+                    ),
+                    fill=fill,
+                )
 
-        def px(grid_x: int, grid_y: int) -> tuple[int, int]:
-            return (gx + grid_x * cell, gy + grid_y * cell)
-
-        def pixel_rect(gx0: int, gy0: int, gx1: int, gy1: int, fill: Color) -> None:
+        def cell(column: int, row: int, fill: Color) -> None:
             draw.rectangle(
-                (px(gx0, gy0), px(gx1, gy1)),
+                (
+                    left + column * self.BUDDY_SCALE,
+                    top + row * self.BUDDY_SCALE,
+                    left + column * self.BUDDY_SCALE + self.BUDDY_SCALE - 1,
+                    top + row * self.BUDDY_SCALE + self.BUDDY_SCALE - 1,
+                ),
                 fill=fill,
-                outline=None,
-                width=0,
             )
 
-        def pixel(gx0: int, gy0: int, gx1: int, gy1: int, fill: Color) -> None:
-            draw.line((px(gx0, gy0), px(gx1, gy1)), fill=fill, width=stroke)
-
-        character = str(character or "owl").casefold()
-        body_color = (16, 28, 51, 238)
-
-        # --- Character-specific body silhouette on the 16x12 grid ---
-        if character == "owl":
-            # Owl silhouette: rounded head with ear tufts, wide body,
-            # two eyes, small beak, wing folds, and small feet.
-            # No monitor face or antenna — a genuine owl shape.
-            # Head top (rows 2-3): narrower, rounded shape.
-            pixel_rect(2, 2, 6, 2, body_color)  # left head top
-            pixel_rect(9, 2, 13, 2, body_color)  # right head top
-            pixel_rect(1, 3, 7, 3, body_color)  # left head wide
-            pixel_rect(8, 3, 14, 3, body_color)  # right head wide
-            # Head-body (rows 4-10): wider body merging from head.
-            pixel_rect(2, 4, 7, 10, body_color)  # left body+head
-            pixel_rect(8, 4, 14, 10, body_color)  # right body+head
-            # Outline: perimeter lines for the owl silhouette.
-            pixel(2, 2, 1, 3, color)  # left head curve top
-            pixel(1, 3, 1, 10, color)  # left body side
-            pixel(1, 10, 2, 11, color)  # left foot up
-            pixel(2, 11, 3, 11, color)  # left foot
-            pixel(13, 2, 14, 3, color)  # right head curve top
-            pixel(14, 3, 14, 10, color)  # right body side
-            pixel(14, 10, 13, 11, color)  # right foot up
-            pixel(12, 11, 11, 11, color)  # right foot
-            # Ear tufts: upward-pointing triangles.
-            pixel(4, 2, 3, 0, color)  # left ear slope
-            pixel(5, 2, 3, 1, color)  # left ear inner
-            pixel_rect(3, 0, 3, 1, body_color)  # left ear tip
-            pixel(12, 2, 13, 0, color)  # right ear slope
-            pixel(11, 2, 13, 1, color)  # right ear inner
-            pixel_rect(12, 0, 12, 1, body_color)  # right ear tip
-            # Eyes: quantized to grid, shift with phase.
-            eye_y = 5
-            eye_shift = 0
-            if status in {"READING", "SEARCHING", "INSPECTING"}:
-                eye_shift = 1 if phase > 0.5 else -1
-            elif status in {"FAILURE", "BLOCKED"}:
-                eye_shift = -1
-            eye = bad if status in {"FAILURE", "BLOCKED"} else ink
-            pixel_rect(5 + eye_shift, eye_y, 6 + eye_shift, eye_y + 1, eye)
-            pixel_rect(9 - eye_shift, eye_y, 10 - eye_shift, eye_y + 1, eye)
-            # Beak: small triangle between eyes below face.
-            pixel_rect(7, 8, 8, 8, warn)
-            # Wing cues: subtle diagonal folds at body sides.
-            pixel(2, 4, 0, 6, color)  # left wing
-            pixel(14, 4, 16, 6, color)  # right wing
-            # Feet.
-            pixel(3, 11, 2, 11, color)
-            pixel(12, 11, 13, 11, color)
-        elif character == "cat":
-            # Original rectangular body with cat ears on top.
-            body_color = (16, 28, 51, 238)
-            pixel_rect(2, 2, 14, 10, body_color)
-            pixel(2, 2, 14, 2, color)
-            pixel(2, 10, 14, 10, color)
-            pixel(2, 2, 2, 10, color)
-            pixel(14, 2, 14, 10, color)
-            # Monitor face.
-            pixel_rect(4, 3, 12, 8, (9, 20, 39, 245))
-            pixel(4, 3, 12, 3, (100, 148, 191, 180))
-            pixel(4, 8, 12, 8, (100, 148, 191, 180))
-            pixel(4, 3, 4, 8, (100, 148, 191, 180))
-            pixel(12, 3, 12, 8, (100, 148, 191, 180))
-            # Eyes: quantized to grid, shift with phase.
-            eye_y = 5
-            eye_shift = 0
-            if status in {"READING", "SEARCHING", "INSPECTING"}:
-                eye_shift = 1 if phase > 0.5 else -1
-            elif status in {"FAILURE", "BLOCKED"}:
-                eye_shift = -1
-            eye = bad if status in {"FAILURE", "BLOCKED"} else ink
-            pixel_rect(6 + eye_shift, eye_y, 7 + eye_shift, eye_y + 1, eye)
-            pixel_rect(9 - eye_shift, eye_y, 10 - eye_shift, eye_y + 1, eye)
-            # Antenna.
-            antenna_x = 4 if phase > 0.5 else 12
-            pixel(8, 2, antenna_x, 0, color)
-            pixel_rect(antenna_x - 1, 0, antenna_x + 1, 1, color)
-            # Feet.
-            pixel(4, 10, 2, 11, color)
-            pixel(12, 10, 14, 11, color)
-            # Pointed cat ears.
-            pixel(4, 2, 3, 0, color)
-            pixel(12, 2, 13, 0, color)
-        else:
-            # Default rectangular body with monitor face for unknown/custom chars.
-            pixel_rect(2, 2, 14, 10, body_color)
-            pixel(2, 2, 14, 2, color)
-            pixel(2, 10, 14, 10, color)
-            pixel(2, 2, 2, 10, color)
-            pixel(14, 2, 14, 10, color)
-            pixel_rect(4, 3, 12, 8, (9, 20, 39, 245))
-            pixel(4, 3, 12, 3, (100, 148, 191, 180))
-            pixel(4, 8, 12, 8, (100, 148, 191, 180))
-            pixel(4, 3, 4, 8, (100, 148, 191, 180))
-            pixel(12, 3, 12, 8, (100, 148, 191, 180))
-            eye_y = 5
-            eye_shift = 0
-            if status in {"READING", "SEARCHING", "INSPECTING"}:
-                eye_shift = 1 if phase > 0.5 else -1
-            elif status in {"FAILURE", "BLOCKED"}:
-                eye_shift = -1
-            eye = bad if status in {"FAILURE", "BLOCKED"} else ink
-            pixel_rect(6 + eye_shift, eye_y, 7 + eye_shift, eye_y + 1, eye)
-            pixel_rect(9 - eye_shift, eye_y, 10 - eye_shift, eye_y + 1, eye)
-            antenna_x = 4 if phase > 0.5 else 12
-            pixel(8, 2, antenna_x, 0, color)
-            pixel_rect(antenna_x - 1, 0, antenna_x + 1, 1, color)
-            pixel(4, 10, 2, 11, color)
-            pixel(12, 10, 14, 11, color)
-        # Mode-specific pose.
-        if mode is VisualActionKind.CODE:
-            pixel(2, 6, 0, 7, color)
-            pixel(14, 6, 16, 7, color)
-        elif mode in {VisualActionKind.TEST, VisualActionKind.VERIFY}:
-            pixel(14, 4, 16, 3, color)
-        # State-specific cues.
-        if status == "THINKING":
-            # Arc around body.
-            pixel(1, 1, 2, 0, color)
-            pixel(14, 1, 15, 0, color)
-        elif status in {"READING", "SEARCHING", "INSPECTING"}:
-            scan_y = 3 + int((phase % 1.0) * 5)
-            pixel(4, scan_y, 12, scan_y, color)
-        elif status in {"EXECUTING", "DELEGATED"}:
-            pulse = int((phase % 1.0) * 3)
-            pixel(2 - pulse, 2, 2 - pulse, 10, color)
-            pixel(14 + pulse, 2, 14 + pulse, 10, color)
-            if status == "DELEGATED":
-                pixel(15, 6, 18, 3, color)
-                pixel(15, 6, 18, 9, color)
-        elif status == "APPROVAL":
-            # The approval affordance shares the same logical sprite grid;
-            # avoid a smooth vector card that would make this one state look
-            # like a different visual system.
-            pixel_rect(16, 4, 20, 8, (30, 35, 54, 245))
-            pixel(16, 4, 20, 4, warn)
-            pixel(20, 4, 20, 8, warn)
-            pixel(20, 8, 16, 8, warn)
-            pixel(16, 8, 16, 4, warn)
-            pixel(17, 6, 19, 6, warn)
-        elif status in {"FAILURE", "BLOCKED"}:
-            pixel(16, 4, 19, 8, bad)
-            pixel(19, 4, 16, 8, bad)
-            pixel(-2, 8, 1, 10, bad)
-        elif status == "RECOVERING":
-            pixel(-2, 5, -1, 3, color)
-            pixel(-1, 3, 2, 1, color)
-            pixel(2, 1, 6, 1, color)
-            pixel(6, 1, 8, 3, color)
-            pixel(-2, 5, -4, 5, color)
-        elif status in {"SUCCESS", "COMPLETE"}:
-            pixel(-1, 3, 1, 1, color)
-            pixel(1, 1, 5, 1, color)
-            pixel(5, 1, 7, 3, color)
-            pixel(16, 6, 18, 8, color)
-            pixel(18, 8, 22, 3, color)
-        elif status in {"GENERATED", "GENERATED_TOOL", "CONSTRUCTING"}:
-            pixel(16, 6, 18, 4, color)
-            pixel(18, 4, 20, 6, color)
-            pixel(20, 6, 18, 8, color)
-            pixel(18, 8, 16, 6, color)
-            pixel(18, 4, 18, 8, color)
-
-        self._text(
-            draw,
-            (gx + 2 * cell, gy + grid_h * cell + 1),
-            status.lower(),
-            self._font(max(9, cell)),
-            color,
-        )
+        # All semantic animation remains inside the fixed sprite bounds.
+        if not blink:
+            cell(9, 9, eye)
+            cell(22, 9, eye)
+        cell(16, 13, warn if status == "APPROVAL" else outline)
+        if status in {"THINKING", "EXECUTING", "DELEGATED", "RECOVERING"}:
+            for column in range(8, 24):
+                if self._BUDDY_SPRITE[scan_row][column] == "#":
+                    cell(column, scan_row, signal)
 
 
 __all__ = ["FrameBuffer", "OIFrameBuffer", "pillow_available"]

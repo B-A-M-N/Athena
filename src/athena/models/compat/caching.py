@@ -105,10 +105,12 @@ def cache_message_payload(message: Any) -> dict[str, Any]:
     """Return the provider-relevant, metadata-free identity of a message."""
     role = getattr(getattr(message, "role", None), "value", getattr(message, "role", ""))
     blocks = getattr(message, "blocks", ()) or ()
+    conversation_text = getattr(message, "conversation_text", None)
+    content = conversation_text() if callable(conversation_text) else message
     return {
         "role": str(role),
         "block_types": [str(getattr(block, "type", type(block).__name__)) for block in blocks],
-        "content": str(message.text() if hasattr(message, "text") else message),
+        "content": str(content),
     }
 
 

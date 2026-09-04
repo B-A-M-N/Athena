@@ -21,7 +21,7 @@ import hashlib
 import json
 import threading
 from datetime import datetime
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from athena.protocol.policy import (
     ApprovalGrant,
@@ -68,6 +68,7 @@ class ApprovalManager:
         capability: Optional[str] = None,
         effect: Optional[str] = None,
         resource_pattern: Optional[str] = None,
+        allowed_effects: Optional[Iterable[EffectClass | str]] = None,
         task_id: Optional[str] = None,
         session_id: Optional[str] = None,
         expires_at: Optional[datetime] = None,
@@ -79,6 +80,9 @@ class ApprovalManager:
 
         aid = approval_id or new_id("apr")
         sc = scope if isinstance(scope, ApprovalScope) else ApprovalScope(scope)
+        effects_ceiling = frozenset(
+            _effect_from(e) for e in (allowed_effects or ()) if _effect_from(e) is not None
+        )
         self._records[aid] = {
             "_id": aid,
             "_principal": principal,
@@ -86,6 +90,7 @@ class ApprovalManager:
             "scope": sc,
             "capability": capability,
             "effect": _effect_from(effect) if effect else None,
+            "allowed_effects": effects_ceiling,
             "resource_pattern": resource_pattern,
             "task_id": task_id,
             "session_id": session_id,
@@ -206,10 +211,16 @@ class ApprovalManager:
                 rank += 40
             else:
                 return -1
-        effect = rec.get("effect")
-        if effect is not None:
-            hit = effect in request.effects
-            if not hit:
+        # Effect envelope (P0): a grant authorizes only the effects the
+        # operator actually approved. A request whose resolved effect set
+        # adds anything beyond that ceiling is NOT covered. Legacy grants
+        # that carry only the single ``effect`` field are treated as a
+        # one-element envelope — equally strict, never broader.
+        ceiling = rec.get("allowed_effects") or frozenset()
+        if not ceiling and rec.get("effect") is not None:
+            ceiling = frozenset({rec["effect"]})
+        if ceiling:
+            if not set(request.effects).issubset(ceiling):
                 return -1
             rank += 30
         resource = rec.get("resource_pattern")
@@ -271,6 +282,9 @@ class ApprovalManager:
 
     @staticmethod
     def _to_grant(rec: dict[str, Any]) -> ApprovalGrant:
+        ceiling = rec.get("allowed_effects") or frozenset()
+        if not ceiling and rec.get("effect") is not None:
+            ceiling = frozenset({rec["effect"]})
         return ApprovalGrant(
             id=rec["_id"],
             principal=rec["_principal"],
@@ -278,15 +292,18 @@ class ApprovalManager:
             capability=rec.get("capability"),
             resource_pattern=rec.get("resource_pattern"),
             effect=rec.get("effect"),
+            allowed_effects=frozenset(ceiling),
             task_id=rec.get("task_id"),
             session_id=rec.get("session_id"),
             expires_at=rec.get("expires_at"),
         )
 
 
-def _effect_from(name: str):
+def _effect_from(name: str | EffectClass):
     from athena.protocol.capabilities import EffectClass
 
+    if isinstance(name, EffectClass):
+        return name
     if name in EffectClass._value2member_map_:
         return EffectClass(name)
     try:

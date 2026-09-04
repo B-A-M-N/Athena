@@ -6,6 +6,7 @@ import pytest
 from athena.cli.app import Options, _arg_parse
 from athena.cli.native import (
     NativePreflight,
+    _load_credential_env,
     native_binary,
     native_preflight,
     worker_command,
@@ -84,6 +85,32 @@ def test_native_worker_command_forwards_scope_without_credentials():
     assert "--model" in command
     assert "OPENROUTER_API_KEY" not in command
     assert command[-5:] == ["--verbose", "--mascot", "owl", "--no-animations", "--reduced-motion"]
+
+
+def test_native_loads_only_supported_credential_settings_without_executing_file(
+    tmp_path, monkeypatch
+):
+    env_file = tmp_path / "opencodex.env"
+    env_file.write_text(
+        "FREEINFERENCE_API_KEY=test-key\n"
+        "FREEINFERENCE_API_ENDPOINT=https://fi.example/v1\n"
+        "FREEINFERENCE_MODEL=glm-5.3-flash\n"
+        "ATHENA_NATIVE_INJECTED=should-not-load\n"
+        "$(touch %s)=not-shell\n" % (tmp_path / "should-not-exist"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ATHENA_CREDENTIAL_ENV_FILE", str(env_file))
+
+    env = {"ATHENA_CREDENTIAL_ENV_FILE": str(env_file)}
+    _load_credential_env(env)
+
+    assert env == {
+        "ATHENA_CREDENTIAL_ENV_FILE": str(env_file),
+        "FREEINFERENCE_API_KEY": "test-key",
+        "FREEINFERENCE_API_ENDPOINT": "https://fi.example/v1",
+        "FREEINFERENCE_MODEL": "glm-5.3-flash",
+    }
+    assert not (tmp_path / "should-not-exist").exists()
 
 
 def test_native_session_parser_matches_worker_contract():

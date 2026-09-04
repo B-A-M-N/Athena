@@ -31,6 +31,24 @@ _FIRST_SCRIPTS = (
         },
     },
 )
+_RESUME_SCRIPTS = (
+    # Iteration 1: the resumed context still ends with the seed task's
+    # execute result, so the model performs fresh work. Iteration 2: the fs
+    # result is now the last capability result, so the generic completion
+    # script below takes over. (A bare ``user_contains`` match would fire on
+    # iteration 1 too — the seed transcript already contains a capability
+    # result — and the task would end without doing anything.)
+    {
+        "match": {"last_capability_result_contains": _MARKER},
+        "respond": {
+            "capability_call": {
+                "capability_id": "fs",
+                "arguments": {"operation": "list", "path": "."},
+            }
+        },
+    },
+    {"match": {"capability_result_ok": True}, "respond": {"text": "", "done": True}},
+)
 
 
 async def _wait_terminal(svc, task_id, target=TaskStatus.COMPLETE.value, tries=300, delay=0.02):
@@ -61,7 +79,10 @@ async def test_resume_session_sees_prior_transcript(make_durable_service, durabl
     await svc1.stop()
 
     # --- Phase 2: new service, same DB, resume the session. --------------- #
-    svc2 = await make_durable_service(durable_db_path, scripts=None)
+    # The resumed "continue" turn is tool-eligible under the observable-work
+    # gate, so the resumed provider must actually do work — not just emit
+    # prose — for the task to finish COMPLETE.
+    svc2 = await make_durable_service(durable_db_path, scripts=_RESUME_SCRIPTS)
 
     # Spy on the model request so we can assert the resumed task's compiled
     # context actually contains the prior session's assistant answer.

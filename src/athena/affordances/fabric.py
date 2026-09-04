@@ -34,6 +34,91 @@ _UNUSABLE_LIFECYCLE_STATES = frozenset(
     }
 )
 
+# Search is progressive disclosure, not a full-text index.  These terms are
+# intentionally small and operator-facing: a capability earns visibility from
+# an identity/tag/synonym hit, while arbitrary prose in a long descriptor
+# cannot make it appear relevant to a casual question.
+_SEARCH_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "be",
+        "can",
+        "do",
+        "for",
+        "from",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "me",
+        "my",
+        "of",
+        "on",
+        "or",
+        "please",
+        "the",
+        "tell",
+        "that",
+        "this",
+        "to",
+        "what",
+        "with",
+        "you",
+        "your",
+    }
+)
+_SEARCH_WEAK_TERMS = frozenset(
+    {
+        "all",
+        "bounded",
+        "current",
+        "local",
+        "normal",
+        "output",
+        "project",
+        "return",
+        "short",
+        "task",
+        "use",
+        "used",
+        "using",
+        "work",
+    }
+)
+# Tags are the primary vocabulary. This tiny table exists only for legacy
+# vocabulary that cannot be expressed by a canonical descriptor ID alone;
+# native, MCP, pack, and generated descriptors should publish their own tags.
+_CAPABILITY_SYNONYMS: dict[str, frozenset[str]] = {
+    "fs": frozenset({"file_ops"}),
+    "execute": frozenset({"command_runner"}),
+    "research": frozenset({"web_lookup"}),
+}
+
+
+def _search_tokens(value: Any, *, include_weak: bool = True) -> frozenset[str]:
+    """Tokenize human words without turning prose substrings into matches."""
+    tokens = {
+        token.casefold()
+        for token in re.findall(r"[a-zA-Z0-9]+", str(value or ""))
+        if len(token) >= 2 and token.casefold() not in _SEARCH_STOPWORDS
+    }
+    if not include_weak:
+        tokens.difference_update(_SEARCH_WEAK_TERMS)
+    return frozenset(tokens)
+
+
+# Two relevance policies serve two distinct callers. Automatic initial
+# disclosure filters weak generic terms so ordinary prose cannot expose the
+# whole fabric. An explicit reflection search requested through the
+# ``capabilities`` capability takes the user's query literally: a
+# meaningful-but-generic term like "project" must find ``project.inspect``.
+AUTOMATIC_DISCLOSURE = "automatic_disclosure"
+EXPLICIT_REFLECTION_SEARCH = "explicit_reflection_search"
+
 
 class CapabilityFabric:
     """Effective capability surface: task overlay over project over global.
@@ -870,29 +955,63 @@ class CapabilityFabric:
         task_id: str | None = None,
         project_id: str | None = None,
         user_id: str | None = None,
-        limit: int = 20,
+        limit: int = 12,
         workspace: WorkspaceSpec | None = None,
+        mode: str = AUTOMATIC_DISCLOSURE,
     ) -> list[dict[str, Any]]:
-        terms = {term.casefold() for term in re.findall(r"[a-zA-Z0-9_.-]+", query)}
+        explicit = mode == EXPLICIT_REFLECTION_SEARCH
+        terms = _search_tokens(query, include_weak=explicit)
         ranked: list[tuple[float, dict[str, Any]]] = []
         for descriptor in self.list_descriptors(
             task_id=task_id, project_id=project_id, user_id=user_id
         ):
-            capability_id = descriptor.id.casefold()
-            description = descriptor.description.casefold()
-            if not terms:
-                score = 0
-            else:
-                # Deterministic lexical ranking: exact capability identity
-                # beats descriptive matches, while partial overlap remains
-                # useful for queries such as "typescript verification".
-                score = sum(
-                    3 if term in capability_id else 1 if term in description else 0
-                    for term in terms
-                )
-                if score == 0:
-                    continue
+            capability_id = _search_tokens(descriptor.id)
+            descriptor_tags = _search_tokens(descriptor.tags)
             record = self._records.get(descriptor.id)
+            record_name = _search_tokens(getattr(record, "name", ""))
+            record_terms = _search_tokens(getattr(record, "description", ""))
+            aliases = frozenset().union(
+                *(
+                    _CAPABILITY_SYNONYMS.get(part, frozenset())
+                    for part in descriptor.id.casefold().split(".")
+                )
+            )
+            description = _search_tokens(descriptor.description, include_weak=explicit)
+            identity_hits = terms & (capability_id | record_name)
+            tag_hits = terms & descriptor_tags
+            alias_hits = terms & aliases
+            description_hits = terms & (description | record_terms)
+            # Descriptor prose is a weak signal under automatic disclosure: it
+            # can supplement a strong identity/tag/synonym hit, or stand alone
+            # only when two meaningful words agree; one generic word must not
+            # expose a primitive to ordinary conversation ("short joke" ->
+            # scratch). An explicit reflection search takes the operator's
+            # query literally — a single meaningful term matching an id, tag,
+            # alias, description, workflow, or skill is a real hit.
+            strong_hits = identity_hits | tag_hits | alias_hits
+            if explicit:
+                if not (strong_hits or description_hits):
+                    continue
+            elif not strong_hits and len(description_hits) < 2:
+                continue
+            partial_hits = {
+                term
+                for term in terms
+                if len(term) >= 6
+                and any(
+                    candidate != term and len(candidate) >= 6 and candidate.startswith(term)
+                    for candidate in capability_id | descriptor_tags | aliases | description
+                )
+            }
+            score = (
+                len(identity_hits) * 12
+                + len(tag_hits) * 10
+                + len(alias_hits) * 8
+                + len(description_hits) * 2
+                + len(partial_hits)
+            )
+            if score <= 0:
+                continue
             scope = record.scope.value if record is not None else "system"
             # A scoped/generated affordance is more useful in the context in
             # which it was discovered.  Historical proof only breaks ties;

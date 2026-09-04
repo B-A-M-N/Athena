@@ -399,6 +399,10 @@ class ChatREPL:
             metadata=({"acceptance_criteria": list(self.criteria)} if self.criteria else {}),
         )
         spec = await self.service.submit(request, wait=False)
+        # The service allocates the canonical session at intake. Persist it in
+        # the REPL before streaming so the next turn continues the same
+        # session even if the current task is still running or pauses.
+        self.session_id = getattr(spec, "session_id", self.session_id)
         self._active_task_id = spec.id
         self._last_task_id = spec.id
         result = await stream_task(
@@ -408,7 +412,6 @@ class ChatREPL:
             surface=self.surface,
         )
         if result is not None:
-            self.session_id = getattr(spec, "session_id", self.session_id)
             summary = getattr(result, "summary", "") or ""
             status = getattr(result, "status", None)
             status_str = (

@@ -228,7 +228,7 @@ def _decode_model_policy(raw: Any) -> ModelPolicy:
     return ModelPolicy(
         role=data.get("role", "primary"),
         allowed=tuple(data.get("allowed") or []),
-        require_tools=bool(data.get("require_tools", True)),
+        require_tools=bool(data.get("require_tools", False)),
         privacy=data.get("privacy", "local-preferred"),
         max_cost_usd=Decimal(str(cost)) if cost else None,
         routing_preference=data.get("routing_preference", "balanced"),
@@ -242,12 +242,12 @@ def _decode_budget(raw: Any) -> ResourceBudget:
     wall = data.get("max_wall_time")
     cost = data.get("max_cost_usd")
     return ResourceBudget(
-        max_agent_iterations=int(data.get("max_agent_iterations", 500)),
+        max_agent_iterations=int(data.get("max_agent_iterations", 50)),
         max_input_tokens=_opt_int(data.get("max_input_tokens")),
         max_output_tokens=_opt_int(data.get("max_output_tokens")),
         max_cost_usd=Decimal(str(cost)) if cost else None,
         max_wall_time=timedelta(seconds=float(wall)) if wall else None,
-        max_children=int(data.get("max_children", 16)),
+        max_children=int(data.get("max_children", 4)),
         max_child_depth=int(data.get("max_child_depth", 1)),
         max_parallel_model_calls=int(data.get("max_parallel_model_calls", 4)),
         max_parallel_executions=int(data.get("max_parallel_executions", 16)),

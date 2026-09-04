@@ -73,6 +73,11 @@ class ApprovalGrant:
     capability: str | None = None
     resource_pattern: str | None = None
     effect: EffectClass | None = None
+    # Authority envelope (P0): the full effect set the operator approved.
+    # A later request is covered only when its resolved effects are a
+    # SUBSET of this ceiling — a grant may never widen into effects the
+    # operator never saw.
+    allowed_effects: frozenset[EffectClass] = frozenset()
     task_id: str | None = None
     session_id: str | None = None
     expires_at: datetime | None = None

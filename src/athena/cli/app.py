@@ -34,6 +34,8 @@ from typing import Any
 from athena.execution.environment import VerificationEnvironment
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, WorkspaceSpec
 
+FREEINFERENCE_DEFAULT_BASE_URL = "https://freeinference.org/v1"
+FREEINFERENCE_DEFAULT_MODEL = "glm-5.3-flash"
 OPENROUTER_DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
 
 
@@ -122,6 +124,26 @@ def build_config(o: "Options"):
         config.workspace_root = os.getcwd()
     if pcs:
         config.providers = tuple(pcs)
+    elif not config.providers and os.environ.get("FREEINFERENCE_API_KEY"):
+        # FreeInference speaks the OpenAI-compatible protocol. Prefer its
+        # operator-owned key when it is available; the native launcher may
+        # load that key from the user's credential env file for the worker.
+        config.providers = (
+            ProviderConfig(
+                kind="openai-compat",
+                name="freeinference",
+                model=(
+                    os.environ.get("FREEINFERENCE_MODEL") or FREEINFERENCE_DEFAULT_MODEL
+                ).strip(),
+                credential_id="FREEINFERENCE_API_KEY",
+                base_url=(
+                    os.environ.get("FREEINFERENCE_API_BASE_URL")
+                    or os.environ.get("FREEINFERENCE_API_ENDPOINT")
+                    or FREEINFERENCE_DEFAULT_BASE_URL
+                ).strip(),
+                extra={"headers": {"X-Title": "Athena"}},
+            ),
+        )
     elif not config.providers and os.environ.get("OPENROUTER_API_KEY"):
         # OpenRouter speaks the OpenAI-compatible protocol. Keep the key in
         # the environment/SecretManager; never copy it into config or task

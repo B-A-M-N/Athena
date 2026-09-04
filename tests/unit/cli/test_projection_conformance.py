@@ -623,3 +623,21 @@ def test_runtime_tree_keeps_task_operation_and_execution_hierarchy():
     assert runtime[0]["id"] == "task:task-1"
     assert runtime[0]["children"][0]["id"] == "operation:call-1"
     assert runtime[0]["children"][0]["children"][0]["id"] == "execution:exec-1"
+
+
+def test_learning_activity_is_separate_from_recent_task_activity():
+    state = ProjectionState()
+
+    state.reduce("MemoryCandidateCreated", {})
+    state.reduce("SkillCandidateCreated", {})
+    state.reduce("SkillActivated", {})
+    state.reduce("MutationRecorded", {})
+
+    recent_text = [text for _, text in state.recent]
+    maintenance_text = [text for _, text in state.maintenance]
+    assert recent_text == ["Mutation applied"]
+    assert maintenance_text == [
+        "Memory candidate recorded",
+        "Skill candidate recorded",
+        "Skill activated",
+    ]

@@ -58,35 +58,78 @@ class TaskTemplate:
     delivery_channel: str | None = None
     acceptance_criteria: tuple[Criterion, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    capability_policy: CapabilityPolicy | None = None
+    model_policy: ModelPolicy | None = None
+    resource_budget: ResourceBudget | None = None
+    autonomy: str = "supervised"
+    # Service-owned, immutable-at-intake authority snapshot. The public
+    # template remains descriptive; future occurrences read this separately
+    # persisted snapshot so a model cannot widen its own schedule.
+    authority_snapshot: Mapping[str, Any] = field(default_factory=dict)
 
     def build_task_spec(self, job_id: str, occurrence_key: str | None = None) -> TaskSpec:
         workspace = None
-        if self.workspace_id or self.workspace_root:
+        authority_workspace = self.authority_snapshot.get("workspace")
+        if not isinstance(authority_workspace, Mapping):
+            authority_workspace = {}
+        workspace_id = authority_workspace.get("id") or self.workspace_id
+        workspace_root = authority_workspace.get("root") or self.workspace_root
+        if workspace_id or workspace_root:
             workspace_kwargs: dict[str, Any] = {}
-            if self.network_policy:
-                workspace_kwargs["network_policy"] = NetworkPolicy(self.network_policy)
-            if self.mutation_mode:
-                workspace_kwargs["mutation_mode"] = MutationMode(self.mutation_mode)
+            network = authority_workspace.get("network_policy") or self.network_policy
+            mutation = authority_workspace.get("mutation_mode") or self.mutation_mode
+            if network:
+                workspace_kwargs["network_policy"] = NetworkPolicy(str(network))
+            if mutation:
+                workspace_kwargs["mutation_mode"] = MutationMode(str(mutation))
             workspace = WorkspaceSpec(
-                id=self.workspace_id or job_id,
-                root=self.workspace_root or ".",
+                id=str(workspace_id or job_id),
+                root=str(workspace_root or "."),
+                readable=_path_rules(authority_workspace.get("readable")),
+                writable=_path_rules(authority_workspace.get("writable")),
+                temp_root=authority_workspace.get("temp_root"),
+                execution_backend=authority_workspace.get("execution_backend"),
+                revision=authority_workspace.get("revision"),
                 **workspace_kwargs,
             )
-        budget = ResourceBudget()
-        if self.max_agent_iterations is not None:
+        budget = _budget_from_record(self.authority_snapshot.get("resource_budget"))
+        if budget is None:
+            budget = self.resource_budget or ResourceBudget()
+        if self.max_agent_iterations is not None and self.resource_budget is None and not self.authority_snapshot.get("resource_budget"):
             budget = ResourceBudget(max_agent_iterations=self.max_agent_iterations)
+        capability_policy = _capability_policy_from_record(
+            self.authority_snapshot.get("capability_policy")
+        ) or self.capability_policy
+        if capability_policy is None:
+            capability_policy = CapabilityPolicy(allow=self.capability_allow)
+        model_policy = _model_policy_from_record(self.authority_snapshot.get("model_policy")) or self.model_policy
+        if model_policy is None:
+            model_policy = ModelPolicy(role=self.model_role)
+        if not self.authority_snapshot and self.capability_policy is None and not self.capability_allow:
+            # A hand-authored legacy template has no creator authority to
+            # inherit. Keep it capability-free until a service-owned schedule
+            # snapshot is supplied.
+            capability_policy = CapabilityPolicy(deny=("*",))
         metadata = dict(self.metadata)
         if occurrence_key is not None:
             metadata["_occurrence"] = occurrence_key
+        metadata.setdefault("autonomy", str(self.authority_snapshot.get("autonomy") or self.autonomy))
+        if self.authority_snapshot:
+            metadata["_authority_snapshot"] = dict(self.authority_snapshot)
+        # A template without a persistent session minted one fresh session per
+        # occurrence (the default). TaskManager._ensure_session creates the
+        # row; the lineage in metadata ties the occurrence back to its
+        # schedule and the conversation that scheduled it.
+        session_id = self.session_id or new_id("session")
         return TaskSpec(
             id=new_id("task"),
             objective=self.objective,
             acceptance_criteria=self.acceptance_criteria,
-            session_id=self.session_id,
+            session_id=session_id,
             parent_task_id=self.parent_task_id,
             workspace=workspace,
-            capability_policy=CapabilityPolicy(allow=self.capability_allow),
-            model_policy=ModelPolicy(role=self.model_role),
+            capability_policy=capability_policy,
+            model_policy=model_policy,
             resource_budget=budget,
             deadline=self.deadline,
             delivery=(
@@ -172,6 +215,8 @@ def _template_from_job(job: dict) -> TaskTemplate:
     template = raw_template if isinstance(raw_template, dict) else src
     itinerary = template.get("task_template")
     active = itinerary if isinstance(itinerary, dict) else template
+    authority = meta.get("_authority_snapshot") if isinstance(meta, dict) else None
+    authority = dict(authority) if isinstance(authority, Mapping) else {}
     deadline = _to_dt(active.get("deadline"))
     return TaskTemplate(
         objective=active.get("objective") or job.get("name") or "",
@@ -188,7 +233,47 @@ def _template_from_job(job: dict) -> TaskTemplate:
         delivery_channel=active.get("delivery_channel"),
         acceptance_criteria=_criteria_from_records(active.get("acceptance_criteria")),
         metadata=dict(active.get("metadata") or {}),
+        authority_snapshot=authority,
     )
+
+
+def _path_rules(raw: Any) -> tuple:
+    from athena.protocol.tasks import PathRule
+
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(
+        PathRule(path=str(item.get("path") or ""), allow=bool(item.get("allow", True)))
+        for item in raw
+        if isinstance(item, Mapping) and item.get("path")
+    )
+
+
+def _capability_policy_from_record(raw: Any) -> CapabilityPolicy | None:
+    if not isinstance(raw, Mapping):
+        return None
+    return CapabilityPolicy(
+        effects=frozenset(str(value) for value in raw.get("effects") or ()),
+        allow=tuple(str(value) for value in raw.get("allow") or ()),
+        ask=tuple(str(value) for value in raw.get("ask") or ()),
+        deny=tuple(str(value) for value in raw.get("deny") or ()),
+    )
+
+
+def _model_policy_from_record(raw: Any) -> ModelPolicy | None:
+    if not isinstance(raw, Mapping):
+        return None
+    from athena.api.decoders import decode_model_policy
+
+    return decode_model_policy(raw)
+
+
+def _budget_from_record(raw: Any) -> ResourceBudget | None:
+    if not isinstance(raw, Mapping):
+        return None
+    from athena.api.decoders import decode_budget
+
+    return decode_budget(raw)
 
 
 def _criteria_from_records(value: Any) -> tuple[Criterion, ...]:
@@ -231,12 +316,14 @@ class Scheduler:
         task_manager: Any,
         *,
         admission: Any = None,
+        intake: Any = None,
         max_concurrent: int = 0,
         loop_interval_seconds: float = 1.0,
     ) -> None:
         self._store = store
         self._tm = task_manager
         self._admission = admission
+        self._intake = intake
         self._max_concurrent = max_concurrent
         self._loop_interval = loop_interval_seconds
         self._task: asyncio.Task | None = None
@@ -333,14 +420,20 @@ class Scheduler:
         spec = template.build_task_spec(job["id"], occurrence_key=occurrence_key)
         created = None
         try:
-            if self._admission is not None:
-                result = self._admission(spec)
-                if asyncio.iscoroutine(result):
-                    await result
-            created = await self._tm.create(spec)
+            if self._intake is not None:
+                result = self._intake(spec, wait=False, trusted=True)
+                created = await result if asyncio.iscoroutine(result) else result
+            else:
+                if self._admission is not None:
+                    result = self._admission(spec)
+                    if asyncio.iscoroutine(result):
+                        await result
+                created = await self._tm.create(spec)
+                if created is None:
+                    raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")
+                await self._tm.enqueue(created.id)
             if created is None:
                 raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")
-            await self._tm.enqueue(created.id)
         except Exception:
             # A successful create followed by enqueue failure leaves a real
             # CREATED task that reconciliation can enqueue. Releasing that

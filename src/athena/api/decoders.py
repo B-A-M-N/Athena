@@ -119,7 +119,12 @@ def decode_workspace(
 
 
 def decode_capability_policy(raw: Any) -> CapabilityPolicy:
-    """Decode a capability policy fragment (empty list => empty allow-list)."""
+    """Decode a capability policy using the shared empty-list semantics.
+
+    Empty ``allow`` and ``ask`` fields do not mean deny-all; with no deny
+    entries they mean unrestricted. Callers that need a safe deny-all default
+    must supply ``deny=("*",)`` explicitly.
+    """
     data = _as_mapping(raw, "capability_policy")
     if data is None:
         return CapabilityPolicy()
@@ -141,7 +146,7 @@ def decode_model_policy(raw: Any) -> ModelPolicy:
     return ModelPolicy(
         role=str(data.get("role", "primary")),
         allowed=tuple(data.get("allowed") or ()),
-        require_tools=bool(data.get("require_tools", True)),
+        require_tools=bool(data.get("require_tools", False)),
         privacy=str(data.get("privacy", "local-preferred")),
         max_cost_usd=Decimal(str(cost)) if cost else None,
         routing_preference=str(data.get("routing_preference", "balanced")),
@@ -181,12 +186,12 @@ def decode_budget(raw: Any) -> ResourceBudget:
     wall = data.get("max_wall_time")
     cost = data.get("max_cost_usd")
     return ResourceBudget(
-        max_agent_iterations=_int(data.get("max_agent_iterations"), 500),
+        max_agent_iterations=_int(data.get("max_agent_iterations"), 50),
         max_input_tokens=_opt_int(data.get("max_input_tokens")),
         max_output_tokens=_opt_int(data.get("max_output_tokens")),
         max_cost_usd=Decimal(str(cost)) if cost else None,
         max_wall_time=timedelta(seconds=float(wall)) if wall else None,
-        max_children=_int(data.get("max_children"), 16),
+        max_children=_int(data.get("max_children"), 4),
         max_child_depth=_int(data.get("max_child_depth"), 1),
         max_parallel_model_calls=_int(data.get("max_parallel_model_calls"), 4),
         max_parallel_executions=_int(data.get("max_parallel_executions"), 16),

@@ -31,9 +31,27 @@ command -v xdotool >/dev/null || {
 command -v xdpyinfo >/dev/null || {
   unavailable 'xdpyinfo is unavailable'
 }
-golden_dir="${NATIVE_VISUAL_GOLDEN_DIR:-}"
+golden_dir="${NATIVE_VISUAL_GOLDEN_DIR:-$repo_root/native/assets/oi/visual-goldens}"
 update_goldens="${NATIVE_VISUAL_UPDATE_GOLDENS:-0}"
-if [[ -n "$golden_dir" && "$update_goldens" != "1" ]]; then
+manifest_path="$golden_dir/manifest.json"
+[[ -f "$manifest_path" ]] || {
+  printf 'native-visual-smoke: FAIL — missing visual golden manifest %s\n' "$manifest_path" >&2
+  exit 1
+}
+MANIFEST_PATH="$manifest_path" UPDATE_GOLDENS="$update_goldens" python3 -c '
+import json
+import os
+from pathlib import Path
+
+manifest = json.loads(Path(os.environ["MANIFEST_PATH"]).read_text(encoding="utf-8"))
+if os.environ.get("UPDATE_GOLDENS") != "1" and manifest.get("review_status") != "approved":
+    raise SystemExit("visual golden manifest is not marked approved after human review")
+if manifest.get("capture_clock") != "fixed":
+    raise SystemExit("visual golden manifest must require the fixed presentation clock")
+if not manifest.get("required_pngs"):
+    raise SystemExit("visual golden manifest has no required PNGs")
+'
+if [[ "$update_goldens" != "1" ]]; then
   command -v compare >/dev/null || {
     printf '%s\n' 'native-visual-smoke: FAIL — ImageMagick compare is required for golden checks' >&2
     exit 1
@@ -104,6 +122,7 @@ projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARC
 
 PROJECTION="$projection" NATIVE_BIN="$native_bin" TMP_DIR="$tmp_dir" \
   GOLDEN_DIR="$golden_dir" UPDATE_GOLDENS="$update_goldens" CHECK_LAYOUT="$repo_root/scripts/check-native-layout.py" \
+  CHECK_OI_VISUAL="$repo_root/scripts/check-native-oi-visual.py" \
   xvfb-run -a -s '-screen 0 1920x1080x24 -ac' bash -c '
     set -euo pipefail
 
@@ -158,11 +177,12 @@ PY
     resize_sequence() {
       local layout_path="$TMP_DIR/live-resize.layout.json"
       local sync_path="$TMP_DIR/live-resize.presentation.json"
-      ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --no-animations --command "tail -f /dev/null" >/dev/null 2>&1 &
+      ATHENA_PRESENTATION_CLOCK=fixed ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --no-animations --command "tail -f /dev/null" >/dev/null 2>&1 &
       local native_pid=$!
       local window
       window="$(wait_for_window)"
       xdotool windowfocus --sync "$window"
+      xdotool windowsize --sync "$window" 1280 800
       wait_for_presentation "$sync_path" 1 1280 800
       local last_sequence
       last_sequence="$(presentation_sequence "$sync_path")"
@@ -183,6 +203,13 @@ PY
       local scene_mode="$2"
       local mascot="$3"
       local input="$4"
+      local size="${5:-1280x800}"
+      local animation_mode="${6:-static}"
+      IFS=x read -r expected_width expected_height <<< "$size"
+      local animation_args=(--no-animations)
+      if [[ "$animation_mode" == "animated" ]]; then
+        animation_args=()
+      fi
       local fixture_projection="${PROJECTION//\"search\"/\"$scene_mode\"}"
       local upper_mode="${scene_mode^^}"
       fixture_projection="${fixture_projection//\"SEARCH\"/\"$upper_mode\"}"
@@ -193,19 +220,21 @@ PY
       local oi_path="$TMP_DIR/${label}-${mascot}.oi.png"
       local sync_path="$TMP_DIR/${label}-${mascot}.presentation.json"
 
-      printf "%s\\n" "$fixture_projection" | ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" ATHENA_NATIVE_OI_DUMP="$oi_path" ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --bridge-stdin --no-animations \
+      printf "native-visual-smoke: capture %s-%s (%s, %s)\\n" "$label" "$mascot" "$size" "$scene_mode" >&2
+      printf "%s\\n" "$fixture_projection" | ATHENA_PRESENTATION_CLOCK=fixed ATHENA_NATIVE_LAYOUT_DUMP="$layout_path" ATHENA_NATIVE_OI_DUMP="$oi_path" ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --bridge-stdin "${animation_args[@]}" \
         --mascot "$mascot" --command "printf native-ok; tail -f /dev/null" >/dev/null 2>&1 &
       local native_pid=$!
       local window
       window="$(wait_for_window)"
       xdotool windowfocus --sync "$window"
-      wait_for_presentation "$sync_path" 1 1280 800 "$scene_mode"
+      xdotool windowsize --sync "$window" "$expected_width" "$expected_height"
+      wait_for_presentation "$sync_path" 1 "$expected_width" "$expected_height" "$scene_mode"
       local last_sequence
       last_sequence="$(presentation_sequence "$sync_path")"
       if [[ -n "$input" ]]; then
         xdotool type --window "$window" --clearmodifiers "$input"
         xdotool key --window "$window" Left Left
-        wait_for_presentation "$sync_path" "$((last_sequence + 1))" 1280 800 "$scene_mode"
+        wait_for_presentation "$sync_path" "$((last_sequence + 1))" "$expected_width" "$expected_height" "$scene_mode"
       fi
       import -window "$window" "$image_path"
       kill "$native_pid" 2>/dev/null || true
@@ -224,6 +253,7 @@ PY
         printf "native-visual-smoke: FAIL — OI dump has unexpected dimensions\\n" >&2
         return 1
       }
+      python3 "$CHECK_OI_VISUAL" "$oi_path"
 
       if [[ -n "$GOLDEN_DIR" ]]; then
         local golden_path="$GOLDEN_DIR/${label}-${mascot}.png"
@@ -246,7 +276,7 @@ PY
 
       local dimensions colors stddev
       dimensions="$(identify -format "%wx%h" "$image_path")"
-      [[ "$dimensions" == "1280x800" ]] || {
+      [[ "$dimensions" == "${expected_width}x${expected_height}" ]] || {
         printf "native-visual-smoke: FAIL — %s has dimensions %s\\n" "$label-$mascot" "$dimensions" >&2
         return 1
       }
@@ -286,6 +316,20 @@ PY
         capture_fixture "$scene_mode" "$scene_mode" "$mascot" ""
       done
     done
+
+    # The physical reference and the larger active-world surfaces are separate
+    # reviewed evidence. They must not be hidden behind the 1280x800 smoke.
+    for scene_mode in idle search code approval; do
+      for mascot in owl cat bot; do
+        capture_fixture "1672-${scene_mode}" "$scene_mode" "$mascot" "" 1672x941
+      done
+    done
+
+    # Fixed-clock temporal samples make animation cadence and semantic state
+    # transitions reviewable without relying on wall-clock timing.
+    for scene_mode in idle search code execute failure recover; do
+      capture_fixture "temporal-${scene_mode}" "$scene_mode" owl "" 1280x800 animated
+    done
   '
 
-printf '%s\n' 'native-visual-smoke: PASS — 27 exact-window fixtures (idle, typing, semantic modes × owl/cat/bot)'
+printf '%s\n' 'native-visual-smoke: PASS — mandatory responsive, semantic, Buddy, and fixed-clock visual evidence'

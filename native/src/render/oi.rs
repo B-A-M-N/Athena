@@ -1,8 +1,12 @@
 use super::super::*;
 use super::buddy::draw_buddy;
-use super::chassis::PresentationSettings;
-use super::primitives::{draw_line, draw_node, draw_rect, draw_round_outline, draw_round_rect};
-use crate::buddy::{SPRITE_DIRTY_HEIGHT, SPRITE_DIRTY_WIDTH};
+use super::chassis::{PresentationSettings, bitmap_width, draw_bitmap_text};
+use super::primitives::{
+    draw_line, draw_line_alpha, draw_node, draw_rect, draw_round_outline, draw_round_rect,
+};
+use crate::buddy::{
+    SPRITE_DIRTY_HEIGHT, SPRITE_DIRTY_WIDTH, SPRITE_HEIGHT, SPRITE_SCALE, SPRITE_WIDTH,
+};
 use crate::{ProjectionAttention, ProjectionEntity, ProjectionTreeNode};
 #[cfg(test)]
 use serde::{Deserialize, Serialize};
@@ -299,6 +303,7 @@ impl OiTarget {
         let safe_area = scene_safe_area(projection.attention_items.len());
         let half_width = SPRITE_DIRTY_WIDTH / 2.0;
         let half_height = SPRITE_DIRTY_HEIGHT / 2.0;
+        // DAGOAL: keep buddy clearly visible but respect safe area for attention rail
         let clamp_x = |x: f32| {
             x.clamp(
                 half_width,
@@ -330,14 +335,11 @@ impl OiTarget {
         } else {
             motion.current = motion_position(&motion, phase);
         }
-        let bob = if animated {
-            (phase * 1.7).sin() * 1.5
-        } else {
-            0.0
-        };
         (
-            clamp_x(motion.current.0),
-            clamp_y(motion.current.1 + bob),
+            // Keep actor motion on logical pixels so it reads as stepped
+            // phosphor movement instead of a floating sine-wave bob.
+            clamp_x(motion.current.0).round(),
+            clamp_y(motion.current.1).round(),
         )
     }
 }
@@ -388,6 +390,10 @@ pub(crate) fn draw_oi_scene(
         phase,
         options.animations && !options.reduced_motion,
     );
+    let safe_area = scene_safe_area(projection.attention_items.len());
+    let buddy_position =
+        buddy_anchor_is_clear(buddy_position, projection, safe_area.unobscured_right)
+            .then_some(buddy_position);
     if target.enabled() {
         unsafe {
             // The caller has already established the CRT clip on the window
@@ -407,7 +413,7 @@ pub(crate) fn draw_oi_scene(
             options,
             presentation,
             buddy_position,
-            scene_safe_area(projection.attention_items.len()),
+            safe_area,
         );
         unsafe {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -446,7 +452,7 @@ pub(crate) fn draw_oi_scene(
         options,
         presentation,
         buddy_position,
-        scene_safe_area(projection.attention_items.len()),
+        safe_area,
     );
     unsafe { glPopMatrix() };
     draw_glass_surface(
@@ -460,7 +466,7 @@ pub(crate) fn draw_oi_scene(
 }
 
 fn draw_crt_texture(texture: u32, x: f32, y: f32, width: f32, height: f32) {
-    const GRID: usize = 16;
+    const GRID: usize = 24;
     let grid_f = GRID as f32;
     unsafe {
         glEnable(GL_TEXTURE_2D);
@@ -493,7 +499,7 @@ fn draw_crt_texture(texture: u32, x: f32, y: f32, width: f32, height: f32) {
 
 fn barrel_uv(u: f32, v: f32) -> (f32, f32) {
     let edge = ((u - 0.5).abs().max((v - 0.5).abs()) * 2.0).powi(2);
-    let gain = 1.0 + edge * 0.045;
+    let gain = 1.0 + edge * 0.065;
     (0.5 + (u - 0.5) * gain, 0.5 + (v - 0.5) * gain)
 }
 
@@ -525,51 +531,62 @@ fn draw_glass_surface(x: f32, y: f32, width: f32, height: f32, brightness: f32, 
         (height - 16.0).max(0.0),
         (edge.0 * 0.22, edge.1 * 0.22, edge.2 * 0.22),
     );
+    unsafe {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
     // Upper and left convex curved specular highlights
-    draw_line(
+    draw_line_alpha(
         x + width * 0.08,
         y + 3.0,
         x + width * 0.78,
         y + 3.0,
         (0.16, 0.30, 0.31),
+        0.42,
     );
-    draw_line(
+    draw_line_alpha(
         x + 3.0,
         y + height * 0.08,
         x + 3.0,
         y + height * 0.72,
         (0.12, 0.24, 0.25),
+        0.34,
     );
-    draw_line(
+    draw_line_alpha(
         x + width * 0.12,
         y + 5.0,
         x + width * 0.48,
         y + 5.0,
         (0.10, 0.20, 0.22),
+        0.28,
     );
     // Diagonal reflection sheen across the upper-left glass quadrant.
-    draw_line(
+    draw_line_alpha(
         x + width * 0.18,
         y + 9.0,
         x + width * 0.06 + height * 0.24,
         y + height * 0.28,
         (0.04, 0.09, 0.10),
+        0.55,
     );
-    draw_line(
+    draw_line_alpha(
         x + width * 0.22,
         y + 9.0,
         x + width * 0.10 + height * 0.24,
         y + height * 0.28,
         (0.03, 0.07, 0.08),
+        0.45,
     );
     // Bottom edge falloff
-    draw_line(
+    draw_line_alpha(
         x + width * 0.22,
         y + height - 3.0,
         x + width * 0.90,
         y + height - 3.0,
         (0.016, 0.034, 0.036),
+        0.40,
     );
+    unsafe { glDisable(GL_BLEND) };
 }
 
 fn set_projection(width: i32, height: i32) {
@@ -583,12 +600,76 @@ fn set_projection(width: i32, height: i32) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scene layout
+// ---------------------------------------------------------------------------
+
+const HEADER_TOP: f32 = 8.0;
+const HEADER_HEIGHT: f32 = 22.0;
+const READOUT_HEIGHT: f32 = 96.0;
+const MARGIN: f32 = 10.0;
+
+#[derive(Clone, Copy, Debug)]
+struct SceneLayout {
+    full: PixelRect,
+    header: PixelRect,
+    stage: PixelRect,
+    readout: Option<PixelRect>,
+}
+
+fn scene_layout(safe_area: SceneSafeArea) -> SceneLayout {
+    let full = PixelRect {
+        x: MARGIN,
+        y: HEADER_TOP + HEADER_HEIGHT + 4.0,
+        width: (safe_area.unobscured_right - MARGIN * 2.0).max(20.0),
+        height: SCENE_HEIGHT - HEADER_TOP - HEADER_HEIGHT - 14.0,
+    };
+    let header = PixelRect {
+        x: MARGIN,
+        y: HEADER_TOP,
+        width: full.width,
+        height: HEADER_HEIGHT,
+    };
+    SceneLayout {
+        full,
+        header,
+        stage: full,
+        readout: None,
+    }
+}
+
+fn scene_layout_with_readout(safe_area: SceneSafeArea) -> SceneLayout {
+    let base = scene_layout(safe_area);
+    let readout = PixelRect {
+        x: base.full.x + 8.0,
+        y: base.full.bottom() - READOUT_HEIGHT - 2.0,
+        width: (base.full.width - 16.0).max(20.0),
+        height: READOUT_HEIGHT,
+    };
+    let stage = PixelRect {
+        x: base.full.x,
+        y: base.full.y,
+        width: base.full.width,
+        height: (readout.y - base.full.y - 6.0).max(20.0),
+    };
+    SceneLayout {
+        full: base.full,
+        header: base.header,
+        stage,
+        readout: Some(readout),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scene contents
+// ---------------------------------------------------------------------------
+
 fn draw_scene_contents(
     projection: &Projection,
     phase: f32,
     options: &RendererOptions,
     presentation: PresentationSettings,
-    buddy_position: (f32, f32),
+    buddy_position: Option<(f32, f32)>,
     safe_area: SceneSafeArea,
 ) {
     let mode = VisualMode::from_projection(projection);
@@ -601,28 +682,48 @@ fn draw_scene_contents(
         SCENE_HEIGHT,
         (0.008 * brightness, 0.026 * brightness, 0.036 * brightness),
     );
-    if presentation.display_enabled {
-        draw_terrain(
-            color,
-            phase,
-            mode,
-            presentation.focus,
-            safe_area.unobscured_right,
-        );
-        // Idle is a world, not a report about the absence of work. Semantic
-        // nodes and action grammar appear only when there is an active mode.
-        if !matches!(mode, VisualMode::Idle) {
-            draw_semantic_world(
-                projection,
-                mode,
-                color,
-                phase,
-                presentation.focus,
-                safe_area.unobscured_right,
-            );
-        }
-        draw_oi_information(projection, mode, color, safe_area.unobscured_right);
+    if !presentation.display_enabled {
+        return;
     }
+
+    draw_crt_treatment(color, brightness, presentation.focus, phase);
+
+    // Quiet ground plane shared by every scene.
+    draw_terrain(
+        color,
+        phase,
+        mode,
+        presentation.focus,
+        safe_area.unobscured_right,
+    );
+
+    let layout = if mode.shows_readout() {
+        scene_layout_with_readout(safe_area)
+    } else {
+        scene_layout(safe_area)
+    };
+
+    draw_chrome(projection, mode, &layout, color, safe_area.unobscured_right);
+
+    match mode {
+        VisualMode::Idle => draw_idle_scene(projection, &layout, color, phase),
+        VisualMode::Inspect | VisualMode::Search => {
+            draw_workspace_scene(projection, &layout, color, phase, mode)
+        }
+        VisualMode::Read => draw_read_scene(projection, &layout, color, phase),
+        VisualMode::Code => draw_code_scene(projection, &layout, color, phase),
+        VisualMode::Execute | VisualMode::Generate | VisualMode::Recover => {
+            draw_execute_scene(projection, &layout, color, phase, mode)
+        }
+        VisualMode::Test | VisualMode::Verify => draw_test_scene(projection, &layout, color, phase),
+        VisualMode::Approval => draw_approval_scene(projection, &layout, color, phase),
+        VisualMode::Failure => draw_failure_scene(projection, &layout, color, phase),
+        VisualMode::Success => draw_success_scene(&layout, color, phase),
+        VisualMode::Think | VisualMode::Respond => {
+            draw_think_scene(projection, &layout, color, phase)
+        }
+    }
+
     let state = projection
         .buddy
         .as_ref()
@@ -640,31 +741,25 @@ fn draw_scene_contents(
         .map(|buddy| buddy.character.as_str())
         .filter(|character| !character.is_empty())
         .unwrap_or(options.mascot.as_str());
-    if presentation.display_enabled {
-        draw_buddy(
-            buddy_position.0,
-            buddy_position.1,
-            state,
-            status,
-            character,
-            phase,
-        );
-        draw_crt_treatment(color, presentation.brightness, presentation.focus);
-        draw_attention_rail(projection, safe_area);
+    if let Some((buddy_x, buddy_y)) = buddy_position {
+        draw_buddy(buddy_x, buddy_y, state, status, character, phase);
     }
+    draw_attention_rail(projection, safe_area);
 }
 
-fn draw_crt_treatment(color: (f32, f32, f32), brightness: f32, focus: f32) {
+fn draw_crt_treatment(color: (f32, f32, f32), brightness: f32, focus: f32, phase: f32) {
     // This pass stays in the low-resolution target, so the scanline rhythm is
     // coherent after nearest-neighbour composition instead of becoming a
     // monitor-sized overlay that scales differently at every window size.
+    let flicker = 0.986 + (phase * std::f32::consts::TAU * 1.15).sin() * 0.010;
+    let scanline_strength = (0.032 + (1.0 - focus) * 0.035) * flicker;
     let scanline = (
-        color.0 * (0.06 + (1.0 - focus) * 0.06),
-        color.1 * (0.06 + (1.0 - focus) * 0.06),
-        color.2 * (0.06 + (1.0 - focus) * 0.06),
+        color.0 * scanline_strength,
+        color.1 * scanline_strength,
+        color.2 * scanline_strength,
     );
-    // Tight 2-pixel cathode-ray beam modulation.
-    for y in (2..SCENE_HEIGHT as i32 - 2).step_by(2) {
+    // Fine cathode-ray texture stays subordinate to the matrix dots.
+    for y in (2..SCENE_HEIGHT as i32 - 2).step_by(4) {
         draw_rect(2.0, y as f32, SCENE_WIDTH - 4.0, 1.0, scanline);
     }
     // Bulbous tube corner vignetting: corners are darker than edges.
@@ -673,11 +768,7 @@ fn draw_crt_treatment(color: (f32, f32, f32), brightness: f32, focus: f32) {
         0.010 + (1.0 - brightness) * 0.018,
         0.014 + (1.0 - brightness) * 0.022,
     );
-    let corner = (
-        edge.0 * 2.2,
-        edge.1 * 2.2,
-        edge.2 * 2.2,
-    );
+    let corner = (edge.0 * 2.2, edge.1 * 2.2, edge.2 * 2.2);
     draw_rect(0.0, 0.0, SCENE_WIDTH, 2.0, edge);
     draw_rect(0.0, SCENE_HEIGHT - 2.0, SCENE_WIDTH, 2.0, edge);
     draw_rect(0.0, 0.0, 2.0, SCENE_HEIGHT, edge);
@@ -689,19 +780,25 @@ fn draw_crt_treatment(color: (f32, f32, f32), brightness: f32, focus: f32) {
         SCENE_HEIGHT - 8.0,
         (color.0 * 0.16, color.1 * 0.16, color.2 * 0.16),
     );
-    // Additional corner shadow quads for tube bulb falloff.
+    // DAGOAL: lighter corner vignette so buddy remains clearly visible
     for (cx, cy, w, h) in [
-        (0.0, 0.0, 28.0, 28.0),
-        (SCENE_WIDTH - 28.0, 0.0, 28.0, 28.0),
-        (0.0, SCENE_HEIGHT - 28.0, 28.0, 28.0),
-        (SCENE_WIDTH - 28.0, SCENE_HEIGHT - 28.0, 28.0, 28.0),
+        (0.0, 0.0, 20.0, 20.0),
+        (SCENE_WIDTH - 20.0, 0.0, 20.0, 20.0),
+        (0.0, SCENE_HEIGHT - 20.0, 20.0, 20.0),
+        (SCENE_WIDTH - 20.0, SCENE_HEIGHT - 20.0, 20.0, 20.0),
     ] {
-        draw_rect(cx, cy, w, h, corner);
+        draw_rect(
+            cx,
+            cy,
+            w,
+            h,
+            (corner.0 * 0.62, corner.1 * 0.62, corner.2 * 0.62),
+        );
     }
 }
 
-fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, focus: f32, right: f32) {
-    let horizon = 148.0;
+fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, _focus: f32, right: f32) {
+    let horizon = 152.0;
     let quiet = matches!(mode, VisualMode::Idle);
     let base_grid = (color.0 * 0.34, color.1 * 0.34, color.2 * 0.34);
     let grid = if quiet {
@@ -709,16 +806,8 @@ fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, focus: f32
     } else {
         base_grid
     };
-    let near_grid = (
-        grid.0 * 1.35,
-        grid.1 * 1.35,
-        grid.2 * 1.35,
-    );
-    let far_grid = (
-        grid.0 * 0.55,
-        grid.1 * 0.55,
-        grid.2 * 0.55,
-    );
+    let near_grid = (grid.0 * 1.35, grid.1 * 1.35, grid.2 * 1.35);
+    let far_grid = (grid.0 * 0.55, grid.1 * 0.55, grid.2 * 0.55);
     // A dense perspective vector ground plane receding beneath Buddy.
     // Horizontal rungs are spaced with quadratic perspective (t*t) and crawl
     // downward so the plane feels alive without drifting the horizon.
@@ -728,7 +817,7 @@ fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, focus: f32
         let perspective = t * t;
         let row_y = horizon + (SCENE_HEIGHT - horizon - 8.0) * perspective;
         let line_color = if t > 0.75 { near_grid } else { grid };
-        draw_rect(12.0, row_y, (right - 24.0).max(0.0), 1.0, line_color);
+        draw_dotted_span(14.0, row_y, (right - 14.0).max(14.0), line_color, 2.0);
     }
     // Vertical perspective lines fanning out from a vanishing point behind
     // the active information panel, matching the DAGOAL reference wireframe.
@@ -739,80 +828,54 @@ fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, focus: f32
         let bottom_t = index as f32 / (line_count - 1) as f32;
         let bottom_x = 14.0 + bottom_t * (right - 28.0);
         // Lines converge toward the vanishing point but stop at the horizon.
-        draw_line(vanish_x, horizon, bottom_x, bottom_y, far_grid);
+        draw_dotted_line(vanish_x, horizon, bottom_x, bottom_y, far_grid);
     }
     // Horizon accent
-    draw_rect(
+    draw_dotted_span(
         12.0,
         horizon,
-        (right - 24.0).max(0.0),
-        1.0,
+        (right - 12.0).max(12.0),
         (color.0 * 0.65, color.1 * 0.65, color.2 * 0.65),
+        3.0,
     );
-    // Floating phosphor starfield above the grid, with deterministic twinkle.
-    let particle_count = 12 + (focus * 18.0) as usize;
-    for index in 0..particle_count {
-        let px = (index * 67 % ((right as usize).saturating_sub(28)) + 14) as f32;
-        let py = (index * 31 % 126 + 12) as f32;
-        let twinkle_tick = (phase.max(0.0) * 8.0 + index as f32 * 1.7).floor();
-        let pulse = if (twinkle_tick as usize) % 5 == 0 {
-            0.92
-        } else if (twinkle_tick as usize) % 3 == 0 {
-            0.62
-        } else {
-            0.42
-        };
-        let star_size = if (twinkle_tick as usize) % 7 == 0 { 2.0 } else { 1.0 };
-        draw_rect(
-            px,
-            py,
-            star_size,
-            star_size,
-            (color.0 * pulse, color.1 * pulse, color.2 * pulse),
-        );
+    // Sparse ambient markers only in idle; active scenes reserve the field
+    // for semantic motion.
+    if quiet {
+        for index in 0..6 {
+            let px = (index * 67 % ((right as usize).saturating_sub(36)) + 18) as f32;
+            let py = (index * 31 % 96 + 18) as f32;
+            let pulse = 0.45 + 0.25 * ((phase * 2.0 + index as f32 * 1.1).sin());
+            draw_rect(
+                px,
+                py,
+                1.0,
+                1.0,
+                (color.0 * pulse, color.1 * pulse, color.2 * pulse),
+            );
+        }
     }
 }
 
-fn draw_oi_information(
+// ---------------------------------------------------------------------------
+// Chrome
+// ---------------------------------------------------------------------------
+
+fn draw_chrome(
     projection: &Projection,
     mode: VisualMode,
+    _layout: &SceneLayout,
     color: (f32, f32, f32),
     right: f32,
 ) {
-    let right = right.clamp(46.0, SCENE_WIDTH - 8.0);
     let bright = (color.0 * 0.92, color.1 * 0.92, color.2 * 0.92);
     let dim = (color.0 * 0.58, color.1 * 0.58, color.2 * 0.58);
     pixel_text(
+        10.0,
         14.0,
-        18.0,
         "ATHENA OI // GLASS COMPUTE",
         bright,
-        right,
+        right - 10.0,
     );
-    let viewport_label = "LIVE VIEWPORT";
-    let viewport_width = viewport_label.chars().count() as f32 * 6.0;
-    pixel_text(
-        (right - viewport_width - 14.0).max(14.0),
-        18.0,
-        viewport_label,
-        dim,
-        right,
-    );
-    // Dotted header rule beneath the operational header.
-    let mut rule_x = 14.0;
-    while rule_x + 3.0 < right - 14.0 {
-        draw_rect(rule_x, 29.0, 2.0, 1.0, (color.0 * 0.42, color.1 * 0.42, color.2 * 0.42));
-        rule_x += 5.0;
-    }
-    if !projection.self_host_phase.is_empty() {
-        pixel_text(
-            (right - 134.0).max(14.0),
-            18.0,
-            &format!("SELF-HOST // {}", projection.self_host_phase),
-            bright,
-            right,
-        );
-    }
 
     let operation = projection.active_operation.as_ref();
     let action = projection.current_action.as_ref();
@@ -829,115 +892,144 @@ fn draw_oi_information(
         })
         .unwrap_or("");
 
-    // Operational telemetry hierarchy with chevron callouts.
-    let mut info_y = 32.0;
-    if let Some(request) = projection.model_request.as_ref() {
-        let model = if request.provider.is_empty() {
-            request.model.clone()
-        } else if request.model.is_empty() {
-            request.provider.clone()
-        } else {
-            format!("{}/{}", request.provider, request.model)
-        };
-        if !model.is_empty() {
-            pixel_text(
-                14.0,
-                info_y,
-                &format!("> MODEL REQUEST · {}", model),
-                bright,
-                right,
-            );
-            info_y += 10.0;
-        }
-    }
+    // Mode badge on the right of the header.
+    let badge = mode.as_str().to_ascii_uppercase();
+    let badge_width = badge.chars().count() as f32 * 7.0;
     pixel_text(
+        (right - badge_width - 10.0).max(10.0),
         14.0,
-        info_y,
-        &format!("> ACTIVE OPERATION // {}", mode.as_str().to_ascii_uppercase()),
-        bright,
-        right,
+        &badge,
+        dim,
+        right - 10.0,
     );
-    info_y += 10.0;
-    if !label.is_empty() {
-        pixel_text(
-            14.0,
-            info_y,
-            &format!("  {}", label),
-            dim,
-            right,
+
+    // Dotted header rule.
+    let mut rule_x = 10.0;
+    while rule_x + 3.0 < right - 10.0 {
+        draw_rect(
+            rule_x,
+            27.0,
+            2.0,
+            1.0,
+            (color.0 * 0.42, color.1 * 0.42, color.2 * 0.42),
         );
-        info_y += 10.0;
-    }
-    if !target.is_empty() {
-        pixel_text(
-            14.0,
-            info_y,
-            &format!("  {}", target),
-            (color.0 * 0.72, color.1 * 0.72, color.2 * 0.72),
-            right,
-        );
-        info_y += 10.0;
+        rule_x += 5.0;
     }
 
-    let detail = operation
-        .and_then(|value| (!value.operation.is_empty()).then_some(value.operation.as_str()))
-        .or_else(|| {
-            action.and_then(|value| (!value.detail.is_empty()).then_some(value.detail.as_str()))
-        })
-        .or_else(|| {
-            action.and_then(|value| (!value.query.is_empty()).then_some(value.query.as_str()))
-        })
-        .unwrap_or("");
-    if !detail.is_empty() {
-        pixel_text(14.0, info_y, &format!("> {}", detail), dim, right);
-        info_y += 10.0;
-    }
-    if let Some(operation) = operation {
-        if !operation.mutation_state.is_empty() {
-            pixel_text(
-                (right - 112.0).max(14.0),
-                info_y - 10.0,
-                &format!("MUT {}", operation.mutation_state),
-                dim,
-                right,
-            );
-        }
+    // Secondary context line just below the header, inside the stage margin.
+    let context = if !target.is_empty() {
+        format!("{label}  //  {target}")
+    } else {
+        label.to_owned()
+    };
+    if !context.is_empty() {
+        pixel_text(10.0, 35.0, &context, dim, right - 10.0);
     }
 
     if let Some(request) = projection.model_request.as_ref() {
         if request.status.eq_ignore_ascii_case("unconfigured") {
             pixel_text(
-                (right - 170.0).max(14.0),
-                32.0,
+                (right - 170.0).max(10.0),
+                35.0,
                 "MODEL UNCONFIGURED",
                 (0.91, 0.62, 0.22),
-                right,
+                right - 10.0,
             );
         }
     }
+}
 
-    let mut y = info_y + 6.0;
+// ---------------------------------------------------------------------------
+// Live readout pane
+// ---------------------------------------------------------------------------
+
+fn draw_readout_frame(rect: PixelRect, color: (f32, f32, f32)) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let glass = (color.0 * 0.12, color.1 * 0.22, color.2 * 0.24);
+    let rim = (color.0 * 0.55, color.1 * 0.55, color.2 * 0.55);
+    draw_round_rect(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        5.0,
+        (0.006, 0.014, 0.016),
+    );
+    draw_round_outline(rect.x, rect.y, rect.width, rect.height, rim);
+    // Inner glass sheen
+    draw_line_alpha(
+        rect.x + 4.0,
+        rect.y + 2.0,
+        rect.x + rect.width * 0.55,
+        rect.y + 2.0,
+        glass,
+        0.35,
+    );
+}
+
+fn draw_live_readout(
+    projection: &Projection,
+    mode: VisualMode,
+    rect: PixelRect,
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    draw_readout_frame(rect, color);
+    if rect.width <= 14.0 || rect.height <= 14.0 {
+        return;
+    }
+    let inner_x = rect.x + 6.0;
+    let inner_y = rect.y + 7.0;
+    let inner_right = rect.right() - 6.0;
+    let line_height = 9.0;
+    let bright = (color.0 * 0.92, color.1 * 0.92, color.2 * 0.92);
+    let dim = (color.0 * 0.58, color.1 * 0.58, color.2 * 0.58);
+
+    let mut y = inner_y;
+    let max_lines = ((rect.height - 14.0) / line_height).floor().max(1.0) as usize;
+
     match mode {
-        VisualMode::Inspect | VisualMode::Search => {
-            draw_tree_information(
-                "WORKSPACE",
-                &projection.workspace_tree,
-                y,
-                bright,
-                dim,
-                right,
-            );
-        }
-        VisualMode::Read | VisualMode::Code => {
+        VisualMode::Read => {
             if let Some(code) = projection.code_view.as_ref() {
-                pixel_text(
-                    14.0,
-                    y,
-                    &format!("{} {}", code.language, code.path),
-                    bright,
-                    right,
-                );
-                y += 10.0;
+                let header = format!("READ  {}", code.path);
+                pixel_text(inner_x, y, &header, bright, inner_right);
+                y += line_height;
+                let lines = if !code.lines.is_empty() {
+                    &code.lines
+                } else {
+                    &code.text.lines().map(str::to_owned).collect::<Vec<_>>()
+                };
+                let scan_index = ((phase * 1.4).floor() as usize) % lines.len().max(1);
+                for (index, line) in lines.iter().take(max_lines.saturating_sub(1)).enumerate() {
+                    let _ = index;
+                    let dimmed = if index == scan_index { 1.0 } else { 0.65 };
+                    pixel_text(
+                        inner_x,
+                        y,
+                        line,
+                        (
+                            color.0 * 0.75 * dimmed,
+                            color.1 * 0.82 * dimmed,
+                            color.2 * 0.85 * dimmed,
+                        ),
+                        inner_right,
+                    );
+                    y += line_height;
+                }
+                if code.preview_truncated {
+                    pixel_text(inner_x, y, "...", dim, inner_right);
+                }
+            } else {
+                pixel_text(inner_x, y, "AWAITING ARTIFACT", dim, inner_right);
+            }
+        }
+        VisualMode::Code => {
+            if let Some(code) = projection.code_view.as_ref() {
+                let header = format!("MODIFY  {}", code.path);
+                pixel_text(inner_x, y, &header, bright, inner_right);
+                y += line_height;
                 let lines = if !code.diff.is_empty() {
                     code.diff.clone()
                 } else if !code.lines.is_empty() {
@@ -945,100 +1037,99 @@ fn draw_oi_information(
                 } else {
                     code.text.lines().map(str::to_owned).collect()
                 };
-                for line in lines.iter().take(6) {
-                    pixel_text(14.0, y, line, dim, right);
-                    y += 8.0;
-                }
-                if code.preview_truncated {
-                    pixel_text(14.0, y, "... PREVIEW TRUNCATED", dim, right);
+                for line in lines.iter().take(max_lines.saturating_sub(1)) {
+                    let line_color = if line.starts_with('+') {
+                        (0.46, 0.91, 0.67)
+                    } else if line.starts_with('-') {
+                        (0.88, 0.28, 0.32)
+                    } else {
+                        (color.0 * 0.75, color.1 * 0.82, color.2 * 0.85)
+                    };
+                    pixel_text(inner_x, y, line, line_color, inner_right);
+                    y += line_height;
                 }
                 if !code.mutation_state.is_empty() {
                     pixel_text(
-                        14.0,
-                        224.0,
-                        &format!("MUTATION {}", code.mutation_state),
-                        bright,
-                        right,
+                        inner_x,
+                        y,
+                        &code.mutation_state.to_ascii_uppercase(),
+                        dim,
+                        inner_right,
                     );
                 }
             } else {
-                draw_tree_information(
-                    "WORKSPACE",
-                    &projection.workspace_tree,
-                    y,
-                    bright,
-                    dim,
-                    right,
-                );
+                pixel_text(inner_x, y, "AWAITING CODE VIEW", dim, inner_right);
             }
         }
         VisualMode::Execute | VisualMode::Generate | VisualMode::Recover => {
-            y = draw_tree_information("RUNTIME", &projection.runtime_tree, y, bright, dim, right);
-            if let Some(operation) = operation {
-                if !operation.command.is_empty() {
-                    pixel_text(14.0, y, &format!("$ {}", operation.command), dim, right);
-                }
-                if !operation.progress.is_empty() {
-                    pixel_text(
-                        14.0,
-                        y + 9.0,
-                        &format!("PROGRESS {}", operation.progress),
-                        bright,
-                        right,
-                    );
-                }
-                if let Some(value) = operation.progress_value {
-                    if operation.progress_determinate {
-                        pixel_text(
-                            14.0,
-                            y + 18.0,
-                            &format!("{}%", (value * 100.0).round()),
-                            bright,
-                            right,
-                        );
-                    }
-                }
+            let operation = projection.active_operation.as_ref();
+            let command =
+                operation.and_then(|op| (!op.command.is_empty()).then_some(op.command.as_str()));
+            if let Some(command) = command {
+                pixel_text(inner_x, y, &format!("$ {command}"), bright, inner_right);
+                y += line_height;
             }
-            if let Some(action) = action {
-                if !action.progress.is_empty() {
-                    pixel_text(
-                        14.0,
-                        y + 27.0,
-                        &format!("ACTION {}", action.progress),
-                        dim,
-                        right,
+            let tail: Vec<&str> = projection
+                .stream_tail
+                .iter()
+                .rev()
+                .take(max_lines.saturating_sub(1))
+                .map(String::as_str)
+                .collect();
+            for line in tail.iter().rev() {
+                pixel_text(inner_x, y, line, dim, inner_right);
+                y += line_height;
+            }
+            if operation.is_some_and(|op| op.progress_determinate) {
+                if let Some(value) = operation.and_then(|op| op.progress_value) {
+                    let bar_width = (rect.width - 16.0).max(4.0);
+                    let filled = bar_width * value as f32;
+                    draw_rect(
+                        inner_x,
+                        y,
+                        bar_width,
+                        3.0,
+                        (color.0 * 0.22, color.1 * 0.22, color.2 * 0.22),
                     );
-                }
-                if action.progress_determinate {
-                    if let Some(value) = action.progress_value {
-                        pixel_text(
-                            14.0,
-                            y + 36.0,
-                            &format!("{}%", (value * 100.0).round()),
-                            bright,
-                            right,
-                        );
-                    }
+                    draw_rect(inner_x, y, filled, 3.0, color);
                 }
             }
         }
         VisualMode::Test | VisualMode::Verify => {
-            pixel_text(14.0, y, "EVIDENCE", bright, right);
-            y += 10.0;
-            if !projection.verification.status.is_empty() {
-                pixel_text(14.0, y, &projection.verification.status, dim, right);
-                y += 8.0;
+            pixel_text(inner_x, y, "VERIFICATION", bright, inner_right);
+            y += line_height;
+            let status = projection.verification.status.to_ascii_uppercase();
+            if !status.is_empty() {
+                pixel_text(inner_x, y, &status, dim, inner_right);
+                y += line_height;
             }
-            for check in projection.verification.checks.iter().take(6) {
+            for check in projection
+                .verification
+                .checks
+                .iter()
+                .take(max_lines.saturating_sub(2))
+            {
                 let text = check.to_string();
-                pixel_text(14.0, y, &text, dim, right);
-                y += 8.0;
+                let status = check_status(check);
+                let check_color = if status == "failed" {
+                    (0.88, 0.28, 0.32)
+                } else if status == "passed" || status == "complete" {
+                    (0.46, 0.91, 0.67)
+                } else {
+                    dim
+                };
+                pixel_text(inner_x, y, &text, check_color, inner_right);
+                y += line_height;
             }
         }
         VisualMode::Failure => {
-            pixel_text(14.0, y, "DIAGNOSTICS", bright, right);
-            y += 10.0;
-            for diagnostic in projection.diagnostics.iter().take(5) {
+            pixel_text(inner_x, y, "DIAGNOSTICS", bright, inner_right);
+            y += line_height;
+            for diagnostic in projection
+                .diagnostics
+                .iter()
+                .take(max_lines.saturating_sub(1))
+            {
                 let location = if diagnostic.path.is_empty() {
                     diagnostic.message.clone()
                 } else {
@@ -1050,154 +1141,612 @@ fn draw_oi_information(
                             .map_or(String::new(), |line| format!(":{line}"))
                     )
                 };
-                let severity = if diagnostic.severity.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", diagnostic.severity)
-                };
-                pixel_text(
-                    14.0,
-                    y,
-                    &format!("{}{}", location, severity),
-                    (0.84, 0.45, 0.30),
-                    right,
-                );
-                y += 8.0;
+                pixel_text(inner_x, y, &location, (0.84, 0.45, 0.30), inner_right);
+                y += line_height;
                 if !diagnostic.detail.is_empty() {
-                    pixel_text(14.0, y, &diagnostic.detail, dim, right);
-                    y += 8.0;
-                }
-                if diagnostic.expected.is_some() || diagnostic.actual.is_some() {
-                    pixel_text(
-                        14.0,
-                        y,
-                        &format!(
-                            "E {} A {}",
-                            diagnostic
-                                .expected
-                                .as_ref()
-                                .unwrap_or(&serde_json::Value::Null),
-                            diagnostic
-                                .actual
-                                .as_ref()
-                                .unwrap_or(&serde_json::Value::Null)
-                        ),
-                        dim,
-                        right,
-                    );
-                    y += 8.0;
+                    pixel_text(inner_x, y, &diagnostic.detail, dim, inner_right);
+                    y += line_height;
                 }
             }
         }
-        VisualMode::Approval => {
-            pixel_text(
-                14.0,
-                y,
-                "ACTION PAUSED AT POLICY GATE",
-                (0.91, 0.62, 0.22),
-                right,
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scene primitives
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct TreeLayoutNode {
+    id: String,
+    label: String,
+    kind: String,
+    status: String,
+    x: f32,
+    y: f32,
+    radius: f32,
+    children: Vec<usize>,
+    parent: Option<usize>,
+}
+
+fn layout_tree(tree: &[ProjectionTreeNode], stage: PixelRect) -> Vec<TreeLayoutNode> {
+    let mut nodes: Vec<TreeLayoutNode> = Vec::new();
+    let mut stack: Vec<(usize, usize, f32, f32, f32)> = Vec::new();
+    for (root_index, _root) in tree.iter().enumerate() {
+        let root_x = stage.x + stage.width * (0.25 + (root_index as f32 * 0.25).min(0.5));
+        let root_y = stage.y + stage.height * 0.18;
+        stack.push((usize::MAX, root_index, root_x, root_y, stage.width * 0.35));
+    }
+    while let Some((parent, tree_index, x, y, spread)) = stack.pop() {
+        let node = &tree[tree_index];
+        let current_index = nodes.len();
+        nodes.push(TreeLayoutNode {
+            id: node.id.clone(),
+            label: node.label.clone(),
+            kind: node.kind.clone(),
+            status: node.status.clone(),
+            x,
+            y,
+            radius: if node.kind.eq_ignore_ascii_case("directory") {
+                7.0
+            } else {
+                5.0
+            },
+            children: Vec::new(),
+            parent: if parent == usize::MAX {
+                None
+            } else {
+                Some(parent)
+            },
+        });
+        if parent != usize::MAX {
+            nodes[parent].children.push(current_index);
+        }
+        let child_count = node.children.len();
+        if child_count == 0 {
+            continue;
+        }
+        let step = spread / (child_count as f32).max(1.0);
+        let start_x = x - step * (child_count.saturating_sub(1) as f32) * 0.5;
+        let child_y = y + stage.height * 0.18;
+        for (child_i, child) in node.children.iter().enumerate() {
+            let Some(child_index) = tree.iter().position(|node| node.id == child.id) else {
+                continue;
+            };
+            let child_x = start_x + child_i as f32 * step;
+            stack.push((current_index, child_index, child_x, child_y, spread * 0.55));
+        }
+    }
+    nodes
+}
+
+fn node_status_color(status: &str, base: (f32, f32, f32)) -> (f32, f32, f32) {
+    match status.to_ascii_lowercase().as_str() {
+        "failed" | "error" | "failure" => (0.88, 0.28, 0.32),
+        "passed" | "complete" | "ready" | "ok" | "success" | "succeeded" => (0.46, 0.91, 0.67),
+        "approval" | "warning" => (0.91, 0.62, 0.22),
+        "reading" | "testing" | "running" | "active" | "working" => (
+            base.0 * (0.72 + 0.28),
+            base.1 * (0.72 + 0.28),
+            base.2 * (0.72 + 0.28),
+        ),
+        _ => (base.0 * 0.72, base.1 * 0.72, base.2 * 0.72),
+    }
+}
+
+fn draw_tree_nodes(
+    nodes: &[TreeLayoutNode],
+    color: (f32, f32, f32),
+    phase: f32,
+    active_id: Option<&str>,
+) {
+    let dim = (color.0 * 0.45, color.1 * 0.45, color.2 * 0.45);
+    // Edges first so nodes sit on top.
+    for node in nodes.iter() {
+        if let Some(parent) = node.parent.and_then(|index| nodes.get(index)) {
+            draw_dotted_line(parent.x, parent.y, node.x, node.y, dim);
+        }
+    }
+    for node in nodes.iter() {
+        let is_active = active_id.is_some_and(|id| id == node.id);
+        let node_color = node_status_color(&node.status, color);
+        let radius = if is_active {
+            node.radius + 2.0
+        } else {
+            node.radius
+        };
+        draw_node(node.x, node.y, radius, node_color);
+        if is_active {
+            let pulse = 0.6 + 0.4 * (phase * std::f32::consts::TAU * 1.3).sin();
+            draw_round_outline(
+                node.x - radius - 6.0,
+                node.y - radius - 6.0,
+                radius * 2.0 + 12.0,
+                radius * 2.0 + 12.0,
+                (
+                    node_color.0 * pulse,
+                    node_color.1 * pulse,
+                    node_color.2 * pulse,
+                ),
             );
         }
-        VisualMode::Think | VisualMode::Respond => {
-            if let Some(progress) = projection.progress.as_ref() {
-                if let Some(object) = progress.as_object() {
-                    if let Some(label) = object.get("label").and_then(serde_json::Value::as_str) {
-                        pixel_text(14.0, y, label, dim, right);
-                    }
-                }
-            } else if let Some(line) = projection.display_oi().first() {
-                pixel_text(14.0, y, line, dim, right);
-            }
-        }
-        VisualMode::Idle => {
-            if let Some(index) = projection.history_index {
-                pixel_text(
-                    14.0,
-                    y,
-                    &format!("OI HISTORY // {}", index + 1),
-                    bright,
-                    right,
-                );
-                y += 10.0;
-                for line in projection.display_oi().iter().take(10) {
-                    pixel_text(14.0, y, line, dim, right);
-                    y += 8.0;
-                }
-            } else if projection.view.history {
-                let _ = draw_tree_information(
-                    "HISTORY",
-                    &projection.runtime_tree,
-                    y,
-                    bright,
-                    dim,
-                    right,
-                );
-            } else if let Some(line) = projection.display_oi().first() {
-                pixel_text(14.0, y, line, dim, right);
-            }
-        }
-        VisualMode::Success => {
-            pixel_text(14.0, y, "OUTCOME VERIFIED", (0.46, 0.91, 0.67), right);
-            if projection.view.history {
-                let _ = draw_tree_information(
-                    "HISTORY",
-                    &projection.runtime_tree,
-                    y + 12.0,
-                    bright,
-                    dim,
-                    right,
-                );
-            }
+        if node.label.len() <= 16 {
+            pixel_text(
+                node.x - 18.0,
+                node.y + radius + 6.0,
+                &node.label,
+                (node_color.0 * 0.8, node_color.1 * 0.8, node_color.2 * 0.8),
+                node.x + 40.0,
+            );
         }
     }
 }
 
-fn draw_tree_information(
-    title: &str,
-    tree: &[ProjectionTreeNode],
-    mut y: f32,
-    bright: (f32, f32, f32),
-    dim: (f32, f32, f32),
-    right: f32,
-) -> f32 {
-    if tree.is_empty() {
-        return y;
+fn runtime_entity_nodes(projection: &Projection) -> Vec<&ProjectionEntity> {
+    let source = if !projection.runtime_entities.is_empty() {
+        &projection.runtime_entities
+    } else {
+        &projection.entities
+    };
+    source
+        .iter()
+        .filter(|entity| !entity.id.is_empty())
+        .take(8)
+        .collect()
+}
+
+fn layout_runtime_graph<'a>(
+    entities: &'a [&'a ProjectionEntity],
+    stage: PixelRect,
+) -> Vec<(f32, f32, f32, &'a ProjectionEntity)> {
+    let count = entities.len();
+    if count == 0 {
+        return Vec::new();
     }
-    pixel_text(14.0, y, title, bright, right);
-    y += 10.0;
-    let mut lines = Vec::new();
-    append_pixel_tree(tree, 0, &mut lines);
-    let total = lines.len();
-    for line in lines.into_iter().take(8) {
-        pixel_text(14.0, y, &line, dim, right);
-        y += 8.0;
+    // Simple left-to-right pipeline layout with vertical spreading for branches.
+    let columns = (count as f32).sqrt().ceil().max(1.0) as usize;
+    let col_step = stage.width / (columns.max(2) as f32);
+    let row_count = count.div_ceil(columns.max(1));
+    let row_step = stage.height * 0.55 / (row_count.max(2) as f32);
+    entities
+        .iter()
+        .enumerate()
+        .map(|(index, entity)| {
+            let col = index % columns;
+            let row = index / columns;
+            let x = stage.x + col_step * 0.5 + col as f32 * col_step;
+            let y = stage.y + stage.height * 0.22 + row as f32 * row_step;
+            let radius = if entity.kind.eq_ignore_ascii_case("task") {
+                12.0
+            } else {
+                9.0
+            };
+            (x, y, radius, *entity)
+        })
+        .collect()
+}
+
+fn draw_runtime_graph(
+    layout: &[(f32, f32, f32, &ProjectionEntity)],
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    let dim = (color.0 * 0.45, color.1 * 0.45, color.2 * 0.45);
+    // Edges by parent_id.
+    let by_id: HashMap<&str, (f32, f32)> = layout
+        .iter()
+        .map(|(x, y, _, entity)| (entity.id.as_str(), (*x, *y)))
+        .collect();
+    for (x, y, _, entity) in layout.iter() {
+        if let Some(parent_id) = entity.parent_id.as_deref() {
+            if let Some((px, py)) = by_id.get(parent_id) {
+                draw_dotted_line(*px, *py, *x, *y, dim);
+            }
+        }
     }
-    if total > 8 {
-        pixel_text(
-            14.0,
-            y,
-            &format!("+{} MORE", total - 8),
-            (0.91, 0.62, 0.22),
-            right,
+    for (x, y, radius, entity) in layout.iter() {
+        let node_color = node_status_color(&entity.status, color);
+        draw_node(*x, *y, *radius, node_color);
+        let label = if entity.label.is_empty() {
+            entity_label(entity)
+        } else {
+            entity.label.clone()
+        };
+        if label.len() <= 16 {
+            pixel_text(
+                x - 20.0,
+                y + radius + 6.0,
+                &label,
+                (node_color.0 * 0.8, node_color.1 * 0.8, node_color.2 * 0.8),
+                x + 40.0,
+            );
+        }
+    }
+    // Activity packets travel along edges.
+    let edges: Vec<((f32, f32), (f32, f32))> = layout
+        .iter()
+        .filter_map(|(x, y, _, entity)| {
+            entity
+                .parent_id
+                .as_deref()
+                .and_then(|id| by_id.get(id))
+                .map(|parent| (*parent, (*x, *y)))
+        })
+        .collect();
+    draw_packets(&edges, phase, color, false);
+}
+
+// ---------------------------------------------------------------------------
+// Individual scenes
+// ---------------------------------------------------------------------------
+
+fn draw_idle_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    // Understated Athena identity glyph in the upper stage.
+    let cx = layout.stage.x + layout.stage.width * 0.5;
+    let cy = layout.stage.y + layout.stage.height * 0.35;
+    let pulse = 0.5 + 0.5 * (phase * std::f32::consts::TAU * 0.4).sin();
+    draw_node(
+        cx,
+        cy,
+        16.0,
+        (color.0 * pulse, color.1 * pulse, color.2 * pulse),
+    );
+    // Small status word.
+    let status = if projection.status.is_empty() {
+        "READY".to_string()
+    } else {
+        projection.status.to_ascii_uppercase()
+    };
+    pixel_text(
+        cx - bitmap_width(&status, 1.0) * 0.5,
+        cy + 26.0,
+        &status,
+        (color.0 * 0.7, color.1 * 0.7, color.2 * 0.7),
+        layout.stage.right(),
+    );
+}
+
+fn draw_workspace_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+    mode: VisualMode,
+) {
+    let tree = layout_tree(&projection.workspace_tree, layout.stage);
+    let active_id = projection
+        .code_view
+        .as_ref()
+        .map(|code| code.path.as_str())
+        .or_else(|| {
+            projection
+                .active_operation
+                .as_ref()
+                .and_then(|op| (!op.target.is_empty()).then_some(op.target.as_str()))
+        });
+    draw_tree_nodes(&tree, color, phase, active_id);
+    if mode == VisualMode::Search {
+        let right = layout.stage.right();
+        let span = (right - layout.stage.x - 24.0).max(12.0);
+        let sweep_x = layout.stage.x + 12.0 + phase.fract() * span;
+        draw_dotted_line(
+            sweep_x,
+            layout.stage.y,
+            sweep_x,
+            layout.stage.bottom(),
+            (color.0 * 0.84, color.1 * 0.84, color.2 * 0.84),
         );
-        y += 8.0;
     }
-    y
 }
 
-fn entity_label(entity: &ProjectionEntity) -> String {
-    if !entity.label.is_empty() {
-        return entity.label.clone();
+fn draw_read_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    // Stage shows the focused artifact with a scan ring.
+    let cx = layout.stage.x + layout.stage.width * 0.35;
+    let cy = layout.stage.y + layout.stage.height * 0.45;
+    draw_node(cx, cy, 20.0, color);
+    let scan_radius = 16.0 + ((phase * 0.8).fract() * 18.0);
+    draw_round_outline(
+        cx - scan_radius,
+        cy - scan_radius,
+        scan_radius * 2.0,
+        scan_radius * 2.0,
+        (color.0 * 0.55, color.1 * 0.55, color.2 * 0.55),
+    );
+    if let Some(code) = projection.code_view.as_ref() {
+        let name = code
+            .path
+            .rsplit_once('/')
+            .map_or(code.path.as_str(), |(_, name)| name);
+        pixel_text(
+            cx - 22.0,
+            cy + 28.0,
+            name,
+            color,
+            layout.stage.right() - 8.0,
+        );
     }
-    for key in ["canonical_path", "path", "uri", "resource"] {
-        if let Some(value) = entity.metadata.get(key).and_then(serde_json::Value::as_str) {
-            if !value.is_empty() {
-                return value.to_owned();
-            }
+    if let Some(readout) = layout.readout {
+        draw_live_readout(projection, VisualMode::Read, readout, color, phase);
+    }
+}
+
+fn draw_code_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    // Workspace topology above, active file highlighted.
+    let tree = layout_tree(&projection.workspace_tree, layout.stage);
+    let active_id = projection
+        .code_view
+        .as_ref()
+        .map(|code| code.path.as_str())
+        .or_else(|| {
+            projection
+                .active_operation
+                .as_ref()
+                .and_then(|op| (!op.target.is_empty()).then_some(op.target.as_str()))
+        });
+    draw_tree_nodes(&tree, color, phase, active_id);
+
+    // Focal artifact glow near the readout.
+    if let Some(readout) = layout.readout {
+        let cx = readout.x + readout.width * 0.88;
+        let cy = layout.stage.y + layout.stage.height * 0.72;
+        let pulse = 0.5 + 0.5 * (phase * std::f32::consts::TAU * 1.2).sin();
+        draw_rect(
+            cx - 3.0,
+            cy - 3.0,
+            6.0,
+            6.0,
+            (color.0 * pulse, color.1 * pulse, color.2 * pulse),
+        );
+    }
+
+    if let Some(readout) = layout.readout {
+        draw_live_readout(projection, VisualMode::Code, readout, color, phase);
+    }
+}
+
+fn draw_execute_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+    mode: VisualMode,
+) {
+    let entities = runtime_entity_nodes(projection);
+    let graph = layout_runtime_graph(&entities, layout.stage);
+    draw_runtime_graph(&graph, color, phase);
+    // Process pulse in the lower stage.
+    let cx = layout.stage.x + layout.stage.width * 0.5;
+    let cy = layout.stage.y + layout.stage.height * 0.82;
+    let pulse = 0.5 + 0.5 * (phase * std::f32::consts::TAU * 0.9).sin();
+    draw_node(
+        cx,
+        cy,
+        10.0,
+        (color.0 * pulse, color.1 * pulse, color.2 * pulse),
+    );
+    let label = if mode == VisualMode::Recover {
+        "RECOVER"
+    } else {
+        "EXECUTE"
+    };
+    pixel_text(
+        cx - bitmap_width(label, 1.0) * 0.5,
+        cy + 18.0,
+        label,
+        (color.0 * 0.7, color.1 * 0.7, color.2 * 0.7),
+        layout.stage.right(),
+    );
+    if let Some(readout) = layout.readout {
+        draw_live_readout(projection, mode, readout, color, phase);
+    }
+}
+
+fn draw_test_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    let checks = &projection.verification.checks;
+    let cx = layout.stage.x + layout.stage.width * 0.5;
+    let cy = layout.stage.y + layout.stage.height * 0.42;
+    if checks.is_empty() {
+        draw_node(cx, cy, 14.0, color);
+        pixel_text(
+            cx - 28.0,
+            cy + 22.0,
+            "AWAITING EVIDENCE",
+            color,
+            layout.stage.right() - 8.0,
+        );
+    } else {
+        let count = checks.len().min(5);
+        let radius = 48.0_f32.min(layout.stage.width * 0.22);
+        let start_angle = -std::f32::consts::FRAC_PI_2;
+        for (index, check) in checks.iter().take(count).enumerate() {
+            let angle = start_angle + index as f32 * (std::f32::consts::TAU / count.max(1) as f32);
+            let x = cx + angle.cos() * radius;
+            let y = cy + angle.sin() * radius;
+            let status = check_status(check);
+            let gate_color = if status == "failed" {
+                (0.88, 0.28, 0.32)
+            } else if status == "passed" || status == "complete" {
+                (0.46, 0.91, 0.67)
+            } else {
+                color
+            };
+            draw_node(x, y, 10.0, gate_color);
+            draw_dotted_line(
+                cx,
+                cy,
+                x,
+                y,
+                (color.0 * 0.45, color.1 * 0.45, color.2 * 0.45),
+            );
+            let glyph = if status == "passed" || status == "complete" {
+                "OK"
+            } else if status == "failed" {
+                "X"
+            } else {
+                ".."
+            };
+            pixel_text(x - 4.0, y + 3.0, glyph, gate_color, x + 12.0);
+        }
+        draw_node(cx, cy, 14.0, color);
+    }
+    if let Some(readout) = layout.readout {
+        draw_live_readout(projection, VisualMode::Test, readout, color, phase);
+    }
+}
+
+fn draw_approval_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    let amber = (0.91, 0.62, 0.22);
+    let cx = layout.stage.x + layout.stage.width * 0.5;
+    let cy = layout.stage.y + layout.stage.height * 0.45;
+    let pulse = (phase / 0.28).clamp(0.0, 1.0);
+    let width = 74.0 * pulse;
+    let height = 48.0 * pulse;
+    draw_round_outline(cx - width * 0.5, cy - height * 0.5, width, height, amber);
+    draw_rect(cx - 14.0, cy, 28.0, 2.0, amber);
+    draw_rect(cx, cy - 14.0, 2.0, 28.0, amber);
+    pixel_text(
+        cx - 40.0,
+        cy + 32.0,
+        "POLICY GATE",
+        amber,
+        layout.stage.right() - 8.0,
+    );
+    // Approval summary in readout area even though readout is not the primary
+    // surface; it keeps the required action legible.
+    if let Some(readout) = layout.readout {
+        draw_readout_frame(readout, color);
+        if let Some(item) = projection.attention_items.first() {
+            let x = readout.x + 6.0;
+            let mut y = readout.y + 9.0;
+            pixel_text(x, y, &item.title, amber, readout.right() - 6.0);
+            y += 9.0;
+            pixel_text(
+                x,
+                y,
+                &item.summary,
+                (color.0 * 0.75, color.1 * 0.82, color.2 * 0.85),
+                readout.right() - 6.0,
+            );
         }
     }
-    entity.id.clone()
 }
+
+fn draw_failure_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    let red = (0.88, 0.28, 0.32);
+    let cx = layout.stage.x + layout.stage.width * 0.35;
+    let cy = layout.stage.y + layout.stage.height * 0.45;
+    // Fracture marks around the focal failure.
+    let shift = 2.0 * (1.0 - (phase / 0.24).clamp(0.0, 1.0));
+    draw_rect(cx - 24.0 + shift, cy - 22.0, 2.0, 44.0, red);
+    draw_rect(cx - 24.0, cy, 48.0, 2.0, red);
+    draw_rect(cx + 8.0, cy - 18.0, 2.0, 18.0, red);
+    draw_rect(cx + 18.0, cy + 4.0, 2.0, 24.0, red);
+    draw_node(cx, cy, 16.0, red);
+    pixel_text(
+        cx - 20.0,
+        cy + 26.0,
+        "FAILURE",
+        red,
+        layout.stage.right() - 8.0,
+    );
+    if let Some(readout) = layout.readout {
+        draw_live_readout(projection, VisualMode::Failure, readout, color, phase);
+    }
+}
+
+fn draw_success_scene(layout: &SceneLayout, _color: (f32, f32, f32), phase: f32) {
+    let green = (0.46, 0.91, 0.67);
+    let cx = layout.stage.x + layout.stage.width * 0.5;
+    let cy = layout.stage.y + layout.stage.height * 0.45;
+    let pulse = 0.85 + 0.15 * (phase * std::f32::consts::TAU * 0.6).sin();
+    draw_node(
+        cx,
+        cy,
+        18.0,
+        (green.0 * pulse, green.1 * pulse, green.2 * pulse),
+    );
+    draw_line(cx - 12.0, cy + 2.0, cx - 2.0, cy + 12.0, green);
+    draw_line(cx - 2.0, cy + 12.0, cx + 14.0, cy - 8.0, green);
+    pixel_text(
+        cx - 34.0,
+        cy + 30.0,
+        "VERIFIED",
+        green,
+        layout.stage.right() - 8.0,
+    );
+}
+
+fn draw_think_scene(
+    projection: &Projection,
+    layout: &SceneLayout,
+    color: (f32, f32, f32),
+    phase: f32,
+) {
+    let cx = layout.stage.x + layout.stage.width * 0.5;
+    let cy = layout.stage.y + layout.stage.height * 0.42;
+    for index in 0..3 {
+        let radius = 18.0 + ((phase * 34.0 + index as f32 * 24.0) % 60.0);
+        draw_round_outline(
+            cx - radius,
+            cy - radius,
+            radius * 2.0,
+            radius * 2.0,
+            (color.0 * 0.34, color.1 * 0.34, color.2 * 0.34),
+        );
+    }
+    draw_node(cx, cy, 10.0, color);
+    let label = projection
+        .progress
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("label"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| "REASONING".to_owned());
+    pixel_text(
+        cx - bitmap_width(&label, 1.0) * 0.5,
+        cy + 24.0,
+        &label,
+        (color.0 * 0.7, color.1 * 0.7, color.2 * 0.7),
+        layout.stage.right() - 8.0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Attention rail and helpers (preserved behavior)
+// ---------------------------------------------------------------------------
 
 fn draw_attention_rail(projection: &Projection, safe_area: SceneSafeArea) {
     let Some(rail) = safe_area.attention_rail else {
@@ -1408,366 +1957,89 @@ pub(crate) fn attention_hit_map(projection: &Projection) -> AttentionHitMap {
     AttentionHitMap { hits }
 }
 
-fn append_pixel_tree(nodes: &[ProjectionTreeNode], depth: usize, lines: &mut Vec<String>) {
-    for node in nodes {
-        let label = if node.label.is_empty() {
-            if node.kind.is_empty() {
-                &node.id
-            } else {
-                &node.kind
-            }
-        } else {
-            &node.label
-        };
-        let badge = match node.status.to_ascii_lowercase().as_str() {
-            "passed" | "complete" | "ready" | "ok" => " [OK]",
-            "reading" => " [READ]",
-            "testing" => " [TEST]",
-            "running" => " [...]",
-            "failed" | "error" => " [FAIL]",
-            _ => "",
-        };
-        let prefix = if depth == 0 { "" } else { "├── " };
-        lines.push(format!(
-            "{}{}{}{}",
-            "  ".repeat(depth.saturating_sub(1)),
-            prefix,
-            label,
-            badge
-        ));
-        append_pixel_tree(&node.children, depth + 1, lines);
+// ---------------------------------------------------------------------------
+// Low-level primitives
+// ---------------------------------------------------------------------------
+
+fn draw_dotted_span(left: f32, y: f32, right: f32, color: (f32, f32, f32), dot: f32) {
+    let mut x = left;
+    let mut index = 0_u32;
+    while x < right {
+        if index % 2 == 0 {
+            draw_rect(x, y, dot.min(right - x), 1.0, color);
+        }
+        x += dot.max(1.0) * 2.0;
+        index += 1;
     }
+}
+
+fn draw_dotted_line(x1: f32, y1: f32, x2: f32, y2: f32, color: (f32, f32, f32)) {
+    let distance = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
+    let segments = (distance / 8.0).ceil().max(1.0) as usize;
+    for index in (0..segments).step_by(2) {
+        let t0 = index as f32 / segments as f32;
+        let t1 = ((index + 1).min(segments)) as f32 / segments as f32;
+        draw_rect(
+            x1 + (x2 - x1) * t0,
+            y1 + (y2 - y1) * t0,
+            ((x2 - x1) * (t1 - t0)).abs().max(1.0),
+            ((y2 - y1) * (t1 - t0)).abs().max(1.0),
+            color,
+        );
+    }
+}
+
+fn entity_label(entity: &ProjectionEntity) -> String {
+    if !entity.label.is_empty() {
+        return entity.label.clone();
+    }
+    for key in ["canonical_path", "path", "uri", "resource"] {
+        if let Some(value) = entity.metadata.get(key).and_then(serde_json::Value::as_str) {
+            if !value.is_empty() {
+                return value.to_owned();
+            }
+        }
+    }
+    entity.id.clone()
 }
 
 fn pixel_text(x: f32, y: f32, value: &str, color: (f32, f32, f32), right: f32) {
-    let start_x = x;
-    let mut x = x;
-    let mut y = y;
-    unsafe {
-        glColor3f(color.0, color.1, color.2);
-        glBegin(GL_QUADS);
-        for character in value.chars() {
-            if character == '\n' {
-                x = start_x;
-                y += 9.0;
-                continue;
-            }
-            let glyph = pixel_glyph(character);
-            if x + 5.0 > right {
-                break;
-            }
-            for (row, bits) in glyph.into_iter().enumerate() {
-                for column in 0..5 {
-                    if bits & (1 << (4 - column)) == 0 {
-                        continue;
-                    }
-                    let px = x + column as f32;
-                    let py = y + row as f32;
-                    glVertex2f(px, py);
-                    glVertex2f(px + 1.0, py);
-                    glVertex2f(px + 1.0, py + 1.0);
-                    glVertex2f(px, py + 1.0);
-                }
-            }
-            x += 6.0;
+    draw_bitmap_text(x, y, value, 1.0, color, right);
+}
+
+#[allow(dead_code)]
+fn pixel_text_scaled(x: f32, y: f32, value: &str, color: (f32, f32, f32), right: f32, scale: f32) {
+    draw_bitmap_text(x, y, value, scale.max(1.0), color, right);
+}
+
+type PacketEdge = ((f32, f32), (f32, f32));
+
+fn draw_packets(edges: &[PacketEdge], phase: f32, color: (f32, f32, f32), reverse: bool) {
+    for (index, ((start_x, start_y), (end_x, end_y))) in edges.iter().enumerate() {
+        let mut t = (phase * 0.42 + index as f32 * 0.17).fract();
+        if reverse {
+            t = 1.0 - t;
         }
-        glEnd();
+        let x = *start_x + (*end_x - *start_x) * t;
+        let y = *start_y + (*end_y - *start_y) * t;
+        draw_rect(x - 3.0, y - 3.0, 6.0, 6.0, color);
     }
-}
-
-fn pixel_glyph(character: char) -> [u8; 7] {
-    match character.to_ascii_uppercase() {
-        'A' => [
-            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'B' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
-        ],
-        'C' => [
-            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
-        ],
-        'D' => [
-            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
-        ],
-        'E' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
-        ],
-        'F' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'G' => [
-            0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111,
-        ],
-        'H' => [
-            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'I' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
-        ],
-        'J' => [
-            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
-        ],
-        'K' => [
-            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
-        ],
-        'L' => [
-            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
-        ],
-        'M' => [
-            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
-        ],
-        'N' => [
-            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
-        ],
-        'O' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'P' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'Q' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
-        ],
-        'R' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
-        ],
-        'S' => [
-            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        'T' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'U' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'V' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
-        ],
-        'W' => [
-            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
-        ],
-        'X' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
-        ],
-        'Y' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'Z' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
-        ],
-        '0' => [
-            0b01110, 0b10011, 0b10101, 0b10101, 0b10101, 0b11001, 0b01110,
-        ],
-        '1' => [
-            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        '2' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
-        ],
-        '3' => [
-            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        '4' => [
-            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
-        ],
-        '5' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
-        ],
-        '6' => [
-            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
-        ],
-        '7' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
-        ],
-        '8' => [
-            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
-        ],
-        '9' => [
-            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b11100,
-        ],
-        '+' => [0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0],
-        '=' => [0, 0, 0b11111, 0, 0b11111, 0, 0],
-        '<' => [0b00001, 0b00010, 0b00100, 0b01000, 0b00100, 0b00010, 0b00001],
-        '%' => [0b11001, 0b11010, 0b00100, 0b01000, 0b01011, 0b10011, 0],
-        '|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        '$' => [0b00100, 0b01111, 0b10100, 0b01110, 0b00101, 0b11110, 0b00100],
-        '#' => [0b01010, 0b01010, 0b11111, 0b01010, 0b11111, 0b01010, 0b01010],
-        '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
-        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
-        '-' => [0, 0, 0, 0b11111, 0, 0, 0],
-        '_' => [0, 0, 0, 0, 0, 0, 0b11111],
-        '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0, 0],
-        ':' => [0, 0b00100, 0, 0, 0b00100, 0, 0],
-        '.' => [0, 0, 0, 0, 0, 0b00110, 0b00110],
-        '[' => [
-            0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110,
-        ],
-        ']' => [
-            0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110,
-        ],
-        '!' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100],
-        '>' => [
-            0b10000, 0b01000, 0b00100, 0b00010, 0b00100, 0b01000, 0b10000,
-        ],
-        _ => [0; 7],
-    }
-}
-
-fn draw_semantic_world(
-    projection: &Projection,
-    mode: VisualMode,
-    color: (f32, f32, f32),
-    phase: f32,
-    focus: f32,
-    right: f32,
-) {
-    let entities = semantic_entities(projection);
-    let hidden_entities = semantic_entity_count(projection).saturating_sub(entities.len());
-    let positions: Vec<(String, f32, f32)> = entities
-        .iter()
-        .enumerate()
-        .map(|(index, entity)| {
-            let column = index % 2;
-            let row = index / 2;
-            (
-                entity.id.clone(),
-                if column == 0 {
-                    72.0
-                } else {
-                    (right - 48.0).max(150.0)
-                },
-                74.0 + row as f32 * 42.0,
-            )
-        })
-        .collect();
-    let position_by_id: HashMap<&str, (f32, f32)> = positions
-        .iter()
-        .map(|(id, x, y)| (id.as_str(), (*x, *y)))
-        .collect();
-    let edges: Vec<((f32, f32), (f32, f32))> = entities
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entity)| {
-            let parent_id = entity.parent_id.as_deref()?;
-            let parent = position_by_id.get(parent_id)?;
-            let child = positions.get(index)?;
-            Some((*parent, (child.1, child.2)))
-        })
-        .collect();
-    let active_color = (
-        color.0 * (0.62 + focus * 0.24),
-        color.1 * (0.62 + focus * 0.24),
-        color.2 * (0.62 + focus * 0.24),
-    );
-    for (index, entity) in entities.iter().enumerate() {
-        let (_, px, py) = &positions[index];
-        let node_color = if entity.status.eq_ignore_ascii_case("failed")
-            || entity.status.eq_ignore_ascii_case("failure")
-        {
-            (0.88, 0.28, 0.32)
-        } else if entity.status.eq_ignore_ascii_case("approval") {
-            (0.91, 0.62, 0.22)
-        } else {
-            active_color
-        };
-        let radius = if entity.kind.eq_ignore_ascii_case("task") {
-            15.0
-        } else if entity.parent_id.is_some() {
-            11.0
-        } else {
-            13.0
-        };
-        draw_node(*px, *py, radius, node_color);
-        let label = if entity.label.is_empty() {
-            entity_label(entity)
-        } else {
-            entity.label.clone()
-        };
-        pixel_text(
-            (*px - 30.0).max(12.0),
-            *py + radius + 10.0,
-            &label,
-            (
-                node_color.0 * 0.78,
-                node_color.1 * 0.78,
-                node_color.2 * 0.78,
-            ),
-            (right - 8.0).max(40.0),
-        );
-    }
-    for ((start_x, start_y), (end_x, end_y)) in &edges {
-        draw_line(
-            *start_x,
-            *start_y,
-            *end_x,
-            *end_y,
-            (color.0 * 0.46, color.1 * 0.46, color.2 * 0.46),
-        );
-    }
-    if hidden_entities > 0 {
-        pixel_text(
-            12.0,
-            (SCENE_HEIGHT - 14.0).max(12.0),
-            &format!("+{hidden_entities} MORE ENTITIES"),
-            (0.91, 0.62, 0.22),
-            (right - 8.0).max(40.0),
-        );
-    }
-    match mode {
-        VisualMode::Think => draw_pulses((right * 0.5).max(28.0), 90.0, phase, color),
-        VisualMode::Search => draw_scanner(phase, color, right),
-        VisualMode::Read => draw_artifact(projection, color, phase, right),
-        VisualMode::Code => draw_code_columns(projection, color, phase, right),
-        VisualMode::Execute | VisualMode::Generate => draw_packets(&edges, phase, color, false),
-        VisualMode::Recover => draw_packets(&edges, phase, color, true),
-        VisualMode::Test => draw_test_gates(projection, &positions, phase, color, right),
-        VisualMode::Verify => draw_verify_gate(projection, &positions, color, right),
-        VisualMode::Approval => draw_approval_object(color, phase, right),
-        VisualMode::Failure => draw_failure_fracture(color, phase, right),
-        VisualMode::Success => draw_success_seal(color, right),
-        VisualMode::Respond | VisualMode::Inspect | VisualMode::Idle => {}
-    }
-}
-
-fn semantic_entities(projection: &Projection) -> Vec<&ProjectionEntity> {
-    let source = if !projection.runtime_entities.is_empty() {
-        &projection.runtime_entities
-    } else if !projection.entities.is_empty() {
-        &projection.entities
-    } else {
-        return Vec::new();
-    };
-    source
-        .iter()
-        .filter(|entity| !entity.id.is_empty())
-        .take(8)
-        .collect()
-}
-
-fn semantic_entity_count(projection: &Projection) -> usize {
-    let source = if !projection.runtime_entities.is_empty() {
-        &projection.runtime_entities
-    } else {
-        &projection.entities
-    };
-    source.iter().filter(|entity| !entity.id.is_empty()).count()
 }
 
 fn buddy_target(projection: &Projection, mode: VisualMode, right: f32) -> (f32, f32) {
     // Buddy stands on the perspective grid near the right half of the scene,
     // mirroring the AthenaBOX / DAGOAL reference composition.
+    let stage_x = (right * if right < 300.0 { 0.54 } else { 0.62 }).clamp(132.0, right - 52.0);
     let preferred = match mode {
-        VisualMode::Failure => ((right - 58.0).max(150.0), 188.0),
-        VisualMode::Approval => ((right - 58.0).max(150.0), 194.0),
-        VisualMode::Success => ((right - 58.0).max(150.0), 194.0),
-        VisualMode::Code => ((right - 52.0).max(180.0), 180.0),
-        VisualMode::Test | VisualMode::Verify | VisualMode::Execute => {
-            ((right - 52.0).max(180.0), 184.0)
-        }
-        VisualMode::Search | VisualMode::Inspect => ((right - 96.0).max(150.0), 184.0),
-        VisualMode::Read => ((right - 120.0).max(150.0), 182.0),
+        VisualMode::Failure => (stage_x, 190.0),
+        VisualMode::Approval => (stage_x, 194.0),
+        VisualMode::Success => (stage_x, 194.0),
+        VisualMode::Code => (stage_x, 186.0),
+        VisualMode::Test | VisualMode::Verify | VisualMode::Execute => (stage_x, 190.0),
+        VisualMode::Search | VisualMode::Inspect => (stage_x, 190.0),
+        VisualMode::Read => (stage_x, 190.0),
         VisualMode::Think | VisualMode::Respond | VisualMode::Generate | VisualMode::Recover => {
-            ((right - 80.0).max(150.0), 184.0)
+            (stage_x, 190.0)
         }
         VisualMode::Idle => match projection
             .buddy
@@ -1777,17 +2049,10 @@ fn buddy_target(projection: &Projection, mode: VisualMode, right: f32) -> (f32, 
         {
             Some("left") => (132.0, 184.0),
             Some("center") => (228.0, 184.0),
-            _ => ((right - 96.0).max(150.0), 184.0),
+            _ => (stage_x, 190.0),
         },
     };
-    if semantic_entities(projection).is_empty() {
-        return preferred;
-    }
 
-    // Buddy is an actor, not an opaque projection card. Prefer the authored
-    // pose anchor, then move through open scene lanes if the enlarged sprite
-    // would cover a projected node. The fallback anchors deliberately keep
-    // the graph's two columns readable while retaining a visible actor.
     let candidates = [
         preferred,
         (196.0, 222.0),
@@ -1802,294 +2067,47 @@ fn buddy_target(projection: &Projection, mode: VisualMode, right: f32) -> (f32, 
 }
 
 fn buddy_anchor_is_clear(candidate: (f32, f32), projection: &Projection, right: f32) -> bool {
-    let half_width = SPRITE_DIRTY_WIDTH / 2.0 + 4.0;
-    let half_height = SPRITE_DIRTY_HEIGHT / 2.0 + 4.0;
-    semantic_entities(projection)
-        .iter()
-        .enumerate()
-        .all(|(index, entity)| {
-            let node_x = if index % 2 == 0 {
-                72.0
-            } else {
-                (right - 48.0).max(150.0)
-            };
-            let node_y = 74.0 + (index / 2) as f32 * 42.0;
-            let node_radius = if entity.kind.eq_ignore_ascii_case("task") {
-                20.0
-            } else if entity.parent_id.is_some() {
-                16.0
-            } else {
-                18.0
-            };
-            (candidate.0 - node_x).abs() >= half_width + node_radius
-                || (candidate.1 - node_y).abs() >= half_height + node_radius
-        })
-}
-
-fn draw_pulses(x: f32, y: f32, phase: f32, color: (f32, f32, f32)) {
-    for index in 0..3 {
-        let radius = 24.0 + ((phase * 34.0 + index as f32 * 24.0) % 74.0);
-        draw_round_outline(
-            x - radius,
-            y - radius,
-            radius * 2.0,
-            radius * 2.0,
-            (color.0 * 0.34, color.1 * 0.34, color.2 * 0.34),
-        );
-    }
-}
-
-fn draw_scanner(phase: f32, color: (f32, f32, f32), right: f32) {
-    let right = right.clamp(46.0, SCENE_WIDTH - 8.0);
-    let span = (right - 56.0).max(12.0);
-    let sweep_x = 28.0 + phase.fract() * span;
-    draw_rect(
-        sweep_x,
-        28.0,
-        2.0,
-        174.0,
-        (color.0 * 0.84, color.1 * 0.84, color.2 * 0.84),
-    );
-    draw_rect(
-        sweep_x - 16.0,
-        28.0,
-        32.0,
-        174.0,
-        (color.0 * 0.08, color.1 * 0.10, color.1 * 0.12),
-    );
-}
-
-fn draw_artifact(projection: &Projection, color: (f32, f32, f32), phase: f32, right: f32) {
-    let x = 78.0 + (phase * 8.0).sin() * 2.0;
-    let width = (right - x - 18.0).clamp(80.0, 176.0);
-    draw_round_outline(x, 46.0, width, 92.0, color);
-    if let Some(code) = projection.code_view.as_ref() {
-        let lines = if !code.lines.is_empty() {
-            code.lines.clone()
+    // Target selection uses the visible authored matrix. The exact sprite
+    // envelope is the actor silhouette; no external pose marks are drawn.
+    let half_width = SPRITE_WIDTH * SPRITE_SCALE / 2.0 + 8.0;
+    let half_height = SPRITE_HEIGHT * SPRITE_SCALE / 2.0 + 8.0;
+    let entities = runtime_entity_nodes(projection);
+    entities.iter().enumerate().all(|(index, entity)| {
+        let node_x = if index % 2 == 0 {
+            72.0
         } else {
-            code.text.lines().map(str::to_owned).collect()
+            (right - 48.0).max(150.0)
         };
-        for (index, line) in lines.iter().take(5).enumerate() {
-            pixel_text(
-                x + 10.0,
-                60.0 + index as f32 * 13.0,
-                line,
-                color,
-                x + width - 8.0,
-            );
-        }
-    } else {
-        pixel_text(
-            x + 10.0,
-            72.0,
-            "ARTIFACT // NO PREVIEW",
-            color,
-            x + width - 8.0,
-        );
-    }
-    draw_line(
-        x + width,
-        92.0,
-        (x + width + 46.0).min(right - 8.0),
-        92.0,
-        (color.0 * 0.72, color.1 * 0.72, color.2 * 0.72),
-    );
-}
-
-fn draw_code_columns(projection: &Projection, color: (f32, f32, f32), _phase: f32, right: f32) {
-    if let Some(code) = projection.code_view.as_ref() {
-        let x = 28.0;
-        let width = (right - 42.0).max(100.0);
-        draw_round_outline(x, 46.0, width, 112.0, color);
-        let lines = if !code.diff.is_empty() {
-            code.diff.clone()
-        } else if !code.lines.is_empty() {
-            code.lines.clone()
+        let node_y = 154.0 + (index / 2) as f32 * 38.0;
+        let node_radius = if entity.kind.eq_ignore_ascii_case("task") {
+            20.0
+        } else if entity.parent_id.is_some() {
+            16.0
         } else {
-            code.text.lines().map(str::to_owned).collect()
+            18.0
         };
-        for (index, line) in lines.iter().take(8).enumerate() {
-            let line_color = if line.starts_with('+') {
-                (0.46, 0.91, 0.67)
-            } else if line.starts_with('-') {
-                (0.88, 0.28, 0.32)
-            } else {
-                (color.0 * 0.78, color.1 * 0.78, color.2 * 0.78)
-            };
-            pixel_text(
-                x + 9.0,
-                58.0 + index as f32 * 11.0,
-                line,
-                line_color,
-                x + width - 8.0,
-            );
-        }
-        if lines.is_empty() {
-            pixel_text(
-                x + 9.0,
-                70.0,
-                "CODE // NO PREVIEW DATA",
-                color,
-                x + width - 8.0,
-            );
-        } else if code.preview_truncated || lines.len() > 8 {
-            let hidden = lines.len().saturating_sub(8);
-            let summary = if hidden > 0 {
-                format!("+{hidden} MORE LINES")
-            } else {
-                "MORE LINES // PREVIEW TRUNCATED".to_owned()
-            };
-            pixel_text(
-                x + 9.0,
-                150.0,
-                &summary,
-                (0.91, 0.62, 0.22),
-                x + width - 8.0,
-            );
-        }
-        draw_line(
-            x + width + 5.0,
-            102.0,
-            (x + width + 25.0).min(right - 4.0),
-            102.0,
-            color,
-        );
-        return;
-    }
-    pixel_text(
-        28.0,
-        70.0,
-        "CODE // WAITING FOR PROJECTION",
-        color,
-        (right - 8.0).max(40.0),
-    );
+        (candidate.0 - node_x).abs() >= half_width + node_radius
+            || (candidate.1 - node_y).abs() >= half_height + node_radius
+    })
 }
 
-fn draw_packets(
-    edges: &[((f32, f32), (f32, f32))],
-    phase: f32,
-    color: (f32, f32, f32),
-    reverse: bool,
-) {
-    for (index, ((start_x, start_y), (end_x, end_y))) in edges.iter().enumerate() {
-        let mut t = (phase * 0.42 + index as f32 * 0.17).fract();
-        if reverse {
-            t = 1.0 - t;
-        }
-        let x = *start_x + (*end_x - *start_x) * t;
-        let y = *start_y + (*end_y - *start_y) * t;
-        draw_rect(x - 3.0, y - 3.0, 6.0, 6.0, color);
-    }
-}
+// ---------------------------------------------------------------------------
+// Mode helpers and tests
+// ---------------------------------------------------------------------------
 
-fn draw_test_gates(
-    projection: &Projection,
-    _positions: &[(String, f32, f32)],
-    _phase: f32,
-    color: (f32, f32, f32),
-    right: f32,
-) {
-    let checks = &projection.verification.checks;
-    if checks.is_empty() {
-        pixel_text(
-            18.0,
-            150.0,
-            "TEST // AWAITING EVIDENCE",
-            color,
-            (right - 8.0).max(40.0),
-        );
-        return;
-    }
-    let count = checks.len().min(5);
-    let start = 34.0;
-    let spacing = ((right - start - 28.0) / count.max(1) as f32).max(24.0);
-    let mut previous = None;
-    for (index, check) in checks.iter().take(count).enumerate() {
-        let x = start + index as f32 * spacing;
-        let y = 150.0;
-        let status = check_status(check);
-        let gate_color = if status == "failed" {
-            (0.88, 0.28, 0.32)
-        } else if status == "passed" || status == "complete" {
-            (0.46, 0.91, 0.67)
-        } else {
-            color
-        };
-        if let Some((previous_x, previous_y)) = previous {
-            draw_line(
-                previous_x,
-                previous_y,
-                x,
-                y,
-                (
-                    gate_color.0 * 0.48,
-                    gate_color.1 * 0.48,
-                    gate_color.2 * 0.48,
-                ),
-            );
-        }
-        draw_round_outline(x - 14.0, y - 14.0, 28.0, 28.0, gate_color);
-        pixel_text(
-            x - 9.0,
-            y + 3.0,
-            if status == "passed" || status == "complete" {
-                "OK"
-            } else if status == "failed" {
-                "X"
-            } else {
-                ".."
-            },
-            gate_color,
-            (x + 12.0).min(right),
-        );
-        previous = Some((x, y));
-    }
-}
-
-fn draw_verify_gate(
-    projection: &Projection,
-    _positions: &[(String, f32, f32)],
-    color: (f32, f32, f32),
-    right: f32,
-) {
-    if !projection.verification.checks.is_empty() {
-        let target = (right - 54.0).max(160.0);
-        let target_y = 172.0;
-        for (index, check) in projection.verification.checks.iter().take(5).enumerate() {
-            let x = 36.0 + index as f32 * ((target - 60.0) / 4.0).max(26.0);
-            let y = 92.0 + (index % 3) as f32 * 30.0;
-            let status = check_status(check);
-            let check_color = if status == "failed" {
-                (0.88, 0.28, 0.32)
-            } else if status == "passed" || status == "complete" {
-                (0.46, 0.91, 0.67)
-            } else {
-                color
-            };
-            draw_node(x, y, 8.0, check_color);
-            draw_line(
-                x,
-                y,
-                target,
-                target_y,
-                (
-                    check_color.0 * 0.44,
-                    check_color.1 * 0.44,
-                    check_color.2 * 0.44,
-                ),
-            );
-        }
-        draw_round_outline(target - 22.0, target_y - 22.0, 44.0, 44.0, color);
-        draw_rect(target - 9.0, target_y, 18.0, 2.0, color);
-        draw_rect(target, target_y - 9.0, 2.0, 18.0, color);
-    } else {
-        pixel_text(
-            18.0,
-            150.0,
-            "VERIFY // AWAITING EVIDENCE",
-            color,
-            (right - 8.0).max(40.0),
-        );
+impl VisualMode {
+    fn shows_readout(self) -> bool {
+        matches!(
+            self,
+            VisualMode::Read
+                | VisualMode::Code
+                | VisualMode::Execute
+                | VisualMode::Generate
+                | VisualMode::Recover
+                | VisualMode::Test
+                | VisualMode::Verify
+                | VisualMode::Failure
+        )
     }
 }
 
@@ -2107,34 +2125,6 @@ fn check_status(check: &serde_json::Value) -> &str {
             _ => "running",
         })
         .unwrap_or("running")
-}
-
-fn draw_approval_object(color: (f32, f32, f32), phase: f32, right: f32) {
-    let amber = (0.91, 0.62, 0.22);
-    let pulse = (phase / 0.28).clamp(0.0, 1.0);
-    let width = 66.0 * pulse;
-    let x = (right - width - 12.0).max(120.0);
-    draw_round_outline(x, 166.0 + 20.0 * (1.0 - pulse), width, 40.0 * pulse, amber);
-    draw_rect(x + 16.0, 184.0, 34.0, 2.0, color);
-}
-
-fn draw_failure_fracture(_color: (f32, f32, f32), phase: f32, right: f32) {
-    let red = (0.88, 0.28, 0.32);
-    let shift = 2.0 * (1.0 - (phase / 0.24).clamp(0.0, 1.0));
-    let x = (right - 48.0).max(120.0);
-    draw_rect(x + shift, 150.0, 2.0, 44.0, red);
-    draw_rect(x, 170.0, 48.0, 2.0, red);
-    draw_rect(x + 18.0, 138.0, 2.0, 18.0, red);
-    draw_rect(x + 32.0, 172.0, 2.0, 24.0, red);
-}
-
-fn draw_success_seal(color: (f32, f32, f32), right: f32) {
-    let green = (0.46, 0.91, 0.67);
-    let x = (right - 58.0 - 12.0).max(120.0);
-    draw_round_outline(x, 148.0, 58.0, 44.0, green);
-    draw_line(x + 12.0, 170.0, x + 22.0, 180.0, green);
-    draw_line(x + 22.0, 180.0, x + 46.0, 158.0, green);
-    draw_rect(x + 8.0, 194.0, 42.0, 2.0, color);
 }
 
 #[cfg(test)]
@@ -2336,6 +2326,22 @@ fn semantic_scene_snapshot(projection: &Projection) -> SemanticSceneSnapshot {
 }
 
 #[cfg(test)]
+fn semantic_entities(projection: &Projection) -> Vec<&ProjectionEntity> {
+    let source = if !projection.runtime_entities.is_empty() {
+        &projection.runtime_entities
+    } else if !projection.entities.is_empty() {
+        &projection.entities
+    } else {
+        return Vec::new();
+    };
+    source
+        .iter()
+        .filter(|entity| !entity.id.is_empty())
+        .take(8)
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         AttentionAction, BuddyMotion, OiTarget, SCENE_HEIGHT, SCENE_WIDTH, SemanticSceneSnapshot,
@@ -2343,11 +2349,11 @@ mod tests {
         scene_safe_area, semantic_scene_snapshot,
     };
     use crate::buddy::SPRITE_DIRTY_WIDTH;
-    use crate::{AnimationState, Projection, ProjectionAttention, ProjectionEntity};
     use crate::{
-        ProjectionAction, ProjectionBuddy, ProjectionCodeView, ProjectionDiagnostic,
-        ProjectionOperation, ProjectionVerification,
+        AnimationState, ProjectionAction, ProjectionBuddy, ProjectionCodeView,
+        ProjectionDiagnostic, ProjectionOperation, ProjectionVerification,
     };
+    use crate::{Projection, ProjectionAttention, ProjectionEntity};
     use athena_terminal::PixelRect;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -2666,6 +2672,10 @@ mod tests {
                     .clamp(half_width, (safe_right - half_width).max(half_width)),
                 destination.1,
             );
+            let rendered_destination = (
+                rendered_destination.0.round(),
+                rendered_destination.1.round(),
+            );
             let old_safe_right = scene_safe_area(from.attention_items.len()).unobscured_right;
             let safe_area_changed = (old_safe_right - safe_right).abs() > 0.001;
             let motion_start = if safe_area_changed {
@@ -2721,7 +2731,7 @@ mod tests {
             read_mode,
             scene_safe_area(read.attention_items.len()).unobscured_right,
         );
-        assert_eq!(actual, expected);
+        assert_eq!(actual, (expected.0.round(), expected.1.round()));
     }
 
     #[test]

@@ -1,11 +1,5 @@
-mod bot;
-mod cat;
-mod owl;
 mod poses;
 
-pub(crate) use bot::SPRITE_ROWS as BOT_SPRITE_ROWS;
-pub(crate) use cat::SPRITE_ROWS as CAT_SPRITE_ROWS;
-pub(crate) use owl::SPRITE_ROWS as OWL_SPRITE_ROWS;
 pub(crate) use poses::{BuddyPose, REQUIRED_POSES, pose_for_state};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -15,18 +9,20 @@ pub(crate) enum BuddyKind {
     Bot,
 }
 
-pub(crate) const SPRITE_FRAME_COUNT: usize = 2;
-pub(crate) const SPRITE_WIDTH: f32 = 14.0;
-pub(crate) const SPRITE_HEIGHT: f32 = 11.0;
-// A larger phosphor dot scale makes Buddy legible against the dense
-// perspective grid and matches the high-quality DAGOAL reference silhouette.
-pub(crate) const SPRITE_SCALE: f32 = 6.8;
+/// Buddy is authored as a phosphor matrix, not as enlarged terminal glyphs.
+/// The 32×40 masks are deliberately kept in source so every frame is stable,
+/// reviewable, and available without a texture-loading dependency.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpriteFrame {
+    pub(crate) rows: &'static [u32; SPRITE_HEIGHT as usize],
+}
 
-// Covers the enlarged body plus every pose marker/effect. All built-in
-// sprites use this same compositor footprint, so a mascot choice cannot
-// change scene collision, clamping, or dirty-region behavior.
-pub(crate) const SPRITE_DIRTY_WIDTH: f32 = 122.0;
-pub(crate) const SPRITE_DIRTY_HEIGHT: f32 = 102.0;
+pub(crate) const SPRITE_FRAME_COUNT: usize = 4;
+pub(crate) const SPRITE_WIDTH: f32 = 32.0;
+pub(crate) const SPRITE_HEIGHT: f32 = 40.0;
+pub(crate) const SPRITE_SCALE: f32 = 2.0;
+pub(crate) const SPRITE_DIRTY_WIDTH: f32 = SPRITE_WIDTH * SPRITE_SCALE;
+pub(crate) const SPRITE_DIRTY_HEIGHT: f32 = SPRITE_HEIGHT * SPRITE_SCALE;
 
 impl BuddyKind {
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -56,67 +52,218 @@ impl BuddyKind {
     }
 }
 
-pub(crate) fn sprite_rows(kind: BuddyKind) -> [&'static str; 11] {
-    match kind {
-        BuddyKind::Owl => OWL_SPRITE_ROWS,
-        BuddyKind::Cat => CAT_SPRITE_ROWS,
-        BuddyKind::Bot => BOT_SPRITE_ROWS,
-    }
+const FRAME_A: [u32; 40] = [
+    0x0000_0000,
+    0x0020_0400,
+    0x0070_0e00,
+    0x03ff_ffc0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x0780_01e0,
+    0x0780_01e0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x03ff_ffc0,
+    0x03ff_ffc0,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x0dff_ffb0,
+    0x0dff_ffb0,
+    0x01ff_ff80,
+    0x0181_8180,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x0181_8180,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x00ff_ff00,
+    0x00ff_ff00,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x0181_8180,
+    0x0181_8180,
+    0x0181_8180,
+    0x0181_8180,
+    0x0100_0080,
+    0x0100_0080,
+    0x0000_0000,
+];
+
+const FRAME_B: [u32; 40] = [
+    0x0000_0000,
+    0x0020_0400,
+    0x0070_0e00,
+    0x03ff_ffc0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x0780_01e0,
+    0x0780_01e0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x03ff_ffc0,
+    0x03ff_ffc0,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x0fff_fff0,
+    0x0fff_fff0,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x00ff_ff00,
+    0x00ff_ff00,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x0181_8180,
+    0x0181_8180,
+    0x0181_8180,
+    0x0181_8180,
+    0x0100_0080,
+    0x0100_0080,
+    0x0000_0000,
+];
+
+const FRAME_C: [u32; 40] = [
+    0x0000_0000,
+    0x0020_0400,
+    0x0070_0e00,
+    0x03ff_ffc0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x0780_01e0,
+    0x0780_01e0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x03ff_ffc0,
+    0x03ff_ffc0,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x0181_8180,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x00ff_ff00,
+    0x00ff_ff00,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x0181_8180,
+    0x0181_8180,
+    0x0181_8180,
+    0x0181_8180,
+    0x0100_0080,
+    0x0100_0080,
+    0x0000_0000,
+];
+
+const FRAME_D: [u32; 40] = [
+    0x0000_0000,
+    0x0000_0000,
+    0x0070_0e00,
+    0x03ff_ffc0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x0780_01e0,
+    0x0780_01e0,
+    0x07ff_ffe0,
+    0x07ff_ffe0,
+    0x03ff_ffc0,
+    0x03ff_ffc0,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x01ff_ff80,
+    0x00ff_ff00,
+    0x00ff_ff00,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x00c3_c300,
+    0x0181_8180,
+    0x0181_8180,
+    0x0181_8180,
+    0x0181_8180,
+    0x0100_0080,
+    0x0100_0080,
+    0x0000_0000,
+];
+
+const FRAMES: [SpriteFrame; SPRITE_FRAME_COUNT] = [
+    SpriteFrame { rows: &FRAME_A },
+    SpriteFrame { rows: &FRAME_B },
+    SpriteFrame { rows: &FRAME_C },
+    SpriteFrame { rows: &FRAME_D },
+];
+
+pub(crate) fn sprite_frame(_kind: BuddyKind, _pose: BuddyPose, frame: usize) -> SpriteFrame {
+    FRAMES[frame % SPRITE_FRAME_COUNT]
 }
 
-/// Return an authored low-resolution pose frame. The base silhouettes stay
-/// character-specific, while pose rows change the eyes, arms, and stance so
-/// the two frame sets communicate state without requiring a texture atlas.
-pub(crate) fn sprite_frame(kind: BuddyKind, pose: BuddyPose, frame: usize) -> Vec<Vec<char>> {
-    let mut rows: Vec<Vec<char>> = sprite_rows(kind)
-        .into_iter()
-        .map(|row| row.chars().collect())
-        .collect();
-    let frame = frame % SPRITE_FRAME_COUNT;
-    let set = |rows: &mut [Vec<char>], row: usize, column: usize, value: char| {
-        if let Some(cell) = rows.get_mut(row).and_then(|line| line.get_mut(column)) {
-            *cell = value;
-        }
+#[cfg(test)]
+mod tests {
+    use super::{
+        BuddyKind, REQUIRED_POSES, SPRITE_FRAME_COUNT, SPRITE_HEIGHT, SPRITE_WIDTH, sprite_frame,
     };
-    match pose {
-        BuddyPose::Idle => {
-            set(&mut rows, 2, 5, if frame == 0 { 'o' } else { '-' });
-            set(&mut rows, 2, 8, if frame == 0 { 'o' } else { '-' });
-        }
-        BuddyPose::Listening | BuddyPose::Inspecting => {
-            set(&mut rows, 6, 3, if frame == 0 { '/' } else { '\\' });
-            set(&mut rows, 6, 10, if frame == 0 { '\\' } else { '/' });
-        }
-        BuddyPose::Thinking => {
-            set(&mut rows, 3, 6, if frame == 0 { '^' } else { '-' });
-            set(&mut rows, 4, 5, if frame == 0 { '-' } else { '^' });
-        }
-        BuddyPose::Searching | BuddyPose::Reading => {
-            set(&mut rows, 7, 2, if frame == 0 { '/' } else { '-' });
-            set(&mut rows, 7, 11, if frame == 0 { '\\' } else { '-' });
-        }
-        BuddyPose::Coding | BuddyPose::Executing => {
-            set(&mut rows, 8, 4, if frame == 0 { '#' } else { '/' });
-            set(&mut rows, 8, 9, if frame == 0 { '#' } else { '\\' });
-        }
-        BuddyPose::Testing | BuddyPose::Verifying => {
-            set(&mut rows, 3, 5, if frame == 0 { 'o' } else { '^' });
-            set(&mut rows, 3, 8, if frame == 0 { 'o' } else { '^' });
-        }
-        BuddyPose::Approval | BuddyPose::Success => {
-            set(&mut rows, 4, 6, if frame == 0 { '^' } else { 'o' });
-            set(&mut rows, 4, 7, if frame == 0 { '^' } else { 'o' });
-        }
-        BuddyPose::Failure => {
-            set(&mut rows, 2, 5, 'x');
-            set(&mut rows, 2, 8, 'x');
-            set(&mut rows, 7, 3, if frame == 0 { '/' } else { '\\' });
-            set(&mut rows, 7, 10, if frame == 0 { '\\' } else { '/' });
-        }
-        BuddyPose::Recovering => {
-            set(&mut rows, 6, 3, if frame == 0 { '<' } else { '/' });
-            set(&mut rows, 6, 10, if frame == 0 { '>' } else { '\\' });
+
+    #[test]
+    fn built_in_buddies_have_authored_matrix_coverage() {
+        for kind in [BuddyKind::Owl, BuddyKind::Cat, BuddyKind::Bot] {
+            for pose in REQUIRED_POSES {
+                assert_eq!(kind.pose_frame_count(pose), SPRITE_FRAME_COUNT);
+                assert_eq!(kind.sprite_bounds(), (SPRITE_WIDTH, SPRITE_HEIGHT));
+                assert_eq!(kind.dirty_region(pose), (64.0, 80.0));
+            }
         }
     }
-    rows
+
+    #[test]
+    fn authored_frames_are_not_ascii_or_static() {
+        assert_ne!(
+            sprite_frame(BuddyKind::Owl, REQUIRED_POSES[0], 0).rows,
+            sprite_frame(BuddyKind::Owl, REQUIRED_POSES[0], 1).rows
+        );
+        const { assert!(SPRITE_WIDTH >= 28.0 && SPRITE_HEIGHT >= 32.0) };
+    }
+
+    #[test]
+    fn unknown_buddies_do_not_use_a_generic_sprite_fallback() {
+        assert!(BuddyKind::parse("dragon").is_none());
+        assert!(BuddyKind::parse("off").is_none());
+    }
 }

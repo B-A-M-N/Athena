@@ -1,7 +1,9 @@
 import pytest
 
+from athena.protocol.messages import Message, Provenance, Role, SourceType, TextBlock, utcnow
 from athena.protocol.tasks import TaskStatus
 from athena.state.database import Database
+from athena.state.messages import MessageStore
 from athena.state.sessions import SessionRepository
 from athena.state.tasks import TaskStore
 
@@ -58,3 +60,44 @@ async def test_task_transition_illegal_rejected(repo, db):
         await store.transition("task_2", TaskStatus.RUNNING)
     row = await store.get("task_2")
     assert row["status"] == TaskStatus.COMPLETE.value
+
+
+async def test_recent_messages_returns_newest_tail_in_chronological_order(repo):
+    for index in range(150):
+        await repo.append_message(
+            Message(
+                id=f"message-{index:03d}",
+                role=Role.USER,
+                blocks=(TextBlock(text=str(index)),),
+                created_at=utcnow(),
+                provenance=Provenance(source_type=SourceType.USER),
+            )
+        )
+
+    recent = await repo.list_recent_messages("sess_1", limit=100)
+
+    assert [message.id for message in recent] == [
+        f"message-{index:03d}" for index in range(50, 150)
+    ]
+
+
+async def test_canonical_user_turn_is_idempotent_by_stable_message_identity(db):
+    sessions = SessionRepository(db)
+    await sessions.create("sess-canonical")
+    messages = MessageStore(db)
+    message = Message(
+        id="msg_user_task-canonical",
+        role=Role.USER,
+        blocks=(TextBlock(text="do the task"),),
+        created_at=utcnow(),
+        provenance=Provenance(source_type=SourceType.USER),
+        metadata={
+            "session_id": "sess-canonical",
+            "task_id": "task-canonical",
+            "canonical_user_turn": True,
+        },
+    )
+
+    assert await messages.append_user_turn("sess-canonical", message) is True
+    assert await messages.append_user_turn("sess-canonical", message) is False
+    assert await messages.count_session_messages("sess-canonical") == 1

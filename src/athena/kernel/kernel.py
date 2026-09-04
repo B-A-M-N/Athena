@@ -60,6 +60,7 @@ from athena.protocol.messages import (
     Provenance,
     Role,
     SourceType,
+    TextBlock,
     TrustClass,
     utcnow,
 )
@@ -83,7 +84,12 @@ from athena.state.tasks import TaskStore
 from athena.tasks.budgets import BudgetStateUnavailable
 from athena.kernel.dispatch import DispatchResult, SuspendedCall
 from athena.kernel.lifecycle import TaskLifecycle
-from athena.kernel.termination import TerminationDecision, TerminationEvaluator
+from athena.kernel.termination import (
+    TerminationDecision,
+    TerminationEvaluator,
+    WorkEvidence,
+    result_qualifies_as_work_evidence,
+)
 from athena.interpreter.context import InterpreterContext  # noqa: F401 (annotation)
 from athena.interpreter.protocol import InterpreterProposal  # noqa: F401 (annotation)
 
@@ -189,6 +195,7 @@ class RunState:
     budget_wall_time_remaining_s: float | None = None
     budget_wall_time_checkpoint_s: float = 0.0
     tool_correction_counts: dict[str, int] = field(default_factory=dict)
+    work_evidence: list[WorkEvidence] = field(default_factory=list)
 
     @property
     def elapsed_ms(self) -> int:
@@ -208,7 +215,9 @@ def _assistant_message(task: TaskSpec, response: ModelResponse) -> Message:
     breaks provider replay (BHV provider-history invariant).
     """
     blocks = tuple(response.blocks or ())
-    metadata: dict[str, Any] = {"session_id": task.session_id} if task.session_id else {}
+    metadata: dict[str, Any] = {"task_id": task.id}
+    if task.session_id:
+        metadata["session_id"] = task.session_id
     try:
         from athena.models.compat.caching import InferenceReceipt
 
@@ -247,7 +256,10 @@ def _results_message(task: TaskSpec, blocks) -> Message:
         blocks=tuple(blocks),
         created_at=utcnow(),
         provenance=Provenance(source_type=SourceType.CAPABILITY),
-        metadata={"session_id": task.session_id} if task.session_id else {},
+        metadata={
+            "task_id": task.id,
+            **({"session_id": task.session_id} if task.session_id else {}),
+        },
     )
 
 
@@ -349,6 +361,7 @@ class AgentKernel:
         provider_usage_store=None,
         continuation_store=None,
         workflow_run_store=None,
+        input_request_store=None,
         router: "ModelRouter",
         interpreter=None,
         reality_coordinator: Any = None,
@@ -375,6 +388,10 @@ class AgentKernel:
         self._provider_usage_store = provider_usage_store
         self._continuation_store = continuation_store
         self._workflow_run_store = workflow_run_store
+        # Operator-clarification continuation: a model-issued request_input
+        # call parks the SAME task in WAITING_INPUT with the question durable;
+        # the operator's answer resumes the identical task.
+        self._input_request_store = input_request_store
         # Reality completion authority: intercepts terminal decisions to bind
         # acceptance evidence to an active candidate branch and promote only
         # proven reality.
@@ -394,6 +411,7 @@ class AgentKernel:
             self._lifecycle.set_cancellation_manager(cancellations)
 
         self._runs: dict[str, RunState] = {}
+        self._input_answers: dict[str, str] = {}
         # Durable terminal state is written by the lifecycle before the
         # kernel's final budget checkpoint runs.  Keep a process-local barrier
         # so callers that need a stable snapshot (forks, reviews) can wait for
@@ -498,6 +516,173 @@ class AgentKernel:
         self._resume_decision[task_id] = decision
         self._resume.setdefault(task_id, asyncio.Event()).set()
 
+    async def notify_input_provided(self, task_id: str, answer: str) -> None:
+        """Resume a WAITING_INPUT task with the operator's answer.
+
+        The same Task continues: the answer is appended to the session so the
+        next compile sees it as a user turn directed at the parked question.
+        """
+        self._input_answers[task_id] = answer
+        self._resume.setdefault(task_id, asyncio.Event()).set()
+
+    @staticmethod
+    def _replay_policy_context(task) -> dict:
+        """Canonical extraction of the authority context approval replay needs.
+
+        Replay paths must restore the SAME authority the original dispatch ran
+        under: model policy, capability policy, task budget, deadline. One
+        helper keeps that contract in one place instead of ad-hoc attribute
+        reads scattered across ``_approval_path``, ``_resume_durable_continuation``
+        and ``_resume_workflow_parent``. Fields absent from a partial test
+        double default to permissive-None, which the dispatcher treats as
+        unset — never as a widened grant.
+        """
+        return {
+            "task_policy": getattr(task, "capability_policy", None),
+            "model_policy": getattr(task, "model_policy", None),
+            "task_budget": getattr(task, "resource_budget", None),
+            "task_deadline": getattr(task, "deadline", None),
+        }
+
+    async def _input_request_path(self, task, state, response, input_calls):
+        """Park the task in WAITING_INPUT and return a resumable outcome.
+
+        Persisted: task id, question, choices, expected-input metadata, and the
+        continuation identity. When no input store is configured the kernel
+        still answers the call truthfully (failed result) instead of parking.
+        """
+        call = input_calls[0]
+        args = dict(call.arguments or {})
+        question = str(args.get("question") or "").strip()
+        if not question:
+            await self._append_results(
+                task,
+                [
+                    CapabilityResultBlock(
+                        call_id=call.call_id,
+                        capability_id="request_input",
+                        ok=False,
+                        error="request_input requires a non-empty question",
+                    )
+                ],
+                calls=[call],
+            )
+            return None
+        if self._input_request_store is None:
+            await self._append_results(
+                task,
+                [
+                    CapabilityResultBlock(
+                        call_id=call.call_id,
+                        capability_id="request_input",
+                        ok=False,
+                        error="operator input is unavailable in this deployment",
+                    )
+                ],
+                calls=[call],
+            )
+            return None
+
+        request_id = await self._input_request_store.record(
+            task_id=task.id,
+            session_id=task.session_id,
+            question=question,
+            choices=tuple(str(c) for c in (args.get("choices") or ())),
+            context=dict(args.get("context") or {}),
+            expected=str(args.get("expected") or "text"),
+        )
+        extra_calls = [c for c in input_calls if c is not call]
+        if extra_calls:
+            await self._append_results(
+                task,
+                [
+                    CapabilityResultBlock(
+                        call_id=c.call_id,
+                        capability_id=c.capability_id,
+                        ok=False,
+                        error="superseded by request_input for this turn",
+                    )
+                    for c in extra_calls
+                ],
+                calls=extra_calls,
+            )
+        await self._append_results(
+            task,
+            [
+                CapabilityResultBlock(
+                    call_id=call.call_id,
+                    capability_id="request_input",
+                    ok=True,
+                    output=f"waiting for operator input: {request_id}",
+                    metadata={"operation": "request_input", "request_id": request_id},
+                )
+            ],
+            calls=[call],
+        )
+
+        await self._transition(task, TaskStatus.WAITING_INPUT)
+        await self._emit(
+            "InputRequested",
+            {
+                "request_id": request_id,
+                "question": question,
+                "choices": [str(c) for c in (args.get("choices") or ())],
+            },
+            task,
+        )
+
+        ev = self._resume.setdefault(task.id, asyncio.Event())
+        ev.clear()
+        resume_task = asyncio.create_task(ev.wait())
+        cancel_task = asyncio.create_task(state.cancel.wait())
+        try:
+            await asyncio.wait({resume_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (resume_task, cancel_task):
+                if not pending.done():
+                    pending.cancel()
+        if not resume_task.done() or state.cancel.is_set():
+            await self._input_request_store.resolve(request_id, "")
+            return await self._finalize(
+                task, state, TaskStatus.CANCELLED, "task cancelled while awaiting input"
+            )
+
+        answer = str(self._input_answers.pop(task.id, ""))
+        await self._input_request_store.resolve(request_id, answer)
+        if task.session_id:
+            try:
+                await self._messages.append_to_session(
+                    task.session_id,
+                    Message(
+                        id=f"msg_input_{request_id}",
+                        role=Role.USER,
+                        blocks=(TextBlock(text=answer),),
+                        created_at=utcnow(),
+                        provenance=Provenance(source_type=SourceType.USER),
+                        metadata={
+                            "task_id": task.id,
+                            "input_request_id": request_id,
+                            "canonical_user_turn": False,
+                        },
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — continuation must survive persist issues
+                _logger.warning(
+                    "input answer persistence failed for %s", request_id, exc_info=True
+                )
+        try:
+            await self._transition(task, TaskStatus.RUNNING)
+        except Exception:
+            return await self._finalize_decision(
+                task,
+                state,
+                TerminationDecision(True, "input wait could not resume", TaskStatus.BLOCKED),
+            )
+        await self._emit("InputReceived", {"request_id": request_id}, task)
+        # The loop continues: the next compile includes the answer, and the
+        # model owns deciding what the answer means for the objective.
+        return None
+
     # ------------------------------------------------------------------ #
     # The loop — THE one reasoning loop (INV-001)
     # ------------------------------------------------------------------ #
@@ -547,6 +732,12 @@ class AgentKernel:
                 continue
 
             compiled = await self._compile(task)
+            # Rebuild the observable-work bit from durable results when a
+            # process restarted or an approval continuation resumed. The
+            # in-memory RunState is intentionally disposable.
+            for evidence in _compiled_work_evidence(compiled, task.id):
+                if evidence.call_id not in {item.call_id for item in state.work_evidence}:
+                    state.work_evidence.append(evidence)
             selection = await self._select_model(task, compiled)
 
             try:
@@ -584,6 +775,8 @@ class AgentKernel:
                 max_iterations=budget.max_agent_iterations,
                 budget_exhausted=_budget_exhausted(state, budget),
                 cancelled=state.cancel.is_set(),
+                completion_mode=compiled.strategy.completion_mode,
+                work_evidence=tuple(state.work_evidence),
             )
             if decision.terminal:
                 await self._append_final_response(task, response)
@@ -595,10 +788,21 @@ class AgentKernel:
     # Steps
     # ------------------------------------------------------------------ #
     async def _compile(self, task: TaskSpec) -> CompiledContext:
-        recent = []
+        recent: list[Message] = []
         if task.session_id:
             try:
-                recent = await self._messages.list_session_messages(task.session_id)
+                loader = getattr(self._messages, "list_causal_messages", None)
+                if loader is not None:
+                    recent = await loader(task.session_id, task.id)
+                else:
+                    loader = getattr(self._messages, "list_task_messages", None)
+                    if loader is not None:
+                        recent = await loader(task.session_id, task.id)
+                    else:
+                        loader = getattr(self._messages, "list_recent_session_messages", None)
+                        if loader is None:
+                            loader = self._messages.list_session_messages
+                        recent = await loader(task.session_id)
             except Exception as exc:
                 _logger.warning(
                     "context compilation fallback: could not load session messages for %s: %s",
@@ -641,7 +845,12 @@ class AgentKernel:
 
         requirements = ModelRequirements(
             required_capabilities=frozenset(caps),
-            minimum_context_tokens=getattr(compiled.requirements, "min_context_window", None),
+            # The compiler's requirement field is ``minimum_context_tokens``
+            # (P0 fix: the old name silently dropped the constraint and let
+            # an undersized-context model survive routing).
+            minimum_context_tokens=getattr(
+                compiled.requirements, "minimum_context_tokens", None
+            ),
             max_output_tokens=getattr(compiled.requirements, "reserved_output", None),
         )
         return await self._router.select(
@@ -1697,6 +1906,19 @@ class AgentKernel:
     # Capability dispatch path (INV-004)
     # ------------------------------------------------------------------ #
     async def _dispatch(self, task, state, response, calls):
+        # A model-issued clarification request is kernel-owned, not a capability
+        # execution: intercept it before the dispatcher so the task can park in
+        # WAITING_INPUT even when the turn compiled no other tools.
+        input_calls = [c for c in calls if c.capability_id == "request_input"]
+        if input_calls:
+            return await self._input_request_path(task, state, response, input_calls)
+        # Natural-language framing is never a semantic authorization boundary:
+        # the kernel refuses a call because policy forbids it, the task
+        # disabled tools, the capability is unavailable, the request is
+        # malformed, or authority is absent — never because the objective's
+        # surface grammar looked conversational. A turn compiled with zero
+        # capability definitions should not normally produce a valid call; if
+        # one arrives anyway, the dispatcher's policy path owns the refusal.
         if self._dispatch_factory is None:
             not_executed = [
                 CapabilityResultBlock(
@@ -1707,7 +1929,7 @@ class AgentKernel:
                 )
                 for c in calls
             ]
-            await self._append_results(task, not_executed)
+            await self._append_results(task, not_executed, calls=calls)
             return None
 
         shim = self._dispatch_factory(task)
@@ -1728,7 +1950,7 @@ class AgentKernel:
         if outcome.suspended:
             return await self._approval_path(task, state, outcome)
 
-        await self._append_results(task, outcome.results)
+        await self._append_results(task, outcome.results, calls=calls)
         # Loop-side observation producer (audit P0.2 completion): a FAILED
         # capability result is an execution-grounded observation. Offer at
         # most ONE per dispatch (cost-amplification bound: a turn with N
@@ -1865,9 +2087,7 @@ class AgentKernel:
                 requests,
                 workspace=shim._workspace,
                 profile=shim._profile,
-                task_policy=task.capability_policy,
-                task_budget=getattr(task, "resource_budget", None),
-                task_deadline=getattr(task, "deadline", None),
+                **AgentKernel._replay_policy_context(task),
                 runtime_remaining_s=AgentKernel._remaining_runtime_seconds(task, state),
                 _directives_by_call_id={
                     suspended_call.call_id: suspended_call.directives
@@ -2015,8 +2235,7 @@ class AgentKernel:
                 parent_request,
                 workspace=workspace,
                 profile=profile,
-                task_policy=task.capability_policy,
-                task_budget=task.resource_budget,
+                **AgentKernel._replay_policy_context(task),
             )
         except Exception as exc:  # the outer result must remain truthful
             return CapabilityResultBlock(
@@ -2148,11 +2367,13 @@ class AgentKernel:
                         else None
                     ),
                 )
+            replay_context = AgentKernel._replay_policy_context(task)
             result = await shim._dispatcher.dispatch(
                 request,
                 workspace=shim._workspace,
                 profile=shim._profile,
-                task_policy=task.capability_policy,
+                task_policy=replay_context["task_policy"],
+                model_policy=replay_context["model_policy"],
                 _directives=directives,
             )
             if isinstance(result, SuspendedCall):
@@ -2369,7 +2590,13 @@ class AgentKernel:
     async def _append_response(self, task: TaskSpec, response: ModelResponse) -> None:
         if response.request_id and response.request_id in self._stored_responses:
             return
-        await self._messages.append(_assistant_message(task, response))
+        message = _assistant_message(task, response)
+        await self._messages.append(message)
+        await self._emit(
+            "TaskMessage",
+            {"message_id": message.id, "role": message.role.value, "text": message.conversation_text()},
+            task,
+        )
         if response.request_id:
             self._stored_responses.add(response.request_id)
 
@@ -2387,12 +2614,37 @@ class AgentKernel:
         if not any((getattr(b, "text", "") or "") for b in message.blocks):
             return
         await self._messages.append(message)
+        await self._emit(
+            "TaskMessage",
+            {"message_id": message.id, "role": message.role.value, "text": message.conversation_text()},
+            task,
+        )
         self._stored_responses.add(response.request_id)
 
-    async def _append_results(self, task: TaskSpec, blocks) -> None:
+    async def _append_results(self, task: TaskSpec, blocks, *, calls=()) -> None:
         if not blocks:
             return
-        await self._messages.append(_results_message(task, blocks))
+        state = self._runs.get(task.id)
+        if state is not None:
+            calls_by_id = {getattr(call, "call_id", ""): call for call in calls}
+            for block in blocks:
+                if not isinstance(block, CapabilityResultBlock):
+                    continue
+                evidence = result_qualifies_as_work_evidence(
+                    block,
+                    call=calls_by_id.get(block.call_id),
+                )
+                if evidence is not None and evidence.call_id not in {
+                    item.call_id for item in state.work_evidence
+                }:
+                    state.work_evidence.append(evidence)
+        message = _results_message(task, blocks)
+        await self._messages.append(message)
+        await self._emit(
+            "TaskMessage",
+            {"message_id": message.id, "role": message.role.value, "text": message.conversation_text()},
+            task,
+        )
 
     async def _maybe_await(self, value) -> None:
         if inspect.isawaitable(value):
@@ -2420,6 +2672,27 @@ def _input_tokens_of(
     return estimate if estimate is not None else _display_input_estimate(request)
 
 
+def _compiled_work_evidence(compiled: CompiledContext, task_id: str) -> list[WorkEvidence]:
+    evidence: list[WorkEvidence] = []
+    for message in compiled.messages:
+        metadata = getattr(message, "metadata", {}) or {}
+        recorded_task = metadata.get("task_id")
+        if recorded_task is not None and str(recorded_task) != str(task_id):
+            continue
+        for block in getattr(message, "blocks", ()):
+            if not isinstance(block, CapabilityResultBlock):
+                continue
+            item = result_qualifies_as_work_evidence(block)
+            if item is not None and item.call_id not in {entry.call_id for entry in evidence}:
+                evidence.append(item)
+    return evidence
+
+
+# Compatibility for integrations that imported the old private helper.
+def _compiled_has_observed_work(compiled: CompiledContext, task_id: str) -> bool:
+    return bool(_compiled_work_evidence(compiled, task_id))
+
+
 def _estimate_input_tokens(
     request: ModelRequest,
     *,
@@ -2434,7 +2707,15 @@ def _display_input_estimate(request: ModelRequest) -> int:
     text = (
         (request.system or "")
         + "\n"
-        + "\n".join(message.text() or "" for message in request.messages)
+        + "\n".join(
+            (
+                message.conversation_text()
+                if callable(getattr(message, "conversation_text", None))
+                else message.text()
+            )
+            or ""
+            for message in request.messages
+        )
     )
     return max(1, (len(text) + 3) // 4)
 

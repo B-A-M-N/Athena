@@ -58,7 +58,7 @@ raise SystemExit(f"presentation sync timeout: sequence >= {minimum}, {width}x{he
 PY
     }
     sync_path="${CAPTURE_PATH%/*}/presentation.json"
-    ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --cabinet-only --no-animations --command "tail -f /dev/null" >/dev/null 2>&1 &
+    ATHENA_PRESENTATION_CLOCK=fixed ATHENA_NATIVE_PRESENTATION_SYNC="$sync_path" "$NATIVE_BIN" --cabinet-only --no-animations --command "tail -f /dev/null" >/dev/null 2>&1 &
     native_pid=$!
     window="$(timeout 10s xdotool search --sync --name "ATHENA" 2>/dev/null | head -1 || true)"
     [[ -n "$window" ]] || {
@@ -68,6 +68,7 @@ PY
       exit 1
     }
     xdotool windowfocus --sync "$window"
+    xdotool windowsize --sync "$window" 1280 800
     wait_for_presentation "$sync_path" 1 1280 800
     sequence="$(SYNC_PATH="$sync_path" python3 - <<'PY'
 import json

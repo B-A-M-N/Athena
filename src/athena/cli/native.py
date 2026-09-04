@@ -14,6 +14,7 @@ import ctypes.util
 import importlib.util
 import os
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -25,6 +26,15 @@ from typing import Any
 NATIVE_REQUIREMENTS_MESSAGE = (
     "Athena native frontend requires Linux x86_64 GNU/glibc >= 2.34, X11, Xft and OpenGL."
 )
+_CREDENTIAL_ENV_NAMES = frozenset(
+    {
+        "FREEINFERENCE_API_KEY",
+        "FREEINFERENCE_API_BASE_URL",
+        "FREEINFERENCE_API_ENDPOINT",
+        "FREEINFERENCE_MODEL",
+    }
+)
+_ENV_ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
 
 class NativePreflight:
@@ -137,6 +147,45 @@ def worker_command(options: Any) -> list[str]:
     return command
 
 
+def _load_credential_env(env: dict[str, str]) -> None:
+    """Load supported provider values from the user's private env file.
+
+    This is deliberately a small assignment parser rather than ``source``:
+    launching Athena must not execute arbitrary shell code from a credential
+    file. Existing process values win, and only the provider settings needed
+    by the native worker are considered.
+    """
+    candidates: list[Path] = []
+    configured = env.get("ATHENA_CREDENTIAL_ENV_FILE")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    config_home = Path(env.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+    candidates.append(config_home / "opencodex" / "opencodex.env")
+    seen: set[Path] = set()
+    for path in candidates:
+        path = path.resolve(strict=False)
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            match = _ENV_ASSIGNMENT.match(line.strip())
+            if match is None or match.group(1) not in _CREDENTIAL_ENV_NAMES:
+                continue
+            name, raw_value = match.groups()
+            try:
+                parsed = shlex.split(raw_value, comments=True)
+            except ValueError:
+                continue
+            value = parsed[0] if parsed else ""
+            if value and name not in env:
+                env[name] = value
+        return
+
+
 def launch(options: Any) -> int:
     """Run the native terminal until its window or child session exits."""
     binary = native_binary()
@@ -171,6 +220,7 @@ def launch(options: Any) -> int:
         if getattr(options, "reduced_motion", False):
             argv.append("--reduced-motion")
         env = os.environ.copy()
+        _load_credential_env(env)
         repository_src = str(Path(__file__).resolve().parents[2])
         env["PYTHONPATH"] = repository_src + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""

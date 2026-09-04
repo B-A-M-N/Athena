@@ -128,6 +128,12 @@ class CapabilityUnavailable(CapabilityError):
     code = "capability_unavailable"
 
 
+class CapabilityReadinessError(CapabilityError):
+    """The requested task has no policy-permitted ready capability surface."""
+
+    code = "capability_readiness_error"
+
+
 class CapabilityValidationError(CapabilityError):
     code = "capability_validation_error"
 
@@ -196,6 +202,7 @@ __all__ = [
     "Cancelled",
     "CapabilityError",
     "CapabilityUnavailable",
+    "CapabilityReadinessError",
     "CapabilityValidationError",
     "PolicyDenied",
     "ApprovalExpired",

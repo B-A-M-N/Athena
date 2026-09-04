@@ -20,6 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 from athena.protocol.tasks import (
     AutonomyLevel,
     CapabilityPolicy,
+    ModelPolicy,
     ResourceBudget,
     WorkspaceSpec,
 )
@@ -57,6 +58,13 @@ class CapabilityRequestOrigin(str, enum.Enum):
     USER_DIRECT = "user_direct"
     TRUSTED_ORCHESTRATION = "trusted_orchestration"
     SYSTEM = "system"
+    # The acceptance verifier executing an operator-declared criterion in a
+    # bounded verification environment. Distinct from SYSTEM (pure host
+    # observation of task state) because it CAN execute — but only within
+    # the verifier's restricted envelope: read-mostly, workspace-bound,
+    # no secrets, no privilege, no external publication. Never
+    # model-reachable, never a general ceiling bypass.
+    SYSTEM_VERIFICATION = "system_verification"
     MCP = "mcp"
     GENERATED = "generated"
     REMOTE = "remote"
@@ -424,9 +432,11 @@ class InvocationContext:
 
     workspace: WorkspaceSpec
     task_id: str | None = None
+    principal_id: str | None = None
     credentials: Mapping[str, Any] = field(default_factory=dict)
     execution_backend: str = "local"
     capability_policy: CapabilityPolicy | None = None
+    model_policy: ModelPolicy | None = None
     resource_budget: ResourceBudget | None = None
     deadline: datetime | None = None
     runtime_remaining_s: float | None = None

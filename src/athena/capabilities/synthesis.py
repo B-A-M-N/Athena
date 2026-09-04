@@ -105,6 +105,7 @@ class SynthesisCapability:
             "governed native tools with athena.call(capability_id, arguments); "
             "those calls remain policy- and RealityGate-checked."
         ),
+        tags=frozenset({"synthesis", "create", "generate", "repair", "construct"}),
         input_schema={
             "type": "object",
             "required": ["operation"],

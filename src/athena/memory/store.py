@@ -381,6 +381,71 @@ class MemoryStore:
             self._generation += 1
         return changed
 
+    async def list_pending_candidates(self, limit: int = 100) -> list[MemoryRecord]:
+        """List agent-derived memory candidates awaiting deliberate review."""
+        rows = await self._db.fetch_all(
+            "SELECT * FROM memories WHERE json_extract(metadata, '$.pending_promotion') = 1 "
+            "ORDER BY created_at ASC LIMIT ?",
+            (max(1, int(limit)),),
+        )
+        return [_row_to_record(row) for row in rows]
+
+    async def promote_pending_candidate(
+        self,
+        id: str,
+        *,
+        scope: MemoryScope,
+        scope_id: str | None = None,
+    ) -> MemoryRecord | None:
+        """Promote one pending candidate after an operator decision."""
+        record = await self.get(id)
+        if record is None or (record.metadata or {}).get("pending_promotion") is not True:
+            return None
+        metadata = {
+            **dict(record.metadata),
+            "pending_promotion": False,
+            "promotion": "promoted",
+            **({"scope_id": scope_id} if scope_id else {}),
+        }
+        await self._db.execute(
+            "UPDATE memories SET scope = ?, metadata = ?, updated_at = ? WHERE id = ?",
+            (scope.value, json.dumps(metadata, default=str), utcnow().isoformat(), id),
+        )
+        self._generation += 1
+        return _replace(record, scope=scope, metadata=metadata)
+
+    async def discard_pending_candidate(self, id: str) -> bool:
+        record = await self.get(id)
+        if record is None or (record.metadata or {}).get("pending_promotion") is not True:
+            return False
+        return await self.delete(id)
+
+    async def expire_pending_candidates(self, before: datetime) -> int:
+        cursor = await self._db.execute(
+            "DELETE FROM memories WHERE json_extract(metadata, '$.pending_promotion') = 1 "
+            "AND created_at < ?",
+            (before.isoformat(),),
+        )
+        changed = int(cursor.rowcount or 0)
+        if changed:
+            self._generation += 1
+        return changed
+
+    async def compact_pending_candidates(self, limit: int = 512) -> int:
+        """Retain only the newest bounded set of pending candidates."""
+        keep = max(1, int(limit))
+        rows = await self._db.fetch_all(
+            "SELECT id FROM memories "
+            "WHERE json_extract(metadata, '$.pending_promotion') = 1 "
+            "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?",
+            (keep,),
+        )
+        removed = 0
+        for row in rows:
+            if await self.discard_pending_candidate(str(row["id"])):
+                removed += 1
+        return removed
+
     async def list_by_scope(self, scope: MemoryScope, scope_id: str | None) -> list[MemoryRecord]:
         conditions = ["scope = ?"]
         params: list[Any] = [scope.value]
@@ -484,6 +549,10 @@ class MemoryStore:
     ) -> tuple[str, list[Any]]:
         conds: list[str] = []
         params: list[Any] = []
+        # Pending agent-derived candidates are review material, not ordinary
+        # context. Explicit USER_CONTENT records use pending_promotion=false
+        # and remain immediately retrievable.
+        conds.append("COALESCE(json_extract(m.metadata, '$.pending_promotion'), 0) != 1")
         if scope is not None:
             conds.append("m.scope = ?")
             params.append(scope.value)
@@ -562,7 +631,11 @@ class MemoryStore:
             if tag:
                 tag_parts.append("json_extract(m.metadata, '$._athena:tags') LIKE ?")
                 params.append(f'%"{tag}"%')
-        where = ["memories_fts MATCH ?", "(" + " OR ".join(groups) + ")"]
+        where = [
+            "memories_fts MATCH ?",
+            "COALESCE(json_extract(m.metadata, '$.pending_promotion'), 0) != 1",
+            "(" + " OR ".join(groups) + ")",
+        ]
         where.extend(tag_parts)
         params.append(limit)
         return await self._fetch_records(

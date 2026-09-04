@@ -1,8 +1,8 @@
 # Athena
 
 A compact, local-first autonomous agent runtime with durable knowledge,
-structured delegation, universal execution, a programmable computer body, and
-a **single authoritative reasoning loop**.
+structured delegation, universal execution, a programmable execution
+environment, and a **single authoritative reasoning loop**.
 
 Athena brings capability discovery, evidence, execution, policy, and learning
 into one durable kernel. The normative contracts live in `SPEC.md`,
@@ -305,7 +305,7 @@ agent while remaining one durable intelligence internally:
                  policy, approvals, budgets, scopes
                               │
                               ▼
-                    Programmable computer body
+                 Programmable execution environment
        execute │ runtimes │ PTY │ files │ processes │ network │ devices
                               │
                               ▼
@@ -670,10 +670,13 @@ always wins over role defaults.
 
 ### Post-task knowledge pipeline
 
-Every completed or partial task feeds Athena's durable knowledge: an episodic
-record of the task outcome is saved immediately, conservative lesson
-candidates are stored as `pending_promotion` (never auto-trusted), and skill
-drafts are validated and recorded for explicit promotion later (BHV-099/102/107).
+Eligible completed or partially completed tasks feed Athena's durable
+knowledge: an episodic record of the task outcome is saved immediately,
+conservative lesson candidates are stored as `pending_promotion` (never
+auto-trusted), and skill drafts are validated and recorded for explicit
+promotion later (BHV-099/102/107). Extraction is deliberately conservative —
+trivial conversational turns and tasks without explicit facts or grounded
+procedure evidence produce no durable lessons.
 
 ### Acceptance criteria
 

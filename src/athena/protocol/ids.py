@@ -1,7 +1,8 @@
 """Opaque identifier generation.
 
-Identifiers are opaque to consumers; production uses monotonic time-sortable
-IDs. Consumers MUST NOT depend on identifier internals.
+Identifiers are opaque to consumers; production uses time-sortable IDs with a
+random suffix. They are not a causal append sequence, so durable stores must
+use their own insertion/sequence ordering when order matters.
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ _PREFIXES = {
 
 
 def _make_sortable_id() -> str:
-    # Monotonic time-sortable: 12 hex digits of ms timestamp + random suffix.
+    # Time-sortable: 12 hex digits of ms timestamp + random suffix. The random
+    # suffix is intentionally not used as a causal tie-breaker.
     ms = int(time.time() * 1000)
     return f"{ms:012x}{random.getrandbits(48):012x}"
 

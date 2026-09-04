@@ -142,7 +142,7 @@ class FakeModelProvider:
                     )
 
         output_tokens = len(text) if text else 0
-        input_tokens = sum(len(msg.text() or "") for msg in request.messages)
+        input_tokens = sum(len(msg.conversation_text() or "") for msg in request.messages)
         response_cost = respond.get("cost_usd", self._response_cost_usd)
         usage = UsageInfo(
             input_tokens=input_tokens,
@@ -175,7 +175,7 @@ class FakeModelProvider:
         capability_result_texts: list[str] = []
         capability_result_ok: bool | None = None
         for msg in request.messages:
-            t = msg.text() or ""
+            t = msg.conversation_text() or ""
             if t:
                 user_text = user_text + "\n" + t
                 role = getattr(msg.role, "value", msg.role)

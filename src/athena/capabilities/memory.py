@@ -83,6 +83,7 @@ class MemoryCapability:
             "Long-term memory: recall relevant memories by query, or persist a "
             "new memory entry. Delegates to the memory store."
         ),
+        tags=frozenset({"memory", "remember", "preference", "recall"}),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         origin=CapabilityOrigin.NATIVE,

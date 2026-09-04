@@ -52,7 +52,12 @@ from athena.protocol.policy import (
     PolicyVerdict,
     Principal,
 )
-from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
+from athena.protocol.tasks import (
+    CapabilityPolicy,
+    ResourceBudget,
+    WorkspaceSpec,
+    capability_id_permitted,
+)
 from athena.state.approvals import ApprovalStore
 from athena.state.mutations import MutationStore
 
@@ -252,6 +257,7 @@ class CapabilityDispatcher:
         workspace: WorkspaceSpec,
         profile: str | None = None,
         task_policy: CapabilityPolicy | None = None,
+        model_policy: Any = None,
         task_budget: ResourceBudget | None = None,
         task_deadline: datetime | None = None,
         runtime_remaining_s: float | None = None,
@@ -490,8 +496,48 @@ class CapabilityDispatcher:
         decision = self.policy.evaluate(policy_request, autonomy=profile)
         global_verdict = _verdict(decision.decision)
 
-        task_verdict = self._eval_task_policy(
-            request.capability_id, task_policy, request_effects=frozenset(effects)
+        # The task capability policy is a ceiling on the task's work surface.
+        # SYSTEM-origin calls are the host auditing the task's own declared
+        # state (acceptance-criteria verification, internal memory recall):
+        # never model-controlled, never dispatched from natural language. A
+        # task that denies every capability must still be verifiable against
+        # the criteria it declared, so the host's own observation floor is not
+        # narrowed by the task's ceiling.
+        origin_value = getattr(request.origin, "value", request.origin)
+        host_observation = origin_value == CapabilityRequestOrigin.SYSTEM.value
+        # SYSTEM_VERIFICATION is the bounded verifier authority (P0-7): the
+        # acceptance verifier may execute operator-declared criteria, but it
+        # inherits none of the task's capability ceiling. It is still held to
+        # a restricted effect envelope — observation plus bounded execution,
+        # never secrets, privilege, external publication, or computer input.
+        verifier_authority = origin_value == CapabilityRequestOrigin.SYSTEM_VERIFICATION.value
+        if verifier_authority and not _VERIFICATION_EFFECT_FLOOR.issuperset(effects):
+            await self._emit(
+                EV["CAPABILITY_FAILED"],
+                {
+                    "call_id": request.call_id,
+                    "capability_id": request.capability_id,
+                    "reason": "verification_effect_ceiling",
+                    "effects": sorted(effect.value for effect in effects),
+                },
+                request.task_id,
+                causal_id=request.call_id,
+            )
+            return CapabilityResult(
+                request.call_id,
+                request.capability_id,
+                CapabilityResultStatus.FAILED,
+                error=(
+                    "verification call requires effects outside the bounded "
+                    "verification envelope"
+                ),
+            )
+        task_verdict = (
+            None
+            if host_observation or verifier_authority
+            else self._eval_task_policy(
+                request.capability_id, task_policy, request_effects=frozenset(effects)
+            )
         )
         combined, reason = _combine_verdicts(task_verdict, global_verdict, decision.reason)
         external_contract = executor.descriptor.resolve_external_effect_contract(
@@ -741,9 +787,11 @@ class CapabilityDispatcher:
             )
             context = InvocationContext(
                 task_id=request.task_id,
+                principal_id=self._principal.id,
                 workspace=routed_workspace,
                 execution_backend=routed_workspace.execution_backend or "local",
                 capability_policy=task_policy,
+                model_policy=model_policy,
                 resource_budget=task_budget,
                 deadline=task_deadline,
                 runtime_remaining_s=runtime_remaining_s,
@@ -1015,6 +1063,7 @@ class CapabilityDispatcher:
         workspace: WorkspaceSpec,
         profile: str | None = None,
         task_policy: CapabilityPolicy | None = None,
+        model_policy: Any = None,
         task_budget: ResourceBudget | None = None,
         task_deadline: datetime | None = None,
         runtime_remaining_s: float | None = None,
@@ -1067,6 +1116,7 @@ class CapabilityDispatcher:
                     workspace=workspace,
                     profile=profile,
                     task_policy=task_policy,
+                    model_policy=model_policy,
                     task_budget=task_budget,
                     task_deadline=task_deadline,
                     runtime_remaining_s=runtime_remaining_s,
@@ -1090,6 +1140,7 @@ class CapabilityDispatcher:
         workspace: WorkspaceSpec,
         profile: str | None,
         task_policy: CapabilityPolicy | None,
+        model_policy: Any,
         task_budget: ResourceBudget | None,
         task_deadline: datetime | None,
         runtime_remaining_s: float | None,
@@ -1123,6 +1174,7 @@ class CapabilityDispatcher:
                     workspace=workspace,
                     profile=profile,
                     task_policy=task_policy,
+                    model_policy=model_policy,
                     task_budget=task_budget,
                     task_deadline=task_deadline,
                     runtime_remaining_s=runtime_remaining_s,
@@ -1433,15 +1485,7 @@ class CapabilityDispatcher:
         """
         if task_policy is None:
             return None
-        if capability_id in task_policy.deny:
-            return PolicyVerdict.DENY
-        if task_policy.allow and capability_id not in task_policy.allow:
-            return PolicyVerdict.DENY
-        if (
-            task_policy.ask
-            and capability_id not in task_policy.ask
-            and capability_id not in task_policy.allow
-        ):
+        if not capability_id_permitted(capability_id, task_policy):
             return PolicyVerdict.DENY
         if capability_id in task_policy.ask:
             return PolicyVerdict.ASK
@@ -1513,6 +1557,11 @@ class CapabilityDispatcher:
                 scope,
                 capability=request.capability_id,
                 effect=str(primary.value) if primary is not None else None,
+                # Authority envelope (P0): the grant binds to the COMPLETE
+                # resolved effect set the operator is approving, not just
+                # the primary effect. A resumed or generalized call whose
+                # effects exceed this ceiling is not covered.
+                allowed_effects=tuple(effects),
                 task_id=request.task_id,
                 session_id=getattr(request, "session_id", None),
                 expires_at=expires_at,
@@ -1896,6 +1945,20 @@ _STRICTNESS = {
     PolicyVerdict.ASK.value: 1,
     PolicyVerdict.DENY.value: 2,
 }
+
+# Bounded verification authority envelope (P0-7). The acceptance verifier
+# may observe and execute; it may never read secrets, escalate privilege,
+# publish externally, or drive computer input. Hard workspace/global
+# boundaries still apply through the normal PolicyEngine path.
+_VERIFICATION_EFFECT_FLOOR = frozenset(
+    {
+        EffectClass.READ_LOCAL,
+        EffectClass.WRITE_LOCAL,
+        EffectClass.EXECUTE,
+        EffectClass.SPAWN_PROCESS,
+        EffectClass.NETWORK_READ,
+    }
+)
 
 
 def _combine_verdicts(
