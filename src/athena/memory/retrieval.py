@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 from athena.protocol.memory import MemoryRecord, MemoryScope, RetrievalMode
 
@@ -87,6 +87,49 @@ class MemoryRetriever:
         if mode is RetrievalMode.EXACT:
             return candidate[:limit]
         return self._rank(candidate, query, limit)
+
+    async def retrieve_scopes_weighted(
+        self,
+        *,
+        query: str,
+        scopes: Sequence[tuple[MemoryScope, str | None]],
+        mode: RetrievalMode | str,
+        limit: int,
+        tags: Sequence[str] | None = None,
+        weights: Mapping[str, float] | None = None,
+    ) -> list[MemoryRecord]:
+        """Rank scope-weighted: score = text_overlap * scope_weight (P1-12).
+
+        Candidates come from the same FTS union as ``retrieve_scopes``;
+        the difference is the ranking key. Text overlap stays the base
+        signal (a weight can never rescue a non-matching record), and the
+        scope weight is the tie-breaking authority preference — which is
+        what makes "weight current session > project > user-global" a
+        ranking property rather than a post-hoc sort.
+        """
+        mode = RetrievalMode(mode)
+        limit = max(0, int(limit or 0))
+        if limit == 0 or not scopes:
+            return []
+        # Weight keys are matched case-insensitively against the scope VALUE
+        # ("session" / "project" / "global"), so callers may use either the
+        # enum name (SESSION) or the value.
+        weight_map = {str(k).lower(): float(v) for k, v in (weights or {}).items()}
+        candidate = await self._store.retrieve_by_fts_scopes(query, scopes, limit * 8, tags=tags)
+        qset = _tokens(query)
+        scope_key = {scope.value: weight_map.get(scope.value, 0.0) for scope, _ in scopes}
+        scored: list[tuple[float, MemoryRecord]] = []
+        for rec in candidate:
+            scope_weight = scope_key.get(rec.scope.value, 0.0)
+            if scope_weight <= 0.0:
+                continue
+            text = " ".join((rec.content or "", rec.summary or "")).lower()
+            overlap = len(qset & _tokens(text)) / len(qset) if qset else 0.0
+            if overlap <= 0.0:
+                continue
+            scored.append((overlap * scope_weight, rec))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [rec for _, rec in scored[:limit]]
 
     @staticmethod
     def _rank(candidate: list[MemoryRecord], query: str, limit: int) -> list[MemoryRecord]:

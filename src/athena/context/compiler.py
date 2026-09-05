@@ -17,6 +17,7 @@ into a bounded, provider-neutral model request.  It:
 from __future__ import annotations
 
 import asyncio
+import enum
 import inspect
 import hashlib
 import json
@@ -194,6 +195,98 @@ class _StaticContext:
             route="respond", rationale="No external action or evidence acquisition is required."
         )
     )
+
+
+class MemoryRetrievalMode(str, enum.Enum):
+    """Staged memory-retrieval gating (P1-12).
+
+    EXPLICIT — the objective uses referential language ("remember",
+    "the way we decided", "my usual format"): retrieve broadly; the
+    referent plausibly lives in durable memory.
+    WORK — ordinary repo/work turn: retrieve, but only content that
+    strongly matches; the durable store is not scanned for every turn.
+    SKIP — definitely a self-contained response turn (greeting, thanks):
+    no retrieval.
+    """
+
+    EXPLICIT = "explicit"
+    WORK = "work"
+    SKIP = "skip"
+
+
+# Referential vocabulary that justifies broad memory retrieval. Deliberately
+# narrow: staging only downgrades the DEFAULT, never suppresses an explicit
+# reference.
+_EXPLICIT_MEMORY_TOKENS = {
+    "remember", "recall", "memory", "memories", "preference", "preferences",
+    "favorite", "usual", "previously", "earlier", "decide", "decided",
+    "decision", "chose", "chosen", "said", "discussed", "agreed",
+    "convention", "conventions", "conventionally", "historically",
+}
+
+
+def _memory_context_mode(objective: str) -> MemoryRetrievalMode:
+    """Stage the retrieval decision for this objective (P1-12).
+
+    Referential language retrieves broadly (EXPLICIT); ordinary work turns
+    retrieve but are held to a strong-match threshold (WORK); only a
+    definitely self-contained conversational turn skips the store.
+
+    The EXPLICIT check precedes the response-channel check on purpose:
+    "how did we decide to handle retries?" is response-CHANNEL grammar,
+    but its referent may live in durable memory, and skipping the store
+    would strand it. The channel suppresses the tool surface; it does not
+    adjudicate where context lives.
+    """
+    text = str(objective or "")
+    if _objective_tokens(text) & _EXPLICIT_MEMORY_TOKENS:
+        return MemoryRetrievalMode.EXPLICIT
+    from athena.strategy import is_explicit_response_turn
+
+    if is_explicit_response_turn(text):
+        return MemoryRetrievalMode.SKIP
+    return MemoryRetrievalMode.WORK
+
+
+def _memory_context_needed(objective: str) -> bool:
+    """Compatibility aggregate: whether retrieval runs at all."""
+    return _memory_context_mode(objective) is not MemoryRetrievalMode.SKIP
+
+
+# Authority-ordered scope weights (P1-12): the current session is the
+# strongest authority over "how we do things here", then the project, then
+# the user-global store. Applied during retrieval ranking so a global
+# memory cannot outrank a session-local one on text overlap alone.
+_MEMORY_SCOPE_WEIGHTS = {"SESSION": 1.0, "PROJECT": 0.6, "GLOBAL": 0.3}
+
+# WORK-mode floor: a memory must overlap at least this fraction of the
+# objective's tokens to earn context space on an ordinary work turn.
+_WORK_MATCH_FLOOR = 0.34
+
+
+def _strong_matches(objective: str, records: list[Any]) -> list[Any]:
+    """Keep records whose token overlap clears the WORK-mode floor.
+
+    The scoring mirrors the retriever's own rank (shared-token fraction)
+    but is applied at the compiler boundary, where the staged mode is
+    known. EXPLICIT-mode results skip this filter entirely.
+    """
+    qset = _objective_tokens(objective)
+    if not qset:
+        return []
+    kept: list[Any] = []
+    for rec in records:
+        text = str(
+            getattr(rec, "content", None)
+            or (rec.get("content") if isinstance(rec, dict) else None)
+            or getattr(rec, "summary", None)
+            or (rec.get("summary") if isinstance(rec, dict) else None)
+            or ""
+        )
+        overlap = len(qset & _objective_tokens(text)) / len(qset)
+        if overlap >= _WORK_MATCH_FLOOR:
+            kept.append(rec)
+    return kept
 
 
 class ContextCompiler:
@@ -488,14 +581,18 @@ class ContextCompiler:
         self, task: TaskSpec, key: tuple[Any, ...] | None
     ) -> _StaticContext:
         """The actual static-context computation (single-flight target)."""
-        memory_needed = _memory_context_needed(task.objective)
+        memory_mode = _memory_context_mode(task.objective)
         research_needed = _research_context_needed(task.objective)
         skills_needed = _skills_context_needed(task.objective)
         require_tools = bool(task.model_policy.require_tools)
         tool_eligible = not is_explicit_response_turn(task.objective)
         blocks, memories, skills, research, capability_result = await asyncio.gather(
             self._load_context_blocks(task),
-            self._load_memories(task) if memory_needed else _empty_list(),
+            (
+                self._load_memories(task, mode=memory_mode)
+                if memory_mode is not MemoryRetrievalMode.SKIP
+                else _empty_list()
+            ),
             self._load_skills(task) if skills_needed else _empty_list(),
             self._load_research(task) if research_needed else _empty_list(),
             (
@@ -1120,17 +1217,23 @@ class ContextCompiler:
                 return []
         return []
 
-    async def _load_memories(self, task: TaskSpec) -> list[Any]:
+    async def _load_memories(
+        self, task: TaskSpec, *, mode: MemoryRetrievalMode = MemoryRetrievalMode.WORK
+    ) -> list[Any]:
         if self._memory_store is None:
             return []
         store = self._memory_store
         generation = getattr(store, "generation", None)
-        cache_key = (task.id, int(generation)) if isinstance(generation, int) else None
+        cache_key = (task.id, mode.value, int(generation)) if isinstance(generation, int) else None
         if cache_key is not None:
             cached = self._memory_cache.get(cache_key)
             if cached is not None:
                 self._memory_cache.move_to_end(cache_key)
                 return list(cached)
+        # Scope weighting (P1-12): the current session outranks the project,
+        # which outranks user-global. The weighted retrieval applies the
+        # preference during ranking; the per-scope limits bound how much
+        # each scope may contribute before merge.
         combined = getattr(store, "search_scopes", None)
         if callable(combined):
             scopes: list[tuple[MemoryScope, str | None]] = []
@@ -1139,13 +1242,31 @@ class ContextCompiler:
             scopes.append((MemoryScope.PROJECT, task.workspace.id if task.workspace else None))
             scopes.append((MemoryScope.GLOBAL, None))
             try:
-                result = list(
-                    await combined(
-                        task.objective,
-                        scopes,
-                        limit=24,
-                    )
+                retrieve_scopes = getattr(
+                    store, "retrieve_scopes_weighted", None
                 )
+                if callable(retrieve_scopes):
+                    result = list(
+                        await retrieve_scopes(
+                            task.objective,
+                            scopes,
+                            limit=24,
+                            mode="semantic",
+                            weights=_MEMORY_SCOPE_WEIGHTS,
+                        )
+                    )
+                    if mode is MemoryRetrievalMode.WORK:
+                        result = _strong_matches(task.objective, result)
+                else:
+                    result = list(
+                        await combined(
+                            task.objective,
+                            scopes,
+                            limit=24,
+                        )
+                    )
+                    if mode is MemoryRetrievalMode.WORK:
+                        result = _strong_matches(task.objective, result)
                 if cache_key is not None:
                     self._memory_cache[cache_key] = tuple(result)
                     self._memory_cache.move_to_end(cache_key)
@@ -1180,6 +1301,8 @@ class ContextCompiler:
             out.extend(await store.search(task.objective, scope=MemoryScope.GLOBAL))
         except Exception:
             pass
+        if mode is MemoryRetrievalMode.WORK:
+            out = _strong_matches(task.objective, out)
         if cache_key is not None:
             self._memory_cache[cache_key] = tuple(out)
             self._memory_cache.move_to_end(cache_key)
@@ -1470,20 +1593,6 @@ def _retrieval_context_needed(objective: str) -> bool:
 
 def _objective_tokens(objective: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", objective.casefold()))
-
-
-def _memory_context_needed(objective: str) -> bool:
-    """Whether durable memory retrieval should run for this objective.
-
-    Only a definitely-trivial conversational turn skips retrieval. Everything
-    work-bearing or ambiguous retrieves: referential language in agent
-    conversations ("use the same setup", "the way we decided", "my usual
-    format") cannot be enumerated by a keyword list, and the metadata-only
-    search is cheap.
-    """
-    from athena.strategy import is_explicit_response_turn
-
-    return not is_explicit_response_turn(str(objective or ""))
 
 
 def _objective_tokens_in_order(objective: str) -> list[str]:

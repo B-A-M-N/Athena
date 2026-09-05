@@ -539,6 +539,32 @@ class MemoryStore:
             tags=tags,
         )
 
+    async def retrieve_scopes_weighted(
+        self,
+        query: str,
+        scopes: Sequence[tuple[MemoryScope, str | None]],
+        *,
+        limit: int = 10,
+        mode: RetrievalMode | str = RetrievalMode.SEMANTIC,
+        tags: Sequence[str] | None = None,
+        weights: Mapping[str, float] | None = None,
+    ) -> list[MemoryRecord]:
+        """Scope-weighted retrieval (P1-12): authority order participates in
+        the ranking, so a session-local memory outranks a user-global one on
+        equal text overlap. ``weights`` maps scope VALUE names (upper-case)
+        to multipliers; unlisted scopes default to 0.0 weight.
+        """
+        from athena.memory.retrieval import MemoryRetriever
+
+        return await MemoryRetriever(self).retrieve_scopes_weighted(
+            query=query,
+            scopes=scopes,
+            mode=mode,
+            limit=limit,
+            tags=tags,
+            weights=weights,
+        )
+
     # ---- retrieval SQL (owned by the store; the retriever only re-ranks) ----
 
     async def _scope_where(
