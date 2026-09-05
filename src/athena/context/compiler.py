@@ -355,6 +355,102 @@ class ContextCompiler:
             strategy=static.strategy,
         )
 
+    async def compile_auxiliary(
+        self,
+        task: TaskSpec,
+        *,
+        system: str,
+        observation: str,
+        max_observation_chars: int = 20_000,
+    ) -> CompiledContext:
+        """Auxiliary compilation mode for bounded subturns (P1-14).
+
+        Interpreter (and similar auxiliary) subturns must NOT pay for — or
+        risk ingesting — the full work surface. This mode compiles exactly:
+
+            system instruction (authority)
+          + task objective (what the work is for)
+          + the bounded observation (the body state to interpret)
+
+        and deliberately excludes skills, durable memory, research, project
+        context blocks, transcript history, and the capability tool schema.
+        An auxiliary subturn reasons over the given observation; it cannot
+        mine the wider context corpus, and it receives no tool surface to
+        act on (its only output channel is the reply itself).
+
+        ``observation`` is truncated at ``max_observation_chars`` (tail kept) —
+        the producer should have artifactized anything larger; truncation here
+        is the last-resort bound, not the policy.
+        """
+        text = observation[-max_observation_chars:] if observation else ""
+        entry_role = provider_role_for_source(
+            "runtime_safety_policy", scope="runtime", trust=TrustClass.AUTHORITY
+        )
+        entries: list[_Entry] = [
+            _Entry(
+                name="system:auxiliary",
+                text=system,
+                tokens=estimate_tokens(system),
+                role=entry_role,
+                category="security_policy",
+                trust=TrustClass.AUTHORITY,
+                mandatory=True,
+                cache_zone="stable",
+                provenance=prov(
+                    SourceType.SYSTEM, trust=TrustClass.AUTHORITY, scope="runtime"
+                ),
+            )
+        ]
+        objective_text = f"Task objective: {task.objective}" if task.objective else ""
+        if objective_text:
+            entries.append(
+                _Entry(
+                    name=f"task:{task.id}",
+                    text=objective_text,
+                    tokens=estimate_tokens(objective_text),
+                    role=provider_role_for_source(
+                        "task_instruction", scope="session", trust=TrustClass.CONFIGURED_INSTRUCTION
+                    ),
+                    category="task",
+                    trust=TrustClass.CONFIGURED_INSTRUCTION,
+                    mandatory=True,
+                    cache_zone="stable",
+                    provenance=prov(
+                        SourceType.TASK, trust=TrustClass.CONFIGURED_INSTRUCTION
+                    ),
+                )
+            )
+        entries.append(
+            _Entry(
+                name="observation:body",
+                text=text,
+                tokens=estimate_tokens(text),
+                role="user",
+                category="observation",
+                trust=TrustClass.UNTRUSTED,
+                mandatory=True,
+                cache_zone="none",
+                provenance=prov(SourceType.RUNTIME, trust=TrustClass.UNTRUSTED),
+            )
+        )
+        messages = tuple(_render_entry(e) for e in entries)
+        provenance_map = _index_provenance(messages)
+        estimated = estimate_tokens("\n\n".join(m.conversation_text() for m in messages))
+        requirements = ModelRequirements(
+            # No CAP_TOOLS: an auxiliary subturn gets no tool surface.
+            required_capabilities=frozenset(),
+            minimum_context_tokens=estimated + self.reserve_output + self.safety_margin,
+            needs_tools=False,
+            reserved_output=self.reserve_output,
+        )
+        return CompiledContext(
+            messages=messages,
+            requirements=requirements,
+            estimated_tokens=estimated,
+            provenance_map=provenance_map,
+            cache_prefix_messages=messages[:1],
+        )
+
     async def _load_static_context(self, task: TaskSpec) -> _StaticContext:
         """Load revisioned context once; transcript/tool state stays dynamic.
 
