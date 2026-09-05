@@ -456,9 +456,7 @@ def _steps_from_row(row: Mapping[str, Any]) -> tuple[Any, ...]:
     from athena.workflows.models import WorkflowStep
 
     raw_steps = json.loads(row["steps"] or "[]")
-    return tuple(
-        WorkflowStep.from_record(step, index) for index, step in enumerate(raw_steps)
-    )
+    return tuple(WorkflowStep.from_record(step, index) for index, step in enumerate(raw_steps))
 
 
 def _observation_record(row: Mapping[str, Any]) -> dict[str, Any]:

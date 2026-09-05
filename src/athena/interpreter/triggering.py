@@ -23,19 +23,25 @@ from athena.interpreter.protocol import (
 __all__ = ["observation_warrants_subturn"]
 
 
-def _payload_int(payload: dict, key: str) -> int:
-    """Safe numeric extraction from an unconstrained payload.
+def _as_int(value: object) -> int:
+    """Best-effort integer conversion of a producer-authored value.
 
-    Payload values are producer-authored objects; a non-numeric value must
+    Payload values are unconstrained objects; a non-numeric value must
     never raise inside policy evaluation (it fails the check instead).
     """
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _payload_int(payload: dict, key: str) -> int:
+    """Safe numeric extraction from an unconstrained payload."""
     value = payload.get(key)
     if value is None:
         return 0
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0
+    return _as_int(value)
+
 
 # How many consecutive failures of the same capability (after the primary
 # loop's tool-correction path) turn the failure into an observation worth
@@ -100,7 +106,4 @@ def observation_warrants_subturn(observation: InterpreterObservation) -> bool:
 def _nonzero_exit(exit_code: object) -> bool:
     if exit_code is None:
         return False
-    try:
-        return int(exit_code) != 0
-    except (TypeError, ValueError):
-        return False
+    return _as_int(exit_code) != 0

@@ -199,9 +199,7 @@ def _compile_validator(schema: Mapping[str, Any]):
         raise RuntimeError("jsonschema is required for capability schemas") from exc
     effective = _effective_schema(schema)
     if _schema_depth(effective) > _MAX_SCHEMA_DEPTH:
-        raise ValueError(
-            f"capability schema exceeds maximum nesting depth {_MAX_SCHEMA_DEPTH}"
-        )
+        raise ValueError(f"capability schema exceeds maximum nesting depth {_MAX_SCHEMA_DEPTH}")
     validator_cls = validator_for(effective)
     validator_cls.check_schema(effective)
     return validator_cls(effective)

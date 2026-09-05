@@ -174,7 +174,9 @@ def _execute(verdict: str, priority: int = 50) -> Rule:
 
 
 def _spawn(verdict: str, priority: int = 50) -> Rule:
-    return Rule(verdict, effect=EffectClass.SPAWN_PROCESS, priority=priority, reason="spawn process")
+    return Rule(
+        verdict, effect=EffectClass.SPAWN_PROCESS, priority=priority, reason="spawn process"
+    )
 
 
 def _delegate_spawn(verdict: str) -> Rule:

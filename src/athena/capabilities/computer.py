@@ -27,7 +27,7 @@ import asyncio
 import importlib
 import json
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from athena.protocol.capabilities import (
     Availability,
@@ -85,9 +85,7 @@ def _result(
     return CapabilityResult(
         call_id=request.call_id,
         capability_id=request.capability_id,
-        status=(
-            CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED
-        ),
+        status=(CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED),
         output=output,
         error=None if ok else (error or "computer operation failed"),
         metadata=dict(meta or {}),
@@ -192,9 +190,7 @@ class ComputerCapability:
         if operation == "wait":
             seconds = min(float(args.get("seconds") or 1.0), 30.0)
             await asyncio.sleep(seconds)
-            return _result(
-                request, output=json.dumps({"waited_s": seconds})
-            )
+            return _result(request, output=json.dumps({"waited_s": seconds}))
 
         if operation == "click":
             button = str(args.get("button") or "left")
@@ -248,9 +244,7 @@ class ComputerCapability:
             x, y = args.get("x"), args.get("y")
             if x is None or y is None:
                 return _result(request, ok=False, error="move requires x and y")
-            await loop.run_in_executor(
-                None, lambda: backend.moveTo(int(x), int(y), duration=0.1)
-            )
+            await loop.run_in_executor(None, lambda: backend.moveTo(int(x), int(y), duration=0.1))
             return _result(request, output=json.dumps({"moved_to": [int(x), int(y)]}))
 
         return _result(request, ok=False, error=f"unknown computer operation: {operation!r}")
@@ -263,7 +257,7 @@ class ComputerCapability:
     ) -> CapabilityResult:
         started = time.monotonic()
         try:
-            shot = await loop.run_in_executor(None, backend.screenshot)
+            await loop.run_in_executor(None, backend.screenshot)
         except Exception as exc:  # headless hosts cannot grab a framebuffer
             return _result(
                 request,

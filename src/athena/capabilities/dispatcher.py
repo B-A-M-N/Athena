@@ -529,8 +529,7 @@ class CapabilityDispatcher:
                 request.capability_id,
                 CapabilityResultStatus.FAILED,
                 error=(
-                    "verification call requires effects outside the bounded "
-                    "verification envelope"
+                    "verification call requires effects outside the bounded verification envelope"
                 ),
             )
         task_verdict = (
@@ -863,12 +862,8 @@ class CapabilityDispatcher:
             # resolution instead of reverse-engineering from names.
             if "resolved_effects" not in (result.metadata or {}):
                 receipt_meta = dict(result.metadata or {})
-                receipt_meta["resolved_effects"] = sorted(
-                    effect.value for effect in effects
-                )
-                if execution_backend := getattr(
-                    routed_workspace, "execution_backend", None
-                ):
+                receipt_meta["resolved_effects"] = sorted(effect.value for effect in effects)
+                if execution_backend := getattr(routed_workspace, "execution_backend", None):
                     receipt_meta["execution_backend"] = execution_backend
                 if route is not None and route.disposition is not None:
                     receipt_meta["reality_disposition"] = route.disposition.value

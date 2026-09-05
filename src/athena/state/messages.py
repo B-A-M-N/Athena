@@ -140,8 +140,7 @@ class MessageStore:
         because both tasks share a session.
         """
         rows = await self._db.fetch_all(
-            "SELECT * FROM messages WHERE session_id = ? "
-            "ORDER BY created_at ASC, rowid ASC",
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
             (session_id,),
         )
         messages = [_row_to_message(row) for row in rows]
@@ -151,10 +150,7 @@ class MessageStore:
                 index
                 for index, message in enumerate(messages)
                 if message.id == canonical_id
-                or (
-                    _is_canonical_user_turn(message)
-                    and _belongs_to_task(message, task_id)
-                )
+                or (_is_canonical_user_turn(message) and _belongs_to_task(message, task_id))
             ),
             None,
         )
@@ -163,7 +159,11 @@ class MessageStore:
 
         bounded: list[Message] = []
         for index, message in enumerate(messages):
-            if index > start and _is_canonical_user_turn(message) and not _belongs_to_task(message, task_id):
+            if (
+                index > start
+                and _is_canonical_user_turn(message)
+                and not _belongs_to_task(message, task_id)
+            ):
                 break
             bounded.append(message)
         return bounded[-limit:] if limit > 0 else []
@@ -217,7 +217,11 @@ class MessageStore:
         # leak into the current task merely because its timestamp is close.
         bounded: list[Message] = []
         for message in messages:
-            if bounded and _is_canonical_user_turn(message) and not _belongs_to_task(message, task_id):
+            if (
+                bounded
+                and _is_canonical_user_turn(message)
+                and not _belongs_to_task(message, task_id)
+            ):
                 break
             bounded.append(message)
         return bounded
@@ -260,14 +264,10 @@ class MessageStore:
         results = [_hit_to_record(row) for row in rows]
         if context_window > 0:
             for hit in results:
-                hit["context"] = await self._context_around_hit(
-                    hit, context_window
-                )
+                hit["context"] = await self._context_around_hit(hit, context_window)
         return results
 
-    async def _context_around_hit(
-        self, hit: dict, context_window: int
-    ) -> list[dict]:
+    async def _context_around_hit(self, hit: dict, context_window: int) -> list[dict]:
         """Return N messages before and after the hit from the SAME session."""
         session_id = hit["session_id"]
         hit_rowid = hit.get("_rowid") or hit.get("rowid")
@@ -285,9 +285,7 @@ class MessageStore:
             (session_id, hit_rowid, context_window + 1),
         )
         after_rows = await self._db.fetch_all(
-            "SELECT * FROM messages "
-            "WHERE session_id = ? AND rowid > ? "
-            "ORDER BY rowid ASC LIMIT ?",
+            "SELECT * FROM messages WHERE session_id = ? AND rowid > ? ORDER BY rowid ASC LIMIT ?",
             (session_id, hit_rowid, context_window),
         )
         before_messages = [_row_to_message(r) for r in reversed(before_rows)]

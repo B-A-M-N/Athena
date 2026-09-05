@@ -72,4 +72,3 @@ class InputRequestCapability:
 
 
 __all__ = ["INPUT_REQUEST_DESCRIPTOR", "InputRequestCapability"]
-

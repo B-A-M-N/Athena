@@ -13,8 +13,10 @@ from athena.tasks.manager import TaskManager
 
 class _BoomBudget:
     """Budget tracker whose registration intentionally fails."""
+
     def __init__(self):
         self.calls = 0
+
     def register(self, spec) -> None:
         self.calls += 1
         raise RuntimeError("ledger backend down")
@@ -23,6 +25,7 @@ class _BoomBudget:
 class _BoomCancellations:
     def __init__(self):
         self.calls = 0
+
     def reset(self, task_id) -> None:
         self.calls += 1
         raise RuntimeError("reset backend down")
@@ -30,8 +33,10 @@ class _BoomCancellations:
 
 class _BoomEvents:
     """Event store whose append_event intentionally fails."""
+
     def __init__(self):
         self.emitted = 0
+
     async def append_event(self, *args, **kwargs):
         self.emitted += 1
         raise RuntimeError("event bus down")

@@ -19,7 +19,13 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     DispatchDirectives,
 )
-from athena.protocol.tasks import CapabilityPolicy, ModelPolicy, ResourceBudget, TaskSpec, WorkspaceSpec
+from athena.protocol.tasks import (
+    CapabilityPolicy,
+    ModelPolicy,
+    ResourceBudget,
+    TaskSpec,
+    WorkspaceSpec,
+)
 from athena.workflows import Workflow, WorkflowExecutor, WorkflowStep
 from athena.workflows.runs import (
     WorkflowRunIdentityError,

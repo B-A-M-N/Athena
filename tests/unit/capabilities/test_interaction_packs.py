@@ -24,7 +24,6 @@ import pytest
 
 from athena.capabilities.browser import (
     BrowserCapability,
-    BrowserDriver,
     ElementSnapshot,
 )
 from athena.capabilities.computer import ComputerCapability
@@ -38,9 +37,9 @@ from athena.protocol.capabilities import (
 
 def _request(operation: str, **extra) -> CapabilityRequest:
     return CapabilityRequest(
-        capability_id="computer" if operation in {
-            "observe", "click", "type", "key", "scroll", "move", "wait"
-        } else "browser",
+        capability_id="computer"
+        if operation in {"observe", "click", "type", "key", "scroll", "move", "wait"}
+        else "browser",
         arguments={"operation": operation, **extra},
         task_id="task-1",
         call_id="call-1",

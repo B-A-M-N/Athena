@@ -625,9 +625,7 @@ class ExecutionManager:
                 await self.cancel_task(task_id)
                 outcome["tasks_cancelled"] += 1
             except Exception as exc:
-                outcome["runtime_failures"].append(
-                    {"task_id": task_id, "error": str(exc)}
-                )
+                outcome["runtime_failures"].append({"task_id": task_id, "error": str(exc)})
                 _logger.warning("task %s runtime cancellation failed: %s", task_id, exc)
         for runtime in set(self._runtimes.values()):
             close_all = getattr(runtime, "close_all", None)
@@ -667,11 +665,7 @@ class ExecutionManager:
     def live_resource_count(self) -> int:
         """Count execution resources that must be zero after close_all (P0-2)."""
         live_sessions = sum(len(sessions) for sessions in self._task_sessions.values())
-        return (
-            live_sessions
-            + len(self._pending_runtime_cancellations)
-            + len(self._exec_runtimes)
-        )
+        return live_sessions + len(self._pending_runtime_cancellations) + len(self._exec_runtimes)
 
     async def _emit_event(self, event_type: str, payload: dict, task_id: str | None = None) -> None:
         """Emit an execution event to the event sink if one is configured."""

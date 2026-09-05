@@ -88,9 +88,7 @@ class TaskWorker:
         """
         self._stop.set()
         self._wake.set()
-        tasks = getattr(self, "_worker_tasks", None) or (
-            [] if self._task is None else [self._task]
-        )
+        tasks = getattr(self, "_worker_tasks", None) or ([] if self._task is None else [self._task])
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=max(grace_seconds, 0.0))
             for t in pending:
@@ -259,9 +257,7 @@ class TaskWorker:
         except RequestCancelled as exc:
             if self._ownership_lost.get(task_id):
                 return _ownership_lost_result(task_id, exc)
-            return await self._mark_failed(
-                task_id, TaskStatus.CANCELLED, f"task cancelled: {exc}"
-            )
+            return await self._mark_failed(task_id, TaskStatus.CANCELLED, f"task cancelled: {exc}")
         except Exception as exc:  # noqa: BLE001 - classify every kernel failure truthfully
             if self._ownership_lost.get(task_id):
                 return _ownership_lost_result(task_id, exc)
@@ -440,10 +436,7 @@ def _ownership_lost_result(task_id: str, exc: BaseException) -> TaskResult:
     return TaskResult(
         task_id=task_id,
         status=TaskStatus.INTERRUPTED,
-        summary=(
-            f"worker lost task ownership: {exc}; final state belongs to the "
-            "current owner"
-        ),
+        summary=(f"worker lost task ownership: {exc}; final state belongs to the current owner"),
     )
 
 

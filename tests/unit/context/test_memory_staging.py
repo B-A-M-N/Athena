@@ -33,8 +33,7 @@ class TestStaging:
 
     def test_ordinary_work_is_work_mode(self):
         assert (
-            _memory_context_mode("fix the failing import in src/app.py")
-            is MemoryRetrievalMode.WORK
+            _memory_context_mode("fix the failing import in src/app.py") is MemoryRetrievalMode.WORK
         )
 
     def test_definite_response_turn_skips(self):

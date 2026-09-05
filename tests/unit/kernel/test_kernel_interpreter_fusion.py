@@ -148,7 +148,10 @@ class _RecordingShim:
                     capability_id=c.capability_id,
                     ok=ok,
                     output="ok" if ok else "x" * 3000,
-                    error=None if ok else "Traceback (most recent call last):\n" + "\n".join(
+                    error=None
+                    if ok
+                    else "Traceback (most recent call last):\n"
+                    + "\n".join(
                         f'  File "mod_{i}.py", line {i}, in fn_{i}\n    raise RuntimeError("boom")'
                         for i in range(40)
                     ),

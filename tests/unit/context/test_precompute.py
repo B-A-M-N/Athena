@@ -13,8 +13,6 @@ import pytest
 from athena.context.compiler import ContextCompiler
 from athena.protocol.capabilities import CapabilityDescriptor
 from athena.protocol.tasks import (
-    AutonomyLevel,
-    CapabilityPolicy,
     ModelPolicy,
     TaskSpec,
     WorkspaceSpec,
@@ -43,9 +41,7 @@ class _MiniRegistry:
     def search(self, query, **kwargs):
         # Match ids that appear in the query; always let reflection through.
         result = [
-            {"id": d.id}
-            for d in self._by_id.values()
-            if d.id in query or d.id == "capabilities"
+            {"id": d.id} for d in self._by_id.values() if d.id in query or d.id == "capabilities"
         ]
         return result
 

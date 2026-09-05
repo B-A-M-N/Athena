@@ -8,9 +8,7 @@ floor one tier for its remaining turns.
 
 from __future__ import annotations
 
-from dataclasses import replace
 
-from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
 from athena.kernel.kernel import _escalated_quality_floor
 from athena.protocol.models import ModelInfo, ModelQualityTier
@@ -50,9 +48,7 @@ class TestFloorFilter:
 
     async def test_undeclared_survives_any_floor(self):
         """A model that never declared a tier is not excluded by one."""
-        router = ModelRouter(
-            _StaticRegistry([_info("mystery", None), _info("cheap", "economy")])
-        )
+        router = ModelRouter(_StaticRegistry([_info("mystery", None), _info("cheap", "economy")]))
         policy = ModelPolicy(min_quality_tier="frontier")
         sel = await router.select(policy=policy)
         # The declared-economy model is excluded; the undeclared one survives.
@@ -102,9 +98,10 @@ class TestEscalation:
         policy = ModelPolicy()
         mild = _escalated_quality_floor(policy, self._state(2))
         strong = _escalated_quality_floor(policy, self._state(8))
-        assert ModelQualityTier(strong.min_quality_tier).rank >= ModelQualityTier(
-            mild.min_quality_tier
-        ).rank
+        assert (
+            ModelQualityTier(strong.min_quality_tier).rank
+            >= ModelQualityTier(mild.min_quality_tier).rank
+        )
 
     def test_escalation_cap_at_frontier(self):
         policy = ModelPolicy()

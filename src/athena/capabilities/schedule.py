@@ -120,8 +120,16 @@ def _authority_snapshot(
             "temp_root": getattr(workspace, "temp_root", None),
             "execution_backend": getattr(workspace, "execution_backend", None),
             "revision": getattr(workspace, "revision", None),
-            "network_policy": getattr(getattr(workspace, "network_policy", None), "value", getattr(workspace, "network_policy", None)),
-            "mutation_mode": getattr(getattr(workspace, "mutation_mode", None), "value", getattr(workspace, "mutation_mode", None)),
+            "network_policy": getattr(
+                getattr(workspace, "network_policy", None),
+                "value",
+                getattr(workspace, "network_policy", None),
+            ),
+            "mutation_mode": getattr(
+                getattr(workspace, "mutation_mode", None),
+                "value",
+                getattr(workspace, "mutation_mode", None),
+            ),
         }
     cp = capability_policy
     if cp is None:
@@ -140,7 +148,9 @@ def _authority_snapshot(
         "principal": dict(owner),
         "workspace": workspace_record,
         "capability_policy": {
-            "effects": sorted(str(getattr(value, "value", value)) for value in getattr(cp, "effects", ()) or ()),
+            "effects": sorted(
+                str(getattr(value, "value", value)) for value in getattr(cp, "effects", ()) or ()
+            ),
             "allow": list(getattr(cp, "allow", ()) or ()),
             "ask": list(getattr(cp, "ask", ()) or ()),
             "deny": list(getattr(cp, "deny", ()) or ()),
@@ -516,9 +526,7 @@ class ScheduleCapability:
                     # lineage in the template metadata, never as the
                     # execution session.
                     session_id=(
-                        request.session_id
-                        if bool(args.get("persistent_session"))
-                        else None
+                        request.session_id if bool(args.get("persistent_session")) else None
                     ),
                     reuse_session=bool(args.get("persistent_session")),
                     workspace_root=workspace_root,
@@ -530,9 +538,7 @@ class ScheduleCapability:
                     autonomy=getattr(context, "autonomy", None),
                 )
                 job_id = (
-                    result.get("id") or result.get("job_id")
-                    if isinstance(result, dict)
-                    else None
+                    result.get("id") or result.get("job_id") if isinstance(result, dict) else None
                 )
                 return CapabilityResult(
                     call_id,

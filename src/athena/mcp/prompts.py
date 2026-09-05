@@ -120,9 +120,7 @@ class MCPPromptProvider:
         for client in self._clients.values():
             if any(ref.name == name for ref in (getattr(client, "_prompt_cache", None) or ())):
                 return client
-        raise LookupError(
-            "cannot resolve MCP prompt; specify connection_id or list prompts first"
-        )
+        raise LookupError("cannot resolve MCP prompt; specify connection_id or list prompts first")
 
 
 __all__ = ["MCPPromptProvider", "mcp_prompt_provenance"]

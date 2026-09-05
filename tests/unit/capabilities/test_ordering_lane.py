@@ -43,15 +43,11 @@ class _OrderedExecutor:
         await asyncio.sleep(self.delay)
         async with self.mutex:
             self.observed_active -= 1
-        return CapabilityResult(
-            request.call_id, request.capability_id, CapabilityResultStatus.OK
-        )
+        return CapabilityResult(request.call_id, request.capability_id, CapabilityResultStatus.OK)
 
 
 def _req(cap, **args) -> CapabilityRequest:
-    return CapabilityRequest(
-        capability_id=cap, arguments=args, task_id="t1"
-    )
+    return CapabilityRequest(capability_id=cap, arguments=args, task_id="t1")
 
 
 def _dispatcher(ex, profile="autonomous") -> CapabilityDispatcher:
@@ -146,9 +142,7 @@ def test_pure_reads_vs_mutations_do_not_race_on_shared_resource():
         id="shared.resource",
         description="shared",
         input_schema={"allow_extra": True},
-        effects=frozenset(
-            {EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}
-        ),
+        effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
     )
     ex = _OrderedExecutor(shared, delay_ms=30)
     d = _dispatcher(ex, profile="supervised")
@@ -165,6 +159,7 @@ def test_pure_reads_vs_mutations_do_not_race_on_shared_resource():
     )
     assert ex.max_active == 1, f"shared-path read+write must not overlap, saw {ex.max_active}"
     assert ex.starts[0] == "read", f"model order preserved: {ex.starts}"
+
 
 def test_execution_concurrency_serializes_through_order_lane():
     """Opaque execute/process calls are ordering-sensitive: they serialize

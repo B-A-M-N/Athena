@@ -451,9 +451,9 @@ class KnowledgePipeline:
                                 "task_id": task.id,
                                 "steps": len(steps),
                                 "trace_signature": signature,
-                                "successful_observations": getattr(
-                                    observed, "provenance", {}
-                                ).get("successful_observations", 2),
+                                "successful_observations": getattr(observed, "provenance", {}).get(
+                                    "successful_observations", 2
+                                ),
                                 "source": "repeated_successful_task_traces",
                             },
                             task_id=task.id,

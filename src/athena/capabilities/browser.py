@@ -95,9 +95,7 @@ def _result(
     return CapabilityResult(
         call_id=request.call_id,
         capability_id=request.capability_id,
-        status=(
-            CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED
-        ),
+        status=(CapabilityResultStatus.OK if ok else CapabilityResultStatus.FAILED),
         output=output,
         error=None if ok else (error or "browser operation failed"),
         metadata=dict(meta or {}),
@@ -193,17 +191,14 @@ class BrowserCapability:
             if not url:
                 return _result(request, ok=False, error="navigate requires url")
             if not url.lower().startswith(("http://", "https://")):
-                return _result(
-                    request, ok=False, error="url must use http or https"
-                )
+                return _result(request, ok=False, error="url must use http or https")
             outcome = await driver.navigate(url)
             return _result(request, output=json.dumps(outcome, default=str))
 
         if operation == "snapshot":
             elements = await driver.snapshot()
             lines = [
-                f"{e.role}\t{e.name}\t{e.selector}"
-                + (f"\t{e.value}" if e.value else "")
+                f"{e.role}\t{e.name}\t{e.selector}" + (f"\t{e.value}" if e.value else "")
                 for e in elements
             ]
             text = "\n".join(lines)[0:_MAX_SNAPSHOT_CHARS]

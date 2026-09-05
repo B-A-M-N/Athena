@@ -17,7 +17,9 @@ def test_instruction_renderer_canonicalizes_conflict_order():
         "untrusted_text",
     )
     rendered = InstructionSet(
-        tuple(InstructionBlock(text=f"rule-{source}", source=source) for source in reversed(sources))
+        tuple(
+            InstructionBlock(text=f"rule-{source}", source=source) for source in reversed(sources)
+        )
     ).render()
 
     positions = [rendered.index(f"rule-{source}") for source in sources]

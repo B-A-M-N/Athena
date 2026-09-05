@@ -95,17 +95,29 @@ class TaskTemplate:
         budget = _budget_from_record(self.authority_snapshot.get("resource_budget"))
         if budget is None:
             budget = self.resource_budget or ResourceBudget()
-        if self.max_agent_iterations is not None and self.resource_budget is None and not self.authority_snapshot.get("resource_budget"):
+        if (
+            self.max_agent_iterations is not None
+            and self.resource_budget is None
+            and not self.authority_snapshot.get("resource_budget")
+        ):
             budget = ResourceBudget(max_agent_iterations=self.max_agent_iterations)
-        capability_policy = _capability_policy_from_record(
-            self.authority_snapshot.get("capability_policy")
-        ) or self.capability_policy
+        capability_policy = (
+            _capability_policy_from_record(self.authority_snapshot.get("capability_policy"))
+            or self.capability_policy
+        )
         if capability_policy is None:
             capability_policy = CapabilityPolicy(allow=self.capability_allow)
-        model_policy = _model_policy_from_record(self.authority_snapshot.get("model_policy")) or self.model_policy
+        model_policy = (
+            _model_policy_from_record(self.authority_snapshot.get("model_policy"))
+            or self.model_policy
+        )
         if model_policy is None:
             model_policy = ModelPolicy(role=self.model_role)
-        if not self.authority_snapshot and self.capability_policy is None and not self.capability_allow:
+        if (
+            not self.authority_snapshot
+            and self.capability_policy is None
+            and not self.capability_allow
+        ):
             # A hand-authored legacy template has no creator authority to
             # inherit. Keep it capability-free until a service-owned schedule
             # snapshot is supplied.
@@ -113,7 +125,9 @@ class TaskTemplate:
         metadata = dict(self.metadata)
         if occurrence_key is not None:
             metadata["_occurrence"] = occurrence_key
-        metadata.setdefault("autonomy", str(self.authority_snapshot.get("autonomy") or self.autonomy))
+        metadata.setdefault(
+            "autonomy", str(self.authority_snapshot.get("autonomy") or self.autonomy)
+        )
         if self.authority_snapshot:
             metadata["_authority_snapshot"] = dict(self.authority_snapshot)
         # A template without a persistent session minted one fresh session per
@@ -430,7 +444,9 @@ class Scheduler:
                         await result
                 created = await self._tm.create(spec)
                 if created is None:
-                    raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")
+                    raise RuntimeError(
+                        "TaskManager.create returned no Task for scheduled occurrence"
+                    )
                 await self._tm.enqueue(created.id)
             if created is None:
                 raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")

@@ -335,6 +335,7 @@ class ACPAdapter:
             seq=0,
         )
 
+
 def _task_id_of(task: Any) -> str:
     """Extract an id from a Task/object/dict for ACP envelopes."""
     if isinstance(task, dict):

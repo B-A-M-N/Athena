@@ -391,12 +391,8 @@ async def test_kernel_selects_model_by_compiled_minimum_context():
     large = FakeModelProvider(
         model="ctx-128k", provider="largeprov", context_limit=128 * 1024, tool_calling=True
     )
-    kernel._router = ModelRouter(
-        _registry({"smallprov": small, "largeprov": large})
-    )
-    compiled = Holder(
-        ModelRequirements(minimum_context_tokens=20 * 1024, needs_tools=True)
-    )
+    kernel._router = ModelRouter(_registry({"smallprov": small, "largeprov": large}))
+    compiled = Holder(ModelRequirements(minimum_context_tokens=20 * 1024, needs_tools=True))
 
     selection = await kernel._select_model(task=TaskStub(), compiled=compiled)
     assert (selection.provider, selection.model) == ("largeprov", "ctx-128k")
@@ -419,10 +415,7 @@ class _MultiModelProvider(FakeModelProvider):
     async def list_models(self) -> list:
         from athena.protocol.models import ModelInfo
 
-        return [
-            ModelInfo(id=m, provider=self._provider, **self._info_kwargs)
-            for m in self._models
-        ]
+        return [ModelInfo(id=m, provider=self._provider, **self._info_kwargs) for m in self._models]
 
 
 async def test_excluding_one_model_pair_keeps_healthy_sibling_models():
@@ -457,9 +450,7 @@ async def test_excluding_every_model_pair_exhausts_that_provider():
     router = ModelRouter(reg)
 
     with pytest.raises(ModelUnavailable):
-        await router.select(
-            exclude=frozenset({("megaprov", "model-a"), ("megaprov", "model-b")})
-        )
+        await router.select(exclude=frozenset({("megaprov", "model-a"), ("megaprov", "model-b")}))
 
 
 async def test_bare_provider_name_still_excludes_the_whole_provider():

@@ -99,8 +99,7 @@ async def test_response_frames_keep_advanced_machinery_dormant(make_service):
         assert "CapabilityRequested" not in types
         assert "CapabilityCompleted" not in types
         assert not any(
-            event_type.startswith(("Synthesis", "Workflow", "Delegation"))
-            for event_type in types
+            event_type.startswith(("Synthesis", "Workflow", "Delegation")) for event_type in types
         )
 
 

@@ -284,16 +284,67 @@ _CONTINUATION_PHRASES = (
 )
 _TARGET_TERMS = frozenset(
     {
-        "artifact", "artifacts", "app", "application", "branch", "command", "config",
-        "configuration", "data", "directory", "diff", "docs", "documentation", "file",
-        "files", "folder", "git", "issue", "job", "log", "logs", "meeting", "message",
-        "output", "path", "problem", "project", "release", "report", "repo", "repository",
-        "result", "results", "source", "sources", "status", "task", "test", "tests",
-        "workspace", "workflow", "pipeline", "database", "record", "table", "email", "evidence",
+        "artifact",
+        "artifacts",
+        "app",
+        "application",
+        "branch",
+        "command",
+        "config",
+        "configuration",
+        "data",
+        "directory",
+        "diff",
+        "docs",
+        "documentation",
+        "file",
+        "files",
+        "folder",
+        "git",
+        "issue",
+        "job",
+        "log",
+        "logs",
+        "meeting",
+        "message",
+        "output",
+        "path",
+        "problem",
+        "project",
+        "release",
+        "report",
+        "repo",
+        "repository",
+        "result",
+        "results",
+        "source",
+        "sources",
+        "status",
+        "task",
+        "test",
+        "tests",
+        "workspace",
+        "workflow",
+        "pipeline",
+        "database",
+        "record",
+        "table",
+        "email",
+        "evidence",
         # Code-unit nouns: a referential construction naming one ("this
         # function", "that method") points at observable source state.
-        "function", "functions", "method", "methods", "module", "modules",
-        "class", "classes", "library", "libraries", "package", "packages",
+        "function",
+        "functions",
+        "method",
+        "methods",
+        "module",
+        "modules",
+        "class",
+        "classes",
+        "library",
+        "libraries",
+        "package",
+        "packages",
     }
 )
 
@@ -368,35 +419,101 @@ def resolve_turn_intent(objective: str) -> TurnIntent:
         )
 
     creative = terms & {"poem", "poetry", "story", "haiku", "names", "name", "joke", "slogan"}
-    if creative and terms & {"create", "generate", "write", "make"} and not terms & {
-        "file", "files", "save", "persist", "repo", "repository", "workspace", "artifact"
-    }:
+    if (
+        creative
+        and terms & {"create", "generate", "write", "make"}
+        and not terms
+        & {"file", "files", "save", "persist", "repo", "repository", "workspace", "artifact"}
+    ):
         return TurnIntent(RESPONSE, False, "creative generation is a response artifact")
 
     target = bool(_PERSISTENT_TARGET.search(raw) or terms & _TARGET_TERMS)
     if terms & {"run", "execute", "exec", "pytest", "test", "tests"} and not terms & {
-        "fix", "edit", "patch", "write", "create", "delete", "change", "modify", "update"
+        "fix",
+        "edit",
+        "patch",
+        "write",
+        "create",
+        "delete",
+        "change",
+        "modify",
+        "update",
     }:
         # A question such as "what happens when I run pytest?" was handled by
         # the response frame above; bare imperatives are execution requests.
         return TurnIntent(EXECUTION, True, "explicit execution/test frame")
     if terms & {"send", "schedule", "notify", "email", "deploy", "publish"} and target:
         return TurnIntent(EXTERNAL_ACTION, True, "explicit external side-effect frame")
-    if terms & {
-        "create", "delete", "remove", "edit", "fix", "patch", "write", "save", "persist",
-        "change", "modify", "update", "apply", "build", "make", "move", "set", "compose",
-        "commit",
-    } and target:
+    if (
+        terms
+        & {
+            "create",
+            "delete",
+            "remove",
+            "edit",
+            "fix",
+            "patch",
+            "write",
+            "save",
+            "persist",
+            "change",
+            "modify",
+            "update",
+            "apply",
+            "build",
+            "make",
+            "move",
+            "set",
+            "compose",
+            "commit",
+        }
+        and target
+    ):
         return TurnIntent(MUTATION, True, "explicit persistent mutation frame")
     if "set" in terms and "then" in terms:
         if terms & {"read", "inspect", "show", "check"}:
             return TurnIntent(EXECUTION, True, "sequenced state execution frame")
         return TurnIntent(MUTATION, True, "sequenced state mutation frame")
-    if terms & {"read", "inspect", "open", "show", "list", "check", "view", "research", "search", "compare"} and target:
+    if (
+        terms
+        & {
+            "read",
+            "inspect",
+            "open",
+            "show",
+            "list",
+            "check",
+            "view",
+            "research",
+            "search",
+            "compare",
+        }
+        and target
+    ):
         return TurnIntent(OBSERVATION, True, "explicit observation frame")
 
     if _IMPERATIVE_FRAME.search(raw):
-        if terms & {"create", "delete", "remove", "edit", "fix", "patch", "write", "save", "persist", "change", "modify", "update", "apply", "build", "make", "move", "set", "compose", "commit"}:
+        if terms & {
+            "create",
+            "delete",
+            "remove",
+            "edit",
+            "fix",
+            "patch",
+            "write",
+            "save",
+            "persist",
+            "change",
+            "modify",
+            "update",
+            "apply",
+            "build",
+            "make",
+            "move",
+            "set",
+            "compose",
+            "commit",
+        }:
             return TurnIntent(MUTATION, True, "imperative mutation frame")
         if terms & {"run", "execute", "exec", "pytest", "test", "tests"}:
             return TurnIntent(EXECUTION, True, "imperative execution frame")
@@ -438,9 +555,7 @@ def is_explicit_response_turn(objective: str) -> bool:
     tool-eligible — surface grammar like a leading "what" or "why" is never
     authority on its own.
     """
-    return (
-        resolve_turn_intent(objective).channel == DEFINITELY_RESPONSE_ONLY
-    )
+    return resolve_turn_intent(objective).channel == DEFINITELY_RESPONSE_ONLY
 
 
 def _names_observable_state(raw: str, terms: set[str]) -> bool:
@@ -457,9 +572,7 @@ def _names_observable_state(raw: str, terms: set[str]) -> bool:
         return True
     if terms & _WORKSPACE_STRONG_TERMS:
         return True
-    if _REFERENTIAL_CONSTRUCTION.search(raw) and terms & (
-        _TARGET_TERMS | _WORKSPACE_WEAK_TERMS
-    ):
+    if _REFERENTIAL_CONSTRUCTION.search(raw) and terms & (_TARGET_TERMS | _WORKSPACE_WEAK_TERMS):
         return True
     if terms & _SESSION_PAST_TERMS:
         return True
@@ -478,9 +591,21 @@ def _is_definitely_response_only(raw: str, text: str, terms: set[str]) -> bool:
         or _RESPONSE_CONDITIONAL.search(raw)
         or _COMPARE_RESPONSE.search(raw)
         or _QUESTION_FRAME.search(raw)
-        or terms & {
-            "hi", "hello", "hey", "thanks", "thank", "goodbye", "bye",
-            "joke", "poem", "poetry", "story", "haiku", "recursion",
+        or terms
+        & {
+            "hi",
+            "hello",
+            "hey",
+            "thanks",
+            "thank",
+            "goodbye",
+            "bye",
+            "joke",
+            "poem",
+            "poetry",
+            "story",
+            "haiku",
+            "recursion",
         }
         or _SMALL_TALK.search(text)
     )
@@ -549,7 +674,18 @@ def _intent_from_action_terms(terms: set[str], *, target: bool) -> TurnIntent:
         return TurnIntent(EXECUTION, True, "imperative execution override")
     if terms & {"send", "schedule", "notify", "email", "deploy", "publish"}:
         return TurnIntent(EXTERNAL_ACTION, True, "imperative external-action override")
-    if target or terms & {"fix", "edit", "patch", "write", "create", "delete", "change", "make", "set", "compose"}:
+    if target or terms & {
+        "fix",
+        "edit",
+        "patch",
+        "write",
+        "create",
+        "delete",
+        "change",
+        "make",
+        "set",
+        "compose",
+    }:
         return TurnIntent(MUTATION, True, "imperative mutation override")
     return TurnIntent(OBSERVATION, True, "imperative observation override")
 

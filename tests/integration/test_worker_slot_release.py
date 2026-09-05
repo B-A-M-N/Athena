@@ -36,9 +36,7 @@ def _config(scripts, parked_slot_wait_s: float = 1.0) -> AthenaConfig:
         db_path=":memory:",
         workspace_root=tmp,
         artifact_root=os.path.join(tmp, "artifacts"),
-        providers=(
-            ProviderConfig(kind="fake", name="fake", extra={"scripts": scripts}),
-        ),
+        providers=(ProviderConfig(kind="fake", name="fake", extra={"scripts": scripts}),),
         parked_slot_wait_s=parked_slot_wait_s,
     )
 

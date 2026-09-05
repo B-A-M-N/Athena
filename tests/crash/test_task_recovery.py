@@ -66,8 +66,14 @@ async def test_running_task_becomes_interrupted_on_hard_stop(make_durable_servic
 
     # Restart on the same DB; the background worker reclaims the INTERRUPTED
     # task (claim_statuses includes INTERRUPTED) and drives it to COMPLETE.
+    # The resume leg waits on a scheduler tick, reclaim, and a real execute
+    # round-trip (~3-4s observed standalone); the budget absorbs scheduler
+    # and load jitter without weakening the assertion.
     svc2 = await make_durable_service(durable_db_path, scripts=None)
-    assert await _wait_status(svc2, task.id, TaskStatus.COMPLETE.value) == TaskStatus.COMPLETE.value
+    assert (
+        await _wait_status(svc2, task.id, TaskStatus.COMPLETE.value, tries=1500)
+        == TaskStatus.COMPLETE.value
+    )
 
 
 @pytest.mark.athena_claim("BHV-079")
@@ -88,8 +94,12 @@ async def test_queued_task_survives_restart(make_durable_service, durable_db_pat
     await svc1.stop()
 
     # Restart with a live worker; the queued task is picked up and completes.
+    # Same resume-leg budget rationale as RECOVERY-002 above.
     svc2 = await make_durable_service(durable_db_path, scripts=None)
-    assert await _wait_status(svc2, task.id, TaskStatus.COMPLETE.value) == TaskStatus.COMPLETE.value
+    assert (
+        await _wait_status(svc2, task.id, TaskStatus.COMPLETE.value, tries=1500)
+        == TaskStatus.COMPLETE.value
+    )
 
 
 @pytest.mark.athena_claim("BHV-079")

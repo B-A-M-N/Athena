@@ -135,9 +135,7 @@ def test_all_effect_subsets_are_monotonic_pairwise():
     )
     # The empty set is the fail-closed sentinel (no rule basis to allow),
     # not an authorization point; the property governs resolved effects.
-    subsets = [
-        frozenset(s) for s in _all_effect_subsets(universe) if s
-    ]
+    subsets = [frozenset(s) for s in _all_effect_subsets(universe) if s]
     verdicts = {
         tuple(sorted(e.value for e in s)): _verdict(
             engine, _req("generic.cap", s, {"path": "/tmp/ws/a"})
@@ -243,9 +241,7 @@ def test_service_mutations_deny_for_privileged_even_under_autonomous():
     for op in ("start", "stop", "restart"):
         effects = _operation_effects("service", op)
         assert EffectClass.PRIVILEGED in effects, op
-        decision = engine.evaluate(
-            _req("service", effects, {"operation": op})
-        )
+        decision = engine.evaluate(_req("service", effects, {"operation": op}))
         assert decision.decision.value == "deny", op
 
 
@@ -280,8 +276,6 @@ def test_generated_host_call_inherits_parent_effect_ceiling():
     from athena.capabilities.registry import CapabilityRegistry
     from athena.protocol.capabilities import CapabilityRequest
 
-    from athena.protocol.tasks import CapabilityPolicy
-
     class _Exec:
         def __init__(self, descriptor):
             self.descriptor = descriptor
@@ -302,9 +296,7 @@ def test_generated_host_call_inherits_parent_effect_ceiling():
         id="gen.host",
         description="generated host call",
         input_schema={"allow_extra": True, "properties": {}},
-        effects=frozenset(
-            {EffectClass.READ_LOCAL, EffectClass.NETWORK_WRITE}
-        ),
+        effects=frozenset({EffectClass.READ_LOCAL, EffectClass.NETWORK_WRITE}),
     )
     reg = CapabilityRegistry()
     reg.register(_Exec(descriptor))
@@ -319,9 +311,7 @@ def test_generated_host_call_inherits_parent_effect_ceiling():
         dispatcher.dispatch(
             request,
             workspace=_WS,
-            _directives=DispatchDirectives(
-                inherited_effects=frozenset({EffectClass.READ_LOCAL})
-            ),
+            _directives=DispatchDirectives(inherited_effects=frozenset({EffectClass.READ_LOCAL})),
         )
     )
     # The operation resolves to READ_LOCAL only, inside the inherited
@@ -438,9 +428,7 @@ def test_grant_effect_envelope_rejects_wider_effect_sets():
     )
     manager.grant(aid)
 
-    same = engine.evaluate(
-        _req("dependency", approved_effects, {"operation": "install"})
-    )
+    same = engine.evaluate(_req("dependency", approved_effects, {"operation": "install"}))
     assert same.decision.value == "allow"
 
     wider = engine.evaluate(

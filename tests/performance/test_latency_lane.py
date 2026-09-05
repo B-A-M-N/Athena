@@ -27,11 +27,7 @@ from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskStatus
 
 async def _model_request_events(svc, task_id: str) -> list[dict]:
     events = [e async for e in svc.stream_events(task_id)]
-    return [
-        dict(e.payload or {})
-        for e in events
-        if e.type == "ModelRequestStarted"
-    ]
+    return [dict(e.payload or {}) for e in events if e.type == "ModelRequestStarted"]
 
 
 def _primary_calls(payloads: list[dict]) -> int:

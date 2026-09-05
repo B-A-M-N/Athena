@@ -61,9 +61,7 @@ async def _watch_owner(svc, task_id, violations: list[str], stop: asyncio.Event)
 
 @pytest.mark.athena_claim("BHV-080")
 @pytest.mark.athena_evidence("test", "e2e")
-async def test_task_outliving_lease_keeps_single_owner(
-    make_durable_service, durable_db_path
-):
+async def test_task_outliving_lease_keeps_single_owner(make_durable_service, durable_db_path):
     """A task running longer than its worker lease is NOT stolen mid-run.
 
     The lease duration is set well below the task's execution time; with no
@@ -110,9 +108,7 @@ async def test_task_outliving_lease_keeps_single_owner(
 
 
 @pytest.mark.athena_evidence("test", "e2e")
-async def test_ownership_survives_concurrent_competing_pool(
-    make_durable_service, durable_db_path
-):
+async def test_ownership_survives_concurrent_competing_pool(make_durable_service, durable_db_path):
     """A second TaskWorker racing the same store cannot double-run a task.
 
     Both pools claim through the same durable rows; the lease CAS plus the

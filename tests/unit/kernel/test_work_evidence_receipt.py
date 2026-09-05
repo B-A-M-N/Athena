@@ -6,7 +6,7 @@ metadata, the evidence classifier prefers them over name heuristics.
 
 from __future__ import annotations
 
-from athena.kernel.termination import result_qualifies_as_work_evidence, WorkEvidence
+from athena.kernel.termination import result_qualifies_as_work_evidence
 from athena.strategy import EXECUTION, MUTATION, OBSERVATION, EXTERNAL_ACTION
 
 

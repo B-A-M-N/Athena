@@ -136,9 +136,7 @@ def source_for_context(scope: str, trust: TrustClass) -> str:
         return "project_instruction"
     if trust is TrustClass.USER_CONTENT:
         return (
-            "established_session_instruction"
-            if scope == "session"
-            else "explicit_user_instruction"
+            "established_session_instruction" if scope == "session" else "explicit_user_instruction"
         )
     if trust is TrustClass.EXTERNAL_CONTENT:
         return "retrieved_context"

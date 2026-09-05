@@ -124,7 +124,9 @@ class TestGeneratedSourceContract:
         __HOST__ protocol exists, and the host re-checks authority."""
         from athena.synthesis.engine import _child_code
 
-        program = _child_code(repr("def run(args):\n    return athena.call('fs', {'operation': 'read'})\n"))
+        program = _child_code(
+            repr("def run(args):\n    return athena.call('fs', {'operation': 'read'})\n")
+        )
         # The only host surface is the framed IPC protocol; no dispatcher,
         # registry, or store object is in the child namespace.
         for banned in ("dispatcher", "registry", "task_store", "message_store"):

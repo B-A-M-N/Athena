@@ -25,11 +25,10 @@ compiled object can never authorize what the live authority would refuse.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from athena.policy.profiles import profile_ruleset
 from athena.policy.rules import RuleSet
-from athena.protocol.capabilities import EffectClass
 from athena.protocol.tasks import AutonomyLevel, CapabilityPolicy, WorkspaceSpec
 
 _SEP = os.sep
@@ -101,9 +100,7 @@ class PolicySnapshot:
             and self.workspace_root_raw == workspace.root
             and self.network_policy == workspace.network_policy
             and self.writable_rules == _rule_paths(workspace.writable)
-            and self.readable_rules == _rule_paths(
-                workspace.readable or workspace.writable
-            )
+            and self.readable_rules == _rule_paths(workspace.readable or workspace.writable)
         )
 
 
@@ -217,9 +214,9 @@ def _canonical_rule(pattern: str) -> str:
                 # "/tmp/ws/" canonicalized as the directory "/tmp/ws", then
                 # + "/**".
                 cut_at = i - 1 if (i > 0 and text[i - 1] == "/") else i
-                canonical_dir = os.path.realpath(
-                    os.path.abspath(text[:cut_at] or "/")
-                ).rstrip("/\\")
+                canonical_dir = os.path.realpath(os.path.abspath(text[:cut_at] or "/")).rstrip(
+                    "/\\"
+                )
                 return canonical_dir + text[cut_at:]
         return text
     return os.path.realpath(os.path.abspath(text))

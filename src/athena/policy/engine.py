@@ -99,9 +99,7 @@ class PolicyEngine:
         # ---- 2. per-effect profile verdicts, combined monotonically ------ #
         combined, reasons = self._eval_effects(request, rules)
         if combined is PolicyVerdict.DENY:
-            return PolicyDecision(
-                PolicyVerdict.DENY, "; ".join(reasons), None, ()
-            )
+            return PolicyDecision(PolicyVerdict.DENY, "; ".join(reasons), None, ())
 
         # ---- 3. approval converts ASK -> ALLOW only ---------------------- #
         if combined is PolicyVerdict.ASK:
@@ -141,28 +139,26 @@ class PolicyEngine:
         # defense in depth, but PolicyEngine is the authority — a third-party
         # native/generated/MCP capability must not need to rediscover the
         # workspace's hard network boundary on its own.
-        if (
-            request.workspace.network_policy == NetworkPolicy.DENY
-            and effects
-            & {
-                EffectClass.NETWORK_READ,
-                EffectClass.NETWORK_WRITE,
-            }
-        ):
+        if request.workspace.network_policy == NetworkPolicy.DENY and effects & {
+            EffectClass.NETWORK_READ,
+            EffectClass.NETWORK_WRITE,
+        }:
             return _deny("network denied: workspace network_policy is DENY")
 
-        execute_bearing = (
-            EffectClass.EXECUTE in effects or EffectClass.SPAWN_PROCESS in effects
-        )
+        execute_bearing = EffectClass.EXECUTE in effects or EffectClass.SPAWN_PROCESS in effects
 
         # WRITE_LOCAL / DELETE target concrete filesystem paths unless the
         # capability operates on Athena state rather than files (declared by
         # the pathless-write classification). EXECUTE-bearing calls resolve
         # their cwd/path through the execute containment check instead.
-        if (EffectClass.WRITE_LOCAL in effects or EffectClass.DELETE in effects) and not execute_bearing:
+        if (
+            EffectClass.WRITE_LOCAL in effects or EffectClass.DELETE in effects
+        ) and not execute_bearing:
             if request.capability_id == "database":
                 if not self._database_within(request, snapshot):
-                    return _deny(f"database outside writable scope: {request.arguments.get('path')}")
+                    return _deny(
+                        f"database outside writable scope: {request.arguments.get('path')}"
+                    )
             elif request.arguments.get("path") or request.arguments.get("resource"):
                 out = (
                     self._eval_write(request, snapshot)
@@ -195,7 +191,9 @@ class PolicyEngine:
                 return out
         return None
 
-    def _eval_effects(self, request: PolicyRequest, rules: RuleSet) -> tuple[PolicyVerdict, list[str]]:
+    def _eval_effects(
+        self, request: PolicyRequest, rules: RuleSet
+    ) -> tuple[PolicyVerdict, list[str]]:
         """Evaluate every resolved effect independently and combine strictly.
 
         Each effect is evaluated against the rule set as a SINGLETON effect
@@ -223,9 +221,7 @@ class PolicyEngine:
         if not verdicts:
             hit = rules.evaluate(request.capability_id, frozenset(), dict(request.arguments))
             if hit is None:
-                verdicts = [
-                    (_verdict(rules.default), "no resolved effects; profile default")
-                ]
+                verdicts = [(_verdict(rules.default), "no resolved effects; profile default")]
             else:
                 verdicts = [(_verdict(hit[0]), f"rule {hit[1]}")]
         combined = max((v for v, _ in verdicts), key=_STRICTNESS_RANK.__getitem__)
@@ -292,10 +288,11 @@ class PolicyEngine:
         # arbitrary code is network-confined.  The shadow backend is allowed
         # through only because its runtime contract invokes the fail-closed
         # namespace sandbox with a private network namespace.
-        if (
-            req.workspace.network_policy == NetworkPolicy.DENY
-            and req.execution_backend not in {"shadow", "sandbox", "sandboxed-local"}
-        ):
+        if req.workspace.network_policy == NetworkPolicy.DENY and req.execution_backend not in {
+            "shadow",
+            "sandbox",
+            "sandboxed-local",
+        }:
             return _deny("execute denied: workspace network_policy is DENY")
         if self._out_of_workspace(req, snapshot) and not (
             level is not None and _execute_granted(level, req)
@@ -383,9 +380,7 @@ class PolicyEngine:
         if not cwd or not os.path.isabs(str(cwd)):
             return False
         target = self._abs(str(cwd), req.workspace)
-        return not self._within(
-            target, req.workspace, snapshot=snapshot, writable_only=True
-        )
+        return not self._within(target, req.workspace, snapshot=snapshot, writable_only=True)
 
     def _is_files_op(self, req, ops) -> bool:
         if req.capability_id not in ("files", "fs"):

@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from athena.protocol.errors import IllegalStateTransition, TaskOwnershipLost
+from athena.protocol.errors import IllegalStateTransition
 from athena.protocol.tasks import TaskStatus
 from athena.state.database import Database
 from athena.state.tasks import TaskStore
@@ -86,13 +86,11 @@ async def test_renew_lease_adopts_unowned_running_task_exactly_once():
         # Simulate the WAITING_* -> RUNNING resume: status RUNNING, lease
         # cleared by the park path.
         await store.transition("t1", TaskStatus.WAITING_INPUT)
-        import sqlite3
 
         raw = db._conn  # noqa: SLF001 - test reach into the sync handle
+
         def _force_running() -> None:
-            raw._connection.execute(
-                "UPDATE tasks SET status = 'RUNNING' WHERE id = 't1'"
-            )
+            raw._connection.execute("UPDATE tasks SET status = 'RUNNING' WHERE id = 't1'")
             raw._connection.commit()
 
         await raw._call(_force_running)

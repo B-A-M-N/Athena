@@ -102,8 +102,9 @@ async def test_empty_messages_produce_no_blocks():
 @pytest.mark.athena_evidence("test", "unit")
 async def test_ambiguous_name_requires_connection_id():
     a = _FakeClient("a", prompts=[_ref("dup", "a")])
-    b = _FakeClient("b", prompts=[_ref("dup", "b")],
-                    messages=[MCPMessage(role="user", text="b's version")])
+    b = _FakeClient(
+        "b", prompts=[_ref("dup", "b")], messages=[MCPMessage(role="user", text="b's version")]
+    )
     provider = MCPPromptProvider({"a": a, "b": b})
 
     with pytest.raises(LookupError):
@@ -153,7 +154,8 @@ class _FakeSession:
         return SimpleNamespace(
             messages=[
                 # SDK content is a LIST of typed blocks per message.
-                SimpleNamespace(role=m["role"], content=[c]) for m, c in self._messages
+                SimpleNamespace(role=m["role"], content=[c])
+                for m, c in self._messages
             ]
         )
 

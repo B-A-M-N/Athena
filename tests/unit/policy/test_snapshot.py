@@ -94,16 +94,15 @@ def test_snapshot_verdicts_identical_to_fresh_engine():
     for size in (1, 2, 4):
         for combo in itertools.combinations(universe, size):
             request = _req("generic.cap", combo, {"path": "/tmp/ws/a"})
-            assert (
-                cold.evaluate(request).decision
-                == warm.evaluate(request).decision
-            ), combo
+            assert cold.evaluate(request).decision == warm.evaluate(request).decision, combo
 
 
 def test_repeated_evaluation_is_stable_across_cache_hits():
     engine = PolicyEngine(AutonomyLevel.SUPERVISED)
     first = engine.evaluate(
-        _req("dependency", {EffectClass.EXECUTE, EffectClass.NETWORK_WRITE}, {"operation": "install"})
+        _req(
+            "dependency", {EffectClass.EXECUTE, EffectClass.NETWORK_WRITE}, {"operation": "install"}
+        )
     ).decision
     for _ in range(5):
         again = engine.evaluate(

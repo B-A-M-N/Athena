@@ -8,7 +8,6 @@ not the effects arbitrary code can actually perform.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 from athena.capabilities.dispatcher import CapabilityDispatcher
@@ -25,7 +24,6 @@ from athena.protocol.capabilities import (
     InvocationContext,
 )
 from athena.protocol.tasks import (
-    AutonomyLevel,
     MutationMode,
     NetworkPolicy,
     WorkspaceSpec,
@@ -290,9 +288,11 @@ def test_is_opaque_execution_classifies_correctly():
     """Unit-level classification of opaque execution."""
     from athena.reality.gate import RealityGate
 
-    ws = WorkspaceSpec(id="w", root="/tmp")
     desc = CapabilityDescriptor(
-        id="x", description="d", input_schema={}, effects=frozenset(),
+        id="x",
+        description="d",
+        input_schema={},
+        effects=frozenset(),
         origin=CapabilityOrigin.NATIVE,
     )
     assert RealityGate._is_opaque_execution(
@@ -309,7 +309,10 @@ def test_is_opaque_execution_classifies_correctly():
         CapabilityRequest(capability_id="gen.run", arguments={}, task_id="t", call_id="c"),
         frozenset({EffectClass.READ_LOCAL}),
         CapabilityDescriptor(
-            id="gen.run", description="d", input_schema={}, effects=frozenset(),
+            id="gen.run",
+            description="d",
+            input_schema={},
+            effects=frozenset(),
             origin=CapabilityOrigin.GENERATED,
         ),
     )

@@ -1124,8 +1124,7 @@ class AthenaService:
             else:
                 if outcome.get("runtime_failures") or outcome.get("sessions_remaining"):
                     _logger.warning(
-                        "execution shutdown incomplete: %d runtime failures, "
-                        "%d sessions remaining",
+                        "execution shutdown incomplete: %d runtime failures, %d sessions remaining",
                         len(outcome.get("runtime_failures", ())),
                         len(outcome.get("sessions_remaining", ())),
                     )
@@ -1372,9 +1371,7 @@ class AthenaService:
             try:
                 pending = await input_requests.pending_resumable(task_id)
             except Exception as exc:
-                _logger.warning(
-                    "input-request resumable lookup failed for %s: %s", task_id, exc
-                )
+                _logger.warning("input-request resumable lookup failed for %s: %s", task_id, exc)
                 continue
             if pending is None:
                 continue
@@ -1383,15 +1380,11 @@ class AthenaService:
                     task_id, TaskStatus.RUNNING, reason="resume answered input request"
                 )
             except Exception as exc:
-                _logger.warning(
-                    "cannot resume WAITING_INPUT task %s: %s", task_id, exc
-                )
+                _logger.warning("cannot resume WAITING_INPUT task %s: %s", task_id, exc)
                 continue
             recovery = asyncio.create_task(kernel.run_task(task_id))
             self._approval_recovery_tasks.add(recovery)
-            recovery.add_done_callback(
-                self._log_background_failure(f"input-recovery {task_id}")
-            )
+            recovery.add_done_callback(self._log_background_failure(f"input-recovery {task_id}"))
 
     # ------------------------------------------------------------------ #
     # Application API
@@ -2679,9 +2672,7 @@ class AthenaService:
             await self._task_manager.transition(task_id, TaskStatus.RUNNING)
             relaunch = asyncio.create_task(kernel.run_task(task_id))
             self._approval_recovery_tasks.add(relaunch)
-            relaunch.add_done_callback(
-                self._log_background_failure(f"input relaunch {task_id}")
-            )
+            relaunch.add_done_callback(self._log_background_failure(f"input relaunch {task_id}"))
 
     async def approve(self, approval_id: str, *, granted: bool, scope: str | None = None) -> None:
         """Resolve a pending approval and wake the parked task, if any.
@@ -4682,9 +4673,7 @@ class AthenaService:
                     "computer capability unavailable: install the 'computer' extra (pyautogui)"
                 )
             if self.config.browser_driver_factory is not None:
-                self._browser = BrowserCapability(
-                    driver_factory=self.config.browser_driver_factory
-                )
+                self._browser = BrowserCapability(driver_factory=self.config.browser_driver_factory)
                 registry.register(self._browser)
             else:
                 _logger.info(

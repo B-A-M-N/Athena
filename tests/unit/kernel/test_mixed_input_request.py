@@ -11,6 +11,7 @@ from __future__ import annotations
 def test_mixed_calls_all_get_results():
     """When request_input co-occurs with other calls, the other calls must
     receive a 'suspended for operator clarification' result."""
+
     # Simulate model response with both request_input and fs.read
     class MockCall:
         def __init__(self, call_id, capability_id):
@@ -86,7 +87,7 @@ async def test_dispatch_path_appends_suspended_results(tmp_path):
     # Create a task
     from athena.protocol.tasks import AgentRequest, AutonomyLevel
 
-    task = await service.submit(
+    await service.submit(
         AgentRequest(
             prompt="test mixed calls",
             autonomy=AutonomyLevel.SUPERVISED,

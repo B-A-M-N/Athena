@@ -70,9 +70,23 @@ _CONTROL_CAPABILITIES = frozenset(
         "workflow.list",
     }
 )
-_READ_OPERATIONS = frozenset({"read", "list", "stat", "get", "exists", "open", "diff", "status", "inspect"})
+_READ_OPERATIONS = frozenset(
+    {"read", "list", "stat", "get", "exists", "open", "diff", "status", "inspect"}
+)
 _MUTATION_OPERATIONS = frozenset(
-    {"write", "patch", "mkdir", "copy", "move", "delete", "remove", "update", "create", "apply", "save"}
+    {
+        "write",
+        "patch",
+        "mkdir",
+        "copy",
+        "move",
+        "delete",
+        "remove",
+        "update",
+        "create",
+        "apply",
+        "save",
+    }
 )
 
 
@@ -100,10 +114,7 @@ def result_qualifies_as_work_evidence(
     metadata = dict(getattr(result, "metadata", None) or {})
     arguments = dict(getattr(call, "arguments", None) or {})
     operation = str(
-        arguments.get("operation")
-        or arguments.get("action")
-        or metadata.get("operation")
-        or ""
+        arguments.get("operation") or arguments.get("action") or metadata.get("operation") or ""
     ).casefold()
     if capability_id.startswith("capabilities."):
         return None
@@ -133,10 +144,14 @@ def result_qualifies_as_work_evidence(
     mutation_ref = None
     if isinstance(mutation, dict):
         mutation_ref = str(mutation.get("mutation_id") or mutation.get("id") or "") or None
-    mutation_ref = mutation_ref or str(
-        metadata.get("mutation_ref") or metadata.get("mutation_id") or ""
-    ) or None
-    artifact_ref = str(getattr(result, "ref_uri", None) or metadata.get("artifact_uri") or "") or None
+    mutation_ref = (
+        mutation_ref
+        or str(metadata.get("mutation_ref") or metadata.get("mutation_id") or "")
+        or None
+    )
+    artifact_ref = (
+        str(getattr(result, "ref_uri", None) or metadata.get("artifact_uri") or "") or None
+    )
     receipt = metadata.get("external_receipt") or metadata.get("receipt_id")
     external_receipt = str(receipt) if receipt else None
 
@@ -161,9 +176,11 @@ def result_qualifies_as_work_evidence(
             kind = "artifact"
         else:
             kind = OBSERVATION
-    elif capability_id in {"execute", "shell", "process"} or capability_leaf in {
-        "execute", "shell", "process"
-    } or operation in {"run", "exec", "execute", "pytest"}:
+    elif (
+        capability_id in {"execute", "shell", "process"}
+        or capability_leaf in {"execute", "shell", "process"}
+        or operation in {"run", "exec", "execute", "pytest"}
+    ):
         kind = EXECUTION
     elif operation in _MUTATION_OPERATIONS or mutation_ref is not None:
         kind = MUTATION
@@ -185,7 +202,10 @@ def result_qualifies_as_work_evidence(
         artifact_ref=artifact_ref,
         external_receipt=external_receipt,
     )
-    if required_kind is not None and required_kind not in {kind, "artifact" if artifact_ref else kind}:
+    if required_kind is not None and required_kind not in {
+        kind,
+        "artifact" if artifact_ref else kind,
+    }:
         return None
     return evidence
 
@@ -359,9 +379,7 @@ class TerminationEvaluator:
         if completion_mode == OBSERVABLE_WORK_REQUIRED and not (
             observed_work
             or verified_criteria_sufficient
-            or work_evidence_satisfies(
-                work_evidence, task=task, completion_mode=completion_mode
-            )
+            or work_evidence_satisfies(work_evidence, task=task, completion_mode=completion_mode)
         ):
             return TerminationDecision(
                 terminal=True,

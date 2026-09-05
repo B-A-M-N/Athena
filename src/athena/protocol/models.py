@@ -41,9 +41,9 @@ class ModelQualityTier(str, enum.Enum):
     only binds declared models.
     """
 
-    ECONOMY = "economy"      # cheap conversational / high-volume utility tier
-    STANDARD = "standard"    # ordinary work tier
-    FRONTIER = "frontier"    # strongest reasoning / coding / agentic tier
+    ECONOMY = "economy"  # cheap conversational / high-volume utility tier
+    STANDARD = "standard"  # ordinary work tier
+    FRONTIER = "frontier"  # strongest reasoning / coding / agentic tier
     UNDECLARED = "undeclared"
 
     @property

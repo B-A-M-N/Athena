@@ -71,7 +71,9 @@ async def test_schedule_capability_defaults_to_fresh_sessions():
         def __init__(self):
             self.jobs = {}
 
-        async def upsert_job(self, job_id, name, *, payload, trigger_spec, enabled, next_run, metadata=None):
+        async def upsert_job(
+            self, job_id, name, *, payload, trigger_spec, enabled, next_run, metadata=None
+        ):
             self.jobs[job_id] = {
                 "id": job_id,
                 "name": name,
@@ -129,7 +131,9 @@ async def test_schedule_capability_persistent_session_opt_in():
         def __init__(self):
             self.jobs = {}
 
-        async def upsert_job(self, job_id, name, *, payload, trigger_spec, enabled, next_run, metadata=None):
+        async def upsert_job(
+            self, job_id, name, *, payload, trigger_spec, enabled, next_run, metadata=None
+        ):
             self.jobs[job_id] = {"id": job_id, "payload": payload, "metadata": metadata or {}}
 
         async def list_jobs(self, enabled_only=True):

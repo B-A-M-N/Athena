@@ -151,6 +151,19 @@ class CompiledContext:
 
 
 @dataclass(frozen=True)
+class _MemoryCacheKey:
+    """Cache key for memory retrieval results.
+
+    Named (not a bare tuple) so future key-component changes surface as
+    type errors instead of silently colliding tuple shapes.
+    """
+
+    task_id: str
+    mode: str
+    store_generation: int
+
+
+@dataclass(frozen=True)
 class _Entry:
     """Internal representation of one context element before final render."""
 
@@ -218,10 +231,28 @@ class MemoryRetrievalMode(str, enum.Enum):
 # narrow: staging only downgrades the DEFAULT, never suppresses an explicit
 # reference.
 _EXPLICIT_MEMORY_TOKENS = {
-    "remember", "recall", "memory", "memories", "preference", "preferences",
-    "favorite", "usual", "previously", "earlier", "decide", "decided",
-    "decision", "chose", "chosen", "said", "discussed", "agreed",
-    "convention", "conventions", "conventionally", "historically",
+    "remember",
+    "recall",
+    "memory",
+    "memories",
+    "preference",
+    "preferences",
+    "favorite",
+    "usual",
+    "previously",
+    "earlier",
+    "decide",
+    "decided",
+    "decision",
+    "chose",
+    "chosen",
+    "said",
+    "discussed",
+    "agreed",
+    "convention",
+    "conventions",
+    "conventionally",
+    "historically",
 }
 
 
@@ -341,7 +372,7 @@ class ContextCompiler:
         self._principal_id = principal_id
         self.capability_limit = max(1, capability_limit)
         self._project_cache: dict[str, tuple[str, tuple[_Entry, ...]]] = {}
-        self._memory_cache: OrderedDict[tuple[str, int], tuple[Any, ...]] = OrderedDict()
+        self._memory_cache: OrderedDict[_MemoryCacheKey, tuple[Any, ...]] = OrderedDict()
         self._static_cache: OrderedDict[tuple[Any, ...], _StaticContext] = OrderedDict()
         # Single-flight registry: prevents duplicate concurrent static-context
         # loads for the same key.  The first caller computes; waiters share.
@@ -489,9 +520,7 @@ class ContextCompiler:
                 trust=TrustClass.AUTHORITY,
                 mandatory=True,
                 cache_zone="stable",
-                provenance=prov(
-                    SourceType.SYSTEM, trust=TrustClass.AUTHORITY, scope="runtime"
-                ),
+                provenance=prov(SourceType.SYSTEM, trust=TrustClass.AUTHORITY, scope="runtime"),
             )
         ]
         objective_text = f"Task objective: {task.objective}" if task.objective else ""
@@ -508,9 +537,7 @@ class ContextCompiler:
                     trust=TrustClass.CONFIGURED_INSTRUCTION,
                     mandatory=True,
                     cache_zone="stable",
-                    provenance=prov(
-                        SourceType.TASK, trust=TrustClass.CONFIGURED_INSTRUCTION
-                    ),
+                    provenance=prov(SourceType.TASK, trust=TrustClass.CONFIGURED_INSTRUCTION),
                 )
             )
         entries.append(
@@ -518,7 +545,7 @@ class ContextCompiler:
                 name="observation:body",
                 text=text,
                 tokens=estimate_tokens(text),
-                role="user",
+                role=Role.USER,
                 category="observation",
                 trust=TrustClass.UNTRUSTED,
                 mandatory=True,
@@ -637,7 +664,7 @@ class ContextCompiler:
         recomputed per turn by design).
         """
         try:
-            static = await self._load_static_context(task)
+            await self._load_static_context(task)
         except Exception:
             # Prefetch must never fail admission: the normal compile path
             # owns error surfacing.
@@ -906,8 +933,7 @@ class ContextCompiler:
             descriptors = [
                 d
                 for d in (result or ())
-                if isinstance(d, CapabilityDescriptor)
-                and capability_id_permitted(d.id, policy)
+                if isinstance(d, CapabilityDescriptor) and capability_id_permitted(d.id, policy)
             ]
             descriptors, records, discovery_state = await self._select_relevant_capabilities(
                 reg,
@@ -1029,9 +1055,7 @@ class ContextCompiler:
         """
         if any(descriptor.id == "capabilities" for descriptor in selected):
             return selected
-        reflection = next(
-            (item for item in descriptors if item.id == "capabilities"), None
-        )
+        reflection = next((item for item in descriptors if item.id == "capabilities"), None)
         if reflection is None:
             return selected
         return [*selected, reflection]
@@ -1053,9 +1077,7 @@ class ContextCompiler:
         bundle: list[CapabilityDescriptor] = []
         for capability_id in needed:
             if capability_id in available:
-                descriptor = next(
-                    (item for item in descriptors if item.id == capability_id), None
-                )
+                descriptor = next((item for item in descriptors if item.id == capability_id), None)
                 if descriptor is not None:
                     bundle.append(descriptor)
         # If the need-scoped bundle matched nothing this workspace exposes
@@ -1070,14 +1092,10 @@ class ContextCompiler:
                         (item for item in descriptors if item.id == capability_id),
                         None,
                     )
-                    if descriptor is not None and all(
-                        item.id != descriptor.id for item in bundle
-                    ):
+                    if descriptor is not None and all(item.id != descriptor.id for item in bundle):
                         bundle.append(descriptor)
         if not any(descriptor.id == "capabilities" for descriptor in bundle):
-            reflection = next(
-                (item for item in descriptors if item.id == "capabilities"), None
-            )
+            reflection = next((item for item in descriptors if item.id == "capabilities"), None)
             if reflection is not None:
                 bundle.append(reflection)
         return bundle
@@ -1224,7 +1242,11 @@ class ContextCompiler:
             return []
         store = self._memory_store
         generation = getattr(store, "generation", None)
-        cache_key = (task.id, mode.value, int(generation)) if isinstance(generation, int) else None
+        cache_key = (
+            _MemoryCacheKey(task.id, mode.value, int(generation))
+            if isinstance(generation, int)
+            else None
+        )
         if cache_key is not None:
             cached = self._memory_cache.get(cache_key)
             if cached is not None:
@@ -1242,9 +1264,7 @@ class ContextCompiler:
             scopes.append((MemoryScope.PROJECT, task.workspace.id if task.workspace else None))
             scopes.append((MemoryScope.GLOBAL, None))
             try:
-                retrieve_scopes = getattr(
-                    store, "retrieve_scopes_weighted", None
-                )
+                retrieve_scopes = getattr(store, "retrieve_scopes_weighted", None)
                 if callable(retrieve_scopes):
                     result = list(
                         await retrieve_scopes(
@@ -1544,35 +1564,89 @@ def _fallback_bundle_ids(objective: str) -> tuple[str, ...]:
     tokens = set(re.findall(r"[a-z0-9]+", str(objective or "").casefold()))
     # Debug / test / fix work: inspect plus run plus verify.
     if tokens & {
-        "debug", "fix", "failing", "failure", "broken", "crash", "crashed",
-        "error", "errors", "bug", "regression", "test", "tests", "pytest",
-        "lint", "traceback", "stack", "trace",
+        "debug",
+        "fix",
+        "failing",
+        "failure",
+        "broken",
+        "crash",
+        "crashed",
+        "error",
+        "errors",
+        "bug",
+        "regression",
+        "test",
+        "tests",
+        "pytest",
+        "lint",
+        "traceback",
+        "stack",
+        "trace",
     }:
         return ("fs", "execute", "diagnostics", "git", "capabilities")
     # Commit / branch / history work: git plus the filesystem.
     if tokens & {
-        "commit", "branch", "merge", "rebase", "push", "pull", "git",
-        "changelog", "blame", "revert", "tag", "stash",
+        "commit",
+        "branch",
+        "merge",
+        "rebase",
+        "push",
+        "pull",
+        "git",
+        "changelog",
+        "blame",
+        "revert",
+        "tag",
+        "stash",
     }:
         return ("git", "fs", "capabilities")
     # Recalled / referential context: durable memory, session search, plus
     # reflection.  The model chooses whether the referent lives in
     # conversation history or durable semantic memory.
     if tokens & {
-        "remember", "recall", "earlier", "previous", "before", "preference",
-        "favorite", "memory", "last", "decided", "chose", "said", "discussed",
+        "remember",
+        "recall",
+        "earlier",
+        "previous",
+        "before",
+        "preference",
+        "favorite",
+        "memory",
+        "last",
+        "decided",
+        "chose",
+        "said",
+        "discussed",
     }:
         return ("memory", "session_search", "capabilities")
     # Research / current facts: research plus reflection.
     if tokens & {
-        "research", "investigate", "evidence", "source", "sources", "latest",
-        "release", "protocol", "study", "compare", "survey",
+        "research",
+        "investigate",
+        "evidence",
+        "source",
+        "sources",
+        "latest",
+        "release",
+        "protocol",
+        "study",
+        "compare",
+        "survey",
     }:
         return ("research", "capabilities")
     # Persistent terminal / long-running work.
     if tokens & {
-        "terminal", "session", "pty", "watch", "stream", "long-running",
-        "background", "process", "daemon", "server", "serve",
+        "terminal",
+        "session",
+        "pty",
+        "watch",
+        "stream",
+        "long-running",
+        "background",
+        "process",
+        "daemon",
+        "server",
+        "serve",
     }:
         return ("execute", "terminal_session", "process", "capabilities")
     # Default: workspace observation. Reading files and repo state answers a
@@ -1765,7 +1839,9 @@ def _agents_entry(path: str, text: str) -> _Entry:
         name=f"project:{path}",
         text=rendered_text,
         tokens=estimate_tokens(rendered_text),
-        role=provider_role_for_source(source, scope="workspace", trust=TrustClass.CONFIGURED_INSTRUCTION),
+        role=provider_role_for_source(
+            source, scope="workspace", trust=TrustClass.CONFIGURED_INSTRUCTION
+        ),
         category="project_instruction",
         trust=TrustClass.CONFIGURED_INSTRUCTION,
         mandatory=True,

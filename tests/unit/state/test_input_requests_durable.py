@@ -23,9 +23,7 @@ async def test_answer_ref_stored_instead_of_raw_secret(tmp_path):
     raw_secret = "sk-supersecret123"
     await store.resolve(rid, raw_secret, answer_ref="runtime:task-1:openrouter_key")
 
-    row = await store._db.fetch_one(
-        "SELECT * FROM input_requests WHERE id = ?", (rid,)
-    )
+    row = await store._db.fetch_one("SELECT * FROM input_requests WHERE id = ?", (rid,))
     assert row is not None
     # Status must be ANSWERED_PENDING_RESUME
     assert row["status"] == "ANSWERED_PENDING_RESUME"
@@ -34,9 +32,7 @@ async def test_answer_ref_stored_instead_of_raw_secret(tmp_path):
     assert row["answer_ref"] == "runtime:task-1:openrouter_key"
 
     await store.consume(rid)
-    row2 = await store._db.fetch_one(
-        "SELECT * FROM input_requests WHERE id = ?", (rid,)
-    )
+    row2 = await store._db.fetch_one("SELECT * FROM input_requests WHERE id = ?", (rid,))
     assert row2["status"] == "CONSUMED"
     await db.close()
 

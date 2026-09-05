@@ -224,9 +224,7 @@ class WebhookAdapter:
                 )
             except Exception:
                 receipt = {"transaction_id": transaction_id, "error": str(exc)}
-            return DeliveryOutcome(
-                ok=False, status=RETRYABLE, error=str(exc), receipt=receipt
-            )
+            return DeliveryOutcome(ok=False, status=RETRYABLE, error=str(exc), receipt=receipt)
 
         if not isinstance(response, Mapping):
             # A runner that resolves to a non-mapping breaks the response

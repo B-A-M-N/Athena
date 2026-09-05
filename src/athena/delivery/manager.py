@@ -24,7 +24,6 @@ import logging
 from typing import Any
 
 from athena.delivery.adapters import (
-    DELIVERED,
     FAILED,
     RETRYABLE,
     DeliveryAdapter,
@@ -154,15 +153,12 @@ class DeliveryManager:
         receipt = dict(outcome.receipt or {})
         receipt.update(
             {
-                "delivery_channel": str(
-                    getattr(task.delivery, "channel", None) or "event_log"
-                ),
+                "delivery_channel": str(getattr(task.delivery, "channel", None) or "event_log"),
                 "destination": getattr(task.delivery, "destination", None),
                 "delivery_status": outcome.status,
                 "ok": outcome.ok,
                 "attempts": attempts,
-                "result_status": getattr(result.status, "value", None)
-                or str(result.status),
+                "result_status": getattr(result.status, "value", None) or str(result.status),
                 "summary": result.summary,
             }
         )

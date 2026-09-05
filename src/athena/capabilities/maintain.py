@@ -249,7 +249,11 @@ class MaintenanceCapability:
         observe = dict(args["observe"])
         requested_policy = str(args.get("policy") or "supervised").casefold()
         creator_policy = str(
-            getattr(getattr(context, "autonomy", None), "value", getattr(context, "autonomy", "supervised"))
+            getattr(
+                getattr(context, "autonomy", None),
+                "value",
+                getattr(context, "autonomy", "supervised"),
+            )
             or "supervised"
         ).casefold()
         policy = _attenuate_autonomy(requested_policy, creator_policy)

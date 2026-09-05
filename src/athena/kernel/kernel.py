@@ -403,9 +403,7 @@ def _observation_from_result(task, result: CapabilityResultBlock):
     )
 
 
-def _repeated_failure_observation(
-    task, result: CapabilityResultBlock, attempts: int
-):
+def _repeated_failure_observation(task, result: CapabilityResultBlock, attempts: int):
     """Build a REPEATED_FAILURE observation when a capability keeps failing.
 
     The primary loop's normal tool-correction path repairs input-shape
@@ -727,9 +725,7 @@ class AgentKernel:
             return "slot_released"
         return "resumed"
 
-    async def _paused_result(
-        self, task, state, status: TaskStatus, reason: str
-    ) -> TaskResult:
+    async def _paused_result(self, task, state, status: TaskStatus, reason: str) -> TaskResult:
         """End the run leaving the task in a paused (non-terminal) status.
 
         The task keeps its WAITING_* status — NOT terminal — so `wait_for`
@@ -777,11 +773,7 @@ class AgentKernel:
         # between resolve() and wakeup would leave _input_answers empty;
         # the DB is the authority for the continuation.
         durable = await self._input_request_store.pending_resumable(task.id)
-        answer = str(
-            self._input_answers.pop(task.id, "")
-            or (durable or {}).get("answer")
-            or ""
-        )
+        answer = str(self._input_answers.pop(task.id, "") or (durable or {}).get("answer") or "")
         answer_ref = (durable or {}).get("answer_ref") or None
         expected = str((durable or {}).get("expected") or "text").lower()
         await self._input_request_store.consume(request_id)
@@ -826,9 +818,7 @@ class AgentKernel:
                     ),
                 )
             except Exception:  # noqa: BLE001 — continuation must survive persist issues
-                _logger.warning(
-                    "input answer persistence failed for %s", request_id, exc_info=True
-                )
+                _logger.warning("input answer persistence failed for %s", request_id, exc_info=True)
         try:
             # The live wakeup path parks in WAITING_INPUT; the relaunched
             # path (P1-17: provide_input with no live coroutine) already
@@ -1198,9 +1188,7 @@ class AgentKernel:
             # The compiler's requirement field is ``minimum_context_tokens``
             # (P0 fix: the old name silently dropped the constraint and let
             # an undersized-context model survive routing).
-            minimum_context_tokens=getattr(
-                compiled.requirements, "minimum_context_tokens", None
-            ),
+            minimum_context_tokens=getattr(compiled.requirements, "minimum_context_tokens", None),
             max_output_tokens=getattr(compiled.requirements, "reserved_output", None),
         )
         # Quality floor (P1-16): the task policy's declared floor is the
@@ -1237,8 +1225,7 @@ class AgentKernel:
             )
             if pair in attempted:
                 raise last_err or ModelUnavailable(
-                    f"no candidate model excludes failed model selections "
-                    f"{sorted(attempted)}"
+                    f"no candidate model excludes failed model selections {sorted(attempted)}"
                 )
             provider = self._registry.provider_for(selection_for_attempt.provider)
             attempt_metadata = await self._attempt_metadata(task, compiled, selection_for_attempt)
@@ -1476,9 +1463,7 @@ class AgentKernel:
                     break
                 # Exclude the failed (provider, model) pair only; sibling
                 # models on the same provider remain candidates.
-                attempted.add(
-                    (selection_for_attempt.provider, selection_for_attempt.model)
-                )
+                attempted.add((selection_for_attempt.provider, selection_for_attempt.model))
                 selection_for_attempt = await self._select_model(
                     task, compiled, exclude=frozenset(attempted)
                 )
@@ -2405,9 +2390,7 @@ class AgentKernel:
                     failures[result.capability_id] = failures.get(result.capability_id, 0) + 1
                     candidates = [
                         _observation_from_result(task, result),
-                        _repeated_failure_observation(
-                            task, result, failures[result.capability_id]
-                        ),
+                        _repeated_failure_observation(task, result, failures[result.capability_id]),
                     ]
                 offered = False
                 for observation in candidates:
@@ -2958,7 +2941,7 @@ class AgentKernel:
     async def _scrub_input_answer_impl(self, request_id: str, answer_ref: str) -> None:
         store = self._input_request_store
         await store.ensure_table()
-        await store._db.execute(  # type: ignore[attr-defined]
+        await store._db.execute(
             "UPDATE input_requests SET answer = NULL, answer_ref = ? "
             "WHERE id = ? AND answer_ref IS NULL",
             (answer_ref, request_id),
@@ -3079,7 +3062,11 @@ class AgentKernel:
         await self._messages.append(message)
         await self._emit(
             "TaskMessage",
-            {"message_id": message.id, "role": message.role.value, "text": message.conversation_text()},
+            {
+                "message_id": message.id,
+                "role": message.role.value,
+                "text": message.conversation_text(),
+            },
             task,
         )
         if response.request_id:
@@ -3101,7 +3088,11 @@ class AgentKernel:
         await self._messages.append(message)
         await self._emit(
             "TaskMessage",
-            {"message_id": message.id, "role": message.role.value, "text": message.conversation_text()},
+            {
+                "message_id": message.id,
+                "role": message.role.value,
+                "text": message.conversation_text(),
+            },
             task,
         )
         self._stored_responses.add(response.request_id)
@@ -3127,7 +3118,11 @@ class AgentKernel:
         await self._messages.append(message)
         await self._emit(
             "TaskMessage",
-            {"message_id": message.id, "role": message.role.value, "text": message.conversation_text()},
+            {
+                "message_id": message.id,
+                "role": message.role.value,
+                "text": message.conversation_text(),
+            },
             task,
         )
 

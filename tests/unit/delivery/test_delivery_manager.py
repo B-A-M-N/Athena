@@ -22,8 +22,7 @@ import json
 import pytest
 
 from athena.delivery import DeliveryManager
-from athena.delivery.adapters import DeliveryOutcome, WebhookAdapter
-from athena.protocol.capabilities import ExternalEffectPhase
+from athena.delivery.adapters import WebhookAdapter
 from athena.protocol.tasks import DeliverySpec, TaskResult, TaskSpec, TaskStatus
 
 
@@ -49,8 +48,17 @@ class _FakeExternalStore:
         self.prepared: list[dict] = []
         self.applied: list[dict] = []
 
-    async def prepare(self, *, transaction_id, task_id, capability_id,
-                      external_identity, request_digest, idempotency_key, phase):
+    async def prepare(
+        self,
+        *,
+        transaction_id,
+        task_id,
+        capability_id,
+        external_identity,
+        request_digest,
+        idempotency_key,
+        phase,
+    ):
         receipt = {
             "transaction_id": transaction_id,
             "task_id": task_id,
@@ -67,13 +75,25 @@ class _FakeExternalStore:
         return dict(receipt)
 
     async def finish(self, transaction_id, *, status, response=None, error=None, phase=None):
-        receipt = {**self.receipts[transaction_id], "status": status,
-                   "response": dict(response or {}), "error": error}
+        receipt = {
+            **self.receipts[transaction_id],
+            "status": status,
+            "response": dict(response or {}),
+            "error": error,
+        }
         self.receipts[transaction_id] = receipt
         return dict(receipt)
 
-    async def begin_apply(self, *, transaction_id, task_id, capability_id,
-                          external_identity, request_digest, idempotency_key):
+    async def begin_apply(
+        self,
+        *,
+        transaction_id,
+        task_id,
+        capability_id,
+        external_identity,
+        request_digest,
+        idempotency_key,
+    ):
         receipt = self.receipts[transaction_id]
         if receipt["status"] == "COMPLETED":
             return dict(receipt), True
@@ -146,7 +166,9 @@ async def test_webhook_delivery_sends_through_receipt_lifecycle():
     send = sends[0]
     assert send["url"] == "https://hooks.example/x"
     assert send["method"] == "POST"
-    assert send["idempotency" if False else "headers"]["Idempotency-Key"].startswith("delivery:task-1:")
+    assert send["idempotency" if False else "headers"]["Idempotency-Key"].startswith(
+        "delivery:task-1:"
+    )
     assert send["follow_redirects"] is False
     body = json.loads(send["body"])
     assert body == {"task_id": "task-1", "status": "COMPLETE", "summary": "done"}

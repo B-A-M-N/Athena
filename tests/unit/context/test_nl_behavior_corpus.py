@@ -136,11 +136,17 @@ def test_action_work_is_tool_eligible():
 # can see a way to work" from "the model was starved".
 _CORPUS_REGISTRY = (
     CapabilityDescriptor(id="fs", description="read and write files", input_schema={}),
-    CapabilityDescriptor(id="git", description="inspect and change repository state", input_schema={}),
+    CapabilityDescriptor(
+        id="git", description="inspect and change repository state", input_schema={}
+    ),
     CapabilityDescriptor(id="execute", description="run a bounded command", input_schema={}),
-    CapabilityDescriptor(id="diagnostics", description="inspect failures and health", input_schema={}),
+    CapabilityDescriptor(
+        id="diagnostics", description="inspect failures and health", input_schema={}
+    ),
     CapabilityDescriptor(id="memory", description="recall durable memory", input_schema={}),
-    CapabilityDescriptor(id="capabilities", description="search the capability fabric", input_schema={}),
+    CapabilityDescriptor(
+        id="capabilities", description="search the capability fabric", input_schema={}
+    ),
 )
 
 
@@ -161,9 +167,7 @@ def _task(objective: str) -> TaskSpec:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "utterance", DEFINITE_RESPONSE, ids=lambda u: f"response::{u[:36]}"
-)
+@pytest.mark.parametrize("utterance", DEFINITE_RESPONSE, ids=lambda u: f"response::{u[:36]}")
 async def test_response_turns_compile_tool_less(utterance):
     context = await ContextCompiler(capability_registry=_CorpusRegistry(_CORPUS_REGISTRY)).compile(
         _task(utterance)
@@ -176,9 +180,7 @@ async def test_response_turns_compile_tool_less(utterance):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "utterance", WORKSPACE_QUESTIONS, ids=lambda u: f"workspace::{u[:36]}"
-)
+@pytest.mark.parametrize("utterance", WORKSPACE_QUESTIONS, ids=lambda u: f"workspace::{u[:36]}")
 async def test_workspace_questions_get_a_working_tool_surface(utterance):
     context = await ContextCompiler(capability_registry=_CorpusRegistry(_CORPUS_REGISTRY)).compile(
         _task(utterance)
@@ -199,9 +201,7 @@ async def test_workspace_questions_get_a_working_tool_surface(utterance):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "utterance", CONTINUATIONS, ids=lambda u: f"continuation::{u[:36]}"
-)
+@pytest.mark.parametrize("utterance", CONTINUATIONS, ids=lambda u: f"continuation::{u[:36]}")
 async def test_continuations_are_tool_eligible_end_to_end(utterance):
     context = await ContextCompiler(capability_registry=_CorpusRegistry(_CORPUS_REGISTRY)).compile(
         _task(utterance)
@@ -212,18 +212,16 @@ async def test_continuations_are_tool_eligible_end_to_end(utterance):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "utterance", MEMORY_REFERENTIAL, ids=lambda u: f"memory::{u[:36]}"
-)
+@pytest.mark.parametrize("utterance", MEMORY_REFERENTIAL, ids=lambda u: f"memory::{u[:36]}")
 async def test_memory_referential_turns_retrieve_memory(utterance):
     context = await ContextCompiler(capability_registry=_CorpusRegistry(_CORPUS_REGISTRY)).compile(
         _task(utterance)
     )
 
     assert context.requirements.needs_tools is True, utterance
-    assert "capabilities" in {
-        descriptor.id for descriptor in context.capability_definitions
-    }, utterance
+    assert "capabilities" in {descriptor.id for descriptor in context.capability_definitions}, (
+        utterance
+    )
     # Memory-referential questions ("what did we use last time?") ask what
     # actually happened; an honest answer requires retrieval, so completion
     # must refuse a prose-only recall hallucination.

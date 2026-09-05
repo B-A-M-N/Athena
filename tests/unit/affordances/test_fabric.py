@@ -39,9 +39,7 @@ class _Executor:
                         "git": "diff repository",
                         "research": "source latest release evidence",
                         "diagnostics": "inspect broken debug",
-                    }
-                    .get(capability_id, "")
-                    .split(),
+                    }.get(capability_id, "").split(),
                 ]
             ),
             origin=CapabilityOrigin.PROJECT,

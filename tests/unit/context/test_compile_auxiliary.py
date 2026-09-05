@@ -39,9 +39,7 @@ async def test_exactly_three_messages(compiler):
 
 async def test_no_capability_definitions(compiler):
     """No tool schema: the auxiliary subturn cannot act, only answer."""
-    compiled = await compiler.compile_auxiliary(
-        _task(), system="s", observation="o"
-    )
+    compiled = await compiler.compile_auxiliary(_task(), system="s", observation="o")
     assert compiled.capability_definitions == ()
     assert compiled.requirements.needs_tools is False
     assert "tools" not in compiled.requirements.required_capabilities
@@ -79,9 +77,7 @@ async def test_empty_observation_still_compiles(compiler):
 
 async def test_no_transcript_leak(compiler):
     """A task with durable history compiles none of it in auxiliary mode."""
-    compiled = await compiler.compile_auxiliary(
-        _task(), system="s", observation="o"
-    )
+    compiled = await compiler.compile_auxiliary(_task(), system="s", observation="o")
     body = "\n\n".join(m.conversation_text() for m in compiled.messages)
     # Nothing beyond the three pieces the mode declares.
     assert "session" not in body.lower() or "session" == "session"

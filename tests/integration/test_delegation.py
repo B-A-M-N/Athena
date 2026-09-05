@@ -169,9 +169,7 @@ async def test_delegation_collect_returns_child_conclusion_to_parent(make_servic
     await svc.approve(approval_id, granted=True)
     await svc.wait_for(parent.id)
 
-    rows = await svc._db.fetch_all(
-        "SELECT id FROM tasks WHERE parent_task_id = ?", (parent.id,)
-    )
+    rows = await svc._db.fetch_all("SELECT id FROM tasks WHERE parent_task_id = ?", (parent.id,))
     assert len(rows) == 1
     child_id = rows[0]["id"]
     for _ in range(200):

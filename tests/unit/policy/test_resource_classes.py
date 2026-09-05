@@ -82,9 +82,7 @@ def test_declared_resources_win_over_inference():
 
 async def test_dispatcher_threads_descriptor_resources_into_policy_request(tmp_path):
     """The canonical dispatch path resolves resources from the descriptor."""
-    import pytest
 
-    from athena.capabilities.dispatcher import CapabilityDispatcher
     from athena.capabilities.registry import CapabilityRegistry
     from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus
 
@@ -141,22 +139,12 @@ def test_native_descriptors_declare_expected_resource_classes():
     from athena.capabilities.synthesis import SynthesisCapability
     from athena.capabilities.workflow import WorkflowCapability
 
-    assert MemoryCapability.descriptor.resolve_resources() == frozenset(
-        {ResourceClass.MEMORY}
-    )
-    assert MaintenanceCapability.descriptor.resolve_resources() == frozenset(
-        {ResourceClass.STATE}
-    )
-    assert ScheduleCapability.descriptor.resolve_resources() == frozenset(
-        {ResourceClass.SCHEDULE}
-    )
-    assert ResearchCapability.descriptor.resolve_resources() == frozenset(
-        {ResourceClass.RESEARCH}
-    )
+    assert MemoryCapability.descriptor.resolve_resources() == frozenset({ResourceClass.MEMORY})
+    assert MaintenanceCapability.descriptor.resolve_resources() == frozenset({ResourceClass.STATE})
+    assert ScheduleCapability.descriptor.resolve_resources() == frozenset({ResourceClass.SCHEDULE})
+    assert ResearchCapability.descriptor.resolve_resources() == frozenset({ResourceClass.RESEARCH})
     # workflow/synthesis write workflow/synthesis STATE, not workspace files.
-    assert WorkflowCapability.descriptor.resolve_resources() == frozenset(
-        {ResourceClass.WORKFLOW}
-    )
+    assert WorkflowCapability.descriptor.resolve_resources() == frozenset({ResourceClass.WORKFLOW})
     assert SynthesisCapability.descriptor.resolve_resources() == frozenset(
         {ResourceClass.SYNTHESIS}
     )

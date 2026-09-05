@@ -42,9 +42,7 @@ class TestRuntimeCompleted:
         )
 
     def test_nonzero_exit_accepted(self):
-        assert observation_warrants_subturn(
-            obs(K.RUNTIME_COMPLETED, exit_code=1, output_chars=100)
-        )
+        assert observation_warrants_subturn(obs(K.RUNTIME_COMPLETED, exit_code=1, output_chars=100))
 
     def test_timeout_accepted(self):
         assert observation_warrants_subturn(obs(K.RUNTIME_COMPLETED, timed_out=True))
@@ -57,36 +55,26 @@ class TestRuntimeCompleted:
 
 class TestTerminalScreen:
     def test_small_screen_declined(self):
-        assert not observation_warrants_subturn(
-            obs(K.TERMINAL_SCREEN_CHANGED, screen_text="tiny")
-        )
+        assert not observation_warrants_subturn(obs(K.TERMINAL_SCREEN_CHANGED, screen_text="tiny"))
 
     def test_large_screen_accepted(self):
-        assert observation_warrants_subturn(
-            obs(K.TERMINAL_SCREEN_CHANGED, screen_text="s" * 4000)
-        )
+        assert observation_warrants_subturn(obs(K.TERMINAL_SCREEN_CHANGED, screen_text="s" * 4000))
 
 
 class TestDebuggerStopped:
     def test_always_accepted(self):
-        assert observation_warrants_subturn(
-            obs(K.DEBUGGER_STOPPED, reason="exception")
-        )
+        assert observation_warrants_subturn(obs(K.DEBUGGER_STOPPED, reason="exception"))
 
 
 class TestRepeatedFailure:
     def test_below_threshold_declined(self):
-        assert not observation_warrants_subturn(
-            obs(K.REPEATED_FAILURE, attempts=2)
-        )
+        assert not observation_warrants_subturn(obs(K.REPEATED_FAILURE, attempts=2))
 
     def test_at_threshold_accepted(self):
         assert observation_warrants_subturn(obs(K.REPEATED_FAILURE, attempts=3))
 
     def test_garbage_attempts_declined(self):
-        assert not observation_warrants_subturn(
-            obs(K.REPEATED_FAILURE, attempts="many")
-        )
+        assert not observation_warrants_subturn(obs(K.REPEATED_FAILURE, attempts="many"))
 
 
 class TestUnknownKind:
