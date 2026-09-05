@@ -26,24 +26,14 @@ from typing import Optional
 
 from athena.policy.approvals import ApprovalManager
 from athena.policy.rules import RuleSet
-from athena.policy.snapshot import get_snapshot
-from athena.protocol.capabilities import EffectClass
+from athena.policy.snapshot import PolicySnapshot, get_snapshot
+from athena.protocol.capabilities import EffectClass, ResourceClass
 from athena.protocol.policy import ApprovalScope, PolicyDecision, PolicyRequest, PolicyVerdict
 from athena.protocol.tasks import AutonomyLevel, NetworkPolicy, WorkspaceSpec
 
 _WRITE_OPS = frozenset({"write", "patch", "mkdir", "copy", "move", "create", "update"})
 _DELETE_OPS = frozenset({"delete", "remove", "rmtree", "unlink"})
 _READ_OPS = frozenset({"read", "list", "stat", "read_text", "get", "exists", "open"})
-_PATHLESS_WRITE_CAPABILITIES = frozenset(
-    {
-        "memory",
-        "maintain",
-        "schedule",
-        "synthesis",
-        "workflow",
-        "research",
-    }
-)
 _BUILD_CMDS = frozenset({"build", "test", "pytest", "make", "go", "cargo", "npm"})
 _SEP = os.sep
 
@@ -102,7 +92,7 @@ class PolicyEngine:
         rules = snapshot.rules
 
         # ---- 1. hard containment (structural, approval-proof) ------------ #
-        structural = self._eval_containment(request, level)
+        structural = self._eval_containment(request, level, snapshot)
         if structural is not None:
             return structural
 
@@ -126,7 +116,7 @@ class PolicyEngine:
         return _decision(combined.value, "; ".join(reasons), None, request)
 
     def _eval_containment(
-        self, request: PolicyRequest, level: AutonomyLevel
+        self, request: PolicyRequest, level: AutonomyLevel, snapshot: PolicySnapshot
     ) -> PolicyDecision | None:
         """Hard, approval-immutable constraints evaluated before policy.
 
@@ -171,23 +161,36 @@ class PolicyEngine:
         # their cwd/path through the execute containment check instead.
         if (EffectClass.WRITE_LOCAL in effects or EffectClass.DELETE in effects) and not execute_bearing:
             if request.capability_id == "database":
-                if not self._database_within(request):
+                if not self._database_within(request, snapshot):
                     return _deny(f"database outside writable scope: {request.arguments.get('path')}")
             elif request.arguments.get("path") or request.arguments.get("resource"):
-                out = self._eval_write(request) if EffectClass.WRITE_LOCAL in effects else self._eval_delete(request)
+                out = (
+                    self._eval_write(request, snapshot)
+                    if EffectClass.WRITE_LOCAL in effects
+                    else self._eval_delete(request, snapshot)
+                )
                 if out.decision is PolicyVerdict.DENY:
                     return out
-            elif request.capability_id not in _PATHLESS_WRITE_CAPABILITIES:
+            elif request.resources and ResourceClass.FILESYSTEM in request.resources:
+                # A filesystem write without a resolved path is structurally
+                # uncontainable (P1-23: typed resources replace the
+                # capability-name exception list).
+                return _deny("write call missing resolved path", "files.path")
+            elif not request.resources:
+                # Unresolved resources (direct engine callers, legacy tests):
+                # fall back to the descriptor inference default — a write
+                # bearing capability is assumed FILESYSTEM until proven
+                # otherwise, so the fail direction never loosens.
                 return _deny("write call missing resolved path", "files.path")
 
         if execute_bearing:
-            out = self._eval_execute_containment(request, level)
+            out = self._eval_execute_containment(request, level, snapshot)
             if out is not None:
                 return out
         elif EffectClass.READ_LOCAL in effects and (
             request.arguments.get("path") or request.arguments.get("resource")
         ):
-            out = self._eval_read(request)
+            out = self._eval_read(request, snapshot)
             if out.decision is PolicyVerdict.DENY:
                 return out
         return None
@@ -230,17 +233,17 @@ class PolicyEngine:
         return combined, reasons
 
     # ------------------------------------------------------------- workspace
-    def _eval_write(self, req, rules=None):
+    def _eval_write(self, req, snapshot: PolicySnapshot, rules=None):
         """Structural containment for a filesystem write target."""
         path = req.arguments.get("path") or req.arguments.get("resource")
         if not path:
             return _deny("write call missing resolved path", "files.path")
         target = self._abs(path, req.workspace)
-        if not self._within(target, req.workspace, writable_only=True):
+        if not self._within(target, req.workspace, snapshot=snapshot, writable_only=True):
             return _deny(f"write outside writable scope: {path}")
         return _allow("write within writable scope")
 
-    def _database_within(self, req) -> bool:
+    def _database_within(self, req, snapshot: PolicySnapshot) -> bool:
         """Database write containment (BHV-041).
 
         A database file is a legitimate mutation target even outside the
@@ -249,33 +252,37 @@ class PolicyEngine:
         allowed under profile rules.
         """
         path = str(req.arguments.get("path") or "")
-        if self._out_of_workspace(req) and os.path.realpath(os.path.abspath(path)).startswith(
-            "/tmp/"
-        ):
+        if self._out_of_workspace(req, snapshot) and os.path.realpath(
+            os.path.abspath(path)
+        ).startswith("/tmp/"):
             return True
-        return self._within(self._abs(path, req.workspace), req.workspace, writable_only=True)
+        return self._within(
+            self._abs(path, req.workspace), req.workspace, snapshot=snapshot, writable_only=True
+        )
 
-    def _eval_delete(self, req, rules=None):
+    def _eval_delete(self, req, snapshot: PolicySnapshot, rules=None):
         """Structural containment for a delete target."""
         path = req.arguments.get("path") or req.arguments.get("resource")
         if not path:
             return _deny("delete call missing resolved path")
         target = self._abs(path, req.workspace)
-        if not self._within(target, req.workspace, writable_only=True):
+        if not self._within(target, req.workspace, snapshot=snapshot, writable_only=True):
             return _deny(f"delete outside writable scope: {path}")
         return _allow("delete within writable scope")
 
-    def _eval_read(self, req, rules=None):
+    def _eval_read(self, req, snapshot: PolicySnapshot, rules=None):
         """Structural containment for a read target."""
         path = req.arguments.get("path") or req.arguments.get("resource")
         if not path:
             return _allow("read: no path argument")
         target = self._abs(path, req.workspace)
-        if not self._within(target, req.workspace, writable_only=False):
+        if not self._within(target, req.workspace, snapshot=snapshot, writable_only=False):
             return _deny(f"read outside readable scope: {path}")
         return _allow("read within readable scope")
 
-    def _eval_execute_containment(self, req, level=None) -> PolicyDecision | None:
+    def _eval_execute_containment(
+        self, req, level=None, snapshot: PolicySnapshot | None = None
+    ) -> PolicyDecision | None:
         """Structural execute checks: a DENY decision, or None to continue.
 
         Out-of-workspace execute is granted only when the active profile
@@ -290,7 +297,7 @@ class PolicyEngine:
             and req.execution_backend not in {"shadow", "sandbox", "sandboxed-local"}
         ):
             return _deny("execute denied: workspace network_policy is DENY")
-        if self._out_of_workspace(req) and not (
+        if self._out_of_workspace(req, snapshot) and not (
             level is not None and _execute_granted(level, req)
         ):
             return _deny("execute outside workspace requires profile grant (INV-008)")
@@ -308,7 +315,7 @@ class PolicyEngine:
             and req.execution_backend not in {"shadow", "sandbox", "sandboxed-local"}
         ):
             return _deny("execute denied: workspace network_policy is DENY")
-        if self._out_of_workspace(req) and not _execute_granted(level, req):
+        if self._out_of_workspace(req, None) and not _execute_granted(level, req):
             return _deny(
                 "execute outside workspace requires profile grant (INV-008)",
             )
@@ -332,20 +339,30 @@ class PolicyEngine:
             return os.path.realpath(os.path.abspath(path))
         return os.path.realpath(os.path.abspath(os.path.join(ws.root, path)))
 
-    def _within(self, target, ws: WorkspaceSpec, *, writable_only: bool) -> bool:
+    def _within(
+        self,
+        target,
+        ws: WorkspaceSpec,
+        *,
+        snapshot: PolicySnapshot | None = None,
+        writable_only: bool,
+    ) -> bool:
         """Path-scope containment against precompiled workspace identity.
 
-        The canonical root and canonical rule paths come from the compiled
-        snapshot (guarded by revision, rebuilt on mismatch); only the
-        request's target is canonicalized per call.
+        The canonical root and canonical rule paths come from the snapshot
+        the caller already resolved (P1-26: the containment path no longer
+        re-calls get_snapshot); only the request's target is canonicalized
+        per call. A None snapshot falls back to resolving one — for the
+        legacy isolated-entry helpers only.
         """
         target = os.path.realpath(os.path.abspath(target))
-        snapshot = get_snapshot(
-            level=self.profile,
-            workspace=ws,
-            task_policy=None,
-            policy_revision=self._policy_revision,
-        )
+        if snapshot is None:
+            snapshot = get_snapshot(
+                level=self.profile,
+                workspace=ws,
+                task_policy=None,
+                policy_revision=self._policy_revision,
+            )
         root = snapshot.workspace_root
         if target != root and not target.startswith(root + _SEP):
             return False
@@ -361,12 +378,14 @@ class PolicyEngine:
                 matched = True
         return matched
 
-    def _out_of_workspace(self, req) -> bool:
+    def _out_of_workspace(self, req, snapshot: PolicySnapshot | None = None) -> bool:
         cwd = req.arguments.get("cwd") or req.arguments.get("workdir") or req.arguments.get("path")
         if not cwd or not os.path.isabs(str(cwd)):
             return False
         target = self._abs(str(cwd), req.workspace)
-        return not self._within(target, req.workspace, writable_only=True)
+        return not self._within(
+            target, req.workspace, snapshot=snapshot, writable_only=True
+        )
 
     def _is_files_op(self, req, ops) -> bool:
         if req.capability_id not in ("files", "fs"):

@@ -37,17 +37,22 @@ _SEP = os.sep
 
 @dataclass(frozen=True)
 class SnapshotKey:
-    """Identity of a compiled snapshot's authority inputs."""
+    """Identity of a compiled snapshot's authority inputs.
+
+    ``task_ceiling`` is the task's CapabilityPolicy used ONLY as a cache-key
+    and revision guard (its hash): the compiled snapshot contains no
+    task-derived rules — profile rules and canonical workspace paths only.
+    """
 
     level: AutonomyLevel
     workspace_id: str
-    task_policy: CapabilityPolicy | None
+    task_ceiling: CapabilityPolicy | None
 
     def __post_init__(self) -> None:
         # CapabilityPolicy is a frozen dataclass of tuples/frozensets, so it
         # is hashable already; normalize None to a stable absent marker.
-        if self.task_policy is None:
-            object.__setattr__(self, "task_policy", None)
+        if self.task_ceiling is None:
+            object.__setattr__(self, "task_ceiling", None)
 
 
 @dataclass(frozen=True)
