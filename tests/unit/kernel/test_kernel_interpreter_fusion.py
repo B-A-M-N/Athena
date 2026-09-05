@@ -118,7 +118,13 @@ async def _persisted_task(stack: Stack) -> TaskSpec:
 
 
 class _RecordingShim:
-    """Dispatch stand-in: first call fails a capability, later calls succeed."""
+    """Dispatch stand-in: first call fails a capability, later calls succeed.
+
+    Failures are observation-shaped (a sprawling traceback with a large
+    output dump) because that is the class of failure the interpreter
+    exists to condense. Concise failures do not trigger subturns — pinned
+    separately in test_concise_failure_returns_directly.
+    """
 
     def __init__(self, sink: list, fail_first: bool = True, fail_count: int = 1):
         self._sink = sink
@@ -141,8 +147,11 @@ class _RecordingShim:
                     call_id=c.call_id,
                     capability_id=c.capability_id,
                     ok=ok,
-                    output="ok" if ok else "",
-                    error=None if ok else "TypeError: boom",
+                    output="ok" if ok else "x" * 3000,
+                    error=None if ok else "Traceback (most recent call last):\n" + "\n".join(
+                        f'  File "mod_{i}.py", line {i}, in fn_{i}\n    raise RuntimeError("boom")'
+                        for i in range(40)
+                    ),
                 )
             )
         return DispatchResult(results=tuple(results))
@@ -199,6 +208,82 @@ async def test_failed_result_triggers_interpreter_subturn_and_dispatch():
     assert "interpreter" in roles
     proposal_events = [e for e in rows if e.type == "InterpreterProposalDispatched"]
     assert proposal_events, "canonical dispatch must be inspectable"
+    await stack.db.close()
+
+
+async def test_concise_failure_returns_directly():
+    """P1-13: a short, legible failure does NOT spend an interpreter subturn.
+
+    The primary transcript already carries the error verbatim; a subturn
+    would only re-derive context the loop already has.
+    """
+    stack = await _make_stack(interpreter="wired-marker")
+    task = await _persisted_task(stack)
+    ext = _extension_for(stack.kernel)
+    stack.kernel._interpreter = ext
+    dispatched: list = []
+
+    class _ConciseShim:
+        async def dispatch(self, task, calls):
+            from athena.kernel.dispatch import DispatchResult
+
+            dispatched.extend(calls)
+            return DispatchResult(
+                results=tuple(
+                    CapabilityResultBlock(
+                        call_id=c.call_id,
+                        capability_id=c.capability_id,
+                        ok=False,
+                        error="TypeError: boom",
+                    )
+                    for c in calls
+                )
+            )
+
+    await _run_one_turn(stack, task, _ConciseShim())
+    assert len(dispatched) == 1  # primary dispatch only
+    state = stack.kernel._runs[task.id]
+    assert state.model_calls == 0
+    await stack.db.close()
+
+
+async def test_repeated_concise_failures_trigger_subturn():
+    """P1-13: after enough consecutive failures of the same capability,
+    even a concise failure becomes a REPEATED_FAILURE observation."""
+    stack = await _make_stack(interpreter="wired-marker")
+    task = await _persisted_task(stack)
+    ext = _extension_for(stack.kernel)
+    stack.kernel._interpreter = ext
+    dispatched: list = []
+
+    class _ConciseShim:
+        def __init__(self):
+            self.calls = 0
+
+        async def dispatch(self, task, calls):
+            from athena.kernel.dispatch import DispatchResult
+
+            self.calls += 1
+            dispatched.extend(calls)
+            return DispatchResult(
+                results=tuple(
+                    CapabilityResultBlock(
+                        call_id=c.call_id,
+                        capability_id=c.capability_id,
+                        ok=False,
+                        error="TypeError: boom",
+                    )
+                    for c in calls
+                )
+            )
+
+    shim = _ConciseShim()
+    for _ in range(3):  # threshold is 3 consecutive failures
+        await _run_one_turn(stack, task, shim)
+    state = stack.kernel._runs[task.id]
+    # First two failures: no subturn. Third: REPEATED_FAILURE fires one.
+    assert state.interpreter_failure_counts["runtime.evaluate"] == 3
+    assert state.model_calls == 1
     await stack.db.close()
 
 

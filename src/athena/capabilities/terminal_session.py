@@ -55,6 +55,10 @@ except ImportError:  # pragma: no cover
 _MAX_SESSIONS_PER_TASK = 8
 _DEFAULT_WAIT_TIMEOUT = 15.0
 _MAX_WAIT_TIMEOUT = 60.0
+# Screens at or above this size are announced as RUNTIME_SCREEN_CHANGED so
+# the kernel's interpreter path can condense them (P1-15). Matches the
+# triggering policy's screen threshold.
+_LARGE_SCREEN_CHARS = 4_000
 _logger = logging.getLogger("athena.terminal_session")
 _TERMINAL_AVAILABILITY = (
     Availability.AVAILABLE
@@ -443,9 +447,24 @@ class TerminalSessionCapability:
         if op == "screen":
             data = await run_blocking(session.drain)
             row, col = session.cursor()
+            screen_text = _tail_text(data)
+            # Large screen renders (busy TUIs, dense scrollbacks) are ambient
+            # body state: announce them so the kernel's interpreter path can
+            # condense them instead of the primary transcript absorbing the
+            # whole screen verbatim.
+            if len(screen_text) >= _LARGE_SCREEN_CHARS:
+                await self._emit_runtime(
+                    EV["RUNTIME_SCREEN_CHANGED"],
+                    session,
+                    screen_chars=len(screen_text),
+                    cursor_row=row,
+                    cursor_col=col,
+                    rows=session.rows,
+                    cols=session.cols,
+                )
             return _result(
                 request,
-                output=_tail_text(data),
+                output=screen_text,
                 meta={
                     "session": session.id,
                     "alive": session.alive(),

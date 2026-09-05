@@ -646,6 +646,22 @@ class AthenaService:
         )
         self._kernel = kernel
 
+        # 10.9 Body-observation bridge (P1-15): terminal sessions announce
+        # large screen renders as RuntimeScreenChanged events; the bridge
+        # converts them into typed TerminalScreenChanged observations and
+        # offers them to the kernel's interpreter path. The kernel enforces
+        # the same triggering/budget rules as loop-side offers.
+        def _on_runtime_screen_changed(event) -> None:
+            payload = getattr(event, "payload", None) or {}
+            observation = _body_observation_from_screen_event(event, payload)
+            if observation is not None:
+                asyncio.ensure_future(kernel.offer_body_observation(observation))
+
+        events.subscribe(
+            _on_runtime_screen_changed,
+            event_types={"RuntimeScreenChanged"},
+        )
+
         # 11. Delegation (needs kernel).
         delegation = DelegationManager(
             task_manager=task_manager,
@@ -5385,6 +5401,34 @@ def _default_model_policy():
     from athena.protocol.tasks import ModelPolicy
 
     return ModelPolicy(require_tools=False)
+
+
+def _body_observation_from_screen_event(event, payload: dict):
+    """Convert a RuntimeScreenChanged event into a typed interpreter
+    observation (P1-15). Returns None when the event carries no screen
+    render (defensive: the capability announces the size, the full text
+    comes from a bounded screen read the bridge performs itself).
+    """
+    from athena.interpreter.protocol import (
+        BodyObservationKind,
+        InterpreterObservation,
+    )
+
+    session_id = str(payload.get("session") or "")
+    if not session_id:
+        return None
+    return InterpreterObservation(
+        kind=BodyObservationKind.TERMINAL_SCREEN_CHANGED,
+        payload={
+            "session": session_id,
+            "screen_chars": int(payload.get("screen_chars") or 0),
+            "rows": payload.get("rows"),
+            "cols": payload.get("cols"),
+        },
+        task_id=getattr(event, "task_id", None),
+        session_id=getattr(event, "session_id", None),
+        runtime_session_id=session_id,
+    )
 
 
 # Privacy values ModelRouter treats as a hard LOCAL-only gate. OFFLINE

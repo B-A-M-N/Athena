@@ -92,6 +92,9 @@ from athena.kernel.termination import (
 )
 from athena.interpreter.context import InterpreterContext  # noqa: F401 (annotation)
 from athena.interpreter.protocol import InterpreterProposal  # noqa: F401 (annotation)
+from athena.interpreter.triggering import (  # noqa: F401 (re-exported for tests)
+    observation_warrants_subturn,
+)
 
 if TYPE_CHECKING:
     from athena.models.router import ModelRouter
@@ -195,6 +198,11 @@ class RunState:
     budget_wall_time_remaining_s: float | None = None
     budget_wall_time_checkpoint_s: float = 0.0
     tool_correction_counts: dict[str, int] = field(default_factory=dict)
+    # Consecutive failed results per capability, feeding the interpreter's
+    # REPEATED_FAILURE trigger (P1-13). Distinct from tool_correction_counts:
+    # that one counts input-shape corrections the repair loop handles; this
+    # counts every failed result after the normal path has run.
+    interpreter_failure_counts: dict[str, int] = field(default_factory=dict)
     work_evidence: list[WorkEvidence] = field(default_factory=list)
 
     @property
@@ -312,19 +320,24 @@ def _block_of(suspended) -> CapabilityCallBlock:
 
 
 def _observation_from_result(task, result: CapabilityResultBlock):
-    """Build an InterpreterObservation from a failed capability result.
+    """Build a typed InterpreterObservation from a failed capability result.
 
     Keeps the payload small (audit P0.2: producers artifactize anything
-    large); None when there is nothing interpretive to offer.
+    large); None when there is nothing interpretive to offer. Whether the
+    observation actually warrants a subturn is the triggering policy's
+    decision (P1-13), made at the offer site.
     """
-    from athena.interpreter.protocol import InterpreterObservation
+    from athena.interpreter.protocol import (
+        BodyObservationKind,
+        InterpreterObservation,
+    )
 
     error_text = (result.error or "")[:2000]
     output_text = (result.output or "")[:4000]
     if not error_text and not output_text:
         return None
     return InterpreterObservation(
-        kind=f"capability.failed:{result.capability_id}",
+        kind=BodyObservationKind.CAPABILITY_FAILED,
         payload={
             "call_id": result.call_id,
             "capability_id": result.capability_id,
@@ -334,6 +347,78 @@ def _observation_from_result(task, result: CapabilityResultBlock):
         },
         task_id=task.id,
         session_id=task.session_id,
+    )
+
+
+def _repeated_failure_observation(
+    task, result: CapabilityResultBlock, attempts: int
+):
+    """Build a REPEATED_FAILURE observation when a capability keeps failing.
+
+    The primary loop's normal tool-correction path repairs input-shape
+    errors; when the same capability keeps failing past that, the loop is
+    circling and the failure pattern is worth one interpretive look.
+    Returns None below the policy threshold (the count is tracked
+    regardless, so the threshold is evaluated against true attempts).
+    """
+    from athena.interpreter.protocol import (
+        BodyObservationKind,
+        InterpreterObservation,
+    )
+    from athena.interpreter.triggering import _REPEATED_FAILURE_THRESHOLD
+
+    if attempts < _REPEATED_FAILURE_THRESHOLD:
+        return None
+    return InterpreterObservation(
+        kind=BodyObservationKind.REPEATED_FAILURE,
+        payload={
+            "capability_id": result.capability_id,
+            "attempts": attempts,
+            "last_error": (result.error or "")[:500],
+        },
+        task_id=task.id,
+        session_id=task.session_id,
+    )
+
+
+def _runtime_completed_observation(task, result: CapabilityResultBlock):
+    """Build a RUNTIME_COMPLETED observation from an execute-style result.
+
+    Covers the successful-but-voluminous case the failure-only trigger
+    misses: a run that exited 0 but produced more output than the primary
+    transcript should absorb (the tails and artifact ref go in the payload;
+    triggering policy decides whether the size or the exit status warrants
+    a subturn). None for results that are not execution-shaped.
+    """
+    from athena.interpreter.protocol import (
+        BodyObservationKind,
+        InterpreterObservation,
+    )
+
+    metadata = result.metadata or {}
+    if "exit_code" not in metadata and "resolved_effects" not in metadata:
+        return None
+    is_execute = result.capability_id in {"execute", "shell", "process"} or (
+        "execute" in set(metadata.get("resolved_effects") or ())
+    )
+    if not is_execute:
+        return None
+    output_text = (result.output or "")[:4000]
+    return InterpreterObservation(
+        kind=BodyObservationKind.RUNTIME_COMPLETED,
+        payload={
+            "call_id": result.call_id,
+            "capability_id": result.capability_id,
+            "exit_code": metadata.get("exit_code"),
+            "timed_out": (result.error or "") == "execution timed out",
+            "interrupted": (result.error or "") == "execution interrupted",
+            "output_chars": len(result.output or ""),
+            "stdout_tail": output_text,
+            "artifact_uri": getattr(result, "ref_uri", None),
+        },
+        task_id=task.id,
+        session_id=task.session_id,
+        artifact_uri=getattr(result, "ref_uri", None),
     )
 
 
@@ -1192,6 +1277,11 @@ class AgentKernel:
         * routes through the SAME ModelRouter with role "interpreter",
         * emits its own ModelRequestStarted/Completed events with
           role="interpreter" so `athena inspect` shows it as its own row,
+        * compiles AUXILIARY context (P1-14): system instruction + task
+          objective + the bounded observation. No skills, memory, research,
+          project blocks, transcript, or capability tool schema — an
+          interpreter subturn interprets the given observation; it does not
+          mine the context corpus or act through a tool surface,
         * does NOT append to the durable assistant history — an interpreter
           subturn is a side read, not a conversational turn (its proposal,
           if any, is dispatched and its results land in the transcript the
@@ -1205,8 +1295,8 @@ class AgentKernel:
         state = context.run_state
         role_policy = _dc_replace(task.model_policy, role="interpreter")
         subturn_task = _dc_replace(task, model_policy=role_policy)
-        compiled = await self._compile_for_prompts(
-            subturn_task, system=system_prompt, user_prompt=user_prompt
+        compiled = await self._compiler.compile_auxiliary(
+            subturn_task, system=system_prompt, observation=user_prompt
         )
         selection = await self._select_model(subturn_task, compiled)
         await self._emit(
@@ -1330,6 +1420,40 @@ class AgentKernel:
         if not proposal.is_executable():
             return
         await self.dispatch_interpreter_proposal(proposal, context)
+
+    async def offer_body_observation(self, observation) -> bool:
+        """External producers' entry into the interpreter path (P1-15).
+
+        Terminal sessions, runtimes, and process trees announce ambient body
+        state (large screen renders, debugger stops) as events; the service
+        bridges those events here. The same rules as loop-side offers apply:
+        the triggering policy decides whether the observation warrants a
+        subturn, the offer is skipped when the task has no live run, the
+        budget is exhausted, or no extension is wired. Returns whether an
+        offer was actually made.
+        """
+        if self._interpreter is None:
+            return False
+        if not observation_warrants_subturn(observation):
+            return False
+        task_id = observation.task_id
+        state = self._runs.get(task_id) if task_id else None
+        if state is None or state.cancel.is_set():
+            return False
+        task = state.task
+        budget = getattr(task, "resource_budget", None)
+        if budget is not None and _budget_exhausted(state, budget):
+            return False
+        try:
+            await self._offer_observation(task, state, observation)
+        except Exception:  # noqa: BLE001 — fusion must not kill the producer
+            _logger.warning(
+                "interpreter fusion failed for %s observation",
+                observation.kind,
+                exc_info=True,
+            )
+            return False
+        return True
 
     async def utility_inference(
         self,
@@ -2036,22 +2160,47 @@ class AgentKernel:
             for result in outcome.results:
                 if not isinstance(result, CapabilityResultBlock):
                     continue
+                # Track consecutive failures per capability AFTER the primary
+                # loop's own tool-correction path has run: enough repetitions
+                # turn one more failed result into a REPEATED_FAILURE
+                # observation (triggering policy decides the threshold).
+                candidates = []
                 if result.ok:
-                    continue
-                observation = _observation_from_result(task, result)
-                if observation is None:
-                    continue
-                if budget is not None and _budget_exhausted(state, budget):
+                    # RuntimeCompleted: successful runs with abnormal status
+                    # or voluminous output are interpreter material too.
+                    candidates.append(_runtime_completed_observation(task, result))
+                else:
+                    failures = state.interpreter_failure_counts
+                    failures[result.capability_id] = failures.get(result.capability_id, 0) + 1
+                    candidates = [
+                        _observation_from_result(task, result),
+                        _repeated_failure_observation(
+                            task, result, failures[result.capability_id]
+                        ),
+                    ]
+                offered = False
+                for observation in candidates:
+                    if observation is None:
+                        continue
+                    # Triggering policy (P1-13): concise failures return
+                    # directly to the primary loop; only observations that
+                    # genuinely compress body state spend a subturn.
+                    if not observation_warrants_subturn(observation):
+                        continue
+                    if budget is not None and _budget_exhausted(state, budget):
+                        break
+                    try:
+                        await self._offer_observation(task, state, observation)
+                        offered = True
+                    except Exception:  # noqa: BLE001 — fusion must not kill the loop
+                        _logger.warning(
+                            "interpreter fusion failed for %s observation",
+                            observation.kind,
+                            exc_info=True,
+                        )
+                    break  # one subturn per dispatch, however many failures
+                if offered:
                     break
-                try:
-                    await self._offer_observation(task, state, observation)
-                except Exception:  # noqa: BLE001 — fusion must not kill the loop
-                    _logger.warning(
-                        "interpreter fusion failed for %s observation",
-                        observation.kind,
-                        exc_info=True,
-                    )
-                break  # one observation per dispatch, however many failures
         exhausted: list[str] = []
         max_cycles = int(response.metadata.get("max_tool_correction_cycles", 2))
         for result in outcome.results:

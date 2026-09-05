@@ -30,12 +30,14 @@ Import surface:
 from athena.interpreter.context import InterpreterContext
 from athena.interpreter.extension import InterpreterExtension
 from athena.interpreter.protocol import (
+    BodyObservationKind,
     InterpreterObservation,
     InterpreterProposal,
     ProposalStatus,
 )
 
 __all__ = [
+    "BodyObservationKind",
     "InterpreterContext",
     "InterpreterExtension",
     "InterpreterObservation",
