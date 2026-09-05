@@ -4,6 +4,15 @@ The model can determine mid-task that required information is missing. This
 store persists the question and the task's continuation identity so the same
 Task can be resumed with the operator's answer — instead of forcing the model
 to guess or to finish the task with a question in place of a result.
+
+Durability protocol (matches the approval continuation pattern):
+
+    OPEN → ANSWERED_PENDING_RESUME → task reacquired/requeued →
+    answer consumed → CONSUMED
+
+The kernel reads the durable answer from this store rather than from an
+in-memory dictionary, so a process crash between DB-write and kernel-wakeup
+cannot strand a task in WAITING_INPUT with no live waiter.
 """
 
 from __future__ import annotations
@@ -17,7 +26,17 @@ from athena.state.database import Database
 
 
 class InputRequestStore:
-    """Durable records of tasks paused awaiting operator input."""
+    """Durable records of tasks paused awaiting operator input.
+
+    Status lifecycle:
+        OPEN                  the question is live; no answer yet
+        ANSWERED_PENDING_RESUME  answer durably stored; task not yet consumed it
+        CONSUMED              answer read by the kernel; terminal
+    """
+
+    STATUS_OPEN = "OPEN"
+    STATUS_ANSWERED_PENDING_RESUME = "ANSWERED_PENDING_RESUME"
+    STATUS_CONSUMED = "CONSUMED"
 
     def __init__(self, db: Database) -> None:
         self._db = db
@@ -37,9 +56,22 @@ class InputRequestStore:
             "expected TEXT, "
             "status TEXT NOT NULL, "
             "answer TEXT, "
+            "answer_ref TEXT, "
             "created_at TEXT NOT NULL, "
-            "resolved_at TEXT)"
+            "resolved_at TEXT, "
+            "consumed_at TEXT)"
         )
+        # Migrate older schemas without the new columns.
+        for column, definition in (
+            ("answer_ref", "TEXT"),
+            ("consumed_at", "TEXT"),
+        ):
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE input_requests ADD COLUMN {column} {definition}"
+                )
+            except Exception:
+                pass
         self._ensured = True
 
     async def record(
@@ -59,8 +91,8 @@ class InputRequestStore:
         await self._db.execute(
             "INSERT INTO input_requests("
             "id, task_id, session_id, question, choices, context, expected, "
-            "status, answer, created_at, resolved_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', NULL, ?, NULL)",
+            "status, answer, answer_ref, created_at, resolved_at, consumed_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', NULL, NULL, ?, NULL, NULL)",
             (
                 rid,
                 task_id,
@@ -84,8 +116,16 @@ class InputRequestStore:
         )
         return _decode(row) if row else None
 
-    async def resolve(self, request_id: str, answer: str) -> dict | None:
-        """Record the operator's answer; returns the updated request row."""
+    async def resolve(
+        self, request_id: str, answer: str, *, answer_ref: str | None = None
+    ) -> dict | None:
+        """Record the operator's answer durably.
+
+        Sets status to ANSWERED_PENDING_RESUME (not directly to CONSUMED) so a
+        restart can detect the half-resumed state and requeue the task.  The
+        kernel later calls ``consume`` once the answer has been durably injected
+        into the task's session.
+        """
         await self.ensure_table()
         row = await self._db.fetch_one(
             "SELECT * FROM input_requests WHERE id = ? AND status = 'OPEN'",
@@ -94,14 +134,40 @@ class InputRequestStore:
         if row is None:
             return None
         await self._db.execute(
-            "UPDATE input_requests SET status = 'ANSWERED', answer = ?, resolved_at = ? "
-            "WHERE id = ?",
-            (str(answer), utcnow().isoformat(), request_id),
+            "UPDATE input_requests "
+            "SET status = 'ANSWERED_PENDING_RESUME', answer = ?, answer_ref = ?, "
+            "resolved_at = ? "
+            "WHERE id = ? AND status = 'OPEN'",
+            (str(answer), answer_ref, utcnow().isoformat(), request_id),
         )
         updated = await self._db.fetch_one(
             "SELECT * FROM input_requests WHERE id = ?", (request_id,)
         )
         return _decode(updated) if updated else _decode(row)
+
+    async def consume(self, request_id: str) -> None:
+        """Mark an answered input request as consumed by the kernel."""
+        await self.ensure_table()
+        await self._db.execute(
+            "UPDATE input_requests SET status = 'CONSUMED', consumed_at = ? "
+            "WHERE id = ? AND status = 'ANSWERED_PENDING_RESUME'",
+            (utcnow().isoformat(), request_id),
+        )
+
+    async def pending_resumable(self, task_id: str) -> dict | None:
+        """An answered-but-not-consumed input request for a task, if any.
+
+        Used by startup recovery to requeue a task that was parked in
+        WAITING_INPUT and received an answer while the process was down.
+        """
+        await self.ensure_table()
+        row = await self._db.fetch_one(
+            "SELECT * FROM input_requests "
+            "WHERE task_id = ? AND status = 'ANSWERED_PENDING_RESUME' "
+            "ORDER BY resolved_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        )
+        return _decode(row) if row else None
 
     async def list_open(self, *, session_id: str | None = None) -> list[dict]:
         """Open requests, newest first, optionally scoped to one session."""

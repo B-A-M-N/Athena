@@ -250,6 +250,9 @@ class ContextCompiler:
         self._project_cache: dict[str, tuple[str, tuple[_Entry, ...]]] = {}
         self._memory_cache: OrderedDict[tuple[str, int], tuple[Any, ...]] = OrderedDict()
         self._static_cache: OrderedDict[tuple[Any, ...], _StaticContext] = OrderedDict()
+        # Single-flight registry: prevents duplicate concurrent static-context
+        # loads for the same key.  The first caller computes; waiters share.
+        self._inflight_static: dict[tuple[Any, ...], asyncio.Future[_StaticContext]] = {}
 
     @property
     def principal_id(self) -> str:
@@ -353,23 +356,46 @@ class ContextCompiler:
         )
 
     async def _load_static_context(self, task: TaskSpec) -> _StaticContext:
-        """Load revisioned context once; transcript/tool state stays dynamic."""
+        """Load revisioned context once; transcript/tool state stays dynamic.
+
+        Single-flight: concurrent callers for the same key share one
+        computation instead of duplicating the static-context load.
+        """
         key = self._static_context_key(task)
         if key is not None:
             cached = self._static_cache.get(key)
             if cached is not None:
                 self._static_cache.move_to_end(key)
                 return cached
+            # Single-flight: if another coroutine is already computing this
+            # key, await its result instead of duplicating work.
+            inflight = self._inflight_static.get(key)
+            if inflight is not None:
+                return await inflight
 
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[_StaticContext] = loop.create_future()
+        if key is not None:
+            self._inflight_static[key] = future
+        try:
+            static = await self._compute_static_context(task, key)
+            future.set_result(static)
+            return static
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            if key is not None:
+                self._inflight_static.pop(key, None)
+
+    async def _compute_static_context(
+        self, task: TaskSpec, key: tuple[Any, ...] | None
+    ) -> _StaticContext:
+        """The actual static-context computation (single-flight target)."""
         memory_needed = _memory_context_needed(task.objective)
         research_needed = _research_context_needed(task.objective)
         skills_needed = _skills_context_needed(task.objective)
         require_tools = bool(task.model_policy.require_tools)
-        # The NARROW channel is the authority over tool eligibility — not the
-        # advisory fine-grained kind. A grammatical question that references
-        # workspace state ("what does this function do?") is response-kind in
-        # the advisory metadata but stays tool-eligible in the channel, so it
-        # must receive a capability surface.
         tool_eligible = not is_explicit_response_turn(task.objective)
         blocks, memories, skills, research, capability_result = await asyncio.gather(
             self._load_context_blocks(task),
@@ -1310,12 +1336,14 @@ def _fallback_bundle_ids(objective: str) -> tuple[str, ...]:
         "changelog", "blame", "revert", "tag", "stash",
     }:
         return ("git", "fs", "capabilities")
-    # Recalled / referential context: durable memory plus reflection.
+    # Recalled / referential context: durable memory, session search, plus
+    # reflection.  The model chooses whether the referent lives in
+    # conversation history or durable semantic memory.
     if tokens & {
         "remember", "recall", "earlier", "previous", "before", "preference",
-        "favorite", "memory", "last",
+        "favorite", "memory", "last", "decided", "chose", "said", "discussed",
     }:
-        return ("memory", "capabilities")
+        return ("memory", "session_search", "capabilities")
     # Research / current facts: research plus reflection.
     if tokens & {
         "research", "investigate", "evidence", "source", "sources", "latest",

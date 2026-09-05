@@ -213,6 +213,11 @@ class SecretManager:
     allowed SECRET_READ before requesting a lease. This keeps raw values out of
     model context by default (B-072) and resolves strictly after policy
     checks (B-073).
+
+    Runtime-supplied secrets (operator-answered ``request_input`` with
+    ``expected="secret"``) are stored task-scoped and in-memory only: they
+    never touch the durable input-request ``answer`` column or the model
+    transcript, preserving Athena's secret-opacity contract.
     """
 
     def __init__(
@@ -232,6 +237,10 @@ class SecretManager:
         self._leases: list[CredentialLease] = []
         self._delegations: list[SecretDelegation] = []
         self._on_lease = on_lease
+        # Task-scoped runtime secrets (operator-supplied via request_input).
+        # In-memory only; never persisted to the input_request answer column
+        # or the model transcript.
+        self._task_secrets: dict[str, dict[str, str]] = {}
 
     def register_source(self, source: SecretSource) -> None:
         self._sources.append(source)
@@ -386,6 +395,35 @@ class SecretManager:
     def prune_expired(self) -> None:
         now = datetime.now()
         self._leases = [lease for lease in self._leases if lease.is_valid(now)]
+
+    # -- runtime-secret handling (operator-answered request_input) ---------- #
+    def store_task_secret(
+        self,
+        task_id: str,
+        *,
+        name: str,
+        value: str,
+        context: str | None = None,
+    ) -> str:
+        """Store an operator-supplied secret for a task in memory only.
+
+        Returns a stable ref (``runtime:<task>:<name>``) that can be used in
+        input_requests.answer_ref so the durable column never holds the raw
+        value.  The model sees only that a credential is available, never the
+        value itself.
+        """
+        task_entry = self._task_secrets.setdefault(task_id, {})
+        task_entry[name] = value
+        ref = f"runtime:{task_id}:{name}"
+        return ref
+
+    def resolve_task_secret(self, task_id: str, name: str) -> str | None:
+        """Resolve a runtime secret previously stored for a task."""
+        return self._task_secrets.get(task_id, {}).get(name)
+
+    def clear_task_secrets(self, task_id: str) -> None:
+        """Discard all runtime secrets for a task (e.g. on completion/cancel)."""
+        self._task_secrets.pop(task_id, None)
 
     def _resolve(self, name: str) -> str | None:
         for source in self._sources:

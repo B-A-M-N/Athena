@@ -642,6 +642,7 @@ class AthenaService:
             provider_usage_store=self._provider_usage_store,
             interpreter=self._make_interpreter(),
             reality_coordinator=coordinator,
+            secret_manager=self._secrets,
         )
         self._kernel = kernel
 
@@ -855,6 +856,17 @@ class AthenaService:
             task_manager=task_manager,
             kernel=kernel,
         )
+
+        # 12.76 Durable input-request recovery: a WAITING_INPUT task whose
+        # answer arrived while the process was down. The answer is durable
+        # (ANSWERED_PENDING_RESUME); the old kernel coroutine is not.
+        if self._store_input_requests is not None:
+            await self._recover_answered_input_requests(
+                input_requests=self._store_input_requests,
+                task_store=tasks,
+                task_manager=task_manager,
+                kernel=kernel,
+            )
 
         # 13. MCP (best-effort).
         self._mcp = MCPAdapter(registry)
@@ -1293,6 +1305,55 @@ class AthenaService:
             self._log_background_failure(f"approval recovery {task_id}")(task)
 
         return _done
+
+    async def _recover_answered_input_requests(
+        self,
+        *,
+        input_requests: InputRequestStore,
+        task_store: TaskStore,
+        task_manager: TaskManager,
+        kernel: AgentKernel,
+    ) -> None:
+        """Resume WAITING_INPUT tasks whose answer arrived while the process was down.
+
+        After ``InputRequestStore.resolve``, the answer is durable but the old
+        kernel coroutine is not. Any task in WAITING_INPUT with an
+        ANSWERED_PENDING_RESUME input request is a candidate for resume: the
+        operator answered while the service was restarting.
+        """
+        try:
+            tasks = await task_store.list_by_status(TaskStatus.WAITING_INPUT)
+        except Exception as exc:
+            _logger.warning("WAITING_INPUT recovery lookup failed: %s", exc)
+            return
+
+        for row in tasks or []:
+            task_id = row.get("id") if isinstance(row, dict) else None
+            if not task_id:
+                continue
+            try:
+                pending = await input_requests.pending_resumable(task_id)
+            except Exception as exc:
+                _logger.warning(
+                    "input-request resumable lookup failed for %s: %s", task_id, exc
+                )
+                continue
+            if pending is None:
+                continue
+            try:
+                await task_manager.transition(
+                    task_id, TaskStatus.RUNNING, reason="resume answered input request"
+                )
+            except Exception as exc:
+                _logger.warning(
+                    "cannot resume WAITING_INPUT task %s: %s", task_id, exc
+                )
+                continue
+            recovery = asyncio.create_task(kernel.run_task(task_id))
+            self._approval_recovery_tasks.add(recovery)
+            recovery.add_done_callback(
+                self._log_background_failure(f"input-recovery {task_id}")
+            )
 
     # ------------------------------------------------------------------ #
     # Application API

@@ -260,14 +260,40 @@ class MessageStore:
         results = [_hit_to_record(row) for row in rows]
         if context_window > 0:
             for hit in results:
-                hit["context"] = [
-                    _context_record(message)
-                    for message in await self.list_recent_session_messages(
-                        hit["session_id"],
-                        limit=context_window * 2 + 1,
-                    )
-                ]
+                hit["context"] = await self._context_around_hit(
+                    hit, context_window
+                )
         return results
+
+    async def _context_around_hit(
+        self, hit: dict, context_window: int
+    ) -> list[dict]:
+        """Return N messages before and after the hit from the SAME session."""
+        session_id = hit["session_id"]
+        hit_rowid = hit.get("_rowid") or hit.get("rowid")
+        if hit_rowid is None:
+            return [
+                _context_record(message)
+                for message in await self.list_recent_session_messages(
+                    session_id, limit=context_window * 2 + 1
+                )
+            ]
+        before_rows = await self._db.fetch_all(
+            "SELECT * FROM messages "
+            "WHERE session_id = ? AND rowid <= ? "
+            "ORDER BY rowid DESC LIMIT ?",
+            (session_id, hit_rowid, context_window + 1),
+        )
+        after_rows = await self._db.fetch_all(
+            "SELECT * FROM messages "
+            "WHERE session_id = ? AND rowid > ? "
+            "ORDER BY rowid ASC LIMIT ?",
+            (session_id, hit_rowid, context_window),
+        )
+        before_messages = [_row_to_message(r) for r in reversed(before_rows)]
+        after_messages = [_row_to_message(r) for r in after_rows]
+        all_messages = before_messages + after_messages
+        return [_context_record(m) for m in all_messages]
 
 
 def sanitize_fts_query(query: str) -> str:

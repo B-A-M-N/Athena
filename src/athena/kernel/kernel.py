@@ -365,6 +365,7 @@ class AgentKernel:
         router: "ModelRouter",
         interpreter=None,
         reality_coordinator: Any = None,
+        secret_manager=None,
     ) -> None:
         self._task_store = task_store
         self._events = events
@@ -392,6 +393,8 @@ class AgentKernel:
         # call parks the SAME task in WAITING_INPUT with the question durable;
         # the operator's answer resumes the identical task.
         self._input_request_store = input_request_store
+        # Secret manager for runtime secrets supplied via request_input.
+        self._secret_manager = secret_manager
         # Reality completion authority: intercepts terminal decisions to bind
         # acceptance evidence to an active candidate branch and promote only
         # proven reality.
@@ -519,8 +522,11 @@ class AgentKernel:
     async def notify_input_provided(self, task_id: str, answer: str) -> None:
         """Resume a WAITING_INPUT task with the operator's answer.
 
-        The same Task continues: the answer is appended to the session so the
-        next compile sees it as a user turn directed at the parked question.
+        The answer is already durably stored by ``InputRequestStore.resolve``
+        (ANSWERED_PENDING_RESUME) before this wakeup fires. This method is
+        therefore a non-authoritative fast path: the kernel reads the durable
+        answer from the store on resume, so a crash between DB-write and
+        wakeup cannot strand the task.
         """
         self._input_answers[task_id] = answer
         self._resume.setdefault(task_id, asyncio.Event()).set()
@@ -647,9 +653,42 @@ class AgentKernel:
                 task, state, TaskStatus.CANCELLED, "task cancelled while awaiting input"
             )
 
-        answer = str(self._input_answers.pop(task.id, ""))
-        await self._input_request_store.resolve(request_id, answer)
-        if task.session_id:
+        # Read the DURABLE answer, not the in-memory fast path. A crash
+        # between resolve() and wakeup would leave _input_answers empty;
+        # the DB is the authority for the continuation.
+        durable = await self._input_request_store.pending_resumable(task.id)
+        answer = str(
+            self._input_answers.pop(task.id, "")
+            or (durable or {}).get("answer")
+            or ""
+        )
+        answer_ref = (durable or {}).get("answer_ref") or None
+        expected = str((durable or {}).get("expected") or "text").lower()
+        await self._input_request_store.consume(request_id)
+
+        if expected == "secret" and self._secret_manager is not None:
+            # Secret-opacity path: the raw value must never appear in the
+            # durable answer column or the model transcript.  Store it in
+            # the SecretManager (in-memory, task-scoped) and surface only a
+            # non-secret acknowledgment to the model.
+            secret_name = (
+                (durable or {}).get("context", {}).get("secret_name")
+                or (args.get("context") or {}).get("secret_name")
+                or "operator_secret"
+            )
+            answer_ref = self._secret_manager.store_task_secret(
+                task.id,
+                name=secret_name,
+                value=answer,
+            )
+            # Update the durable record so answer_ref is set and answer is
+            # scrubbed (the raw value was only in the DB transiently; the
+            # persisted answer_ref is what survives).
+            await self._scrub_input_answer(request_id, answer_ref)
+            # The model sees only that a credential is available — never the
+            # raw value.
+            answer = f"Credential '{secret_name}' is now available for this task."
+        elif task.session_id:
             try:
                 await self._messages.append_to_session(
                     task.session_id,
@@ -1927,6 +1966,23 @@ class AgentKernel:
         # WAITING_INPUT even when the turn compiled no other tools.
         input_calls = [c for c in calls if c.capability_id == "request_input"]
         if input_calls:
+            # Every model-issued tool call must receive exactly one result.
+            # When request_input co-occurs with other calls, the clarification
+            # wins the turn: the other calls are not executed and each gets a
+            # deterministic "suspended for operator clarification" result.
+            # This prevents silently dropping call IDs.
+            other_calls = [c for c in calls if c not in input_calls]
+            if other_calls:
+                suspended = [
+                    CapabilityResultBlock(
+                        call_id=c.call_id,
+                        capability_id=c.capability_id,
+                        ok=False,
+                        error="not executed: turn suspended for operator clarification",
+                    )
+                    for c in other_calls
+                ]
+                await self._append_results(task, suspended, calls=other_calls)
             return await self._input_request_path(task, state, response, input_calls)
         # Natural-language framing is never a semantic authorization boundary:
         # the kernel refuses a call because policy forbids it, the task
@@ -2494,6 +2550,28 @@ class AgentKernel:
             await release(call_id)
         except Exception as exc:
             _logger.warning("continuation claim release failed for %s: %s", call_id, exc)
+
+    async def _scrub_input_answer(self, request_id: str, answer_ref: str) -> None:
+        """Replace a stored input answer with its non-secret ref.
+
+        Called after a runtime secret has been moved to the SecretManager.
+        Keeps the durable row for audit but removes the raw value.
+        """
+        if self._input_request_store is None:
+            return
+        try:
+            await self._scrub_input_answer_impl(request_id, answer_ref)
+        except Exception as exc:
+            _logger.warning("input answer scrub failed for %s: %s", request_id, exc)
+
+    async def _scrub_input_answer_impl(self, request_id: str, answer_ref: str) -> None:
+        store = self._input_request_store
+        await store.ensure_table()
+        await store._db.execute(  # type: ignore[attr-defined]
+            "UPDATE input_requests SET answer = NULL, answer_ref = ? "
+            "WHERE id = ? AND answer_ref IS NULL",
+            (answer_ref, request_id),
+        )
 
     # ------------------------------------------------------------------ #
     # Finalization
