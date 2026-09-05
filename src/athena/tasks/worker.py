@@ -77,16 +77,31 @@ class TaskWorker:
         # the driving kernel is being interrupted (P0-1).
         self._ownership_lost: dict[str, bool] = {}
 
-    async def stop(self) -> None:
-        """Signal the background loop to stop and await its graceful exit."""
+    async def stop(self, *, grace_seconds: float = 5.0) -> None:
+        """Signal the background loop to stop and quiesce every worker.
+
+        One bounded global deadline covers the whole pool: workers are waited
+        CONCURRENTLY until ``grace_seconds`` elapse, then pending ones are
+        cancelled and awaited to terminal coroutine state before
+        ``_worker_tasks`` is cleared (P0-2). The sequential wait/cancel that
+        previously leaked un-awaited cancelled coroutines is gone.
+        """
         self._stop.set()
         self._wake.set()
-        tasks = getattr(self, "_worker_tasks", None) or ([] if self._task is None else [self._task])
-        for t in tasks:
-            try:
-                await asyncio.wait_for(t, timeout=5)
-            except (TimeoutError, asyncio.CancelledError):
+        tasks = getattr(self, "_worker_tasks", None) or (
+            [] if self._task is None else [self._task]
+        )
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=max(grace_seconds, 0.0))
+            for t in pending:
                 t.cancel()
+            if pending:
+                # Every cancelled coroutine must reach terminal state before
+                # this method returns; results/exceptions are folded away.
+                await asyncio.gather(*pending, return_exceptions=True)
+            # Drain any already-done tasks so their exceptions are observed
+            # and the coroutines are definitely terminal.
+            await asyncio.gather(*done, return_exceptions=True)
         self._task = None
         self._worker_tasks = None
 

@@ -605,9 +605,44 @@ class ExecutionManager:
             ),
         )
 
-    async def close_all(self) -> None:
+    async def close_all(self) -> dict[str, Any]:
+        """Shut down every execution resource this manager owns.
+
+        Sole cleanup owner (P0-2): tasks' sessions, pending runtime
+        cancellations, every registered runtime's sessions, and every
+        non-local backend. Returns a structured outcome so shutdown knows
+        when a process tree could not be proven dead instead of the failure
+        hiding in a log line.
+        """
+        outcome: dict[str, Any] = {
+            "tasks_cancelled": 0,
+            "sessions_remaining": [],
+            "runtime_failures": [],
+            "backend_failures": [],
+        }
         for task_id in set(self._task_sessions) | set(self._pending_runtime_cancellations):
-            await self.cancel_task(task_id)
+            try:
+                await self.cancel_task(task_id)
+                outcome["tasks_cancelled"] += 1
+            except Exception as exc:
+                outcome["runtime_failures"].append(
+                    {"task_id": task_id, "error": str(exc)}
+                )
+                _logger.warning("task %s runtime cancellation failed: %s", task_id, exc)
+        for runtime in set(self._runtimes.values()):
+            close_all = getattr(runtime, "close_all", None)
+            if close_all is None:
+                continue
+            try:
+                if asyncio.iscoroutinefunction(close_all):
+                    await close_all()
+                else:
+                    close_all()
+            except Exception as exc:
+                outcome["runtime_failures"].append(
+                    {"runtime": type(runtime).__name__, "error": str(exc)}
+                )
+                _logger.warning("runtime %s close_all failed: %s", type(runtime).__name__, exc)
         for backend in list(self._backends.values()):
             shutdown = getattr(backend, "shutdown", None)
             if shutdown is None:
@@ -618,9 +653,25 @@ class ExecutionManager:
                 else:
                     shutdown()
             except Exception as exc:
+                outcome["backend_failures"].append(
+                    {"backend": getattr(backend, "name", "?"), "error": str(exc)}
+                )
                 _logger.warning(
                     "backend %s shutdown failed: %s", getattr(backend, "name", "?"), exc
                 )
+        outcome["sessions_remaining"] = sorted(
+            {sid for sessions in self._task_sessions.values() for _rt, sid in sessions}
+        )
+        return outcome
+
+    def live_resource_count(self) -> int:
+        """Count execution resources that must be zero after close_all (P0-2)."""
+        live_sessions = sum(len(sessions) for sessions in self._task_sessions.values())
+        return (
+            live_sessions
+            + len(self._pending_runtime_cancellations)
+            + len(self._exec_runtimes)
+        )
 
     async def _emit_event(self, event_type: str, payload: dict, task_id: str | None = None) -> None:
         """Emit an execution event to the event sink if one is configured."""

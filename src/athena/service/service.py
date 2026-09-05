@@ -1109,25 +1109,28 @@ class AthenaService:
                 self._hermes_referee = None
                 self._hermes_referee_owned = False
 
-        # Runtimes / execution. Kill every in-flight subprocess tree so a
-        # shutdown never leaves an orphan process, including sessions the
-        # runtimes adopted that were never surfaced into _task_sessions.
+        # Runtimes / execution. ExecutionManager is the SOLE cleanup owner
+        # (P0-2): its close_all covers task sessions, adopted execution
+        # sessions, registered runtimes, and non-local backends. The service
+        # must not reach into the manager's private runtime collection.
         if self._execution is not None:
             try:
-                await self._execution.close_all()
+                outcome = await self._execution.close_all()
             except Exception as exc:
                 _logger.warning("execution close_all failed: %s", exc)
-            for rt in set(self._execution._runtimes.values()):
-                close_all = getattr(rt, "close_all", None)
-                if close_all is None:
-                    continue
-                try:
-                    if asyncio.iscoroutinefunction(close_all):
-                        await close_all()
-                    else:
-                        close_all()
-                except Exception as exc:
-                    _logger.warning("runtime %s close_all failed: %s", type(rt).__name__, exc)
+            else:
+                if outcome.get("runtime_failures") or outcome.get("sessions_remaining"):
+                    _logger.warning(
+                        "execution shutdown incomplete: %d runtime failures, "
+                        "%d sessions remaining",
+                        len(outcome.get("runtime_failures", ())),
+                        len(outcome.get("sessions_remaining", ())),
+                    )
+            if self._execution.live_resource_count() > 0:
+                _logger.warning(
+                    "execution manager still holds %d live resources after close_all",
+                    self._execution.live_resource_count(),
+                )
             self._execution = None
 
         # DB last.
