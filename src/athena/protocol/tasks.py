@@ -189,6 +189,10 @@ class WorkspaceSpec:
     execution_backend: str | None = None
     network_policy: NetworkPolicy = NetworkPolicy.ALLOW
     mutation_mode: MutationMode = MutationMode.DIRECT
+    # Child workspace mode for delegation (SHARED_READ, SHADOW_WRITE, SUBTREE, DETACHED).
+    delegate_mode: str | None = None
+    # Whether the child is required (parent can't complete without it) vs detached.
+    required_child: bool = True
     # Optional revision supplied by a persisted project/workspace index.  A
     # cache policy may use it, but the dispatcher never invents one by hashing
     # the entire workspace synchronously.
@@ -357,6 +361,11 @@ class AgentRequest:
     autonomy: AutonomyLevel = AutonomyLevel.SUPERVISED
     attachments: tuple[ArtifactRef, ...] = ()
     requested_capabilities: frozenset[str] | None = None
+    # Authority-bearing: explicit mutation mode (defaults to workspace or SUPERVISED default).
+    mutation_mode: MutationMode | None = None
+    # Authority-bearing: explicit acceptance criteria for the task.
+    acceptance_criteria: tuple[Criterion, ...] = ()
+    # Descriptive metadata (should not change where effects land or whether a task may complete).
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
