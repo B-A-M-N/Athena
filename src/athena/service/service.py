@@ -538,6 +538,17 @@ class AthenaService:
         )
         task_manager.add_finalize_observer(self._knowledge)
 
+        # Terminal-result delivery (P1-19): TaskSpec.delivery finally has a
+        # consumer. Bound as a finalize observer — delivery runs after the
+        # result is durable and its failures never destabilize finalization.
+        from athena.delivery import DeliveryManager
+
+        self._delivery = DeliveryManager(
+            event_store=events,
+            external_store=self._external_effect_store,
+        )
+        task_manager.add_finalize_observer(self._delivery)
+
         # 8. Models + router (with role-divided policies: "summarizer",
         # "judge", etc. can be pinned to specific models in config; roles
         # without an entry fall back to the user's primary/global choice).
