@@ -734,16 +734,14 @@ def select_strategy(
             turn_intent=intent.kind,
         )
 
-    # Route is advisory evidence ranking. Objective terms are only signals in
-    # the score; the actual route is selected from the visible descriptor
-    # inventory, declared effects/tags, and readiness proof. This keeps a
-    # missing capability observable without making a keyword switch the
-    # execution planner.
+    # Route is advisory evidence ranking over the visible descriptor
+    # inventory, declared effects/tags, and readiness proof. Profiles carry
+    # no objective-keyword signals: a keyword must never summon a route or
+    # manufacture a missing primitive (P1-24 removed the dead sets).
     profiles: tuple[Mapping[str, Any], ...] = (
         {
             "route": "fusion",
             "preferred": ("fusion", "workflow", "fs", "execute"),
-            "signals": {"experiment", "shadow", "speculative", "fork", "branch"},
             "tags": {"fusion", "shadow", "experiment"},
             "effects": {"execute", "write_local"},
             "rationale": "Bounded speculative work should be proven in a shadow before commit.",
@@ -751,7 +749,6 @@ def select_strategy(
         {
             "route": "evidence_acquisition",
             "preferred": ("research", "workflow", "artifacts"),
-            "signals": {"research", "compare", "sources", "evidence", "investigate"},
             "tags": {"research", "evidence", "sources"},
             "effects": {"read_local", "network_read"},
             "rationale": "Sourced work needs bounded acquisition and explicit gap handling.",
@@ -759,7 +756,6 @@ def select_strategy(
         {
             "route": "synthesize",
             "preferred": ("synthesis", "scratch", "workflow"),
-            "signals": {"tool", "automate", "generate", "capability", "helper"},
             "tags": {"synthesis", "generated", "tool"},
             "effects": {"execute", "write_local"},
             "rationale": "Reusable behavior should be validated task-locally before promotion.",
@@ -767,7 +763,6 @@ def select_strategy(
         {
             "route": "compose",
             "preferred": ("workflow", "execute", "fs"),
-            "signals": {"workflow", "pipeline", "release", "deploy", "steps"},
             "tags": {"workflow", "pipeline", "compose"},
             "effects": {"execute", "write_local"},
             "rationale": "Ordered work should use a bounded workflow when one exists.",
@@ -775,7 +770,6 @@ def select_strategy(
         {
             "route": "direct",
             "preferred": ("capabilities", "execute", "fs", "workflow", "scratch", "synthesis"),
-            "signals": set(),
             "tags": {"primitive", "native"},
             "effects": {"execute", "read_local"},
             "priority": 1,
