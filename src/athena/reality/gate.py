@@ -49,6 +49,7 @@ from athena.causal.checkpoint import _run_worker as _run_checkpoint_worker
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityRequest,
+    CapabilityRequestOrigin,
     EffectClass,
 )
 from athena.protocol.messages import utcnow
@@ -428,7 +429,17 @@ class RealityGate:
             )
 
         if mode is MutationMode.DIRECT:
-            return RealityRoute(workspace, ExecutionDisposition.DIRECT)
+            # Opaque execution (arbitrary shell/Python/code) can mutate the
+            # workspace through paths its effect descriptor does not declare
+            # (e.g. ``open().write()``, ``os.unlink()``, ``sed -i``,
+            # ``git checkout``).  The classifier correctly flags such calls
+            # as SPECULATIVE, but only if we let it run.  A DIRECT mode
+            # short-circuit here would route arbitrary code straight to the
+            # real workspace — the exact authority escape the effect model
+            # exists to prevent.  For opaque calls, fall through to
+            # classification so they land on a candidate branch.
+            if not self._is_opaque_execution(request, effects, descriptor):
+                return RealityRoute(workspace, ExecutionDisposition.DIRECT)
 
         sensitive = self._is_project_sensitive(request, effects, descriptor)
         if not sensitive:
@@ -932,6 +943,46 @@ class RealityGate:
             return True
         origin = getattr(descriptor.origin, "value", descriptor.origin)
         return origin in {"generated", "project", "user"}
+
+    @staticmethod
+    def _is_opaque_execution(
+        request: CapabilityRequest,
+        effects,
+        descriptor: CapabilityDescriptor,
+    ) -> bool:
+        """Whether arbitrary code may mutate the workspace undeclared.
+
+        Opaque execution (shell, python, generated code, PTY) can perform
+        writes/deletes that the effect descriptor does not express —
+        ``open().write()``, ``os.unlink()``, ``sed -i``, ``git checkout``.
+        Such calls MUST enter the candidate path so the RealityGate can
+        observe what actually mutated before any effect crosses into
+        reality.  Reads and declared-path mutations are not opaque.
+        """
+        capability_id = str(request.capability_id)
+        effect_set = set(effects or ())
+        origin = getattr(descriptor.origin, "value", descriptor.origin)
+        if (
+            capability_id in RealityGate._PROCESS_CAPABILITIES
+            or EffectClass.EXECUTE in effect_set
+            or EffectClass.SPAWN_PROCESS in effect_set
+            or origin in {"generated", "project", "user"}
+        ):
+            # Trusted orchestration (fusion probes, commit plans) and the
+            # acceptance verifier execute under their own authority envelope,
+            # explicitly bound to the workspace they pass in — frequently the
+            # shadow itself. Reclassifying them would hijack a probe aimed at
+            # a candidate branch into a nested candidate and deadlock the
+            # commit boundary. The opaque hazard is model-REACHABLE code:
+            # MODEL, USER_DIRECT, GENERATED, MCP, REMOTE origins stay opaque.
+            request_origin = getattr(request.origin, "value", request.origin)
+            if request_origin in {
+                CapabilityRequestOrigin.TRUSTED_ORCHESTRATION.value,
+                CapabilityRequestOrigin.SYSTEM_VERIFICATION.value,
+            }:
+                return False
+            return True
+        return False
 
 
 def _mutation_mode(value: MutationMode | str | None) -> MutationMode:
