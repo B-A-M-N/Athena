@@ -208,3 +208,66 @@ async def test_enabled_file_observer_rehydrates_from_persisted_contract(tmp_path
     )
     assert await restored.rehydrate() == 1
     assert set(restored_registry.file_watches) == {old_watch_id}
+
+
+# --------------------------------------------------------------------------- #
+# Objective-template classification contract (e2e release regression).
+#
+# The maintenance objective is system-authored, and the termination gate
+# reads its shape through the deterministic turn-intent classifier. The
+# template's leading line must therefore classify state-shaped so a purely
+# observational contract (no remediation) can COMPLETE on its machine-
+# verified criterion — while remediation-bearing contracts must still
+# classify action-shaped and keep the causal-evidence requirement.
+# --------------------------------------------------------------------------- #
+def _objective_text(contract: dict) -> str:
+    from athena.capabilities.maintain import _objective
+
+    return _objective(contract)
+
+
+@pytest.mark.athena_evidence("test", "unit")
+def test_observation_contract_classifies_state_shaped():
+    """No remediation -> observation intent: verified criteria satisfy the
+    observable-work gate, so an observer that correctly records truth is not
+    held PARTIAL for lacking causal work it never owed."""
+    from athena.strategy import OBSERVATION, resolve_turn_intent
+
+    intent = resolve_turn_intent(
+        _objective_text(
+            {
+                "claim": "RELEASE_WATCH",
+                "observe": {"kind": "file", "path": ".", "pattern": "x.txt"},
+                "verify": {"path": "x.txt", "predicate": "exists"},
+                "remediation": {},
+                "policy": "supervised",
+            }
+        )
+    )
+    assert intent.kind == OBSERVATION
+    assert intent.requires_observable_work is True
+
+
+@pytest.mark.athena_evidence("test", "unit")
+def test_remediation_contract_still_classifies_action_shaped():
+    """A remediation contract names real mutations; the classifier must keep
+    demanding causal evidence for those regardless of the template's label."""
+    from athena.strategy import MUTATION, resolve_turn_intent
+
+    intent = resolve_turn_intent(
+        _objective_text(
+            {
+                "claim": "RELEASE_WATCH",
+                "observe": {"kind": "file", "path": ".", "pattern": "x.txt"},
+                "verify": {"path": "x.txt", "predicate": "exists"},
+                "remediation": {
+                    "operation": "write",
+                    "path": "x.txt",
+                    "content": "restored",
+                },
+                "policy": "supervised",
+            }
+        )
+    )
+    assert intent.kind == MUTATION
+    assert intent.requires_observable_work is True

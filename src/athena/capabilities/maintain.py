@@ -504,8 +504,16 @@ class MaintenanceCapability:
 
 
 def _objective(contract: Mapping[str, Any]) -> str:
+    # The leading noun matters: this line feeds the deterministic turn-intent
+    # classifier, which reads "run" as an execution verb and would classify a
+    # purely observational contract as action-shaped — demanding causal work
+    # receipts the observer legitimately never produces (its verify criterion
+    # is machine-checked instead). "check" classifies observation (state-
+    # shaped), so the verified criterion satisfies the observable-work gate;
+    # a remediation-bearing contract still classifies mutation and keeps the
+    # causal-evidence requirement.
     return (
-        "Maintenance run. Claim: {claim}\n"
+        "Maintenance check. Claim: {claim}\n"
         "Observe: {observe}\n"
         "Verify: {verify}\n"
         "Remediation (only under policy): {remediation}\n"
