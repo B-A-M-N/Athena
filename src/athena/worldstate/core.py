@@ -7,9 +7,10 @@ Three cooperating pieces of the fusion thesis:
    When the workspace changes afterward, affected claims become STALE:
    not false, but no longer trustworthy without reverification.
 
-2. InvariantSet   — continuous invariants checked AFTER each mutation,
-   giving autonomous work a runtime safety envelope instead of
-   end-of-task verification alone.
+2. InvariantSet   — invariants checked ONCE per speculative experiment,
+   after shadow execution and BEFORE commit (P1-22: this is a pre-commit
+   gate, not a per-mutation runtime envelope — the fusion orchestrator
+   is its only evaluator).
 
 3. TaskWorldState — a structured, execution-grounded snapshot of what is
    actually true for a task right now: dirty files, mutation counts,
@@ -228,7 +229,15 @@ class Invariant:
 
 
 class InvariantSet:
-    """Runtime safety envelope: probes run after each mutation batch."""
+    """Pre-commit safety envelope: probes run once per speculative
+    experiment, after shadow execution and before commit touches
+    reality (P1-22).
+
+    The docstring previously claimed "probes run after each mutation
+    batch" — no mutation boundary consumes this class. It is evaluated
+    once, by the fusion orchestrator, on the shadow copy before a
+    verified branch may commit.
+    """
 
     def __init__(self, *, task_id: str | None = None, store: WorldStateStore | None = None) -> None:
         self.task_id = task_id
