@@ -77,6 +77,7 @@ from athena.strategy import (
 __all__ = [
     "CompiledContext",
     "ContextCompiler",
+    "ContextDegradation",
     "ModelRequirements",
 ]
 
@@ -130,6 +131,9 @@ class CompiledContext:
             route="respond", rationale="No external action or evidence acquisition is required."
         )
     )
+    # Optional-context sources that raised during this compile (P1-6).
+    # Empty means every consulted store answered — not that data exists.
+    degradations: tuple[ContextDegradation, ...] = ()
 
     def to_request(
         self,
@@ -161,6 +165,30 @@ class _MemoryCacheKey:
     task_id: str
     mode: str
     store_generation: int
+
+
+@dataclass(frozen=True)
+class ContextDegradation:
+    """One optional-context source that failed during compilation (P1-6).
+
+    Graceful degradation is correct behavior — a broken memory store must
+    not fail the task — but empty context is semantically meaningful: it
+    is observationally identical to "no memories exist" unless the
+    compiler records the difference. These records surface through
+    ``CompiledContext.degradations`` so operator inspection (``athena
+    inspect``, diagnostics events) can distinguish absence from failure.
+    """
+
+    source: str
+    """Which optional handle failed: ``memory``, ``transcript``,
+    ``skills``, ``research``, ``context_blocks``, ``capabilities``,
+    ``workspace``."""
+
+    detail: str
+    """Bounded exception summary (type + message)."""
+
+    scope: str = ""
+    """Optional narrower scope, e.g. the memory scope that raised."""
 
 
 @dataclass(frozen=True)
@@ -373,10 +401,45 @@ class ContextCompiler:
         self.capability_limit = max(1, capability_limit)
         self._project_cache: dict[str, tuple[str, tuple[_Entry, ...]]] = {}
         self._memory_cache: OrderedDict[_MemoryCacheKey, tuple[Any, ...]] = OrderedDict()
+        # Degradations recorded since the last drain (P1-6). Bounded so a
+        # persistently failing store cannot grow the ledger without limit
+        # between compiles.
+        self._degradations: list[ContextDegradation] = []
+        self._degradations_dropped = 0
         self._static_cache: OrderedDict[tuple[Any, ...], _StaticContext] = OrderedDict()
         # Single-flight registry: prevents duplicate concurrent static-context
         # loads for the same key.  The first caller computes; waiters share.
         self._inflight_static: dict[tuple[Any, ...], asyncio.Future[_StaticContext]] = {}
+
+    def _record_degradation(self, source: str, exc: BaseException, *, scope: str = "") -> None:
+        """Record an optional-context failure for operator visibility.
+
+        Degradation never fails the compile; it only makes the failure
+        observable. The detail is bounded — the exception summary, never a
+        full traceback or store payload.
+        """
+        entry = ContextDegradation(
+            source=source,
+            detail=f"{type(exc).__name__}: {exc}"[:256],
+            scope=scope,
+        )
+        if len(self._degradations) >= 64:
+            self._degradations_dropped += 1
+            return
+        self._degradations.append(entry)
+
+    def _drain_degradations(self) -> tuple[ContextDegradation, ...]:
+        drained = tuple(self._degradations)
+        if self._degradations_dropped:
+            drained = drained + (
+                ContextDegradation(
+                    source="ledger",
+                    detail=f"{self._degradations_dropped} further degradation(s) dropped",
+                ),
+            )
+        self._degradations.clear()
+        self._degradations_dropped = 0
+        return drained
 
     @property
     def principal_id(self) -> str:
@@ -477,6 +540,7 @@ class ContextCompiler:
             capability_definitions=capabilities,
             cache_prefix_messages=messages[:stable_count],
             strategy=static.strategy,
+            degradations=self._drain_degradations(),
         )
 
     async def compile_auxiliary(
@@ -722,6 +786,7 @@ class ContextCompiler:
             blocks = await store.list(scopes=scopes, attached_only=True, limit=64)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             _logger.warning("attached context lookup failed: %s", exc)
+            self._record_degradation("context_blocks", exc)
             return []
         entries: list[_Entry] = []
         for block in blocks or ():
@@ -1006,7 +1071,8 @@ class ContextCompiler:
                 and item.get("id")
                 and capability_id_permitted(str(item.get("id")), policy)
             }
-        except Exception:
+        except Exception as exc:
+            self._record_degradation("capabilities", exc)
             if not is_explicit_response_turn(task.objective):
                 return (
                     self._fallback_bundle(descriptors, task),
@@ -1180,6 +1246,7 @@ class ContextCompiler:
             )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             _logger.warning("research context lookup failed: %s", exc)
+            self._record_degradation("research", exc)
             return []
         entries: list[_Entry] = []
         for hit in hits or []:
@@ -1231,7 +1298,8 @@ class ContextCompiler:
                     return list(await m.list_recent_messages(task.session_id))
                 if hasattr(m, "list_messages"):
                     return list(await m.list_messages(task.session_id))
-            except Exception:
+            except Exception as exc:
+                self._record_degradation("transcript", exc, scope=task.session_id)
                 return []
         return []
 
@@ -1293,8 +1361,8 @@ class ContextCompiler:
                     while len(self._memory_cache) > 256:
                         self._memory_cache.popitem(last=False)
                 return result
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_degradation("memory", exc, scope="scopes")
         out: list[Any] = []
         try:
             if task.session_id:
@@ -1305,8 +1373,8 @@ class ContextCompiler:
                         scope_id=task.session_id,
                     )
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record_degradation("memory", exc, scope="session")
         try:
             out.extend(
                 await store.search(
@@ -1315,12 +1383,12 @@ class ContextCompiler:
                     scope_id=task.workspace.id if task.workspace else None,
                 )
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record_degradation("memory", exc, scope="project")
         try:
             out.extend(await store.search(task.objective, scope=MemoryScope.GLOBAL))
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record_degradation("memory", exc, scope="global")
         if mode is MemoryRetrievalMode.WORK:
             out = _strong_matches(task.objective, out)
         if cache_key is not None:
@@ -1335,7 +1403,8 @@ class ContextCompiler:
             return []
         try:
             available = list(await self._skill_loader.load_active())
-        except Exception:
+        except Exception as exc:
+            self._record_degradation("skills", exc)
             return []
         if not available:
             return []
@@ -1363,7 +1432,8 @@ class ContextCompiler:
                 revision = hashlib.sha256(
                     json.dumps(files, sort_keys=True, default=str).encode("utf-8")
                 ).hexdigest()
-        except Exception:
+        except Exception as exc:
+            self._record_degradation("workspace", exc)
             return []
         key = str(workspace or "")
         cached = self._project_cache.get(key)

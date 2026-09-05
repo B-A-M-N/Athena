@@ -1152,6 +1152,22 @@ class AgentKernel:
         )
         strategy = compiled.strategy
         await self._emit("StrategySelected", strategy.to_dict(), task)
+        if compiled.degradations:
+            # P1-6: optional-context failures are visible, not silent. Empty
+            # memory/skills/transcript must be distinguishable from a store
+            # that raised; this is the diagnostic that says which it was.
+            await self._emit(
+                "DiagnosticsProduced",
+                {
+                    "kind": "context_degradation",
+                    "degradations": [
+                        {"source": d.source, "scope": d.scope, "detail": d.detail}
+                        for d in compiled.degradations
+                    ],
+                    "count": len(compiled.degradations),
+                },
+                task,
+            )
         if strategy.missing_affordance:
             await self._emit(
                 "AffordanceGapDetected",
