@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
+import fcntl
 import os
 import shutil
+import stat
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -163,6 +169,83 @@ def tree_paths(root: Path) -> list[Path]:
     return sorted(result)
 
 
+_FICLONE = 0x40049409  # Linux ioctl: clone a file's extents (reflink)
+
+
+@lru_cache(maxsize=8)
+def _reflink_supported(directory: str) -> bool:
+    """Probe whether the filesystem under ``directory`` supports FICLONE.
+
+    Copy-on-write reflinks make shadow clones near-free on btrfs/xfs/zfs/
+    NFSv4.2 while degrading to a plain byte copy on ext4 — silently, so a
+    probe failure never surfaces as an error. The probe clones a scratch
+    file onto ITSELF (a no-op rewrite): the cheapest way to ask the kernel
+    without touching real data.
+    """
+    if os.name != "posix" or sys.platform == "darwin":
+        return False
+    probe_path: str | None = None
+    try:
+        fd, probe_path = tempfile.mkstemp(dir=directory, prefix=".athena-reflink-probe-")
+        os.close(fd)
+        probe_fd = os.open(probe_path, os.O_RDONLY)
+        try:
+            fcntl.ioctl(probe_fd, _FICLONE, probe_fd)
+            return True
+        finally:
+            os.close(probe_fd)
+    except (OSError, AttributeError, ValueError):
+        return False
+    finally:
+        if probe_path:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+
+
+def _copy_file(source: Path, destination: Path) -> None:
+    """Copy one regular file, preferring a copy-on-write reflink (P1-21).
+
+    A reflink never aliases bytes: the clone gets private extents the
+    moment either side writes, which is precisely the isolation contract
+    the shadow's full copy previously bought by brute force. When the
+    filesystem cannot reflink (ext4, tmpfs without support), this is a
+    byte-identical ``copy2``.
+    """
+    try:
+        if _reflink_supported(str(source.parent)):
+            _reflink_file(source, destination)
+            return
+    except (OSError, ValueError):
+        pass
+    shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def _reflink_file(source: Path, destination: Path) -> None:
+    """FICLONE ``source`` into ``destination`` (Linux ioctl)."""
+    src_fd = os.open(source, os.O_RDONLY)
+    try:
+        st = os.fstat(src_fd)
+        dst_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            fcntl.ioctl(dst_fd, _FICLONE, src_fd)
+            # Preserve metadata the way copy2 does, on top of cloned extents.
+            os.chmod(destination, stat.S_IMODE(st.st_mode))
+            os.utime(destination, ns=(st.st_atime_ns, st.st_mtime_ns))
+        except OSError:
+            # A failed clone must not leave a truncated/empty target behind.
+            try:
+                os.unlink(destination)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+
 def copy_workspace_tree(
     source: str | Path,
     destination: str | Path,
@@ -284,7 +367,7 @@ def copy_workspace_tree(
                             raise FileExistsError(destination_path)
                         remove_existing(destination_path)
                     destination_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source_path, destination_path, follow_symlinks=False)
+                    _copy_file(source_path, destination_path)
                 else:
                     raise ValueError(f"unsupported workspace entry: {source_path}")
 
