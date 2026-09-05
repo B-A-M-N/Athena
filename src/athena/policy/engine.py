@@ -143,6 +143,24 @@ class PolicyEngine:
         if request.workspace is None:
             return None
         effects = set(request.effects)
+
+        # ---- universal network boundary (structural, approval-proof) ---- #
+        # Workspace network_policy=DENY is a hard containment invariant: no
+        # capability may read or write the network regardless of what its
+        # descriptor declares. Individual capability backends enforce this as
+        # defense in depth, but PolicyEngine is the authority — a third-party
+        # native/generated/MCP capability must not need to rediscover the
+        # workspace's hard network boundary on its own.
+        if (
+            request.workspace.network_policy == NetworkPolicy.DENY
+            and effects
+            & {
+                EffectClass.NETWORK_READ,
+                EffectClass.NETWORK_WRITE,
+            }
+        ):
+            return _deny("network denied: workspace network_policy is DENY")
+
         execute_bearing = (
             EffectClass.EXECUTE in effects or EffectClass.SPAWN_PROCESS in effects
         )
