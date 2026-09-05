@@ -162,29 +162,52 @@ class _CountingVerifier2:
 
 
 async def test_verified_criteria_count_works_and_proves_twice():
-    """A single criteria-verification run satisfies BOTH the acceptance gate
-    and the observable-work gate (no separate model execution needed)."""
+    """For state-shaped objectives (observation/response), a verified criterion
+    alone satisfies both the acceptance gate and the observable-work gate.
+    For action-shaped objectives (execution/mutation/external), verified
+    criteria alone are insufficient — causal work evidence is required."""
     verifier = _CountingVerifier2(outcome=True)
     evaluator = TerminationEvaluator(acceptance_verifier=verifier)
 
+    # State-shaped objective: "what does the README say?" — verified criteria ARE the work
     task = TaskSpec(
         id="criteria-evidence",
-        objective="fix the failing test",
-        acceptance_criteria=(Criterion(id="c-tests", description="tests pass"),),
+        objective="what does the README say?",
+        acceptance_criteria=(Criterion(id="c-readme", description="README was read"),),
     )
 
     decision = await evaluator.evaluate(
         task,
-        _response([TextBlock(type="text", text="all tests green")]),
+        _response([TextBlock(type="text", text="the README says...")]),
         iterations=1,
         completion_mode=OBSERVABLE_WORK_REQUIRED,
         observed_work=False,
         work_evidence=(),
     )
 
-    # COMPLETE not PARTIAL: the verified criterion is the work proof. The run
-    # counted once (criteria) and proved twice (the observable-work gate).
+    # COMPLETE: the verified criterion is sufficient proof for a state-shaped objective
     assert decision.terminal is True
     assert decision.status is TaskStatus.COMPLETE
     assert decision.unresolved == ()
     assert verifier.calls == 1
+
+    # Action-shaped objective: "fix the failing test" — verified criteria alone
+    # are NOT sufficient; need causal work evidence
+    verifier2 = _CountingVerifier2(outcome=True)
+    evaluator2 = TerminationEvaluator(acceptance_verifier=verifier2)
+    action_task = TaskSpec(
+        id="criteria-action",
+        objective="fix the failing test",
+        acceptance_criteria=(Criterion(id="c-tests", description="tests pass"),),
+    )
+    decision2 = await evaluator2.evaluate(
+        action_task,
+        _response([TextBlock(type="text", text="all tests green")]),
+        iterations=1,
+        completion_mode=OBSERVABLE_WORK_REQUIRED,
+        observed_work=False,
+        work_evidence=(),
+    )
+    # PARTIAL: action-shaped objective requires causal work evidence
+    assert decision2.terminal is True
+    assert decision2.status is TaskStatus.PARTIAL

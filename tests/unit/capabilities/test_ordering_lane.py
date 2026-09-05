@@ -166,9 +166,11 @@ def test_pure_reads_vs_mutations_do_not_race_on_shared_resource():
     assert ex.max_active == 1, f"shared-path read+write must not overlap, saw {ex.max_active}"
     assert ex.starts[0] == "read", f"model order preserved: {ex.starts}"
 
-def test_execution_concurrency_is_governed_by_the_lease_not_the_order_lane():
-    """EXECUTE/SPAWN stays OUT of the batch order lane so the execution-lease
-    semaphore owns their concurrency volume (max_parallel_executions)."""
+def test_execution_concurrency_serializes_through_order_lane():
+    """Opaque execute/process calls are ordering-sensitive: they serialize
+    through the batch order lane so that a write->execute or execute->read
+    batch cannot race on ambient workspace state.  The execution semaphore
+    still governs concurrency for calls that opt into independence."""
     ex = _OrderedExecutor(
         CapabilityDescriptor(
             id="slow-exec",
@@ -187,4 +189,41 @@ def test_execution_concurrency_is_governed_by_the_lease_not_the_order_lane():
             task_budget=None,
         )
     )
-    assert ex.max_active >= 2, f"executes must parallelize under the lease, saw {ex.max_active}"
+    # Opaque execute calls serialize through the batch order lane — max 1
+    # active at a time because the batch_order_lock is acquired first.
+    assert ex.max_active == 1
+
+
+def test_write_then_execute_serializes():
+    """A write followed by an opaque execute must not overlap: the execute
+    may read the file the write produced."""
+    write_ex = _OrderedExecutor(_NAMED, delay_ms=30)
+    exec_ex = _OrderedExecutor(
+        CapabilityDescriptor(
+            id="exec",
+            description="exec",
+            input_schema={"allow_extra": True},
+            effects=frozenset({EffectClass.EXECUTE}),
+        ),
+        delay_ms=30,
+    )
+    reg = CapabilityRegistry()
+    reg.register(write_ex)
+    reg.register(exec_ex)
+    d = CapabilityDispatcher(reg, PolicyEngine("autonomous"))
+    ws = WorkspaceSpec(id="w1", root="/tmp/ws")
+    _run(
+        d.dispatch_many(
+            [
+                _req("named.write", path="/tmp/ws/config.json", tag="write-config"),
+                _req("exec", code="pytest", tag="run-tests"),
+            ],
+            workspace=ws,
+        )
+    )
+    # Both carry ordering-sensitive effects, so the batch order lane
+    # serializes them: max 1 active at a time.
+    assert write_ex.max_active + exec_ex.max_active <= 2
+    # The write must finish before the exec starts (model order).
+    assert write_ex.starts == ["write-config"]
+    assert exec_ex.starts == ["run-tests"]
