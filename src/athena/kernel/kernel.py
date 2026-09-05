@@ -447,6 +447,7 @@ class AgentKernel:
         continuation_store=None,
         workflow_run_store=None,
         input_request_store=None,
+        parked_slot_wait_s: float = 300.0,
         router: "ModelRouter",
         interpreter=None,
         reality_coordinator: Any = None,
@@ -478,6 +479,13 @@ class AgentKernel:
         # call parks the SAME task in WAITING_INPUT with the question durable;
         # the operator's answer resumes the identical task.
         self._input_request_store = input_request_store
+        # Worker slot release (P1-17): how long a parked wait (WAITING_INPUT,
+        # WAITING_APPROVAL) may hold its worker coroutine. Past this, the run
+        # returns with the task left in its paused status and the worker slot
+        # is free; the durable continuation (open question / pending approval)
+        # survives, and the resumer (provide_input / approve / startup
+        # recovery) relaunches the task on a fresh worker.
+        self._parked_slot_wait_s = max(float(parked_slot_wait_s), 0.0)
         # Secret manager for runtime secrets supplied via request_input.
         self._secret_manager = secret_manager
         # Reality completion authority: intercepts terminal decisions to bind
@@ -635,6 +643,158 @@ class AgentKernel:
             "task_deadline": getattr(task, "deadline", None),
         }
 
+    async def _park_wait(self, task, state) -> str:
+        """Park until resume, cancellation, or the slot-release deadline.
+
+        Returns "resumed" | "cancelled" | "slot_released". The deadline is
+        the P1-17 worker slot release: a parked task must not pin a worker
+        coroutine for the hours an operator may take to answer. Past the
+        deadline the caller ends the run with the task in its paused status;
+        the durable continuation (open question / pending approval) is what
+        wakes the task again.
+        """
+        ev = self._resume.setdefault(task.id, asyncio.Event())
+        ev.clear()
+        resume_task = asyncio.create_task(ev.wait())
+        cancel_task = asyncio.create_task(state.cancel.wait())
+        wait_s = getattr(self, "_parked_slot_wait_s", 300.0)
+        timeout_task = asyncio.create_task(asyncio.sleep(wait_s))
+        try:
+            await asyncio.wait(
+                {resume_task, cancel_task, timeout_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for pending in (resume_task, cancel_task, timeout_task):
+                if not pending.done():
+                    pending.cancel()
+        if not resume_task.done() or state.cancel.is_set():
+            if state.cancel.is_set():
+                return "cancelled"
+            return "slot_released"
+        return "resumed"
+
+    async def _paused_result(
+        self, task, state, status: TaskStatus, reason: str
+    ) -> TaskResult:
+        """End the run leaving the task in a paused (non-terminal) status.
+
+        The task keeps its WAITING_* status — NOT terminal — so `wait_for`
+        keeps polling and the durable continuation can relaunch it. Usage
+        consumed so far is checkpointed without writing a terminal result.
+        """
+        try:
+            if self._budgets is not None:
+                persist_budget = getattr(self._budgets, "_persist_usage", None)
+                if persist_budget is not None:
+                    await persist_budget(task.id)
+        except Exception:  # noqa: BLE001 — paused return must not fail the run
+            _logger.warning("budget checkpoint on pause failed for %s", task.id)
+        await self._emit(
+            "TaskSlotReleased",
+            {"status": status.value, "reason": reason},
+            task,
+        )
+        return TaskResult(
+            task_id=task.id,
+            status=status,
+            summary=reason,
+            usage=UsageSummary(
+                input_tokens=state.input_tokens,
+                output_tokens=state.output_tokens,
+                model_calls=state.model_calls,
+                cost_usd=state.cost,
+                cost_known=state.cost_known,
+                duration_ms=state.elapsed_ms,
+            ),
+        )
+
+    async def _consume_pending_input(
+        self, task, state, request_id: str, args: dict | None = None
+    ) -> TaskResult | None:
+        """Read the durable answer, apply secret-opacity rules, append the
+        user turn, and return to the loop (None = continue).
+
+        Shared by the live wakeup path and the relaunched-loop entry, so a
+        task relaunched after slot release (or process restart) consumes the
+        answer exactly once through the same authority path.
+        """
+        args = args or {}
+        # Read the DURABLE answer, not the in-memory fast path. A crash
+        # between resolve() and wakeup would leave _input_answers empty;
+        # the DB is the authority for the continuation.
+        durable = await self._input_request_store.pending_resumable(task.id)
+        answer = str(
+            self._input_answers.pop(task.id, "")
+            or (durable or {}).get("answer")
+            or ""
+        )
+        answer_ref = (durable or {}).get("answer_ref") or None
+        expected = str((durable or {}).get("expected") or "text").lower()
+        await self._input_request_store.consume(request_id)
+
+        if expected == "secret" and self._secret_manager is not None:
+            # Secret-opacity path: the raw value must never appear in the
+            # durable answer column or the model transcript.  Store it in
+            # the SecretManager (in-memory, task-scoped) and surface only a
+            # non-secret acknowledgment to the model.
+            secret_name = (
+                (durable or {}).get("context", {}).get("secret_name")
+                or (args.get("context") or {}).get("secret_name")
+                or "operator_secret"
+            )
+            answer_ref = self._secret_manager.store_task_secret(
+                task.id,
+                name=secret_name,
+                value=answer,
+            )
+            # Update the durable record so answer_ref is set and answer is
+            # scrubbed (the raw value was only in the DB transiently; the
+            # persisted answer_ref is what survives).
+            await self._scrub_input_answer(request_id, answer_ref)
+            # The model sees only that a credential is available — never the
+            # raw value.
+            answer = f"Credential '{secret_name}' is now available for this task."
+        elif task.session_id:
+            try:
+                await self._messages.append_to_session(
+                    task.session_id,
+                    Message(
+                        id=f"msg_input_{request_id}",
+                        role=Role.USER,
+                        blocks=(TextBlock(text=answer),),
+                        created_at=utcnow(),
+                        provenance=Provenance(source_type=SourceType.USER),
+                        metadata={
+                            "task_id": task.id,
+                            "input_request_id": request_id,
+                            "canonical_user_turn": False,
+                        },
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — continuation must survive persist issues
+                _logger.warning(
+                    "input answer persistence failed for %s", request_id, exc_info=True
+                )
+        try:
+            # The live wakeup path parks in WAITING_INPUT; the relaunched
+            # path (P1-17: provide_input with no live coroutine) already
+            # transitioned to RUNNING before run_task — RUNNING→RUNNING is
+            # illegal, so transition only when actually parked.
+            row = await self._task_store.get(task.id)
+            if row and (row.get("status") or "").upper() == TaskStatus.WAITING_INPUT.value:
+                await self._transition(task, TaskStatus.RUNNING)
+        except Exception:
+            return await self._finalize_decision(
+                task,
+                state,
+                TerminationDecision(True, "input wait could not resume", TaskStatus.BLOCKED),
+            )
+        await self._emit("InputReceived", {"request_id": request_id}, task)
+        # The loop continues: the next compile includes the answer, and the
+        # model owns deciding what the answer means for the objective.
+        return None
+
     async def _input_request_path(self, task, state, response, input_calls):
         """Park the task in WAITING_INPUT and return a resumable outcome.
 
@@ -722,96 +882,104 @@ class AgentKernel:
             task,
         )
 
-        ev = self._resume.setdefault(task.id, asyncio.Event())
-        ev.clear()
-        resume_task = asyncio.create_task(ev.wait())
-        cancel_task = asyncio.create_task(state.cancel.wait())
-        try:
-            await asyncio.wait({resume_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for pending in (resume_task, cancel_task):
-                if not pending.done():
-                    pending.cancel()
-        if not resume_task.done() or state.cancel.is_set():
+        woke = await self._park_wait(task, state)
+        if woke == "cancelled":
             await self._input_request_store.resolve(request_id, "")
             return await self._finalize(
                 task, state, TaskStatus.CANCELLED, "task cancelled while awaiting input"
             )
+        if woke == "slot_released":
+            # Worker slot release (P1-17): return without a model turn. The
+            # task stays WAITING_INPUT with the question durable; the
+            # operator's answer relaunches it (provide_input → run_task), and
+            # the relaunched loop consumes the answer via
+            # _consume_pending_input before asking the model anything.
+            # Re-check first: the answer may have landed inside the deadline
+            # window (resolve commits before notify) — consume it now rather
+            # than strand it until a relaunch that might never be scheduled.
+            if await self._input_request_store.pending_resumable(task.id) is not None:
+                return await self._consume_pending_input(task, state, request_id, args)
+            return await self._paused_result(
+                task, state, TaskStatus.WAITING_INPUT, f"awaiting operator input: {request_id}"
+            )
 
-        # Read the DURABLE answer, not the in-memory fast path. A crash
-        # between resolve() and wakeup would leave _input_answers empty;
-        # the DB is the authority for the continuation.
-        durable = await self._input_request_store.pending_resumable(task.id)
-        answer = str(
-            self._input_answers.pop(task.id, "")
-            or (durable or {}).get("answer")
-            or ""
-        )
-        answer_ref = (durable or {}).get("answer_ref") or None
-        expected = str((durable or {}).get("expected") or "text").lower()
-        await self._input_request_store.consume(request_id)
-
-        if expected == "secret" and self._secret_manager is not None:
-            # Secret-opacity path: the raw value must never appear in the
-            # durable answer column or the model transcript.  Store it in
-            # the SecretManager (in-memory, task-scoped) and surface only a
-            # non-secret acknowledgment to the model.
-            secret_name = (
-                (durable or {}).get("context", {}).get("secret_name")
-                or (args.get("context") or {}).get("secret_name")
-                or "operator_secret"
-            )
-            answer_ref = self._secret_manager.store_task_secret(
-                task.id,
-                name=secret_name,
-                value=answer,
-            )
-            # Update the durable record so answer_ref is set and answer is
-            # scrubbed (the raw value was only in the DB transiently; the
-            # persisted answer_ref is what survives).
-            await self._scrub_input_answer(request_id, answer_ref)
-            # The model sees only that a credential is available — never the
-            # raw value.
-            answer = f"Credential '{secret_name}' is now available for this task."
-        elif task.session_id:
-            try:
-                await self._messages.append_to_session(
-                    task.session_id,
-                    Message(
-                        id=f"msg_input_{request_id}",
-                        role=Role.USER,
-                        blocks=(TextBlock(text=answer),),
-                        created_at=utcnow(),
-                        provenance=Provenance(source_type=SourceType.USER),
-                        metadata={
-                            "task_id": task.id,
-                            "input_request_id": request_id,
-                            "canonical_user_turn": False,
-                        },
-                    ),
-                )
-            except Exception:  # noqa: BLE001 — continuation must survive persist issues
-                _logger.warning(
-                    "input answer persistence failed for %s", request_id, exc_info=True
-                )
-        try:
-            await self._transition(task, TaskStatus.RUNNING)
-        except Exception:
-            return await self._finalize_decision(
-                task,
-                state,
-                TerminationDecision(True, "input wait could not resume", TaskStatus.BLOCKED),
-            )
-        await self._emit("InputReceived", {"request_id": request_id}, task)
-        # The loop continues: the next compile includes the answer, and the
-        # model owns deciding what the answer means for the objective.
-        return None
+        return await self._consume_pending_input(task, state, request_id, args)
 
     # ------------------------------------------------------------------ #
     # The loop — THE one reasoning loop (INV-001)
     # ------------------------------------------------------------------ #
+    async def _resume_paused_entry(self, task, state) -> TaskResult | None:
+        """Resume-or-re-park entry for a relaunched paused task (P1-17).
+
+        Runs once at loop entry. Handles the durable states a task can be
+        relaunched in:
+
+        - ANSWERED_PENDING_RESUME input request → consume the answer (same
+          authority path as the live wakeup) and continue into the loop.
+        - OPEN input request → re-park (bounded) for the answer.
+        - Unresolved approval continuation → re-park; a resolved one is left
+          for _resume_durable_continuation, which already owns that path.
+
+        Returns a TaskResult only when the run should end here (cancelled,
+        or re-parked past the slot deadline); None continues into the loop.
+        """
+        if self._input_request_store is None:
+            return None
+        try:
+            answered = await self._input_request_store.pending_resumable(task.id)
+        except Exception:  # noqa: BLE001 — store failure must not crash the loop
+            answered = None
+        if answered is not None:
+            request_id = str(answered.get("id") or "")
+            if request_id:
+                # Relaunch carries no in-memory answer args; the durable
+                # record (context/expected/answer) is authoritative.
+                return await self._consume_pending_input(task, state, request_id)
+            return None
+        try:
+            open_request = await self._input_request_store.pending_for_task(task.id)
+        except Exception:  # noqa: BLE001
+            open_request = None
+        if open_request is None:
+            return None
+        await self._transition(task, TaskStatus.WAITING_INPUT)
+        await self._emit(
+            "InputRequested",
+            {
+                "request_id": open_request.get("id"),
+                "question": open_request.get("question"),
+                "choices": list(open_request.get("choices") or ()),
+                "repark": True,
+            },
+            task,
+        )
+        woke = await self._park_wait(task, state)
+        if woke == "cancelled":
+            await self._input_request_store.resolve(str(open_request["id"]), "")
+            return await self._finalize(
+                task, state, TaskStatus.CANCELLED, "task cancelled while awaiting input"
+            )
+        if woke == "slot_released":
+            return await self._paused_result(
+                task,
+                state,
+                TaskStatus.WAITING_INPUT,
+                f"awaiting operator input: {open_request.get('id')}",
+            )
+        return await self._consume_pending_input(task, state, str(open_request["id"]))
+
     async def _loop(self, task: TaskSpec, state: RunState) -> TaskResult:
         budget = task.resource_budget or ResourceBudget()
+
+        # Relaunched-entry resume (P1-17): a task relaunched after slot
+        # release or process restart re-enters here while durably paused.
+        # Consume durable state BEFORE the first model call — an answered
+        # question becomes a user turn; an open question or unresolved
+        # approval re-parks (bounded) — so the relaunch never re-asks the
+        # model for information the kernel already holds.
+        entry = await self._resume_paused_entry(task, state)
+        if entry is not None:
+            return entry
 
         while True:
             try:
@@ -2235,21 +2403,32 @@ class AgentKernel:
         ev.clear()
         await self._emit("ApprovalRequested", {"calls": len(outcome.suspended)}, task)
 
-        # Park until granted/denied (BHV-017) or cancelled (§20, BHV-017). No
-        # spin: race the resume event against the cancellation token so an
-        # external cancel wakes the task instead of leaving it hung forever.
-        resume_task = asyncio.create_task(ev.wait())
-        cancel_task = asyncio.create_task(state.cancel.wait())
-        try:
-            await asyncio.wait({resume_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for pending in (resume_task, cancel_task):
-                if not pending.done():
-                    pending.cancel()
-        if not resume_task.done() or state.cancel.is_set():
+        # Park until granted/denied (BHV-017), cancelled (§20, BHV-017), or
+        # the slot-release deadline (P1-17): an operator may take hours to
+        # decide; the worker slot must not be pinned that whole time. Past
+        # the deadline the run ends with the task left WAITING_APPROVAL; the
+        # durable continuation is what relaunches it (approve → run_task, or
+        # startup recovery). On relaunch, _bootstrap re-parks (below) so no
+        # model call is spent re-deriving the pending decision.
+        woke = await self._park_wait(task, state)
+        if woke == "cancelled":
             return await self._finalize(
                 task, state, TaskStatus.CANCELLED, "task cancelled during approval"
             )
+        if woke == "slot_released":
+            # Re-check before releasing: a decision that landed inside the
+            # deadline window has a durable continuation the next loop
+            # iteration would consume — don't strand it until a relaunch.
+            decision = self._resume_decision.get(task.id)
+            if decision is not None:
+                woke = "resumed"
+            else:
+                return await self._paused_result(
+                    task,
+                    state,
+                    TaskStatus.WAITING_APPROVAL,
+                    "awaiting approval decision",
+                )
         decision = self._resume_decision.get(task.id, "denied")
 
         try:

@@ -992,6 +992,9 @@ async def test_same_process_approval_replay_keeps_workflow_identity(tmp_path):
     kernel._append_results = _append_results
     kernel._mark_continuations_consumed = _mark_continuations_consumed
     kernel._reconcile_workflow_suspended = _reconcile
+    # The production park (P1-17): resumes on the pre-granted decision's
+    # event, never reaching the slot-release deadline in this test.
+    kernel._park_wait = lambda task, state: AgentKernel._park_wait(kernel, task, state)
 
     directives = DispatchDirectives(
         workflow_run_id="run-1",
@@ -1117,6 +1120,7 @@ async def test_workflow_approval_resolves_outer_call_after_child_result(tmp_path
             workspace_root=workspace_root,
         )
     )
+    kernel._park_wait = lambda task, state: AgentKernel._park_wait(kernel, task, state)
     kernel._resume_workflow_parent = lambda *args, **kwargs: AgentKernel._resume_workflow_parent(
         kernel,
         *args,

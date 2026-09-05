@@ -143,10 +143,12 @@ def result_qualifies_as_work_evidence(
     capability_leaf = capability_id.rsplit(".", 1)[-1]
     # Canonical receipt path: the dispatcher has already resolved the exact
     # effects.  Prefer this over operation-name heuristics — it is the
-    # authority for what the capability was allowed to cause.
+    # authority for what the capability was allowed to cause. Match
+    # case-insensitively: the dispatcher stamps EffectClass enum values
+    # (uppercase), while policy metadata may carry lowercase effect names.
     resolved = metadata.get("resolved_effects")
     if resolved:
-        resolved_set = set(resolved)
+        resolved_set = {str(item).casefold() for item in resolved}
         if resolved_set & {"write_local", "delete"}:
             kind = MUTATION
         elif resolved_set & {"network_write", "external_message", "external_publish"}:

@@ -639,6 +639,7 @@ class AthenaService:
             continuation_store=continuations,
             workflow_run_store=self._workflow_run_store,
             input_request_store=input_requests,
+            parked_slot_wait_s=cfg.parked_slot_wait_s,
             provider_usage_store=self._provider_usage_store,
             interpreter=self._make_interpreter(),
             reality_coordinator=coordinator,
@@ -2631,6 +2632,13 @@ class AthenaService:
         The question was persisted when the model issued ``request_input``;
         this records the answer durably and wakes the parked kernel loop, which
         continues the identical Task with the answer in its session.
+
+        With worker slot release (P1-17) the parked task may have no live
+        coroutine: the run returned when the slot deadline fired. The answer
+        is durable either way (ANSWERED_PENDING_RESUME), so the no-live-run
+        branch relaunches the task exactly like the approval path does — the
+        relaunched loop consumes the durable answer before its first model
+        call.
         """
         if self._store_input_requests is None:
             raise RuntimeError("operator input is unavailable in this deployment")
@@ -2638,7 +2646,21 @@ class AthenaService:
         if request is None:
             raise KeyError(f"No pending input request for task: {task_id}")
         await self._store_input_requests.resolve(request["id"], str(answer))
-        await self._kernel.notify_input_provided(task_id, str(answer))
+        kernel = self._kernel
+        active = bool(kernel is not None and task_id in getattr(kernel, "_runs", {}))
+        if active and kernel is not None:
+            await kernel.notify_input_provided(task_id, str(answer))
+            return
+        if kernel is None or self._task_manager is None:
+            return
+        row = await self._store_tasks.get(task_id) if self._store_tasks else None
+        if row and row.get("status") == TaskStatus.WAITING_INPUT.value:
+            await self._task_manager.transition(task_id, TaskStatus.RUNNING)
+            relaunch = asyncio.create_task(kernel.run_task(task_id))
+            self._approval_recovery_tasks.add(relaunch)
+            relaunch.add_done_callback(
+                self._log_background_failure(f"input relaunch {task_id}")
+            )
 
     async def approve(self, approval_id: str, *, granted: bool, scope: str | None = None) -> None:
         """Resolve a pending approval and wake the parked task, if any.

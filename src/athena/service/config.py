@@ -239,6 +239,11 @@ class AthenaConfig:
     # silently changing their limit.
     worker_max_parallel: int | None = None
     max_parallel_tasks: int = 4
+    # Worker slot release (P1-17): how long a parked wait (WAITING_INPUT,
+    # WAITING_APPROVAL) may hold its worker coroutine before the run returns
+    # and the slot frees. The durable continuation (open question / pending
+    # approval) relaunches the task on the operator's action.
+    parked_slot_wait_s: float = 300.0
     scheduler_interval_seconds: float = 1.0
     scheduler_max_concurrent: int = 0
     profile: str | None = None

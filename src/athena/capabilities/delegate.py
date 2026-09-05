@@ -90,8 +90,13 @@ class DelegateCapability:
         origin=CapabilityOrigin.NATIVE,
     )
 
-    def __init__(self, delegation_handle=None) -> None:
+    def __init__(self, delegation_handle=None, *, default_collect_timeout: float = 30.0) -> None:
         self._handle = delegation_handle
+        # Worker slot release (P1-17): a model-issued collect with no timeout
+        # must not pin the worker for as long as the child may run. Without
+        # an explicit timeout the wait is bounded here; the model can poll
+        # delegate.status or re-issue collect with a longer timeout.
+        self._default_collect_timeout = max(float(default_collect_timeout), 0.0)
 
     async def invoke(
         self,
@@ -201,10 +206,14 @@ class DelegateCapability:
         if not await self._owns_child(request.task_id, child_id):
             return self._ownership_failure(call_id, child_id)
         timeout = args.get("timeout")
-        result = await self._handle.collect(
-            child_id,
-            timeout=timeout if timeout is None else float(timeout),
-        )
+        if timeout is None:
+            # P1-17: an unbounded collect pins the worker coroutine for the
+            # child's whole runtime. Bound the default and tell the model the
+            # child is still running — it can poll status or re-collect.
+            timeout = self._default_collect_timeout
+        else:
+            timeout = float(timeout)
+        result = await self._handle.collect(child_id, timeout=timeout)
         status = _result_status(result)
         return CapabilityResult(
             call_id,
