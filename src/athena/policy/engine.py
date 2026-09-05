@@ -211,15 +211,15 @@ class PolicyEngine:
             singleton = frozenset({effect})
             hit = rules.evaluate(request.capability_id, singleton, dict(request.arguments))
             if hit is None:
-                verdict, matched = (
-                    _verdict(rules.default),
+                raw_verdict, matched = (
+                    rules.default,
                     f"{request.capability_id}.{effect.value}",
                 )
                 reason = f"no rule matched {effect.value}; profile default {rules.default}"
             else:
-                verdict, matched = hit
+                raw_verdict, matched = hit
                 reason = f"rule {matched}"
-            verdicts.append((_verdict(verdict), reason))
+            verdicts.append((_verdict(raw_verdict), reason))
         if not verdicts:
             hit = rules.evaluate(request.capability_id, frozenset(), dict(request.arguments))
             if hit is None:

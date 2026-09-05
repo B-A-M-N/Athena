@@ -284,7 +284,7 @@ class MCPClient:
         return [
             MCPMessage(
                 role=str(getattr(message, "role", "user")),
-                text=_render_mcp_content(getattr(message, "content", None) or []).content,
+                text=_render_mcp_content(getattr(message, "content", None) or []),
             )
             for message in getattr(result, "messages", None) or ()
         ]

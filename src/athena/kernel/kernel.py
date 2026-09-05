@@ -71,6 +71,7 @@ from athena.protocol.models import (
     ModelResponseAccumulator,
 )
 from athena.protocol.tasks import (
+    ModelPolicy,
     ResourceBudget,
     TaskResult,
     TaskSpec,

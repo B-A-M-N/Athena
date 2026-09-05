@@ -22,6 +22,21 @@ from athena.interpreter.protocol import (
 
 __all__ = ["observation_warrants_subturn"]
 
+
+def _payload_int(payload: dict, key: str) -> int:
+    """Safe numeric extraction from an unconstrained payload.
+
+    Payload values are producer-authored objects; a non-numeric value must
+    never raise inside policy evaluation (it fails the check instead).
+    """
+    value = payload.get(key)
+    if value is None:
+        return 0
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
 # How many consecutive failures of the same capability (after the primary
 # loop's tool-correction path) turn the failure into an observation worth
 # interpreting. The first failure is ordinary — the model sees the error
@@ -62,7 +77,7 @@ def observation_warrants_subturn(observation: InterpreterObservation) -> bool:
             or payload.get("interrupted")
             or _nonzero_exit(payload.get("exit_code"))
         )
-        large = int(payload.get("output_chars") or 0) > CONCISE_OUTPUT_CHARS
+        large = _payload_int(payload, "output_chars") > CONCISE_OUTPUT_CHARS
         return abnormal or large
 
     if observation.kind == BodyObservationKind.TERMINAL_SCREEN_CHANGED:
@@ -72,11 +87,7 @@ def observation_warrants_subturn(observation: InterpreterObservation) -> bool:
         return True
 
     if observation.kind == BodyObservationKind.REPEATED_FAILURE:
-        try:
-            attempts = int(payload.get("attempts") or 0)
-        except (TypeError, ValueError):
-            return False
-        return attempts >= _REPEATED_FAILURE_THRESHOLD
+        return _payload_int(payload, "attempts") >= _REPEATED_FAILURE_THRESHOLD
 
     if observation.kind == BodyObservationKind.CAPABILITY_FAILED:
         error_len = len(str(payload.get("error") or ""))

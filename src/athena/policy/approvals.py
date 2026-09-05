@@ -23,6 +23,7 @@ import threading
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional
 
+from athena.protocol.capabilities import EffectClass
 from athena.protocol.policy import (
     ApprovalGrant,
     ApprovalScope,
@@ -300,8 +301,6 @@ class ApprovalManager:
 
 
 def _effect_from(name: str | EffectClass):
-    from athena.protocol.capabilities import EffectClass
-
     if isinstance(name, EffectClass):
         return name
     if name in EffectClass._value2member_map_:

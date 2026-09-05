@@ -20,9 +20,10 @@ reason uniformly.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from athena.protocol.capabilities import ExternalEffectPhase
 from athena.protocol.ids import new_id
@@ -214,7 +215,7 @@ class WebhookAdapter:
                 follow_redirects=False,
                 policy_name=None,
             )
-            if hasattr(response, "__await__"):
+            if inspect.isawaitable(response):
                 response = await response
         except Exception as exc:  # noqa: BLE001 - remote outcome is uncertain
             try:
@@ -225,6 +226,27 @@ class WebhookAdapter:
                 receipt = {"transaction_id": transaction_id, "error": str(exc)}
             return DeliveryOutcome(
                 ok=False, status=RETRYABLE, error=str(exc), receipt=receipt
+            )
+
+        if not isinstance(response, Mapping):
+            # A runner that resolves to a non-mapping breaks the response
+            # contract; fail closed into recovery rather than raise mid-run.
+            try:
+                receipt = await self._external_store.finish(
+                    transaction_id,
+                    status="RECOVERY_REQUIRED",
+                    error=f"delivery runner returned {type(response).__name__}, expected mapping",
+                )
+            except Exception:
+                receipt = {
+                    "transaction_id": transaction_id,
+                    "error": "delivery runner returned a non-mapping response",
+                }
+            return DeliveryOutcome(
+                ok=False,
+                status=RETRYABLE,
+                error="delivery runner returned a non-mapping response",
+                receipt=receipt,
             )
 
         status_code = int(response.get("status") or 0)

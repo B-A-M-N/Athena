@@ -31,7 +31,7 @@ import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import httpx
 
@@ -111,6 +111,9 @@ from athena.tasks.cancellation import CancellationManager
 from athena.tasks.delegation import DelegationManager
 from athena.tasks.manager import TaskManager
 from athena.tasks.worker import TaskWorker, WorkerConfig
+
+if TYPE_CHECKING:
+    from athena.state.input_requests import InputRequestStore
 
 from athena.protocol.events import Event, make_event
 from athena.protocol.ids import new_id

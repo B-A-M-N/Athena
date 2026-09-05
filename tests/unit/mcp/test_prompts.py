@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from athena.mcp.client import MCPMessage, MCPPromptRef
+from athena.mcp.client import MCPClient, MCPMessage, MCPPromptRef
 from athena.mcp.prompts import MCPPromptProvider, mcp_prompt_provenance
 from athena.protocol.messages import SourceType, TrustClass
 
@@ -129,3 +129,81 @@ def test_provenance_is_always_untrusted_mcp():
     assert prov.trust == TrustClass.UNTRUSTED
     assert prov.scope == "mcp:prompt"
     assert prov.source_id == "mcp:srv:prompt:p"
+
+
+# --------------------------------------------------------------------- #
+# Real-client end-to-end materialization (P0-5)
+#
+# The tests above fake the client; this one drives MCPClient.get_prompt()
+# itself (session injected, no transport) because that path had a runtime
+# AttributeError — _render_mcp_content() returns str and the old code read
+# `.content` off it — which the fake-client tests could not catch.
+# --------------------------------------------------------------------- #
+
+
+class _FakeSession:
+    """Mimics the MCP SDK session surface get_prompt() exercises."""
+
+    def __init__(self, messages):
+        self._messages = messages
+
+    async def get_prompt(self, name, arguments):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            messages=[
+                # SDK content is a LIST of typed blocks per message.
+                SimpleNamespace(role=m["role"], content=[c]) for m, c in self._messages
+            ]
+        )
+
+
+def _client_with_session(messages) -> MCPClient:
+    client = MCPClient("e2e", command="unused-do-not-connect")
+    client._session = _FakeSession(messages)  # noqa: SLF001 - transport-free test seam
+    client._connected = True  # noqa: SLF001
+    return client
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_real_client_get_prompt_materializes_text_content():
+    """Text-block content reaches the provider as rendered text (P0-5)."""
+    client = _client_with_session(
+        [
+            ({"role": "user", "text": "hello"}, {"type": "text", "text": "Do the thing."}),
+            (
+                {"role": "assistant", "text": "ack"},
+                {"type": "text", "text": "Proceeding with the thing."},
+            ),
+        ]
+    )
+    messages = await client.get_prompt("review", {"target": "x"})
+
+    assert [m.text for m in messages] == [
+        "Do the thing.",
+        "Proceeding with the thing.",
+    ]
+    assert [m.role for m in messages] == ["user", "assistant"]
+
+    provider = MCPPromptProvider({"e2e": client})
+    blocks = await provider.render_prompt_blocks("review", {"target": "x"})
+    assert len(blocks) == 2
+    assert "Do the thing." in blocks[0].text
+    assert blocks[0].provenance.trust == TrustClass.UNTRUSTED
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_real_client_get_prompt_renders_resource_and_unknown_blocks():
+    """Non-text dict blocks flow through the same renderer without raising."""
+    client = _client_with_session(
+        [
+            (
+                {"role": "user", "text": "res"},
+                {"type": "resource", "resource": {"uri": "file:///r.txt", "text": "body"}},
+            ),
+            ({"role": "assistant", "text": "odd"}, {"type": "unknown-kind", "x": 1}),
+        ]
+    )
+    messages = await client.get_prompt("mix")
+    assert "body" in messages[0].text
+    assert messages[1].text  # unknown blocks still stringify, never raise
