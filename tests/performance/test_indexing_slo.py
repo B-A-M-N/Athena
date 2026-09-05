@@ -51,7 +51,7 @@ def _synthetic_repo(root: str) -> None:
     """
     os.makedirs(os.path.join(root, "pkg"), exist_ok=True)
     for i in range(_REPO_FILES):
-        parts = [f"import os\nimport sys\n\n"]
+        parts = ["import os\nimport sys\n\n"]
         for j in range(_FUNCS_PER_FILE):
             parts.append(
                 f"def fn_{i}_{j}(a, b):\n"
