@@ -856,6 +856,22 @@ class CapabilityDispatcher:
                 metadata = dict(result.metadata or {})
                 metadata["reality"] = reality_metadata
                 object.__setattr__(result, "metadata", metadata)
+            # Canonical receipt: stamp the resolved effects and execution
+            # identity onto the result metadata so downstream evidence
+            # classification can consume the dispatcher's authoritative
+            # resolution instead of reverse-engineering from names.
+            if "resolved_effects" not in (result.metadata or {}):
+                receipt_meta = dict(result.metadata or {})
+                receipt_meta["resolved_effects"] = sorted(
+                    effect.value for effect in effects
+                )
+                if execution_backend := getattr(
+                    routed_workspace, "execution_backend", None
+                ):
+                    receipt_meta["execution_backend"] = execution_backend
+                if route is not None and route.disposition is not None:
+                    receipt_meta["reality_disposition"] = route.disposition.value
+                object.__setattr__(result, "metadata", receipt_meta)
             await self._attach_failure_memory(request, result, workspace)
             if result.status == CapabilityResultStatus.OK:
                 instrument = (result.metadata or {}).get("instrument")
@@ -1556,6 +1572,13 @@ class CapabilityDispatcher:
         scope = ApprovalScope.CALL
         if decision.approval_scope_options:
             scope = decision.approval_scope_options[0]
+        # High-risk effects (network write, external message, secret read,
+        # financial, privileged) should default to CALL scope even when the
+        # operator picks TASK/SESSION.  A reusable grant for these is too
+        # coarse — the blast radius crosses task boundaries.
+        effect_set = set(effects)
+        if scope != ApprovalScope.CALL and effect_set & HIGH_RISK_EFFECTS:
+            scope = ApprovalScope.CALL
         digest = args_digest(arguments)
         # ApprovalManager currently stores naive UTC datetimes. Keep that
         # legacy contract while deriving the value from an explicit UTC clock.
@@ -1841,14 +1864,14 @@ def _is_execution(effects: tuple[EffectClass, ...]) -> bool:
 def _is_ordering_sensitive(effects: tuple[EffectClass, ...]) -> bool:
     """Whether a resource-less call must serialize against sibling mutations.
 
-    Write/delete/external/network-write calls that name NO concrete resource
-    act on ambient state and cannot prove independence, so they join the batch
-    order lane. Named-path mutations already serialize per-resource (different
-    paths run parallel) — defined there, they bypass the lane. EXECUTE/SPAWN
-    are intentionally excluded: the execution-lease semaphore is their
-    concurrency-volume authority, and write-vs-execute ordering on a shared
-    named resource is already handled by the per-resource lock. Pure reads are
-    never ordering-sensitive.
+    Write/delete/external/network-write/execute calls that name NO concrete
+    resource act on ambient state and cannot prove independence, so they join
+    the batch order lane. Named-path mutations already serialize per-resource
+    (different paths run parallel) — defined there, they bypass the lane.
+    Opaque execution/process is ordering-sensitive: arbitrary code reads and
+    writes ambient workspace state that no per-resource lock can capture, so
+    a write→execute or execute→read batch would race without serialization.
+    Pure reads are never ordering-sensitive.
     """
     return bool(
         set(effects)
@@ -1861,6 +1884,8 @@ def _is_ordering_sensitive(effects: tuple[EffectClass, ...]) -> bool:
             EffectClass.FINANCIAL,
             EffectClass.PRIVILEGED,
             EffectClass.COMPUTER_INPUT,
+            EffectClass.EXECUTE,
+            EffectClass.SPAWN_PROCESS,
         }
     )
 
@@ -2070,6 +2095,24 @@ def _primary_effect(available) -> EffectClass | None:
     for eff in available:
         return eff
     return None
+
+
+# High-risk effects that should default to CALL scope even when the operator
+# chooses TASK or SESSION.  These effects have blast radius beyond a single
+# localized operation: network egress, external messages, privilege, secrets,
+# financial impact, and computer input.  Reusable grants for these are too
+# coarse — the operator should bind an explicit authority envelope.
+HIGH_RISK_EFFECTS = frozenset(
+    {
+        EffectClass.NETWORK_WRITE,
+        EffectClass.EXTERNAL_MESSAGE,
+        EffectClass.EXTERNAL_PUBLISH,
+        EffectClass.COMPUTER_INPUT,
+        EffectClass.SECRET_READ,
+        EffectClass.FINANCIAL,
+        EffectClass.PRIVILEGED,
+    }
+)
 
 
 def _wrap_exception(exc, request) -> CapabilityResult:

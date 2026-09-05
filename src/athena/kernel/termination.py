@@ -27,6 +27,7 @@ from athena.strategy import (
     MUTATION,
     OBSERVABLE_WORK_REQUIRED,
     OBSERVATION,
+    RESPONSE,
     RESPONSE_ONLY,
     resolve_turn_intent,
 )
@@ -55,7 +56,19 @@ class WorkEvidence:
 
 
 _CONTROL_CAPABILITIES = frozenset(
-    {"capabilities", "skills", "workflows", "reflection"}
+    {
+        "capabilities",
+        "skills",
+        "workflows",
+        "reflection",
+        "request_input",
+        "delegate.status",
+        "delegate.collect",
+        "schedule.describe",
+        "schedule.list",
+        "workflow.describe",
+        "workflow.list",
+    }
 )
 _READ_OPERATIONS = frozenset({"read", "list", "stat", "get", "exists", "open", "diff", "status", "inspect"})
 _MUTATION_OPERATIONS = frozenset(
@@ -128,7 +141,25 @@ def result_qualifies_as_work_evidence(
     external_receipt = str(receipt) if receipt else None
 
     capability_leaf = capability_id.rsplit(".", 1)[-1]
-    if capability_id in {"execute", "shell", "process"} or capability_leaf in {
+    # Canonical receipt path: the dispatcher has already resolved the exact
+    # effects.  Prefer this over operation-name heuristics — it is the
+    # authority for what the capability was allowed to cause.
+    resolved = metadata.get("resolved_effects")
+    if resolved:
+        resolved_set = set(resolved)
+        if resolved_set & {"write_local", "delete"}:
+            kind = MUTATION
+        elif resolved_set & {"network_write", "external_message", "external_publish"}:
+            kind = EXTERNAL_ACTION
+        elif resolved_set & {"execute", "spawn_process"}:
+            kind = EXECUTION
+        elif resolved_set & {"read_local", "network_read"}:
+            kind = OBSERVATION
+        elif artifact_ref is not None and required_kind in {None, "artifact"}:
+            kind = "artifact"
+        else:
+            kind = OBSERVATION
+    elif capability_id in {"execute", "shell", "process"} or capability_leaf in {
         "execute", "shell", "process"
     } or operation in {"run", "exec", "execute", "pytest"}:
         kind = EXECUTION
@@ -141,8 +172,6 @@ def result_qualifies_as_work_evidence(
     elif operation in _READ_OPERATIONS or capability_id in {"fs", "git", "research", "http"}:
         kind = OBSERVATION
     else:
-        # A successful non-control capability is at least an observation, but
-        # it must still match the turn's expected category below.
         kind = OBSERVATION
 
     evidence = WorkEvidence(
@@ -296,7 +325,15 @@ class TerminationEvaluator:
                 summary=response_summary(response),
             )
 
-        # The model claims completion. Audit acceptance criteria (BHV-005).
+        # Acceptance criteria audit (BHV-005): a verified criterion proves
+        # the *desired state* is true.  But state proof is not causal proof:
+        # "config.json exists" passing does not mean Athena *created* it.
+        # Separate the two completion requirements:
+        #   - state-shaped objectives (observation/response): verified criteria
+        #     ARE the work — the model observed and reported faithfully.
+        #   - action-shaped objectives (execution/mutation/external): verified
+        #     criteria alone are insufficient — require causal work receipts
+        #     that prove Athena performed the requested action.
         required_criteria = [c for c in task.acceptance_criteria if c.required]
         unresolved = await self._unresolved_criteria(task)
         if unresolved:
@@ -308,18 +345,21 @@ class TerminationEvaluator:
                 summary=response_summary(response),
             )
 
+        expected = resolve_turn_intent(task.objective).kind
+        state_only_objective = expected in {OBSERVATION, RESPONSE}
+        verified_criteria_sufficient = (
+            bool(required_criteria) and not unresolved and state_only_objective
+        )
+
         # Action-shaped objectives need evidence from the shared execution
         # path. A fluent final paragraph is not proof that a file was read,
-        # a command ran, or a mutation was applied. Keep this separate from
-        # acceptance criteria: a verified criterion is itself qualifying
-        # evidence — the host just observed the declared state directly —
-        # while this gate ensures the task crossed the observable-work
-        # boundary when no such criterion exists.
-        verified_criteria_evidence = bool(required_criteria) and not unresolved
+        # a command ran, or a mutation was applied.
         if completion_mode == OBSERVABLE_WORK_REQUIRED and not (
             observed_work
-            or verified_criteria_evidence
-            or work_evidence_satisfies(work_evidence, task=task, completion_mode=completion_mode)
+            or verified_criteria_sufficient
+            or work_evidence_satisfies(
+                work_evidence, task=task, completion_mode=completion_mode
+            )
         ):
             return TerminationDecision(
                 terminal=True,
