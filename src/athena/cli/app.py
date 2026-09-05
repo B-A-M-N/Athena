@@ -925,11 +925,21 @@ async def _cmd_cancel(o: Options, service: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _package_version() -> str:
+    """Installed package version; the declared fallback covers source checkouts."""
+    try:
+        from importlib.metadata import version
+
+        return version("athena-agent")
+    except Exception:
+        return "0.1.0b1"
+
+
 def _click_cli(click: Any):
     levels = [a.value for a in AutonomyLevel]
 
     @click.group(invoke_without_command=True)
-    @click.version_option("0.1.0")
+    @click.version_option(_package_version())
     @click.option("--config", "config_path", default=None, help="Path to config file.")
     @click.option("--db", "db_path", default=None, help="Path to persistence DB.")
     @click.option("--workspace", default=None, help="Workspace root directory.")

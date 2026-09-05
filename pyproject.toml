@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "athena-agent"
-version = "0.1.0"
+version = "0.1.0b1"
 description = "Compact, local-first autonomous agent runtime with durable knowledge, structured delegation, universal execution, open capability protocols, and a single authoritative reasoning loop."
 requires-python = ">=3.12"
 license = "MIT"

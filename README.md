@@ -9,11 +9,14 @@ into one durable kernel. The normative contracts live in `SPEC.md`,
 `BUILDSPEC.md`, `BEHAVIORSPEC.md`, and `RESEARCHSPEC.md`; the architectural
 overview is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-> **Status: Athena 0.1 stable support scope.** Linux is the certified native
+> **Status: public beta candidate (`0.1.0b1`).** Linux is the certified native
 > and isolation platform. macOS and Windows native/isolation parity and other
 > unlisted integrations are outside the 0.1 support contract. A release stamp
 > requires the core release gate and real X11 desktop acceptance described
-> below. Hermes live evidence is an optional integration certification.
+> below. Hermes live evidence is an optional integration certification. The
+> version is a PEP 440 beta pre-release, not stable: it becomes stable only
+> when one frozen SHA has passed every required gate
+> (`./scripts/release-check`).
 
 ## Why this exists
 
@@ -517,7 +520,7 @@ the optional demo wrapper.
 ### Optional host-terminal compatibility smoke test
 
 The Termux script is an optional ANSI/PTY compatibility probe, not an
-Athena 0.1 stable support target or release gate. Athena's supported terminal
+Athena 0.1 support target or release gate. Athena's supported terminal
 surfaces are hosted Glass over Kitty Graphics Protocol (Kitty and WezTerm),
 the ANSI fallback, and the Linux native Alacritty-core frontend. From a
 checkout, run the optional probe manually:
