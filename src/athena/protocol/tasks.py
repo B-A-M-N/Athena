@@ -283,6 +283,12 @@ class ModelPolicy:
     # latency/reliability-aware route, while ``latency`` and ``cost`` let a
     # configured role state its operational priority explicitly.
     routing_preference: str = "balanced"
+    # Quality floor (P1-16): when set, routing excludes models that DECLARE
+    # a tier below this floor. Undeclared models stay selectable — the floor
+    # never excludes a model that could not have known about it, so a
+    # deployment whose providers declare no tiers is unaffected. Accepts the
+    # bare string value ("standard"); invalid values are ignored.
+    min_quality_tier: str | None = None
 
 
 @dataclass(frozen=True)

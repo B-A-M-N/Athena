@@ -15,7 +15,7 @@ import time
 from typing import Any, Protocol
 
 from athena.protocol.errors import ModelUnavailable, ProviderUnavailable
-from athena.protocol.models import ModelInfo, PrivacyClass
+from athena.protocol.models import ModelInfo, ModelQualityTier, PrivacyClass
 from athena.protocol.tasks import ModelPolicy
 
 CAP_TOOLS = "tools"
@@ -220,6 +220,8 @@ class ModelRouter:
                 continue
             if not privacy_gate(info):
                 continue
+            if not self._meets_quality_floor(info, policy):
+                continue
             candidates.append(info)
 
         if not candidates:
@@ -384,6 +386,31 @@ class ModelRouter:
                 return False
         return True
 
+    def _meets_quality_floor(self, info: ModelInfo, policy: ModelPolicy) -> bool:
+        """Quality-floor filter (P1-16).
+
+        Excludes only models that DECLARE a tier below the policy floor.
+        ``UNDECLARED`` survives every floor — the metadata is advisory and
+        a model cannot be held to a standard it never declared — so a
+        deployment without tier declarations routes exactly as before.
+        """
+        raw = getattr(policy, "min_quality_tier", None)
+        if not raw:
+            return True
+        try:
+            floor = ModelQualityTier(str(raw))
+        except ValueError:
+            return True  # invalid declarations are ignored, never widened
+        tier = getattr(info, "quality_tier", ModelQualityTier.UNDECLARED)
+        if isinstance(tier, str):
+            try:
+                tier = ModelQualityTier(tier)
+            except ValueError:
+                return True
+        if tier is ModelQualityTier.UNDECLARED:
+            return True
+        return tier.rank >= floor.rank
+
     def _meets_cost(self, info: ModelInfo, policy: ModelPolicy) -> bool:
         if policy.max_cost_usd is None:
             return True
@@ -415,6 +442,9 @@ class ModelRouter:
         parts = [f"model={best.id}", f"provider={best.provider}"]
         if policy.privacy:
             parts.append(f"privacy={best.privacy_class.value}")
+        floor = getattr(policy, "min_quality_tier", None)
+        if floor:
+            parts.append(f"quality_floor={floor}")
         if requirements.required_capabilities:
             parts.append("caps=" + ",".join(sorted(requirements.required_capabilities)))
         if history_used:

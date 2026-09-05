@@ -210,6 +210,58 @@ class RunState:
         return int((utcnow() - self.start).total_seconds() * 1000)
 
 
+# Tool-input corrections tolerated before the quality floor escalates one
+# tier (P1-16): repeated malformed tool calls are a model-capability signal,
+# not a prompt problem.
+_QUALITY_ESCALATION_THRESHOLD = 2
+
+# Escalation is one tier per threshold crossing, capped at FRONTIER (the
+# ladder's top). "escalated" floors never retreat within the run: a run that
+# needed a stronger model keeps it.
+_ESCALATION_STEP = 1
+
+
+def _escalated_quality_floor(policy: ModelPolicy, state: RunState | None) -> ModelPolicy:
+    """Raise the policy's quality floor when the run shows correction strain.
+
+    Escalation only ever NARROWS the candidate set one declared tier at a
+    time, and only when at least one registered model could be affected —
+    with no tier declarations anywhere, this is a no-op and routing is
+    unchanged. The task policy object is never mutated (frozen dataclass).
+    """
+    from dataclasses import replace as _dc_replace
+
+    from athena.protocol.models import ModelQualityTier
+
+    base = getattr(policy, "min_quality_tier", None)
+    total_corrections = 0
+    if state is not None:
+        counts = getattr(state, "tool_correction_counts", None)
+        if isinstance(counts, dict):
+            total_corrections = sum(int(v) for v in counts.values())
+    if total_corrections < _QUALITY_ESCALATION_THRESHOLD:
+        return policy
+    steps = min(
+        total_corrections // _QUALITY_ESCALATION_THRESHOLD,
+        2,
+    )
+    try:
+        current = (
+            ModelQualityTier(str(base))
+            if base
+            else ModelQualityTier.ECONOMY  # undeclared base: escalate from the bottom
+        )
+    except ValueError:
+        current = ModelQualityTier.ECONOMY
+    rank = min(current.rank + steps * _ESCALATION_STEP, ModelQualityTier.FRONTIER.rank)
+    if rank <= current.rank:
+        return policy  # base already at (or above) the escalation ceiling
+    for tier in ModelQualityTier:
+        if tier.rank == rank:
+            return _dc_replace(policy, min_quality_tier=tier.value)
+    return policy
+
+
 # --------------------------------------------------------------------------- #
 # Message / result builders
 # --------------------------------------------------------------------------- #
@@ -1030,7 +1082,7 @@ class AgentKernel:
             for evidence in _compiled_work_evidence(compiled, task.id):
                 if evidence.call_id not in {item.call_id for item in state.work_evidence}:
                     state.work_evidence.append(evidence)
-            selection = await self._select_model(task, compiled)
+            selection = await self._select_model(task, compiled, state=state)
 
             try:
                 response = await self._invoke(task, state, selection, compiled)
@@ -1125,6 +1177,7 @@ class AgentKernel:
         task: TaskSpec,
         compiled: CompiledContext,
         *,
+        state: RunState | None = None,
         exclude: frozenset[str | tuple[str, str]] = frozenset(),
     ) -> ModelSelection:
         from athena.models.router import ModelRequirements
@@ -1149,8 +1202,17 @@ class AgentKernel:
             ),
             max_output_tokens=getattr(compiled.requirements, "reserved_output", None),
         )
+        # Quality floor (P1-16): the task policy's declared floor is the
+        # base; a run that keeps needing tool-input corrections escalates
+        # one tier for its remaining turns — a cheap model that cannot
+        # produce well-formed calls costs more in retries than a stronger
+        # model costs in tokens.
+        policy = task.model_policy
+        escalated = _escalated_quality_floor(policy, state)
+        if escalated is not policy:
+            policy = escalated
         return await self._router.select(
-            policy=task.model_policy,
+            policy=policy,
             requirements=requirements,
             exclude=exclude,
         )
