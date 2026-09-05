@@ -4,8 +4,11 @@ ONE reasoning authority. This extension is not an agent, has no provider
 handle, no subprocess, and no store. It:
 
 1. receives execution observations from the computational body,
-2. asks ONE bounded interpretive question of the SAME model the primary
-   loop uses, through the kernel's single inference broker,
+2. asks ONE bounded interpretive question through the SAME kernel
+   inference authority the primary loop uses (the ModelRouter, re-entered
+   with role="interpreter" — configuration may resolve that role to a
+   different model than the primary; what is shared is the routing,
+   metering, and cancellation authority, not necessarily the model),
 3. converts the answer into an ``InterpreterProposal`` (a capability id +
    arguments — no authority of its own),
 4. hands the proposal to the kernel's normal dispatch path: repair →
@@ -16,6 +19,12 @@ can produce volumes (screen states, trace tails) that would bloat the
 primary context; the extension condenses observation → proposal through
 a metered, cancellable, role-tagged subturn instead, and every subturn is
 visible in `athena inspect` as its own inference row.
+
+Known limitation (deliberate, not a defect): an interpreter subturn is a
+stateless inference. Persistent computational sessions live in the
+execution runtime and cannot be process-reattached after a service
+restart; observations after a restart describe the NEW session state.
+This is not full OI process continuity and must not be presented as such.
 """
 
 from __future__ import annotations
