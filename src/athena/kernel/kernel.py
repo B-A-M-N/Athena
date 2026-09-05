@@ -1223,7 +1223,13 @@ class AgentKernel:
         )
 
     async def _invoke(
-        self, task: TaskSpec, state: RunState, selection: ModelSelection, compiled: CompiledContext
+        self,
+        task: TaskSpec,
+        state: RunState,
+        selection: ModelSelection,
+        compiled: CompiledContext,
+        *,
+        inference_kind: str | None = None,
     ) -> ModelResponse:
         role = getattr(task.model_policy, "role", None) or "primary"
         last_err: ProviderError | None = None
@@ -1335,19 +1341,23 @@ class AgentKernel:
             # model attempt. Fallbacks must never overwrite the first row.
             attempt_usage_id: str | None = None
             attempt_started = time.monotonic()
-            await self._emit(
-                "ModelRequestStarted",
-                {
-                    "provider": selection_for_attempt.provider,
-                    "model": selection_for_attempt.model,
-                    "provider_profile_id": request.metadata.get("provider_profile_id"),
-                    "prefix_fingerprint": request.metadata.get("prefix_fingerprint"),
-                    "role": role,
-                    "attempt_index": attempt,
-                    "request_id": request.request_id,
-                },
-                task,
-            )
+            # Inference-kind metadata (P1-8): auxiliary subturns carry the
+            # same lifecycle events as primary inference — emitted here, once
+            # — plus a kind marker so operators can distinguish them without
+            # counting duplicate event pairs.
+            request_started_payload: dict[str, Any] = {
+                "provider": selection_for_attempt.provider,
+                "model": selection_for_attempt.model,
+                "provider_profile_id": request.metadata.get("provider_profile_id"),
+                "prefix_fingerprint": request.metadata.get("prefix_fingerprint"),
+                "role": role,
+                "attempt_index": attempt,
+            }
+            if inference_kind is not None:
+                request_started_payload["subturn"] = True
+                request_started_payload["inference_kind"] = inference_kind
+            request_started_payload["request_id"] = request.request_id
+            await self._emit("ModelRequestStarted", request_started_payload, task)
             if self._provider_usage_store is not None:
                 try:
                     attempt_usage_id = await self._provider_usage_store.record_attempt(
@@ -1374,16 +1384,16 @@ class AgentKernel:
                     response = await self._consume(
                         task, state, provider, request, estimator=token_estimator
                     )
-                await self._emit(
-                    "ModelResponseCompleted",
-                    {
-                        "provider": selection_for_attempt.provider,
-                        "model": selection_for_attempt.model,
-                        "role": role,
-                        "attempt_index": attempt,
-                    },
-                    task,
-                )
+                response_completed_payload: dict[str, Any] = {
+                    "provider": selection_for_attempt.provider,
+                    "model": selection_for_attempt.model,
+                    "role": role,
+                    "attempt_index": attempt,
+                }
+                if inference_kind is not None:
+                    response_completed_payload["subturn"] = True
+                    response_completed_payload["inference_kind"] = inference_kind
+                await self._emit("ModelResponseCompleted", response_completed_payload, task)
                 state.model_calls += 1
                 actual_cost = _actual_model_cost(
                     selection_for_attempt.info,
@@ -1507,8 +1517,10 @@ class AgentKernel:
 
         * reuses the SAME RunState (model_calls / tokens / cost / cancel),
         * routes through the SAME ModelRouter with role "interpreter",
-        * emits its own ModelRequestStarted/Completed events with
-          role="interpreter" so `athena inspect` shows it as its own row,
+        * emits exactly ONE ModelRequestStarted/Completed pair (P1-8) via
+          ``_invoke``'s single lifecycle path, tagged role="interpreter" and
+          inference_kind="interpreter" so `athena inspect` shows it as its
+          own row without double-counting inference boundaries,
         * compiles AUXILIARY context (P1-14): system instruction + task
           objective + the bounded observation. No skills, memory, research,
           project blocks, transcript, or capability tool schema — an
@@ -1531,28 +1543,9 @@ class AgentKernel:
             subturn_task, system=system_prompt, observation=user_prompt
         )
         selection = await self._select_model(subturn_task, compiled)
-        await self._emit(
-            "ModelRequestStarted",
-            {
-                "provider": selection.provider,
-                "model": selection.model,
-                "role": "interpreter",
-                "subturn": True,
-            },
-            task,
+        return await self._invoke(
+            subturn_task, state, selection, compiled, inference_kind="interpreter"
         )
-        response = await self._invoke(subturn_task, state, selection, compiled)
-        await self._emit(
-            "ModelResponseCompleted",
-            {
-                "provider": selection.provider,
-                "model": selection.model,
-                "role": "interpreter",
-                "subturn": True,
-            },
-            task,
-        )
-        return response
 
     async def judge_subturn(
         self,
