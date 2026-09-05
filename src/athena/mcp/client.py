@@ -83,6 +83,14 @@ class MCPToolResult:
     structured: Any = None
 
 
+@dataclass(frozen=True)
+class MCPMessage:
+    """One normalized message of a materialized remote prompt."""
+
+    role: str
+    text: str
+
+
 class MCPClient:
     """A single lazy, async MCP server connection (stdio or HTTP)."""
 
@@ -252,6 +260,33 @@ class MCPClient:
                 server=self.connection_id,
             )
             for p in result.prompts
+        ]
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: Mapping[str, str] | None = None,
+    ) -> list[MCPMessage]:
+        """Materialize one remote prompt; return normalized messages.
+
+        A prompt is remote-authored procedural text: the host treats the
+        result as UNTRUSTED context (see ``mcp/prompts.py``), never as
+        configured instruction.
+        """
+        session = self._require()
+        try:
+            async with self._lock:
+                result = await session.get_prompt(name, dict(arguments or {}))
+        except Exception as exc:
+            raise MCPError(
+                f"mcp get_prompt {name!r} failed on {self.connection_id!r}: {exc}"
+            ) from exc
+        return [
+            MCPMessage(
+                role=str(getattr(message, "role", "user")),
+                text=_render_mcp_content(getattr(message, "content", None) or []).content,
+            )
+            for message in getattr(result, "messages", None) or ()
         ]
 
     # ------------------------------------------------------------------ #
