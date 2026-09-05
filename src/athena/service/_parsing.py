@@ -12,7 +12,13 @@ import hashlib
 import json
 from typing import Any, Mapping
 
-__all__ = ["bounded_strings", "json_hash", "parse_self_host_completion_verdict"]
+__all__ = [
+    "bounded_strings",
+    "json_hash",
+    "parse_review_json",
+    "parse_self_host_completion_verdict",
+    "successful_usage",
+]
 
 
 def bounded_strings(value: Any, *, limit: int = 16, item_limit: int = 512) -> list[str]:
@@ -49,3 +55,29 @@ def json_hash(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def successful_usage(row: Mapping[str, Any]) -> bool:
+    """Accept only a durable completed provider attempt as identity evidence."""
+    metadata = row.get("metadata")
+    return isinstance(metadata, Mapping) and str(metadata.get("state") or "") == "success"
+
+
+def parse_review_json(value: str | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(line for line in lines if not line.strip().startswith("```"))
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except (TypeError, ValueError):
+            return None
+    return dict(parsed) if isinstance(parsed, dict) else None
