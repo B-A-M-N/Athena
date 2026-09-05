@@ -27,6 +27,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 from athena.research.models import EvidenceObject, ResearchGap, SourceRecord
 from athena.research.policy import (
@@ -214,6 +215,7 @@ class ResearchCapability:
                 EffectClass.NETWORK_READ,
             }
         ),
+        resources=frozenset({ResourceClass.RESEARCH}),
         origin=CapabilityOrigin.NATIVE,
     )
 

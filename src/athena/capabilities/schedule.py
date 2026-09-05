@@ -25,6 +25,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 from athena.scheduler.scheduler import TriggerSpec, TriggerType
 from athena.scheduler.triggers import next_fire
@@ -449,6 +450,7 @@ class ScheduleCapability:
             ],
         },
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        resources=frozenset({ResourceClass.SCHEDULE}),
         origin=CapabilityOrigin.NATIVE,
     )
 

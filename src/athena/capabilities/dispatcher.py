@@ -490,6 +490,7 @@ class CapabilityDispatcher:
             workspace=workspace,
             execution_backend=workspace.execution_backend or "local",
             effects=frozenset(effects),
+            resources=executor.descriptor.resolve_resources(),
             session_id=getattr(request, "session_id", None),
             call_id=request.call_id,
         )

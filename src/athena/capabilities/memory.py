@@ -19,6 +19,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 from athena.protocol.ids import new_id
 from athena.protocol.memory import (
@@ -86,6 +87,7 @@ class MemoryCapability:
         tags=frozenset({"memory", "remember", "preference", "recall"}),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        resources=frozenset({ResourceClass.MEMORY}),
         origin=CapabilityOrigin.NATIVE,
     )
 

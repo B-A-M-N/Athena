@@ -22,6 +22,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 
 _NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
@@ -298,6 +299,7 @@ class SynthesisCapability:
                 EffectClass.WRITE_LOCAL,
             }
         ),
+        resources=frozenset({ResourceClass.SYNTHESIS}),
         origin=CapabilityOrigin.NATIVE,
     )
 

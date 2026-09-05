@@ -14,6 +14,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import Criterion, VerificationSpec, VerificationType
@@ -98,6 +99,7 @@ class MaintenanceCapability:
             "additionalProperties": False,
         },
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        resources=frozenset({ResourceClass.STATE}),
         origin=CapabilityOrigin.NATIVE,
     )
 

@@ -16,6 +16,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 from athena.workflows.models import Workflow, WorkflowStep
 from athena.workflows.validation import WorkflowValidator
@@ -96,6 +97,7 @@ class WorkflowCapability:
                 EffectClass.NETWORK_WRITE,
             }
         ),
+        resources=frozenset({ResourceClass.WORKFLOW}),
         origin=CapabilityOrigin.NATIVE,
     )
 
