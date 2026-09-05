@@ -105,7 +105,7 @@ class ClaimRegistry:
             depends_on_paths=tuple(depends_on_paths or ()),
         )
         self._claims[claim.id] = claim
-        if self._store is not None:
+        if self._store is not None and claim.task_id is not None:
             self._persist(
                 self._store.save_claim(
                     {
@@ -158,6 +158,10 @@ class ClaimRegistry:
         """Mark claims STALE when a path they depend on has been mutated.
 
         Returns the claims whose status changed so callers can surface it.
+        Persistence stays best-effort background here: the registry API is
+        synchronous (both watcher and orchestrator call it without awaiting),
+        and the mutation boundary that DOES need the write committed before
+        proceeding awaits ``WorldStateStore.invalidate_for_paths`` directly.
         """
         changed = set(changed_paths)
         flipped: list[Claim] = []
