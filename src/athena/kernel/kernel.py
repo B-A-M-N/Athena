@@ -107,6 +107,25 @@ _logger = logging.getLogger("athena.kernel")
 _FALLBACK_ATTEMPTS = 2
 
 
+def _bookkeeping_failure(what: str, task: TaskSpec | str | None, exc: BaseException) -> None:
+    """Log a critical-bookkeeping failure visibly (P1-11).
+
+    Cost/audit/telemetry persistence must never fail the task, but silent
+    ``except: pass`` means Athena completes work while its evidence
+    disappears without a trace. This logs at warning with task identity so
+    operators can detect evidence loss; call sites that also own an event
+    sink emit a diagnostic as well.
+    """
+    task_id = task if isinstance(task, str) else getattr(task, "id", None)
+    _logger.warning(
+        "bookkeeping failure: %s (task=%s): %s: %s",
+        what,
+        task_id or "?",
+        type(exc).__name__,
+        exc,
+    )
+
+
 class _ResultTextBlock(CapabilityResultBlock):
     """Text-capable view of a capability-result block.
 
@@ -650,14 +669,17 @@ class AgentKernel:
         if cancellations is not None:
             try:
                 cancellations.set_token(task_id, "cancelled by kernel")
-            except Exception:
-                pass
+            except Exception as exc:
+                # P1-11: a cancellation bookkeeping failure can leave a token
+                # un-set; operators must see why a task kept running.
+                _bookkeeping_failure("cancellation token set", task_id, exc)
         if state.request_id and state.provider:
             try:
                 provider = self._registry.provider_for(state.provider)
                 asyncio.create_task(provider.cancel(state.request_id))
-            except Exception:
-                pass
+            except Exception as exc:
+                # P1-11: best-effort stream interrupt, but the miss is visible.
+                _bookkeeping_failure("provider stream interrupt", task_id, exc)
 
     async def notify_approval_resolved(self, task_id: str, decision: str) -> None:
         self._resume_decision[task_id] = decision
@@ -1372,8 +1394,9 @@ class AgentKernel:
                             "state": "started",
                         },
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # P1-11: usage evidence must not vanish silently.
+                    _bookkeeping_failure("provider usage attempt record", task, exc)
             try:
                 if self._budgets is not None:
                     async with self._budgets.model_call_lease(task.id):
@@ -1454,8 +1477,9 @@ class AgentKernel:
                                 ),
                             },
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # P1-11: cost/audit evidence must not vanish silently.
+                        _bookkeeping_failure("provider usage completion record", task, exc)
                 return response
             except ProviderError as exc:
                 if self._budgets is not None and reservation and worst_cost is not None:
@@ -1481,8 +1505,11 @@ class AgentKernel:
                                 ),
                             },
                         )
-                    except Exception:
-                        pass
+                    except Exception as record_exc:
+                        # P1-11: the failure record IS the audit evidence for
+                        # this attempt; losing it silently is worse than the
+                        # provider error itself.
+                        _bookkeeping_failure("provider usage failure record", task, record_exc)
                 if not _is_retryable(exc):
                     raise
                 if attempt >= _FALLBACK_ATTEMPTS - 1:
@@ -1882,8 +1909,9 @@ class AgentKernel:
                                 metadata=completion_metadata,
                             )
                             usage_id = None
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            # P1-11: usage evidence must not vanish silently.
+                            _bookkeeping_failure("utility usage completion record", task_id, exc)
             if model_lease is not None:
                 await model_lease.__aexit__(None, None, None)
                 model_lease = None
@@ -1904,21 +1932,26 @@ class AgentKernel:
                         output_tokens=0,
                         metadata=failure_metadata,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # P1-11: this row is the only evidence the call happened.
+                    _bookkeeping_failure("utility usage no-done closure", task_id, exc)
             return " ".join(parts).strip() or None
         except Exception:
             if model_lease is not None:
                 try:
                     await model_lease.__aexit__(None, None, None)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _logger.debug(
+                        "utility inference lease release failed (task=%s): %s",
+                        task_id or "?",
+                        exc,
+                    )
                 model_lease = None
             if reservation_amount is not None and budget_id and self._budgets is not None:
                 try:
                     await self._budgets.release_model_cost(budget_id, reservation_amount)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _bookkeeping_failure("utility budget reservation release", task_id, exc)
                 reservation_amount = None
             if usage_id is not None:
                 # started but never completed (exception mid-stream): close
@@ -1934,8 +1967,9 @@ class AgentKernel:
                         output_tokens=0,
                         metadata=failure_metadata,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # P1-11: this row is the only evidence the call happened.
+                    _bookkeeping_failure("utility usage error closure", task_id, exc)
             _logger.debug("utility_inference failed; deterministic fallback", exc_info=True)
             return None
 

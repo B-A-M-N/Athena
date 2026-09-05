@@ -2623,12 +2623,21 @@ class AthenaService:
         if self._kernel is not None:
             try:
                 self._kernel.cancel_task(task_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                # P1-11: a failed kernel cancel can leave work running after
+                # the operator's cancel call returned success.
+                _logger.warning(
+                    "kernel cancel_task failed for %s: %s: %s", task_id, type(exc).__name__, exc
+                )
             try:
                 await self._kernel.notify_approval_resolved(task_id, "denied")
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning(
+                    "approval denial notification failed for %s: %s: %s",
+                    task_id,
+                    type(exc).__name__,
+                    exc,
+                )
         return status
 
     async def interrupt(self, task_id: str, reason: str = "externally interrupted") -> TaskStatus:

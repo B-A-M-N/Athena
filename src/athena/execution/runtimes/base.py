@@ -251,10 +251,20 @@ class BaseRuntime(metaclass=abc.ABCMeta):
 
     # -- synchronous overridables (called from close()/interrupt()) ---------- #
     def _close_session(self, session: Any) -> None:
-        """Synchronously tear down a session's process tree."""
+        """Synchronously tear down a session's process tree.
+
+        The kill outcome is forwarded via ``_on_session_kill_outcome`` so a
+        tree that could not be proven dead reaches the structured shutdown
+        evidence instead of hiding inside a best-effort close (P1-11).
+        """
         close = getattr(session, "close", None) or getattr(session, "terminate", None)
         if close is not None:
-            close()
+            outcome = close()
+            self._on_session_kill_outcome(session, outcome)
+
+    def _on_session_kill_outcome(self, session: Any, outcome: Any) -> None:
+        """Hook for kill outcomes from ``_close_session``; default ignores."""
+        return None
 
     def _interrupt_session(self, session: Any) -> None:
         interrupt = getattr(session, "interrupt", None)

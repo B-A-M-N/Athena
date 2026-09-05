@@ -47,6 +47,10 @@ class RuntimeCancellationResult:
     closed_sessions: tuple[str, ...] = ()
     remaining_sessions: tuple[str, ...] = ()
     pending_runtime_cancellations: tuple[str, ...] = ()
+    # P1-11: sessions whose process tree survived the close escalation
+    # ladder (SIGTERM → SIGKILL → reap) without observed exit. Shutdown
+    # evidence, not a silent best-effort miss.
+    unproven_process_kills: tuple[dict[str, Any], ...] = ()
 
     @property
     def confirmed(self) -> bool:
@@ -538,6 +542,7 @@ class ExecutionManager:
         remaining: list[tuple[Any, str]] = []
         errors: list[BaseException] = []
         closed_sessions: list[str] = []
+        unproven_kills: list[dict[str, Any]] = []
         for rt, sid in rooms:
             close = getattr(rt, "close", None) or getattr(rt, "destroy_session", None)
             try:
@@ -546,10 +551,23 @@ class ExecutionManager:
                     self._pending_session_persistence.pop(sid, None)
                 else:
                     if close is not None:
+                        # P1-11: capture the kill outcome before/after close so
+                        # a process tree that could not be proven dead is
+                        # structured shutdown evidence, not a log line.
+                        session = getattr(rt, "_sessions", {}).get(sid)
+                        process_before = getattr(session, "process", None)
                         if asyncio.iscoroutinefunction(close):
                             await close(sid)
                         else:
                             await loop.run_in_executor(None, close, sid)
+                        if (
+                            process_before is not None
+                            and getattr(process_before, "poll", None) is not None
+                            and process_before.poll() is None
+                        ):
+                            unproven_kills.append(
+                                {"session_id": sid, "pid": getattr(process_before, "pid", None)}
+                            )
                     try:
                         await self._persist_session_closed(sid)
                     except Exception:
@@ -596,6 +614,13 @@ class ExecutionManager:
                 + "; ".join(str(error) for error in errors)
             ) from errors[0]
         self._confirmed_runtime_cancellations.pop(task_id, None)
+        if unproven_kills:
+            for entry in unproven_kills:
+                _logger.warning(
+                    "process tree for session %s (pid %s) could not be proven dead after close",
+                    entry["session_id"],
+                    entry["pid"],
+                )
         return RuntimeCancellationResult(
             task_id=task_id,
             closed_sessions=tuple(closed_sessions),
@@ -603,6 +628,7 @@ class ExecutionManager:
             pending_runtime_cancellations=tuple(
                 type(rt).__name__ for rt in self._pending_runtime_cancellations.get(task_id, [])
             ),
+            unproven_process_kills=tuple(unproven_kills),
         )
 
     async def close_all(self) -> dict[str, Any]:
@@ -619,11 +645,16 @@ class ExecutionManager:
             "sessions_remaining": [],
             "runtime_failures": [],
             "backend_failures": [],
+            "unproven_process_kills": [],
         }
         for task_id in set(self._task_sessions) | set(self._pending_runtime_cancellations):
             try:
-                await self.cancel_task(task_id)
+                result = await self.cancel_task(task_id)
                 outcome["tasks_cancelled"] += 1
+                if result.unproven_process_kills:
+                    outcome["unproven_process_kills"].extend(
+                        {"task_id": task_id, **kill} for kill in result.unproven_process_kills
+                    )
             except Exception as exc:
                 outcome["runtime_failures"].append({"task_id": task_id, "error": str(exc)})
                 _logger.warning("task %s runtime cancellation failed: %s", task_id, exc)
