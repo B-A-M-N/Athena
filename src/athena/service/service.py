@@ -4655,6 +4655,35 @@ class AthenaService:
         except Exception as exc:  # debugpy optional
             _logger.info("debugger capability unavailable: %s", exc)
 
+        # Computer + browser interaction (P1-20/P1-28, SPEC 36/65): optional
+        # packs behind the standard governance surface. Both register only
+        # when their driver is importable; operators wire a driver factory
+        # for structured browser control, and computer control stays on the
+        # ask-by-default COMPUTER_INPUT path.
+        try:
+            from athena.capabilities.browser import BrowserCapability
+            from athena.capabilities.computer import ComputerCapability
+
+            if ComputerCapability.available():
+                self._computer = ComputerCapability()
+                registry.register(self._computer)
+            else:
+                _logger.info(
+                    "computer capability unavailable: install the 'computer' extra (pyautogui)"
+                )
+            if self.config.browser_driver_factory is not None:
+                self._browser = BrowserCapability(
+                    driver_factory=self.config.browser_driver_factory
+                )
+                registry.register(self._browser)
+            else:
+                _logger.info(
+                    "browser capability not wired: set browser_driver_factory to enable "
+                    "structured browser automation"
+                )
+        except Exception as exc:  # optional interaction packs
+            _logger.info("computer/browser capability unavailable: %s", exc)
+
         # P1/P2 environment families.
         from athena.capabilities.environment import (
             DatabaseCapability,

@@ -256,6 +256,11 @@ class AthenaConfig:
     research_allowed_domains: tuple[str, ...] = ()
     research_denied_domains: tuple[str, ...] = ()
     research_allow_private_network: bool = False
+    # Structured browser automation (P1-28): a zero-arg callable returning a
+    # BrowserDriver (Playwright-shaped). The browser capability registers
+    # only when an operator wires a driver — the service never constructs a
+    # browser session on its own.
+    browser_driver_factory: Any | None = None
     # Terminal UI: which mascot/buddy the surfaces show (a registered
     # character name, or "off" to hide the mascot column). ``mascots``
     # registers user-defined characters ([mascots.<name>] in TOML) with

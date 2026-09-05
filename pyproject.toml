@@ -31,6 +31,8 @@ container = ["docker>=7.0"]
 debug = ["debugpy>=1.8"]
 cli = ["wcwidth>=0.2"]
 glass = ["Pillow>=10.0"]
+computer = ["pyautogui>=0.9.14"]
+browser = ["playwright>=1.40"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
