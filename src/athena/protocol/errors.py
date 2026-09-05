@@ -65,6 +65,17 @@ class IllegalStateTransition(TaskError):
     code = "illegal_state_transition"
 
 
+class TaskOwnershipLost(TaskError):
+    """A worker's task lease was lost (expired, reclaimed, or cleared).
+
+    Raised by the storage layer when a lease-renewal CAS fails: the worker no
+    longer owns the task and MUST stop driving it immediately instead of
+    risking duplicate execution alongside the new owner.
+    """
+
+    code = "task_ownership_lost"
+
+
 class ProviderError(AthenaError):
     code = "provider_error"
     retryable = False

@@ -942,7 +942,11 @@ class AthenaService:
         worker = TaskWorker(
             task_manager=task_manager,
             kernel=kernel,
-            config=WorkerConfig(max_parallel=cfg.max_parallel_tasks),
+            config=WorkerConfig(
+                max_parallel=cfg.max_parallel_tasks,
+                lease_duration_seconds=cfg.worker_lease_duration_seconds,
+                lease_renewal_divisor=cfg.worker_lease_renewal_divisor,
+            ),
         )
         self._worker = worker
         task_manager.set_wakeup_callback(worker.notify)

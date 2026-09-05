@@ -83,6 +83,8 @@ async def make_durable_service():
                 ),
             ),
             worker_max_parallel=cfg.get("worker_max_parallel", 4),
+            worker_lease_duration_seconds=cfg.get("worker_lease_duration_seconds", 300.0),
+            worker_lease_renewal_divisor=cfg.get("worker_lease_renewal_divisor", 3.0),
             scheduler_interval_seconds=cfg.get("scheduler_interval_seconds", 1.0),
         )
         svc = AthenaService(config=config)

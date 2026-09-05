@@ -8,7 +8,9 @@ from athena.tasks.worker import TaskWorker
 
 
 class _BrokenStore:
-    async def claim_with_lease(self, statuses, *, worker_id):
+    async def claim_with_lease(
+        self, statuses, *, worker_id, lease_duration_seconds=300.0, reclaim_grace_seconds=0.0
+    ):
         raise RuntimeError("database unavailable")
 
 

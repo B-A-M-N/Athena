@@ -244,6 +244,12 @@ class AthenaConfig:
     # and the slot frees. The durable continuation (open question / pending
     # approval) relaunches the task on the operator's action.
     parked_slot_wait_s: float = 300.0
+    # Worker task lease (P0-1): how long a claimed task's lease runs before it
+    # could be reclaimed, and the heartbeat cadence divisor. The heartbeat
+    # renews at lease_duration/divisor, so a live worker never lets a healthy
+    # lease expire; only a genuinely dead process's leases are reclaimable.
+    worker_lease_duration_seconds: float = 300.0
+    worker_lease_renewal_divisor: float = 3.0
     scheduler_interval_seconds: float = 1.0
     scheduler_max_concurrent: int = 0
     profile: str | None = None
