@@ -113,6 +113,31 @@ class AutonomyLevel(str, enum.Enum):
     OFFLINE = "offline"
 
 
+class Durability(str, enum.Enum):
+    """Persistence contract for a durable write (P1-27).
+
+    Codifies the durability split established by the manager's authority
+    commit: authority state commits synchronously and its failure blocks the
+    operation; bookkeeping may defer and its failure is logged, never
+    surfaced to the caller. Every durable write site declares which side of
+    the split it is on, so the contract is auditable at the call site instead
+    of living only in comments.
+    """
+
+    # The write IS the source of truth being admitted. It commits before the
+    # caller observes success, and a failure propagates: the operation did
+    # not happen. Examples: task-row insert in TaskManager.create, durable
+    # status transitions, input-request answer columns, branch verification
+    # records.
+    AUTHORITY = "authority"
+
+    # Derived or reproducible state that must not mask or roll back an
+    # already-committed authority write. A failure is logged and non-fatal.
+    # Examples: budget ledger registration, cancellation-key resets,
+    # lifecycle event emission, usage bookkeeping.
+    BOOKKEEPING = "bookkeeping"
+
+
 class VerificationType(str, enum.Enum):
     COMMAND = "command"
     FILE = "file"

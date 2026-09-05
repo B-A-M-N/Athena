@@ -51,6 +51,31 @@ class CapabilityOrigin(str, enum.Enum):
     REMOTE = "remote"
 
 
+class ResourceClass(str, enum.Enum):
+    """What kind of state a capability's resources live in (P1-23).
+
+    Replaces the pathless-write capability-name exception list: policy asks
+    "does this call touch FILESYSTEM resources?" instead of "is this
+    capability_id on the magic allow-list?". A WRITE_LOCAL/DELETE call
+    without a resolved path argument is structurally valid exactly when the
+    capability operates on non-filesystem resources (STATE, SCHEDULE,
+    DATABASE, ...) — those resources are addressed by identity, not by
+    workspace path, so path containment does not apply to them.
+    """
+
+    FILESYSTEM = "FILESYSTEM"
+    DATABASE = "DATABASE"
+    STATE = "STATE"
+    SCHEDULE = "SCHEDULE"
+    WORKFLOW = "WORKFLOW"
+    SYNTHESIS = "SYNTHESIS"
+    MEMORY = "MEMORY"
+    RESEARCH = "RESEARCH"
+    NETWORK = "NETWORK"
+    PROCESS = "PROCESS"
+    SECRET = "SECRET"
+
+
 class CapabilityRequestOrigin(str, enum.Enum):
     """Trust/provenance of a capability request."""
 
@@ -230,6 +255,7 @@ class CapabilityDescriptor:
     operation_cache_policies: Mapping[str, CachePolicy] | None = None
     cache_key_resolver: Callable[[Mapping[str, Any], WorkspaceSpec], str | None] | None = None
     external_effects: Mapping[str, ExternalEffectContract] | None = None
+    resources: frozenset[ResourceClass] | None = None
 
     def __post_init__(self) -> None:
         """Attach the native operation contract at descriptor creation.
@@ -311,6 +337,23 @@ class CapabilityDescriptor:
             return self.cache_policy
         operation = str(arguments.get("operation") or arguments.get("action") or "").lower()
         return self.operation_cache_policies.get(operation, CachePolicy.NONE)
+
+    def resolve_resources(self) -> frozenset[ResourceClass]:
+        """The resource classes this capability operates on (P1-23).
+
+        Declared via the ``resources`` field when a capability's resources
+        are non-filesystem (STATE, SCHEDULE, DATABASE, ...). Undeclared
+        capabilities are inferred conservatively: a capability that can
+        WRITE_LOCAL or DELETE is assumed FILESYSTEM (path containment
+        applies); anything else is assumed to touch no governed resource
+        class. The inference errs toward filesystem so path checks stay
+        active until a descriptor declares otherwise.
+        """
+        if self.resources is not None:
+            return self.resources
+        if self.effects & {EffectClass.WRITE_LOCAL, EffectClass.DELETE}:
+            return frozenset({ResourceClass.FILESYSTEM})
+        return frozenset()
 
     def resolve_external_effect_contract(
         self,

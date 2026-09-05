@@ -17,6 +17,7 @@ from athena.protocol.errors import (
 from athena.protocol.messages import utcnow
 from athena.protocol.tasks import (
     ContextRef,
+    Durability,
     TaskResult,
     TaskSpec,
     TaskStatus,
@@ -147,11 +148,11 @@ class TaskManager:
             if inspect.isawaitable(result):
                 await result
         await self._ensure_session(spec)
-        # AUTHORITY COMMIT: the durable task row is the single source of
-        # truth for the task's existence and state. It commits first and is
-        # allowed to surface a real error (the task was NOT admitted). Anything
-        # after it is bookkeeping that must never roll back or mask the
-        # authority commit (durability split, task #11): a budget/cancellation
+        # AUTHORITY (Durability.AUTHORITY): the durable task row is the single
+        # source of truth for the task's existence and state. It commits first
+        # and is allowed to surface a real error (the task was NOT admitted).
+        # Anything after it is BOOKKEEPING and must never roll back or mask
+        # the authority commit (durability split, P1-27): a budget/cancellation
         # registration or event-emit failure cannot surface as a failed
         # ``create`` for a task that was actually admitted.
         await self._store.insert_task(
@@ -172,31 +173,58 @@ class TaskManager:
             status=TaskStatus.CREATED,
         )
 
-        # ---- best-effort bookkeeping, after the durable authority commit --- #
-        # These register derived in-memory state (budget ledger, cancellation
-        # reset) and publish the lifecycle event. They are not authority: if
-        # one fails, the task still exists and is runnable. Failures are logged
-        # and non-fatal, matching ``_finalize_observers`` semantics.
-        try:
-            if self._budgets is not None:
-                self._budgets.register(spec)
-            if self._cancellations is not None:
-                self._cancellations.reset(spec.id)
-        except Exception as exc:
-            _logger.warning(
-                "task %s committed but bookkeeping registration failed (non-fatal): %s",
-                spec.id,
-                exc,
-            )
-        try:
-            await self._emit(spec, TaskStatus.CREATED)
-        except Exception as exc:
-            _logger.warning(
-                "task %s committed but CREATED event emit failed (non-fatal): %s",
-                spec.id,
-                exc,
-            )
+        # ---- BOOKKEEPING (Durability.BOOKKEEPING), after the commit ------ #
+        # Derived in-memory state (budget ledger, cancellation reset) and the
+        # lifecycle event. Not authority: if one fails, the task still exists
+        # and is runnable. Failures are logged and non-fatal, matching
+        # ``_finalize_observers`` semantics.
+        await self._bookkeeping(
+            spec.id,
+            Durability.BOOKKEEPING,
+            "bookkeeping registration",
+            self._register_bookkeeping,
+            spec,
+        )
+        await self._bookkeeping(
+            spec.id,
+            Durability.BOOKKEEPING,
+            "CREATED event emit",
+            self._emit_created,
+            spec,
+        )
         return spec
+
+    def _register_bookkeeping(self, spec: TaskSpec) -> None:
+        if self._budgets is not None:
+            self._budgets.register(spec)
+        if self._cancellations is not None:
+            self._cancellations.reset(spec.id)
+
+    async def _emit_created(self, spec: TaskSpec) -> None:
+        await self._emit(spec, TaskStatus.CREATED)
+
+    async def _bookkeeping(self, task_id: str, durability: Durability, what: str, op, *args):
+        """Run a deferred write under its declared Durability contract.
+
+        The classification is what makes the split mechanical: a BOOKKEEPING
+        failure is logged and swallowed (the authority row already committed);
+        anything else — an AUTHORITY-classified write routed here by mistake,
+        or a future Durability member — is re-raised, so the contract cannot
+        silently erode.
+        """
+        try:
+            result = op(*args)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            if durability is not Durability.BOOKKEEPING:
+                raise
+            _logger.warning(
+                "task %s committed but %s failed (non-fatal): %s",
+                task_id,
+                what,
+                exc,
+            )
 
     async def _ensure_session(self, spec: TaskSpec) -> None:
         if self._sessions is None or not spec.session_id:

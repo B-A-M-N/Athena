@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from athena.protocol.errors import ModelProviderUnconfigured
-from athena.protocol.tasks import TaskSpec
+from athena.protocol.tasks import Durability, TaskSpec
 from athena.state.database import Database
 from athena.state.events import EventStore
 from athena.state.sessions import SessionRepository
@@ -102,5 +102,30 @@ async def test_task_manager_admits_before_creating_session_or_task() -> None:
         assert admitted == ["admission-task"]
         assert await sessions.get("new-session") is None
         assert await tasks.get("admission-task") is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_bookkeeping_helper_enforces_durability_split() -> None:
+    """P1-27: the split is classified, not just commented.
+
+    A BOOKKEEPING-classified write failing after the authority commit is
+    logged and swallowed; an AUTHORITY-classified write routed through the
+    deferred path re-raises, so the contract cannot silently erode.
+    """
+    db = Database(":memory:")
+    await db._ensure_ready()
+    try:
+        manager = TaskManager(task_store=TaskStore(db), events=EventStore(db))
+
+        async def boom() -> None:
+            raise RuntimeError("sink down")
+
+        # BOOKKEEPING: failure is non-fatal.
+        await manager._bookkeeping("t1", Durability.BOOKKEEPING, "ledger flush", boom)
+        # AUTHORITY: failure propagates — the operation did not happen.
+        with pytest.raises(RuntimeError, match="sink down"):
+            await manager._bookkeeping("t1", Durability.AUTHORITY, "status transition", boom)
     finally:
         await db.close()

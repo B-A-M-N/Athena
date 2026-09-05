@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
-from athena.protocol.capabilities import EffectClass
+from athena.protocol.capabilities import EffectClass, ResourceClass
 from athena.protocol.tasks import WorkspaceSpec
 
 
@@ -53,6 +53,10 @@ class PolicyRequest:
     workspace: WorkspaceSpec
     execution_backend: str | None = None
     effects: frozenset[EffectClass] = frozenset()
+    # Typed resource classes from the descriptor (P1-23): the policy engine
+    # reasons about what KIND of state a call touches, not a capability-name
+    # exception list.
+    resources: frozenset[ResourceClass] = frozenset()
     session_id: str | None = None
     call_id: str | None = None
 
@@ -91,4 +95,5 @@ __all__ = [
     "PolicyRequest",
     "PolicyDecision",
     "ApprovalGrant",
+    "ResourceClass",
 ]
