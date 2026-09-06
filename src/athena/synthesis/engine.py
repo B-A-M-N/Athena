@@ -17,14 +17,11 @@ knows "executed successfully N times under these conditions", not merely
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -38,7 +35,12 @@ from athena.affordances.models import (
 )
 from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
 from athena.capabilities.registry import validate_schema
-from athena.execution.process_tree import kill_tree, kill_tree_async, sandbox_argv, spawn_owned
+from athena.execution.process_tree import (  # noqa: F401 (patch seams)
+    kill_tree,
+    kill_tree_async,
+    sandbox_argv,
+    spawn_owned,
+)
 from athena.workspace_manifest import copy_workspace_tree
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
@@ -52,6 +54,7 @@ from athena.protocol.events import EV, Event
 from athena.protocol.errors import CapabilityUnavailable
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import MutationMode, WorkspaceSpec
+from athena.synthesis.child_runtime import ChildRuntime, _namespace_python_paths  # noqa: F401 (patch-seam re-export)
 from athena.synthesis.runtime import GeneratedToolHost, PersistentGeneratedSession
 
 __all__ = [
@@ -134,19 +137,6 @@ def _child_code(cap_code_repr: str, *, persistent: bool = False) -> str:
         "NS['athena'] = _GeneratedHost()\n"
         f"exec({cap_code_repr}, NS)\n" + execution
     )
-
-
-def _namespace_python_paths(paths: Sequence[str], root: str) -> tuple[str, ...]:
-    """Map host workspace paths to the sandbox's ``/workspace`` mount."""
-    root_abs = os.path.realpath(os.path.abspath(root))
-    mapped: list[str] = []
-    for path in paths:
-        path_abs = os.path.realpath(os.path.abspath(path))
-        if path_abs == root_abs or path_abs.startswith(root_abs + os.sep):
-            mapped.append("/workspace" + path_abs[len(root_abs) :])
-        else:
-            raise ValueError("dependency import path escaped workspace")
-    return tuple(mapped)
 
 
 @dataclass
@@ -697,15 +687,7 @@ class SynthesisEngine:
         }
 
     def _child_env(self, python_paths: Sequence[str] = ()) -> dict:
-        if not self._restricted_env:
-            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        else:
-            allowed = ("PATH", "PYTHONIOENCODING", "LANG", "LC_ALL", "TMPDIR")
-            env = {k: os.environ[k] for k in allowed if k in os.environ}
-            env["PYTHONIOENCODING"] = "utf-8"
-        if python_paths:
-            env["PYTHONPATH"] = os.pathsep.join(python_paths)
-        return env
+        return ChildRuntime(self)._child_env(python_paths)
 
     @staticmethod
     def _effect_values(cap: SyntheticCapability) -> set[str]:
@@ -716,261 +698,29 @@ class SynthesisEngine:
         return set(cap.effective_effects)
 
     def _run_child(
-        self,
-        child: str,
-        payload: str,
-        *,
-        timeout: float,
-        workspace_root: str | None = None,
-        effects: set[str] | None = None,
-        python_paths: Sequence[str] = (),
-    ) -> tuple[str, str, int]:
-        """Run generated code inside the same namespace boundary as runtimes.
-
-        A subprocess with a sanitized environment is not a sandbox: Python
-        can still open arbitrary host paths.  Bubblewrap is therefore required
-        here as well.  Read-only synthetic capabilities receive a read-only
-        workspace; write/delete effects explicitly receive writable scope.
-        """
-        owned_root = workspace_root is None
-        root = workspace_root or tempfile.mkdtemp(prefix="athena-synth-")
-        values = effects or set()
-        writable = bool({"WRITE_LOCAL", "DELETE"} & values)
-        network = "allow" if {"NETWORK_READ", "NETWORK_WRITE"} & values else "deny"
-        proc = None
-        try:
-            proc = spawn_owned(
-                [sys.executable, "-c", child],
-                env=self._child_env(python_paths),
-                sandbox_root=root,
-                network_policy=network,
-                sandbox_writable=writable,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            try:
-                stdout, stderr = proc.communicate(input=payload, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                kill_tree(proc)
-                stdout, stderr = proc.communicate()
-                return stdout, stderr or "synthetic execution timed out", 124
-            return stdout, stderr, proc.returncode
-        finally:
-            if owned_root:
-                shutil.rmtree(root, ignore_errors=True)
+        self, child, payload, *, timeout, workspace_root=None, effects=None, python_paths=()
+    ):
+        return ChildRuntime(self)._run_child(
+            child,
+            payload,
+            timeout=timeout,
+            workspace_root=workspace_root,
+            effects=effects,
+            python_paths=python_paths,
+        )
 
     async def _run_child_async(
         self,
-        child: str,
-        payload: str,
+        child,
+        payload,
         *,
-        timeout: float,
-        workspace_root: str | None = None,
-        effects: set[str] | None = None,
-        python_paths: Sequence[str] = (),
-        host: GeneratedToolHost | None = None,
-    ) -> tuple[str, str, int]:
-        """Async equivalent of :meth:`_run_child` for live validation/invocation.
-
-        Validation and generated capability calls are part of the async agent
-        path.  Using ``asyncio.create_subprocess_exec`` keeps the event loop
-        responsive and avoids relying on thread-pool subprocess semantics.
-        The command line is built by the same fail-closed Bubblewrap policy as
-        the synchronous compatibility path.
-        """
-        owned_root = workspace_root is None
-        root = workspace_root or tempfile.mkdtemp(prefix="athena-synth-")
-        values = effects or set()
-        writable = bool({"WRITE_LOCAL", "DELETE"} & values)
-        network = "allow" if {"NETWORK_READ", "NETWORK_WRITE"} & values else "deny"
-        proc = None
-        try:
-            argv = sandbox_argv(
-                [sys.executable, "-c", child],
-                root=root,
-                network_policy=network,
-                writable=writable,
-            )
-            proc = await asyncio.create_subprocess_exec(  # architecture-lint: allow subprocess-outside-approved-backends reason=generated validation worker
-                *argv,
-                env=self._child_env(_namespace_python_paths(python_paths, root)),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            try:
-                if host is None:
-                    # ``athena.call`` is still injected so source validation
-                    # and execution use one stable contract.  Without a
-                    # parent host, answer the first mediated request with a
-                    # deterministic failure instead of leaving the child
-                    # blocked on stdin until the execution timeout.
-                    unavailable = json.dumps(
-                        {
-                            "ok": False,
-                            "error": "generated host is unavailable in this context",
-                        }
-                    )
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate((payload + "\n" + unavailable + "\n").encode()),
-                        timeout=timeout,
-                    )
-                else:
-                    stdout, stderr = await asyncio.wait_for(
-                        self._communicate_with_host(proc, payload, host),
-                        timeout=timeout,
-                    )
-            except TimeoutError:
-                await kill_tree_async(proc)
-                stdout, stderr = await proc.communicate()
-                return (
-                    stdout.decode("utf-8", errors="replace"),
-                    stderr.decode("utf-8", errors="replace") or "synthetic execution timed out",
-                    124,
-                )
-            return (
-                stdout.decode("utf-8", errors="replace"),
-                stderr.decode("utf-8", errors="replace"),
-                proc.returncode if proc.returncode is not None else 1,
-            )
-        except asyncio.CancelledError:
-            if proc is not None and proc.returncode is None:
-                await asyncio.shield(kill_tree_async(proc))
-                await asyncio.shield(proc.communicate())
-            raise
-        finally:
-            if owned_root:
-                shutil.rmtree(root, ignore_errors=True)
-
-    async def _run_persistent_child_async(
-        self,
-        child: str,
-        payload: str,
-        *,
-        timeout: float,
-        workspace_root: str | None,
-        effects: set[str] | None,
-        python_paths: Sequence[str],
-        host: GeneratedToolHost | None,
-        session_key: tuple[str, str, str],
-    ) -> tuple[str, str, int]:
-        """Run one call on the task/workspace-scoped generated process."""
-        handle = self._persistent_sessions.get(session_key)
-        if handle is None or handle[0].closed:
-            if handle is not None:
-                await handle[0].close()
-                if handle[2]:
-                    shutil.rmtree(handle[1], ignore_errors=True)
-            owned_root = workspace_root is None
-            root = workspace_root or tempfile.mkdtemp(prefix="athena-synth-persistent-")
-            values = effects or set()
-            writable = bool({"WRITE_LOCAL", "DELETE"} & values)
-            network = "allow" if {"NETWORK_READ", "NETWORK_WRITE"} & values else "deny"
-            try:
-                session = PersistentGeneratedSession(
-                    sandbox_argv(
-                        [sys.executable, "-c", child],
-                        root=root,
-                        network_policy=network,
-                        writable=writable,
-                    ),
-                    env=self._child_env(_namespace_python_paths(python_paths, root)),
-                )
-                await session.start()
-            except BaseException:
-                if owned_root:
-                    shutil.rmtree(root, ignore_errors=True)
-                raise
-            handle = (session, root, owned_root)
-            self._persistent_sessions[session_key] = handle
-        result = await handle[0].invoke(payload, host, timeout=timeout)
-        if handle[0].closed:
-            self._persistent_sessions.pop(session_key, None)
-            if handle[2]:
-                shutil.rmtree(handle[1], ignore_errors=True)
-        return result
-
-    async def close_persistent_sessions(self) -> None:
-        """Stop all generated persistent runtimes during service shutdown."""
-        handles = tuple(self._persistent_sessions.items())
-        self._persistent_sessions.clear()
-        await self._close_persistent_handles(handles)
-
-    async def close_persistent_sessions_for_task(self, task_id: str) -> None:
-        """Stop task-owned generated state when the task reaches a terminal state."""
-        selected = tuple(
-            (key, self._persistent_sessions.pop(key))
-            for key in tuple(self._persistent_sessions)
-            if key[1] == task_id
-        )
-        await self._close_persistent_handles(selected)
-
-    async def _close_persistent_handles(self, handles) -> None:
-        for _key, (session, root, owned_root) in handles:
-            try:
-                await session.close()
-            except (OSError, RuntimeError) as exc:
-                _logger.warning("persistent generated runtime close failed: %s", exc)
-            finally:
-                if owned_root:
-                    shutil.rmtree(root, ignore_errors=True)
-
-    async def _run_generated_child(
-        self,
-        *,
-        cap: SyntheticCapability,
-        child: str,
-        payload: str,
-        timeout: float,
-        workspace_root: str | None,
-        effects: set[str],
-        python_paths: Sequence[str],
-        context,
-        request,
-    ) -> tuple[str, str, int]:
-        host = (
-            GeneratedToolHost(
-                dispatcher=self._dispatcher,
-                workspace=context.workspace,
-                task_id=request.task_id,
-                session_id=getattr(request, "session_id", None),
-                profile=getattr(context, "autonomy", None),
-                task_policy=getattr(context, "capability_policy", None),
-                task_budget=getattr(context, "resource_budget", None),
-                call_depth=getattr(context, "generated_call_depth", 0),
-                call_chain=tuple(getattr(context, "generated_call_chain", ())) + (cap.id,),
-                allowed_capabilities=frozenset(cap.required_capabilities),
-                inherited_effects=frozenset(
-                    getattr(
-                        getattr(context, "directives", None),
-                        "inherited_effects",
-                        (),
-                    )
-                ),
-                inherited_capability_id=getattr(
-                    getattr(context, "directives", None),
-                    "inherited_capability_id",
-                    None,
-                ),
-            )
-            if self._dispatcher is not None and context is not None
-            else None
-        )
-        if cap.runtime != "python_persistent" or request.task_id is None:
-            return await self._run_child_async(
-                child,
-                payload,
-                timeout=timeout,
-                workspace_root=workspace_root,
-                effects=effects,
-                python_paths=python_paths,
-                host=host,
-            )
-        root_key = os.path.realpath(os.path.abspath(workspace_root or f"<task:{request.task_id}>"))
-        return await self._run_persistent_child_async(
+        timeout,
+        workspace_root=None,
+        effects=None,
+        python_paths=(),
+        host=None,
+    ):
+        return await ChildRuntime(self)._run_child_async(
             child,
             payload,
             timeout=timeout,
@@ -978,40 +728,59 @@ class SynthesisEngine:
             effects=effects,
             python_paths=python_paths,
             host=host,
-            session_key=(cap.id, str(request.task_id), root_key),
+        )
+
+    async def _run_persistent_child_async(
+        self, child, payload, *, timeout, workspace_root, effects, python_paths, host, session_key
+    ):
+        return await ChildRuntime(self)._run_persistent_child_async(
+            child,
+            payload,
+            timeout=timeout,
+            workspace_root=workspace_root,
+            effects=effects,
+            python_paths=python_paths,
+            host=host,
+            session_key=session_key,
+        )
+
+    async def close_persistent_sessions(self) -> None:
+        await ChildRuntime(self).close_persistent_sessions()
+
+    async def close_persistent_sessions_for_task(self, task_id: str) -> None:
+        await ChildRuntime(self).close_persistent_sessions_for_task(task_id)
+
+    async def _close_persistent_handles(self, handles) -> None:
+        await ChildRuntime(self)._close_persistent_handles(handles)
+
+    async def _run_generated_child(
+        self,
+        *,
+        cap,
+        child,
+        payload,
+        timeout,
+        workspace_root,
+        effects,
+        python_paths,
+        context,
+        request,
+    ):
+        return await ChildRuntime(self)._run_generated_child(
+            cap=cap,
+            child=child,
+            payload=payload,
+            timeout=timeout,
+            workspace_root=workspace_root,
+            effects=effects,
+            python_paths=python_paths,
+            context=context,
+            request=request,
         )
 
     @staticmethod
     async def _communicate_with_host(proc, payload: str, host: GeneratedToolHost):
-        """Serve framed ``__HOST__`` requests until the child returns."""
-        assert proc.stdin is not None
-        assert proc.stdout is not None
-        assert proc.stderr is not None
-        proc.stdin.write((payload + "\n").encode())
-        await proc.stdin.drain()
-        stderr_task = asyncio.create_task(proc.stderr.read())
-        output: list[bytes] = []
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            if line.startswith(b"__HOST__"):
-                try:
-                    request = json.loads(line[len(b"__HOST__") :])
-                    value = await host.call(request["capability_id"], request["arguments"])
-                    response = {"ok": True, "value": value}
-                except Exception as exc:  # noqa: BLE001 - return failure to child
-                    response = {"ok": False, "error": str(exc)}
-                proc.stdin.write((json.dumps(response) + "\n").encode())
-                await proc.stdin.drain()
-                continue
-            output.append(line)
-            if line.startswith(b"__RESULT__"):
-                break
-        if not proc.stdin.is_closing():
-            proc.stdin.close()
-        await proc.wait()
-        return b"".join(output), await stderr_task
+        return await ChildRuntime._communicate_with_host(proc, payload, host)
 
     def synthesize(
         self,
