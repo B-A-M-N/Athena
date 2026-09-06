@@ -14,30 +14,49 @@ entrypoints and stays the only caller that decides WHEN this mechanism runs.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from athena.kernel.dispatch import SuspendedCall
+from athena.kernel.dispatch import DispatchResult, SuspendedCall
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityRequestOrigin,
     DispatchDirectives,
 )
 from athena.protocol.ids import new_id
-from athena.protocol.messages import CapabilityResultBlock
+from athena.protocol.messages import (
+    CapabilityResultBlock,
+    Message,
+    Provenance,
+    Role,
+    SourceType,
+    TextBlock,
+    utcnow,
+)
+
+from athena.kernel.termination import TerminationDecision
 
 if TYPE_CHECKING:
     from athena.kernel.kernel import AgentKernel
+    from athena.protocol.tasks import TaskResult
     from athena.protocol.tasks import TaskSpec
+from athena.protocol.tasks import TaskStatus
+
+
+def _mod():
+    # Kernel-module helpers resolve through the kernel module at call time.
+    from athena.kernel import kernel
+
+    return kernel
 
 
 def _replay_policy_context(task) -> dict:
-    # Pure static on AgentKernel; imported lazily to avoid the import cycle
-    # while keeping one definition.
-    from athena.kernel.kernel import AgentKernel
-
-    return AgentKernel._replay_policy_context(task)
+    # Pure static on AgentKernel; resolved through the kernel module to
+    # avoid the import cycle while keeping one definition.
+    return _mod().AgentKernel._replay_policy_context(task)
 
 
 _logger = logging.getLogger("athena.kernel")
@@ -406,6 +425,376 @@ class ContinuationCoordinator:
             "WHERE id = ? AND answer_ref IS NULL",
             (answer_ref, request_id),
         )
+
+    # ------------------------------------------------------------------
+    # Approval/input/park/resume cluster (P1-10 extraction, second slice).
+    # ------------------------------------------------------------------
+    async def _approval_path(self, task, state, outcome: DispatchResult) -> TaskResult | None:
+        await self._k._transition(task, TaskStatus.WAITING_APPROVAL)
+        ev = self._k._resume.setdefault(task.id, asyncio.Event())
+        ev.clear()
+        await self._k._emit("ApprovalRequested", {"calls": len(outcome.suspended)}, task)
+        woke = await self._k._park_wait(task, state)
+        if woke == "cancelled":
+            return await self._k._finalize(
+                task, state, TaskStatus.CANCELLED, "task cancelled during approval"
+            )
+        if woke == "slot_released":
+            decision = self._k._resume_decision.get(task.id)
+            if decision is not None:
+                woke = "resumed"
+            else:
+                return await self._k._paused_result(
+                    task, state, TaskStatus.WAITING_APPROVAL, "awaiting approval decision"
+                )
+        decision = self._k._resume_decision.get(task.id, "denied")
+        try:
+            await self._k._transition(task, TaskStatus.RUNNING)
+        except Exception:
+            return await self._k._finalize_decision(
+                task,
+                state,
+                TerminationDecision(True, "approval wait could not resume", TaskStatus.BLOCKED),
+            )
+        if decision in ("denied", "cancelled"):
+            denied = [_mod()._deny_result(s) for s in outcome.suspended]
+            parent_results: list[CapabilityResultBlock] = []
+            parent_suspended: list[SuspendedCall] = []
+            for suspended_call, result in zip(outcome.suspended, denied):
+                await self._k._reconcile_workflow_suspended(suspended_call, result)
+                resume_parent = getattr(self, "_resume_workflow_parent", None)
+                parent = (
+                    await resume_parent(task, suspended_call) if resume_parent is not None else None
+                )
+                if isinstance(parent, SuspendedCall):
+                    parent_suspended.append(parent)
+                elif parent is not None:
+                    parent_results.append(_to_result_block(parent))
+            await self._k._append_results(task, [*denied, *parent_results])
+            await self._k._mark_continuations_consumed(outcome.suspended)
+            if parent_suspended:
+                return await self._k._approval_path(
+                    task, state, DispatchResult(suspended=tuple(parent_suspended))
+                )
+            return None
+        if self._k._dispatch_factory is None:
+            return None
+        shim = self._k._dispatch_factory(task)
+        dispatcher = getattr(shim, "_dispatcher", None)
+        if dispatcher is None:
+            blocks = [_mod()._block_of(s) for s in outcome.suspended]
+            retried = await shim.dispatch(task, blocks)
+            await self._k._append_results(task, retried.results)
+            return None
+        suspended = list(outcome.suspended)
+        while suspended:
+            requests = [s.request for s in suspended]
+            for request in requests:
+                object.__setattr__(request, "origin", CapabilityRequestOrigin.TRUSTED_ORCHESTRATION)
+            items = await dispatcher.dispatch_many(
+                requests,
+                workspace=shim._workspace,
+                profile=shim._profile,
+                **_mod().AgentKernel._replay_policy_context(task),
+                runtime_remaining_s=_mod().AgentKernel._remaining_runtime_seconds(task, state),
+                _directives_by_call_id={
+                    suspended_call.call_id: suspended_call.directives
+                    for suspended_call in suspended
+                    if suspended_call.directives is not None
+                },
+            )
+            results = []
+            raw_results = []
+            re_ask: list = []
+            for it in items:
+                if isinstance(it, SuspendedCall):
+                    re_ask.append(it)
+                else:
+                    raw_results.append(it)
+                    results.append(_to_result_block(it))
+            by_call_id = {item.call_id: item for item in suspended}
+            for item in raw_results:
+                matched_suspended = by_call_id.get(getattr(item, "call_id", ""))
+                if matched_suspended is not None:
+                    reconcile_kwargs = {"workspace_root": shim._workspace.root}
+                    if (
+                        "workspace"
+                        in inspect.signature(self._k._reconcile_workflow_suspended).parameters
+                    ):
+                        reconcile_kwargs["workspace"] = shim._workspace
+                    await self._k._reconcile_workflow_suspended(
+                        matched_suspended, item, **reconcile_kwargs
+                    )
+                    resume_parent = getattr(self, "_resume_workflow_parent", None)
+                    parent_result = (
+                        await resume_parent(
+                            task,
+                            matched_suspended,
+                            dispatcher=dispatcher,
+                            workspace=shim._workspace,
+                            profile=shim._profile,
+                        )
+                        if resume_parent is not None
+                        else None
+                    )
+                    if isinstance(parent_result, SuspendedCall):
+                        re_ask.append(parent_result)
+                    elif parent_result is not None:
+                        results.append(_to_result_block(parent_result))
+            if re_ask:
+                await self._k._append_results(task, results)
+                return await self._k._approval_path(
+                    task, state, DispatchResult(results=(), suspended=tuple(re_ask))
+                )
+            await self._k._append_results(task, results)
+            await self._k._mark_continuations_consumed(suspended)
+            return None
+        return None
+
+    async def _input_request_path(self, task, state, response, input_calls):
+        """Park the task in WAITING_INPUT and return a resumable outcome.
+
+        Persisted: task id, question, choices, expected-input metadata, and the
+        continuation identity. When no input store is configured the kernel
+        still answers the call truthfully (failed result) instead of parking.
+        """
+        call = input_calls[0]
+        args = dict(call.arguments or {})
+        question = str(args.get("question") or "").strip()
+        if not question:
+            await self._k._append_results(
+                task,
+                [
+                    CapabilityResultBlock(
+                        call_id=call.call_id,
+                        capability_id="request_input",
+                        ok=False,
+                        error="request_input requires a non-empty question",
+                    )
+                ],
+                calls=[call],
+            )
+            return None
+        if self._k._input_request_store is None:
+            await self._k._append_results(
+                task,
+                [
+                    CapabilityResultBlock(
+                        call_id=call.call_id,
+                        capability_id="request_input",
+                        ok=False,
+                        error="operator input is unavailable in this deployment",
+                    )
+                ],
+                calls=[call],
+            )
+            return None
+        request_id = await self._k._input_request_store.record(
+            task_id=task.id,
+            session_id=task.session_id,
+            question=question,
+            choices=tuple((str(c) for c in args.get("choices") or ())),
+            context=dict(args.get("context") or {}),
+            expected=str(args.get("expected") or "text"),
+        )
+        extra_calls = [c for c in input_calls if c is not call]
+        if extra_calls:
+            await self._k._append_results(
+                task,
+                [
+                    CapabilityResultBlock(
+                        call_id=c.call_id,
+                        capability_id=c.capability_id,
+                        ok=False,
+                        error="superseded by request_input for this turn",
+                    )
+                    for c in extra_calls
+                ],
+                calls=extra_calls,
+            )
+        await self._k._append_results(
+            task,
+            [
+                CapabilityResultBlock(
+                    call_id=call.call_id,
+                    capability_id="request_input",
+                    ok=True,
+                    output=f"waiting for operator input: {request_id}",
+                    metadata={"operation": "request_input", "request_id": request_id},
+                )
+            ],
+            calls=[call],
+        )
+        await self._k._transition(task, TaskStatus.WAITING_INPUT)
+        await self._k._emit(
+            "InputRequested",
+            {
+                "request_id": request_id,
+                "question": question,
+                "choices": [str(c) for c in args.get("choices") or ()],
+            },
+            task,
+        )
+        woke = await self._k._park_wait(task, state)
+        if woke == "cancelled":
+            await self._k._input_request_store.resolve(request_id, "")
+            return await self._k._finalize(
+                task, state, TaskStatus.CANCELLED, "task cancelled while awaiting input"
+            )
+        if woke == "slot_released":
+            if await self._k._input_request_store.pending_resumable(task.id) is not None:
+                return await self._k._consume_pending_input(task, state, request_id, args)
+            return await self._k._paused_result(
+                task, state, TaskStatus.WAITING_INPUT, f"awaiting operator input: {request_id}"
+            )
+        return await self._k._consume_pending_input(task, state, request_id, args)
+
+    async def _park_wait(self, task, state) -> str:
+        """Park until resume, cancellation, or the slot-release deadline.
+
+        Returns "resumed" | "cancelled" | "slot_released". The deadline is
+        the P1-17 worker slot release: a parked task must not pin a worker
+        coroutine for the hours an operator may take to answer. Past the
+        deadline the caller ends the run with the task in its paused status;
+        the durable continuation (open question / pending approval) is what
+        wakes the task again.
+        """
+        ev = self._k._resume.setdefault(task.id, asyncio.Event())
+        ev.clear()
+        resume_task = asyncio.create_task(ev.wait())
+        cancel_task = asyncio.create_task(state.cancel.wait())
+        wait_s = getattr(self, "_parked_slot_wait_s", 300.0)
+        timeout_task = asyncio.create_task(asyncio.sleep(wait_s))
+        try:
+            await asyncio.wait(
+                {resume_task, cancel_task, timeout_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for pending in (resume_task, cancel_task, timeout_task):
+                if not pending.done():
+                    pending.cancel()
+        if not resume_task.done() or state.cancel.is_set():
+            if state.cancel.is_set():
+                return "cancelled"
+            return "slot_released"
+        return "resumed"
+
+    async def _resume_paused_entry(self, task, state) -> TaskResult | None:
+        """Resume-or-re-park entry for a relaunched paused task (P1-17).
+
+        Runs once at loop entry. Handles the durable states a task can be
+        relaunched in:
+
+        - ANSWERED_PENDING_RESUME input request → consume the answer (same
+          authority path as the live wakeup) and continue into the loop.
+        - OPEN input request → re-park (bounded) for the answer.
+        - Unresolved approval continuation → re-park; a resolved one is left
+          for _resume_durable_continuation, which already owns that path.
+
+        Returns a TaskResult only when the run should end here (cancelled,
+        or re-parked past the slot deadline); None continues into the loop.
+        """
+        if self._k._input_request_store is None:
+            return None
+        try:
+            answered = await self._k._input_request_store.pending_resumable(task.id)
+        except Exception:
+            answered = None
+        if answered is not None:
+            request_id = str(answered.get("id") or "")
+            if request_id:
+                return await self._k._consume_pending_input(task, state, request_id)
+            return None
+        try:
+            open_request = await self._k._input_request_store.pending_for_task(task.id)
+        except Exception:
+            open_request = None
+        if open_request is None:
+            return None
+        await self._k._transition(task, TaskStatus.WAITING_INPUT)
+        await self._k._emit(
+            "InputRequested",
+            {
+                "request_id": open_request.get("id"),
+                "question": open_request.get("question"),
+                "choices": list(open_request.get("choices") or ()),
+                "repark": True,
+            },
+            task,
+        )
+        woke = await self._k._park_wait(task, state)
+        if woke == "cancelled":
+            await self._k._input_request_store.resolve(str(open_request["id"]), "")
+            return await self._k._finalize(
+                task, state, TaskStatus.CANCELLED, "task cancelled while awaiting input"
+            )
+        if woke == "slot_released":
+            return await self._k._paused_result(
+                task,
+                state,
+                TaskStatus.WAITING_INPUT,
+                f"awaiting operator input: {open_request.get('id')}",
+            )
+        return await self._k._consume_pending_input(task, state, str(open_request["id"]))
+
+    async def _consume_pending_input(
+        self, task, state, request_id: str, args: dict | None = None
+    ) -> TaskResult | None:
+        """Read the durable answer, apply secret-opacity rules, append the
+        user turn, and return to the loop (None = continue).
+
+        Shared by the live wakeup path and the relaunched-loop entry, so a
+        task relaunched after slot release (or process restart) consumes the
+        answer exactly once through the same authority path.
+        """
+        args = args or {}
+        durable = await self._k._input_request_store.pending_resumable(task.id)
+        answer = str(self._k._input_answers.pop(task.id, "") or (durable or {}).get("answer") or "")
+        answer_ref = (durable or {}).get("answer_ref") or None
+        expected = str((durable or {}).get("expected") or "text").lower()
+        await self._k._input_request_store.consume(request_id)
+        if expected == "secret" and self._k._secret_manager is not None:
+            secret_name = (
+                (durable or {}).get("context", {}).get("secret_name")
+                or (args.get("context") or {}).get("secret_name")
+                or "operator_secret"
+            )
+            answer_ref = self._k._secret_manager.store_task_secret(
+                task.id, name=secret_name, value=answer
+            )
+            await self._k._scrub_input_answer(request_id, answer_ref)
+            answer = f"Credential '{secret_name}' is now available for this task."
+        elif task.session_id:
+            try:
+                await self._k._messages.append_to_session(
+                    task.session_id,
+                    Message(
+                        id=f"msg_input_{request_id}",
+                        role=Role.USER,
+                        blocks=(TextBlock(text=answer),),
+                        created_at=utcnow(),
+                        provenance=Provenance(source_type=SourceType.USER),
+                        metadata={
+                            "task_id": task.id,
+                            "input_request_id": request_id,
+                            "canonical_user_turn": False,
+                        },
+                    ),
+                )
+            except Exception:
+                _logger.warning("input answer persistence failed for %s", request_id, exc_info=True)
+        try:
+            row = await self._k._task_store.get(task.id)
+            if row and (row.get("status") or "").upper() == TaskStatus.WAITING_INPUT.value:
+                await self._k._transition(task, TaskStatus.RUNNING)
+        except Exception:
+            return await self._k._finalize_decision(
+                task,
+                state,
+                TerminationDecision(True, "input wait could not resume", TaskStatus.BLOCKED),
+            )
+        await self._k._emit("InputReceived", {"request_id": request_id}, task)
+        return None
 
     # ------------------------------------------------------------------ #
     # Finalization
