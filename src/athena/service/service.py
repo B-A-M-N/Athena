@@ -111,7 +111,7 @@ from athena.tasks.worker import TaskWorker, WorkerConfig
 if TYPE_CHECKING:
     from athena.state.input_requests import InputRequestStore
 
-from athena.protocol.events import Event, make_event
+from athena.protocol.events import Event
 from athena.protocol.ids import new_id
 from athena.protocol.errors import ModelProviderUnconfigured, PersistenceError, ProviderError
 from athena.protocol.policy import ApprovalScope
@@ -132,6 +132,7 @@ from athena.protocol.tasks import (
 from athena.service.candidates import CandidateService
 from athena.service.interaction import OperatorInteractionService
 from athena.service.task_api import TaskAPI
+from athena.service.operator_query import OperatorQueryService
 from athena.service.self_host import SelfHostService
 from athena.service.config import (
     AthenaConfig,
@@ -2070,202 +2071,47 @@ class AthenaService:
     # path; the CLI renders them verbatim.
 
     async def operator_permissions(self) -> dict:
-        """Active policy grants plus pending approval requests."""
-        grants: list[dict] = []
-        if self._policy is not None:
-            try:
-                for g in self._policy.approvals.list_active():
-                    grants.append(
-                        {
-                            "approval_id": g.id,
-                            "scope": getattr(g.scope, "value", str(g.scope)),
-                            "capability": g.capability,
-                            "resource_pattern": g.resource_pattern,
-                            "task_id": g.task_id,
-                            "session_id": g.session_id,
-                            "expires_at": (g.expires_at.isoformat() if g.expires_at else None),
-                        }
-                    )
-            except Exception as exc:
-                _logger.warning("list_active grants failed: %s", exc)
-        pending: list[dict] = []
-        if self._store_approvals is not None:
-            try:
-                for rec in await self._store_approvals.list_pending():
-                    pending.append(
-                        {
-                            "approval_id": rec.get("id"),
-                            "capability_id": rec.get("capability_id"),
-                            "arguments": rec.get("arguments"),
-                            "created_at": rec.get("created_at"),
-                        }
-                    )
-            except Exception as exc:
-                _logger.warning("list_pending approvals failed: %s", exc)
-        return {"active_grants": grants, "pending": pending}
+        return await OperatorQueryService(self).operator_permissions()
 
     async def operator_diff(self, *, limit: int = 25) -> list[dict]:
-        """Recent file mutations from the write-ahead mutation ledger."""
-        if self._store_mutations is None:
-            return []
-        try:
-            rows = await self._store_mutations.list_recent(limit=limit)
-        except Exception as exc:
-            _logger.warning("mutation listing failed: %s", exc)
-            return []
-        return [
-            {
-                "id": r.get("id"),
-                "task_id": r.get("task_id"),
-                "resource": r.get("resource"),
-                "operation": r.get("operation"),
-                "status": r.get("status"),
-                "reversible": bool(r.get("reversible")),
-                "before_ref": r.get("before_ref") or r.get("before_state"),
-                "after_state": r.get("after_state"),
-                "created_at": r.get("created_at"),
-            }
-            for r in rows
-            if isinstance(r, dict)
-        ]
+        return await OperatorQueryService(self).operator_diff(limit=limit)
 
     async def undo_mutation(self, mutation_id: str) -> dict:
-        """Roll back one completed mutation through the RollbackExecutor."""
-        if self._store_mutations is None:
-            return {"status": "error", "error": "mutation store unavailable"}
-        from athena.state.rollback import RollbackExecutor
-
-        executor = RollbackExecutor(self._store_mutations, self._artifacts)
-        try:
-            outcome = await executor.execute_inverse(mutation_id)
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}
-        # Emit an event so the surface and audit trail see the rollback.
-        try:
-            sink = self._forward_events(self._require_events())
-            await sink(
-                make_event(
-                    "MutationRolledBack",
-                    {
-                        "mutation_id": mutation_id,
-                        "outcome": outcome.get("status"),
-                        "rollback_id": outcome.get("rollback_id"),
-                    },
-                )
-            )
-        except Exception as exc:
-            _logger.warning("rollback event emission failed: %s", exc)
-        return outcome
+        return await OperatorQueryService(self).undo_mutation(mutation_id)
 
     async def operator_context_summary(self, session_id: str | None = None) -> dict:
-        """What the model would actually see next turn (bounded-context view)."""
-        info: dict = {"session_id": session_id}
-        if session_id and self._store_messages is not None:
-            try:
-                info["message_count"] = await self._store_messages.count_session_messages(
-                    session_id
-                )
-            except Exception as exc:
-                _logger.warning("session message count failed: %s", exc)
-        if self._compiler is not None:
-            try:
-                window = getattr(self._compiler, "context_window", None)
-                reserve = getattr(self._compiler, "reserve_output", None)
-                recent = getattr(self._compiler, "recent_verbatim_turns", None)
-                info["window"] = int(window) if window else None
-                info["reserve_output"] = int(reserve) if reserve else None
-                info["recent_verbatim_turns"] = int(recent) if recent else None
-            except Exception:
-                pass
-        return info
+        return await OperatorQueryService(self).operator_context_summary(session_id)
 
     async def operator_artifacts(self, *, limit: int = 50) -> list[dict]:
-        """Artifact index across all tasks (evidence view)."""
-        if self._artifacts is None:
-            return []
-        try:
-            refs = await self._artifacts.list(limit=limit)
-        except Exception as exc:
-            _logger.warning("artifact listing failed: %s", exc)
-            return []
-        out: list[dict] = []
-        for ref in refs:
-            out.append(
-                {
-                    "uri": getattr(ref, "uri", None),
-                    "name": getattr(ref, "name", None),
-                    "mime_type": getattr(ref, "mime_type", None),
-                    "kind": getattr(ref, "kind", None),
-                    "task_id": getattr(ref, "task_id", None),
-                    "producer": getattr(ref, "producer", None),
-                }
-            )
-        return out
+        return await OperatorQueryService(self).operator_artifacts(limit=limit)
 
     async def operator_generated_capabilities(self, task_id: str | None = None) -> list[dict]:
-        """Review candidates for one task through the canonical synthesis API."""
-        result = await self._invoke_synthesis({"operation": "candidates"}, task_id=task_id)
-        return result["value"]
+        return await OperatorQueryService(self).operator_generated_capabilities(task_id)
 
     async def operator_generated_capability(
         self, capability_id: str, task_id: str | None = None
     ) -> dict:
-        """Inspect one generated capability through the canonical synthesis API."""
-        result = await self._invoke_synthesis(
-            {"operation": "inspect", "capability_id": capability_id}, task_id=task_id
+        return await OperatorQueryService(self).operator_generated_capability(
+            capability_id, task_id
         )
-        return result["value"]
 
     async def operator_promote_generated_capability(
         self, capability_id: str, scope: str, task_id: str | None = None
     ) -> dict:
-        """Promote a generated capability through policy and synthesis."""
-        return await self._invoke_synthesis(
-            {"operation": "promote", "capability_id": capability_id, "scope": scope},
-            task_id=task_id,
+        return await OperatorQueryService(self).operator_promote_generated_capability(
+            capability_id, scope, task_id
         )
 
     async def operator_deprecate_generated_capability(
         self, capability_id: str, task_id: str | None = None
     ) -> dict:
-        """Retire a generated capability through policy and synthesis."""
-        return await self._invoke_synthesis(
-            {"operation": "deprecate", "capability_id": capability_id}, task_id=task_id
+        return await OperatorQueryService(self).operator_deprecate_generated_capability(
+            capability_id, task_id
         )
 
     async def _invoke_synthesis(self, arguments: dict, *, task_id: str | None) -> dict:
-        from athena.protocol.capabilities import (
-            CapabilityRequest,
-            CapabilityRequestOrigin,
-            CapabilityResult,
-            CapabilityResultStatus,
-        )
+        return await OperatorQueryService(self)._invoke_synthesis(arguments, task_id=task_id)
 
-        if self._dispatcher is None:
-            raise RuntimeError("AthenaService not started")
-        result = await self._dispatcher.dispatch(
-            CapabilityRequest(
-                capability_id="synthesis",
-                arguments=arguments,
-                task_id=task_id,
-                call_id=new_id("operator-synthesis"),
-                origin=CapabilityRequestOrigin.USER_DIRECT,
-            ),
-            workspace=self._default_workspace,
-            profile=self.config.autonomy_level,
-        )
-        if not isinstance(result, CapabilityResult):
-            raise RuntimeError("generated capability operation requires approval")
-        if result.status is not CapabilityResultStatus.OK:
-            raise ValueError(result.error or "generated capability operation failed")
-        try:
-            value = json.loads(result.output or "null")
-        except (TypeError, ValueError) as exc:
-            raise ValueError("generated capability operation returned invalid output") from exc
-        return {"value": value, "metadata": dict(result.metadata or {})}
-
-    # ------------------------------------------------------------------ #
-    # Internal wiring
     # ------------------------------------------------------------------ #
     def _build_task_spec(
         self,
