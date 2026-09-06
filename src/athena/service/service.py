@@ -113,7 +113,7 @@ if TYPE_CHECKING:
 
 from athena.protocol.events import Event
 from athena.protocol.ids import new_id
-from athena.protocol.errors import ModelProviderUnconfigured, PersistenceError, ProviderError
+from athena.protocol.errors import ModelProviderUnconfigured, ProviderError
 from athena.protocol.policy import ApprovalScope
 from athena.protocol.tasks import (
     AgentRequest,
@@ -133,6 +133,7 @@ from athena.service.candidates import CandidateService
 from athena.service.interaction import OperatorInteractionService
 from athena.service.task_api import TaskAPI
 from athena.service.operator_query import OperatorQueryService
+from athena.service.recovery import RecoveryCoordinator
 from athena.service.self_host import SelfHostService
 from athena.service.config import (
     AthenaConfig,
@@ -986,35 +987,9 @@ class AthenaService:
         task_manager: TaskManager,
         unavailable: set[str],
     ) -> list[str]:
-        """Park resumable tasks whose explicit pack dependency is unavailable."""
-        if not unavailable:
-            return []
-        quarantined: list[str] = []
-        for status in (TaskStatus.RUNNING, TaskStatus.INTERRUPTED):
-            for row in await task_store.list_by_status(status):
-                metadata = row.get("metadata") or {}
-                required = metadata.get("required_packs") if isinstance(metadata, dict) else ()
-                if isinstance(required, str):
-                    required = (required,)
-                required_ids = {str(item) for item in required or ()}
-                missing = sorted(required_ids.intersection(unavailable))
-                if not missing:
-                    continue
-                try:
-                    await task_manager.transition(
-                        str(row["id"]),
-                        TaskStatus.RECOVERY_REQUIRED,
-                        reason="required capability pack unavailable: " + ", ".join(missing),
-                    )
-                except (KeyError, ValueError) as exc:
-                    _logger.warning(
-                        "could not quarantine task %s for unavailable packs: %s",
-                        row.get("id"),
-                        exc,
-                    )
-                    continue
-                quarantined.append(str(row["id"]))
-        return quarantined
+        return await RecoveryCoordinator(self)._quarantine_tasks_for_packs(
+            task_store=task_store, task_manager=task_manager, unavailable=unavailable
+        )
 
     async def stop(self) -> None:
         if not self._started and self._db is None:
@@ -1285,68 +1260,15 @@ class AthenaService:
         task_manager: TaskManager,
         kernel: AgentKernel,
     ) -> None:
-        """Resume resolved approval calls after a process restart.
-
-        Approval resolution and the canonical call are durable, but the old
-        kernel coroutine is not. This method reconstructs only the missing
-        continuation boundary: it never re-runs model repair and never creates
-        a new task. A resolved call for a terminal task is left untouched for
-        forensic recovery rather than being executed against a completed task.
-        """
-        try:
-            await continuations.release_claims_for_restart()
-            task_ids = await continuations.recoverable_task_ids()
-        except Exception as exc:
-            raise PersistenceError(
-                f"approval continuation recovery lookup failed: {exc}",
-                cause=exc,
-            ) from exc
-
-        for task_id in task_ids:
-            try:
-                row = await task_store.get(task_id)
-            except Exception as exc:
-                raise PersistenceError(
-                    f"approval continuation task lookup failed for {task_id}: {exc}",
-                    cause=exc,
-                ) from exc
-            if row is None:
-                _logger.error("approval continuation %s references missing task", task_id)
-                continue
-
-            try:
-                status = TaskStatus(row["status"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise PersistenceError(
-                    f"approval continuation task {task_id} has invalid status",
-                    cause=exc,
-                ) from exc
-
-            # RecoveryManager converts orphaned RUNNING tasks to INTERRUPTED.
-            # WAITING_APPROVAL is the normal hard-crash state. Both are safe to
-            # move back to RUNNING for this exact durable continuation.
-            if status in (TaskStatus.WAITING_APPROVAL, TaskStatus.INTERRUPTED):
-                await task_manager.transition(
-                    task_id, TaskStatus.RUNNING, reason="resume approved continuation"
-                )
-            elif status is not TaskStatus.RUNNING:
-                _logger.error(
-                    "not resuming approved continuation for task %s in status %s",
-                    task_id,
-                    status.value,
-                )
-                continue
-
-            recovery = asyncio.create_task(kernel.run_task(task_id))
-            self._approval_recovery_tasks.add(recovery)
-            recovery.add_done_callback(self._track_approval_recovery(task_id, recovery))
+        return await RecoveryCoordinator(self)._recover_approved_continuations(
+            continuations=continuations,
+            task_store=task_store,
+            task_manager=task_manager,
+            kernel=kernel,
+        )
 
     def _track_approval_recovery(self, task_id: str, recovery: asyncio.Task):
-        def _done(task: asyncio.Task) -> None:
-            self._approval_recovery_tasks.discard(task)
-            self._log_background_failure(f"approval recovery {task_id}")(task)
-
-        return _done
+        return RecoveryCoordinator(self)._track_approval_recovery(task_id, recovery)
 
     async def _recover_answered_input_requests(
         self,
@@ -1356,40 +1278,12 @@ class AthenaService:
         task_manager: TaskManager,
         kernel: AgentKernel,
     ) -> None:
-        """Resume WAITING_INPUT tasks whose answer arrived while the process was down.
-
-        After ``InputRequestStore.resolve``, the answer is durable but the old
-        kernel coroutine is not. Any task in WAITING_INPUT with an
-        ANSWERED_PENDING_RESUME input request is a candidate for resume: the
-        operator answered while the service was restarting.
-        """
-        try:
-            tasks = await task_store.list_by_status(TaskStatus.WAITING_INPUT)
-        except Exception as exc:
-            _logger.warning("WAITING_INPUT recovery lookup failed: %s", exc)
-            return
-
-        for row in tasks or []:
-            task_id = row.get("id") if isinstance(row, dict) else None
-            if not task_id:
-                continue
-            try:
-                pending = await input_requests.pending_resumable(task_id)
-            except Exception as exc:
-                _logger.warning("input-request resumable lookup failed for %s: %s", task_id, exc)
-                continue
-            if pending is None:
-                continue
-            try:
-                await task_manager.transition(
-                    task_id, TaskStatus.RUNNING, reason="resume answered input request"
-                )
-            except Exception as exc:
-                _logger.warning("cannot resume WAITING_INPUT task %s: %s", task_id, exc)
-                continue
-            recovery = asyncio.create_task(kernel.run_task(task_id))
-            self._approval_recovery_tasks.add(recovery)
-            recovery.add_done_callback(self._log_background_failure(f"input-recovery {task_id}"))
+        return await RecoveryCoordinator(self)._recover_answered_input_requests(
+            input_requests=input_requests,
+            task_store=task_store,
+            task_manager=task_manager,
+            kernel=kernel,
+        )
 
     # ------------------------------------------------------------------ #
     # Application API
