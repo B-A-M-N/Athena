@@ -22,7 +22,14 @@ def _sleep_process(seconds: float = 30) -> subprocess.Popen:
 
 def test_kill_tree_reports_proven_death():
     process = _sleep_process(0.05)
-    time.sleep(0.2)  # let it exit on its own
+    # A fixed sleep races interpreter startup under a loaded runner
+    # (observed on -n 6: startup alone can exceed 200ms, so the child is
+    # still alive and already_dead is legitimately False).  Poll for the
+    # exit we intend to observe, with a generous bound.
+    deadline = time.monotonic() + 10.0
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert process.poll() is not None  # child exited on its own
     outcome = kill_tree(process)
     assert isinstance(outcome, ProcessKillOutcome)
     assert outcome.proven_dead is True
