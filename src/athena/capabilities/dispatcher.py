@@ -41,6 +41,7 @@ from athena.protocol.capabilities import (
     ExternalEffectPhase,
     InvocationContext,
 )
+from athena.capabilities.mutation_recorder import MutationRecorder
 from athena.protocol.errors import CapabilityUnavailable, PersistenceError
 from athena.reality.gate import ExecutionDisposition
 from athena.protocol.events import EV, make_event
@@ -1697,125 +1698,20 @@ class CapabilityDispatcher:
             except AttributeError:
                 pass
 
+    # Mutation bookkeeping mechanism (P1-10): bodies live in
+    # :mod:`athena.capabilities.mutation_recorder`. The dispatcher keeps the
+    # entrypoints and remains the only caller that decides WHEN recording runs.
+
     async def _record_mutation(
         self,
         request: CapabilityRequest,
         result: CapabilityResult,
     ) -> None:
-        if self._mutation_store is None:
-            return
-        mutation = (result.metadata or {}).get("mutation")
-        if not mutation:
-            return
-        mutation_id = mutation.get("mutation_id")
-        mutation_sequence = None
-        if mutation_id and self._mutation_store is not None:
-            mutation_sequence = await self._mutation_sequence_for(self._mutation_store, mutation_id)
-        if mutation.get("mutation_id"):
-            event = await self._emit(
-                EV["MUTATION_RECORDED"],
-                {
-                    "call_id": request.call_id,
-                    "capability_id": request.capability_id,
-                    "resource": mutation.get("resource"),
-                    "operation": mutation.get("operation"),
-                    "mutation_id": mutation.get("mutation_id"),
-                    "mutation_sequence": mutation_sequence,
-                },
-                request.task_id,
-                causal_id=request.call_id,
-            )
-            self._attach_mutation_boundary(
-                result,
-                event_sequence=getattr(event, "sequence", None),
-                mutation_sequence=mutation_sequence,
-            )
-            if self._mutation_observer is not None:
-                await self._mutation_observer(
-                    request.task_id,
-                    mutation.get("resource", ""),
-                    mutation.get("mutation_id"),
-                    getattr(event, "sequence", None),
-                    mutation_sequence,
-                )
-            return
-        try:
-            mid = await self._mutation_store.record(
-                task_id=request.task_id,
-                resource=mutation.get("resource", ""),
-                operation=mutation.get("operation", ""),
-                before_state=mutation.get("before_hash"),
-                after_state=mutation.get("after_hash"),
-                reversible=bool(mutation.get("reversible", False)),
-                before_ref=mutation.get("before_ref"),
-                inverse=mutation.get("inverse"),
-                metadata={
-                    "capability_call_id": request.call_id,
-                    "capability_id": request.capability_id,
-                },
-            )
-        except Exception as e:
-            await self._emit(
-                "MUTATION_RECORD_FAILED",
-                {
-                    "call_id": request.call_id,
-                    "capability_id": request.capability_id,
-                    "resource": mutation.get("resource"),
-                    "operation": mutation.get("operation"),
-                    "error": str(e),
-                },
-                request.task_id,
-                causal_id=request.call_id,
-            )
-            import logging
-
-            logging.getLogger("athena.dispatcher").warning(
-                "mutation record failed: %s",
-                e,
-                exc_info=True,
-            )
-            raise
-
-        mutation_sequence = await self._mutation_sequence_for(self._mutation_store, mid)
-        event = await self._emit(
-            EV["MUTATION_RECORDED"],
-            {
-                "call_id": request.call_id,
-                "capability_id": request.capability_id,
-                "resource": mutation.get("resource"),
-                "operation": mutation.get("operation"),
-                "mutation_id": mid,
-                "mutation_sequence": mutation_sequence,
-            },
-            request.task_id,
-            causal_id=request.call_id,
-        )
-        self._attach_mutation_boundary(
-            result,
-            event_sequence=getattr(event, "sequence", None),
-            mutation_sequence=mutation_sequence,
-        )
-        if self._mutation_observer is not None:
-            await self._mutation_observer(
-                request.task_id,
-                mutation.get("resource", ""),
-                mid,
-                getattr(event, "sequence", None),
-                mutation_sequence,
-            )
+        return await MutationRecorder(self)._record_mutation(request, result)
 
     @staticmethod
     async def _mutation_sequence_for(store, mutation_id: str) -> int | None:
-        """Read a sequence when the configured store supports the extension.
-
-        A few embedders provide a compatible pre-sequence MutationStore. They
-        must retain the mutation path without losing the newer world-state
-        boundary metadata.
-        """
-        sequence_for = getattr(store, "sequence_for", None)
-        if sequence_for is None:
-            return None
-        return await sequence_for(mutation_id)
+        return await MutationRecorder._mutation_sequence_for(store, mutation_id)
 
     @staticmethod
     def _attach_mutation_boundary(
@@ -1824,11 +1720,9 @@ class CapabilityDispatcher:
         event_sequence: int | None,
         mutation_sequence: int | None,
     ) -> None:
-        """Expose the durable mutation boundary to downstream orchestration."""
-        metadata = dict(result.metadata or {})
-        metadata["mutation_event_sequence"] = event_sequence
-        metadata["mutation_sequence"] = mutation_sequence
-        object.__setattr__(result, "metadata", metadata)
+        return MutationRecorder._attach_mutation_boundary(
+            result, event_sequence=event_sequence, mutation_sequence=mutation_sequence
+        )
 
 
 def _bounded_diagnostics(values: list[Any] | tuple[Any, ...]) -> list[Any]:
