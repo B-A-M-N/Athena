@@ -44,6 +44,7 @@ dev = [
     "starlette>=1.3.1,<1.4",
     "uvicorn>=0.30",
     "click>=8.1",
+    "pytest-xdist>=3.8.0",
 ]
 
 [project.scripts]
@@ -80,6 +81,13 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Parallel test lane (gate perf): pytest-xdist is a dev extra. The suite is
+# audited for worker-serial xdist safety — no fixed socket binds (endpoint URLs
+# are mocked strings), one os.chdir usage, env snapshot/restore discipline is
+# per-process safe, and every test uses tmp_path/tempfile workspaces. Worker
+# count is chosen by the invoking lane, not here, so CI can tune for machine
+# load: the release gate passes -n auto for non-E2E lanes only; timing-
+# sensitive suites (performance, crash/soak) run serially by design.
 markers = [
   "athena_claim(*claim_ids): normative claim ids this test proves",
   "athena_evidence(*kinds): evidence classes this test produces (test, invariant, security, e2e)",

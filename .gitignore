@@ -71,3 +71,4 @@ native/target/
 .visual-loop/
 assets/Screenshot from *.png
 ui-reference/
+.release-evidence/

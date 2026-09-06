@@ -39,6 +39,7 @@ def _replay_policy_context(task) -> dict:
 
     return AgentKernel._replay_policy_context(task)
 
+
 _logger = logging.getLogger("athena.kernel")
 
 __all__ = ["ContinuationCoordinator", "_deny_result_for_request", "_to_result_block"]

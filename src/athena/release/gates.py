@@ -3,6 +3,68 @@
 from __future__ import annotations
 
 
+# Lane -> stage mapping. Stages exist so a wall-clock benchmark failure does
+# not cost a full integration run and vice versa: each stage is independently
+# runnable and re-runnable, and the default full gate still covers every lane.
+LANE_STAGES: dict[str, str] = {
+    # environment + budgets: timing-sensitive, want a quiet machine
+    "uv-version": "bench",
+    "python-version": "bench",
+    "cargo-version": "bench",
+    "rustc-version": "bench",
+    "alacrity-benchmark": "bench",
+    "indexing-benchmark": "bench",
+    "rendering-benchmark": "bench",
+    # deterministic source checks: cheapest, run first everywhere
+    "ruff-format": "static",
+    "ruff-check": "static",
+    "uv-lock-check": "static",
+    "mypy": "static",
+    "dependency-audit": "static",
+    "compileall": "static",
+    "architecture-lint": "static",
+    # test evidence
+    "pytest": "tests",
+    "pytest-performance": "tests",
+    "release-scenarios": "tests",
+    # heavy integration: artifacts, native, E2E, sandboxes
+    "native-fetch": "integration",
+    "native-check": "integration",
+    "native-test": "integration",
+    "release-artifacts": "integration",
+    "native-smoke": "integration",
+    "e2e": "integration",
+    "sandbox-matrix": "integration",
+    "workflow-strategy": "integration",
+    "mcp-stdio": "integration",
+    "native-input-smoke": "integration",
+    "native-visual-smoke": "integration",
+    "native-desktop-acceptance": "integration",
+    "hermes-live": "integration",
+}
+
+VALID_STAGES = ("static", "tests", "bench", "integration")
+
+
+def lane_stage(name: str) -> str:
+    return LANE_STAGES.get(name, "integration")
+
+
+def xdist_workers(default: str = "6") -> str:
+    """Worker count for the parallel pytest lane.
+
+    ``auto`` is deliberately NOT the default: at full 20-way parallelism on a
+    loaded machine, timing-sensitive subprocess tests (kill outcomes, repair
+    receipts, soak restarts) flake under scheduler contention — observed three
+    different tests failing across -n 12 runs while each passes solo and at
+    -n 6. The release gate values truthful failures over maximum throughput.
+    Operators on quiet machines can opt into more via ATHENA_XDIST_N=auto.
+    """
+    import os
+
+    return os.environ.get("ATHENA_XDIST_N", default)
+
+
 def candidate_commands() -> tuple[str, ...]:
     """Commands required before a self-host candidate can be reviewed."""
     return (
@@ -40,8 +102,13 @@ def release_commands(
     skip_e2e: bool,
     bootstrap: bool,
     include_hermes_live: bool = False,
+    stage: str | None = None,
 ) -> tuple[tuple[str, list[str]], ...]:
-    """Return core lanes, with live Hermes evidence opt-in."""
+    """Return core lanes, with live Hermes evidence opt-in.
+
+    ``stage`` optionally filters to one of ``static | tests | bench |
+    integration``. ``None`` (the default) returns every lane — the full gate.
+    """
     prefix = [uv, "run", "--frozen", "--extra", "dev"]
     commands: list[tuple[str, list[str]]] = [
         ("uv-version", [uv, "--version"]),
@@ -116,7 +183,26 @@ def release_commands(
             [*prefix, "python", "scripts/dependency-audit"],
         ),
         ("compileall", [*prefix, "python", "-m", "compileall", "-q", "src", "tests"]),
-        ("pytest", [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "--ignore=tests/e2e"]),
+        (
+            "pytest",
+            [
+                *prefix,
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "--ignore=tests/e2e",
+                "--ignore=tests/performance",
+                "-n",
+                xdist_workers(),
+            ],
+        ),
+        # Wall-clock budget tests measure real latency; they run serially so
+        # their measurement is not fighting other workers for CPU.
+        (
+            "pytest-performance",
+            [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "tests/performance"],
+        ),
         (
             "release-scenarios",
             [
@@ -244,6 +330,10 @@ def release_commands(
                     ],
                 )
             )
+    if stage is not None:
+        if stage not in VALID_STAGES:
+            raise ValueError(f"unknown release stage: {stage!r}")
+        commands = [item for item in commands if lane_stage(item[0]) == stage]
     return tuple(commands)
 
 
