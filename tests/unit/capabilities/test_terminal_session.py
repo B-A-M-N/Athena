@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from athena.capabilities.terminal_session import TerminalSessionCapability
-from athena.protocol.capabilities import CapabilityRequest
+from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus
 from athena.protocol.tasks import WorkspaceSpec
 
 
@@ -48,6 +48,15 @@ async def test_create_send_screen_kill(term, tmp_path):
 
     r = await term.invoke(
         _req("send", task_id="t1", session=sid, text="echo marker-$((21*2))"), context=context
+    )
+    assert r.status is CapabilityResultStatus.OK
+    # send() drains after a fixed 150ms, which races shell startup under a
+    # loaded runner (observed on -n 6: the screen still held bash's startup
+    # banner). The durable contract is that the marker appears on screen;
+    # wait_for proves that without betting on the drain timing.
+    r = await term.invoke(
+        _req("wait_for", task_id="t1", session=sid, pattern="marker-42", timeout=5),
+        context=context,
     )
     assert "marker-42" in (r.output or "")
 
