@@ -315,7 +315,7 @@ COMPAT = (
         family="COMPAT",
         title="Assistant-turn replay preserves mixed text/tool history across providers",
         nodeids=(
-            "tests/unit/kernel/test_model_tool_history.py::test_openai_and_anthropic_replay_preserve_mixed_assistant_turn",
+            "tests/unit/kernel/test_model_tool_history.py::test_openai_and_anthropic_replay_excludes_hidden_reasoning_by_default",
             "tests/unit/kernel/test_model_tool_history.py::test_kernel_stream_assembly_keeps_text_and_tool_delta",
         ),
     ),
