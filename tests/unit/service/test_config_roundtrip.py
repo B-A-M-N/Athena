@@ -58,6 +58,9 @@ def test_roundtrip_providers_mcp_model_roles():
             "https://index-a.example.test/search",
             "https://index-b.example.test/search",
         ),
+        required_capabilities=("browser", "mcp:tools"),
+        capability_profile="release",
+        capability_profiles={"release": ("computer", "mcp:tools")},
     )
     d = config_to_dict(config)
     assert "providers" in d and "mcp_servers" in d
@@ -96,6 +99,11 @@ def test_roundtrip_providers_mcp_model_roles():
     assert restored.research_discovery_endpoints == (
         "https://index-a.example.test/search",
         "https://index-b.example.test/search",
+    )
+    assert restored.effective_required_capabilities == (
+        "browser",
+        "mcp:tools",
+        "computer",
     )
 
 

@@ -282,10 +282,12 @@ class TerminationEvaluator:
         acceptance_verifier: AcceptanceVerifier | None = None,
         default_max_iterations: int = 50,
         defer_reality_verification: bool | Callable[[TaskSpec], bool] = False,
+        required_child_state: Callable[[str], Any] | None = None,
     ) -> None:
         self._verifier = acceptance_verifier
         self._default_max_iterations = default_max_iterations
         self._defer_reality_verification = defer_reality_verification
+        self._required_child_state = required_child_state
 
     async def evaluate(
         self,
@@ -334,6 +336,25 @@ class TerminationEvaluator:
                 terminal=False,
                 reason="model did not signal completion",
             )
+
+        if self._required_child_state is not None:
+            child_state = self._required_child_state(task.id)
+            if hasattr(child_state, "__await__"):
+                child_state = await child_state
+            pending, failed = child_state or ((), ())
+            if failed:
+                return TerminationDecision(
+                    terminal=True,
+                    reason="required child did not complete successfully",
+                    status=TaskStatus.PARTIAL,
+                    unresolved=tuple(failed),
+                    summary=response_summary(response),
+                )
+            if pending:
+                return TerminationDecision(
+                    terminal=False,
+                    reason="required child tasks are still running",
+                )
 
         # Candidate proof has one owner.  For speculative tasks the reality
         # coordinator verifies the exact candidate once; running command

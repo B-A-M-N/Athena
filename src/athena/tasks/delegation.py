@@ -101,6 +101,13 @@ class DelegationManager:
         parent_task_id: str,
         metadata: dict | None = None,
         context: tuple[ContextRef, ...] = (),
+        workspace=None,
+        model_policy=None,
+        resource_budget=None,
+        capability_policy=None,
+        delegate_mode: str | None = None,
+        required_child: bool | None = None,
+        detached: bool = False,
     ) -> str:
         parent = await self._tasks.get(parent_task_id)
         # A child carries its OWN fresh session (lineage only, no transcript
@@ -122,6 +129,26 @@ class DelegationManager:
                 summary=objective,
             ),
         ) + tuple(context or ())
+        from athena.protocol.task_codec import (
+            decode_budget,
+            decode_capability_policy,
+            decode_model_policy,
+            decode_workspace,
+        )
+
+        child_workspace = decode_workspace(workspace) if workspace is not None else None
+        if delegate_mode is not None or detached:
+            from dataclasses import replace as _replace
+            from athena.protocol.tasks import WorkspaceSpec
+
+            child_workspace = child_workspace or WorkspaceSpec(id=f"{parent.id}/child", root="")
+            child_workspace = _replace(
+                child_workspace,
+                delegate_mode="DETACHED" if detached else str(delegate_mode).upper(),
+                required_child=(
+                    False if detached else True if required_child is None else bool(required_child)
+                ),
+            )
         child_spec = TaskSpec(
             # No scope is pre-applied here: delegate/_scope_child performs the
             # SINGLE merge of the parent budget and policy (§71) so depth is
@@ -131,6 +158,22 @@ class DelegationManager:
             session_id=child_session,
             parent_task_id=parent.id,
             context_refs=context_refs,
+            workspace=child_workspace,
+            model_policy=(
+                decode_model_policy(model_policy)
+                if model_policy is not None
+                else TaskSpec(id="", objective="").model_policy
+            ),
+            resource_budget=(
+                decode_budget(resource_budget)
+                if resource_budget is not None
+                else TaskSpec(id="", objective="").resource_budget
+            ),
+            capability_policy=(
+                decode_capability_policy(capability_policy)
+                if capability_policy is not None
+                else TaskSpec(id="", objective="").capability_policy
+            ),
             metadata=dict(metadata or {}),
         )
         created = await self.delegate(parent_task=parent, child_spec=child_spec)
@@ -454,6 +497,10 @@ def _scope_model_policy(parent: TaskSpec, child):
             if child_v.routing_preference != "balanced"
             else base.routing_preference
         ),
+        min_quality_tier=_stricter_quality_tier(base.min_quality_tier, child_v.min_quality_tier),
+        require_declared_quality=bool(
+            base.require_declared_quality or child_v.require_declared_quality
+        ),
     )
 
 
@@ -469,7 +516,22 @@ def _as_model_policy(value):
         privacy=getattr(value, "privacy", "local-preferred"),
         max_cost_usd=getattr(value, "max_cost_usd", None),
         routing_preference=getattr(value, "routing_preference", "balanced"),
+        min_quality_tier=getattr(value, "min_quality_tier", None),
+        require_declared_quality=bool(getattr(value, "require_declared_quality", False)),
     )
+
+
+def _stricter_quality_tier(a: str | None, b: str | None) -> str | None:
+    from athena.protocol.models import ModelQualityTier
+
+    values = [value for value in (a, b) if value]
+    valid = []
+    for value in values:
+        try:
+            valid.append(ModelQualityTier(str(value)))
+        except ValueError:
+            continue
+    return max(valid, key=lambda tier: tier.rank).value if valid else None
 
 
 def _intersect_cost(a, b):
@@ -493,6 +555,9 @@ def _scope_workspace(parent: TaskSpec, child):
     if parent_ws is None:
         return child
     child_ws = child or WorkspaceSpec(id=parent_ws.id + "/child", root="")
+    mode = str(child_ws.delegate_mode or "SUBTREE").upper()
+    if mode not in {"SHARED_READ", "SHADOW_WRITE", "SUBTREE", "DETACHED"}:
+        raise DelegationError(f"unsupported child delegate_mode: {mode}")
 
     # Canonicalize parent root
     parent_root_canonical = Path(parent_ws.root).resolve()
@@ -504,8 +569,12 @@ def _scope_workspace(parent: TaskSpec, child):
 
     child_root_canonical = Path(root).resolve()
 
-    # Strict descendant check: child must be UNDER parent, not equal, not sibling
-    if not _is_strict_descendant(child_root_canonical, parent_root_canonical):
+    # SHARED_READ intentionally shares the parent's read root but can never
+    # inherit write authority. Every write-capable mode is isolated beneath
+    # the parent, including DETACHED (detached changes lifetime, not scope).
+    if mode == "SHARED_READ":
+        child_root_canonical = parent_root_canonical
+    elif not _is_strict_descendant(child_root_canonical, parent_root_canonical):
         # Override: force the child root under the parent
         root = str(parent_root_canonical / "tasks" / (child_ws.id or "child"))
         child_root_canonical = Path(root).resolve()
@@ -516,6 +585,8 @@ def _scope_workspace(parent: TaskSpec, child):
     writable = _restrict_paths(
         parent_ws.writable, child_ws.writable, parent_root_canonical, child_root_canonical
     )
+    if mode == "SHARED_READ":
+        writable = ()
     network = _restrict_network(parent_ws.network_policy, child_ws.network_policy)
 
     parent_temp = _canonical_workspace_path(parent_ws.temp_root, parent_root_canonical)
@@ -545,10 +616,18 @@ def _scope_workspace(parent: TaskSpec, child):
         execution_backend=effective_backend,
         network_policy=network,
         mutation_mode=(
-            child_ws.mutation_mode
-            if child_ws.mutation_mode is not MutationMode.DIRECT
-            else parent_ws.mutation_mode
+            MutationMode.READ_ONLY
+            if mode == "SHARED_READ"
+            else MutationMode.SPECULATIVE
+            if mode == "SHADOW_WRITE"
+            else (
+                child_ws.mutation_mode
+                if child_ws.mutation_mode is not MutationMode.DIRECT
+                else parent_ws.mutation_mode
+            )
         ),
+        delegate_mode=mode,
+        required_child=bool(child_ws.required_child and mode != "DETACHED"),
         revision=child_ws.revision or parent_ws.revision,
     )
 

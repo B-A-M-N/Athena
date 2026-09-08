@@ -25,6 +25,7 @@ from typing import Any, AsyncIterator, Mapping, cast
 
 from athena.execution.async_call import run_blocking
 from athena.execution.backend import ExecutionBackend
+from athena.execution.process_tree import process_group_id, process_start_identity
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionEventType,
@@ -55,7 +56,11 @@ class RuntimeCancellationResult:
 
     @property
     def confirmed(self) -> bool:
-        return not self.remaining_sessions and not self.pending_runtime_cancellations
+        return (
+            not self.remaining_sessions
+            and not self.pending_runtime_cancellations
+            and not self.unproven_process_kills
+        )
 
 
 class Sink:
@@ -71,7 +76,8 @@ class ExecutionManager:
         runtime_session_store=None,
         execution_store=None,
         event_sink=None,
-        durability_mandatory: bool = True,
+        durability_mandatory: bool = False,
+        recovery_sink=None,
     ) -> None:
         self._runtimes: dict[str, Runtime] = {}
         self._backends: dict[str, ExecutionBackend] = {}
@@ -88,6 +94,11 @@ class ExecutionManager:
         self._exec_store = execution_store
         self._event_sink = event_sink
         self._durability_mandatory = durability_mandatory
+        self._recovery_sink = recovery_sink
+
+    def set_recovery_sink(self, sink) -> None:
+        """Bind the task-state recovery authority after construction."""
+        self._recovery_sink = sink
 
     def register_runtime(self, runtime: Runtime) -> None:
         name = getattr(runtime, "name", None)
@@ -226,19 +237,23 @@ class ExecutionManager:
                     identity = dict(await describe(sid))
                 except (OSError, RuntimeError, TypeError, ValueError) as exc:
                     _logger.warning("failed to describe runtime session %s: %s", sid, exc)
-            await self._persist_session_start(
-                sid,
-                task_id,
-                backend=backend,
-                runtime=runtime,
-                cwd=cwd,
-                metadata={
-                    "workspace_root": workspace_root,
-                    "network_policy": network_policy,
-                    "env": dict(env or {}),
-                    **identity,
-                },
-            )
+            try:
+                await self._persist_session_start(
+                    sid,
+                    task_id,
+                    backend=backend,
+                    runtime=runtime,
+                    cwd=cwd,
+                    metadata={
+                        "workspace_root": workspace_root,
+                        "network_policy": network_policy,
+                        "env": dict(env or {}),
+                        **identity,
+                    },
+                )
+            except Exception:
+                await self._destroy_unpersisted_session(selected_backend, sid, task_id)
+                raise
             return sid
         rt = self._resolve(runtime)
         kwargs: dict[str, Any] = {"task_id": task_id}
@@ -262,18 +277,22 @@ class ExecutionManager:
             sid = cast(str, rt.create_session(**kwargs))
         self._task_sessions.setdefault(task_id, []).append((rt, sid))
         self._runtime_by_session[sid] = rt
-        await self._persist_session_start(
-            sid,
-            task_id,
-            backend=backend,
-            runtime=runtime,
-            cwd=cwd,
-            metadata={
-                "workspace_root": workspace_root,
-                "network_policy": network_policy,
-                "env": dict(env or {}),
-            },
-        )
+        try:
+            await self._persist_session_start(
+                sid,
+                task_id,
+                backend=backend,
+                runtime=runtime,
+                cwd=cwd,
+                metadata={
+                    "workspace_root": workspace_root,
+                    "network_policy": network_policy,
+                    "env": dict(env or {}),
+                },
+            )
+        except Exception:
+            await self._destroy_unpersisted_session(rt, sid, task_id)
+            raise
         return sid
 
     async def reattach_session(self, record: Mapping[str, Any]) -> bool:
@@ -525,18 +544,50 @@ class ExecutionManager:
     ) -> None:
         if runtime_session_id in self._runtime_by_session:
             return
+        try:
+            await self._persist_session_start(
+                runtime_session_id,
+                task_id,
+                backend=backend,
+                runtime=runtime,
+                cwd=cwd,
+                metadata=dict(metadata or {}),
+            )
+        except Exception:
+            await self._destroy_unpersisted_session(rt, runtime_session_id, task_id)
+            raise
         self._runtime_by_session[runtime_session_id] = rt
         rooms = self._task_sessions.setdefault(task_id, [])
         if not any(sid == runtime_session_id for _r, sid in rooms):
             rooms.append((rt, runtime_session_id))
-        await self._persist_session_start(
-            runtime_session_id,
-            task_id,
-            backend=backend,
-            runtime=runtime,
-            cwd=cwd,
-            metadata=dict(metadata or {}),
-        )
+
+    async def _destroy_unpersisted_session(
+        self, runtime: Any, session_id: str, task_id: str
+    ) -> None:
+        """Destroy a newly-created session whose durable start failed."""
+        close = getattr(runtime, "close", None) or getattr(runtime, "destroy_session", None)
+        if close is not None:
+            try:
+                if asyncio.iscoroutinefunction(close):
+                    await close(session_id)
+                else:
+                    await run_blocking(close, session_id)
+            except Exception as exc:
+                _logger.error(
+                    "runtime session %s remained live after persistence failure: %s",
+                    session_id,
+                    exc,
+                )
+        self._runtime_by_session.pop(session_id, None)
+        rooms = [
+            (candidate, sid)
+            for candidate, sid in self._task_sessions.get(task_id, [])
+            if sid != session_id
+        ]
+        if rooms:
+            self._task_sessions[task_id] = rooms
+        else:
+            self._task_sessions.pop(task_id, None)
 
     async def interrupt(self, execution_id: str) -> None:
         rt = self._resolve_runtime_by_execution(execution_id)
@@ -648,8 +699,16 @@ class ExecutionManager:
                             and getattr(process_before, "poll", None) is not None
                             and process_before.poll() is None
                         ):
+                            pid = getattr(process_before, "pid", None)
                             unproven_kills.append(
-                                {"session_id": sid, "pid": getattr(process_before, "pid", None)}
+                                {
+                                    "session_id": sid,
+                                    "pid": pid,
+                                    "process_start_identity": (
+                                        process_start_identity(pid) if pid is not None else None
+                                    ),
+                                    "pgid": process_group_id(process_before),
+                                }
                             )
                     try:
                         await self._persist_session_closed(sid)
@@ -713,6 +772,10 @@ class ExecutionManager:
             ),
             unproven_process_kills=tuple(unproven_kills),
         )
+
+    async def close_task(self, task_id: str) -> RuntimeCancellationResult:
+        """Task-finalization lifecycle hook for the shared resource coordinator."""
+        return await self.cancel_task(task_id)
 
     async def close_all(self) -> dict[str, Any]:
         """Shut down every execution resource this manager owns.
@@ -890,6 +953,10 @@ class ExecutionManager:
     ) -> None:
         store = self._rt_sessions
         if store is None:
+            if self._durability_mandatory:
+                raise RuntimeError(
+                    "runtime session durability is mandatory but no store is configured"
+                )
             return
         try:
             await store.start(
@@ -902,6 +969,13 @@ class ExecutionManager:
             )
         except Exception as exc:
             _logger.warning("failed to persist session start %s: %s", session_id, exc)
+            await self._emit_event(
+                "RuntimeSessionStartPersistFailed",
+                {"session_id": session_id, "task_id": task_id, "error": str(exc)},
+                task_id=task_id,
+            )
+            if self._durability_mandatory:
+                raise
 
     async def _persist_session_closed(self, session_id: str) -> None:
         store = self._rt_sessions
@@ -1005,6 +1079,26 @@ class ExecutionManager:
                 },
                 task_id=task_id,
             )
+            if self._recovery_sink is not None:
+                try:
+                    marker = {
+                        "kind": "execution_finish_persist_failed",
+                        "execution_id": execution_id,
+                        "runtime": runtime,
+                        "backend": backend,
+                        "exit_status": getattr(exit_status, "value", str(exit_status)),
+                        "exit_code": exit_code,
+                        "error": str(exc),
+                    }
+                    result = self._recovery_sink(task_id, marker)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as recovery_error:
+                    _logger.error(
+                        "could not persist execution recovery marker %s: %s",
+                        execution_id,
+                        recovery_error,
+                    )
 
 
 __all__ = ["ExecutionManager", "Sink"]

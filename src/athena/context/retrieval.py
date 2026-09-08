@@ -25,7 +25,7 @@ from athena.context.instructions import (
 from athena.context.provenance import prov
 from athena.context.selection import estimate_tokens
 from athena.protocol.capabilities import CapabilityDescriptor
-from athena.protocol.errors import CapabilityReadinessError
+from athena.protocol.errors import CapabilityReadinessError, ContextIntegrityError
 from athena.protocol.memory import MemoryScope
 from athena.protocol.messages import Message, Role, SourceType, TrustClass
 from athena.protocol.tasks import capability_id_permitted
@@ -163,8 +163,11 @@ class ContextRetrieval:
                 if hasattr(m, "list_messages"):
                     return list(await m.list_messages(task.session_id))
             except Exception as exc:
-                self._c._record_degradation("transcript", exc, scope=task.session_id)
-                return []
+                raise ContextIntegrityError(
+                    f"canonical transcript unavailable for session {task.session_id}",
+                    cause=exc,
+                    session_id=task.session_id,
+                ) from exc
         return []
 
     async def _load_memories(

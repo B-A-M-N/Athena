@@ -446,6 +446,13 @@ class OperatorInteractionService:
 
     async def resume(self, session_id: str, *, prompt: str = "") -> TaskSpec:
         """Create and run a follow-up task in the given session."""
+        if self._svc._sessions is not None:
+            session = await self._svc._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"session not found: {session_id}")
+            metadata = session.get("metadata") or {}
+            if isinstance(metadata, dict) and metadata.get("state") == "closed":
+                raise ValueError(f"session {session_id!r} is closed")
         return await self._svc.submit(
             AgentRequest(prompt=prompt or "continue", session_id=session_id),
             wait=True,

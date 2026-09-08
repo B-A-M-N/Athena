@@ -39,6 +39,10 @@ class TaskAPI:
         self._svc._validate_request_metadata(request.metadata)
         session_id = request.session_id or new_id("session")
         spec = self._svc._build_task_spec(request, session_id)
+        # Admission must inspect the canonical TaskSpec as well as the
+        # request envelope. This keeps typed acceptance criteria and every
+        # future authority field on the same preflight path.
+        await self._svc.require_task_ready(spec)
         return await self._enqueue_spec(tm, spec, wait=wait, user_request=request)
 
     async def submit_spec(

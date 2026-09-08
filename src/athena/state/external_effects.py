@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import json
 from collections.abc import Mapping
@@ -15,6 +16,21 @@ from athena.protocol.messages import utcnow
 
 class ExternalEffectRecoveryRequired(RuntimeError):
     """The outcome of an external request is not safe to replay."""
+
+
+@dataclass(frozen=True)
+class ExternalPreparation:
+    """Result of resolving an idempotent external transaction."""
+
+    status: str
+    receipt: dict[str, Any]
+
+
+NEW = "NEW"
+REPLAY_COMPLETED = "REPLAY_COMPLETED"
+SAFE_TO_RETRY = "SAFE_TO_RETRY"
+RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+CONFLICT = "CONFLICT"
 
 
 class ExternalEffectStore:
@@ -95,6 +111,70 @@ class ExternalEffectStore:
             }
             await self._save_unlocked(receipt)
             return receipt
+
+    async def prepare_or_recover(
+        self,
+        *,
+        transaction_id: str,
+        task_id: str | None,
+        capability_id: str,
+        external_identity: str,
+        request_digest: str,
+        idempotency_key: str,
+        phase: ExternalEffectPhase = ExternalEffectPhase.PREPARE,
+    ) -> ExternalPreparation:
+        """Resolve a retry against the durable idempotency record.
+
+        A new transaction is created only when no matching key exists.  A
+        completed receipt is replayed without touching the remote endpoint;
+        a prepared receipt is safe to continue; an in-flight/unknown receipt
+        is explicitly fenced.  This method is intentionally separate from
+        ``prepare`` so existing capability protocols retain their strict
+        conflict behavior.
+        """
+        if not idempotency_key:
+            raise ValueError("external preparation requires an idempotency_key")
+        async with self._lock:
+            await self._ensure()
+            existing = await self._get_by_idempotency_unlocked(
+                capability_id, external_identity, idempotency_key
+            )
+            if existing is None:
+                conflict = await self._get_by_key_unlocked(capability_id, idempotency_key)
+                if conflict is not None:
+                    return ExternalPreparation(CONFLICT, conflict)
+                now = utcnow().isoformat()
+                receipt: dict[str, Any] = {
+                    "receipt_id": new_id("external-receipt"),
+                    "transaction_id": transaction_id,
+                    "task_id": task_id,
+                    "capability_id": capability_id,
+                    "phase": phase.value,
+                    "status": "PREPARED" if phase is ExternalEffectPhase.PREPARE else "DRY_RUN",
+                    "external_identity": external_identity,
+                    "request_digest": request_digest,
+                    "idempotency_key": idempotency_key,
+                    "response": {},
+                    "error": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                await self._save_unlocked(receipt)
+                return ExternalPreparation(NEW, receipt)
+
+            if (
+                existing.get("task_id") != task_id
+                or existing.get("request_digest") != request_digest
+            ):
+                return ExternalPreparation(CONFLICT, existing)
+            status = str(existing.get("status") or "")
+            if status == "COMPLETED":
+                return ExternalPreparation(REPLAY_COMPLETED, existing)
+            if status in {"PREPARED", "DRY_RUN"}:
+                return ExternalPreparation(SAFE_TO_RETRY, existing)
+            if status in {"APPLYING", "RECOVERY_REQUIRED", "APPLY_FAILED"}:
+                return ExternalPreparation(RECOVERY_REQUIRED, existing)
+            return ExternalPreparation(CONFLICT, existing)
 
     async def begin_apply(
         self,
@@ -367,6 +447,25 @@ class ExternalEffectStore:
         )
         return _decode(row) if row is not None else None
 
+    async def _get_by_key_unlocked(
+        self, capability_id: str, idempotency_key: str
+    ) -> dict[str, Any] | None:
+        if self._db is None:
+            for value in self._memory.values():
+                if (
+                    value.get("capability_id") == capability_id
+                    and value.get("idempotency_key") == idempotency_key
+                ):
+                    return dict(value)
+            return None
+        row = await self._db.fetch_one(
+            "SELECT * FROM external_effect_receipts "
+            "WHERE capability_id = ? AND idempotency_key = ? "
+            "ORDER BY created_at, transaction_id LIMIT 1",
+            (capability_id, idempotency_key),
+        )
+        return _decode(row) if row is not None else None
+
     async def _list_unlocked(self) -> list[dict[str, Any]]:
         if self._db is None:
             return [dict(value) for value in self._memory.values()]
@@ -443,4 +542,13 @@ def _decode(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-__all__ = ["ExternalEffectRecoveryRequired", "ExternalEffectStore"]
+__all__ = [
+    "CONFLICT",
+    "NEW",
+    "RECOVERY_REQUIRED",
+    "REPLAY_COMPLETED",
+    "SAFE_TO_RETRY",
+    "ExternalEffectRecoveryRequired",
+    "ExternalPreparation",
+    "ExternalEffectStore",
+]

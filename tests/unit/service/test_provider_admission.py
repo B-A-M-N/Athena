@@ -9,7 +9,13 @@ from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
 from athena.protocol.errors import ModelProviderUnconfigured
 from athena.protocol.models import PrivacyClass
-from athena.protocol.tasks import AgentRequest, ModelPolicy
+from athena.protocol.tasks import (
+    AgentRequest,
+    Criterion,
+    ModelPolicy,
+    VerificationSpec,
+    VerificationType,
+)
 from athena.service.service import AthenaService
 
 
@@ -77,16 +83,97 @@ async def test_role_pinned_unready_provider_fails_then_admits_when_ready():
 
 
 @pytest.mark.asyncio
-async def test_model_judgment_preflights_unready_judge_role():
+async def test_typed_acceptance_criteria_are_admitted_with_judge_role():
     service, _ = _service_with_routes()
     request = AgentRequest(
         prompt="judge this",
-        metadata={"acceptance_criteria": ["the result is correct"]},
+        acceptance_criteria=(
+            Criterion(
+                id="criterion-1",
+                description="the result is correct",
+                verification=VerificationSpec(type=VerificationType.MODEL_JUDGMENT),
+            ),
+        ),
     )
 
     with pytest.raises(ModelProviderUnconfigured) as error:
         await service.require_agent_ready(request)
     assert error.value.data["role"] == "judge"
+
+
+@pytest.mark.asyncio
+async def test_typed_command_criteria_do_not_require_judge_role():
+    service, _ = _service_with_routes()
+    request = AgentRequest(
+        prompt="run the check",
+        acceptance_criteria=(
+            Criterion(
+                id="criterion-1",
+                description="the command passes",
+                verification=VerificationSpec(
+                    type=VerificationType.COMMAND,
+                    command="pytest -q",
+                ),
+            ),
+        ),
+    )
+
+    await service.require_agent_ready(request)
+
+
+@pytest.mark.asyncio
+async def test_matching_typed_and_legacy_criteria_are_accepted():
+    service, missing_judge = _service_with_routes()
+    criterion = Criterion(
+        id="criterion-1",
+        description="the result is correct",
+        verification=VerificationSpec(
+            type=VerificationType.MODEL_JUDGMENT,
+            predicate="the result is correct",
+        ),
+    )
+    request = AgentRequest(
+        prompt="judge this",
+        acceptance_criteria=(criterion,),
+        metadata={
+            "acceptance_criteria": [
+                {
+                    "id": "criterion-1",
+                    "description": "the result is correct",
+                    "required": True,
+                    "verification": {
+                        "type": "model_judgment",
+                        "command": None,
+                        "path": None,
+                        "predicate": "the result is correct",
+                        "capability": None,
+                    },
+                }
+            ]
+        },
+    )
+    missing_judge.state = "ready"
+
+    await service.require_agent_ready(request)
+
+
+@pytest.mark.asyncio
+async def test_conflicting_typed_and_legacy_criteria_are_rejected():
+    service, _ = _service_with_routes()
+    request = AgentRequest(
+        prompt="judge this",
+        acceptance_criteria=(
+            Criterion(
+                id="criterion-1",
+                description="the result is correct",
+                verification=VerificationSpec(type=VerificationType.MODEL_JUDGMENT),
+            ),
+        ),
+        metadata={"acceptance_criteria": ["the result is not correct"]},
+    )
+
+    with pytest.raises(ValueError, match="conflicts"):
+        await service.require_agent_ready(request)
 
 
 @pytest.mark.asyncio

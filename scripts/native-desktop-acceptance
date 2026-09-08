@@ -8,7 +8,7 @@ cd "$repo_root"
   printf '%s\n' 'native-desktop-acceptance: FAIL — DISPLAY is required for real desktop acceptance' >&2
   exit 1
 }
-for command in xdotool import identify compare python3 xclip xmessage rg; do
+for command in xdotool import identify compare python3 xclip xmessage xprop rg; do
   command -v "$command" >/dev/null || {
     printf 'native-desktop-acceptance: FAIL — %s is unavailable\n' "$command" >&2
     exit 1
@@ -29,6 +29,24 @@ focus_return="$tmp_dir/focus-return.png"
 clipboard_capture="$tmp_dir/clipboard.txt"
 
 layout_json="$($native_bin --dump-layout)"
+window_strategy="$(LAYOUT_JSON="$layout_json" python3 -c '
+import json, os
+layout = json.loads(os.environ["LAYOUT_JSON"])
+print(layout.get("window_management", {}).get("strategy", "unavailable"))
+')"
+[[ "$window_strategy" != "unavailable" ]] || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — native layout did not report a window-management strategy' >&2
+  exit 1
+}
+wm_supporting_window="$(xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null || true)"
+wm_name=""
+if [[ "$wm_supporting_window" =~ 0x[0-9a-fA-F]+ ]]; then
+  wm_window="${BASH_REMATCH[0]}"
+  wm_name="$(xprop -id "$wm_window" _NET_WM_NAME 2>/dev/null || true)"
+fi
+printf 'native-desktop-acceptance: INFO — strategy=%s DISPLAY=%s XDG_SESSION_TYPE=%s WM=%s %s\n' \
+  "$window_strategy" "$DISPLAY" "${XDG_SESSION_TYPE:-unknown}" \
+  "${wm_supporting_window:-unknown}" "${wm_name:-unknown}" >&2
 read -r brightness_x brightness_y focus_x focus_y crt_x crt_y header_x header_y prompt_x prompt_y < <(
   LAYOUT_JSON="$layout_json" python3 -c '
 import json, os
@@ -52,21 +70,26 @@ ATHENA_NATIVE_LAYOUT_DUMP="$resize_dump" \
   >/dev/null 2>&1 &
 native_pid=$!
 cleanup_native() {
-  if [[ -n "${native_pid:-}" ]]; then
-    kill "$native_pid" 2>/dev/null || true
-    wait "$native_pid" 2>/dev/null || true
-    native_pid=""
-  fi
-  if [[ -n "${clipboard_pid:-}" ]]; then
-    kill "$clipboard_pid" 2>/dev/null || true
-    wait "$clipboard_pid" 2>/dev/null || true
-    clipboard_pid=""
-  fi
-  if [[ -n "${focus_probe_pid:-}" ]]; then
-    kill "$focus_probe_pid" 2>/dev/null || true
-    wait "$focus_probe_pid" 2>/dev/null || true
-    focus_probe_pid=""
-  fi
+  cleanup_pid() {
+    local pid="$1"
+    [[ -n "$pid" ]] || return 0
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+      done
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  }
+
+  cleanup_pid "${native_pid:-}"
+  native_pid=""
+  cleanup_pid "${clipboard_pid:-}"
+  clipboard_pid=""
+  cleanup_pid "${focus_probe_pid:-}"
+  focus_probe_pid=""
 }
 trap 'cleanup_native; rm -rf "$tmp_dir"' EXIT
 
@@ -82,6 +105,22 @@ find_window_for_pid() {
   return 1
 }
 
+focus_window() {
+  local target="$1"
+  # Window discovery can precede WM viewability by a few event-loop turns.
+  # Retry activation/focus rather than letting an asynchronous BadMatch from
+  # X_SetInputFocus abort the acceptance lane before it tests the product.
+  for _ in $(seq 1 30); do
+    if timeout 2s xdotool windowmap "$target" 2>/dev/null \
+      && (timeout 2s xdotool windowactivate --sync "$target" 2>/dev/null \
+        || timeout 2s xdotool windowfocus --sync "$target" 2>/dev/null); then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 window=""
 for _ in $(seq 1 100); do
   window="$(find_window_for_pid || true)"
@@ -92,7 +131,10 @@ done
   printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window did not appear' >&2
   exit 1
 }
-xdotool windowfocus --sync "$window"
+focus_window "$window" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window could not be focused' >&2
+  exit 1
+}
 sleep 0.3
 import -window "$window" "$before"
 xdotool mousemove --window "$window" "$prompt_x" "$prompt_y"
@@ -127,26 +169,31 @@ done
   exit 1
 }
 
-# The borderless fascia owns window movement through _NET_WM_MOVERESIZE.
+# The borderless fascia uses the strategy selected from the WM's
+# _NET_SUPPORTED property. EWMH and client-managed fallback are exclusive.
 window_geometry
 original_x="$window_x"
 original_y="$window_y"
 header_drag_verified=0
-xdotool mousemove --window "$window" "$header_x" "$header_y"
-xdotool mousedown --window "$window" 1
-xdotool mousemove_relative -- 48 32
-xdotool mouseup --window "$window" 1
-sleep 0.2
-window_geometry
-if [[ "$window_x" == "$original_x" && "$window_y" == "$original_y" ]]; then
-  if [[ "${ATHENA_RELEASE_GATE:-0}" == "1" ]]; then
-    printf '%s\n' 'native-desktop-acceptance: FAIL — release gate requires Athena header moveresize; host WM ignored it' >&2
-    exit 1
+if [[ "$window_strategy" == "ewmh" ]]; then
+  xdotool mousemove --window "$window" "$header_x" "$header_y"
+  xdotool mousedown --window "$window" 1
+  xdotool mousemove_relative -- 48 32
+  xdotool mouseup --window "$window" 1
+  sleep 0.2
+  window_geometry
+  if [[ "$window_x" == "$original_x" && "$window_y" == "$original_y" ]]; then
+    if [[ "${ATHENA_RELEASE_GATE:-0}" == "1" ]]; then
+      printf '%s\n' 'native-desktop-acceptance: FAIL — release gate requires Athena EWMH moveresize; host WM ignored it' >&2
+      exit 1
+    fi
+    printf '%s\n' 'native-desktop-acceptance: INFO — host WM ignored synthetic EWMH moveresize; testing managed move directly' >&2
+  else
+    header_drag_verified=1
+    printf '%s\n' 'native-desktop-acceptance: PASS — header fascia EWMH moveresize' >&2
   fi
-  printf '%s\n' 'native-desktop-acceptance: INFO — host WM ignored synthetic header moveresize; testing managed move directly' >&2
 else
-  header_drag_verified=1
-  printf '%s\n' 'native-desktop-acceptance: PASS — header fascia moveresize' >&2
+  printf '%s\n' 'native-desktop-acceptance: INFO — WM lacks _NET_WM_MOVERESIZE; testing client-managed fallback' >&2
 fi
 xdotool windowmove --sync "$window" "$original_x" "$original_y"
 sleep 0.1
@@ -221,10 +268,16 @@ done
   printf '%s\n' 'native-desktop-acceptance: FAIL — focus probe window did not appear' >&2
   exit 1
 }
-xdotool windowfocus --sync "$focus_probe"
+focus_window "$focus_probe" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — focus probe window could not be focused' >&2
+  exit 1
+}
 sleep 0.2
 import -window "$window" "$focus_lost"
-xdotool windowfocus --sync "$window"
+focus_window "$window" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena focus could not be restored' >&2
+  exit 1
+}
 sleep 0.2
 import -window "$window" "$focus_return"
 kill "$focus_probe_pid" 2>/dev/null || true
@@ -294,7 +347,10 @@ if xdotool search --onlyvisible --name 'ATHENA' 2>/dev/null | rg -q "$window"; t
   exit 1
 fi
 xdotool windowmap --sync "$window"
-xdotool windowfocus --sync "$window"
+focus_window "$window" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window could not be refocused after remap' >&2
+  exit 1
+}
 sleep 0.2
 xdotool search --onlyvisible --name 'ATHENA' 2>/dev/null | rg -q "$window" || {
   printf '%s\n' 'native-desktop-acceptance: FAIL — native window did not restore after remap' >&2

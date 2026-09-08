@@ -22,7 +22,7 @@ from athena.protocol.capabilities import (
     EffectClass,
 )
 from athena.protocol.ids import new_id
-from athena.execution.process_tree import kill_tree_async
+from athena.execution.process_tree import ProcessKillOutcome, kill_tree_async
 from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
 
 __all__ = [
@@ -133,19 +133,22 @@ class PersistentGeneratedSession:
                 await self._terminate_unlocked()
                 raise
 
-    async def close(self) -> None:
+    async def close(self) -> ProcessKillOutcome:
         async with self._lock:
-            await self._terminate_unlocked()
+            return await self._terminate_unlocked()
 
-    async def _terminate_unlocked(self) -> None:
+    async def _terminate_unlocked(self) -> ProcessKillOutcome:
         process = self._process
-        self._process = None
-        if process is not None and process.returncode is None:
-            await kill_tree_async(process, timeout=1.0)
-        if self._stderr_task is not None:
+        if process is None:
+            return ProcessKillOutcome(proven_dead=True, already_dead=True)
+        outcome = await kill_tree_async(process, timeout=1.0)
+        if outcome.proven_dead:
+            self._process = None
+        if outcome.proven_dead and self._stderr_task is not None:
             self._stderr_task.cancel()
             await asyncio.gather(self._stderr_task, return_exceptions=True)
             self._stderr_task = None
+        return outcome
 
     async def _host_response(
         self,

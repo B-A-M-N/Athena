@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 import inspect
+from dataclasses import replace
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from athena.memory.embeddings import SemanticRetrievalUnavailable
@@ -128,7 +129,7 @@ class MemoryRetriever:
             weight_map = {str(k).lower(): float(v) for k, v in (weights or {}).items()}
             weighted_scores = [
                 (
-                    _quality_score(record, index=0) * weight_map.get(record.scope.value, 1.0),
+                    _weighted_retrieval_score(record) * weight_map.get(record.scope.value, 1.0),
                     record,
                 )
                 for record in records
@@ -216,10 +217,10 @@ class MemoryRetriever:
             vector, scope, scope_id, limit * 8, tags=tags
         )
         return [
-            record
-            for _, record in sorted(
+            _with_retrieval_score(record, score)
+            for _, record, score in sorted(
                 (
-                    (_quality_score(record, index=index, base=score), record)
+                    (_quality_score(record, index=index, base=score), record, score)
                     for index, (record, score) in enumerate(candidates)
                 ),
                 key=lambda item: (item[0], item[1].created_at, item[1].id),
@@ -256,7 +257,7 @@ class MemoryRetriever:
         vectors = await self._store.retrieve_by_embedding(
             vector, scope, scope_id, limit * 8, tags=tags
         )
-        return _fuse(lexical, [record for record, _ in vectors], limit)
+        return _fuse(lexical, vectors, limit)
 
     async def _by_hybrid_scopes(
         self,
@@ -272,7 +273,7 @@ class MemoryRetriever:
         vectors = await self._store.retrieve_by_embedding_scopes(
             vector, scopes, limit * 8, tags=tags
         )
-        return _fuse(lexical, [record for record, _ in vectors], limit)
+        return _fuse(lexical, vectors, limit)
 
 
 def _rank_vector(
@@ -282,35 +283,67 @@ def _rank_vector(
         (
             _quality_score(record, index=index, base=score),
             record,
+            score,
         )
         for index, (record, score) in enumerate(candidates)
     ]
     scored.sort(key=lambda item: (item[0], item[1].created_at, item[1].id), reverse=True)
-    return [(record, score) for score, record in scored[:limit]]
+    return [
+        (_with_retrieval_score(record, raw_score), quality_score)
+        for quality_score, record, raw_score in scored[:limit]
+    ]
 
 
 def _fuse(
-    lexical: list[MemoryRecord], vector: list[MemoryRecord], limit: int
+    lexical: list[MemoryRecord], vector: list[tuple[MemoryRecord, float]], limit: int
 ) -> list[MemoryRecord]:
     """Deterministic reciprocal-rank fusion with explicit quality signals."""
-    records: dict[str, MemoryRecord] = {record.id: record for record in (*lexical, *vector)}
+    vector_scores = {record.id: float(score) for record, score in vector}
+    vector_records = [record for record, _ in vector]
+    records: dict[str, MemoryRecord] = {record.id: record for record in (*lexical, *vector_records)}
     scores: dict[str, float] = {record_id: 0.0 for record_id in records}
     for rank, record in enumerate(lexical, 1):
         scores[record.id] += 1.0 / (60.0 + rank)
-    for rank, record in enumerate(vector, 1):
+    for rank, record in enumerate(vector_records, 1):
         scores[record.id] += 1.0 / (60.0 + rank)
     recent = sorted(records.values(), key=lambda item: item.created_at, reverse=True)
     recent_rank = {record.id: index for index, record in enumerate(recent)}
     for record in records.values():
         scores[record.id] += _quality_score(record, index=recent_rank[record.id]) * 0.01
-    return [
-        records[record_id]
+    ranked = [
+        (record_id, records[record_id])
         for record_id, _ in sorted(
             records.items(),
             key=lambda item: (scores[item[0]], records[item[0]].created_at, item[0]),
             reverse=True,
         )[:limit]
     ]
+    return [
+        replace(
+            record,
+            metadata={
+                **dict(record.metadata or {}),
+                # Keep both signals: callers doing a later weighted
+                # multi-scope fusion must consume the actual hybrid score,
+                # while diagnostics can still inspect raw vector cosine.
+                "_athena:retrieval_score": scores[record_id],
+                "_athena:vector_score": vector_scores.get(record_id),
+            },
+        )
+        for record_id, record in ranked
+    ]
+
+
+def _with_retrieval_score(record: MemoryRecord, score: float) -> MemoryRecord:
+    """Attach the raw semantic score without changing canonical memory."""
+    return replace(
+        record,
+        metadata={
+            **dict(record.metadata or {}),
+            "_athena:retrieval_score": float(score),
+            "_athena:vector_score": float(score),
+        },
+    )
 
 
 def _quality_score(record: MemoryRecord, *, index: int, base: float = 0.0) -> float:
@@ -328,6 +361,15 @@ def _quality_score(record: MemoryRecord, *, index: int, base: float = 0.0) -> fl
     confidence = max(0.0, min(1.0, float(record.confidence or 0.5)))
     recency = 1.0 / (1.0 + max(0, index))
     return float(base) + scope * 0.25 + trust * 0.2 + confidence * 0.15 + recency * 0.1
+
+
+def _weighted_retrieval_score(record: MemoryRecord) -> float:
+    """Preserve the original vector/hybrid score before scope fusion."""
+    raw = (record.metadata or {}).get("_athena:retrieval_score")
+    try:
+        return float(raw) if raw is not None else _quality_score(record, index=0)
+    except (TypeError, ValueError):
+        return _quality_score(record, index=0)
 
 
 __all__ = ["MemoryRetriever"]

@@ -44,6 +44,7 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     EffectClass,
 )
+from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import WorkspaceSpec
 from athena.synthesis.child_runtime import ChildRuntime, _namespace_python_paths  # noqa: F401 (patch-seam re-export)
 from athena.synthesis.promotion import Promotion
@@ -578,11 +579,11 @@ class SynthesisEngine:
     async def close_persistent_sessions(self) -> None:
         await ChildRuntime(self).close_persistent_sessions()
 
-    async def close_persistent_sessions_for_task(self, task_id: str) -> None:
-        await ChildRuntime(self).close_persistent_sessions_for_task(task_id)
+    async def close_persistent_sessions_for_task(self, task_id: str):
+        return await ChildRuntime(self).close_persistent_sessions_for_task(task_id)
 
-    async def _close_persistent_handles(self, handles) -> None:
-        await ChildRuntime(self)._close_persistent_handles(handles)
+    async def _close_persistent_handles(self, handles) -> TaskResourceCloseResult:
+        return await ChildRuntime(self)._close_persistent_handles(handles)
 
     async def _run_generated_child(
         self,

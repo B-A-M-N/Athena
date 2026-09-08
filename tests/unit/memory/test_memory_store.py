@@ -203,6 +203,8 @@ async def test_semantic_retrieval_uses_persisted_embedding_for_paraphrase():
     )
 
     assert [item.id for item in found] == [record.id]
+    assert found[0].metadata["_athena:retrieval_score"] == pytest.approx(1.0)
+    assert found[0].metadata["_athena:vector_score"] == pytest.approx(1.0)
     assert row["content_hash"] == memory_content_hash(record)
     assert row["embedding_model"] == "test-embedding"
     assert row["embedding_version"] == "v1"

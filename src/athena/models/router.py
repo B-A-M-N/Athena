@@ -48,6 +48,8 @@ _PRIVACY_RANK: dict[PrivacyClass, int] = {
 
 _LATENCY_CLASS_RANK = {"fast": 0, "medium": 1, "slow": 2}
 _ROUTING_PREFERENCES = frozenset({"balanced", "latency", "cost"})
+_UNKNOWN_CONTEXT_FLOOR = 16_384
+_UNKNOWN_OUTPUT_FLOOR = 4_096
 
 
 @dataclass(frozen=True)
@@ -89,15 +91,21 @@ def _privacy_rank(cls: PrivacyClass) -> int:
     return _PRIVACY_RANK.get(cls, _PRIVACY_RANK[PrivacyClass.UNKNOWN])
 
 
-def _cost_per_1m(info: ModelInfo) -> float:
+def _cost_sort_key(info: ModelInfo) -> tuple[int, float]:
+    """Sort known-free before known-paid before unknown pricing.
+
+    Missing rate cards are uncertainty, not a zero-dollar offer.
+    """
     cost = info.cost
-    if cost is None:
-        return 0.0
-    return float(cost.per_1m_input or 0) + float(cost.per_1m_output or 0)
-
-
-def _candidate_key(info: ModelInfo) -> tuple:
-    return (_privacy_rank(info.privacy_class), _cost_per_1m(info), f"{info.provider}/{info.id}")
+    if (
+        cost is None
+        or cost.currency.upper() != "USD"
+        or cost.per_1m_input is None
+        or cost.per_1m_output is None
+    ):
+        return (2, float("inf"))
+    total = float(cost.per_1m_input) + float(cost.per_1m_output)
+    return (0 if total == 0 else 1, total)
 
 
 def _declared_latency_rank(info: ModelInfo) -> int:
@@ -174,6 +182,13 @@ class ModelRouter:
             require_tools=bool(policy.require_tools or role_policy.require_tools),
             privacy=_stricter_policy_privacy(policy.privacy, role_policy.privacy),
             max_cost_usd=_min_cost(policy.max_cost_usd, role_policy.max_cost_usd),
+            min_quality_tier=_stricter_quality_tier(
+                policy.min_quality_tier,
+                role_policy.min_quality_tier,
+            ),
+            require_declared_quality=bool(
+                policy.require_declared_quality or role_policy.require_declared_quality
+            ),
             routing_preference=(
                 policy.routing_preference
                 if policy.routing_preference != "balanced"
@@ -216,7 +231,7 @@ class ModelRouter:
                 continue
             if not self._meets_capacity(info, requirements):
                 continue
-            if not self._meets_cost(info, policy):
+            if not self._meets_cost(info, policy, requirements):
                 continue
             if not privacy_gate(info):
                 continue
@@ -344,13 +359,22 @@ class ModelRouter:
             preference = "balanced"
         operational: tuple[Any, ...]
         if preference == "cost":
-            operational = (_cost_per_1m(info), latency_observed, latency_value)
+            cost_class, cost_value = _cost_sort_key(info)
+            operational = (cost_class, cost_value, latency_observed, latency_value)
         elif preference == "latency":
-            operational = (latency_observed, latency_value, _cost_per_1m(info))
+            operational = (
+                latency_observed,
+                latency_value,
+                *_cost_sort_key(info),
+            )
         else:
             # Balanced keeps observed reliability first, then avoids a cold
             # route to a declared slow model before using cost as a tie-break.
-            operational = (latency_observed, latency_value, _cost_per_1m(info))
+            operational = (
+                latency_observed,
+                latency_value,
+                *_cost_sort_key(info),
+            )
         return (
             _privacy_rank(info.privacy_class),
             reliability_penalty,
@@ -378,10 +402,14 @@ class ModelRouter:
     def _meets_capacity(self, info: ModelInfo, requirements: ModelRequirements) -> bool:
         if requirements.minimum_context_tokens is not None:
             limit = info.context_limit
+            if limit is None and requirements.minimum_context_tokens > _UNKNOWN_CONTEXT_FLOOR:
+                return False
             if limit is not None and limit < requirements.minimum_context_tokens:
                 return False
         if requirements.max_output_tokens is not None:
             cap = info.max_output_tokens
+            if cap is None and requirements.max_output_tokens > _UNKNOWN_OUTPUT_FLOOR:
+                return False
             if cap is not None and cap < requirements.max_output_tokens:
                 return False
         return True
@@ -395,8 +423,17 @@ class ModelRouter:
         deployment without tier declarations routes exactly as before.
         """
         raw = getattr(policy, "min_quality_tier", None)
-        if not raw:
+        require_declared = bool(getattr(policy, "require_declared_quality", False))
+        if not raw and not require_declared:
             return True
+        if not raw:
+            tier = getattr(info, "quality_tier", ModelQualityTier.UNDECLARED)
+            if isinstance(tier, str):
+                try:
+                    tier = ModelQualityTier(tier)
+                except ValueError:
+                    return not require_declared
+            return tier is not ModelQualityTier.UNDECLARED
         try:
             floor = ModelQualityTier(str(raw))
         except ValueError:
@@ -408,10 +445,12 @@ class ModelRouter:
             except ValueError:
                 return True
         if tier is ModelQualityTier.UNDECLARED:
-            return True
+            return not require_declared
         return tier.rank >= floor.rank
 
-    def _meets_cost(self, info: ModelInfo, policy: ModelPolicy) -> bool:
+    def _meets_cost(
+        self, info: ModelInfo, policy: ModelPolicy, requirements: ModelRequirements
+    ) -> bool:
         if policy.max_cost_usd is None:
             return True
         cost = info.cost
@@ -427,8 +466,19 @@ class ModelRouter:
             # A partial rate card, or a currency we cannot compare to the USD
             # policy ceiling, is unknown rather than free.
             return False
-        # Estimate based on typical request sizes (conservative: assume 10k input, 4k output)
-        estimate = cost.per_1m_input * 0.01 + cost.per_1m_output * 0.004
+        # The inference broker performs the authoritative check against the
+        # compiled request. This early filter only rejects a route when the
+        # caller supplied bounded compiled-token requirements; it must not
+        # invent a generic 10k/4k estimate and reject a valid small request.
+        input_tokens = max(int(requirements.minimum_context_tokens or 0), 0)
+        output_tokens = max(
+            int(requirements.max_output_tokens or requirements.reserved_output or 0), 0
+        )
+        if not input_tokens and not output_tokens:
+            return True
+        estimate = (
+            cost.per_1m_input * input_tokens + cost.per_1m_output * output_tokens
+        ) / 1_000_000
         return estimate <= float(policy.max_cost_usd)
 
     def _rationale(
@@ -491,3 +541,18 @@ def _min_cost(left, right):
     if right is None:
         return left
     return min(left, right)
+
+
+def _stricter_quality_tier(left: str | None, right: str | None) -> str | None:
+    """Intersect quality floors without allowing a role to weaken a task."""
+    values = [value for value in (left, right) if value]
+    valid: list[tuple[int, str]] = []
+    for value in values:
+        try:
+            tier = ModelQualityTier(str(value))
+        except ValueError:
+            continue
+        valid.append((tier.rank, tier.value))
+    if valid:
+        return max(valid)[1]
+    return left or right

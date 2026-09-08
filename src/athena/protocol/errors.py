@@ -116,6 +116,18 @@ class ContextOverflow(ProviderError):
     code = "context_overflow"
 
 
+class ContextIntegrityError(TaskError):
+    """Canonical task context could not be read or verified.
+
+    Transcript and authority-bearing context are not optional enrichments. A
+    caller must recover or explicitly repair the durable state before another
+    model turn can be admitted.
+    """
+
+    code = "context_integrity_error"
+    retryable = True
+
+
 class RequestCancelled(AthenaError):
     code = "request_cancelled"
 
@@ -201,6 +213,7 @@ __all__ = [
     "IllegalStateTransition",
     "CancellationUncertain",
     "ProviderError",
+    "ContextIntegrityError",
     "ProviderAuthenticationError",
     "ProviderRateLimitError",
     "ProviderTimeout",

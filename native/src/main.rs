@@ -920,6 +920,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "prompt_layout".to_owned(),
                 serde_json::to_value(prompt_layout)?,
             );
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert(
+                "window_management".to_owned(),
+                serde_json::json!({
+                    "moveresize_supported": false,
+                    "strategy": "unavailable",
+                    "protocol": "_NET_WM_MOVERESIZE",
+                    "reason": "no live X11 display",
+                }),
+            );
         println!("{}", serde_json::to_string_pretty(&dump)?);
         return Ok(());
     }

@@ -10,17 +10,21 @@ beyond the documented default).
 
 from __future__ import annotations
 
-import json
-from datetime import timedelta
-from decimal import Decimal
-from typing import Any, Mapping
+from typing import Any
 
+from athena.protocol.task_codec import (
+    TaskCodecError,
+    decode_budget as _decode_budget,
+    decode_capability_policy as _decode_capability_policy,
+    decode_criteria,
+    decode_model_policy as _decode_model_policy,
+    decode_mutation_mode,
+    decode_workspace as _decode_workspace,
+)
 from athena.protocol.tasks import (
     CapabilityPolicy,
     ModelPolicy,
-    MutationMode,
     NetworkPolicy,
-    PathRule,
     ResourceBudget,
     WorkspaceSpec,
 )
@@ -29,36 +33,14 @@ __all__ = [
     "DecodeError",
     "decode_workspace",
     "decode_capability_policy",
+    "decode_criteria",
     "decode_model_policy",
+    "decode_mutation_mode",
     "decode_budget",
 ]
 
 
-class DecodeError(ValueError):
-    """Raised when a JSON fragment cannot be decoded into a protocol object."""
-
-
-def _as_mapping(raw: Any, field: str) -> Mapping[str, Any] | None:
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, Mapping):
-        return raw
-    if isinstance(raw, str):
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise DecodeError(f"field '{field}' must be a JSON object") from exc
-        if not isinstance(value, Mapping):
-            raise DecodeError(f"field '{field}' must be a JSON object")
-        return value
-    raise DecodeError(f"field '{field}' must be a JSON object")
-
-
-def _require(data: Mapping[str, Any], field: str) -> str:
-    value = data.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise DecodeError(f"field '{field}' is required and must be a non-empty string")
-    return value
+DecodeError = TaskCodecError
 
 
 def decode_workspace(
@@ -73,48 +55,10 @@ def decode_workspace(
     empty ``root`` raises :class:`DecodeError` (a partial workspace is never
     silently widened).
     """
-    data = _as_mapping(raw, "workspace")
-    if data is None:
-        return None
-    root = _require(data, "root")
-    id_value = data.get("id")
-    workspace_id = str(id_value) if id_value else id_fallback
-    readable = tuple(
-        PathRule(path=r.get("path", ""), allow=bool(r.get("allow", True)))
-        for r in (data.get("readable") or [])
-    )
-    writable = tuple(
-        PathRule(path=r.get("path", ""), allow=bool(r.get("allow", True)))
-        for r in (data.get("writable") or [])
-    )
-    net = data.get("network_policy", network_default)
-    if not isinstance(net, NetworkPolicy):
-        try:
-            net = NetworkPolicy(str(net))
-        except ValueError as exc:
-            raise DecodeError(
-                f"field 'network_policy' must be one of {[p.value for p in NetworkPolicy]}"
-            ) from exc
-    mutation_mode = data.get("mutation_mode", MutationMode.DIRECT)
-    if not isinstance(mutation_mode, MutationMode):
-        try:
-            mutation_mode = MutationMode(str(mutation_mode))
-        except ValueError as exc:
-            raise DecodeError(
-                f"field 'mutation_mode' must be one of {[m.value for m in MutationMode]}"
-            ) from exc
-    return WorkspaceSpec(
-        id=workspace_id,
-        root=root,
-        readable=readable,
-        writable=writable,
-        temp_root=data.get("temp_root"),
-        execution_backend=(
-            str(data["execution_backend"]) if data.get("execution_backend") is not None else None
-        ),
-        network_policy=net,
-        mutation_mode=mutation_mode,
-        revision=(str(data["revision"]) if data.get("revision") is not None else None),
+    return _decode_workspace(
+        raw,
+        id_fallback=id_fallback,
+        network_default=network_default,
     )
 
 
@@ -125,50 +69,12 @@ def decode_capability_policy(raw: Any) -> CapabilityPolicy:
     entries they mean unrestricted. Callers that need a safe deny-all default
     must supply ``deny=("*",)`` explicitly.
     """
-    data = _as_mapping(raw, "capability_policy")
-    if data is None:
-        return CapabilityPolicy()
-    effects = frozenset(data.get("effects") or [])
-    return CapabilityPolicy(
-        effects=effects,
-        allow=tuple(data.get("allow") or ()),
-        ask=tuple(data.get("ask") or ()),
-        deny=tuple(data.get("deny") or ()),
-    )
+    return _decode_capability_policy(raw)
 
 
 def decode_model_policy(raw: Any) -> ModelPolicy:
     """Decode a model policy fragment, always honoring supplied fields."""
-    data = _as_mapping(raw, "model_policy")
-    if data is None:
-        return ModelPolicy()
-    cost = data.get("max_cost_usd")
-    return ModelPolicy(
-        role=str(data.get("role", "primary")),
-        allowed=tuple(data.get("allowed") or ()),
-        require_tools=bool(data.get("require_tools", False)),
-        privacy=str(data.get("privacy", "local-preferred")),
-        max_cost_usd=Decimal(str(cost)) if cost else None,
-        routing_preference=str(data.get("routing_preference", "balanced")),
-    )
-
-
-def _opt_int(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise DecodeError(f"expected an integer, got {value!r}") from exc
-
-
-def _int(value: Any, default: int) -> int:
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise DecodeError(f"expected an integer, got {value!r}") from exc
+    return _decode_model_policy(raw)
 
 
 def decode_budget(raw: Any) -> ResourceBudget:
@@ -179,21 +85,4 @@ def decode_budget(raw: Any) -> ResourceBudget:
     optional (``None`` default) stay optional; scalar fields use the documented
     default (never "unlimited") when absent.
     """
-    data = _as_mapping(raw, "resource_budget")
-    if data is None:
-        return ResourceBudget()
-
-    wall = data.get("max_wall_time")
-    cost = data.get("max_cost_usd")
-    return ResourceBudget(
-        max_agent_iterations=_int(data.get("max_agent_iterations"), 50),
-        max_input_tokens=_opt_int(data.get("max_input_tokens")),
-        max_output_tokens=_opt_int(data.get("max_output_tokens")),
-        max_cost_usd=Decimal(str(cost)) if cost else None,
-        max_wall_time=timedelta(seconds=float(wall)) if wall else None,
-        max_children=_int(data.get("max_children"), 4),
-        max_child_depth=_int(data.get("max_child_depth"), 1),
-        max_parallel_model_calls=_int(data.get("max_parallel_model_calls"), 4),
-        max_parallel_executions=_int(data.get("max_parallel_executions"), 16),
-        max_artifact_bytes=_int(data.get("max_artifact_bytes"), 100 * 1024 * 1024),
-    )
+    return _decode_budget(raw)

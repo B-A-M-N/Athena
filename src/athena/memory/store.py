@@ -7,6 +7,7 @@ import logging
 import math
 import uuid
 from datetime import datetime
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from athena.protocol.memory import MemoryKind, MemoryRecord, MemoryScope, RetrievalMode
@@ -31,6 +32,7 @@ _VALID_FROM_KEY = f"{_NSP}:valid_from"
 _VALID_UNTIL_KEY = f"{_NSP}:valid_until"
 _SUPERSEDES_KEY = f"{_NSP}:supersedes"
 _CONTRADICTED_BY_KEY = f"{_NSP}:contradicted_by"
+_RETRIEVAL_SCORE_KEY = f"{_NSP}:retrieval_score"
 
 _NS_KEYS = frozenset(
     {
@@ -49,8 +51,19 @@ _NS_KEYS = frozenset(
         _VALID_UNTIL_KEY,
         _SUPERSEDES_KEY,
         _CONTRADICTED_BY_KEY,
+        _RETRIEVAL_SCORE_KEY,
     }
 )
+
+
+@dataclass(frozen=True)
+class MemoryWriteResult:
+    """Explicit durable outcome of a memory write attempt."""
+
+    status: str
+    memory_id: str | None = None
+    record: MemoryRecord | None = None
+    reason: str | None = None
 
 
 def new_memory_id(kind: MemoryKind | str = MemoryKind.SEMANTIC) -> str:
@@ -265,6 +278,15 @@ class MemoryStore:
         return md
 
     async def save(self, record: MemoryRecord) -> MemoryRecord:
+        """Compatibility wrapper returning the effective record.
+
+        New model-facing callers must use :meth:`save_with_outcome`; this
+        wrapper preserves the historical store API for internal pipelines.
+        """
+        outcome = await self.save_with_outcome(record)
+        return outcome.record or record
+
+    async def save_with_outcome(self, record: MemoryRecord) -> MemoryWriteResult:
         from athena.memory.conflicts import (
             ConflictResolution,
             MemoryConflictResolver,
@@ -284,7 +306,12 @@ class MemoryStore:
             existing_rank = _trust_rank(existing_same.trust)
             incoming_rank = _trust_rank(record.trust)
             if incoming_rank < existing_rank:
-                return record
+                return MemoryWriteResult(
+                    status="REJECTED",
+                    memory_id=existing_same.id,
+                    record=existing_same,
+                    reason="incoming memory has lower trust than the existing record",
+                )
             if incoming_rank == existing_rank:
                 record = _replace(
                     record,
@@ -299,7 +326,14 @@ class MemoryStore:
 
         resolution = result.resolution if result else ConflictResolution.NONE
         if resolution is ConflictResolution.REJECT:
-            return record
+            return MemoryWriteResult(
+                status="REJECTED",
+                memory_id=record.id,
+                record=record,
+                reason=report.reason or "memory conflict rejected",
+            )
+
+        outcome_status = "CREATED"
 
         if resolution is ConflictResolution.FLAG:
             assert result is not None, "FLAG resolution requires a resolver result"
@@ -311,6 +345,7 @@ class MemoryStore:
                     tuple(c.id for c in result.superseded),
                 ),
             )
+            outcome_status = "CONFLICT"
         elif resolution is ConflictResolution.SUPERSEDE:
             assert result is not None, "SUPERSEDE resolution requires a resolver result"
             record = _replace(
@@ -324,6 +359,7 @@ class MemoryStore:
                 tuple(t.id for t in result.superseded),
                 record.id,
             )
+            outcome_status = "SUPERSEDED"
 
         source_task = None
         source_session = None
@@ -355,11 +391,24 @@ class MemoryStore:
             now,
             json.dumps(md, default=str),
         )
-        await self._db.execute(sql, params)
+        cursor = await self._db.execute(sql, params)
+        if getattr(cursor, "rowcount", 1) == 0:
+            stored = await self.get(record.id)
+            return MemoryWriteResult(
+                status="DEDUPED",
+                memory_id=record.id,
+                record=stored or record,
+                reason="an equivalent write already exists",
+            )
         if bool(getattr(self._embedding_provider, "eager_index", True)):
             await self._index_embedding(record)
         self._generation += 1
-        return record
+        return MemoryWriteResult(
+            status=outcome_status,
+            memory_id=record.id,
+            record=record,
+            reason=(report.reason if outcome_status in {"CONFLICT", "SUPERSEDED"} else None),
+        )
 
     async def _index_embedding(self, record: MemoryRecord) -> bool:
         provider = self._embedding_provider
@@ -859,4 +908,4 @@ def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-__all__ = ["MemoryStore", "memory_content_hash", "new_memory_id"]
+__all__ = ["MemoryStore", "MemoryWriteResult", "memory_content_hash", "new_memory_id"]

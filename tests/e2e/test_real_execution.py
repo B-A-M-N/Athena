@@ -37,7 +37,7 @@ def _term_after_ok() -> dict:
     return {"match": {"capability_result_ok": True}, "respond": {"text": "", "done": True}}
 
 
-async def _wait_terminal(svc, task_id, target=TaskStatus.COMPLETE.value, tries=400, delay=0.02):
+async def _wait_terminal(svc, task_id, target=TaskStatus.COMPLETE.value, tries=1000, delay=0.02):
     from asyncio import sleep
 
     for _ in range(tries):

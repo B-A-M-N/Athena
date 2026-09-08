@@ -101,6 +101,9 @@ async def test_health_ok_when_scheduler_running():
             "providers": True,
             "worker_persistence": True,
             "recovery": True,
+            "capability_profile": True,
+            "resource_teardown": True,
+            "execution_recovery": True,
         }, body
         assert status == 200
         assert body["status"] == "ok"
@@ -147,6 +150,26 @@ async def test_health_reports_scheduler_false_for_legacy_duck_type():
     status, body = await _health(service)
     assert status == 503
     assert body["checks"]["scheduler"] is False
+
+
+async def test_ready_fails_when_live_resource_teardown_is_unresolved():
+    service = _ready_service().with_scheduler(SimpleNamespace(is_running=lambda: True))
+    live = {
+        "scheduler": {"health": "healthy"},
+        "capability_profile": {"status": "ok"},
+        "resources": {
+            "state": "recovery_required",
+            "unresolved_count": 1,
+            "unresolved": [{"task_id": "task-1", "resource_type": "terminal"}],
+        },
+    }
+    service.runtime_health = lambda: live
+
+    status, body = await _health(service)
+
+    assert status == 503
+    assert body["checks"]["resource_teardown"] is False
+    assert body["subsystems"]["resources"]["unresolved_count"] == 1
 
 
 async def test_app_rejects_non_loopback_client_even_when_embedded_directly():

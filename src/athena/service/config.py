@@ -149,6 +149,7 @@ class MCPConfig:
     env: Mapping[str, str] = field(default_factory=dict)
     secret_env: Mapping[str, str] = field(default_factory=dict)
     connect_timeout: float = 10.0
+    required: bool = False
 
 
 class HermesSupervisionMode(StrEnum):
@@ -263,6 +264,13 @@ class AthenaConfig:
     scheduler_interval_seconds: float = 1.0
     scheduler_max_concurrent: int = 0
     profile: str | None = None
+    # Deployment capability contract. Entries are native capability ids or
+    # explicit references such as ``mcp:browser``, ``skill:linting``,
+    # ``pack:repo-tools``, and ``delegate:reviewer``. A named capability
+    # profile contributes its own required entries.
+    required_capabilities: tuple[str, ...] = ()
+    capability_profile: str | None = None
+    capability_profiles: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     # Role-divided models (Hermes-style): role name -> {"allowed": [...],
     # "privacy": "...", "max_cost_usd": "0.01"}. Roles without an entry fall
     # back to the user's global/primary choice.
@@ -319,6 +327,19 @@ class AthenaConfig:
         self.worker_lease_duration_seconds = max(1.0, float(self.worker_lease_duration_seconds))
         self.worker_lease_renewal_divisor = max(1.0, float(self.worker_lease_renewal_divisor))
         self.research_discovery_timeout = max(0.1, float(self.research_discovery_timeout))
+        self.required_capabilities = _normalize_capability_ids(self.required_capabilities)
+        profiles = _parse_capability_profiles(self.capability_profiles)
+        profiles = {
+            profile_name: values
+            for name, values in profiles.items()
+            if (profile_name := str(name).strip())
+        }
+        self.capability_profiles = profiles
+        if self.capability_profile is not None:
+            selected = str(self.capability_profile).strip()
+            self.capability_profile = selected or None
+            if selected and selected not in profiles:
+                raise ValueError(f"unknown capability_profile: {selected}")
         self.memory_embedding_model = str(
             self.memory_embedding_model or DEFAULT_FASTEMBED_MODEL
         ).strip()
@@ -358,6 +379,14 @@ class AthenaConfig:
         if isinstance(self.autonomy, AutonomyLevel):
             return self.autonomy
         return AutonomyLevel(self.autonomy or AutonomyLevel.SUPERVISED.value)
+
+    @property
+    def effective_required_capabilities(self) -> tuple[str, ...]:
+        """Return direct and selected-profile requirements without duplicates."""
+        values = list(self.required_capabilities)
+        if self.capability_profile:
+            values.extend(self.capability_profiles.get(self.capability_profile, ()))
+        return _normalize_capability_ids(values)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +429,28 @@ def load_toml_file(path: str | Path) -> dict[str, Any]:
         return {}
     with p.open("rb") as f:
         return tomllib.load(f)
+
+
+def _normalize_capability_ids(values: Any) -> tuple[str, ...]:
+    if isinstance(values, str):
+        values = values.split(",")
+    result: list[str] = []
+    for value in values or ():
+        item = str(value).strip()
+        if item and item not in result:
+            result.append(item)
+    return tuple(result)
+
+
+def _parse_capability_profiles(value: Any) -> dict[str, tuple[str, ...]]:
+    if not isinstance(value, Mapping):
+        return {}
+    profiles: dict[str, tuple[str, ...]] = {}
+    for name, raw in value.items():
+        if isinstance(raw, Mapping):
+            raw = raw.get("required_capabilities", raw.get("required", ()))
+        profiles[str(name)] = _normalize_capability_ids(raw)
+    return profiles
 
 
 def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
@@ -449,6 +500,7 @@ def _parse_mcp(data: dict[str, Any]) -> MCPConfig:
         env=data.get("env") or {},
         secret_env=data.get("secret_env") or {},
         connect_timeout=float(data.get("connect_timeout", 10.0)),
+        required=bool(data.get("required", False)),
     )
 
 
@@ -539,6 +591,15 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["scheduler_max_concurrent"] = config.scheduler_max_concurrent
     if config.profile is not None:
         d["profile"] = config.profile
+    if config.required_capabilities:
+        d["required_capabilities"] = list(config.required_capabilities)
+    if config.capability_profile is not None:
+        d["capability_profile"] = config.capability_profile
+    if config.capability_profiles:
+        d["capability_profiles"] = {
+            name: {"required_capabilities": list(values)}
+            for name, values in config.capability_profiles.items()
+        }
     if config.providers:
         d["providers"] = [
             {
@@ -574,6 +635,7 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
                     "env": dict(m.env),
                     "secret_env": dict(m.secret_env),
                     "connect_timeout": m.connect_timeout,
+                    "required": m.required,
                 }.items()
                 if value is not None
             }
@@ -721,6 +783,11 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         scheduler_interval_seconds=float(data.get("scheduler_interval_seconds", 1.0)),
         scheduler_max_concurrent=int(data.get("scheduler_max_concurrent", 0)),
         profile=data.get("profile"),
+        required_capabilities=_normalize_capability_ids(data.get("required_capabilities")),
+        capability_profile=(
+            str(data["capability_profile"]).strip() if data.get("capability_profile") else None
+        ),
+        capability_profiles=_parse_capability_profiles(data.get("capability_profiles")),
         model_roles=dict(data.get("model_roles") or {}),
         research_allowed_domains=_domains(data.get("research_allowed_domains")),
         research_denied_domains=_domains(data.get("research_denied_domains")),
@@ -768,6 +835,7 @@ def _env_map() -> dict[str, Any]:
         ATHENA_MEMORY_EMBEDDING_CACHE_DIR, ATHENA_WORKER_MAX_PARALLEL,
         ATHENA_SCHEDULER_INTERVAL_SECONDS,
         ATHENA_SCHEDULER_MAX_CONCURRENT, ATHENA_PROFILE,
+        ATHENA_CAPABILITY_PROFILE, ATHENA_REQUIRED_CAPABILITIES,
         ATHENA_SKILLS_PATHS (comma-separated), ATHENA_MASCOT,
         ATHENA_DISPLAY, ATHENA_ANIMATIONS, ATHENA_REDUCED_MOTION
     """
@@ -794,6 +862,11 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_SCHEDULER_INTERVAL_SECONDS": ("scheduler_interval_seconds", float),
         "ATHENA_SCHEDULER_MAX_CONCURRENT": ("scheduler_max_concurrent", int),
         "ATHENA_PROFILE": ("profile", str),
+        "ATHENA_CAPABILITY_PROFILE": ("capability_profile", str),
+        "ATHENA_REQUIRED_CAPABILITIES": (
+            "required_capabilities",
+            lambda v: _normalize_capability_ids(v),
+        ),
         "ATHENA_MASCOT": ("mascot", str),
         "ATHENA_DISPLAY": ("display", str),
         "ATHENA_ANIMATIONS": (

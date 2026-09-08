@@ -20,6 +20,7 @@ from athena.protocol.capabilities import (
     EffectClass,
 )
 from athena.protocol.ids import new_id
+from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
 
 _logger = logging.getLogger("athena.delegates")
@@ -155,37 +156,47 @@ class ExternalDelegateManager:
         session = await self._store.get(session_id, task_id=task_id)
         if session is None:
             raise KeyError("delegate session not found or not owned by task")
-        transport = self._transports.pop(session_id, None)
-        try:
-            if transport is not None:
-                await transport.close()
-        finally:
-            # The durable session is no longer resumable by this task after an
-            # explicit close, even if a connector reports a teardown error.
-            await self._store.update_state(session_id, "closed", task_id=task_id)
+        transport = self._transports.get(session_id)
+        if transport is not None:
+            await transport.close()
+        # Do not discard the transport or durable ownership until both the
+        # transport close and the durable state transition have succeeded.
+        updated = await self._store.update_state(session_id, "closed", task_id=task_id)
+        if updated is None:
+            raise RuntimeError(f"delegate session {session_id!r} close was not persisted")
+        self._transports.pop(session_id, None)
         return True
 
-    async def close_task(self, task_id: str) -> int:
-        """Close every local transport owned by a terminal task."""
+    async def close_task(self, task_id: str) -> TaskResourceCloseResult:
+        """Close every local transport and retain unproven ownership."""
         sessions = await self._store.list(task_id=task_id)
-        closed = 0
+        resource_ids = tuple(str(session.id) for session in sessions if session.state != "closed")
+        closed_ids: list[str] = []
+        errors: list[dict[str, Any]] = []
         for session in sessions:
             if session.state == "closed":
                 self._transports.pop(session.id, None)
                 continue
             try:
                 await self.close(session.id, task_id=task_id)
-                closed += 1
-            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                # Task cleanup must keep walking the other sessions.  The
-                # transport was removed before close(), and the durable state
-                # is marked closed in close()'s finally block when possible.
+                closed_ids.append(str(session.id))
+            except Exception as exc:  # noqa: BLE001 - preserve each resource obligation
+                # Keep walking: one failed specialist must not prevent other
+                # task-owned transports from being closed.
+                errors.append({"session_id": str(session.id), "error": str(exc)})
                 _logger.warning(
                     "delegate session %s cleanup failed: %s",
                     session.id,
                     exc,
                 )
-        return closed
+        return TaskResourceCloseResult(
+            task_id=str(task_id),
+            resource_type="external_delegate",
+            resource_ids=resource_ids,
+            closed_ids=tuple(closed_ids),
+            unproven=tuple(errors),
+            errors=tuple(errors),
+        )
 
     async def close_all(self) -> int:
         """Close all local transports during service shutdown."""

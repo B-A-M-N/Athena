@@ -289,6 +289,9 @@ class ModelPolicy:
     # deployment whose providers declare no tiers is unaffected. Accepts the
     # bare string value ("standard"); invalid values are ignored.
     min_quality_tier: str | None = None
+    # Safety-sensitive deployments may require a provider to declare its tier;
+    # undeclared metadata is otherwise treated conservatively as advisory.
+    require_declared_quality: bool = False
 
 
 @dataclass(frozen=True)
@@ -392,6 +395,11 @@ class AgentRequest:
     autonomy: AutonomyLevel = AutonomyLevel.SUPERVISED
     attachments: tuple[ArtifactRef, ...] = ()
     requested_capabilities: frozenset[str] | None = None
+    # Optional full authority controls for interface callers. The legacy
+    # requested_capabilities field remains a shorthand for allow-only policy.
+    capability_policy: CapabilityPolicy | None = None
+    resource_budget: ResourceBudget | None = None
+    deadline: datetime | None = None
     # Authority-bearing: explicit mutation mode (defaults to workspace or SUPERVISED default).
     mutation_mode: MutationMode | None = None
     # Authority-bearing: explicit acceptance criteria for the task.

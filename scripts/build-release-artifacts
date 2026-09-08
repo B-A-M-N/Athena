@@ -4,7 +4,10 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/athena-uv-cache}"
-build_python=(uv run --frozen --no-sync --extra dev python)
+# This script is invoked directly by the frozen release lane, not inside an
+# already-synchronized ``uv run``.  ``--no-sync`` would create an empty
+# release venv and make the declared ``build`` dev dependency unavailable.
+build_python=(uv run --frozen --extra dev python)
 
 output_dir="dist"
 if [[ "${1:-}" == "--output-dir" ]]; then

@@ -1068,6 +1068,91 @@ enum WindowDragKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowMoveStrategy {
+    Ewmh,
+    ClientManagedFallback,
+}
+
+impl WindowMoveStrategy {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ewmh => "ewmh",
+            Self::ClientManagedFallback => "client_managed_fallback",
+        }
+    }
+
+    fn uses_ewmh(self) -> bool {
+        matches!(self, Self::Ewmh)
+    }
+}
+
+fn select_window_move_strategy(display: *mut Display, screen: c_int) -> WindowMoveStrategy {
+    if net_supported_contains(display, screen, "_NET_WM_MOVERESIZE") {
+        WindowMoveStrategy::Ewmh
+    } else {
+        WindowMoveStrategy::ClientManagedFallback
+    }
+}
+
+fn net_supported_contains(display: *mut Display, screen: c_int, wanted: &str) -> bool {
+    let root = unsafe { XRootWindow(display, screen) };
+    let supported_atom = intern_atom(display, "_NET_SUPPORTED");
+    let wanted_atom = intern_atom(display, wanted);
+    if root == 0 || supported_atom == 0 || wanted_atom == 0 {
+        return false;
+    }
+    let mut actual_type = 0;
+    let mut actual_format = 0;
+    let mut item_count = 0;
+    let mut bytes_after = 0;
+    let mut data: *mut u8 = ptr::null_mut();
+    let status = unsafe {
+        XGetWindowProperty(
+            display,
+            root,
+            supported_atom,
+            0,
+            4096,
+            0,
+            0,
+            &mut actual_type,
+            &mut actual_format,
+            &mut item_count,
+            &mut bytes_after,
+            &mut data,
+        )
+    };
+    let found = if status == 0 && actual_format == 32 && !data.is_null() {
+        let atoms = unsafe {
+            std::slice::from_raw_parts(data.cast::<c_ulong>(), item_count as usize)
+        };
+        atoms.iter().any(|atom| *atom == wanted_atom)
+    } else {
+        false
+    };
+    if !data.is_null() {
+        unsafe { XFree(data.cast()) };
+    }
+    found
+}
+
+fn window_management_diagnostics(
+    display: *mut Display,
+    screen: c_int,
+    strategy: WindowMoveStrategy,
+) -> serde_json::Value {
+    serde_json::json!({
+        "moveresize_supported": strategy.uses_ewmh(),
+        "strategy": strategy.name(),
+        "protocol": "_NET_WM_MOVERESIZE",
+        "source_indication": 1,
+        "display": env::var("DISPLAY").unwrap_or_else(|_| "unknown".to_owned()),
+        "session_type": env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".to_owned()),
+        "wm_support_probe": net_supported_contains(display, screen, "_NET_WM_MOVERESIZE"),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WindowDrag {
     kind: WindowDragKind,
     start_root_x: i32,
@@ -1353,6 +1438,7 @@ pub(crate) fn dump_live_layout_json(
         return Err("X11 display has no compatible visual for live layout metrics".to_owned());
     }
     let root = unsafe { XRootWindow(display, screen) };
+    let window_move_strategy = select_window_move_strategy(display, screen);
     let colormap = unsafe { XDefaultColormap(display, screen) };
     let mut window_attributes = XSetWindowAttributes {
         background_pixmap: 0,
@@ -1434,6 +1520,10 @@ pub(crate) fn dump_live_layout_json(
             "prompt_layout".to_owned(),
             serde_json::to_value(prompt).unwrap(),
         );
+        object.insert(
+            "window_management".to_owned(),
+            window_management_diagnostics(display, screen, window_move_strategy),
+        );
         Ok(dump)
     })();
     unsafe {
@@ -1491,6 +1581,7 @@ fn run_window(
         return Err("X11 display has no compatible OpenGL visual".to_owned());
     }
     let root = unsafe { XRootWindow(display, screen) };
+    let window_move_strategy = select_window_move_strategy(display, screen);
     let colormap = unsafe { XCreateColormap(display, root, (*visual).visual, 0) };
     let mut window_attributes = XSetWindowAttributes {
         background_pixmap: 0,
@@ -1624,12 +1715,15 @@ fn run_window(
     };
     resize_terminal(core, pty, width, height, metrics);
     write_runtime_layout_dump(
+        display,
+        screen,
         width,
         height,
         metrics,
         text.font_pixel_sizes(),
         text_zoom,
         0,
+        window_move_strategy,
     );
     resize_cursors.set(window, None);
     // XSetInputFocus is a BadMatch until the WM has made the mapped window
@@ -1789,12 +1883,15 @@ fn run_window(
                                 resize_terminal(core, pty, width, height, metrics);
                                 configure_events = configure_events.saturating_add(1);
                                 write_runtime_layout_dump(
+                                    display,
+                                    screen,
                                     width,
                                     height,
                                     metrics,
                                     text.font_pixel_sizes(),
                                     text_zoom,
                                     configure_events,
+                                    window_move_strategy,
                                 );
                                 dirty = true;
                                 activity_dirty = true;
@@ -1944,18 +2041,19 @@ fn run_window(
                         focused = true;
                         if let Some(zone) = resize_zone(button.x, button.y, width, height) {
                             selection = None;
-                            window_drag = Some(WindowDrag::new(
-                                display,
-                                window,
-                                button,
-                                width,
-                                height,
-                                WindowDragKind::Resize(zone),
-                            ));
-                            grab_window_pointer(display, window);
                             resize_cursors.set(window, Some(zone));
-                            if env::var_os("ATHENA_NATIVE_USE_WM_MOVERESIZE").is_some() {
+                            if window_move_strategy.uses_ewmh() {
                                 begin_window_resize(display, window, button, zone);
+                            } else {
+                                window_drag = Some(WindowDrag::new(
+                                    display,
+                                    window,
+                                    button,
+                                    width,
+                                    height,
+                                    WindowDragKind::Resize(zone),
+                                ));
+                                grab_window_pointer(display, window);
                             }
                         } else {
                             let geometry = FrameGeometry::for_window(width, height, metrics);
@@ -1968,17 +2066,18 @@ fn run_window(
                                     activity_dirty = true;
                                 }
                             } else if geometry.header.contains(button.x, button.y) {
-                                window_drag = Some(WindowDrag::new(
-                                    display,
-                                    window,
-                                    button,
-                                    width,
-                                    height,
-                                    WindowDragKind::Move,
-                                ));
-                                grab_window_pointer(display, window);
-                                if env::var_os("ATHENA_NATIVE_USE_WM_MOVERESIZE").is_some() {
+                                if window_move_strategy.uses_ewmh() {
                                     begin_window_move(display, window, button);
+                                } else {
+                                    window_drag = Some(WindowDrag::new(
+                                        display,
+                                        window,
+                                        button,
+                                        width,
+                                        height,
+                                        WindowDragKind::Move,
+                                    ));
+                                    grab_window_pointer(display, window);
                                 }
                             } else if geometry.rail.primary_encoder.contains(button.x, button.y) {
                                 projection.return_to_live_oi();
@@ -2056,7 +2155,9 @@ fn run_window(
                     let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
                     if button.button == 1 {
                         window_drag = None;
-                        unsafe { XUngrabPointer(display, CURRENT_TIME) };
+                        if !window_move_strategy.uses_ewmh() {
+                            unsafe { XUngrabPointer(display, CURRENT_TIME) };
+                        }
                         if let (Some((anchor, _)), Some(cell)) = (
                             selection,
                             FrameGeometry::for_window(width, height, metrics)
@@ -2109,12 +2210,15 @@ fn run_window(
                     resize_terminal(core, pty, width, height, metrics);
                     configure_events = configure_events.saturating_add(1);
                     write_runtime_layout_dump(
+                        display,
+                        screen,
                         width,
                         height,
                         metrics,
                         text.font_pixel_sizes(),
                         text_zoom,
                         configure_events,
+                        window_move_strategy,
                     );
                     dirty = true;
                     activity_dirty = true;
@@ -2418,12 +2522,15 @@ fn set_window_pid(display: *mut Display, window: Window) {
 }
 
 fn write_runtime_layout_dump(
+    display: *mut Display,
+    screen: c_int,
     width: i32,
     height: i32,
     metrics: UiFontMetrics,
     font_pixel_sizes: [i32; 4],
     text_scale: f32,
     configure_events: u64,
+    window_move_strategy: WindowMoveStrategy,
 ) {
     let Ok(path) = env::var("ATHENA_NATIVE_LAYOUT_DUMP") else {
         return;
@@ -2474,6 +2581,10 @@ fn write_runtime_layout_dump(
     object.insert(
         "prompt_layout".to_owned(),
         serde_json::to_value(prompt).expect("prompt layout serialize"),
+    );
+    object.insert(
+        "window_management".to_owned(),
+        window_management_diagnostics(display, screen, window_move_strategy),
     );
     if let Err(error) = std::fs::write(path, value.to_string()) {
         eprintln!("could not write native layout dump: {error}");
@@ -2535,14 +2646,12 @@ fn begin_window_moveresize(
     message.window = window;
     message.message_type = message_type;
     message.format = 32;
-    message.data = [
-        button.x_root as c_long,
-        button.y_root as c_long,
-        direction,
-        button.button as c_long,
-        0,
-    ];
+    message.data = moveresize_message_data(button.x_root, button.y_root, direction, button.button);
     unsafe {
+        // EWMH hands pointer ownership to the window manager. Release any
+        // stale client grab before sending the request; the EWMH path never
+        // creates a local grab in the first place.
+        XUngrabPointer(display, CURRENT_TIME);
         XSendEvent(
             display,
             root,
@@ -2552,6 +2661,22 @@ fn begin_window_moveresize(
         );
         XFlush(display);
     }
+}
+
+fn moveresize_message_data(
+    root_x: i32,
+    root_y: i32,
+    direction: c_long,
+    button: u32,
+) -> [c_long; 5] {
+    [
+        root_x as c_long,
+        root_y as c_long,
+        direction,
+        button as c_long,
+        // EWMH source indication: 1 means a normal application request.
+        1,
+    ]
 }
 
 fn process_cpu_seconds() -> Option<f64> {
@@ -2760,8 +2885,8 @@ mod tests {
     use super::render::chassis::{PresentationControl, PresentationSettings};
     use super::render::oi::AttentionAction;
     use super::{
-        FrameGeometry, PresentationClock, Projection, ResizeZone, VisualMode, is_wm_delete_message,
-        resize_zone, write_attention_action,
+        FrameGeometry, PresentationClock, Projection, ResizeZone, VisualMode, WindowMoveStrategy,
+        is_wm_delete_message, moveresize_message_data, resize_zone, write_attention_action,
     };
     use crate::ProjectionView;
     use alacritty_terminal::term::TermMode;
@@ -2957,6 +3082,24 @@ mod tests {
         assert_eq!(ResizeZone::Bottom.direction(), 5);
         assert_eq!(ResizeZone::BottomLeft.direction(), 6);
         assert_eq!(ResizeZone::Left.direction(), 7);
+    }
+
+    #[test]
+    fn moveresize_message_uses_normal_application_source() {
+        assert_eq!(
+            moveresize_message_data(40, 50, ResizeZone::BottomRight.direction(), 1),
+            [40, 50, 4, 1, 1]
+        );
+    }
+
+    #[test]
+    fn window_move_strategy_is_exclusive() {
+        assert!(WindowMoveStrategy::Ewmh.uses_ewmh());
+        assert!(!WindowMoveStrategy::ClientManagedFallback.uses_ewmh());
+        assert_ne!(
+            WindowMoveStrategy::Ewmh.name(),
+            WindowMoveStrategy::ClientManagedFallback.name()
+        );
     }
 
     #[test]

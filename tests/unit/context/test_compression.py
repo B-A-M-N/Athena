@@ -139,3 +139,23 @@ async def test_long_summary_maps_complete_range_before_reducing():
     await compressor._summarize(text, max_tokens=64)  # noqa: SLF001 - callback contract
     assert any(budget == 64 for _text, budget in calls)
     assert all(len(source) <= 8_000 for source, _budget in calls)
+
+
+async def test_failed_summarizer_fallback_represents_every_source_chunk():
+    async def broken_summarizer(_text: str, **_kwargs):
+        raise RuntimeError("summarizer unavailable")
+
+    compressor = ContextCompressor(
+        recent_turns=0,
+        max_summary_chars=900,
+        summarizer=broken_summarizer,
+    )
+    source = "\n".join(
+        f"CHUNK-{index} decision anchor " + ("operational noise " * 500) for index in range(1, 5)
+    )
+
+    summary = await compressor._summarize(source, max_tokens=225)  # noqa: SLF001
+
+    assert compressor.consume_degraded() is True
+    assert len(summary) <= 900
+    assert all(f"CHUNK-{index}" in summary for index in range(1, 5))

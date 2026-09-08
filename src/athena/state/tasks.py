@@ -6,17 +6,19 @@ from typing import Any
 
 from athena.protocol.errors import IllegalStateTransition, TaskOwnershipLost
 from athena.protocol.messages import utcnow
+from athena.protocol.task_codec import (
+    encode_budget,
+    encode_capability_policy,
+    encode_context_refs,
+    encode_criteria,
+    encode_delivery,
+    encode_model_policy,
+    encode_workspace,
+)
 from athena.protocol.tasks import FINAL_STATUSES, TaskStatus
 from athena.state.database import Database
 from athena.state.sessions import (
     _JSON_FIELDS,
-    _serialize_capability_policy,
-    _serialize_context_refs,
-    _serialize_criteria,
-    _serialize_delivery,
-    _serialize_model_policy,
-    _serialize_resource_budget,
-    _serialize_workspace,
 )
 
 
@@ -60,14 +62,14 @@ class TaskStore:
                 status.value,
                 autonomy,
                 objective,
-                _serialize_criteria(acceptance_criteria) if acceptance_criteria else None,
-                _serialize_context_refs(context_refs) if context_refs else None,
-                _serialize_workspace(workspace),
-                _serialize_capability_policy(capability_policy) if capability_policy else None,
-                _serialize_model_policy(model_policy) if model_policy else None,
-                _serialize_resource_budget(resource_budget) if resource_budget else None,
+                encode_criteria(acceptance_criteria) if acceptance_criteria else None,
+                encode_context_refs(context_refs) if context_refs else None,
+                encode_workspace(workspace),
+                encode_capability_policy(capability_policy) if capability_policy else None,
+                encode_model_policy(model_policy) if model_policy else None,
+                encode_budget(resource_budget) if resource_budget else None,
                 deadline.isoformat() if deadline else None,
-                _serialize_delivery(delivery),
+                encode_delivery(delivery),
                 now,
                 now,
                 json.dumps(dict(metadata or {})),
@@ -180,6 +182,24 @@ class TaskStore:
         await self._db.execute(
             "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
             (json.dumps(meta), utcnow().isoformat(), task_id),
+        )
+
+    async def record_recovery_marker(self, task_id: str, marker: dict[str, Any]) -> None:
+        """Persist uncertainty evidence without pretending the task succeeded."""
+        row = await self._db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
+        if row is None:
+            raise KeyError(f"Task not found: {task_id}")
+        try:
+            metadata = json.loads(row.get("metadata") or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        markers = list(metadata.get("recovery_markers") or [])
+        markers.append(dict(marker))
+        metadata["recovery_markers"] = markers[-32:]
+        metadata["recovery_required"] = True
+        await self._db.execute(
+            "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(metadata, default=str), utcnow().isoformat(), task_id),
         )
 
     async def persist_budget_usage(self, task_id: str, usage: dict[str, Any]) -> None:

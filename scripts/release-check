@@ -22,6 +22,7 @@ import argparse
 import io
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import subprocess
@@ -59,25 +60,54 @@ def _run(
 ) -> dict[str, object]:
     print(f"[release] {' '.join(command)}", flush=True)
     started = time.monotonic()
+    popen_kwargs: dict[str, object] = {}
+    if os.name == "posix":
+        # Every lane gets its own session so a timeout cannot leave a compiler,
+        # test worker, or descendant server behind in the release host.
+        popen_kwargs["start_new_session"] = True
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
             env=env,
-            timeout=timeout,
-            check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            **popen_kwargs,
         )
-        output = result.stdout
-        exit_code = result.returncode
-    except subprocess.TimeoutExpired as exc:
-        output = exc.stdout or ""
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", "replace")
-        exit_code = 124
-        output += f"\ncommand timed out after {timeout:g}s"
+        try:
+            output, _ = process.communicate(timeout=timeout)
+            exit_code = process.returncode
+        except subprocess.TimeoutExpired as exc:
+            output = exc.output or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", "replace")
+            group_id = process.pid
+            if os.name == "posix":
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(group_id, sig)
+                    except ProcessLookupError:
+                        break
+                    try:
+                        process.wait(timeout=2.0)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            else:
+                process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            tail, _ = process.communicate()
+            output += tail or ""
+            output += f"\ncommand timed out after {timeout:g}s"
+            if _process_group_alive(group_id):
+                output += "\nrelease-check: descendant process survived timeout cleanup"
+                exit_code = 125
+            else:
+                exit_code = 124
     except OSError as exc:
         output = f"{type(exc).__name__}: {exc}"
         exit_code = 127
@@ -88,6 +118,19 @@ def _run(
         "duration_s": round(time.monotonic() - started, 3),
         "output": output,
     }
+
+
+def _process_group_alive(group_id: int) -> bool:
+    """Return true when a timed-out lane still has a live process group."""
+    if os.name != "posix":
+        return False
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _run_static_concurrently(

@@ -17,6 +17,7 @@ from athena.models.fake import FakeModelProvider
 from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
 from athena.protocol.ids import new_id
+from athena.protocol.messages import Message, Provenance, Role, SourceType, TextBlock, utcnow
 from athena.protocol.models import CostInfo
 from athena.protocol.tasks import ResourceBudget, TaskSpec, TaskStatus
 from athena.tasks.budgets import BudgetStateUnavailable, BudgetTracker
@@ -249,6 +250,46 @@ async def test_scripted_capability_then_answer_runs_two_iterations(stack):
     # UNIQUE(task_id, sequence) collision between the kernel and lifecycle
     # event emitters; see source-bug note in the report).
     assert len(iterations) >= 1
+
+
+async def test_transcript_failure_after_effect_parks_without_new_model_or_effect(
+    stack, monkeypatch
+):
+    """A missing canonical transcript must not create an amnesiac retry."""
+    spec = await _create(stack, "resume the mutation safely")
+    await stack.messages.append_to_session(
+        spec.session_id,
+        Message(
+            id=new_id("msg"),
+            created_at=utcnow(),
+            role=Role.CAPABILITY,
+            blocks=(TextBlock(text="durable mutation result: changed file"),),
+            provenance=Provenance(source_type=SourceType.CAPABILITY),
+        ),
+    )
+
+    model_calls: list[str] = []
+    original_complete = stack.provider.complete
+
+    async def counted_complete(request):
+        model_calls.append(request.model)
+        async for event in original_complete(request):
+            yield event
+
+    monkeypatch.setattr(stack.provider, "complete", counted_complete)
+
+    async def broken_transcript(*args, **kwargs):
+        raise OSError("canonical transcript unavailable")
+
+    monkeypatch.setattr(stack.messages, "list_causal_messages", broken_transcript)
+    dispatched: list = []
+    stack.kernel._dispatch_factory = lambda task: StubDispatchIface(dispatched)
+
+    result = await stack.kernel.run_task(spec.id)
+    assert result.status is TaskStatus.RECOVERY_REQUIRED
+    assert model_calls == []
+    assert dispatched == []
+    assert (await stack.tasks.get(spec.id))["status"] == TaskStatus.RECOVERY_REQUIRED.value
 
 
 @pytest.mark.athena_claim("BHV-134")

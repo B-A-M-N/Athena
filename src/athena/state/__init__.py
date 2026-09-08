@@ -6,6 +6,7 @@ from athena.state.executions import ExecutionStore
 from athena.state.messages import MessageStore
 from athena.state.mutations import MutationStore
 from athena.state.runtime_sessions import RuntimeSessionStore
+from athena.state.resource_obligations import ResourceObligationStore
 from athena.state.schedules import ScheduleStore
 from athena.state.sessions import (
     EventRepository,
@@ -26,6 +27,7 @@ __all__ = [
     "EventStore",
     "ExternalEffectStore",
     "RuntimeSessionStore",
+    "ResourceObligationStore",
     "ExecutionStore",
     "ApprovalStore",
     "MutationStore",
