@@ -129,6 +129,7 @@ class ACPAdapter:
         service: Any = None,
         event_store: Any = None,
         admission: Any = None,
+        principal_id: str | None = None,
         stream_poll_interval: float = 0.25,
         stream_timeout: float = 60.0,
     ) -> None:
@@ -137,6 +138,7 @@ class ACPAdapter:
         self.service = service
         self.event_store = event_store
         self._admission = admission
+        self._principal_id = principal_id
         self._stream_interval = stream_poll_interval
         self._stream_timeout = stream_timeout
 
@@ -305,9 +307,13 @@ class ACPAdapter:
         if self.sessions is None:
             raise RuntimeError("no session service configured for ACP")
         session_id = new_id("session")
-        await self.sessions.create(
-            session_id, parent_id=request.parent_session_id, metadata={"origin": "acp"}
-        )
+        kwargs: dict[str, Any] = {
+            "parent_id": request.parent_session_id,
+            "metadata": {"origin": "acp"},
+        }
+        if self._principal_id:
+            kwargs["principal_id"] = self._principal_id
+        await self.sessions.create(session_id, **kwargs)
         return session_id
 
     async def _session_id_for_task(self, task_id: str) -> str | None:

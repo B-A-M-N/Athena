@@ -28,6 +28,7 @@ from athena.execution.process_tree import spawn_owned
 from athena.execution.runtimes.base import BaseRuntime
 from athena.execution.runtimes.python import _PythonSession, _WORKER_SOURCE
 from athena.execution.runtimes.shell import _SubprocessSession
+from athena.state.runtime_sessions import environment_fingerprint, sanitize_environment
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionEventType,
@@ -522,7 +523,24 @@ class ContainerBackend(ExecutionBackend):
         ):
             raise RuntimeError("container workspace mount contract no longer matches")
 
-        env = metadata.get("env") if isinstance(metadata.get("env"), Mapping) else {}
+        raw_environment = metadata.get("environment")
+        # ``env`` is the pre-redaction spelling used by older records. Sanitize
+        # it before use and refuse reattachment when a credential-bearing
+        # value was omitted, because the restored environment is then not
+        # provably identical to the original runtime.
+        if not isinstance(raw_environment, Mapping):
+            raw_environment = metadata.get("env")
+        env, redacted_environment_keys = sanitize_environment(raw_environment)
+        if redacted_environment_keys:
+            raise RuntimeError(
+                "container reattachment cannot prove redacted environment identity: "
+                + ", ".join(redacted_environment_keys)
+            )
+        expected_environment = str(
+            record.get("environment_fingerprint") or metadata.get("environment_fingerprint") or ""
+        )
+        if expected_environment and expected_environment != environment_fingerprint(env):
+            raise RuntimeError("container environment identity mismatch")
         cwd = str(record.get("cwd") or workspace)
         container_cwd = (
             cwd

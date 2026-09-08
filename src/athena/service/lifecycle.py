@@ -493,6 +493,7 @@ class ServiceLifecycle:
             budgets=budgets,
             cancellations=cancellations,
             execution_manager=execution,
+            principal_id=cfg.cache_namespace,
         )
         self._svc._delegation = delegation
 

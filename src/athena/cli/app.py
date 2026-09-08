@@ -1396,6 +1396,7 @@ async def _cmd_acp(service: Any) -> int:
         service._sessions,
         service=service,
         event_store=service._require_events(),
+        principal_id=service.config.cache_namespace,
     )
     active: dict[str, asyncio.Task] = {}
     output_lock = asyncio.Lock()

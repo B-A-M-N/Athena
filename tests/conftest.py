@@ -87,6 +87,7 @@ async def make_durable_service():
             worker_lease_renewal_divisor=cfg.get("worker_lease_renewal_divisor", 3.0),
             scheduler_interval_seconds=cfg.get("scheduler_interval_seconds", 1.0),
             parked_slot_wait_s=cfg.get("parked_slot_wait_s", 300.0),
+            cache_namespace=cfg.get("cache_namespace", "athena"),
         )
         svc = AthenaService(config=config)
         await svc.start()

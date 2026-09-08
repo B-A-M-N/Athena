@@ -1054,6 +1054,19 @@ PRINCIPAL = (
             "tests/unit/state/test_session_search.py::test_principal_history_search_and_anchor_read_are_host_scoped",
         ),
     ),
+    Scenario(
+        id="PRINCIPAL-003",
+        family="PRINCIPAL",
+        title="Durable user state survives restart without crossing principals",
+        nodeids=(
+            "tests/e2e/test_principal_isolation.py::test_user_scoped_state_isolated_across_service_restarts",
+        ),
+        notes=(
+            "One durable database is exercised by Alice, Bob, and Alice again. "
+            "User memory, context, workflow, and generated capability state must "
+            "survive Alice's restart while remaining invisible and unrehydrated for Bob."
+        ),
+    ),
 )
 
 # ---------------------------------------------------------------------------

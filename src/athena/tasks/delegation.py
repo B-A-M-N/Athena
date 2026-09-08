@@ -67,6 +67,7 @@ class DelegationManager:
         sessions: Any = None,
         cancellations: Any = None,
         execution_manager: Any = None,
+        principal_id: str | None = None,
         default_max_depth: int = _DEFAULT_MAX_DEPTH,
         default_max_children: int = _DEFAULT_MAX_CHILDREN,
     ) -> None:
@@ -86,6 +87,7 @@ class DelegationManager:
             if execution_manager is not None
             else getattr(task_manager, "_execution", None)
         )
+        self._principal_id = principal_id
         self._default_max_depth = default_max_depth
         self._default_max_children = default_max_children
 
@@ -250,7 +252,11 @@ class DelegationManager:
             return
         existing = await self._sessions.get(session_id)
         if existing is None:
-            await self._sessions.create(session_id, parent_id=parent_id)
+            await self._sessions.create(
+                session_id,
+                parent_id=parent_id,
+                principal_id=self._principal_id,
+            )
 
     # ------------------------------------------------------------------ #
     async def _assert_parent_runnable(self, parent: TaskSpec) -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from athena.execution.manager import ExecutionManager
 from athena.state.database import Database
 from athena.state.runtime_sessions import RuntimeSessionStore
@@ -56,4 +58,47 @@ async def test_runtime_session_persists_backend_and_runtime_independently():
     assert rows[0]["cwd"] == "/workspace"
     assert rows[0]["workspace_identity"] == "/tmp/project"
     assert rows[0]["network_policy"] == "restricted"
+    await db.close()
+
+
+async def test_runtime_session_redacts_environment_secrets_before_durable_write():
+    db = Database(":memory:")
+    await db._ensure_ready()
+    store = RuntimeSessionStore(db)
+    tasks = TaskStore(db)
+    await tasks.insert_task("secret-task", None, None, "secret-task")
+
+    await store.start(
+        "secret-session",
+        task_id="secret-task",
+        backend="local",
+        runtime="python",
+        metadata={
+            "environment": {
+                "PATH": "/usr/bin",
+                "ATHENA_TEST": "1",
+                "ATHENA_API_KEY": "do-not-persist",
+                "SERVICE_TOKEN": "also-do-not-persist",
+            }
+        },
+    )
+    row = await db.fetch_one(
+        "SELECT metadata, environment_fingerprint FROM runtime_sessions WHERE id = ?",
+        ("secret-session",),
+    )
+    metadata = json.loads(row["metadata"])
+    assert "do-not-persist" not in row["metadata"]
+    assert "also-do-not-persist" not in row["metadata"]
+    assert "env" not in metadata
+    assert metadata["environment"] == {"ATHENA_TEST": "1", "PATH": "/usr/bin"}
+    assert metadata["redacted_environment_keys"] == ["ATHENA_API_KEY", "SERVICE_TOKEN"]
+    assert row["environment_fingerprint"]
+
+    await store.mark_closed(
+        "secret-session",
+        metadata={"env": {"PASSWORD": "do-not-persist-on-close", "SAFE": "yes"}},
+    )
+    closed = await store.get("secret-session")
+    assert closed is not None
+    assert "do-not-persist-on-close" not in json.dumps(closed["metadata"])
     await db.close()
