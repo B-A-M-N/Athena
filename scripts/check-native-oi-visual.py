@@ -62,19 +62,59 @@ def main() -> int:
 
     # No post-process scanline may dominate a row. Foreground remains visible
     # because the CRT modulation is required to be subordinate/background-only.
-    def horizontal_run(y: int) -> int:
+    def horizontal_run_bounds(y: int) -> tuple[int, int, int]:
         longest = current = 0
+        longest_start = longest_end = 0
+        current_start = 0
         for x in range(WIDTH):
-            current = current + 1 if lit(x, y) else 0
-            longest = max(longest, current)
-        return longest
+            if lit(x, y):
+                if current == 0:
+                    current_start = x
+                current += 1
+                if current > longest:
+                    longest = current
+                    longest_start = current_start
+                    longest_end = x
+            else:
+                current = 0
+        return longest, longest_start, longest_end
 
-    row_runs = [horizontal_run(y) for y in range(HEIGHT)]
-    max_row = max(range(HEIGHT), key=row_runs.__getitem__)
-    if row_runs[max_row] > WIDTH * 0.72:
+    row_bounds = [horizontal_run_bounds(y) for y in range(HEIGHT)]
+    long_rows = [
+        (y, start, end, length)
+        for y, (length, start, end) in enumerate(row_bounds)
+        if length > WIDTH * 0.72
+    ]
+
+    def is_authored_panel_border() -> bool:
+        """Recognize the two-sided readout frame, not an overlay scanline.
+
+        The OI contract intentionally rejects a full-width post-process line.
+        Read/code/test scenes also have an authored readout pane whose top and
+        bottom rules are long by design.  It is only exempted when there are
+        exactly two aligned long rows and both rows have matching vertical
+        side support, which a scanline cannot provide.
+        """
+        if len(long_rows) != 2:
+            return False
+        (top, top_start, top_end, _), (bottom, bottom_start, bottom_end, _) = long_rows
+        if bottom - top < 32:
+            return False
+        if abs(top_start - bottom_start) > 12 or abs(top_end - bottom_end) > 12:
+            return False
+        left_band = range(max(0, min(top_start, bottom_start) - 8), min(WIDTH, max(top_start, bottom_start) + 4))
+        right_band = range(max(0, min(top_end, bottom_end) - 4), min(WIDTH, max(top_end, bottom_end) + 9))
+        middle_rows = range(top + 3, bottom - 2)
+        left_support = sum(any(lit(x, y) for x in left_band) for y in middle_rows)
+        right_support = sum(any(lit(x, y) for x in right_band) for y in middle_rows)
+        span = max(1, bottom - top - 5)
+        return left_support >= span * 0.45 and right_support >= span * 0.45
+
+    max_row = max(range(HEIGHT), key=lambda y: row_bounds[y][0])
+    if row_bounds[max_row][0] > WIDTH * 0.72 and not is_authored_panel_border():
         fail(
             "a scanline-like full-width foreground overlay dominates the scene "
-            f"(row={max_row}, contiguous_lit={row_runs[max_row]})"
+            f"(row={max_row}, contiguous_lit={row_bounds[max_row][0]})"
         )
 
     print(
