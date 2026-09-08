@@ -68,9 +68,7 @@ class TestFloorFilter:
 
     async def test_role_floor_intersects_task_floor(self):
         router = ModelRouter(
-            _StaticRegistry(
-                [_info("standard", "standard"), _info("frontier", "frontier")]
-            ),
+            _StaticRegistry([_info("standard", "standard"), _info("frontier", "frontier")]),
             role_policies={"judge": ModelPolicy(role="judge", min_quality_tier="frontier")},
         )
         effective = router.effective_policy(ModelPolicy(role="judge", min_quality_tier="standard"))

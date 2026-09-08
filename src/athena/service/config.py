@@ -328,11 +328,12 @@ class AthenaConfig:
         self.worker_lease_renewal_divisor = max(1.0, float(self.worker_lease_renewal_divisor))
         self.research_discovery_timeout = max(0.1, float(self.research_discovery_timeout))
         self.required_capabilities = _normalize_capability_ids(self.required_capabilities)
-        profiles: dict[str, tuple[str, ...]] = {}
-        for name, values in dict(self.capability_profiles or {}).items():
-            profile_name = str(name).strip()
-            if profile_name:
-                profiles[profile_name] = _normalize_capability_ids(values)
+        profiles = _parse_capability_profiles(self.capability_profiles)
+        profiles = {
+            profile_name: values
+            for name, values in profiles.items()
+            if (profile_name := str(name).strip())
+        }
         self.capability_profiles = profiles
         if self.capability_profile is not None:
             selected = str(self.capability_profile).strip()
@@ -784,9 +785,7 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         profile=data.get("profile"),
         required_capabilities=_normalize_capability_ids(data.get("required_capabilities")),
         capability_profile=(
-            str(data["capability_profile"]).strip()
-            if data.get("capability_profile")
-            else None
+            str(data["capability_profile"]).strip() if data.get("capability_profile") else None
         ),
         capability_profiles=_parse_capability_profiles(data.get("capability_profiles")),
         model_roles=dict(data.get("model_roles") or {}),

@@ -217,10 +217,10 @@ class MemoryRetriever:
             vector, scope, scope_id, limit * 8, tags=tags
         )
         return [
-            record
-            for _, record in sorted(
+            _with_retrieval_score(record, score)
+            for _, record, score in sorted(
                 (
-                    (_quality_score(record, index=index, base=score), record)
+                    (_quality_score(record, index=index, base=score), record, score)
                     for index, (record, score) in enumerate(candidates)
                 ),
                 key=lambda item: (item[0], item[1].created_at, item[1].id),
@@ -283,11 +283,15 @@ def _rank_vector(
         (
             _quality_score(record, index=index, base=score),
             record,
+            score,
         )
         for index, (record, score) in enumerate(candidates)
     ]
     scored.sort(key=lambda item: (item[0], item[1].created_at, item[1].id), reverse=True)
-    return [(record, score) for score, record in scored[:limit]]
+    return [
+        (_with_retrieval_score(record, raw_score), quality_score)
+        for quality_score, record, raw_score in scored[:limit]
+    ]
 
 
 def _fuse(
@@ -319,11 +323,27 @@ def _fuse(
             record,
             metadata={
                 **dict(record.metadata or {}),
-                "_athena:retrieval_score": (vector_scores.get(record_id, scores[record_id])),
+                # Keep both signals: callers doing a later weighted
+                # multi-scope fusion must consume the actual hybrid score,
+                # while diagnostics can still inspect raw vector cosine.
+                "_athena:retrieval_score": scores[record_id],
+                "_athena:vector_score": vector_scores.get(record_id),
             },
         )
         for record_id, record in ranked
     ]
+
+
+def _with_retrieval_score(record: MemoryRecord, score: float) -> MemoryRecord:
+    """Attach the raw semantic score without changing canonical memory."""
+    return replace(
+        record,
+        metadata={
+            **dict(record.metadata or {}),
+            "_athena:retrieval_score": float(score),
+            "_athena:vector_score": float(score),
+        },
+    )
 
 
 def _quality_score(record: MemoryRecord, *, index: int, base: float = 0.0) -> float:

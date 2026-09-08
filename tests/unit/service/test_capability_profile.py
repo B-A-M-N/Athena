@@ -19,9 +19,7 @@ class _Registry:
 
 @pytest.mark.asyncio
 async def test_required_capability_profile_checks_live_native_and_mcp_surfaces():
-    service = AthenaService(
-        config=AthenaConfig(required_capabilities=("browser", "mcp:tools"))
-    )
+    service = AthenaService(config=AthenaConfig(required_capabilities=("browser", "mcp:tools")))
     service._registry = _Registry({"browser"})
     service._mcp_connection_status = {"tools": {"state": "connected"}}
 

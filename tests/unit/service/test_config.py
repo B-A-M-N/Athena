@@ -114,6 +114,17 @@ def test_required_capability_profile_roundtrips_and_normalizes():
     )
 
 
+def test_direct_config_accepts_structured_capability_profiles():
+    config = AthenaConfig(
+        capability_profile="desktop",
+        capability_profiles={
+            "desktop": {"required_capabilities": ["computer", "computer"]},
+        },
+    )
+
+    assert config.effective_required_capabilities == ("computer",)
+
+
 def test_required_capabilities_environment_is_supported(monkeypatch):
     monkeypatch.setenv("ATHENA_REQUIRED_CAPABILITIES", "browser, mcp:tools, browser")
     config = load_config(cwd="/tmp/nonexistent_athena_test")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -57,6 +58,9 @@ _PROTECTED_CATEGORIES = frozenset(
 # this is roughly a two-thousand-token source chunk.
 _SUMMARY_CHUNK_CHARS = 8_000
 _SUMMARY_CHUNK_OUTPUT_TOKENS = 256
+_ANCHOR_RE = re.compile(
+    r"(?im)^.*(?:capability|result|decision|unresolved|artifact|mutation|error|failed|call).*$"
+)
 
 
 @dataclass(frozen=True)
@@ -236,10 +240,7 @@ class ContextCompressor:
                 self._compression_degraded = True
         else:
             self._compression_degraded = True
-        if len(text) <= max_chars:
-            summary = _truncate_to_tokens(text, max_tokens, max_chars)
-        else:
-            summary = _truncate_to_tokens(text[:max_chars] + " …", max_tokens, max_chars)
+        summary = _deterministic_summary(text, max_tokens=max_tokens, max_chars=max_chars)
         self._remember_summary(key, summary)
         return summary
 
@@ -452,6 +453,47 @@ def _bounded_text_chunks(text: str, max_chars: int) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def _deterministic_summary(text: str, *, max_tokens: int | None, max_chars: int) -> str:
+    """Summarize every source chunk without silently keeping only a prefix.
+
+    This is the failure-path contract for a missing/broken model summarizer.
+    Each chunk contributes a bounded head/tail plus any obvious operational
+    anchor (capability/result/decision/error/artifact/mutation). The output is
+    still bounded by the same compiler budget, while the receipt retains the
+    complete source message ids for exact recovery.
+    """
+    if max_chars <= 0 or not text:
+        return ""
+    chunks = _bounded_text_chunks(text, _SUMMARY_CHUNK_CHARS)
+    if len(chunks) == 1:
+        return _truncate_to_tokens(text, max_tokens, max_chars)
+
+    effective_chars = max_chars
+    if max_tokens is not None:
+        effective_chars = min(effective_chars, max(0, int(max_tokens)) * 4)
+    if effective_chars <= 0:
+        return ""
+
+    # Give every chunk a share of the bounded output. A small minimum keeps a
+    # chunk marker visible even when the source has many chunks; the final
+    # truncation below remains authoritative for the exact budget.
+    per_chunk = max(1, effective_chars // len(chunks))
+    pieces: list[str] = []
+    for index, chunk in enumerate(chunks, 1):
+        anchors = [match.group(0).strip() for match in _ANCHOR_RE.finditer(chunk)]
+        anchor = " | ".join(dict.fromkeys(anchors))
+        prefix = f"[chunk {index}/{len(chunks)}] "
+        # Put anchors before the ordinary excerpt so a tight per-chunk budget
+        # cannot truncate the operational evidence after retaining noise.
+        body = f"anchors: {anchor}" if anchor else chunk.strip()
+        if len(prefix) + len(body) < per_chunk:
+            room = per_chunk - len(prefix) - len(body) - 3
+            if room > 0:
+                body = f"{body} | {chunk[:room].strip()}"
+        pieces.append(_truncate_to_tokens(prefix + body, None, per_chunk))
+    return _truncate_to_tokens("\n".join(pieces), max_tokens, effective_chars)
 
 
 __all__ = [

@@ -105,11 +105,17 @@ class _FakeImage:
 
 
 @pytest.mark.athena_evidence("test", "unit")
-async def test_computer_drives_backend_and_reports_shape():
+async def test_computer_drives_backend_and_reports_shape(tmp_path):
     screen = _FakeScreen()
-    cap = ComputerCapability(backend=screen)
+    cap = ComputerCapability(
+        backend=screen,
+        artifact_store=ArtifactStore(root=tmp_path / "artifacts"),
+    )
 
-    moved = await cap.invoke(_request("move", x=10, y=20))
+    observation = await cap.invoke(_request("observe"))
+    revision = json.loads(observation.output)["observation_revision"]
+
+    moved = await cap.invoke(_request("move", x=10, y=20, observation_revision=revision))
     assert json.loads(moved.output)["moved_to"] == [10, 20]
     typed = await cap.invoke(_request("type", text="hello"))
     assert json.loads(typed.output)["typed_chars"] == 5
@@ -121,6 +127,66 @@ async def test_computer_drives_backend_and_reports_shape():
     assert ("move", 10, 20) in screen.calls
     assert ("type", "hello") in screen.calls
     assert ("key", ("ctrl", "s")) in screen.calls
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_computer_rejects_stale_coordinate_observation(tmp_path):
+    class ChangingImage:
+        def __init__(self, value: bytes) -> None:
+            self.value = value
+
+        def save(self, target, format="PNG"):
+            assert format == "PNG"
+            target.write(self.value)
+
+    class WindowedScreen(_FakeScreen):
+        def __init__(self) -> None:
+            super().__init__()
+            self.frame = b"frame-1"
+            self.window_id = "window-1"
+
+        def screenshot(self):
+            self.calls.append(("screenshot", self.frame))
+            return ChangingImage(self.frame)
+
+        def active_window_identity(self):
+            return {"window_id": self.window_id, "title": "Athena"}
+
+        def focus_window(self, window):
+            self.calls.append(("focus_window", window))
+            return True
+
+    screen = WindowedScreen()
+    cap = ComputerCapability(
+        backend=screen,
+        artifact_store=ArtifactStore(root=tmp_path / "artifacts"),
+    )
+    observed = await cap.invoke(_request("observe", window="Athena"))
+    revision = json.loads(observed.output)["observation_revision"]
+
+    screen.frame = b"frame-2"
+    changed = await cap.invoke(_request("click", x=10, y=20, observation_revision=revision))
+    assert changed.status.name == "FAILED"
+    assert "screen changed" in changed.error
+    assert not any(call[0] == "click" for call in screen.calls)
+
+    refreshed = await cap.invoke(_request("observe", window="Athena"))
+    refreshed_revision = json.loads(refreshed.output)["observation_revision"]
+    screen.window_id = "other-window"
+    moved = await cap.invoke(_request("move", x=10, y=20, observation_revision=refreshed_revision))
+    assert moved.status.name == "FAILED"
+    assert "target changed" in moved.error
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_computer_window_target_requires_identity_proof(tmp_path):
+    cap = ComputerCapability(
+        backend=_FakeScreen(),
+        artifact_store=ArtifactStore(root=tmp_path / "artifacts"),
+    )
+    outcome = await cap.invoke(_request("observe", window="Athena"))
+    assert outcome.status.name == "FAILED"
+    assert "focus windows" in outcome.error
 
 
 @pytest.mark.athena_evidence("test", "unit")

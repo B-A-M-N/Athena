@@ -797,8 +797,7 @@ class ServiceLifecycle:
         self._svc._startup_health["checks"]["capability_profile"] = capability_profile
         if capability_profile.get("status") != "ok":
             missing = ", ".join(
-                f"{item['id']}: {item['reason']}"
-                for item in capability_profile.get("missing", ())
+                f"{item['id']}: {item['reason']}" for item in capability_profile.get("missing", ())
             )
             raise RuntimeError(f"required capability profile is not ready: {missing}")
 
