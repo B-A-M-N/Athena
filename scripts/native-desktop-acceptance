@@ -82,6 +82,22 @@ find_window_for_pid() {
   return 1
 }
 
+focus_window() {
+  local target="$1"
+  # Window discovery can precede WM viewability by a few event-loop turns.
+  # Retry activation/focus rather than letting an asynchronous BadMatch from
+  # X_SetInputFocus abort the acceptance lane before it tests the product.
+  for _ in $(seq 1 30); do
+    if xdotool windowmap "$target" 2>/dev/null \
+      && (xdotool windowactivate --sync "$target" 2>/dev/null \
+        || xdotool windowfocus --sync "$target" 2>/dev/null); then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 window=""
 for _ in $(seq 1 100); do
   window="$(find_window_for_pid || true)"
@@ -92,7 +108,10 @@ done
   printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window did not appear' >&2
   exit 1
 }
-xdotool windowfocus --sync "$window"
+focus_window "$window" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window could not be focused' >&2
+  exit 1
+}
 sleep 0.3
 import -window "$window" "$before"
 xdotool mousemove --window "$window" "$prompt_x" "$prompt_y"
@@ -221,10 +240,16 @@ done
   printf '%s\n' 'native-desktop-acceptance: FAIL — focus probe window did not appear' >&2
   exit 1
 }
-xdotool windowfocus --sync "$focus_probe"
+focus_window "$focus_probe" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — focus probe window could not be focused' >&2
+  exit 1
+}
 sleep 0.2
 import -window "$window" "$focus_lost"
-xdotool windowfocus --sync "$window"
+focus_window "$window" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena focus could not be restored' >&2
+  exit 1
+}
 sleep 0.2
 import -window "$window" "$focus_return"
 kill "$focus_probe_pid" 2>/dev/null || true
@@ -294,7 +319,10 @@ if xdotool search --onlyvisible --name 'ATHENA' 2>/dev/null | rg -q "$window"; t
   exit 1
 fi
 xdotool windowmap --sync "$window"
-xdotool windowfocus --sync "$window"
+focus_window "$window" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window could not be refocused after remap' >&2
+  exit 1
+}
 sleep 0.2
 xdotool search --onlyvisible --name 'ATHENA' 2>/dev/null | rg -q "$window" || {
   printf '%s\n' 'native-desktop-acceptance: FAIL — native window did not restore after remap' >&2
