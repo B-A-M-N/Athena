@@ -62,6 +62,7 @@ from athena.state.failure_memory import FailureMemory
 from athena.state.messages import MessageStore
 from athena.state.mutations import MutationStore
 from athena.state.runtime_sessions import RuntimeSessionStore
+from athena.state.resource_obligations import ResourceObligationStore
 from athena.state.schedules import ScheduleStore
 from athena.state.self_host import SelfHostMissionStore
 from athena.state.sessions import SessionRepository
@@ -162,6 +163,7 @@ class ServiceLifecycle:
         self._svc._store_approvals = approvals
         self._svc._store_mutations = mutations
         self._svc._external_effect_store = ExternalEffectStore(db)
+        self._svc._resource_obligation_store = ResourceObligationStore(db)
         self._svc._store_schedules = schedules
         self._svc._store_continuations = continuations
         self._svc._store_input_requests = input_requests
@@ -534,8 +536,10 @@ class ServiceLifecycle:
         # registered. Logical affordance observers may run afterward, but no
         # process/session owner can be forgotten before this proof runs.
         finalizer = TaskResourceFinalizer(event_sink=self._svc._forward_events(events))
+        finalizer.bind_obligation_store(self._svc._resource_obligation_store)
         finalizer.bind_service(self._svc)
         self._svc._resource_finalizer = finalizer
+        task_manager.set_finalization_barrier(finalizer.quiesce)
         task_manager.add_finalize_observer(finalizer.finalize)
 
         # 12. Register core capabilities (bind executors to current handles).
@@ -657,6 +661,18 @@ class ServiceLifecycle:
 
         # 12.5 Crash recovery: reconcile orphaned state before claiming new work.
         from athena.recovery.manager import RecoveryManager
+
+        # Resource obligations are loaded and reconciled before the worker is
+        # created below. Any remaining ownership keeps readiness degraded and
+        # blocks new admissions until an explicit proof arrives.
+        await finalizer.load_unresolved()
+        await finalizer.reconcile_unresolved()
+        resource_health = finalizer.health()
+        self._svc._startup_health["checks"]["resource_obligations"] = {
+            "status": "ok" if resource_health["unresolved_count"] == 0 else "degraded",
+            "blocking": resource_health["unresolved_count"] > 0,
+            "unresolved_count": resource_health["unresolved_count"],
+        }
 
         # A proven reality commit may have completed just before a process
         # stopped, leaving the task row non-terminal. Finish that saga before

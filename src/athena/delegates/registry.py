@@ -13,6 +13,8 @@ from athena.delegates.models import DelegateSpec
 class DelegateRegistry:
     """Registry populated by trusted host configuration, never by the model."""
 
+    BUILTIN_PROTOCOLS = frozenset({"json_lines"})
+
     def __init__(self) -> None:
         self._specs: dict[str, DelegateSpec] = {}
         self._connectors: dict[str, Callable[..., Any]] = {}
@@ -46,7 +48,12 @@ class DelegateRegistry:
         spec = self.get(delegate_id)
         connector = self.connector_for(delegate_id)
         protocol = spec.protocol_value
-        protocol_supported = protocol in {"acp", "a2a", "openai", "json_lines"}
+        built_in = protocol in self.BUILTIN_PROTOCOLS
+        connector_protocols = _declared_connector_protocols(spec, connector)
+        connector_ready = (
+            connector is not None and callable(connector) and protocol in connector_protocols
+        )
+        protocol_supported = built_in or connector_ready
         executable: str | None = None
         if spec.command:
             command = str(spec.command[0])
@@ -54,14 +61,15 @@ class DelegateRegistry:
                 executable = command if os.access(command, os.X_OK) else None
             else:
                 executable = shutil.which(command)
-        connector_ready = connector is not None and callable(connector)
         executable_ready = executable is not None
-        available = connector_ready or executable_ready
+        available = connector_ready or (built_in and executable_ready)
         return {
             "id": spec.id,
             "protocol": protocol,
             "configured": True,
             "connector_ready": connector_ready,
+            "built_in": built_in,
+            "connector_protocols": sorted(connector_protocols),
             "executable": executable,
             "executable_ready": executable_ready,
             "protocol_supported": protocol_supported,
@@ -74,7 +82,7 @@ class DelegateRegistry:
                     if not protocol_supported
                     else "delegate executable is unavailable"
                     if spec.command
-                    else "delegate connector is unavailable"
+                    else "delegate connector must explicitly declare this protocol"
                 )
             ),
         }
@@ -84,3 +92,20 @@ class DelegateRegistry:
 
 
 __all__ = ["DelegateRegistry"]
+
+
+def _declared_connector_protocols(
+    spec: DelegateSpec, connector: Callable[..., Any] | None
+) -> set[str]:
+    """Read an explicit host declaration; never infer protocol from a name."""
+    values: Any = spec.metadata.get("connector_protocols")
+    if values is None:
+        values = spec.metadata.get("supported_protocols")
+    if values is None:
+        values = getattr(connector, "protocols", None)
+    if values is None:
+        value = getattr(connector, "protocol", None)
+        values = (value,) if value is not None else ()
+    if isinstance(values, str):
+        values = (values,)
+    return {str(getattr(value, "value", value)) for value in values or ()}

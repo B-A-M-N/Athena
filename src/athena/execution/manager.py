@@ -25,6 +25,7 @@ from typing import Any, AsyncIterator, Mapping, cast
 
 from athena.execution.async_call import run_blocking
 from athena.execution.backend import ExecutionBackend
+from athena.execution.process_tree import process_group_id, process_start_identity
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionEventType,
@@ -698,8 +699,16 @@ class ExecutionManager:
                             and getattr(process_before, "poll", None) is not None
                             and process_before.poll() is None
                         ):
+                            pid = getattr(process_before, "pid", None)
                             unproven_kills.append(
-                                {"session_id": sid, "pid": getattr(process_before, "pid", None)}
+                                {
+                                    "session_id": sid,
+                                    "pid": pid,
+                                    "process_start_identity": (
+                                        process_start_identity(pid) if pid is not None else None
+                                    ),
+                                    "pgid": process_group_id(process_before),
+                                }
                             )
                     try:
                         await self._persist_session_closed(sid)

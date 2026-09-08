@@ -269,6 +269,7 @@ class AthenaService:
         self._watch_poll_task: asyncio.Task | None = None
         self._shutdown_hooks: list[tuple[str, Any]] = []
         self._resource_finalizer: Any = None
+        self._resource_obligation_store: Any = None
         self._shutdown_status: dict[str, Any] = {"state": "not_started"}
         self._budgets: BudgetTracker | None = None
         self._cancellations: CancellationManager | None = None
@@ -447,6 +448,35 @@ class AthenaService:
             ),
             "shutdown": dict(self._shutdown_status),
         }
+
+    async def retry_resource_cleanup(self, task_id: str) -> dict[str, Any]:
+        """Run the operator-visible retry path for durable resource obligations."""
+        finalizer = self._resource_finalizer
+        manager = self._task_manager
+        if finalizer is None or manager is None:
+            raise ServiceNotReady("resource finalization is not initialized")
+        task = await manager.get(str(task_id))
+        result = await manager.get_result(str(task_id))
+        if result is None:
+            from athena.protocol.tasks import TaskResult
+
+            result = TaskResult(
+                task_id=str(task_id),
+                status=TaskStatus.RECOVERY_REQUIRED,
+                summary="resource cleanup recovery",
+            )
+        await finalizer.retry(task, result)
+        health = finalizer.health()
+        check = self._startup_health.get("checks", {}).get("resource_obligations")
+        if isinstance(check, dict):
+            check.update(
+                {
+                    "status": "ok" if health["unresolved_count"] == 0 else "degraded",
+                    "blocking": health["unresolved_count"] > 0,
+                    "unresolved_count": health["unresolved_count"],
+                }
+            )
+        return health
 
     def _live_capability_profile_status(
         self, mcp: Mapping[str, Mapping[str, Any]] | None = None
@@ -3305,6 +3335,12 @@ class AthenaService:
         """Admit every model-backed Task before it enters durable state."""
         await self._require_provider_ready()
         await self.require_capability_profile_ready()
+        resources = self.runtime_health().get("resources") or {}
+        if int(resources.get("unresolved_count", 0) or 0) > 0:
+            raise ServiceNotReady(
+                "Task-owned resource cleanup requires recovery before new work is admitted.",
+                missing=["resource_teardown"],
+            )
         policy = spec.model_policy or _default_model_policy()
         await self._admit_model_roles(
             policy,

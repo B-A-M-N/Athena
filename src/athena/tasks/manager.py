@@ -108,6 +108,7 @@ class TaskManager:
         # that visibility window and fork/cross-interface snapshots remain
         # stable.
         self._finalization_events: dict[str, asyncio.Event] = {}
+        self._finalization_barrier: Any = None
         self._wakeup_callback: Any = None
 
     def add_finalize_observer(self, observer: Any) -> None:
@@ -129,6 +130,10 @@ class TaskManager:
     def set_wakeup_callback(self, callback: Any) -> None:
         """Bind the local worker wakeup without making it task authority."""
         self._wakeup_callback = callback
+
+    def set_finalization_barrier(self, callback: Any) -> None:
+        """Bind the pre-publication resource quiescence authority."""
+        self._finalization_barrier = callback
 
     @property
     def budgets(self) -> Any:
@@ -401,8 +406,69 @@ class TaskManager:
             usage=usage,
             created_at=utcnow(),
         )
-
         barrier = self._finalization_events.setdefault(task_id, asyncio.Event())
+
+        # Resource ownership is part of the completion claim. Do not publish
+        # COMPLETE/PARTIAL/FAILED/CANCELLED while a task-owned process or
+        # session still lacks a durable close proof. The barrier parks the
+        # task in RECOVERY_REQUIRED, which is resumable and visible to the
+        # operator, instead of manufacturing a terminal success.
+        if self._finalization_barrier is not None:
+            try:
+                barrier_result = self._finalization_barrier(resolved, result)
+                if inspect.isawaitable(barrier_result):
+                    barrier_result = await barrier_result
+            except Exception as exc:  # fail closed into recoverable state
+                _logger.warning("task %s finalization barrier failed: %s", task_id, exc)
+                barrier_result = {
+                    "confirmed": False,
+                    "unresolved": [{"resource_id": "unknown", "error": str(exc)}],
+                    "failures": [{"error": str(exc)}],
+                }
+            if isinstance(barrier_result, dict) and not barrier_result.get("confirmed", False):
+                unresolved = tuple(
+                    str(
+                        item.get("resource_id")
+                        or item.get("resource_type")
+                        or item.get("error")
+                        or "resource"
+                    )
+                    if isinstance(item, dict)
+                    else str(item)
+                    for item in barrier_result.get("unresolved", ())
+                )
+                blocked_summary = (
+                    "terminal result held: task-owned resource cleanup requires recovery"
+                )
+                blocked = TaskResult(
+                    task_id=task_id,
+                    status=TaskStatus.RECOVERY_REQUIRED,
+                    summary=blocked_summary,
+                    unresolved=unresolved or ("resource_cleanup",),
+                    usage=usage,
+                    created_at=utcnow(),
+                )
+                marker_store = getattr(self._store, "record_recovery_marker", None)
+                if marker_store is not None:
+                    await marker_store(
+                        task_id,
+                        {
+                            "kind": "task_finalization_quiescence",
+                            "intended_status": status.value,
+                            "summary": summary,
+                            "failures": list(barrier_result.get("failures", ())),
+                            "unresolved": list(barrier_result.get("unresolved", ())),
+                            "recorded_at": utcnow().isoformat(),
+                        },
+                    )
+                await self._finalize_atomically(task_id, TaskStatus.RECOVERY_REQUIRED, blocked)
+                self._running_emitted.discard(task_id)
+                await self._emit(
+                    resolved,
+                    TaskStatus.RECOVERY_REQUIRED,
+                    reason=blocked_summary,
+                )
+                return blocked
 
         # Status + result MUST land atomically (§86): do the transition and the
         # result persistence inside a single DB transaction so a crash cannot

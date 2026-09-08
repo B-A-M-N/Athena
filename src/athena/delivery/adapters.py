@@ -28,6 +28,13 @@ from typing import Any, Callable, Mapping, Protocol
 from athena.protocol.capabilities import ExternalEffectPhase
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import DeliverySpec, TaskResult
+from athena.state.external_effects import (
+    CONFLICT,
+    NEW,
+    RECOVERY_REQUIRED,
+    REPLAY_COMPLETED,
+    SAFE_TO_RETRY,
+)
 
 
 DELIVERED = "DELIVERED"
@@ -165,27 +172,60 @@ class WebhookAdapter:
         request_digest = _delivery_digest(spec, result)
         idempotency_key = f"delivery:{result.task_id}:{request_digest[:24]}"
 
+        external_identity = _destination_identifier(destination)
         transaction_id = new_id("delivery-tx")
         try:
-            await self._external_store.prepare(
-                transaction_id=transaction_id,
-                task_id=task_id,
-                capability_id=capability_id,
-                external_identity=_destination_identifier(destination),
-                request_digest=request_digest,
-                idempotency_key=idempotency_key,
-                phase=ExternalEffectPhase.PREPARE,
-            )
-            await self._external_store.finish(
-                transaction_id,
-                status="PREPARED",
-                phase=ExternalEffectPhase.PREPARE,
-            )
+            prepare_or_recover = getattr(self._external_store, "prepare_or_recover", None)
+            if prepare_or_recover is not None:
+                preparation = await prepare_or_recover(
+                    transaction_id=transaction_id,
+                    task_id=task_id,
+                    capability_id=capability_id,
+                    external_identity=external_identity,
+                    request_digest=request_digest,
+                    idempotency_key=idempotency_key,
+                )
+                preparation_status = str(preparation.status)
+                receipt = dict(preparation.receipt)
+                if preparation_status == REPLAY_COMPLETED:
+                    return DeliveryOutcome(ok=True, status=DELIVERED, receipt=receipt)
+                if preparation_status in {CONFLICT, RECOVERY_REQUIRED}:
+                    reason = (
+                        "delivery idempotency key conflicts with another request"
+                        if preparation_status == CONFLICT
+                        else "delivery outcome is unknown; explicit recovery is required"
+                    )
+                    return DeliveryOutcome(ok=False, status=FAILED, error=reason, receipt=receipt)
+                if preparation_status not in {NEW, SAFE_TO_RETRY}:
+                    return DeliveryOutcome(
+                        ok=False,
+                        status=FAILED,
+                        error=f"unsupported external preparation state: {preparation_status}",
+                        receipt=receipt,
+                    )
+                transaction_id = str(receipt["transaction_id"])
+            else:
+                # Compatibility for small third-party test doubles. The
+                # production store always implements prepare_or_recover.
+                await self._external_store.prepare(
+                    transaction_id=transaction_id,
+                    task_id=task_id,
+                    capability_id=capability_id,
+                    external_identity=external_identity,
+                    request_digest=request_digest,
+                    idempotency_key=idempotency_key,
+                    phase=ExternalEffectPhase.PREPARE,
+                )
+                await self._external_store.finish(
+                    transaction_id,
+                    status="PREPARED",
+                    phase=ExternalEffectPhase.PREPARE,
+                )
             receipt, replay = await self._external_store.begin_apply(
                 transaction_id=transaction_id,
                 task_id=task_id,
                 capability_id=capability_id,
-                external_identity=destination,
+                external_identity=external_identity,
                 request_digest=request_digest,
                 idempotency_key=idempotency_key,
             )
@@ -229,7 +269,7 @@ class WebhookAdapter:
                 )
             except Exception:
                 receipt = {"transaction_id": transaction_id, "error": str(exc)}
-            return DeliveryOutcome(ok=False, status=RETRYABLE, error=str(exc), receipt=receipt)
+            return DeliveryOutcome(ok=False, status=FAILED, error=str(exc), receipt=receipt)
 
         if not isinstance(response, Mapping):
             # A runner that resolves to a non-mapping breaks the response
@@ -247,7 +287,7 @@ class WebhookAdapter:
                 }
             return DeliveryOutcome(
                 ok=False,
-                status=RETRYABLE,
+                status=FAILED,
                 error="delivery runner returned a non-mapping response",
                 receipt=receipt,
             )
@@ -274,12 +314,15 @@ class WebhookAdapter:
             )
         receipt = await self._external_store.finish(
             transaction_id,
-            status="APPLY_FAILED",
+            status="RECOVERY_REQUIRED",
             response={"http_status": status_code},
-            error=f"delivery endpoint returned {status_code}",
+            error=f"delivery endpoint returned {status_code}; remote outcome requires verification",
         )
         return DeliveryOutcome(
-            ok=False, status=RETRYABLE, error=f"endpoint returned {status_code}", receipt=receipt
+            ok=False,
+            status=FAILED,
+            error=f"endpoint returned {status_code}; remote outcome requires verification",
+            receipt=receipt,
         )
 
 

@@ -24,6 +24,8 @@ import pytest
 from athena.delivery import DeliveryManager
 from athena.delivery.adapters import WebhookAdapter
 from athena.protocol.tasks import DeliverySpec, TaskResult, TaskSpec, TaskStatus
+from athena.state.database import Database
+from athena.state.external_effects import ExternalEffectStore
 
 
 class _FakeEvents:
@@ -261,30 +263,30 @@ async def test_connection_error_retries_then_records_failure():
     )
     await _run(manager, DeliverySpec(channel="webhook", destination="https://x.example/h"))
 
-    assert calls["n"] == 2
+    # Once APPLYING is written, a transport exception has an unknown remote
+    # outcome. Retrying would be an unsafe duplicate side effect.
+    assert calls["n"] == 1
     etype, payload, *_ = events.appended[0]
     assert etype == "DeliveryFailed"
-    assert payload["delivery_status"] == "RETRYABLE"
-    assert payload["attempts"] == 2
+    assert payload["delivery_status"] == "FAILED"
+    assert payload["attempts"] == 1
     assert payload["attempted_at"]
     assert payload["destination"].startswith("destination:")
     # Each failed attempt leaves an explicit recovery-required receipt —
     # never an APPLYING row pretending the outcome is known.
     statuses = [r["status"] for r in store.receipts.values()]
-    assert statuses.count("RECOVERY_REQUIRED") == 2
+    assert statuses.count("RECOVERY_REQUIRED") == 1
 
 
 @pytest.mark.athena_evidence("test", "unit")
-async def test_success_after_retry_records_actual_attempt_and_redacts_destination():
+async def test_uncertain_webhook_failure_is_not_blindly_retried():
     events = _FakeEvents()
     store = _FakeExternalStore()
     calls = {"n": 0}
 
     def runner(**kwargs):
         calls["n"] += 1
-        if calls["n"] == 1:
-            raise ConnectionError("temporary failure")
-        return {"status": 204}
+        raise ConnectionError("temporary failure")
 
     manager = DeliveryManager(
         event_store=events,
@@ -301,11 +303,64 @@ async def test_success_after_retry_records_actual_attempt_and_redacts_destinatio
         ),
     )
 
-    assert calls["n"] == 2
+    assert calls["n"] == 1
     payload = events.appended[0][1]
-    assert payload["delivery_status"] == "DELIVERED"
-    assert payload["attempts"] == 2
+    assert payload["delivery_status"] == "FAILED"
+    assert payload["attempts"] == 1
     assert "do-not-leak" not in json.dumps(payload)
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_real_store_replays_completed_webhook_without_network():
+    db = Database(":memory:")
+    await db._ensure_ready()
+    store = ExternalEffectStore(db)
+    sends: list[dict] = []
+
+    def runner(**kwargs):
+        sends.append(kwargs)
+        return {"status": 204}
+
+    adapter = WebhookAdapter(store, http_runner=runner)
+    spec = DeliverySpec(
+        channel="webhook",
+        destination="https://hooks.example/x?token=do-not-persist",
+    )
+    first = await adapter.send(spec, _result(), task_id="task-1")
+    second = await adapter.send(spec, _result(), task_id="task-1")
+
+    assert first.ok and second.ok
+    assert len(sends) == 1
+    rows = await db.fetch_all("SELECT * FROM external_effect_receipts")
+    assert len(rows) == 1
+    assert str(rows[0]["external_identity"]).startswith("destination:")
+    assert "do-not-persist" not in str(rows[0]["external_identity"])
+    await db.close()
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_real_store_fences_unknown_webhook_outcome_across_retry():
+    db = Database(":memory:")
+    await db._ensure_ready()
+    store = ExternalEffectStore(db)
+    calls = {"n": 0}
+
+    def runner(**kwargs):
+        calls["n"] += 1
+        raise ConnectionError("remote outcome unknown")
+
+    adapter = WebhookAdapter(store, http_runner=runner)
+    spec = DeliverySpec(channel="webhook", destination="https://hooks.example/x")
+    first = await adapter.send(spec, _result(), task_id="task-1")
+    second = await adapter.send(spec, _result(), task_id="task-1")
+
+    assert calls["n"] == 1
+    assert first.status == "FAILED"
+    assert second.status == "FAILED"
+    assert "recovery" in (second.error or "")
+    rows = await db.fetch_all("SELECT status FROM external_effect_receipts")
+    assert [row["status"] for row in rows] == ["RECOVERY_REQUIRED"]
+    await db.close()
 
 
 @pytest.mark.athena_evidence("test", "unit")
