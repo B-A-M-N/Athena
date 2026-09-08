@@ -243,6 +243,120 @@ class SkillLifecycle:
         )
         return True
 
+    async def record_candidate(
+        self,
+        candidate: SkillCandidate,
+        *,
+        task_id: str | None = None,
+        lifecycle_state: str = "PENDING_REVIEW",
+    ) -> str:
+        """Persist one reviewable skill draft without activating it.
+
+        Candidate content is stored separately from active skills.  This
+        makes the pending queue durable and inspectable while preserving the
+        existing explicit validation/promotion gate.
+        """
+        result = self._validator.validate_candidate(candidate)
+        if not result.ok:
+            lifecycle_state = "REJECTED"
+        now = utcnow().isoformat()
+        candidate_id = candidate.id
+        await self._db.execute(
+            "INSERT INTO skill_candidates("
+            "id, source_task_id, name, draft, rationale, evidence, confidence, "
+            "lifecycle_state, promoted_skill_id, created_at, updated_at, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, "
+            "lifecycle_state=CASE WHEN skill_candidates.lifecycle_state IN "
+            "('PROMOTED', 'DEPRECATED') THEN skill_candidates.lifecycle_state "
+            "ELSE excluded.lifecycle_state END",
+            (
+                candidate_id,
+                candidate.source_task_id,
+                candidate.propose_name,
+                json.dumps(_candidate_draft_record(candidate.draft), sort_keys=True),
+                candidate.rationale,
+                json.dumps(list(candidate.evidence), sort_keys=True),
+                float(candidate.confidence),
+                lifecycle_state,
+                now,
+                now,
+                json.dumps(
+                    {
+                        "task_id": task_id or candidate.source_task_id,
+                        "validation_errors": list(result.errors),
+                        "validation_warnings": list(result.warnings),
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        await self._emit_candidate(
+            candidate,
+            accepted=False,
+            task_id=task_id,
+            candidate_id=candidate_id,
+            lifecycle_state=lifecycle_state,
+        )
+        return candidate_id
+
+    async def list_candidates(self, *, include_reviewed: bool = False) -> List[dict[str, Any]]:
+        """List durable skill candidates for the shared operator review view."""
+        sql = "SELECT * FROM skill_candidates"
+        params: tuple[Any, ...] = ()
+        if not include_reviewed:
+            sql += " WHERE lifecycle_state IN ('PENDING_REVIEW', 'REJECTED')"
+        sql += " ORDER BY updated_at DESC, id"
+        rows = await self._db.fetch_all(sql, params)
+        return [_candidate_record(row) for row in rows]
+
+    async def get_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        row = await self._db.fetch_one(
+            "SELECT * FROM skill_candidates WHERE id = ?", (candidate_id,)
+        )
+        return _candidate_record(row) if row else None
+
+    async def discard_candidate(self, candidate_id: str) -> bool:
+        row = await self._db.fetch_one(
+            "SELECT lifecycle_state FROM skill_candidates WHERE id = ?", (candidate_id,)
+        )
+        if row is None or str(row.get("lifecycle_state")) not in {
+            "PENDING_REVIEW",
+            "REJECTED",
+        }:
+            return False
+        await self._db.execute(
+            "UPDATE skill_candidates SET lifecycle_state = 'DEPRECATED', updated_at = ? WHERE id = ?",
+            (utcnow().isoformat(), candidate_id),
+        )
+        return True
+
+    async def promote_candidate(
+        self,
+        candidate_id: str,
+        *,
+        task_id: str | None = None,
+        authorized: bool = True,
+    ) -> str | None:
+        """Promote one stored candidate through the normal skill gate."""
+        row = await self._db.fetch_one(
+            "SELECT * FROM skill_candidates WHERE id = ?", (candidate_id,)
+        )
+        if row is None:
+            return None
+        if str(row.get("lifecycle_state")) != "PENDING_REVIEW":
+            return None
+        candidate = _candidate_from_record(row)
+        skill_id = await self.promote(candidate, task_id=task_id, authorized=authorized)
+        if skill_id is None:
+            return None
+        await self._db.execute(
+            "UPDATE skill_candidates SET lifecycle_state = 'PROMOTED', "
+            "promoted_skill_id = ?, updated_at = ? WHERE id = ?",
+            (skill_id, utcnow().isoformat(), candidate_id),
+        )
+        return skill_id
+
     async def history(self, skill_id: str) -> List[dict]:
         return await self._db.fetch_all(
             "SELECT version, content, created_at FROM skill_versions "
@@ -273,7 +387,7 @@ class SkillLifecycle:
         refused and only a rejected candidate event is emitted (never silent).
         """
         if not authorized:
-            await self._emit_candidate(candidate, accepted=False, task_id=task_id)
+            await self.record_candidate(candidate, task_id=task_id)
             logger.warning("skill promotion blocked by policy for %s", candidate.propose_name)
             return None
 
@@ -342,13 +456,24 @@ class SkillLifecycle:
         except Exception as exc:
             logger.warning("failed to append skill event: %s", exc)
 
-    async def _emit_candidate(self, candidate, *, accepted, skill_id=None, task_id=None):
+    async def _emit_candidate(
+        self,
+        candidate,
+        *,
+        accepted,
+        skill_id=None,
+        task_id=None,
+        candidate_id=None,
+        lifecycle_state=None,
+    ):
         payload = {
             "source_task_id": candidate.source_task_id,
             "target_skill": candidate.target_skill,
             "name": candidate.propose_name,
             "confidence": candidate.confidence,
             "accepted": accepted,
+            "candidate_id": candidate_id or candidate.id,
+            "lifecycle_state": lifecycle_state or ("PROMOTED" if accepted else "PENDING_REVIEW"),
         }
         if skill_id:
             payload["skill_id"] = skill_id
@@ -358,6 +483,85 @@ class SkillLifecycle:
             else EventCategory.SKILL_CANDIDATE_CREATED.value
         )
         await self._emit(ev_type, payload, task_id=task_id)
+
+
+def _candidate_draft_record(skill: Skill) -> dict[str, Any]:
+    return {
+        "id": skill.id,
+        "name": skill.name,
+        "description": skill.description,
+        "body": skill.body,
+        "triggers": list(skill.triggers),
+        "scope": skill.scope,
+        "trust": skill.trust.value,
+        "version": skill.version,
+        "metadata": dict(skill.metadata),
+    }
+
+
+def _candidate_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        draft = json.loads(str(row.get("draft") or "{}"))
+    except (TypeError, ValueError):
+        draft = {}
+    try:
+        evidence = json.loads(str(row.get("evidence") or "[]"))
+    except (TypeError, ValueError):
+        evidence = []
+    try:
+        metadata = json.loads(str(row.get("metadata") or "{}"))
+    except (TypeError, ValueError):
+        metadata = {}
+    return {
+        "id": str(row.get("id") or ""),
+        "type": "skill",
+        "name": str(row.get("name") or draft.get("name") or ""),
+        "draft": draft,
+        "source_task": str(row.get("source_task_id") or ""),
+        "evidence": evidence if isinstance(evidence, list) else [],
+        "observation_count": 1,
+        "last_observed_at": row.get("updated_at"),
+        "proposed_scope": draft.get("scope") or "user",
+        "trust": draft.get("trust") or TrustClass.AGENT_CURATED.value,
+        "conflicts": [],
+        "required_action": "operator_review",
+        "lifecycle_state": str(row.get("lifecycle_state") or "PENDING_REVIEW"),
+        "rationale": str(row.get("rationale") or ""),
+        "confidence": float(row.get("confidence") or 0.0),
+        "promoted_skill_id": row.get("promoted_skill_id"),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+    }
+
+
+def _candidate_from_record(row: Mapping[str, Any]) -> SkillCandidate:
+    raw = json.loads(str(row.get("draft") or "{}"))
+    try:
+        trust = TrustClass(str(raw.get("trust") or TrustClass.AGENT_CURATED.value))
+    except ValueError:
+        trust = TrustClass.AGENT_CURATED
+    draft = Skill(
+        id=str(raw.get("id") or ""),
+        name=str(raw.get("name") or row.get("name") or ""),
+        description=str(raw.get("description") or ""),
+        body=str(raw.get("body") or ""),
+        triggers=tuple(str(item) for item in raw.get("triggers") or ()),
+        scope=str(raw.get("scope") or "user"),
+        trust=trust,
+        version=int(raw.get("version") or 1),
+        metadata=dict(raw.get("metadata") or {}),
+    )
+    try:
+        evidence = json.loads(str(row.get("evidence") or "[]"))
+    except (TypeError, ValueError):
+        evidence = []
+    return SkillCandidate(
+        draft=draft,
+        source_task_id=str(row.get("source_task_id") or ""),
+        target_skill=None,
+        rationale=str(row.get("rationale") or ""),
+        evidence=tuple(str(item) for item in evidence or ()),
+        confidence=float(row.get("confidence") or 0.0),
+    )
 
 
 class SkillStore:

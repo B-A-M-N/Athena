@@ -7,9 +7,10 @@ Three cooperating pieces of the fusion thesis:
    When the workspace changes afterward, affected claims become STALE:
    not false, but no longer trustworthy without reverification.
 
-2. InvariantSet   — continuous invariants checked AFTER each mutation,
-   giving autonomous work a runtime safety envelope instead of
-   end-of-task verification alone.
+2. InvariantSet   — invariants checked ONCE per speculative experiment,
+   after shadow execution and BEFORE commit (P1-22: this is a pre-commit
+   gate, not a per-mutation runtime envelope — the fusion orchestrator
+   is its only evaluator).
 
 3. TaskWorldState — a structured, execution-grounded snapshot of what is
    actually true for a task right now: dirty files, mutation counts,
@@ -28,6 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from athena.execution.async_call import run_blocking
 from athena.protocol.ids import new_id
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -104,7 +106,7 @@ class ClaimRegistry:
             depends_on_paths=tuple(depends_on_paths or ()),
         )
         self._claims[claim.id] = claim
-        if self._store is not None:
+        if self._store is not None and claim.task_id is not None:
             self._persist(
                 self._store.save_claim(
                     {
@@ -157,6 +159,10 @@ class ClaimRegistry:
         """Mark claims STALE when a path they depend on has been mutated.
 
         Returns the claims whose status changed so callers can surface it.
+        Persistence stays best-effort background here: the registry API is
+        synchronous (both watcher and orchestrator call it without awaiting),
+        and the mutation boundary that DOES need the write committed before
+        proceeding awaits ``WorldStateStore.invalidate_for_paths`` directly.
         """
         changed = set(changed_paths)
         flipped: list[Claim] = []
@@ -223,7 +229,15 @@ class Invariant:
 
 
 class InvariantSet:
-    """Runtime safety envelope: probes run after each mutation batch."""
+    """Pre-commit safety envelope: probes run once per speculative
+    experiment, after shadow execution and before commit touches
+    reality (P1-22).
+
+    The docstring previously claimed "probes run after each mutation
+    batch" — no mutation boundary consumes this class. It is evaluated
+    once, by the fusion orchestrator, on the shadow copy before a
+    verified branch may commit.
+    """
 
     def __init__(self, *, task_id: str | None = None, store: WorldStateStore | None = None) -> None:
         self.task_id = task_id
@@ -509,6 +523,7 @@ class TaskWorldState:
                 return []
             return []
 
-        import asyncio
-
-        return await asyncio.get_running_loop().run_in_executor(None, _git)
+        # Do not initialize the process-wide default executor for this small
+        # observation.  Embedded/test hosts may hang while that executor is
+        # shut down even after the Git child has exited.
+        return await run_blocking(_git)

@@ -120,6 +120,7 @@ class ArtifactCapability:
             "the operation. Operations: list/read/slice/search/extract. Reads "
             "are bounded; use offset/limit or search for large results."
         ),
+        tags=frozenset({"artifact", "artifacts", "report", "result"}),
         input_schema={
             "oneOf": [
                 {

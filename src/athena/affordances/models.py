@@ -85,6 +85,8 @@ class GeneratedValidationCase:
     """Typed behavioral fixture used by validation and promotion."""
 
     args: Mapping[str, Any] = field(default_factory=dict)
+    source: str = "authored"
+    expect_invalid_input: bool = False
     expected_output: Any = None
     expects_output: bool = False
     expected_output_contains: Any = None
@@ -105,6 +107,8 @@ class GeneratedValidationCase:
         expected = data.get("expected_output", data.get("expect_output"))
         return cls(
             args=dict(data.get("args") or {}),
+            source=str(data.get("source") or "authored"),
+            expect_invalid_input=bool(data.get("expect_invalid_input", False)),
             expected_output=expected,
             expects_output=("expected_output" in data or "expect_output" in data),
             expected_output_contains=data.get(
@@ -157,6 +161,10 @@ class GeneratedValidationCase:
 
     def to_record(self) -> dict[str, Any]:
         record: dict[str, Any] = {"args": dict(self.args)}
+        if self.source != "authored":
+            record["source"] = self.source
+        if self.expect_invalid_input:
+            record["expect_invalid_input"] = True
         if self.expects_output:
             record["expect_output"] = self.expected_output
         if self.expected_output_contains is not None:
@@ -215,7 +223,12 @@ class GeneratedCapability:
     validation_suite: tuple[GeneratedValidationCase, ...] = ()
     version: int = 1
     lifecycle_state: str = "DRAFT"
+    family_id: str = ""
+    revision: int = 1
+    parent_revision: int | None = None
+    active_revision: int | None = None
     supersedes: tuple[str, ...] = ()
+    superseded_by: str | None = None
     quality_score: float = 0.0
     use_count: int = 0
     success_count: int = 0
@@ -225,6 +238,12 @@ class GeneratedCapability:
     lifecycle_history: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
+        if not self.family_id:
+            object.__setattr__(self, "family_id", f"generated:{self.name}")
+        if self.revision < 1:
+            raise ValueError("generated capability revision must be positive")
+        if self.active_revision is None and self.lifecycle_state != "SUPERSEDED":
+            object.__setattr__(self, "active_revision", self.revision)
         computed_code_hash = hashlib.sha256(self.implementation.encode()).hexdigest()
         if self.code_hash and self.code_hash != computed_code_hash:
             raise ValueError("generated capability code_hash does not match implementation")
@@ -281,7 +300,12 @@ class GeneratedCapability:
             "validation_suite": [case.to_record() for case in self.validation_suite],
             "version": self.version,
             "lifecycle_state": self.lifecycle_state,
+            "family_id": self.family_id,
+            "revision": self.revision,
+            "parent_revision": self.parent_revision,
+            "active_revision": self.active_revision,
             "supersedes": list(self.supersedes),
+            "superseded_by": self.superseded_by,
             "quality_score": self.quality_score,
             "use_count": self.use_count,
             "success_count": self.success_count,
@@ -330,7 +354,16 @@ class GeneratedCapability:
             ),
             version=int(data.get("version") or 1),
             lifecycle_state=str(data.get("lifecycle_state") or "DRAFT"),
+            family_id=str(data.get("family_id") or ""),
+            revision=int(data.get("revision") or 1),
+            parent_revision=(
+                int(data["parent_revision"]) if data.get("parent_revision") is not None else None
+            ),
+            active_revision=(
+                int(data["active_revision"]) if data.get("active_revision") is not None else None
+            ),
             supersedes=tuple(str(item) for item in data.get("supersedes") or ()),
+            superseded_by=(str(data["superseded_by"]) if data.get("superseded_by") else None),
             quality_score=float(data.get("quality_score") or 0.0),
             use_count=int(data.get("use_count") or 0),
             success_count=int(data.get("success_count") or 0),

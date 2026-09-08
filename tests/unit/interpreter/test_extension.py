@@ -222,6 +222,30 @@ async def test_interpreter_subturn_emits_role_tagged_events(stack):
     assert started[0].payload.get("subturn") is True
 
 
+async def test_interpreter_subturn_emits_exactly_one_lifecycle_pair(stack):
+    """P1-8 regression: one subturn, ONE ModelRequestStarted/Completed pair.
+
+    The subturn once emitted its own pair and then called _invoke, which
+    emitted another — the provider call happened once but telemetry saw
+    duplicate inference boundaries, corrupting operator displays, latency
+    attribution, and any event-derived accounting. The subturn's markers
+    (role, subturn, inference_kind) now ride _invoke's single emission.
+    """
+    task = await _persisted_task(stack)
+    ctx = _context(stack.kernel, task)
+    ext = _extension(stack)
+    await ext.interpret(_observation(), ctx)
+    rows = await stack.events.list_for_task(task.id)
+    started = [e for e in rows if e.type == "ModelRequestStarted"]
+    completed = [e for e in rows if e.type == "ModelResponseCompleted"]
+    assert len(started) == 1, f"expected 1 ModelRequestStarted, got {len(started)}"
+    assert len(completed) == 1, f"expected 1 ModelResponseCompleted, got {len(completed)}"
+    assert started[0].payload.get("role") == "interpreter"
+    assert started[0].payload.get("subturn") is True
+    assert started[0].payload.get("inference_kind") == "interpreter"
+    assert completed[0].payload.get("inference_kind") == "interpreter"
+
+
 async def test_interpreter_subturn_cancel_raises(stack):
     task = await _persisted_task(stack)
     ctx = _context(stack.kernel, task)

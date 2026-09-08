@@ -150,6 +150,8 @@ class _SubprocessSession:
                     self.process.stdin.close()
                 if self.process.stdout is not None:
                     self.process.stdout.close()
+                if self.process.stderr is not None:
+                    self.process.stderr.close()
             except Exception:
                 pass
             self.process = None

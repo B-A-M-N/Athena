@@ -8,7 +8,6 @@ Athena will refuse to overwrite a concurrent change.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import json
@@ -21,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from athena.protocol.ids import new_id
-from athena.workspace_manifest import copy_ignore, tree_paths
+from athena.workspace_manifest import copy_ignore, copy_workspace_tree, tree_paths
 
 _logger = logging.getLogger(__name__)
 _IGNORE_PATTERNS = copy_ignore
@@ -230,12 +229,11 @@ class CheckpointManager:
         self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._root.chmod(0o700)
         dest = self._root / checkpoint_id
-        shutil.copytree(
+        copy_workspace_tree(
             src,
             dest,
             ignore=_IGNORE_PATTERNS,
             dirs_exist_ok=False,
-            symlinks=True,
         )
         dest.chmod(0o700)
         file_manifest = _tree_manifest(dest)
@@ -490,7 +488,14 @@ async def _run_worker(operation: str, **kwargs) -> dict:
     The service event loop must not perform copytree/rglob/hash work itself.
     A child process also avoids coupling checkpoint latency to asyncio's
     process-global default thread executor.
+
+    ``asyncio`` is imported lazily: this module is also the child worker's
+    import target, and a child that never awaits must not pay the ~0.5s
+    asyncio/ssl import cost on every spawn (measured stall contributor for
+    verification/commit chains, review P0-3 adjacent).
     """
+    import asyncio  # noqa: PLC0415 - see docstring; child process must not pay this
+
     command = [sys.executable, "-m", "athena.causal.checkpoint_worker", operation]
     for key, value in kwargs.items():
         if value is None:
@@ -501,7 +506,17 @@ async def _run_worker(operation: str, **kwargs) -> dict:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    try:
+        stdout, stderr = await process.communicate()
+    except asyncio.CancelledError:
+        # Shutdown/cancellation must not orphan the child (P0-2): kill it and
+        # wait for exit so no transport outlives the event loop.
+        process.kill()
+        try:
+            await process.wait()
+        except Exception:
+            pass
+        raise
     try:
         payload = json.loads(stdout.decode("utf-8")) if stdout else {}
     except json.JSONDecodeError as exc:

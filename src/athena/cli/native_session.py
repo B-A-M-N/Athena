@@ -12,7 +12,9 @@ from typing import Any
 
 from athena.cli.app import Options, _autonomy, _model_policy, build_config, workspace_spec
 from athena.cli.native_bridge import write_native_projection
+from athena.cli.operator_commands import OperatorCommandRouter
 from athena.cli.projection import ProjectionState
+from athena.execution.async_call import run_blocking
 from athena.protocol.tasks import AgentRequest
 
 _FORCE_PROJECTION_EVENTS = frozenset(
@@ -38,20 +40,101 @@ class NativeSession:
         self._tasks: set[asyncio.Task[Any]] = set()
         self._foreground_task: asyncio.Task[Any] | None = None
         self._foreground_task_id: str | None = None
+        self._last_task_id: str | None = None
+        self.session_id: str | None = None
+        self._autonomy_level = _autonomy(options.autonomy)
+        self._model_name = options.model
+        self._criteria: list[str] = [
+            item.strip() for item in (options.criteria or "").split(";") if item.strip()
+        ]
         self._projection_task: asyncio.Task[Any] | None = None
         self._projection_lock = asyncio.Lock()
         self._projection_dirty = False
         self._projection_interval = 0.05
+        self._bridge_state = "disconnected"
+        self._bridge_error: str | None = None
+        self._navigation: dict[str, Any] | None = None
+        self._operator_router = OperatorCommandRouter(
+            lambda: self.service,
+            emit=print,
+            get_task_id=lambda: self._last_task_id,
+            get_session_id=lambda: self.session_id,
+            set_session_id=lambda value: setattr(self, "session_id", value),
+            set_model=self._set_model,
+            set_autonomy=self._set_autonomy,
+            set_criteria=lambda value: setattr(self, "_criteria", value),
+            new_handler=self._new_session,
+            resume_handler=self._resume_command,
+        )
+
+    def _set_model(self, value: str | None) -> None:
+        self._model_name = value
+
+    def _set_autonomy(self, value: str) -> str:
+        self._autonomy_level = _autonomy(value)
+        return self._autonomy_level.value
+
+    def _new_session(self) -> None:
+        self.session_id = None
+        self._foreground_task_id = None
+        self._last_task_id = None
+        self._navigation = None
+
+    async def _resume_command(self, argument: str) -> None:
+        if self._foreground_task is not None and not self._foreground_task.done():
+            print("BUSY: a foreground task is still running")
+            return
+        rows = await self.service.list_interrupted() if not argument else []
+        task_id = argument or (rows[0].get("id") if rows else None)
+        if not task_id:
+            print("(no interrupted tasks to resume)")
+            return
+        spec = await self.service.resume_task(task_id)
+        resolved_id = str(getattr(spec, "id", task_id))
+        self.session_id = getattr(spec, "session_id", self.session_id)
+        self._last_task_id = resolved_id
+        await self._finish_task(resolved_id)
 
     async def start(self) -> None:
         socket_path = os.environ.get("ATHENA_NATIVE_BRIDGE_SOCKET")
         if not socket_path:
             raise RuntimeError("ATHENA_NATIVE_BRIDGE_SOCKET is not set")
         self._writer = await self._connect(socket_path)
+        self._bridge_state = "connected"
+        self._bridge_error = None
         from athena.service.service import AthenaService
 
         self.service = AthenaService(config=build_config(self.options))
         await self.service.start()
+        registry = getattr(self.service, "_model_registry", None)
+        if registry is None:
+            readiness = {"state": "unconfigured"}
+        else:
+            probe = getattr(registry, "readiness", None)
+            readiness = (
+                probe()
+                if callable(probe)
+                else {
+                    "state": "ready"
+                    if callable(getattr(registry, "names", None)) and registry.names()
+                    else "unconfigured"
+                }
+            )
+        if not isinstance(readiness, dict) or readiness.get("state") != "ready":
+            state = (
+                readiness.get("state", "unconfigured")
+                if isinstance(readiness, dict)
+                else "degraded"
+            )
+            self.projection.model_request_status = state
+            self.projection.status = (
+                "MODEL UNCONFIGURED" if state == "unconfigured" else "MODEL NOT READY"
+            )
+            self.projection.status_message = (
+                "Configure a model provider before submitting work."
+                if state == "unconfigured"
+                else "A configured model provider is not ready for submission."
+            )
         events = getattr(self.service, "_store_events", None)
         if events is None:
             raise RuntimeError("AthenaService did not expose its event store")
@@ -76,8 +159,9 @@ class NativeSession:
             except Exception:
                 pass
         if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
+            writer, self._writer = self._writer, None
+            writer.close()
+            await writer.wait_closed()
 
     async def _connect(self, path: str) -> asyncio.StreamWriter:
         last_error: Exception | None = None
@@ -121,9 +205,20 @@ class NativeSession:
             self._projection_dirty = False
             try:
                 await self._send_projection()
-            except Exception:
-                self._projection_dirty = True
-                raise
+            except (ConnectionError, OSError, RuntimeError) as exc:
+                # The native compositor is a projection client. If it
+                # disappears, detach it explicitly while leaving the
+                # service/kernel and durable task state alive for recovery.
+                self._bridge_state = "detached"
+                self._bridge_error = f"{type(exc).__name__}: {exc}"
+                self._projection_dirty = False
+                writer, self._writer = self._writer, None
+                if writer is not None:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except (ConnectionError, OSError, RuntimeError):
+                        pass
 
     async def _send_projection(self) -> None:
         if self._writer is None:
@@ -133,9 +228,11 @@ class NativeSession:
             output,
             self.projection,
             character=self.options.mascot or "owl",
+            navigation=self._navigation,
         )
         self._writer.write(output.getvalue().encode("utf-8"))
         await self._writer.drain()
+        self._navigation = None
 
     async def run(self) -> int:
         input_attrs = self._disable_input_echo()
@@ -155,13 +252,23 @@ class NativeSession:
                 if line in {"/exit", "/quit"}:
                     return 0
                 if line == "/help":
-                    print("/approve ID  /cancel ID  /exit")
+                    print(
+                        "/approve ID [call|task|session|project]  /deny ID  /cancel ID\n"
+                        "/permissions  /diff [N]  /undo ID  /context  /criteria LIST\n"
+                        "/interrupted  /resume [TASK]  /sessions  /model NAME\n"
+                        "/jobs ...  /workflows ...  /skills ...  /packs ...  /health\n"
+                        "/candidates  /candidate ID  /promote ID project|user\n"
+                        "/deprecate ID  /mascot [owl|cat|bot|off]\n"
+                        "/autonomy LEVEL  /scroll oi up|down|bottom [N]  /exit"
+                    )
                     continue
-                if line.startswith("/approve "):
-                    await self._approve(line.removeprefix("/approve ").strip())
+                if line.startswith("/"):
+                    if await self._dispatch_command(line):
+                        continue
+                    print(f"unknown command: {line}")
                     continue
-                if line.startswith("/cancel "):
-                    await self._cancel(line.removeprefix("/cancel ").strip())
+                if self._foreground_task is not None and not self._foreground_task.done():
+                    print("BUSY: a foreground task is still running; use /cancel TASK")
                     continue
                 task = asyncio.create_task(self._submit(line))
                 self._tasks.add(task)
@@ -175,7 +282,7 @@ class NativeSession:
     async def _readline(self) -> str:
         """Read one completed native-editor line without worker-thread leaks."""
         if not sys.stdin.isatty():
-            return await asyncio.to_thread(sys.stdin.readline)
+            return await run_blocking(sys.stdin.readline)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
         fd = sys.stdin.fileno()
@@ -220,6 +327,10 @@ class NativeSession:
             pass
 
     def _task_finished(self, task: asyncio.Task[Any]) -> None:
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                print(f"ATHENA ERROR: {error}", file=sys.stderr)
         if self._foreground_task is task:
             self._foreground_task = None
             self._foreground_task_id = None
@@ -244,26 +355,26 @@ class NativeSession:
         print(f"\nYOU\n{objective}")
         request = AgentRequest(
             prompt=objective,
-            autonomy=_autonomy(self.options.autonomy),
+            session_id=self.session_id,
+            autonomy=self._autonomy_level,
             workspace=workspace_spec(self.options.workspace),
-            model_policy=_model_policy(self.options.model),
+            model_policy=_model_policy(self._model_name),
             metadata={
-                "acceptance_criteria": [
-                    item.strip()
-                    for item in (self.options.criteria or "").split(";")
-                    if item.strip()
-                ],
+                "acceptance_criteria": list(self._criteria),
             }
-            if self.options.criteria
+            if self._criteria
             else {},
         )
         task = await self.service.submit(request, wait=False)
+        self.session_id = getattr(task, "session_id", self.session_id)
         task_id = getattr(task, "id", task)
         self._foreground_task_id = str(task_id)
-        async for event in self.service.stream_events(task_id, after_sequence=0):
-            if event.type == "ApprovalRequested":
-                approval_id = (event.payload or {}).get("approval_id", "?")
-                print(f"\nAPPROVAL REQUIRED\n/approve {approval_id}")
+        self._last_task_id = str(task_id)
+        async for _event in self.service.stream_events(task_id, after_sequence=0):
+            # Approval is projected into the native OI rail. Keep the PTY
+            # transcript free of a second, stale prompt; the command remains
+            # available as a keyboard/debug fallback.
+            pass
         result = await self.service.get_result(task_id)
         if result is None:
             print("\nATHENA\nThe request has no final result yet.")
@@ -271,19 +382,60 @@ class NativeSession:
         summary = getattr(result, "summary", "") or "The request finished without a summary."
         print(f"\nATHENA\n{summary}")
 
-    async def _approve(self, approval_id: str) -> None:
-        if not approval_id:
-            print("approval id required")
-            return
-        await self.service.approve(approval_id, granted=True)
-        print(f"approval {approval_id}: granted")
+    async def _dispatch_command(self, line: str) -> bool:
+        """Route native meta commands through the same service APIs as chat."""
+        if await self._operator_router.dispatch(line):
+            return True
+        name, _, argument = line[1:].partition(" ")
+        name = name.strip().lower()
+        argument = argument.strip()
+        if name == "scroll":
+            parts = argument.split()
+            if len(parts) < 2 or parts[0].casefold() not in {"oi", "right", "history"}:
+                print("usage: /scroll oi up|down|bottom [N]")
+                return True
+            direction = parts[1].casefold()
+            if direction not in {"up", "down", "bottom", "live"}:
+                print("usage: /scroll oi up|down|bottom [N]")
+                return True
+            try:
+                amount = int(parts[2]) if len(parts) > 2 else 1
+            except ValueError:
+                print("scroll amount must be a number")
+                return True
+            self._navigation = {
+                "pane": "oi",
+                "direction": direction,
+                "amount": max(1, min(abs(amount), 32)),
+            }
+            self._projection_dirty = True
+            await self._flush_projection()
+            print(f"native OI scroll: {direction}")
+            return True
+        if name == "details":
+            print("native details are always semantic and bounded")
+            return True
+        if name == "mascot":
+            if not argument:
+                print(f"mascot: {self.options.mascot or 'owl'}")
+                return True
+            if argument.casefold() not in {"owl", "cat", "bot", "off"}:
+                print("usage: /mascot owl|cat|bot|off")
+                return True
+            self.options.mascot = argument.casefold()
+            self._projection_dirty = True
+            print(f"mascot: {self.options.mascot}")
+            return True
+        return False
 
-    async def _cancel(self, task_id: str) -> None:
-        if not task_id:
-            print("task id required")
-            return
-        await self.service.cancel(task_id)
-        print(f"cancel requested for {task_id}")
+    async def _finish_task(self, task_id: str) -> None:
+        self._foreground_task_id = task_id
+        self._last_task_id = task_id
+        async for _event in self.service.stream_events(task_id, after_sequence=0):
+            pass
+        result = await self.service.get_result(task_id)
+        if result is not None:
+            print(f"\nATHENA\n{getattr(result, 'summary', '') or 'request finished'}")
 
 
 def parse_args(argv: list[str] | None = None) -> Options:

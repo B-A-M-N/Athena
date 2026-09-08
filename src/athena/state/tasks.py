@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from athena.protocol.errors import IllegalStateTransition
+from athena.protocol.errors import IllegalStateTransition, TaskOwnershipLost
 from athena.protocol.messages import utcnow
 from athena.protocol.tasks import FINAL_STATUSES, TaskStatus
 from athena.state.database import Database
@@ -88,10 +88,21 @@ class TaskStore:
                     f"allowed: {sorted(s.value for s in allowed)}"
                 )
             now = utcnow().isoformat()
-            await self._db.execute_raw(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                (new_status.value, now, task_id),
-            )
+            if current is TaskStatus.RUNNING and new_status is not TaskStatus.RUNNING:
+                # Leaving RUNNING ends the live lease. A paused (WAITING_*),
+                # interrupted, or terminal task must never look owned by a
+                # worker; ownership history stays in events, not in a stale
+                # live-looking lease that would block or mislead re-claim.
+                await self._db.execute_raw(
+                    "UPDATE tasks SET status = ?, updated_at = ?, "
+                    "claimed_by = NULL, lease_expires_at = NULL WHERE id = ?",
+                    (new_status.value, now, task_id),
+                )
+            else:
+                await self._db.execute_raw(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (new_status.value, now, task_id),
+                )
             if new_status in FINAL_STATUSES:
                 await self._db.execute_raw(
                     "UPDATE tasks SET completed_at = ? WHERE id = ?",
@@ -194,6 +205,8 @@ class TaskStore:
         *,
         runtime_session_id: str,
         backend: str | None = None,
+        runtime: str | None = None,
+        cwd: str | None = None,
     ) -> None:
         """Persist a fail-closed hint for the next context compilation.
 
@@ -213,9 +226,16 @@ class TaskStore:
         metadata["_runtime_recovery_hint"] = {
             "runtime_session_id": str(runtime_session_id),
             "backend": str(backend or "unknown"),
+            "runtime": str(runtime or backend or "unknown"),
+            "cwd": str(cwd) if cwd else None,
+            "recovery_route": "execute",
+            "replay_command": False,
+            "recovery_action": "reestablish_runtime",
             "message": (
                 "Runtime state was lost across restart. Do not assume prior "
-                "process variables or session state exist; re-establish state explicitly."
+                "process variables or session state exist; invoke execute with a fresh "
+                "task-owned runtime and reconstruct required state explicitly. Do not "
+                "replay a stale command automatically."
             ),
         }
         await self._db.execute(
@@ -357,12 +377,18 @@ class TaskStore:
         *,
         worker_id: str,
         lease_duration_seconds: float = 300.0,
+        reclaim_grace_seconds: float = 0.0,
     ) -> dict | None:
         """Atomically claim a task with a worker-specific lease.
 
         Transitions QUEUED|INTERRUPTED -> RUNNING. If a task is already RUNNING
-        but its lease has expired, it can be re-claimed by the new worker via
-        lease transfer (CAS on claimed_by/lease_expires_at).
+        but its lease has expired by more than ``reclaim_grace_seconds``, it can
+        be re-claimed by the new worker via lease transfer (CAS on
+        claimed_by/lease_expires_at). The grace exists so a live owner whose
+        heartbeat tick was merely delayed by a loaded event loop keeps
+        ownership: callers should set the grace near their renewal interval so
+        reclaim requires the owner to have missed substantially more than one
+        tick — a genuinely dead process, not scheduler jitter.
         """
         if not target_statuses:
             return None
@@ -370,6 +396,7 @@ class TaskStore:
         placeholders = ",".join("?" for _ in target_statuses)
         now = utcnow()
         now_iso = now.isoformat()
+        reclaim_deadline = (now - timedelta(seconds=max(reclaim_grace_seconds, 0.0))).isoformat()
         async with self._db.transaction():
             # Look for a schedulable task: QUEUED/INTERRUPTED first, then
             # RUNNING with expired lease (reclaim abandoned work).
@@ -386,7 +413,7 @@ class TaskStore:
                     "WHERE status = 'RUNNING' AND lease_expires_at IS NOT NULL "
                     "AND lease_expires_at < ? "
                     "ORDER BY created_at ASC LIMIT 1",
-                    (now_iso,),
+                    (reclaim_deadline,),
                 )
             if row is None:
                 return None
@@ -397,19 +424,65 @@ class TaskStore:
             if current == TaskStatus.RUNNING:
                 # Reclaiming expired lease — CAS on claimed_by/lease_expires_at
                 cas_where = "id = ? AND status = 'RUNNING' AND lease_expires_at < ?"
-                cas_params: tuple = (task_id, now_iso)
+                cas_params: tuple = (task_id, reclaim_deadline)
             else:
                 cas_where = "id = ? AND status = ?"
                 cas_params = (task_id, current.value)
-            await self._db.execute_raw(
+            cursor = await self._db.execute_raw(
                 f"UPDATE tasks SET status = 'RUNNING', updated_at = ?, "
                 f"started_at = COALESCE(started_at, ?), "
                 f"claimed_by = ?, claim_started_at = ?, lease_expires_at = ? "
                 f"WHERE {cas_where}",
                 (now_iso, now_iso, worker_id, now_iso, lease_expires.isoformat(), *cas_params),
             )
+            if cursor.rowcount != 1:
+                # The row changed under us between SELECT and UPDATE; the CAS
+                # must not silently return a task this worker does not own.
+                return None
             claimed = await self._db.fetch_one_raw("SELECT * FROM tasks WHERE id = ?", (task_id,))
             return _decode_task_row(claimed) if claimed else None
+
+    async def renew_lease(
+        self,
+        task_id: str,
+        *,
+        worker_id: str,
+        lease_duration_seconds: float = 300.0,
+    ) -> bool:
+        """Extend a RUNNING task's lease, CAS on the owning worker.
+
+        Also re-adopts an unowned RUNNING task whose lease window has passed
+        (``claimed_by IS NULL`` with no fresh lease — the state a task is in
+        right after a WAITING_* → RUNNING resume, where the lease was
+        deliberately cleared on park). Adoption is itself a CAS: two
+        concurrent renewers cannot both win, and adoption never races a
+        legitimately-parked task whose resume slot another worker may hold.
+
+        Returns ``True`` only when the update affected exactly one row this
+        worker owns (or just adopted) while the task is still RUNNING. A
+        ``False`` return means either the task is not RUNNING, or ownership
+        was lost to another worker; the caller must stop driving the task
+        unless it verifies the task is parked/paused.
+        """
+        now = utcnow()
+        new_expiry = (now + timedelta(seconds=lease_duration_seconds)).isoformat()
+        cursor = await self._db.execute(
+            "UPDATE tasks SET lease_expires_at = ?, updated_at = ?, "
+            "claimed_by = ?, claim_started_at = COALESCE(claim_started_at, ?) "
+            "WHERE id = ? AND status = 'RUNNING' "
+            "AND (claimed_by = ? OR (claimed_by IS NULL AND (lease_expires_at IS NULL "
+            "OR lease_expires_at < ?)))",
+            (
+                new_expiry,
+                now.isoformat(),
+                worker_id,
+                now.isoformat(),
+                task_id,
+                worker_id,
+                new_expiry,
+            ),
+        )
+        return cursor.rowcount == 1
 
     async def acquire_with_ownership(
         self,
@@ -455,10 +528,11 @@ class TaskStore:
             else:
                 return None
             lease_expires = now + timedelta(seconds=lease_duration_seconds)
-            await self._db.execute_raw(
-                "UPDATE tasks SET status = ?, updated_at = ?, started_at = ?, "
+            cursor = await self._db.execute_raw(
+                "UPDATE tasks SET status = ?, updated_at = ?, "
+                "started_at = COALESCE(started_at, ?), "
                 "claimed_by = ?, claim_started_at = ?, lease_expires_at = ? "
-                "WHERE id = ?",
+                "WHERE id = ? AND status = ?",
                 (
                     running.value,
                     now_iso,
@@ -467,8 +541,17 @@ class TaskStore:
                     now_iso,
                     lease_expires.isoformat(),
                     task_id,
+                    current.value,
                 ),
             )
+            if cursor.rowcount != 1:
+                # CAS lost: the row changed between SELECT and UPDATE. That is
+                # an ownership boundary, not an empty result — surface it so a
+                # targeted runner cannot execute a task it does not own.
+                raise TaskOwnershipLost(
+                    f"task {task_id} changed state during acquisition "
+                    f"(CAS lost for worker {worker_id!r})"
+                )
             claimed = await self._db.fetch_one_raw("SELECT * FROM tasks WHERE id = ?", (task_id,))
             return _decode_task_row(claimed) if claimed else None
 

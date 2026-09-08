@@ -20,6 +20,9 @@ __all__ = ["ExecutionBackend", "BackendRegistry", "register_backend", "get_backe
 
 class ExecutionBackend(abc.ABC):
     name: str = ""
+    # Backends opt in only when they can prove ownership and environment
+    # identity after the Athena process itself has restarted.
+    supports_reattach: bool = False
 
     @abc.abstractmethod
     async def create_session(
@@ -45,6 +48,14 @@ class ExecutionBackend(abc.ABC):
     @abc.abstractmethod
     async def destroy_session(self, runtime_session_id: str) -> None:
         """Tear down a runtime session and its owned process tree."""
+
+    async def describe_session(self, runtime_session_id: str) -> Mapping[str, str]:
+        """Return durable identity facts for an owned session."""
+        raise RuntimeError(f"backend {self.name!r} does not describe sessions")
+
+    async def reattach_session(self, record: Mapping[str, object]) -> str:
+        """Rebuild ownership only after proving the persisted session record."""
+        raise RuntimeError(f"backend {self.name!r} does not support reattachment")
 
     @abc.abstractmethod
     async def shutdown(self) -> None:

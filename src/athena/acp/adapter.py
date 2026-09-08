@@ -17,6 +17,7 @@ The transport is intentionally thin: ACP envelope <-> Athena Message/Event.
 
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ from athena.protocol.messages import (
 )
 from athena.protocol.tasks import (
     AutonomyLevel,
+    CapabilityPolicy,
     DeliverySpec,
     NetworkPolicy,
     TaskSpec,
@@ -124,16 +126,21 @@ class ACPAdapter:
         task_manager: Any,
         sessions: Any,
         *,
+        service: Any = None,
         event_store: Any = None,
+        admission: Any = None,
+        principal_id: str | None = None,
         stream_poll_interval: float = 0.25,
         stream_timeout: float = 60.0,
     ) -> None:
         self.task_manager = task_manager
         self.sessions = sessions
+        self.service = service
         self.event_store = event_store
+        self._admission = admission
+        self._principal_id = principal_id
         self._stream_interval = stream_poll_interval
         self._stream_timeout = stream_timeout
-        self._seq = 0
 
     # ------------------------------------------------------------------ #
     # Inbound: ACP request -> TaskSpec -> TaskManager
@@ -144,7 +151,9 @@ class ACPAdapter:
         Inbound policy fields are mapped into the TaskSpec so a request can
         never silently escalate to a permissive default: when an ACP client
         leaves policy unspecified, the request is defaulted to SAFE (supervised
-        autonomy, an empty capability allow-list, and a scoped workspace).
+        autonomy, an explicit deny-all capability ceiling, and a scoped
+        workspace). An explicitly supplied empty mapping retains the shared
+        policy meaning of unrestricted and must therefore be deliberate.
         """
         task_id = request.task_id or new_id("task")
         session_id = request.session_id
@@ -154,6 +163,12 @@ class ACPAdapter:
             network_default=NetworkPolicy.DENY,
         )
         capability = decode_capability_policy(request.capability_policy)
+        if request.capability_policy is None:
+            # ``allow=()`` means unrestricted in the shared policy contract.
+            # An omitted ACP policy is different from an explicit empty
+            # mapping: remote callers get a deny-all capability ceiling until
+            # they present one deliberately.
+            capability = CapabilityPolicy(deny=("*",))
         autonomy = _map_autonomy(request.autonomy)
         model_policy = decode_model_policy(request.model_policy)
         return TaskSpec(
@@ -187,16 +202,33 @@ class ACPAdapter:
         the Task belongs to a single stable identity.
         """
         task_id = request.task_id or new_id("task")
-        session_id = request.session_id or await self._ensure_session(request)
-        spec = self.to_task_spec(
-            replace(
-                request,
-                session_id=session_id,
-                task_id=task_id,
+        if self.service is None and self._admission is None:
+            raise RuntimeError(
+                "ACPAdapter requires the AthenaService intake (or legacy admission callback)"
             )
+        # Decode the mapping-form policy before admission. A provisional
+        # typed TaskSpec lets the service validate the actual requested model
+        # roles before ACP allocates a session or persists a Task.
+        provisional = self.to_task_spec(
+            replace(request, task_id=task_id, session_id=request.session_id)
         )
-        await self.task_manager.create(spec)
-        await self.task_manager.enqueue(spec.id)
+        if self.service is not None:
+            spec = await self.service.submit_spec(provisional, user_request=request, wait=False)
+            session_id = spec.session_id
+        else:
+            admitted = self._admission(provisional)
+            if inspect.isawaitable(admitted):
+                await admitted
+            session_id = request.session_id or await self._ensure_session(request)
+            spec = self.to_task_spec(
+                replace(
+                    request,
+                    session_id=session_id,
+                    task_id=task_id,
+                )
+            )
+            await self.task_manager.create(spec)
+            await self.task_manager.enqueue(spec.id)
         return self._event(
             EV_TASK_ACCEPTED, spec.id, {"task_id": spec.id, "session_id": session_id}
         )
@@ -214,25 +246,24 @@ class ACPAdapter:
         payload: dict[str, Any] = {"task_id": task_id}
         if type_ is EV_TASK_FINISHED:
             payload["status"] = "completed"
-        seq = self._next_seq()
         return ACPEvent(
             type=type_,
             task_id=task_id,
             payload=payload,
-            seq=seq,
+            seq=0,
         )
 
     def message_to_acp(self, message: Message) -> ACPEvent:
         """Translate an Athena session Message into an ACP message event."""
         return ACPEvent(
             type=EV_TASK_MESSAGE,
-            task_id="",
+            task_id=str(message.metadata.get("task_id") or ""),
             payload={"text": message.text(), "role": message.role.value},
             session_id=message.metadata.get("session_id"),
-            seq=self._next_seq(),
+            seq=0,
         )
 
-    async def stream(self, task_id: str) -> AsyncIterator[ACPEvent]:
+    async def stream(self, task_id: str, *, after_sequence: int = 0) -> AsyncIterator[ACPEvent]:
         """Stream the ACP view of a task; yields events AS THEY ARRIVE.
 
         Polls the event log and/or the session message store at a fixed
@@ -241,12 +272,15 @@ class ACPAdapter:
         STARTED event and stops once a terminal task event is observed or the
         stream timeout elapses.
         """
-        yield self._event(EV_TASK_STARTED, task_id, {"task_id": task_id})
-        session_id = await self._session_id_for_task(task_id)
-        seen_message_ids: set[str] = set()
-        last_seq = 0
-        if self.event_store is not None:
-            last_seq = await _safe_await(self.event_store.last_sequence, task_id) or 0
+        if int(after_sequence) <= 0:
+            # This is a transport convenience marker, not a durable event.
+            # Reconnected consumers resume strictly from their durable cursor
+            # and must not receive a second synthetic lifecycle event.
+            yield self._event(EV_TASK_STARTED, task_id, {"task_id": task_id})
+        # The cursor is the durable Athena per-task event sequence. Never
+        # initialize it from last_sequence here: a new subscriber must replay
+        # the task rather than silently tailing only future events.
+        last_seq = max(0, int(after_sequence))
         deadline = time.monotonic() + self._stream_timeout
         done = False
         while not done:
@@ -263,16 +297,6 @@ class ACPAdapter:
                     yield _event_from_athena_event(ev, task_id)
                     if _event_type_of(ev) in _TERMINAL_EVENT_TYPES:
                         done = True
-            if session_id and self.sessions is not None and hasattr(self.sessions, "list_messages"):
-                try:
-                    messages = await self.sessions.list_messages(session_id, limit=200)
-                except Exception:
-                    messages = []
-                for m in messages:
-                    mid = str(getattr(m, "id", ""))
-                    if mid and mid not in seen_message_ids:
-                        seen_message_ids.add(mid)
-                        yield self.message_to_acp(m)
             if not done:
                 await _sleep(self._stream_interval)
 
@@ -283,9 +307,13 @@ class ACPAdapter:
         if self.sessions is None:
             raise RuntimeError("no session service configured for ACP")
         session_id = new_id("session")
-        await self.sessions.create(
-            session_id, parent_id=request.parent_session_id, metadata={"origin": "acp"}
-        )
+        kwargs: dict[str, Any] = {
+            "parent_id": request.parent_session_id,
+            "metadata": {"origin": "acp"},
+        }
+        if self._principal_id:
+            kwargs["principal_id"] = self._principal_id
+        await self.sessions.create(session_id, **kwargs)
         return session_id
 
     async def _session_id_for_task(self, task_id: str) -> str | None:
@@ -310,12 +338,8 @@ class ACPAdapter:
             task_id=task_id,
             payload=dict(payload),
             session_id=(dict(payload) or {}).get("session_id"),
-            seq=self._next_seq(),
+            seq=0,
         )
-
-    def _next_seq(self) -> int:
-        self._seq += 1
-        return self._seq
 
 
 def _task_id_of(task: Any) -> str:
@@ -376,6 +400,7 @@ def _event_from_athena_event(ev: Any, task_id: str) -> ACPEvent:
         task_id=task_id,
         payload=payload,
         session_id=getattr(ev, "session_id", None),
+        seq=int(getattr(ev, "sequence", 0) or 0),
     )
 
 

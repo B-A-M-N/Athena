@@ -164,11 +164,12 @@ class ProcedureCapsuleCapability:
     async def _export(self, request, args, context):
         workflow_id = str(args.get("workflow_id") or "")
         workspace_id = getattr(getattr(context, "workspace", None), "id", None)
+        principal_id = getattr(context, "principal_id", None)
         workflow = await self._store.get(
             workflow_id,
             task_id=request.task_id,
             project_id=workspace_id,
-            user_id="athena",
+            user_id=principal_id,
         )
         if workflow is None:
             return _result(request, ok=False, error=f"unknown workflow: {workflow_id}")
@@ -176,6 +177,7 @@ class ProcedureCapsuleCapability:
             workflow,
             request.task_id,
             workspace_id,
+            principal_id,
         )
         capability_ids = sorted(
             {step.capability_id for item in workflows for step in item.steps if step.capability_id}
@@ -187,7 +189,7 @@ class ProcedureCapsuleCapability:
                     capability_id,
                     task_id=request.task_id,
                     project_id=workspace_id,
-                    user_id="athena",
+                    user_id=principal_id,
                 )
             except Exception as exc:  # noqa: BLE001 - export reports missing dependency
                 return _result(
@@ -229,7 +231,7 @@ class ProcedureCapsuleCapability:
             metadata={"capsule_id": capsule["capsule_id"], "workflow_id": workflow.id},
         )
 
-    async def _collect_workflows(self, root, task_id, project_id):
+    async def _collect_workflows(self, root, task_id, project_id, principal_id):
         found: dict[str, Workflow] = {}
         pending = [root]
         while pending:
@@ -244,7 +246,7 @@ class ProcedureCapsuleCapability:
                     step.workflow_id,
                     task_id=task_id,
                     project_id=project_id,
-                    user_id="athena",
+                    user_id=principal_id,
                 )
                 if nested is None:
                     raise ValueError(f"workflow dependency is unavailable: {step.workflow_id}")
@@ -253,6 +255,7 @@ class ProcedureCapsuleCapability:
 
     async def _import(self, request, capsule, context) -> tuple[bool, str]:
         workspace = getattr(context, "workspace", None)
+        principal_id = getattr(context, "principal_id", None)
         if workspace is None:
             return False, "capsule import requires workspace context"
         imported_capabilities: list[str] = []
@@ -269,13 +272,16 @@ class ProcedureCapsuleCapability:
                         capability_id,
                         task_id=request.task_id,
                         project_id=workspace.id,
-                        user_id="athena",
+                        user_id=principal_id,
                     )
                     continue
                 generated = GeneratedCapability.from_record(generated_record)
                 if generated.lifecycle_state in {
                     "STALE",
+                    "DEGRADED",
                     "REVALIDATION_REQUIRED",
+                    "REJECTED",
+                    "SUPERSEDED",
                     "DEPRECATED",
                 }:
                     return False, f"generated capability {capability_id} is unavailable"
@@ -358,7 +364,7 @@ class ProcedureCapsuleCapability:
                         identifier,
                         task_id=request.task_id,
                         project_id=workspace.id,
-                        user_id="athena",
+                        user_id=principal_id,
                     ).descriptor
                 )
             ).validate(root)

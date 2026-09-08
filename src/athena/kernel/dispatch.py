@@ -99,6 +99,7 @@ class CapabilityDispatchShim:
             workspace=workspace,
             profile=self._profile,
             task_policy=task.capability_policy,
+            model_policy=task.model_policy,
             task_budget=task.resource_budget,
             task_deadline=task.deadline,
             runtime_remaining_s=runtime_remaining_s,

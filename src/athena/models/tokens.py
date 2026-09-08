@@ -46,7 +46,15 @@ class ModelTokenEstimator:
         if self.token_upper_bound_per_byte is None:
             return None
         payload = [request.system or ""]
-        payload.extend(message.text() or "" for message in request.messages)
+        payload.extend(
+            (
+                message.conversation_text()
+                if callable(getattr(message, "conversation_text", None))
+                else message.text()
+            )
+            or ""
+            for message in request.messages
+        )
         for capability in request.capabilities:
             to_dict = getattr(capability, "to_dict", None)
             value = to_dict() if callable(to_dict) else vars(capability)

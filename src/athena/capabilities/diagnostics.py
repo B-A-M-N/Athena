@@ -46,6 +46,7 @@ class DiagnosticsCapability:
             "additionalProperties": False,
         },
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        tags=frozenset({"diagnostics", "debug", "inspect", "failure", "repair", "broken"}),
         origin=CapabilityOrigin.NATIVE,
     )
 

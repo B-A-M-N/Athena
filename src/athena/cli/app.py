@@ -26,7 +26,6 @@ import asyncio
 import os
 import shutil
 import sys
-import tempfile
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +34,8 @@ from typing import Any
 from athena.execution.environment import VerificationEnvironment
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, WorkspaceSpec
 
+FREEINFERENCE_DEFAULT_BASE_URL = "https://freeinference.org/v1"
+FREEINFERENCE_DEFAULT_MODEL = "glm-5.3-flash"
 OPENROUTER_DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
 
 
@@ -123,6 +124,26 @@ def build_config(o: "Options"):
         config.workspace_root = os.getcwd()
     if pcs:
         config.providers = tuple(pcs)
+    elif not config.providers and os.environ.get("FREEINFERENCE_API_KEY"):
+        # FreeInference speaks the OpenAI-compatible protocol. Prefer its
+        # operator-owned key when it is available; the native launcher may
+        # load that key from the user's credential env file for the worker.
+        config.providers = (
+            ProviderConfig(
+                kind="openai-compat",
+                name="freeinference",
+                model=(
+                    os.environ.get("FREEINFERENCE_MODEL") or FREEINFERENCE_DEFAULT_MODEL
+                ).strip(),
+                credential_id="FREEINFERENCE_API_KEY",
+                base_url=(
+                    os.environ.get("FREEINFERENCE_API_BASE_URL")
+                    or os.environ.get("FREEINFERENCE_API_ENDPOINT")
+                    or FREEINFERENCE_DEFAULT_BASE_URL
+                ).strip(),
+                extra={"headers": {"X-Title": "Athena"}},
+            ),
+        )
     elif not config.providers and os.environ.get("OPENROUTER_API_KEY"):
         # OpenRouter speaks the OpenAI-compatible protocol. Keep the key in
         # the environment/SecretManager; never copy it into config or task
@@ -156,75 +177,161 @@ def build_service(config) -> Any:
 
 
 def _config_set(o: "Options") -> int:
-    """Persist one supported operator setting without starting the service."""
-    from athena.service.config import global_config_path, load_toml_file
+    """Persist one validated, non-secret configuration path."""
+    from athena.service.config import (
+        config_from_dict,
+        config_to_dict,
+        global_config_path,
+        load_toml_file,
+        write_toml_atomic_private,
+    )
 
-    raw_key = str(o.config_key or "").strip().replace("_", "-")
-    prefix = "hermes-referee."
-    if not raw_key.startswith(prefix):
+    raw_key = str(o.config_key or "").strip()
+    if not raw_key:
+        print("athena config: key cannot be empty", file=sys.stderr)
+        return 2
+    segments = [part.replace("-", "_") for part in raw_key.split(".") if part]
+    if not segments:
+        print(f"athena config: unsupported key {o.config_key!r}", file=sys.stderr)
+        return 2
+    secret_names = {"api_key", "apikey", "access_token", "secret", "password"}
+    if any(part.casefold() in secret_names for part in segments):
         print(
-            "athena config: supported keys are hermes-referee.enabled, "
-            "hermes-referee.endpoint, hermes-referee.profile, "
-            "hermes-referee.timeout-seconds, hermes-referee.credential-id, "
-            "hermes-referee.allow-remote, and hermes-referee.allow-insecure-remote",
+            "athena config: secrets must be stored through the credential store, not config set",
             file=sys.stderr,
         )
         return 2
-    field = raw_key[len(prefix) :].replace("-", "_")
-    if field not in {
-        "enabled",
-        "endpoint",
-        "profile",
-        "timeout_seconds",
-        "credential_id",
-        "allow_remote",
-        "allow_insecure_remote",
-    }:
+    from dataclasses import fields
+
+    from athena.service.config import AthenaConfig, HermesRefereeConfig
+
+    valid_root = {item.name for item in fields(AthenaConfig)}
+    if segments[0] not in valid_root:
         print(f"athena config: unsupported key {o.config_key!r}", file=sys.stderr)
         return 2
+    if segments[0] == "browser_driver_factory":
+        print(
+            "athena config: browser_driver_factory is Python-only; configure a supported browser launcher instead",
+            file=sys.stderr,
+        )
+        return 2
+    if len(segments) > 1:
+        if segments[0] != "hermes_referee":
+            print(
+                f"athena config: nested setting {raw_key!r} is not supported; set the object as JSON",
+                file=sys.stderr,
+            )
+            return 2
+        if segments[1] not in {item.name for item in fields(HermesRefereeConfig)}:
+            print(f"athena config: unsupported key {o.config_key!r}", file=sys.stderr)
+            return 2
+
     value = str(o.config_value or "").strip()
-    if field in {"enabled", "allow_remote", "allow_insecure_remote"}:
-        lowered = value.lower()
-        if lowered not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
-            print("athena config: enabled expects true or false", file=sys.stderr)
-            return 2
-        parsed: Any = lowered in {"true", "1", "yes", "on"}
-    elif field == "timeout_seconds":
+    if not value:
+        print(f"athena config: {o.config_key} cannot be empty", file=sys.stderr)
+        return 2
+    try:
+        import json
+
         try:
-            parsed = float(value)
-        except ValueError:
-            print("athena config: timeout-seconds expects a positive number", file=sys.stderr)
+            parsed: Any = json.loads(value)
+        except json.JSONDecodeError:
+            lowered = value.casefold()
+            if lowered in {"true", "false"}:
+                parsed = lowered == "true"
+            elif "," in value and segments[-1].endswith("domains"):
+                parsed = [part.strip() for part in value.split(",") if part.strip()]
+            else:
+                parsed = value
+
+        def contains_raw_credential(node: Any, *, parent: str | None = None) -> bool:
+            """Reject credential payloads hidden inside structured config values.
+
+            ``secret_env`` is intentionally an exception: it contains names of
+            environment variables, not secret values.  Provider ``api_key``
+            and equivalent fields must still go through the credential store.
+            """
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    normalized = str(key).replace("-", "_").casefold()
+                    if parent == "secret_env":
+                        continue
+                    if normalized in {
+                        "api_key",
+                        "apikey",
+                        "access_token",
+                        "password",
+                        "client_secret",
+                    }:
+                        return True
+                    if contains_raw_credential(child, parent=normalized):
+                        return True
+            elif isinstance(node, (list, tuple)):
+                return any(contains_raw_credential(child, parent=parent) for child in node)
+            return False
+
+        if contains_raw_credential(parsed):
+            raise ValueError(
+                "raw credentials are not accepted; use credential_id or secret_env references"
+            )
+
+        boolean_paths = {
+            ("hermes_referee", "enabled"),
+            ("hermes_referee", "allow_remote"),
+            ("hermes_referee", "allow_insecure_remote"),
+            ("browser_enabled",),
+            ("browser_headless",),
+            ("research_allow_private_network",),
+            ("animations",),
+            ("reduced_motion",),
+        }
+        if tuple(segments) in boolean_paths and not isinstance(parsed, bool):
+            print(f"athena config: {raw_key} expects true or false", file=sys.stderr)
             return 2
-        if parsed <= 0:
-            print("athena config: timeout-seconds expects a positive number", file=sys.stderr)
-            return 2
-    else:
-        if not value:
-            print(f"athena config: {o.config_key} cannot be empty", file=sys.stderr)
-            return 2
-        parsed = value
+        if tuple(segments) == ("hermes_referee", "self_host_supervision"):
+            if str(parsed).casefold() not in {"off", "advisory", "required"}:
+                print(
+                    "athena config: self-host-supervision expects off, advisory, or required",
+                    file=sys.stderr,
+                )
+                return 2
+
+        config = build_config(o)
+        serialized = config_to_dict(config)
+        cursor: dict[str, Any] = serialized
+        for segment in segments[:-1]:
+            current = cursor.get(segment)
+            if current is None:
+                current = {}
+                cursor[segment] = current
+            if not isinstance(current, dict):
+                raise ValueError(f"{raw_key} crosses a non-table value")
+            cursor = current
+        cursor[segments[-1]] = parsed
+        config_from_dict(serialized)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"athena config: invalid value for {raw_key}: {exc}", file=sys.stderr)
+        return 2
 
     path = Path(o.config_path).expanduser() if o.config_path else global_config_path()
     data = load_toml_file(path)
-    section = data.setdefault("hermes_referee", {})
-    if not isinstance(section, dict):
-        print(f"athena config: {path} has a non-table hermes_referee value", file=sys.stderr)
-        return 2
-    section[field] = parsed
+    cursor = data
+    for segment in segments[:-1]:
+        current = cursor.get(segment)
+        if current is None:
+            current = {}
+            cursor[segment] = current
+        if not isinstance(current, dict):
+            print(f"athena config: {path} has a non-table {segment} value", file=sys.stderr)
+            return 2
+        cursor = current
+    cursor[segments[-1]] = parsed
     try:
-        import tomli_w
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "wb", dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as tmp:
-            tomli_w.dump(data, tmp)
-            temporary = Path(tmp.name)
-        os.replace(temporary, path)
-    except (ImportError, OSError) as exc:
+        write_toml_atomic_private(path, data)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
         print(f"athena config: could not write {path}: {exc}", file=sys.stderr)
         return 1
-    print(f"updated {path}: hermes_referee.{field} = {parsed!r}")
+    print(f"updated {path}: {raw_key} = {parsed!r}")
     return 0
 
 
@@ -232,20 +339,58 @@ def _cmd_config(o: "Options", config: Any) -> int:
     if o.config_action == "set":
         return _config_set(o)
     if o.config_action == "show":
-        settings = config.hermes_referee
-        print("hermes_referee:")
-        print(f"  enabled: {str(settings.enabled).lower()}")
-        print(f"  endpoint: {settings.endpoint}")
-        print(f"  profile: {settings.profile}")
-        print(f"  timeout_seconds: {settings.timeout_seconds:g}")
-        print(f"  credential_id: {settings.credential_id or '-'}")
-        print(f"  allow_remote: {str(settings.allow_remote).lower()}")
-        print(f"  allow_insecure_remote: {str(settings.allow_insecure_remote).lower()}")
-        print(f"  managed: {str(settings.managed).lower()}")
-        print(f"  runtime_root: {settings.runtime_root or '-'}")
-        print(f"  required_for_self_host: {str(settings.required_for_self_host).lower()}")
+        from athena.service.config import config_to_dict
+
+        import json
+
+        print(json.dumps(config_to_dict(config), indent=2, sort_keys=True, default=str))
         return 0
-    print("athena config: use 'set KEY VALUE' or 'show'", file=sys.stderr)
+    if o.config_action == "validate":
+        print("configuration: valid")
+        return 0
+    if o.config_action in {"get", "explain"}:
+        key = str(o.config_key or "").strip().replace("-", "_")
+        descriptions = {
+            "browser_enabled": "Enable the first-party Playwright browser launcher.",
+            "browser_session_scope": "Reuse browser state per task or per session.",
+            "browser_engine": "Playwright engine: chromium, firefox, or webkit.",
+            "parked_slot_wait_s": "Maximum worker wait before durable input/approval relaunch.",
+            "worker_lease_duration_seconds": "Task lease duration before dead-worker recovery.",
+            "research_allowed_domains": "External research domains allowed by source policy.",
+            "mcp_servers": "Configured MCP transports and secret references.",
+            "providers": "Configured model adapters; credentials are referenced, not printed.",
+        }
+        if o.config_action == "explain":
+            print(descriptions.get(key, "No explanation is registered for this setting."))
+            return 0 if key in descriptions else 1
+        from athena.service.config import config_to_dict
+
+        segments = key.split(".") if key else []
+        serialized = config_to_dict(config)
+        value: Any = serialized.get(segments[0]) if len(segments) == 1 else config
+        if len(segments) == 1 and segments[0] not in serialized:
+            value = getattr(config, segments[0], None)
+        for segment in segments[1:]:
+            if isinstance(value, dict):
+                if segment not in value:
+                    print(f"configuration key not found: {o.config_key}", file=sys.stderr)
+                    return 1
+                value = value[segment]
+            else:
+                value = getattr(value, segment, None)
+            if value is None:
+                print(f"configuration key not found: {o.config_key}", file=sys.stderr)
+                return 1
+        if hasattr(value, "value"):
+            value = value.value
+        import json
+
+        print(json.dumps(value, indent=2, sort_keys=True, default=str))
+        return 0
+    print(
+        "athena config: use show, get PATH, explain PATH, validate, or set KEY VALUE",
+        file=sys.stderr,
+    )
     return 2
 
 
@@ -262,6 +407,7 @@ def _cmd_referee(o: "Options") -> int:
         host=o.referee_host,
         port=o.referee_port,
         credential_id=o.referee_credential_id,
+        self_host_supervision=o.referee_supervision,
     )
 
 
@@ -294,6 +440,25 @@ def _doctor_display(o: "Options", config: Any) -> int:
     if requested in {"auto", "glass"} and selected != "glass":
         print("note: Glass needs a confirmed Kitty graphics transport; ANSI is safe.")
     return 0
+
+
+def _doctor_native(o: "Options", config: Any) -> int:
+    """Report native companion compatibility without launching it."""
+    del o, config
+    from athena.cli.native import NATIVE_REQUIREMENTS_MESSAGE, native_binary, native_preflight
+
+    preflight = native_preflight()
+    binary = native_binary()
+    binary_ok = binary.is_file() and os.access(binary, os.X_OK)
+    print(f"requirements: {NATIVE_REQUIREMENTS_MESSAGE}")
+    print(f"binary: {binary} ({'available' if binary_ok else 'missing'})")
+    if preflight.ok:
+        print("host: ready")
+    else:
+        print("host: incompatible")
+        for failure in preflight.failures:
+            print(f"  {failure}")
+    return 0 if preflight.ok and binary_ok else 1
 
 
 def _doctor_startup(o: "Options", config: Any) -> int:
@@ -389,6 +554,7 @@ class Options:
     referee_host: str = "127.0.0.1"
     referee_port: int = 8643
     referee_credential_id: str = "HERMES_REFEREE_API_KEY"
+    referee_supervision: str | None = None
     _providers: tuple[Any, ...] = ()
 
 
@@ -411,14 +577,22 @@ def dispatch(o: Options) -> int:
         o.reduced_motion = bool(getattr(config, "reduced_motion", False))
     if o.command == "config":
         return _cmd_config(o, config)
+    if o.command == "serve":
+        from athena.api.app import create_app
+        from athena.api.sse import run as run_server
+
+        run_server(create_app(build_service(config)))
+        return 0
     _register_config_mascots(config)
     if o.command == "doctor":
         target = o.args[0] if o.args else "startup"
         if target == "startup":
             return _doctor_startup(o, config)
+        if target == "native":
+            return _doctor_native(o, config)
         if target != "display":
             print(
-                "athena doctor: supported targets are 'startup' and 'display'",
+                "athena doctor: supported targets are 'startup', 'display', and 'native'",
                 file=sys.stderr,
             )
             return 2
@@ -489,6 +663,24 @@ async def _run(o: Options, service: Any) -> int:
         return await _cmd_approve(o, service)
     if cmd == "cancel":
         return await _cmd_cancel(o, service)
+    if cmd == "tasks":
+        return await _cmd_tasks(o, service)
+    if cmd == "models":
+        return await _cmd_models(service)
+    if cmd == "skills":
+        return await _cmd_skills(o, service)
+    if cmd == "jobs":
+        return await _cmd_jobs(o, service)
+    if cmd == "workflows":
+        return await _cmd_workflows(o, service)
+    if cmd == "packs":
+        return await _cmd_packs(o, service)
+    if cmd == "memory":
+        return await _cmd_memory(o, service)
+    if cmd == "mcp":
+        return await _cmd_mcp(o, service)
+    if cmd == "acp":
+        return await _cmd_acp(service)
     if cmd == "oi-stream":
         from athena.cli.oi_stream import run_viewer
 
@@ -509,6 +701,17 @@ async def _cmd_run(o: Options, service: Any) -> int:
         model_policy=_model_policy(o.model),
         metadata=_criteria_metadata(o),
     )
+    admit = getattr(service, "require_agent_ready", None)
+    if callable(admit):
+        try:
+            admit(request)
+        except Exception as exc:
+            from athena.protocol.errors import ServiceNotReady
+
+            if isinstance(exc, ServiceNotReady):
+                print(f"athena run: {exc.message}", file=sys.stderr)
+                return 2
+            raise
     surface = None
     from athena.cli.chat import _make_surface, _model_label
 
@@ -529,7 +732,15 @@ async def _cmd_run(o: Options, service: Any) -> int:
         # Start streaming before waiting so an interactive approval can wake
         # the parked task. Waiting first deadlocks supervised execution at the
         # service boundary and hides the OI-style operator surface.
-        task = await service.submit(request, wait=False)
+        try:
+            task = await service.submit(request, wait=False)
+        except Exception as exc:
+            from athena.protocol.errors import ServiceNotReady
+
+            if isinstance(exc, ServiceNotReady):
+                surface.render_notice(exc.message, status="NOT_READY")
+                return 2
+            raise
         task_id = getattr(task, "id", task)
         from athena.cli.chat import stream_task
 
@@ -551,10 +762,15 @@ async def _cmd_run(o: Options, service: Any) -> int:
                 status.value if status is not None and hasattr(status, "value") else str(status)
             )
             surface.render_result(summary, status=status_str)
-            return 0
+            normalized = status_str.strip().upper()
+            if normalized == "COMPLETE":
+                return 0
+            if normalized == "CANCELLED":
+                return 130
+            return 1
         # No result available: expose status anyway.
         surface.render_notice(f"[task {task_id} has no result yet]", status="PENDING")
-        return 0
+        return 1
     finally:
         async_closer = getattr(surface, "aclose", None)
         if callable(async_closer):
@@ -846,16 +1062,420 @@ async def _cmd_cancel(o: Options, service: Any) -> int:
     return 0
 
 
+async def _cmd_tasks(o: Options, service: Any) -> int:
+    action = (o.args[0] if o.args else "list").casefold()
+    task_id = o.args[1] if len(o.args) > 1 else None
+    if action == "list":
+        rows = await service.list_tasks()
+        if not rows:
+            print("(no tasks)")
+            return 0
+        for row in rows:
+            print(f"{row.get('id')}\t{row.get('status')}\t{str(row.get('objective') or '')[:120]}")
+        return 0
+    if not task_id:
+        print(f"athena tasks {action}: missing task id", file=sys.stderr)
+        return 2
+    if action in {"show", "inspect"}:
+        import json
+
+        print(json.dumps(await service.inspect(task_id), indent=2, default=str, sort_keys=True))
+        return 0
+    if action == "result":
+        result = await service.get_result(task_id)
+        if result is None:
+            print("(no result)")
+            return 1
+        import json
+
+        print(json.dumps(result, indent=2, default=str, sort_keys=True))
+        return 0
+    if action == "cancel":
+        return await _cmd_cancel(Options(args=[task_id]), service)
+    if action == "interrupt":
+        status = await service.interrupt(task_id)
+        print(f"interrupt requested for {task_id}: {getattr(status, 'value', status)}")
+        return 0
+    print(
+        "athena tasks: use list, show TASK_ID, result TASK_ID, cancel TASK_ID, or interrupt TASK_ID"
+    )
+    return 2
+
+
+async def _cmd_models(service: Any) -> int:
+    registry = getattr(service, "_model_registry", None)
+    models = list(await registry.list_models()) if registry is not None else []
+    if not models:
+        print("(no configured models)")
+        return 0
+    for model in models:
+        print(
+            f"{model.provider}/{model.id}\ttools={'yes' if model.tool_calling else 'no'}\t"
+            f"vision={'yes' if model.vision else 'no'}\tprivacy={model.privacy_class.value}"
+        )
+    return 0
+
+
+async def _cmd_skills(o: Options, service: Any) -> int:
+    lifecycle = getattr(service, "_skill_lifecycle", None)
+    action = (o.args[0] if o.args else "list").casefold()
+    value = o.args[1] if len(o.args) > 1 else None
+    if lifecycle is not None and action in {"enable", "disable"} and value:
+        changed = await getattr(lifecycle, action)(value)
+        if not changed:
+            print(f"skill not found: {value}", file=sys.stderr)
+            return 1
+        print(f"skill {value}: {action}d")
+        return 0
+    if lifecycle is not None and action in {"inspect", "show"} and value:
+        import json
+
+        skill = await lifecycle.get(value)
+        if skill is None:
+            print(f"skill not found: {value}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "id": skill.id,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "enabled": skill.enabled,
+                    "scope": skill.scope,
+                    "trust": skill.trust.value,
+                    "triggers": list(skill.triggers),
+                    "version": skill.version,
+                    "metadata": dict(skill.metadata),
+                },
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+        )
+        return 0
+    skills = await lifecycle.list(active_only=False) if lifecycle is not None else []
+    if action == "search" and value:
+        needle = value.casefold()
+        skills = [
+            skill
+            for skill in skills
+            if needle in f"{skill.name} {skill.description} {' '.join(skill.triggers)}".casefold()
+        ]
+    if action not in {"list", "search"}:
+        print(
+            "athena skills: use list, search TEXT, inspect ID, enable ID, or disable ID",
+            file=sys.stderr,
+        )
+        return 2
+    if not skills:
+        print("(no installed skills)")
+        return 0
+    for skill in skills:
+        state = "enabled" if getattr(skill, "enabled", False) else "disabled"
+        print(
+            f"{skill.id}\t{state}\t{getattr(skill, 'scope', '-') or '-'}\t"
+            f"{skill.name or skill.description}"
+        )
+    return 0
+
+
+async def _cmd_jobs(o: Options, service: Any) -> int:
+    action = (o.args[0] if o.args else "list").casefold()
+    value = o.args[1] if len(o.args) > 1 else None
+    if action in {"list", "show"}:
+        rows = await service.list_jobs(enabled_only=False)
+        if action == "show" and value:
+            rows = [row for row in rows if str(row.get("id")) == value]
+        if not rows:
+            print("(no scheduled jobs)")
+        for row in rows:
+            last = row.get("last_run_receipt") or {}
+            print(
+                f"{row.get('id')}\t{'enabled' if row.get('enabled') else 'disabled'}\t"
+                f"next={row.get('next_run') or '-'}\tlast={last.get('status') or '-'}"
+            )
+        return 0
+    if action in {"enable", "disable"} and value:
+        changed = await service.job_set_enabled(value, action == "enable")
+        if not changed:
+            print(f"job not found: {value}", file=sys.stderr)
+            return 1
+        print(f"job {value}: {action}d")
+        return 0
+    if action in {"run", "run-now"} and value:
+        task_id = await service.job_run_now(value)
+        if task_id is None:
+            print(f"job {value}: not run (missing or disabled)", file=sys.stderr)
+            return 1
+        print(f"job {value}: started task {task_id}")
+        return 0
+    print(
+        "athena jobs: use list, show JOB_ID, enable JOB_ID, disable JOB_ID, or run-now JOB_ID",
+        file=sys.stderr,
+    )
+    return 2
+
+
+async def _cmd_workflows(o: Options, service: Any) -> int:
+    """Inspect durable workflow definitions without executing them."""
+    action = (o.args[0] if o.args else "list").casefold()
+    value = o.args[1] if len(o.args) > 1 else None
+    if action == "list":
+        # ``list TASK_ID`` includes task-owned candidates; ordinary project
+        # and user workflows remain visible without a task id.
+        task_id = value
+        rows = await service.list_workflows(task_id=task_id)
+        if not rows:
+            print("(no visible workflows)")
+        for row in rows:
+            print(
+                f"{row.get('id')}\t{row.get('scope')}\t"
+                f"{row.get('lifecycle_state')}\t"
+                f"{'enabled' if row.get('enabled', True) else 'disabled'}\t"
+                f"{row.get('name')}"
+            )
+        return 0
+    if action in {"show", "inspect", "describe"} and value:
+        import json
+
+        task_id = o.args[2] if len(o.args) > 2 else None
+        row = await service.inspect_workflow(value, task_id=task_id)
+        if row is None:
+            print(f"workflow not found or not visible: {value}", file=sys.stderr)
+            return 1
+        print(json.dumps(row, indent=2, default=str, sort_keys=True))
+        return 0
+    print(
+        "athena workflows: use list [TASK_ID], show WORKFLOW_ID, or describe WORKFLOW_ID [TASK_ID]",
+        file=sys.stderr,
+    )
+    return 2
+
+
+async def _cmd_packs(o: Options, service: Any) -> int:
+    action = (o.args[0] if o.args else "list").casefold()
+    value = o.args[1] if len(o.args) > 1 else None
+    if action in {"list", "search"}:
+        rows = await service.list_packs(value if action == "search" else None)
+        if not rows:
+            print("(no installed packs)")
+        for row in rows:
+            health = (row.get("health_detail") or {}).get("status", row.get("health", "?"))
+            print(
+                f"{row.get('id')}@{row.get('version')}\t"
+                f"{'enabled' if row.get('enabled') else 'disabled'}\t{health}"
+            )
+        return 0
+    try:
+        if action == "inspect" and value:
+            import json
+
+            row = await service.inspect_pack(value)
+            if row is None:
+                print(f"pack not found: {value}", file=sys.stderr)
+                return 1
+            print(json.dumps(row, indent=2, default=str, sort_keys=True))
+            return 0
+        if action == "install" and value:
+            row = await service.install_pack(value)
+            print(f"installed {row.get('id')}@{row.get('version')}")
+            return 0
+        if action in {"enable", "disable"} and value:
+            row = await getattr(service, f"{action}_pack")(value)
+            print(f"pack {value}: {'enabled' if row.get('enabled') else 'disabled'}")
+            return 0
+        if action in {"remove", "uninstall"} and value:
+            if not await service.remove_pack(value):
+                print(f"pack not found: {value}", file=sys.stderr)
+                return 1
+            print(f"removed {value}")
+            return 0
+    except (KeyError, RuntimeError, ValueError, OSError) as exc:
+        print(f"athena packs: {exc}", file=sys.stderr)
+        return 1
+    print(
+        "athena packs: use list, search TEXT, inspect ID, install PATH, "
+        "enable ID, disable ID, or remove ID",
+        file=sys.stderr,
+    )
+    return 2
+
+
+async def _cmd_memory(o: Options, service: Any) -> int:
+    action = (o.args[0] if o.args else "candidates").casefold()
+    if action in {"candidates", "list"}:
+        rows = await service.operator_memory_candidates()
+        if not rows:
+            print("(no pending memory candidates)")
+        for row in rows:
+            print(
+                f"{row.get('id')}\t{row.get('lifecycle_state')}\t{row.get('trust')}\t"
+                f"{row.get('content')}"
+            )
+        return 0
+    if action == "inspect" and len(o.args) >= 2:
+        row = await service.operator_memory_candidate(o.args[1])
+        if row is None:
+            print("memory candidate not found", file=sys.stderr)
+            return 1
+        import json
+
+        print(json.dumps(row, indent=2, default=str, sort_keys=True))
+        return 0
+    if action == "promote" and len(o.args) >= 3:
+        outcome = await service.operator_promote_memory_candidate(
+            o.args[1], o.args[2], o.args[3] if len(o.args) > 3 else None
+        )
+        print(outcome)
+        return 0 if outcome.get("status") == "promoted" else 1
+    if action == "discard" and len(o.args) == 2:
+        outcome = await service.operator_discard_memory_candidate(o.args[1])
+        print(outcome)
+        return 0 if outcome.get("status") == "discarded" else 1
+    print(
+        "athena memory: use candidates, inspect ID, promote ID SCOPE [SCOPE_ID], or discard ID",
+        file=sys.stderr,
+    )
+    return 2
+
+
+async def _cmd_mcp(o: Options, service: Any) -> int:
+    action = (o.args[0] if o.args else "list").casefold()
+    name = o.args[1] if len(o.args) > 1 else None
+    if action in {"list", "status"}:
+        rows = service.mcp_status()
+        if not rows:
+            print("(no configured MCP servers)")
+        for server, state in rows.items():
+            print(
+                f"{server}\t{state.get('state')}\t{state.get('transport')}\t"
+                f"tools={state.get('tool_count', 0)}\t{state.get('last_error') or ''}".rstrip()
+            )
+        return 0
+    if action == "tools" and name:
+        client = next((item for item in service._mcp_clients if item.connection_id == name), None)
+        if client is None:
+            print(f"MCP server {name!r} is not connected", file=sys.stderr)
+            return 1
+        for tool in await client.list_tools():
+            print(f"{tool.name}\t{tool.description}")
+        return 0
+    if action == "doctor" and name:
+        client = next((item for item in service._mcp_clients if item.connection_id == name), None)
+        if client is None:
+            state = service.mcp_status().get(name)
+            print(f"MCP server {name!r}: {state or 'not configured'}")
+            return 1
+        try:
+            tools = await client.list_tools()
+        except Exception as exc:
+            print(f"{name}: failed ({exc})", file=sys.stderr)
+            return 1
+        print(f"{name}: connected; {len(tools)} tool(s) discovered")
+        return 0
+    if action == "reconnect" and name:
+        state = await service.mcp_reconnect(name)
+        print(f"{name}: {state.get('state')} {state.get('last_error') or ''}".rstrip())
+        return 0 if state.get("state") == "connected" else 1
+    print(
+        "athena mcp: use list, status, tools SERVER, reconnect SERVER, or doctor SERVER",
+        file=sys.stderr,
+    )
+    return 2
+
+
+async def _cmd_acp(service: Any) -> int:
+    """Run the local stdio ACP transport around the canonical service loop."""
+    import json
+    from dataclasses import asdict, fields
+
+    from athena.acp import ACPAdapter, ACPRequest
+
+    adapter = ACPAdapter(
+        service._task_manager,
+        service._sessions,
+        service=service,
+        event_store=service._require_events(),
+        principal_id=service.config.cache_namespace,
+    )
+    active: dict[str, asyncio.Task] = {}
+    output_lock = asyncio.Lock()
+
+    async def emit(value: Any) -> None:
+        line = json.dumps(
+            asdict(value) if hasattr(value, "__dataclass_fields__") else value, default=str
+        )
+        async with output_lock:
+            print(line, flush=True)
+
+    async def stream(task_id: str) -> None:
+        try:
+            async for event in adapter.stream(task_id):
+                await emit({"type": "event", "event": asdict(event)})
+        except Exception as exc:  # transport clients need an explicit failure envelope
+            await emit({"type": "error", "task_id": task_id, "error": str(exc)})
+
+    try:
+        while True:
+            from athena.execution.async_call import run_blocking
+
+            line = await run_blocking(sys.stdin.readline)
+            if not line:
+                break
+            try:
+                envelope = json.loads(line)
+                operation = str(envelope.get("type") or "submit").casefold()
+                if operation == "submit":
+                    raw = envelope.get("request") if isinstance(envelope, dict) else envelope
+                    if not isinstance(raw, dict):
+                        raise ValueError("submit request must be an object")
+                    allowed = {item.name for item in fields(ACPRequest)}
+                    request = ACPRequest(
+                        **{key: value for key, value in raw.items() if key in allowed}
+                    )
+                    accepted = await adapter.submit(request)
+                    await emit({"type": "accepted", "event": asdict(accepted)})
+                    active[accepted.task_id] = asyncio.create_task(stream(accepted.task_id))
+                elif operation == "cancel":
+                    task_id = str(envelope.get("task_id") or "")
+                    if not task_id:
+                        raise ValueError("cancel requires task_id")
+                    await service.cancel(task_id)
+                    await emit({"type": "cancelled", "task_id": task_id})
+                elif operation in {"close", "shutdown"}:
+                    break
+                else:
+                    raise ValueError(f"unknown ACP operation: {operation}")
+            except Exception as exc:
+                await emit({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        for task in active.values():
+            task.cancel()
+        if active:
+            await asyncio.gather(*active.values(), return_exceptions=True)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # click front-end (preferred)
 # ---------------------------------------------------------------------------
+
+
+def _package_version() -> str:
+    """Installed package version; the declared fallback covers source checkouts."""
+    try:
+        from importlib.metadata import version
+
+        return version("athena-agent")
+    except Exception:
+        return "0.1.0b1"
 
 
 def _click_cli(click: Any):
     levels = [a.value for a in AutonomyLevel]
 
     @click.group(invoke_without_command=True)
-    @click.version_option("0.1.0")
+    @click.version_option(_package_version())
     @click.option("--config", "config_path", default=None, help="Path to config file.")
     @click.option("--db", "db_path", default=None, help="Path to persistence DB.")
     @click.option("--workspace", default=None, help="Workspace root directory.")
@@ -961,6 +1581,27 @@ def _click_cli(click: Any):
         o.config_value = value
         sys.exit(dispatch(o))
 
+    @config.command("validate")
+    @click.pass_context
+    def config_validate(ctx):
+        """Parse all effective configuration and report validation result."""
+        o = base_options(ctx, "config")
+        o.config_action = "validate"
+        sys.exit(dispatch(o))
+
+    def config_path_command(name, help_text):
+        @config.command(name, help=help_text)
+        @click.argument("path")
+        @click.pass_context
+        def command(ctx, path):
+            o = base_options(ctx, "config")
+            o.config_action = name
+            o.config_key = path
+            sys.exit(dispatch(o))
+
+    config_path_command("get", "Read one effective configuration path.")
+    config_path_command("explain", "Explain one configuration setting.")
+
     @cli.group()
     @click.pass_context
     def referee(ctx):
@@ -975,6 +1616,13 @@ def _click_cli(click: Any):
             click.option("--port", "referee_port", default=8643, type=int),
             click.option(
                 "--credential-id", "referee_credential_id", default="HERMES_REFEREE_API_KEY"
+            ),
+            click.option(
+                "--self-host-supervision",
+                "referee_supervision",
+                type=click.Choice(["off", "advisory", "required"]),
+                default=None,
+                help="Hermes self-host policy (setup defaults to required).",
             ),
         ):
             func = decorator(func)
@@ -1023,6 +1671,12 @@ def _click_cli(click: Any):
         """Check service startup health and readiness dependencies."""
         sys.exit(dispatch(base_options(ctx, "doctor", ["startup"])))
 
+    @doctor.command("native")
+    @click.pass_context
+    def doctor_native(ctx):
+        """Check native companion ABI, libraries, display, and binary."""
+        sys.exit(dispatch(base_options(ctx, "doctor", ["native"])))
+
     @cli.command()
     @click.argument("objective", required=False, nargs=-1)
     @click.option(
@@ -1033,7 +1687,7 @@ def _click_cli(click: Any):
         if c_details:
             ctx.ensure_object(dict)["details"] = True
         if objective:
-            sys.exit(dispatch(base_options(ctx, "run", [objective])))
+            sys.exit(dispatch(base_options(ctx, "run", [" ".join(objective)])))
         sys.exit(dispatch(base_options(ctx, "chat")))
 
     @cli.command()
@@ -1110,6 +1764,73 @@ def _click_cli(click: Any):
     @click.pass_context
     def cancel(ctx, task_id):
         sys.exit(dispatch(base_options(ctx, "cancel", [task_id])))
+
+    @cli.command("tasks")
+    @click.argument("actions", nargs=-1)
+    @click.pass_context
+    def tasks(ctx, actions):
+        """List or inspect durable task state."""
+        sys.exit(dispatch(base_options(ctx, "tasks", list(actions))))
+
+    @cli.command("models")
+    @click.pass_context
+    def models(ctx):
+        """List configured models and declared capabilities."""
+        sys.exit(dispatch(base_options(ctx, "models")))
+
+    @cli.command("skills")
+    @click.argument("actions", nargs=-1)
+    @click.pass_context
+    def skills(ctx, actions):
+        """List installed skills and lifecycle state."""
+        sys.exit(dispatch(base_options(ctx, "skills", list(actions))))
+
+    @cli.command("jobs")
+    @click.argument("actions", nargs=-1)
+    @click.pass_context
+    def jobs(ctx, actions):
+        """Inspect and control scheduled jobs."""
+        sys.exit(dispatch(base_options(ctx, "jobs", list(actions))))
+
+    @cli.command("workflows")
+    @click.argument("actions", nargs=-1)
+    @click.pass_context
+    def workflows(ctx, actions):
+        """Inspect durable workflow definitions and lifecycle state."""
+        sys.exit(dispatch(base_options(ctx, "workflows", list(actions))))
+
+    @cli.command("packs")
+    @click.argument("actions", nargs=-1)
+    @click.pass_context
+    def packs(ctx, actions):
+        """Inspect and control declarative capability packs."""
+        sys.exit(dispatch(base_options(ctx, "packs", list(actions))))
+
+    @cli.command("memory")
+    @click.argument("actions", nargs=-1)
+    @click.pass_context
+    def memory(ctx, actions):
+        """Review durable memory candidates."""
+        sys.exit(dispatch(base_options(ctx, "memory", list(actions))))
+
+    @cli.command("mcp")
+    @click.argument("actions", nargs=-1)
+    @click.pass_context
+    def mcp(ctx, actions):
+        """Inspect and reconnect configured MCP servers."""
+        sys.exit(dispatch(base_options(ctx, "mcp", list(actions))))
+
+    @cli.command("acp")
+    @click.pass_context
+    def acp(ctx):
+        """Run the local JSON-lines ACP server over standard input/output."""
+        sys.exit(dispatch(base_options(ctx, "acp")))
+
+    @cli.command("serve")
+    @click.pass_context
+    def serve(ctx):
+        """Serve the canonical loopback HTTP/SSE API."""
+        sys.exit(dispatch(base_options(ctx, "serve")))
 
     @cli.command("oi-stream")
     @click.option(
@@ -1232,13 +1953,42 @@ def _arg_parse(argv: list[str]) -> Options:
     sp.add_argument("objective", nargs="?", default=None)
     sp = sub.add_parser("sessions", help="List sessions.")
     globals_(sp)
-    sp = sub.add_parser("doctor", help="Diagnose service startup and display support.")
+    for name, help_ in (
+        ("tasks", "List or inspect durable task state."),
+        ("memory", "Review durable memory candidates."),
+        ("mcp", "Inspect and reconnect configured MCP servers."),
+        ("jobs", "Inspect and control scheduled jobs."),
+        ("workflows", "Inspect durable workflow definitions and lifecycle state."),
+        ("packs", "Inspect and control declarative capability packs."),
+    ):
+        sp = sub.add_parser(name, help=help_)
+        globals_(sp)
+        sp.add_argument("action", nargs="*")
+    sp = sub.add_parser("models", help="List configured models and capabilities.")
     globals_(sp)
-    sp.add_argument("target", nargs="?", choices=["startup", "display"], default="startup")
+    sp = sub.add_parser("skills", help="List installed skills and lifecycle state.")
+    globals_(sp)
+    sp = sub.add_parser("acp", help="Run the local JSON-lines ACP server.")
+    globals_(sp)
+    sp = sub.add_parser("serve", help="Serve the canonical loopback HTTP/SSE API.")
+    globals_(sp)
+    sp = sub.add_parser("doctor", help="Diagnose startup, display, and native support.")
+    globals_(sp)
+    sp.add_argument(
+        "target",
+        nargs="?",
+        choices=["startup", "display", "native"],
+        default="startup",
+    )
     sp = sub.add_parser("config", help="Inspect or update operator configuration.")
     globals_(sp)
     config_sub = sp.add_subparsers(dest="config_action")
     config_sub.add_parser("show", help="Show effective Hermes referee settings.")
+    config_sub.add_parser("validate", help="Validate effective configuration.")
+    config_get = config_sub.add_parser("get", help="Read one effective configuration path.")
+    config_get.add_argument("key")
+    config_explain = config_sub.add_parser("explain", help="Explain one configuration setting.")
+    config_explain.add_argument("key")
     config_set = config_sub.add_parser("set", help="Set one supported operator setting.")
     config_set.add_argument("key")
     config_set.add_argument("value")
@@ -1253,6 +2003,13 @@ def _arg_parse(argv: list[str]) -> Options:
         referee_parser.add_argument("--port", dest="referee_port", default=8643, type=int)
         referee_parser.add_argument(
             "--credential-id", dest="referee_credential_id", default="HERMES_REFEREE_API_KEY"
+        )
+        referee_parser.add_argument(
+            "--self-host-supervision",
+            dest="referee_supervision",
+            choices=("off", "advisory", "required"),
+            default=None,
+            help="Hermes self-host policy (setup defaults to required).",
         )
     sp = sub.add_parser("oi-stream", help="Stream the live OI projection.")
     globals_(sp)
@@ -1285,6 +2042,7 @@ def _arg_parse(argv: list[str]) -> Options:
         referee_host=getattr(ns, "referee_host", "127.0.0.1"),
         referee_port=getattr(ns, "referee_port", 8643),
         referee_credential_id=getattr(ns, "referee_credential_id", "HERMES_REFEREE_API_KEY"),
+        referee_supervision=getattr(ns, "referee_supervision", None),
     )
     if command == "doctor":
         o.args = [ns.target]
@@ -1294,6 +2052,8 @@ def _arg_parse(argv: list[str]) -> Options:
         o.config_value = getattr(ns, "value", None)
     if command == "oi-stream":
         o.args = [ns.task_id] if ns.task_id else []
+    elif command in {"tasks", "memory", "mcp", "jobs", "workflows", "packs"}:
+        o.args = list(getattr(ns, "action", []) or [])
     elif command == "run":
         o.args = [ns.objective]
     elif command == "self":

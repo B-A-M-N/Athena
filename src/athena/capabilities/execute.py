@@ -57,6 +57,21 @@ class ExecuteCapability:
         ),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        tags=frozenset(
+            {
+                "execute",
+                "run",
+                "command",
+                "command_runner",
+                "shell",
+                "python",
+                "test",
+                "tests",
+                "pytest",
+                "build",
+                "compute",
+            }
+        ),
         origin=CapabilityOrigin.NATIVE,
     )
 

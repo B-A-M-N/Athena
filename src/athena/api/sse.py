@@ -182,7 +182,7 @@ def run(
     selected_host = str(config.get("host", host))
     if not _is_loopback_host(selected_host):
         raise RuntimeError(
-            "Athena's beta API is local-only; bind to 127.0.0.1, ::1, or "
+            "Athena's 0.1 API is local-only; bind to 127.0.0.1, ::1, or "
             "localhost until an authenticated API boundary is configured"
         )
     uvicorn.run(app, host=selected_host, port=int(config.get("port", port)))

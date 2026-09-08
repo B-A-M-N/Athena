@@ -42,7 +42,11 @@ async def test_runtime_restart_emits_explicit_state_loss_event():
                 {
                     "runtime_session_id": "runtime-1",
                     "backend": "python",
+                    "runtime": None,
+                    "cwd": None,
                     "reason": "Athena restarted without a reattachable runtime process",
+                    "recovery_action": "reestablish_runtime",
+                    "recovery_route": "execute",
                 },
             ),
             {"task_id": "task-1"},
@@ -51,6 +55,11 @@ async def test_runtime_restart_emits_explicit_state_loss_event():
     assert tasks.hints == [
         (
             "task-1",
-            {"runtime_session_id": "runtime-1", "backend": "python"},
+            {
+                "runtime_session_id": "runtime-1",
+                "backend": "python",
+                "runtime": None,
+                "cwd": None,
+            },
         )
     ]

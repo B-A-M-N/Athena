@@ -11,20 +11,26 @@ via ``ExecutionManager`` without routing them through the model loop.
 
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any, AsyncIterator
 
+from athena.execution.async_call import run_blocking
 from athena.protocol.events import Event, make_event
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskResult
 from athena.cli.surface import ApprovalChoice, OperatorSurface
+from athena.cli.operator_commands import OperatorCommandRouter
 
 _META_HELP = """\
 /help            show this help
 /exit  /quit     leave the REPL
 /cancel          cancel the running task
 /sessions        list sessions
+/jobs list|show|enable|disable|run-now  inspect scheduled jobs
+/workflows list [TASK_ID]|show ID [TASK_ID]  inspect durable workflows
+/skills list|search|enable|disable       inspect installed skills
+/packs list|search|enable|disable|remove inspect capability packs
+/health          show live subsystem health
 /new             start a fresh session
 /autonomy LEVEL  set autonomy (supervised|coding|autonomous|offline)
 /model POLICY    set model policy
@@ -38,10 +44,11 @@ _META_HELP = """\
 /criteria LIST   set acceptance criteria (';'-separated; 'command:' prefix = probe); bare to clear
 /interrupted     list tasks parked by shutdown or crash
 /resume [TASK]   re-queue an interrupted task (or the most recent one)
-/candidates      list generated-tool candidates from the last task
+/candidates      list generated-tool and pending-memory candidates
 /candidate ID    inspect one generated-tool candidate
 /promote ID project|user  explicitly promote a generated tool
 /deprecate ID    retire a generated tool
+/memory candidates|inspect ID|promote ID SCOPE|discard ID  memory review
 /mascot [NAME]   list or switch the mascot/buddy ('off' hides it)
 !cmd             execute a shell command directly
 !!cmd            execute a shell command (output not injected into model context)
@@ -63,7 +70,8 @@ def _autonomy(value: str | None) -> AutonomyLevel:
     try:
         return AutonomyLevel(value.strip().lower())
     except ValueError:
-        return AutonomyLevel.SUPERVISED
+        valid = ", ".join(a.value for a in AutonomyLevel)
+        raise ValueError(f"unknown autonomy {value!r}; choose one of: {valid}") from None
 
 
 def _workspace_spec(root: str | None):
@@ -93,51 +101,6 @@ def _model_label(config: Any = None) -> str:
         return f"configured / {identity}" if identity else "configured"
     configured = os.environ.get("OPENROUTER_MODEL")
     return f"configured / {configured}" if configured else ""
-
-
-async def _cmd_permissions(service: Any, surface: OperatorSurface) -> None:
-    """Project active grants and pending approvals from canonical stores."""
-    view = await service.operator_permissions()
-    grants = view.get("active_grants") or []
-    pending = view.get("pending") or []
-    surface.render_notice("┌─ permissions ─────────────────────────")
-    if not grants:
-        surface.render_notice("│ no active grants")
-    for g in grants:
-        scope = g.get("scope") or "?"
-        cap = g.get("capability") or "*"
-        pattern = g.get("resource_pattern") or ""
-        expires = g.get("expires_at") or "no expiry"
-        line = f"│ grant {g.get('approval_id')} · {cap} · {scope}"
-        if pattern:
-            line += f" · {pattern}"
-        surface.render_notice(line)
-        surface.render_notice(f"│   expires: {expires}")
-    if not pending:
-        surface.render_notice("│ no pending approvals")
-    for p in pending:
-        surface.render_notice(f"│ pending {p.get('approval_id')} · {p.get('capability_id')}")
-    surface.render_notice("└──────────────────────────────────────")
-
-
-async def _cmd_diff(service: Any, limit: int, surface: OperatorSurface) -> None:
-    """Project the mutation ledger (grouped file-change evidence)."""
-    rows = await service.operator_diff(limit=limit)
-    surface.render_notice("┌─ mutations ───────────────────────────")
-    if not rows:
-        surface.render_notice("│ (no recorded mutations)")
-    for r in rows:
-        status_icon = {
-            "COMPLETED": "✓",
-            "FAILED": "✗",
-            "ROLLED_BACK": "↩",
-        }.get(r.get("status"), "·")
-        reversible = "reversible" if r.get("reversible") else "one-way"
-        surface.render_notice(
-            f"│ {status_icon} {r.get('operation', '?'):10} {r.get('resource', '?')}  [{reversible}]"
-        )
-        surface.render_notice(f"│   id: {r.get('id')}  task: {r.get('task_id') or '—'}")
-    surface.render_notice("└──────────────────────────────────────")
 
 
 def _surface_class():
@@ -211,12 +174,66 @@ class ChatREPL:
             if getattr(options, "criteria", None)
             else []
         )
+        self._operator_router = OperatorCommandRouter(
+            lambda: self.service,
+            emit=lambda text: self.surface.render_notice(text),
+            get_task_id=lambda: self._last_task_id or self._active_task_id,
+            get_session_id=lambda: self.session_id,
+            set_session_id=lambda value: setattr(self, "session_id", value),
+            set_model=lambda value: setattr(self, "model_policy", value),
+            set_autonomy=self._set_autonomy,
+            set_criteria=lambda value: setattr(self, "criteria", value),
+            new_handler=self._new_session,
+            resume_handler=self._resume_command,
+        )
+
+    def _set_autonomy(self, value: str) -> str:
+        self.autonomy = _autonomy(value)
+        return self.autonomy.value
+
+    def _new_session(self) -> None:
+        self.session_id = None
+        self._active_task_id = None
+        self._last_task_id = None
+
+    async def _resume_command(self, argument: str) -> None:
+        if not self.session_id:
+            self.session_id = new_id("session")
+
+        async def _approval(approval_id: str, scopes: list[str]) -> ApprovalChoice:
+            event = make_event(
+                "ApprovalRequested",
+                {"approval_id": approval_id, "capability_id": "execute", "scopes": scopes},
+                session_id=self.session_id,
+            )
+            await self.surface.render_event(event)
+            return await self.surface.choose_approval(event)
+
+        task_id = argument or None
+        if task_id is None:
+            rows = await self.service.list_interrupted()
+            if not rows:
+                self.surface.render_notice("(no interrupted tasks to resume)")
+                return
+            task_id = rows[0]["id"]
+            self.surface.render_notice(f"resuming most recent: {task_id}")
+        spec = await self.service.resume_task(task_id)
+        self._active_task_id = spec.id
+        self._last_task_id = spec.id
+        result = await stream_task(
+            self.service, spec.id, autonomy=self.autonomy, surface=self.surface
+        )
+        if result is not None:
+            status = getattr(result, "status", None)
+            status_value = getattr(status, "value", None)
+            self.surface.render_result(
+                getattr(result, "summary", "") or "", status=str(status_value or status)
+            )
+        self._active_task_id = None
 
     # -- input ------------------------------------------------------------
 
     async def _read_line(self, prompt: str = "athena> ") -> str:
-        loop = asyncio.get_running_loop()
-
         def _get() -> str:
             try:
                 reader = getattr(self.surface, "read_prompt", None)
@@ -226,7 +243,7 @@ class ChatREPL:
             except EOFError:
                 return ""
 
-        return await loop.run_in_executor(None, _get)
+        return await run_blocking(_get)
 
     # -- main loop --------------------------------------------------------
 
@@ -290,42 +307,13 @@ class ChatREPL:
         name = name.lower().strip()
         arg = arg.strip()
 
+        if await self._operator_router.dispatch(line):
+            return True
+
         if name in ("exit", "quit"):
             raise SystemExit(0)
         if name == "help":
             self.surface.render_notice(_META_HELP)
-            return True
-        if name == "cancel":
-            if self._active_task_id:
-                await self.service.cancel(self._active_task_id)
-                self.surface.render_notice(f"cancel requested for {self._active_task_id}")
-            else:
-                self.surface.render_notice("(no active task)")
-            return True
-        if name == "sessions":
-            sessions = await self.service.list_sessions()
-            if not sessions:
-                self.surface.render_notice("(no sessions)")
-            for s in sessions:
-                sid = s.get("id") if isinstance(s, dict) else getattr(s, "id", s)
-                title = (
-                    s.get("objective")
-                    if isinstance(s, dict)
-                    else (getattr(s, "title", None) or getattr(s, "objective", "") or "")
-                )
-                self.surface.render_notice(f"{sid}\t{title or ''}")
-            return True
-        if name == "new":
-            self.session_id = None
-            self.surface.render_notice("(fresh session)")
-            return True
-        if name == "autonomy":
-            self.autonomy = _autonomy(arg)
-            self.surface.render_notice(f"autonomy: {self.autonomy.value}")
-            return True
-        if name == "model":
-            self.model_policy = arg or None
-            self.surface.render_notice(f"model: {self.model_policy}")
             return True
         if name == "details":
             self.surface.details = not self.surface.details
@@ -341,187 +329,6 @@ class ChatREPL:
             return True
         if name == "mascot":
             self._cmd_mascot(arg)
-            return True
-        if name == "candidates":
-            task_id = self._last_task_id or self._active_task_id
-            if task_id is None:
-                self.surface.render_notice("(no task context for generated candidates)")
-                return True
-            rows = await self.service.operator_generated_capabilities(task_id)
-            if not rows:
-                self.surface.render_notice("(no generated candidates)")
-                return True
-            for row in rows:
-                usage = dict((row.get("proof") or {}).get("usage") or {})
-                evidence = f"{usage.get('successes', 0)}/{usage.get('uses', 0)} successful"
-                self.surface.render_notice(
-                    f"{row.get('capability_id')} · {row.get('lifecycle_state')} · {evidence}"
-                )
-                self.surface.render_notice(f"  {row.get('description') or ''}")
-            return True
-        if name == "candidate":
-            if not arg:
-                self.surface.render_notice("usage: /candidate <capability_id>")
-                return True
-            task_id = self._last_task_id or self._active_task_id
-            try:
-                record = await self.service.operator_generated_capability(arg, task_id)
-            except (RuntimeError, ValueError) as exc:
-                self.surface.render_notice(f"candidate unavailable: {exc}")
-                return True
-            proof = dict(record.get("proof_record") or {})
-            usage = dict(proof.get("usage") or {})
-            quality = proof.get("quality_score")
-            self.surface.render_notice(
-                f"{record.get('id')} · {record.get('scope')} · {record.get('lifecycle_state')}"
-            )
-            self.surface.render_notice(f"  {record.get('description') or ''}")
-            self.surface.render_notice(
-                f"  proof: {usage.get('successes', 0)}/{usage.get('uses', 0)} successful"
-            )
-            if quality is not None:
-                self.surface.render_notice(f"  quality: {quality}")
-            self.surface.render_notice(f"  code hash: {record.get('code_hash')}")
-            self.surface.render_notice(f"  schema hash: {record.get('schema_hash')}")
-            dependencies = ", ".join(
-                dependency.get("name", "?")
-                for dependency in record.get("required_dependencies") or ()
-            )
-            if dependencies:
-                self.surface.render_notice(f"  dependencies: {dependencies}")
-            return True
-        if name == "promote":
-            parts = arg.split()
-            if len(parts) != 2 or parts[1] not in {"project", "user"}:
-                self.surface.render_notice("usage: /promote <capability_id> project|user")
-                return True
-            capability_id, scope = parts
-            task_id = self._last_task_id or self._active_task_id
-            try:
-                outcome = await self.service.operator_promote_generated_capability(
-                    capability_id, scope, task_id
-                )
-            except (RuntimeError, ValueError) as exc:
-                self.surface.render_notice(f"promotion failed: {exc}")
-                return True
-            value = dict(outcome.get("value") or {})
-            owner = value.get("project_id") or value.get("user_id") or "?"
-            self.surface.render_notice(f"promoted {capability_id} to {scope} {owner}")
-            return True
-        if name == "deprecate":
-            if not arg:
-                self.surface.render_notice("usage: /deprecate <capability_id>")
-                return True
-            task_id = self._last_task_id or self._active_task_id
-            try:
-                await self.service.operator_deprecate_generated_capability(arg, task_id)
-            except (RuntimeError, ValueError) as exc:
-                self.surface.render_notice(f"deprecation failed: {exc}")
-                return True
-            self.surface.render_notice(f"deprecated {arg}")
-            return True
-        if name == "permissions":
-            await _cmd_permissions(self.service, self.surface)
-            return True
-        if name == "diff":
-            limit = int(arg) if arg.isdigit() else 25
-            await _cmd_diff(self.service, limit, self.surface)
-            return True
-        if name == "undo":
-            if not arg:
-                self.surface.render_notice("usage: /undo <mutation_id>")
-                return True
-            outcome = await self.service.undo_mutation(arg)
-            status = outcome.get("status")
-            if status == "ok":
-                self.surface.render_notice(
-                    f"rolled back {arg} (rollback {outcome.get('rollback_id')})"
-                )
-            else:
-                self.surface.render_notice(f"undo failed: {outcome.get('error', status)}")
-            return True
-        if name == "criteria":
-            if not arg:
-                self.criteria = []
-                self.surface.render_notice("acceptance criteria cleared")
-            else:
-                self.criteria = [c.strip() for c in arg.split(";") if c.strip()]
-                for i, c in enumerate(self.criteria, 1):
-                    kind = "command probe" if c.lower().startswith("command:") else "model-judged"
-                    self.surface.render_notice(f"  ac_{i} [{kind}] {c}")
-            return True
-        if name == "interrupted":
-            rows = await self.service.list_interrupted()
-            if not rows:
-                self.surface.render_notice("(no interrupted tasks)")
-            for r in rows:
-                objective = (r.get("objective") or "")[:60]
-                self.surface.render_notice(f"{r.get('id')}  {objective}")
-            return True
-        if name == "resume":
-            if not self.session_id:
-                self.session_id = new_id("session")
-
-            async def _approval(approval_id: str, scopes: list[str]) -> ApprovalChoice:
-                event = make_event(
-                    "ApprovalRequested",
-                    {"approval_id": approval_id, "capability_id": "execute", "scopes": scopes},
-                    session_id=self.session_id,
-                )
-                await self.surface.render_event(event)
-                return await self.surface.choose_approval(event)
-
-            task_id = arg or None
-            if task_id is None:
-                rows = await self.service.list_interrupted()
-                if not rows:
-                    self.surface.render_notice("(no interrupted tasks to resume)")
-                    return True
-                task_id = rows[0]["id"]
-                self.surface.render_notice(f"resuming most recent: {task_id}")
-            from athena.cli.chat import stream_task as _stream
-
-            spec = await self.service.resume_task(task_id)
-            self._active_task_id = spec.id
-            self._last_task_id = spec.id
-            result = await _stream(
-                self.service, spec.id, autonomy=self.autonomy, surface=self.surface
-            )
-            if result is not None:
-                status = getattr(result, "status", None)
-                status_value = getattr(status, "value", None)
-                s = str(status_value if status_value is not None else status)
-                summary = getattr(result, "summary", "") or ""
-                self.surface.render_result(summary, status=s)
-            self._active_task_id = None
-            return True
-        if name in ("compact", "context"):
-            summary = await self.service.operator_context_summary(self.session_id)
-            window = summary.get("window")
-            reserve = summary.get("reserve_output")
-            recent = summary.get("recent_verbatim_turns")
-            count = summary.get("message_count")
-            if name == "compact":
-                self.surface.render_notice(f"context window: {window or '?'} tokens")
-                self.surface.render_notice(
-                    f"output reserve: {reserve if reserve is not None else '?'} tokens"
-                )
-                self.surface.render_notice(
-                    f"recent verbatim turns: {recent if recent is not None else '?'}"
-                )
-                older = "compressed with provenance retained"
-                self.surface.render_notice(f"older transcript: {older}")
-            else:
-                self.surface.render_notice(f"session: {self.session_id or '(none yet)'}")
-                self.surface.render_notice(
-                    f"durable messages: {count if count is not None else '?'}"
-                )
-                self.surface.render_notice(
-                    "next turn includes: objective, policy boundaries, recent turns,"
-                )
-                self.surface.render_notice(
-                    "capability calls/results, relevant memories and skills."
-                )
             return True
         return False
 
@@ -597,6 +404,10 @@ class ChatREPL:
             metadata=({"acceptance_criteria": list(self.criteria)} if self.criteria else {}),
         )
         spec = await self.service.submit(request, wait=False)
+        # The service allocates the canonical session at intake. Persist it in
+        # the REPL before streaming so the next turn continues the same
+        # session even if the current task is still running or pauses.
+        self.session_id = getattr(spec, "session_id", self.session_id)
         self._active_task_id = spec.id
         self._last_task_id = spec.id
         result = await stream_task(
@@ -606,7 +417,6 @@ class ChatREPL:
             surface=self.surface,
         )
         if result is not None:
-            self.session_id = getattr(spec, "session_id", self.session_id)
             summary = getattr(result, "summary", "") or ""
             status = getattr(result, "status", None)
             status_str = (

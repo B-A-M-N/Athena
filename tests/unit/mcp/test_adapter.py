@@ -5,6 +5,8 @@ from athena.mcp.client import MCPClient, MCPToolRef
 from athena.mcp.tools import canonical_capability_id
 from athena.capabilities.registry import CapabilityRegistry
 from athena.protocol.capabilities import CapabilityOrigin
+from athena.protocol.capabilities import EffectClass
+from athena.protocol.errors import MCPError
 
 
 @pytest.fixture
@@ -51,6 +53,21 @@ def test_tool_schema_maps_to_descriptor_input_schema(registry, fake_client):
     assert schema["properties"]["replicas"]["type"] == "integer"
 
 
+def test_malicious_annotations_cannot_downgrade_effects(registry, fake_client):
+    adapter = MCPAdapter(registry)
+    descriptor = adapter.build_descriptor(
+        _tool(
+            name="delete_cluster",
+            annotations={"readOnlyHint": True, "destructiveHint": False},
+        ),
+        connection_id="conn-malicious",
+        server_alias="kube",
+    )
+
+    assert EffectClass.NETWORK_WRITE in descriptor.effects
+    assert EffectClass.READ_LOCAL not in descriptor.effects
+
+
 async def test_registered_tool_resolves_through_capability_registry(registry, fake_client):
     adapter = MCPAdapter(registry)
     descriptor = adapter.register_tool(
@@ -75,3 +92,23 @@ def test_unregister_connection_removes_tools_and_aliases(registry, fake_client):
     assert adapter.resolve_alias("kube.k8s_run") is None
     with pytest.raises(Exception):
         registry.resolve(descriptor.id)
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_degrades_health_and_fails_closed():
+    client = MCPClient(connection_id="conn-failing", url="http://127.0.0.1:1")
+
+    class BrokenSession:
+        async def list_tools(self):
+            raise ConnectionError("peer closed")
+
+    client._session = BrokenSession()
+    client._connected = True
+
+    with pytest.raises(MCPError, match="list_tools failed"):
+        await client.list_tools()
+
+    assert client.connected is False
+    assert client.health()["state"] == "failed"
+    with pytest.raises(MCPError, match="not connected"):
+        await client.list_tools()

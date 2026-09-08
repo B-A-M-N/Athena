@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 from athena.affordances.models import (
@@ -17,13 +18,72 @@ from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityOrigin,
     CapabilityRequest,
+    CapabilityRequestOrigin,
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 
 _NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _EFFECTS = {effect.value for effect in EffectClass}
+
+
+def _fixture_hash(case: Mapping[str, Any]) -> str:
+    """Hash behavioral fixture content, excluding live-evidence annotations."""
+    comparable = {
+        key: value
+        for key, value in case.items()
+        if key
+        not in {
+            "id",
+            "source",
+            "failure_class",
+            "observed_failure",
+            "resolved_by_revision",
+            "capability_family",
+            "revision_first_seen",
+            "environment_fingerprint",
+            "expected_contract",
+            # RegressionCase carries both names for replay compatibility.
+            # Normalize them before hashing so an inherited live failure and
+            # an authored fixture for the same input cannot execute twice.
+            "args",
+            "input",
+        }
+    }
+    if "input" in case:
+        comparable["args"] = case["input"]
+    elif "args" in case:
+        comparable["args"] = case["args"]
+    return hashlib.sha256(
+        json.dumps(comparable, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def _merge_validation_cases(*groups: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the first copy of each deterministic fixture in corpus order."""
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw_case in group:
+            case = dict(raw_case)
+            fingerprint = _fixture_hash(case)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            merged.append(case)
+    return merged
+
+
+def _merge_dependency_requirements(
+    *groups: Sequence[DependencyRequirement],
+) -> tuple[DependencyRequirement, ...]:
+    merged: dict[str, DependencyRequirement] = {}
+    for group in groups:
+        for dependency in group:
+            merged[dependency.key()] = dependency
+    return tuple(merged[key] for key in sorted(merged))
 
 
 class SynthesisCapability:
@@ -40,12 +100,13 @@ class SynthesisCapability:
         id="synthesis",
         description=(
             "Create a task-local deterministic capability from Python source, "
-            "or explicitly repair, promote, or deprecate a validated tool. "
+            "or explicitly repair, migrate, promote, or deprecate a validated tool. "
             "The source is sandbox-validated before registration. Operations: "
-            "create/repair/promote_scratch/candidates/inspect/promote/deprecate. Generated run(args) code may compose "
+            "create/repair/revalidate/migrate_contract/promote_scratch/candidates/inspect/promote/deprecate. Generated run(args) code may compose "
             "governed native tools with athena.call(capability_id, arguments); "
             "those calls remain policy- and RealityGate-checked."
         ),
+        tags=frozenset({"synthesis", "create", "generate", "repair", "construct"}),
         input_schema={
             "type": "object",
             "required": ["operation"],
@@ -55,6 +116,8 @@ class SynthesisCapability:
                     "enum": [
                         "create",
                         "repair",
+                        "revalidate",
+                        "migrate_contract",
                         "promote_scratch",
                         "candidates",
                         "inspect",
@@ -99,6 +162,8 @@ class SynthesisCapability:
                             "expect_output_contains": {},
                             "expected_error": {},
                             "expect_failure": {"type": "boolean"},
+                            "expect_invalid_input": {"type": "boolean"},
+                            "source": {"type": "string", "maxLength": 64},
                             "expect_error_contains": {"type": "string"},
                             "expect_effect": {},
                             "expect_effects": {"type": "array"},
@@ -171,6 +236,12 @@ class SynthesisCapability:
                     "type": "object",
                     "maxProperties": 32,
                 },
+                "compatibility": {
+                    "type": "string",
+                    "enum": ["backward_compatible", "breaking"],
+                    "default": "backward_compatible",
+                },
+                "operator_confirmation": {"type": "boolean"},
             },
             "oneOf": [
                 {
@@ -184,6 +255,22 @@ class SynthesisCapability:
                         "name",
                         "description",
                         "code",
+                        "validation_cases",
+                    ],
+                },
+                {
+                    "properties": {"operation": {"const": "revalidate"}},
+                    "required": ["capability_id"],
+                },
+                {
+                    "properties": {"operation": {"const": "migrate_contract"}},
+                    "required": [
+                        "capability_id",
+                        "name",
+                        "description",
+                        "code",
+                        "input_schema",
+                        "output_schema",
                         "validation_cases",
                     ],
                 },
@@ -206,11 +293,13 @@ class SynthesisCapability:
         },
         effects=frozenset(
             {
+                EffectClass.READ_LOCAL,
                 EffectClass.EXECUTE,
                 EffectClass.SPAWN_PROCESS,
                 EffectClass.WRITE_LOCAL,
             }
         ),
+        resources=frozenset({ResourceClass.SYNTHESIS}),
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -225,6 +314,7 @@ class SynthesisCapability:
             return _result(request, ok=False, error="generated capabilities require a task scope")
         args = dict(request.arguments or {})
         operation = str(args.get("operation") or "")
+        principal_id = getattr(context, "principal_id", None)
         if operation == "promote_scratch":
             if self._scratch is None:
                 return _result(request, ok=False, error="scratch promotion is unavailable")
@@ -239,6 +329,27 @@ class SynthesisCapability:
                     request,
                     ok=False,
                     error="scratch computation needs two distinct successful inputs",
+                )
+            # Scratch auto-elevates after its second distinct successful input.
+            # An explicit synthesis.promote_scratch call is therefore allowed
+            # to arrive after the task overlay already contains this exact
+            # capability.  Reuse that live, validated overlay instead of
+            # trying to install the same id twice into the fabric.
+            existing = self._engine.synthetic_for(program.id)
+            if (
+                existing is not None
+                and existing.task_id == request.task_id
+                and self._fabric.has(program.id, task_id=request.task_id)
+            ):
+                return _result(
+                    request,
+                    output=json.dumps(
+                        {
+                            "capability_id": program.id,
+                            "status": "task_reusable",
+                            "proof": self._engine.proof_for(program.id),
+                        }
+                    ),
                 )
             cases = self._scratch.validation_cases(program.id)
             cap = self._engine.synthesize(
@@ -337,7 +448,7 @@ class SynthesisCapability:
                     str(args.get("capability_id") or ""),
                     task_id=request.task_id,
                     project_id=getattr(workspace, "id", None),
-                    user_id="athena",
+                    user_id=principal_id,
                     scope=args.get("scope"),
                 )
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -380,7 +491,11 @@ class SynthesisCapability:
                     return _result(request, ok=False, error=f"candidate restore failed: {exc}")
             scope = str(args.get("scope") or "")
             project_id = context.workspace.id if scope == "project" else None
-            user_id = "athena" if scope == "user" else ""
+            if scope == "user" and not principal_id:
+                return _result(
+                    request, ok=False, error="user capability promotion requires principal"
+                )
+            user_id = principal_id if scope == "user" else ""
             try:
                 cap = self._engine.synthetic_for(capability_id)
                 if cap is None:
@@ -427,7 +542,7 @@ class SynthesisCapability:
                         error="promotion validation failed",
                         output=json.dumps({"validation": cap.validation}),
                     )
-                promoted = self._engine.promote(
+                promoted = await self._engine.promote(
                     self._fabric,
                     capability_id,
                     scope=AffordanceScope(scope),
@@ -440,7 +555,7 @@ class SynthesisCapability:
                     await self._fabric.flush()
             except (TypeError, ValueError) as exc:
                 return _result(request, ok=False, error=str(exc))
-            except RuntimeError as exc:
+            except (OSError, RuntimeError) as exc:
                 return _result(request, ok=False, error=f"promotion persistence failed: {exc}")
             if not promoted:
                 return _result(
@@ -463,37 +578,296 @@ class SynthesisCapability:
                 ),
                 metadata={"capability_id": args["capability_id"], "scope": scope},
             )
-        if operation == "repair":
+        if operation in {"repair", "revalidate", "migrate_contract"}:
             target_id = str(args.get("capability_id") or "")
             workspace = getattr(context, "workspace", None)
+            target_cap = self._engine.synthetic_for(target_id)
+            target_record = None
+            if target_cap is None:
+                # A candidate may outlive the process that created it. Resolve
+                # the durable record through its owner boundary, then restore
+                # the exact predecessor before accepting a repair request.
+                try:
+                    await self._fabric.flush()
+                    for lookup in (
+                        {"task_id": request.task_id},
+                        {"project_id": getattr(workspace, "id", None)},
+                        {"user_id": principal_id},
+                    ):
+                        if not any(lookup.values()):
+                            continue
+                        target_record = await self._fabric.persisted_for(target_id, **lookup)
+                        if target_record is None:
+                            continue
+                        self._engine.restore_executor(
+                            target_record,
+                            proof_sink=getattr(self._fabric, "update_generated_proof", None),
+                            workspace_root=getattr(workspace, "root", None),
+                        )
+                        target_cap = self._engine.synthetic_for(target_id)
+                        break
+                except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                    return _result(
+                        request, ok=False, error=f"{operation} target restore failed: {exc}"
+                    )
             target = self._fabric.provenance(target_id)
-            if target is None:
+            if target is None and target_record is not None:
+                target = target_record.to_record()
+            if target is None or target_cap is None:
                 return _result(
                     request,
                     ok=False,
-                    error="repair target is unknown or has no generated provenance",
+                    error=f"{operation} target is unknown or has no generated provenance",
                 )
             owner_allowed = (
                 target.get("task_scope") == request.task_id
                 or target.get("project_scope") == getattr(workspace, "id", None)
-                or target.get("user_scope") == "athena"
+                or target.get("user_scope") == principal_id
             )
             if not owner_allowed:
-                return _result(request, ok=False, error="repair target is not visible to this task")
+                return _result(
+                    request,
+                    ok=False,
+                    error=f"{operation} target is not visible to this task",
+                )
+            lifecycle_state = str(target.get("lifecycle_state") or "")
+            blocked_states = {"SUPERSEDED", "DEPRECATED"}
+            if operation != "revalidate":
+                blocked_states |= {"STALE", "REJECTED", "REVALIDATION_REQUIRED"}
+            if lifecycle_state in blocked_states:
+                return _result(
+                    request,
+                    ok=False,
+                    error=(
+                        f"{operation} target is unavailable; use the active revision "
+                        "or revalidate it before creating a successor"
+                    ),
+                )
+        if operation == "revalidate":
+            if target_cap is None:
+                return _result(request, ok=False, error="revalidate target is unavailable")
+            if context is None or getattr(context, "workspace", None) is None:
+                return _result(request, ok=False, error="revalidation requires workspace context")
+            original_state = target_cap.lifecycle_state
+            original_identity = (
+                target_cap.id,
+                target_cap.code,
+                dict(target_cap.input_schema),
+                dict(target_cap.output_schema or {}),
+                target_cap.revision,
+                target_cap.parent_revision,
+                target_cap.family_id,
+            )
+            all_cases = _merge_validation_cases(
+                target_cap.validation_cases or [],
+                target_cap.validation.get("regression_cases") or [],
+                target_cap.validation.get("live_failure_cases") or [],
+            )
+            target_scope = (
+                target_record.scope
+                if target_record is not None
+                else (
+                    AffordanceScope.PROJECT if target_cap.task_id is None else AffordanceScope.TASK
+                )
+            )
+            validation_tier = {
+                AffordanceScope.PROJECT: "project",
+                AffordanceScope.USER: "user",
+                AffordanceScope.TASK: "task",
+                AffordanceScope.CANDIDATE: "candidate",
+            }[target_scope]
+            target_cap = await self._engine.validate(
+                target_cap,
+                all_cases,
+                tier=validation_tier,
+                workspace_root=context.workspace.root,
+                workspace=context.workspace,
+                task_id=request.task_id,
+                session_id=request.session_id,
+                profile=getattr(context, "autonomy", None),
+                task_policy=getattr(context, "capability_policy", None),
+                task_budget=getattr(context, "resource_budget", None),
+                generated_call_depth=getattr(context, "generated_call_depth", 0),
+                generated_call_chain=tuple(getattr(context, "generated_call_chain", ())),
+            )
+            evidence = await self._engine.evidence_status(target_cap, self._research)
+            target_cap.validation["evidence"] = evidence
+            unchanged = original_identity == (
+                target_cap.id,
+                target_cap.code,
+                dict(target_cap.input_schema),
+                dict(target_cap.output_schema or {}),
+                target_cap.revision,
+                target_cap.parent_revision,
+                target_cap.family_id,
+            )
+            if (
+                not unchanged
+                or not target_cap.validation.get("all_passed")
+                or evidence["status"] != "CURRENT"
+            ):
+                target_cap.lifecycle_state = original_state
+                return _result(
+                    request,
+                    ok=False,
+                    error="generated capability revalidation failed",
+                    output=json.dumps(
+                        {
+                            "capability_id": target_cap.id,
+                            "unchanged_identity": unchanged,
+                            "validation": target_cap.validation,
+                            "evidence": evidence,
+                        }
+                    ),
+                )
+            target_cap.lifecycle_state = (
+                "PROMOTED"
+                if target_scope in {AffordanceScope.PROJECT, AffordanceScope.USER}
+                else "CANDIDATE"
+                if target_scope is AffordanceScope.CANDIDATE
+                else "VALIDATED"
+            )
+            generated = self._engine._generated_record(
+                target_cap,
+                scope=target_scope,
+                project_scope=(
+                    target_record.project_scope
+                    if target_record
+                    else getattr(context.workspace, "id", None)
+                ),
+                user_scope=(target_record.user_scope if target_record else None),
+            )
+            if target_record is not None:
+                generated = replace(
+                    generated,
+                    validation_state=target_record.validation_state,
+                    lifecycle_state=target_cap.lifecycle_state,
+                )
+            executor = self._engine._build_executor(
+                target_cap,
+                proof_sink=getattr(self._fabric, "update_generated_proof", None),
+            )
+            try:
+                await self._fabric.activate_revalidated(
+                    generated,
+                    executor,
+                    owner=(
+                        generated.project_scope
+                        if target_scope is AffordanceScope.PROJECT
+                        else generated.user_scope
+                        if target_scope is AffordanceScope.USER
+                        else generated.task_scope
+                    )
+                    or request.task_id
+                    or "",
+                )
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                target_cap.lifecycle_state = original_state
+                return _result(request, ok=False, error=f"revalidation persistence failed: {exc}")
+            return _result(
+                request,
+                output=json.dumps(
+                    {
+                        "capability_id": target_cap.id,
+                        "status": "revalidated",
+                        "revision": target_cap.revision,
+                        "family_id": target_cap.family_id,
+                    }
+                ),
+            )
         name = str(args.get("name") or "").strip()
         if not _NAME.fullmatch(name):
             return _result(request, ok=False, error="invalid generated capability name")
 
-        validation_cases = [dict(case) for case in args["validation_cases"]]
+        if operation == "migrate_contract":
+            compatibility = str(args.get("compatibility") or "backward_compatible")
+            if compatibility not in {"backward_compatible", "breaking"}:
+                return _result(
+                    request,
+                    ok=False,
+                    error="compatibility must be backward_compatible or breaking",
+                )
+            if compatibility == "breaking" and (
+                not bool(args.get("operator_confirmation"))
+                or request.origin is CapabilityRequestOrigin.MODEL
+            ):
+                return _result(
+                    request,
+                    ok=False,
+                    error=(
+                        "breaking contract migration requires explicit operator confirmation "
+                        "from a trusted caller"
+                    ),
+                )
+        else:
+            compatibility = "backward_compatible"
+        requested_cases = [dict(case) for case in args["validation_cases"]]
+        if operation == "repair":
+            assert target_cap is not None  # guarded by the predecessor resolution above
+            inherited_cases = [
+                *(target_cap.validation_cases or []),
+                *[
+                    case
+                    for case in (target_cap.validation.get("regression_cases") or [])
+                    if not case.get("resolved_by_revision")
+                ],
+                *[
+                    case
+                    for case in (target_cap.validation.get("live_failure_cases") or [])
+                    if not case.get("resolved_by_revision")
+                ],
+            ]
+            validation_cases = _merge_validation_cases(inherited_cases, requested_cases)
+        elif operation == "migrate_contract" and compatibility == "backward_compatible":
+            predecessor_cases = list(target_cap.validation_cases or []) if target_cap else []
+            validation_cases = _merge_validation_cases(predecessor_cases, requested_cases)
+        else:
+            validation_cases = _merge_validation_cases(requested_cases)
         input_schema_arg = args.get("input_schema")
         input_schema = (
             dict(input_schema_arg)
             if input_schema_arg is not None
-            else infer_input_schema(validation_cases)
+            else (
+                dict(target_cap.input_schema)
+                if operation in {"repair", "migrate_contract"} and target_cap is not None
+                else infer_input_schema(validation_cases)
+            )
         )
         output_schema_arg = args.get("output_schema")
-        output_schema = dict(output_schema_arg) if output_schema_arg is not None else None
-        required_dependencies = tuple(
+        if operation == "repair" and target_cap is not None:
+            if input_schema_arg is not None and input_schema != dict(target_cap.input_schema):
+                return _result(
+                    request,
+                    ok=False,
+                    error="repair cannot change the input contract; use migrate_contract",
+                )
+            if output_schema_arg is not None and dict(output_schema_arg) != dict(
+                target_cap.output_schema or {}
+            ):
+                return _result(
+                    request,
+                    ok=False,
+                    error="repair cannot change the output contract; use migrate_contract",
+                )
+        if operation == "migrate_contract" and target_cap is not None:
+            if input_schema == dict(target_cap.input_schema) and dict(
+                output_schema_arg or {}
+            ) == dict(target_cap.output_schema or {}):
+                return _result(
+                    request,
+                    ok=False,
+                    error="migrate_contract requires an explicit contract change",
+                )
+        output_schema = (
+            dict(output_schema_arg)
+            if output_schema_arg is not None
+            else (
+                dict(target_cap.output_schema or {}) or None
+                if operation in {"repair", "migrate_contract"} and target_cap is not None
+                else None
+            )
+        )
+        requested_dependencies = tuple(
             DependencyRequirement(
                 name=str(dependency["name"]),
                 manager=str(dependency.get("manager") or "python"),
@@ -503,11 +877,17 @@ class SynthesisCapability:
             )
             for dependency in args.get("required_dependencies") or ()
         )
+        required_dependencies = _merge_dependency_requirements(
+            target_cap.required_dependencies
+            if operation in {"repair", "migrate_contract"} and target_cap
+            else (),
+            requested_dependencies,
+        )
         evidence_dependencies = tuple(
             EvidenceDependency.from_record(dict(dependency))
             for dependency in args.get("evidence_dependencies") or ()
         )
-        required_capabilities = tuple(
+        requested_capabilities = tuple(
             sorted(
                 {
                     str(capability).strip()
@@ -516,8 +896,22 @@ class SynthesisCapability:
                 }
             )
         )
+        required_capabilities = tuple(
+            sorted(
+                set(
+                    target_cap.required_capabilities
+                    if operation in {"repair", "migrate_contract"} and target_cap
+                    else ()
+                )
+                | set(requested_capabilities)
+            )
+        )
 
-        target_id = str(args.get("capability_id") or "") if operation == "repair" else ""
+        target_id = (
+            str(args.get("capability_id") or "")
+            if operation in {"repair", "migrate_contract"}
+            else ""
+        )
         cap = self._engine.synthesize(
             name=name,
             description=str(args.get("description") or ""),
@@ -525,12 +919,20 @@ class SynthesisCapability:
             runtime=str(args.get("runtime") or "python"),
             input_schema=input_schema,
             output_schema=output_schema,
-            effects=set(args.get("effects") or {EffectClass.READ_LOCAL.value}),
+            effects=set(
+                args.get("effects")
+                or (
+                    target_cap.effects
+                    if operation in {"repair", "migrate_contract"} and target_cap is not None
+                    else {EffectClass.READ_LOCAL.value}
+                )
+            ),
             task_id=request.task_id,
             provenance={
                 "origin": "model_synthesis",
                 "task_id": request.task_id,
                 "request_call_id": request.call_id,
+                "compatibility": compatibility,
                 **(
                     dict(args.get("provenance") or {})
                     if isinstance(args.get("provenance"), Mapping)
@@ -540,7 +942,31 @@ class SynthesisCapability:
             validation_cases=validation_cases,
             required_dependencies=required_dependencies,
             required_capabilities=required_capabilities,
-            evidence_dependencies=evidence_dependencies,
+            evidence_dependencies=(
+                target_cap.evidence_dependencies + evidence_dependencies
+                if operation in {"repair", "migrate_contract"} and target_cap is not None
+                else evidence_dependencies
+            ),
+            family_id=(
+                target_cap.family_id
+                if operation in {"repair", "migrate_contract"} and target_cap is not None
+                else None
+            ),
+            revision=(
+                target_cap.revision + 1
+                if operation in {"repair", "migrate_contract"} and target_cap is not None
+                else 1
+            ),
+            parent_revision=(
+                target_cap.revision
+                if operation in {"repair", "migrate_contract"} and target_cap is not None
+                else None
+            ),
+            active_revision=(
+                target_cap.revision + 1
+                if operation in {"repair", "migrate_contract"} and target_cap is not None
+                else None
+            ),
             supersedes=(target_id,) if target_id else (),
         )
         cap = await self._engine.validate(
@@ -563,30 +989,7 @@ class SynthesisCapability:
         )
         evidence = await self._engine.evidence_status(cap, self._research)
         cap.validation["evidence"] = evidence
-        # Content-addressed IDs are assigned only after source formatting and
-        # output-schema inference. The advertised contract is therefore part
-        # of the identity, rather than a pre-validation model declaration.
-        identity = json.dumps(
-            {
-                "name": name,
-                "code": cap.code,
-                "runtime": cap.runtime,
-                "input_schema": cap.input_schema,
-                "output_schema": cap.output_schema or {},
-                "effects": sorted(args.get("effects") or (EffectClass.READ_LOCAL.value,)),
-                "required_dependencies": [
-                    dependency.__dict__ for dependency in required_dependencies
-                ],
-                "required_capabilities": list(cap.required_capabilities),
-                "supersedes": list(cap.supersedes),
-                "evidence_dependencies": [
-                    dependency.to_record() for dependency in evidence_dependencies
-                ],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        cap.id = "synth_" + hashlib.sha256(identity).hexdigest()[:20]
+        cap.validation["compatibility"] = compatibility
         if evidence["status"] != "CURRENT":
             return _result(
                 request,

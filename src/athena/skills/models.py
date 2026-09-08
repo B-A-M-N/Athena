@@ -9,6 +9,8 @@ is a self-improvement draft proposed from a task transcript (section 68).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
 from typing import Any, Mapping
 
 from athena.protocol.messages import Provenance, TrustClass
@@ -62,6 +64,26 @@ class SkillCandidate:
     @property
     def propose_name(self) -> str:
         return self.draft.name
+
+    @property
+    def id(self) -> str:
+        """Stable review identifier for this candidate.
+
+        Candidate drafts are immutable values.  Deriving the identifier from
+        their source task, name, and content lets the durable lifecycle
+        upsert the same proposal after a retry or service restart without
+        introducing a second mutable identity authority.
+        """
+        payload = {
+            "source_task_id": self.source_task_id,
+            "name": self.draft.name,
+            "body": self.draft.body,
+            "version": self.draft.version,
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:24]
+        return f"skill_candidate_{digest}"
 
 
 @dataclass(frozen=True)

@@ -155,7 +155,15 @@ class TruthCapability:
         stale_capabilities = [
             capability
             for capability in generated
-            if capability.get("status") in {"STALE", "REVALIDATION_REQUIRED", "DEPRECATED"}
+            if capability.get("status")
+            in {
+                "STALE",
+                "DEGRADED",
+                "REVALIDATION_REQUIRED",
+                "REJECTED",
+                "SUPERSEDED",
+                "DEPRECATED",
+            }
         ]
         proof_graph = _proof_graph(
             claims=claims,

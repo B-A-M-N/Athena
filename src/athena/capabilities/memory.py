@@ -19,6 +19,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 from athena.protocol.ids import new_id
 from athena.protocol.memory import (
@@ -28,6 +29,7 @@ from athena.protocol.memory import (
     RetrievalMode,
 )
 from athena.protocol.messages import Provenance, SourceType, TrustClass
+from athena.memory.embeddings import SemanticRetrievalUnavailable
 
 _KIND_ALIASES = {
     "working": MemoryKind.WORKING,
@@ -38,6 +40,7 @@ _SCOPE_ALIASES = {
     "session": MemoryScope.SESSION,
     "task": MemoryScope.TASK,
     "project": MemoryScope.PROJECT,
+    "user": MemoryScope.USER,
     "global": MemoryScope.GLOBAL,
 }
 
@@ -80,11 +83,14 @@ class MemoryCapability:
     descriptor = CapabilityDescriptor(
         id="memory",
         description=(
-            "Long-term memory: recall relevant memories by query, or persist a "
-            "new memory entry. Delegates to the memory store."
+            "Long-term memory: recall relevant memories using bounded lexical, "
+            "semantic, or hybrid search, or persist a new memory entry. Supports "
+            "isolated session, project, user, and global scopes."
         ),
+        tags=frozenset({"memory", "remember", "preference", "recall"}),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        resources=frozenset({ResourceClass.MEMORY}),
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -110,31 +116,34 @@ class MemoryCapability:
             )
         if op in ("recall", "search"):
             limit = int(args.get("limit") or 10)
-            mode = RetrievalMode(str(args.get("retrieval_mode") or RetrievalMode.SEMANTIC.value))
+            mode = RetrievalMode(str(args.get("retrieval_mode") or RetrievalMode.RELEVANCE.value))
             scopes, error = _visible_scopes(request, context, args, for_write=False)
             if error:
                 return _failed(call_id, request, error)
             items: list[Any] = []
-            for scope, scope_id in scopes:
-                if op == "recall":
-                    found = await self.memory_store.recall(
-                        query=str(args.get("query") or ""),
-                        tags=args.get("tags"),
-                        scope=scope,
-                        scope_id=scope_id,
-                        mode=mode,
-                        limit=limit,
-                    )
-                else:
-                    found = await self.memory_store.search(
-                        query=str(args.get("query") or ""),
-                        limit=limit,
-                        scope=scope,
-                        scope_id=scope_id,
-                        mode=mode,
-                        tags=args.get("tags"),
-                    )
-                items.extend(found)
+            try:
+                for scope, scope_id in scopes:
+                    if op == "recall":
+                        found = await self.memory_store.recall(
+                            query=str(args.get("query") or ""),
+                            tags=args.get("tags"),
+                            scope=scope,
+                            scope_id=scope_id,
+                            mode=mode,
+                            limit=limit,
+                        )
+                    else:
+                        found = await self.memory_store.search(
+                            query=str(args.get("query") or ""),
+                            limit=limit,
+                            scope=scope,
+                            scope_id=scope_id,
+                            mode=mode,
+                            tags=args.get("tags"),
+                        )
+                    items.extend(found)
+            except SemanticRetrievalUnavailable as exc:
+                return _failed(call_id, request, str(exc))
             items = _dedupe_and_bound(items, limit)
             return CapabilityResult(
                 call_id,
@@ -163,7 +172,7 @@ class MemoryCapability:
                 trust=TrustClass.AGENT_CURATED,
                 metadata={"scope_id": scope_id},
                 retrieval_mode=RetrievalMode(
-                    str(args.get("retrieval_mode") or RetrievalMode.SEMANTIC.value)
+                    str(args.get("retrieval_mode") or RetrievalMode.RELEVANCE.value)
                 ),
                 tags=tuple(args.get("tags") or ()),
                 source_refs=((str(args["source_id"]),) if args.get("source_id") else ()),
@@ -214,6 +223,7 @@ def _visible_scopes(
         MemoryScope.SESSION: request.session_id,
         MemoryScope.TASK: request.task_id,
         MemoryScope.PROJECT: getattr(workspace, "id", None),
+        MemoryScope.USER: getattr(context, "principal_id", None),
     }
 
     if requested is None:
@@ -237,6 +247,7 @@ def _visible_scopes(
             MemoryScope.SESSION: "session_id",
             MemoryScope.TASK: "task_id",
             MemoryScope.PROJECT: "workspace",
+            MemoryScope.USER: "principal",
         }[requested_scope]
         return [], f"memory scope {requested_scope.value} requires {required}"
     explicit_id = args.get("scope_id")

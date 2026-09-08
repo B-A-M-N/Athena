@@ -15,7 +15,7 @@ import time
 from typing import Any, Protocol
 
 from athena.protocol.errors import ModelUnavailable, ProviderUnavailable
-from athena.protocol.models import ModelInfo, PrivacyClass
+from athena.protocol.models import ModelInfo, ModelQualityTier, PrivacyClass
 from athena.protocol.tasks import ModelPolicy
 
 CAP_TOOLS = "tools"
@@ -81,6 +81,8 @@ class ModelSource(Protocol):
     async def list_models(self) -> Sequence[ModelInfo]: ...
 
     def provider_for(self, provider_name: str) -> object: ...
+
+    def readiness(self) -> Mapping[str, object]: ...
 
 
 def _privacy_rank(cls: PrivacyClass) -> int:
@@ -184,7 +186,7 @@ class ModelRouter:
         *,
         policy: ModelPolicy | None = None,
         requirements: ModelRequirements | None = None,
-        exclude: frozenset[str] = frozenset(),
+        exclude: frozenset[str | tuple[str, str]] = frozenset(),
     ) -> ModelSelection:
         policy = self._resolve_policy(policy or ModelPolicy())
         requirements = requirements or ModelRequirements()
@@ -192,6 +194,7 @@ class ModelRouter:
 
         if not models:
             raise ProviderUnavailable("no model providers registered")
+        ready_providers = self._ready_provider_names()
 
         offline = policy.privacy in _OFFLINE_PRIVACY
         allowed = tuple(policy.allowed or ())
@@ -199,7 +202,13 @@ class ModelRouter:
 
         candidates: list[ModelInfo] = []
         for info in models:
-            if info.provider in exclude:
+            # Exclusion is model-granular (task #12): a bare provider name
+            # excludes that provider entirely (legacy/whole-provider ban), while
+            # a ``(provider, model)`` pair excludes only that specific model so
+            # healthy sibling models on the same provider survive a retry.
+            if info.provider in exclude or (info.provider, info.id) in exclude:
+                continue
+            if ready_providers is not None and info.provider not in ready_providers:
                 continue
             if allowed and not self._is_allowed(info, allowed):
                 continue
@@ -210,6 +219,8 @@ class ModelRouter:
             if not self._meets_cost(info, policy):
                 continue
             if not privacy_gate(info):
+                continue
+            if not self._meets_quality_floor(info, policy):
                 continue
             candidates.append(info)
 
@@ -239,6 +250,29 @@ class ModelRouter:
                 history_used=history_used,
             ),
         )
+
+    def _ready_provider_names(self) -> set[str] | None:
+        """Return provider names currently admitted for model selection.
+
+        The readiness surface is optional for small compatibility registries;
+        the production ``ProviderRegistry`` always supplies it. When present,
+        only providers explicitly in ``ready`` state may contribute models.
+        """
+        probe = getattr(self._registry, "readiness", None)
+        if not callable(probe):
+            return None
+        try:
+            report = probe()
+        except Exception:
+            return set()
+        providers = report.get("providers") if isinstance(report, Mapping) else None
+        if not isinstance(providers, Mapping):
+            return None
+        return {
+            str(name)
+            for name, value in providers.items()
+            if isinstance(value, Mapping) and str(value.get("state")) == "ready"
+        }
 
     async def _historical_stats(
         self,
@@ -352,6 +386,31 @@ class ModelRouter:
                 return False
         return True
 
+    def _meets_quality_floor(self, info: ModelInfo, policy: ModelPolicy) -> bool:
+        """Quality-floor filter (P1-16).
+
+        Excludes only models that DECLARE a tier below the policy floor.
+        ``UNDECLARED`` survives every floor — the metadata is advisory and
+        a model cannot be held to a standard it never declared — so a
+        deployment without tier declarations routes exactly as before.
+        """
+        raw = getattr(policy, "min_quality_tier", None)
+        if not raw:
+            return True
+        try:
+            floor = ModelQualityTier(str(raw))
+        except ValueError:
+            return True  # invalid declarations are ignored, never widened
+        tier = getattr(info, "quality_tier", ModelQualityTier.UNDECLARED)
+        if isinstance(tier, str):
+            try:
+                tier = ModelQualityTier(tier)
+            except ValueError:
+                return True
+        if tier is ModelQualityTier.UNDECLARED:
+            return True
+        return tier.rank >= floor.rank
+
     def _meets_cost(self, info: ModelInfo, policy: ModelPolicy) -> bool:
         if policy.max_cost_usd is None:
             return True
@@ -383,6 +442,9 @@ class ModelRouter:
         parts = [f"model={best.id}", f"provider={best.provider}"]
         if policy.privacy:
             parts.append(f"privacy={best.privacy_class.value}")
+        floor = getattr(policy, "min_quality_tier", None)
+        if floor:
+            parts.append(f"quality_floor={floor}")
         if requirements.required_capabilities:
             parts.append("caps=" + ",".join(sorted(requirements.required_capabilities)))
         if history_used:

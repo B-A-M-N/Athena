@@ -16,10 +16,12 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 from athena.workflows.models import Workflow, WorkflowStep
 from athena.workflows.validation import WorkflowValidator
 from athena.protocol.tasks import MutationMode, NetworkPolicy
+from athena.workspace_manifest import copy_workspace_tree
 
 
 class WorkflowCapability:
@@ -33,6 +35,7 @@ class WorkflowCapability:
             "ordinary runs can be retained as reviewable workflow candidates; "
             "promotion requires distinct successful observations and replay validation."
         ),
+        tags=frozenset({"workflow", "procedure", "pipeline", "reusable", "sequence"}),
         input_schema={
             "type": "object",
             "required": ["operation"],
@@ -94,6 +97,7 @@ class WorkflowCapability:
                 EffectClass.NETWORK_WRITE,
             }
         ),
+        resources=frozenset({ResourceClass.WORKFLOW}),
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -116,11 +120,12 @@ class WorkflowCapability:
     async def invoke(self, request: CapabilityRequest, *, context=None, **kw):
         args = dict(request.arguments or {})
         operation = str(args.get("operation") or "")
+        principal_id = getattr(context, "principal_id", None)
         if operation == "list":
             workflows = await self._store.list(
                 task_id=request.task_id,
                 project_id=getattr(getattr(context, "workspace", None), "id", None),
-                user_id="athena",
+                user_id=principal_id,
             )
             return _result(request, output=json.dumps([w.to_record() for w in workflows]))
         workflow_id = str(args.get("workflow_id") or "")
@@ -129,7 +134,7 @@ class WorkflowCapability:
                 workflow_id,
                 task_id=request.task_id,
                 project_id=getattr(getattr(context, "workspace", None), "id", None),
-                user_id="athena",
+                user_id=principal_id,
             )
             if workflow is None:
                 return _result(request, ok=False, error=f"unknown workflow: {workflow_id}")
@@ -177,12 +182,16 @@ class WorkflowCapability:
                     error="workflow promotion requires task and workspace context",
                 )
             scope = str(args.get("scope") or "")
+            if scope == "user" and not principal_id:
+                return _result(
+                    request, ok=False, error="user workflow promotion requires principal"
+                )
             try:
                 candidate = await self._store.get(
                     workflow_id,
                     task_id=request.task_id,
                     project_id=context.workspace.id,
-                    user_id="athena",
+                    user_id=principal_id,
                 )
                 if candidate is None or candidate.scope.value != "candidate":
                     return _result(
@@ -214,7 +223,7 @@ class WorkflowCapability:
                     task_id=request.task_id,
                     scope=scope,
                     project_id=context.workspace.id if scope == "project" else None,
-                    user_id="athena" if scope == "user" else None,
+                    user_id=principal_id if scope == "user" else None,
                     validation=replay,
                 )
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -250,15 +259,28 @@ class WorkflowCapability:
                     dict(args["output_schema"]) if args.get("output_schema") is not None else None
                 ),
             )
-            validation = WorkflowValidator(
-                lambda capability_id: (
-                    self._fabric.executor_for(
-                        capability_id,
-                        task_id=request.task_id,
-                        project_id=getattr(getattr(context, "workspace", None), "id", None),
-                    ).descriptor
-                )
-            ).validate(workflow)
+            # Resolve nested workflow references from the same owner-scoped
+            # graph used by execution.  Creation must validate composition as
+            # data, not reject a valid child merely because it is not a native
+            # capability in the fabric.
+            graph = await self._load_graph(
+                workflow,
+                task_id=request.task_id,
+                project_id=getattr(getattr(context, "workspace", None), "id", None),
+                user_id=principal_id,
+            )
+
+            def create_resolver(identifier):
+                nested = graph.get(identifier)
+                if nested is not None:
+                    return nested
+                return self._fabric.executor_for(
+                    identifier,
+                    task_id=request.task_id,
+                    project_id=getattr(getattr(context, "workspace", None), "id", None),
+                ).descriptor
+
+            validation = WorkflowValidator(create_resolver).validate(workflow)
             if not validation.ok:
                 return _result(request, ok=False, error="; ".join(validation.errors))
             await self._store.save(workflow)
@@ -271,7 +293,7 @@ class WorkflowCapability:
             workflow_id,
             task_id=request.task_id,
             project_id=context.workspace.id,
-            user_id="athena",
+            user_id=principal_id,
         )
         if workflow is None:
             return _result(request, ok=False, error=f"unknown workflow: {workflow_id}")
@@ -280,7 +302,7 @@ class WorkflowCapability:
             workflow,
             task_id=request.task_id,
             project_id=context.workspace.id,
-            user_id="athena",
+            user_id=principal_id,
         )
 
         def resolver(identifier):
@@ -291,21 +313,17 @@ class WorkflowCapability:
                 identifier,
                 task_id=request.task_id,
                 project_id=context.workspace.id,
-                user_id="athena",
+                user_id=principal_id,
             ).descriptor
 
         trial_root = None
         execution_workspace = context.workspace
         if operation == "trial":
             trial_root = tempfile.mkdtemp(prefix="athena-workflow-trial-")
-            shutil.copytree(
+            copy_workspace_tree(
                 context.workspace.root,
                 trial_root,
                 dirs_exist_ok=True,
-                # Never reproduce links into the candidate workspace. A
-                # trial must not be able to follow a workspace symlink back
-                # into an unrelated host path.
-                symlinks=False,
             )
             execution_workspace = replace(
                 context.workspace,
@@ -407,7 +425,7 @@ class WorkflowCapability:
             workflow,
             task_id=request.task_id,
             project_id=context.workspace.id,
-            user_id="athena",
+            user_id=getattr(context, "principal_id", None),
         )
 
         def resolver(identifier):
@@ -418,16 +436,15 @@ class WorkflowCapability:
                 identifier,
                 task_id=request.task_id,
                 project_id=context.workspace.id,
-                user_id="athena",
+                user_id=getattr(context, "principal_id", None),
             ).descriptor
 
         trial_root = tempfile.mkdtemp(prefix="athena-workflow-replay-")
         try:
-            shutil.copytree(
+            copy_workspace_tree(
                 context.workspace.root,
                 trial_root,
                 dirs_exist_ok=True,
-                symlinks=False,
             )
             execution_workspace = replace(
                 context.workspace,

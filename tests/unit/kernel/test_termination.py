@@ -9,6 +9,7 @@ from athena.kernel.termination import TerminationDecision, TerminationEvaluator
 from athena.protocol.models import ModelResponse, UsageInfo
 from athena.protocol.messages import CapabilityCallBlock, TextBlock
 from athena.protocol.tasks import Criterion, MutationMode, TaskSpec, TaskStatus, WorkspaceSpec
+from athena.strategy import OBSERVABLE_WORK_REQUIRED
 
 
 @pytest.fixture
@@ -107,3 +108,106 @@ async def test_reality_coordinator_owns_speculative_candidate_proof():
     assert decision.status is TaskStatus.COMPLETE
     assert "delegated" in decision.reason
     assert verifier.calls == 0
+
+
+async def test_action_task_without_observable_evidence_is_partial():
+    task = TaskSpec(id="action-no-proof", objective="read the project file")
+
+    decision = await TerminationEvaluator().evaluate(
+        task,
+        _response([TextBlock(type="text", text="I read it and it looks good")]),
+        iterations=1,
+        completion_mode=OBSERVABLE_WORK_REQUIRED,
+        observed_work=False,
+    )
+
+    assert decision.terminal is True
+    assert decision.status is TaskStatus.PARTIAL
+    assert decision.unresolved == ("observable_work",)
+
+
+async def test_action_task_with_observable_evidence_can_complete():
+    task = TaskSpec(id="action-proof", objective="read the project file")
+
+    decision = await TerminationEvaluator().evaluate(
+        task,
+        _response([TextBlock(type="text", text="The file contains the requested value")]),
+        iterations=1,
+        completion_mode=OBSERVABLE_WORK_REQUIRED,
+        observed_work=True,
+    )
+
+    assert decision.terminal is True
+    assert decision.status is TaskStatus.COMPLETE
+
+
+# ---------------------------------------------------------------------- #
+# Verifier evidence reuse (task #13): ONE test/verification run counts once
+# and proves twice — a verified required criterion is itself the observable
+# work proof, so OBSERVABLE_WORK_REQUIRED is satisfied WITHOUT a separate
+# model execution (termination.verified_criteria_evidence reuse).
+# ---------------------------------------------------------------------- #
+
+
+class _CountingVerifier2:
+    """Records every verify() invocation and its view of the criteria."""
+
+    def __init__(self, outcome=True):
+        self.calls = 0
+        self.outcome = outcome
+
+    async def verify(self, task, criteria):
+        self.calls += 1
+        return [self.outcome for _ in criteria]
+
+
+async def test_verified_criteria_count_works_and_proves_twice():
+    """For state-shaped objectives (observation/response), a verified criterion
+    alone satisfies both the acceptance gate and the observable-work gate.
+    For action-shaped objectives (execution/mutation/external), verified
+    criteria alone are insufficient — causal work evidence is required."""
+    verifier = _CountingVerifier2(outcome=True)
+    evaluator = TerminationEvaluator(acceptance_verifier=verifier)
+
+    # State-shaped objective: "what does the README say?" — verified criteria ARE the work
+    task = TaskSpec(
+        id="criteria-evidence",
+        objective="what does the README say?",
+        acceptance_criteria=(Criterion(id="c-readme", description="README was read"),),
+    )
+
+    decision = await evaluator.evaluate(
+        task,
+        _response([TextBlock(type="text", text="the README says...")]),
+        iterations=1,
+        completion_mode=OBSERVABLE_WORK_REQUIRED,
+        observed_work=False,
+        work_evidence=(),
+    )
+
+    # COMPLETE: the verified criterion is sufficient proof for a state-shaped objective
+    assert decision.terminal is True
+    assert decision.status is TaskStatus.COMPLETE
+    assert decision.unresolved == ()
+    assert verifier.calls == 1
+
+    # Action-shaped objective: "fix the failing test" — verified criteria alone
+    # are NOT sufficient; need causal work evidence
+    verifier2 = _CountingVerifier2(outcome=True)
+    evaluator2 = TerminationEvaluator(acceptance_verifier=verifier2)
+    action_task = TaskSpec(
+        id="criteria-action",
+        objective="fix the failing test",
+        acceptance_criteria=(Criterion(id="c-tests", description="tests pass"),),
+    )
+    decision2 = await evaluator2.evaluate(
+        action_task,
+        _response([TextBlock(type="text", text="all tests green")]),
+        iterations=1,
+        completion_mode=OBSERVABLE_WORK_REQUIRED,
+        observed_work=False,
+        work_evidence=(),
+    )
+    # PARTIAL: action-shaped objective requires causal work evidence
+    assert decision2.terminal is True
+    assert decision2.status is TaskStatus.PARTIAL

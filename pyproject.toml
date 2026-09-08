@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "athena-agent"
-version = "0.1.0"
+version = "0.1.0b1"
 description = "Compact, local-first autonomous agent runtime with durable knowledge, structured delegation, universal execution, open capability protocols, and a single authoritative reasoning loop."
-requires-python = ">=3.12"
-license = { text = "MIT" }
+requires-python = ">=3.12,<3.14"
+license = "MIT"
 authors = [{ name = "Athena Contributors" }]
 readme = "README.md"
 dependencies = [
     "httpx>=0.27",
     "aiosqlite>=0.20",
-    "starlette>=0.38,<1.0",
+    "starlette>=1.3.1,<1.4",
     "click>=8.1",
     "uvicorn>=0.30",
     "pexpect>=4.9",
@@ -26,20 +26,26 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
+semantic = ["fastembed>=0.8,<0.9"]
 anthropic = ["anthropic>=0.39"]
 container = ["docker>=7.0"]
 debug = ["debugpy>=1.8"]
 cli = ["wcwidth>=0.2"]
 glass = ["Pillow>=10.0"]
+computer = ["pyautogui>=0.9.14"]
+browser = ["playwright>=1.40"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.8",
     "mypy>=1.11",
     "build>=1.2",
-    "starlette>=0.38,<1.0",
+    "pip-audit>=2.10",
+    "setuptools>=68",
+    "starlette>=1.3.1,<1.4",
     "uvicorn>=0.30",
     "click>=8.1",
+    "pytest-xdist>=3.8.0",
 ]
 
 [project.scripts]
@@ -49,7 +55,7 @@ athena = "athena.cli.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-athena = ["state/migrations/*.sql"]
+athena = ["state/migrations/*.sql", "bundled_skills/**/SKILL.md"]
 
 [tool.ruff]
 target-version = "py312"
@@ -76,6 +82,13 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Parallel test lane (gate perf): pytest-xdist is a dev extra. The suite is
+# audited for worker-serial xdist safety — no fixed socket binds (endpoint URLs
+# are mocked strings), one os.chdir usage, env snapshot/restore discipline is
+# per-process safe, and every test uses tmp_path/tempfile workspaces. Worker
+# count is chosen by the invoking lane, not here, so CI can tune for machine
+# load: the release gate passes -n auto for non-E2E lanes only; timing-
+# sensitive suites (performance, crash/soak) run serially by design.
 markers = [
   "athena_claim(*claim_ids): normative claim ids this test proves",
   "athena_evidence(*kinds): evidence classes this test produces (test, invariant, security, e2e)",

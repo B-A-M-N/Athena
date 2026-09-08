@@ -553,7 +553,7 @@ class Mascot:
                 self.OBJ_FAIL,
                 "Background work needs attention.",
             )
-        elif event_type in {"ToolRepaired", "MutationRecorded", "MemoryWritten", "SkillActivated"}:
+        elif event_type in {"ToolRepaired", "MutationRecorded"}:
             self.state, self.object, self.speech = (
                 "tools",
                 self.OBJ_CODE,
@@ -561,12 +561,7 @@ class Mascot:
             )
         elif event_type in {"MutationRecordFailed", "ToolInputCorrectionExhausted"}:
             self.state, self.object, self.speech = "failure", self.OBJ_FAIL, "That needs attention."
-        elif event_type in {
-            "MemoryCandidateCreated",
-            "SkillCandidateCreated",
-            "InterpreterProposalDispatched",
-            "RuntimeSessionCreated",
-        }:
+        elif event_type in {"InterpreterProposalDispatched", "RuntimeSessionCreated"}:
             self.state, self.object, self.speech = (
                 "tools",
                 self.OBJ_CODE,
@@ -831,8 +826,17 @@ class DualPaneSurface(OperatorSurface):
         return self.projection.recent
 
     @property
+    def _maintenance(self) -> deque[tuple[str, str]]:
+        return self.projection.maintenance
+
+    @property
     def _pending_approval(self) -> dict[str, Any] | None:
         return self.projection.pending_approval
+
+    @property
+    def _pending_approvals(self) -> list[dict[str, Any]]:
+        """Expose the complete ordered approval set to the hosted renderer."""
+        return self.projection.ordered_pending_approvals()
 
     @property
     def _status(self) -> str:
@@ -1221,37 +1225,48 @@ class DualPaneSurface(OperatorSurface):
             active_lines.extend(["ACTIVE OPERATION", "· no capability is running"])
 
         approval_lines: list[str] = []
-        if self._pending_approval:
-            approval = self._pending_approval
-            approval_lines.extend(["", "APPROVAL REQUIRED"])
-            label = active.label if active else approval.get("capability_id") or "capability"
-            approval_lines.append(f"? {label}  PAUSED")
-            target = (
-                active.target
-                if active
-                else approval.get("target")
-                or approval.get("resource")
-                or approval.get("path")
-                or ""
-            )
-            if target:
-                approval_lines.append(f"target  {target}")
-            reason = (
-                approval.get("reason")
-                or approval.get("policy_reason")
-                or (active.detail if active else "")
-            )
-            if reason:
-                approval_lines.append(f"reason  {reason}")
-            scopes = [str(scope) for scope in approval.get("scopes") or ()]
-            choices = " ".join(f"{index}:{scope}" for index, scope in enumerate(scopes, 1))
-            approval_lines.append(f"keys  {choices or '1:allow'} d:deny")
-            approval_lines.append("paused · choose a scope")
+        pending_approvals = self._pending_approvals
+        if pending_approvals:
+            approval_lines.extend(["", f"APPROVAL REQUIRED ({len(pending_approvals)})"])
+            for index, approval in enumerate(pending_approvals):
+                approval_id = approval.get("approval_id") or approval.get("id") or "?"
+                label = (
+                    active.label
+                    if index == 0 and active
+                    else approval.get("capability_id") or "capability"
+                )
+                approval_lines.append(f"? {approval_id}  {label}  PAUSED")
+                target = (
+                    active.target
+                    if index == 0 and active
+                    else approval.get("target")
+                    or approval.get("resource")
+                    or approval.get("path")
+                    or ""
+                )
+                if target:
+                    approval_lines.append(f"target  {target}")
+                reason = (
+                    approval.get("reason")
+                    or approval.get("policy_reason")
+                    or (active.detail if index == 0 and active else "")
+                )
+                if reason:
+                    approval_lines.append(f"reason  {reason}")
+                scopes = [str(scope) for scope in approval.get("scopes") or ()]
+                choices = " ".join(
+                    f"{scope_index}:{scope}" for scope_index, scope in enumerate(scopes, 1)
+                )
+                approval_lines.append(f"keys  {choices or '1:allow'} d:deny")
+                approval_lines.append("paused · choose a scope")
 
         secondary: list[str] = [""]
         secondary.extend(self._operation_history_lines())
         secondary.extend(["", "RECENT ACTIVITY"])
         secondary.extend(f"{glyph} {text}" for glyph, text in list(self._recent)[-6:])
+        if self.details and self._maintenance:
+            secondary.extend(["", "LEARNING / MAINTENANCE"])
+            secondary.extend(f"{glyph} {text}" for glyph, text in list(self._maintenance)[-6:])
         secondary.extend(["", "LIVE STREAM"])
         for item in self.window.snapshot(min(5, max(height, 1)), max(width - 2, 1))[-5:]:
             if item.strip():

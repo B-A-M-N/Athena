@@ -7,7 +7,7 @@ because :meth:`AthenaService.in_memory` hard-codes ``db_path=":memory:"``.
 Athena owns the ``athena_claim``/``athena_evidence`` marker declarations in
 its tests; DSH injects the private reporter when it collects proof.
 
-The ``athena_scenario`` marker is metadata-only: it names the stable-beta
+The ``athena_scenario`` marker is metadata-only: it names the 0.1 stable
 scenario family (see ``tests/scenarios/registry.py``) a test provides
 evidence for.  It never selects or skips tests — ``scripts/scenarios`` binds
 scenarios to concrete node IDs and runs them by ID; the marker exists so a
@@ -31,7 +31,7 @@ from athena.service.config import AthenaConfig, ProviderConfig
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "athena_scenario(*scenario_ids): stable-beta scenario family evidence "
+        "athena_scenario(*scenario_ids): 0.1 stable scenario family evidence "
         "(see tests/scenarios/registry.py); metadata only, never selects tests",
     )
 
@@ -83,7 +83,11 @@ async def make_durable_service():
                 ),
             ),
             worker_max_parallel=cfg.get("worker_max_parallel", 4),
+            worker_lease_duration_seconds=cfg.get("worker_lease_duration_seconds", 300.0),
+            worker_lease_renewal_divisor=cfg.get("worker_lease_renewal_divisor", 3.0),
             scheduler_interval_seconds=cfg.get("scheduler_interval_seconds", 1.0),
+            parked_slot_wait_s=cfg.get("parked_slot_wait_s", 300.0),
+            cache_namespace=cfg.get("cache_namespace", "athena"),
         )
         svc = AthenaService(config=config)
         await svc.start()

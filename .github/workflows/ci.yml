@@ -1,33 +1,198 @@
+---
 name: CI
 
-on:
+on:  # yamllint disable-line rule:truthy
   pull_request:
   push:
     branches: [main]
     tags: ["v*", "[0-9]+.[0-9]+.[0-9]+"]
 
+permissions:
+  contents: read
+
 jobs:
-  release-check:
-    runs-on: ubuntu-latest
+  normal:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85.0
+        uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315 # 1.85.0
       - name: Install uv
-        run: python -m pip install uv
+        run: python -m pip install uv==0.11.21
       - name: Bootstrap locked Rust dependencies
         run: cargo fetch --manifest-path native/Cargo.toml --locked
       - name: Run release checks
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            scripts/release-check --sha "$GITHUB_SHA" --skip-e2e
-          else
-            scripts/release-check --sha "$GITHUB_SHA"
-          fi
+          scripts/release-check --sha "$GITHUB_SHA" --skip-e2e
+
+  # This lane is intentionally protected: it needs a real X11/WM environment
+  # for the desktop acceptance suite. Hermes is an optional integration and
+  # is certified by a separate job below.
+  core-release-certification:
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-24.04
+    environment: core-release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315 # 1.85.0
+      - name: Install protected desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick xdotool xvfb openbox
+      - name: Install uv
+        run: python -m pip install uv==0.11.21
+      - name: Record runner identity
+        run: |
+          mkdir -p "$RUNNER_TEMP/athena-release-evidence"
+          {
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            uname -a
+            cat /etc/os-release
+          } > "$RUNNER_TEMP/athena-release-evidence/runner-identity.txt"
+      - name: Bootstrap locked Rust dependencies
+        run: cargo fetch --manifest-path native/Cargo.toml --locked
+      - name: Run protected release checks
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
+            bash -ceu '
+              openbox --replace >/tmp/athena-openbox.log 2>&1 &
+              wm_pid=$!
+              trap "kill $wm_pid 2>/dev/null || true" EXIT
+              scripts/release-check \
+                --sha "$GITHUB_SHA" \
+                --evidence-dir "$RUNNER_TEMP/athena-release-evidence"
+            '
+      - name: Upload certified release artifacts and evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: athena-release-core-${{ github.sha }}
+          path: ${{ runner.temp }}/athena-release-evidence
+
+  # Hermes is an optional read-only self-host supervision integration. Its
+  # live evidence is opt-in and is never a prerequisite for core publication.
+  hermes-referee-transport-certification:
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/')) &&
+      needs.core-release-certification.result == 'success' &&
+      vars.ATHENA_HERMES_E2E_ENABLED == 'true'
+    needs: [core-release-certification]
+    runs-on: ubuntu-24.04
+    environment: hermes-integration
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: python -m pip install uv==0.11.21
+      - name: Run optional Hermes referee certification
+        env:
+          ATHENA_HERMES_E2E_ENDPOINT: ${{ secrets.ATHENA_HERMES_E2E_ENDPOINT }}
+          ATHENA_HERMES_E2E_API_KEY: ${{ secrets.ATHENA_HERMES_E2E_API_KEY }}
+          ATHENA_HERMES_E2E_PROFILE: >-
+            ${{ vars.ATHENA_HERMES_E2E_PROFILE || 'athena-referee' }}
+          ATHENA_HERMES_INTEGRATION_GATE: "1"
+          ATHENA_HERMES_E2E_EVIDENCE_PATH: >-
+            ${{ runner.temp }}/athena-hermes-referee-certification.json
+          ATHENA_RELEASE_SHA: ${{ github.sha }}
+          ATHENA_RELEASE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -o pipefail
+          uv run --frozen --extra dev pytest -q -p no:cacheprovider \
+            tests/e2e/test_hermes_agent.py \
+            | tee "$RUNNER_TEMP/athena-hermes-referee-certification.txt"
+      - name: Upload optional Hermes evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: athena-hermes-evidence-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/athena-hermes-referee-certification.txt
+            ${{ runner.temp }}/athena-hermes-referee-certification.json
+
+  verify-release:
+    # Verification is deliberately separate from the OIDC publisher. It may
+    # execute repository verification code, but it has no publish identity.
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.core-release-certification.result == 'success'
+    needs: [core-release-certification]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Download protected certified artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: athena-release-core-${{ github.sha }}
+          path: release-evidence
+      - name: Verify certified identity, manifest, and hashes
+        run: |
+          python scripts/verify-release-evidence \
+            --evidence-dir release-evidence \
+            --sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --tag "$GITHUB_REF_NAME"
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: athena-release-verified-${{ github.sha }}
+          path: release-evidence/${{ github.sha }}/${{ github.run_id }}/distributions
+
+  publish:
+    # The OIDC publisher consumes only the distributions emitted by the
+    # unprivileged verification job. It never checks out or executes repo code.
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.verify-release.result == 'success'
+    needs: [verify-release]
+    runs-on: ubuntu-24.04
+    environment: pypi-production
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: athena-release-verified-${{ github.sha }}
+          path: verified-distributions
+      - name: Publish exact certified distributions
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: verified-distributions
+          skip-existing: false

@@ -144,6 +144,27 @@ def test_transport_projections_preserve_canonical_event_truth():
     assert acp.payload["output"] == "ok"
 
 
+def test_native_projection_keeps_multiple_approvals_and_resolves_one():
+    projection = ProjectionState()
+    projection.reduce(
+        "ApprovalRequested",
+        {"approval_id": "approval-a", "capability_id": "fs", "scopes": ["call"]},
+    )
+    projection.reduce(
+        "ApprovalRequested",
+        {"approval_id": "approval-b", "capability_id": "execute", "scopes": ["task"]},
+    )
+
+    frame = native_projection_frame(projection)
+    assert [item["approval_id"] for item in frame["attention_items"]] == [
+        "approval-a",
+        "approval-b",
+    ]
+
+    projection.reduce("ApprovalResolved", {"approval_id": "approval-a", "decision": "granted"})
+    assert list(projection.pending_approvals) == ["approval-b"]
+
+
 def test_projection_renders_canonical_determinate_progress():
     projection = ProjectionState()
     projection.reduce(
@@ -240,6 +261,8 @@ def test_native_bridge_projects_approval_as_non_modal_attention_item():
     item = frame["attention_items"][0]
     assert item["kind"] == "approval"
     assert item["requires_action"] is True
+    assert item["approval_id"] == "approval-1"
+    assert item["scopes"] == ["workspace"]
     assert "native/src/render/oi.rs" in item["summary"]
     assert frame["progress"]["approval"]["capability_id"] == "fs.write"
 
@@ -547,6 +570,15 @@ def test_native_projection_frame_model_request_fields_present():
     assert "status" in mr
 
 
+def test_self_host_phase_is_preserved_as_native_semantic_state():
+    state = ProjectionState()
+    for phase in ("PLAN", "PATCH", "PROVE", "REVIEW", "REFEREE", "PROMOTION"):
+        state.reduce("SelfHostPhaseChanged", {"phase": phase})
+        frame = native_projection_frame(state)
+        assert state.self_host_phase == phase
+        assert frame["self_host_phase"] == phase
+
+
 def test_write_native_projection_outputs_valid_json_with_owl():
     """write_native_projection must emit parseable JSON with character='owl'."""
     from io import StringIO
@@ -591,3 +623,21 @@ def test_runtime_tree_keeps_task_operation_and_execution_hierarchy():
     assert runtime[0]["id"] == "task:task-1"
     assert runtime[0]["children"][0]["id"] == "operation:call-1"
     assert runtime[0]["children"][0]["children"][0]["id"] == "execution:exec-1"
+
+
+def test_learning_activity_is_separate_from_recent_task_activity():
+    state = ProjectionState()
+
+    state.reduce("MemoryCandidateCreated", {})
+    state.reduce("SkillCandidateCreated", {})
+    state.reduce("SkillActivated", {})
+    state.reduce("MutationRecorded", {})
+
+    recent_text = [text for _, text in state.recent]
+    maintenance_text = [text for _, text in state.maintenance]
+    assert recent_text == ["Mutation applied"]
+    assert maintenance_text == [
+        "Memory candidate recorded",
+        "Skill candidate recorded",
+        "Skill activated",
+    ]

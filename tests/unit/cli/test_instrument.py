@@ -7,7 +7,7 @@ from io import StringIO
 
 import pytest
 
-from athena.cli.animation import AnimationClock, OIAnimator
+from athena.cli.animation import AnimationClock, OIAnimator, OIVisualState
 from athena.cli.framebuffer import OIFrameBuffer, pillow_available
 from athena.cli.dual_pane import DualPaneSurface
 from athena.cli.layout import LayoutMode, compute_layout
@@ -158,6 +158,40 @@ def test_glass_framebuffer_exposes_small_dynamic_overlay() -> None:
     assert moved is not None
     assert moved.png != overlay.png
     assert len(moved.png) < len(framebuffer.render(scene, animator.visual, 640, 360).png)
+
+
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_glass_buddy_uses_fixed_sprite_source_box() -> None:
+    from io import BytesIO
+    from PIL import Image
+
+    layout = compute_layout(120, 40)
+    state = ProjectionState()
+    scene = build_oi_scene(state, layout.oi)
+    animator = OIAnimator()
+    framebuffer = OIFrameBuffer()
+
+    overlay = framebuffer.render_overlay(scene, animator.visual, 640, 360)
+
+    assert overlay is not None and overlay.dirty_region is not None
+    assert (overlay.dirty_region[2], overlay.dirty_region[3]) == (64, 80)
+    assert Image.open(BytesIO(overlay.png)).size == (64, 80)
+    assert len(framebuffer._BUDDY_SPRITE) == 40
+    assert {len(row) for row in framebuffer._BUDDY_SPRITE} == {32}
+    assert sum(row.count("#") for row in framebuffer._BUDDY_SPRITE) < 32 * 40 // 2
+
+
+@pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")
+def test_glass_buddy_disappears_when_the_fixed_box_cannot_fit() -> None:
+    state = ProjectionState()
+    scene = build_oi_scene(state, compute_layout(80, 18).oi)
+    framebuffer = OIFrameBuffer()
+
+    overlay = framebuffer.render_overlay(scene, OIVisualState(), 80, 60)
+
+    assert overlay is not None
+    assert overlay.png == b""
+    assert overlay.dirty_region is None
 
 
 @pytest.mark.skipif(not pillow_available(), reason="Pillow is optional")

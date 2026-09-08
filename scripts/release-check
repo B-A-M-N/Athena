@@ -4,7 +4,8 @@
 The developer checkout may be dirty while work is in progress.  This command
 does not pretend that such a checkout is a release candidate: it extracts one
 resolved commit into a temporary clean tree and runs every release lane there.
-Pass ``--evidence-dir`` when the lane records must survive the temporary tree.
+    Pass ``--evidence-dir`` when the lane records must survive the temporary tree;
+    records are published transactionally under ``<root>/<commit-sha>/<run-id>``.
 
 Usage::
 
@@ -28,12 +29,13 @@ import sys
 import tempfile
 import tarfile
 import time
+import uuid
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from athena.release.gates import release_commands  # noqa: E402
+from athena.release.gates import lane_stage, release_commands  # noqa: E402
 
 
 def _git(*args: str, cwd: Path = REPO_ROOT) -> str:
@@ -88,6 +90,40 @@ def _run(
     }
 
 
+def _run_static_concurrently(
+    lanes_to_run: list[tuple[str, list[str]]],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+) -> list[dict[str, object]]:
+    """Run the static stage's lanes concurrently.
+
+    Every static lane is a read-only source check (ruff/mypy/compileall/audit/
+    lint) on the same frozen tree: no shared writable state, no timing
+    sensitivity. They are also the cheapest full-machine-CPU lanes, so the
+    20-core box otherwise idles through them serially. Results keep the
+    original lane order regardless of completion order, so downstream
+    evidence and failure reporting stay deterministic.
+    """
+    import concurrent.futures
+
+    results: dict[str, dict[str, object]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(lanes_to_run))) as pool:
+        futures = {
+            pool.submit(_run, command, cwd=cwd, env=env, timeout=timeout): name
+            for name, command in lanes_to_run
+        }
+        for future in concurrent.futures.as_completed(futures):
+            results[futures[future]] = future.result()
+    ordered = []
+    for name, _ in lanes_to_run:
+        record = results[name]
+        record["name"] = name
+        ordered.append(record)
+    return ordered
+
+
 def _extract_commit(commit: str, checkout: Path, *, timeout: float) -> None:
     """Extract one commit without writing repository metadata.
 
@@ -138,6 +174,16 @@ def _evidence_record(record: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _release_run_id() -> str:
+    """Choose a stable CI run id or generate one for local certification."""
+    value = os.environ.get("ATHENA_RELEASE_RUN_ID") or os.environ.get("GITHUB_RUN_ID")
+    if value:
+        value = value.strip()
+        if value and all(char.isalnum() or char in {"-", "_"} for char in value):
+            return value
+    return uuid.uuid4().hex
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="scripts/release-check",
@@ -165,6 +211,21 @@ def main(argv: list[str] | None = None) -> int:
         help="skip installed-artifact acceptance; not a full release check",
     )
     parser.add_argument(
+        "--stage",
+        default=None,
+        choices=["static", "tests", "bench", "integration"],
+        help=(
+            "run only one gate stage (static | tests | bench | integration); "
+            "default runs every lane. A stage run records partial evidence "
+            "and is not by itself a release verdict."
+        ),
+    )
+    parser.add_argument(
+        "--include-hermes-live",
+        action="store_true",
+        help="include optional operator-owned Hermes live evidence",
+    )
+    parser.add_argument(
         "--bootstrap",
         action="store_true",
         help="fetch locked Rust dependencies before the offline native checks",
@@ -177,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.skip_e2e and args.include_hermes_live:
+        parser.error("--include-hermes-live requires the full gate (omit --skip-e2e)")
 
     explicit_sha = args.sha is not None
     requested_sha = args.sha or "HEAD"
@@ -202,19 +265,40 @@ def main(argv: list[str] | None = None) -> int:
 
     temp_root = Path(tempfile.mkdtemp(prefix="athena-release-check-"))
     checkout = temp_root / "checkout"
-    evidence_dir = Path(args.evidence_dir).expanduser().resolve() if args.evidence_dir else None
+    evidence_root = Path(args.evidence_dir).expanduser().resolve() if args.evidence_dir else None
+    run_id = _release_run_id()
+    evidence_dir = evidence_root / resolved / run_id if evidence_root is not None else None
+    evidence_stage: Path | None = None
+    if evidence_root is not None:
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        evidence_stage = Path(tempfile.mkdtemp(prefix=f".{run_id}.", dir=evidence_root))
     lanes: list[dict[str, object]] = []
     final_status = "FAIL"
     error: str | None = None
     try:
         if evidence_dir is not None:
             _write_json(
-                evidence_dir / "release-identity.json",
+                evidence_stage / "release-identity.json",
                 {
                     "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "requested_sha": requested_sha,
                     "explicit_sha": explicit_sha,
                     "skip_e2e": bool(args.skip_e2e),
+                    "stage": args.stage,
+                    "include_hermes_live": bool(args.include_hermes_live),
+                    "optional_integrations": {
+                        "hermes_referee": {
+                            "required_for_core_release": False,
+                            "commit_sha": resolved,
+                            "release_run_id": run_id,
+                            "status": (
+                                "pending_live_certification"
+                                if args.include_hermes_live
+                                else "not_certified_live"
+                            ),
+                        }
+                    },
                     "bootstrap": bool(args.bootstrap),
                 },
             )
@@ -225,23 +309,73 @@ def main(argv: list[str] | None = None) -> int:
         )
         env.pop("PYTHONHOME", None)
         env["ATHENA_RELEASE_SHA"] = resolved
+        env["ATHENA_RELEASE_RUN_ID"] = run_id
         env["ATHENA_FROZEN_SOURCE"] = "1"
+        env["ATHENA_RELEASE_GATE"] = "1"
+        if args.include_hermes_live:
+            env["ATHENA_HERMES_INTEGRATION_GATE"] = "1"
+        else:
+            env.pop("ATHENA_HERMES_INTEGRATION_GATE", None)
+        env["ATHENA_RELEASE_UV"] = args.uv
         # Keep uv's environment outside the checkout. Otherwise the first
         # ``uv run`` can create an untracked .venv and make the later
         # scenarios --require-clean assertion fail for the wrong reason.
         env["UV_PROJECT_ENVIRONMENT"] = str(temp_root / "venv")
         env["UV_CACHE_DIR"] = str(temp_root / "uv-cache")
-        for name, command in release_commands(
+        lanes_to_run = release_commands(
             args.uv,
             skip_e2e=args.skip_e2e,
             bootstrap=args.bootstrap,
-        ):
-            record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
+            include_hermes_live=args.include_hermes_live,
+            stage=args.stage,
+        )
+        static_lanes = [
+            (name, command) for name, command in lanes_to_run if lane_stage(name) == "static"
+        ]
+        if len(static_lanes) > 1:
+            static_records = _run_static_concurrently(
+                static_lanes, cwd=checkout, env=env, timeout=args.timeout
+            )
+            static_by_name = {str(rec.get("name")): rec for rec in static_records}
+        else:
+            static_by_name = {}
+        for name, command in lanes_to_run:
+            if name in static_by_name:
+                record = static_by_name[name]
+            else:
+                record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
             record["name"] = name
+            record["commit_sha"] = resolved
+            record["release_run_id"] = run_id
             lanes.append(record)
+            if name == "release-artifacts" and int(record.get("exit_code") or 0) == 0:
+                manifest_path = checkout / "release-artifacts" / "release-manifest.json"
+                if not manifest_path.is_file():
+                    raise RuntimeError("release artifact manifest was not produced")
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest.get("source_sha") != resolved:
+                    raise RuntimeError(
+                        "release artifact manifest source_sha does not match frozen commit"
+                    )
+                if evidence_dir is not None:
+                    manifest["release_run_id"] = run_id
+                    _write_text(
+                        evidence_stage / "release-manifest.json",
+                        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    )
+                    artifact_evidence = evidence_stage / "distributions"
+                    if artifact_evidence.exists():
+                        raise RuntimeError(
+                            "release distributions evidence path already exists; "
+                            "use a fresh --evidence-dir"
+                        )
+                    shutil.copytree(
+                        checkout / "release-artifacts" / "distributions",
+                        artifact_evidence,
+                    )
             if evidence_dir is not None:
                 _write_text(
-                    evidence_dir
+                    evidence_stage
                     / {
                         "architecture-lint": "architecture-lint.txt",
                         "native-check": "native-check.txt",
@@ -256,11 +390,42 @@ def main(argv: list[str] | None = None) -> int:
                     f"command failed with exit {record['exit_code']}: {' '.join(command)}"
                 )
         if evidence_dir is not None:
-            static_names = {"ruff-format", "ruff-check", "mypy", "compileall"}
+            hermes_lane = next(
+                (item for item in lanes if item.get("name") == "hermes-live"),
+                None,
+            )
+            hermes_status = (
+                "PASS"
+                if hermes_lane is not None and int(hermes_lane.get("exit_code") or 0) == 0
+                else "FAIL"
+                if args.include_hermes_live
+                else "not_certified_live"
+            )
+            optional_integrations = {
+                "commit_sha": resolved,
+                "release_run_id": run_id,
+                "hermes_referee": {
+                    "required_for_core_release": False,
+                    "source_sha": resolved,
+                    "commit_sha": resolved,
+                    "release_run_id": run_id,
+                    "status": hermes_status,
+                },
+            }
+            _write_json(evidence_stage / "optional-integrations.json", optional_integrations)
+            static_names = {
+                "ruff-format",
+                "ruff-check",
+                "mypy",
+                "compileall",
+                "dependency-audit",
+                "uv-lock-check",
+            }
             _write_json(
-                evidence_dir / "static-checks.json",
+                evidence_stage / "static-checks.json",
                 {
                     "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "lanes": [
                         _evidence_record(item) for item in lanes if item.get("name") in static_names
                     ],
@@ -271,17 +436,21 @@ def main(argv: list[str] | None = None) -> int:
                 None,
             )
             _write_json(
-                evidence_dir / "pytest-summary.json",
+                evidence_stage / "pytest-summary.json",
                 {
                     "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "lane": _evidence_record(pytest_lane) if pytest_lane else None,
                 },
             )
             scenario_path = checkout / "release-scenarios.json"
             if scenario_path.exists():
+                scenario_manifest = json.loads(scenario_path.read_text(encoding="utf-8"))
+                scenario_manifest["commit_sha"] = resolved
+                scenario_manifest["release_run_id"] = run_id
                 _write_text(
-                    evidence_dir / "release-scenarios.json",
-                    scenario_path.read_text(encoding="utf-8"),
+                    evidence_stage / "release-scenarios.json",
+                    json.dumps(scenario_manifest, indent=2, sort_keys=True) + "\n",
                 )
             else:
                 scenario_lane = next(
@@ -289,43 +458,88 @@ def main(argv: list[str] | None = None) -> int:
                     None,
                 )
                 _write_json(
-                    evidence_dir / "release-scenarios.json",
+                    evidence_stage / "release-scenarios.json",
                     {
                         "commit_sha": resolved,
+                        "release_run_id": run_id,
                         "lane": _evidence_record(scenario_lane) if scenario_lane else None,
                     },
                 )
             if args.skip_e2e:
                 _write_text(
-                    evidence_dir / "e2e.txt",
+                    evidence_stage / "e2e.txt",
                     "SKIPPED: installed-artifact acceptance was explicitly omitted\n",
                 )
-        final_status = "PARTIAL_PASS" if args.skip_e2e else "PASS"
-        if args.skip_e2e:
+        if args.stage is not None:
+            final_status = f"STAGE_{args.stage.upper()}_PASS"
             print(
-                "release-check: PARTIAL PASS — e2e omitted, not releasable",
+                f"release-check: STAGE PASS [{args.stage}] {resolved} "
+                "— partial evidence, not a release verdict",
                 flush=True,
             )
         else:
-            print(f"release-check: PASS {resolved}", flush=True)
+            final_status = "PARTIAL_PASS" if args.skip_e2e else "PASS"
+            if args.skip_e2e:
+                print(
+                    "release-check: PARTIAL PASS — e2e omitted, not releasable",
+                    flush=True,
+                )
+            else:
+                print(f"release-check: PASS {resolved}", flush=True)
         return 0
+    except KeyboardInterrupt:
+        error = "release check interrupted"
+        final_status = "INTERRUPTED"
+        print("release-check: interrupted; evidence remains unpublished", file=sys.stderr)
+        return 130
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         error = str(exc)
         print(f"release-check: FAIL {exc}", file=sys.stderr)
         return 1
     finally:
-        if evidence_dir is not None:
+        if (
+            evidence_dir is not None
+            and evidence_stage is not None
+            and final_status != "INTERRUPTED"
+        ):
             _write_json(
-                evidence_dir / "final-release-result.json",
+                evidence_stage / "final-release-result.json",
                 {
                     "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "status": final_status,
                     "releasable": final_status == "PASS",
                     "error": error,
+                    "optional_integrations": {
+                        "hermes_referee": {
+                            "required_for_core_release": False,
+                            "source_sha": resolved,
+                            "commit_sha": resolved,
+                            "release_run_id": run_id,
+                            "status": (
+                                "PASS"
+                                if any(
+                                    item.get("name") == "hermes-live"
+                                    and int(item.get("exit_code") or 0) == 0
+                                    for item in lanes
+                                )
+                                else "FAIL"
+                                if args.include_hermes_live
+                                else "not_certified_live"
+                            ),
+                        }
+                    },
                     "lanes": [_evidence_record(item) for item in lanes],
                 },
             )
+            evidence_dir.parent.mkdir(parents=True, exist_ok=True)
+            if evidence_dir.exists():
+                raise RuntimeError(f"release evidence target already exists: {evidence_dir}")
+            os.replace(evidence_stage, evidence_dir)
+            evidence_stage = None
         shutil.rmtree(temp_root, ignore_errors=True)
+        if evidence_dir is not None:
+            print(f"release-check: evidence published at {evidence_dir}", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Scenario families for the Athena stable-beta release gate.
+"""Scenario families for the Athena 0.1 stable release gate.
 
 See ``tests/scenarios/registry.py`` for the declarative mapping of scenario
 IDs to real pytest node IDs and probe commands, and ``scripts/scenarios``

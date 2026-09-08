@@ -10,7 +10,10 @@ import pytest
 
 from athena.service.config import (
     AthenaConfig,
+    HermesRefereeConfig,
     deep_merge,
+    config_from_dict,
+    config_to_dict,
     load_config,
     load_toml_file,
     merge_configs,
@@ -93,6 +96,7 @@ def test_load_config_reads_hermes_referee_environment(monkeypatch):
     monkeypatch.setenv("ATHENA_HERMES_REFEREE_PROFILE", "athena-referee")
     monkeypatch.setenv("ATHENA_HERMES_REFEREE_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv("ATHENA_HERMES_REFEREE_CREDENTIAL_ID", "HERMES_API_KEY")
+    monkeypatch.setenv("ATHENA_HERMES_REFEREE_SELF_HOST_SUPERVISION", "advisory")
 
     config = load_config(cwd="/tmp/nonexistent_athena_test")
 
@@ -101,6 +105,43 @@ def test_load_config_reads_hermes_referee_environment(monkeypatch):
     assert config.hermes_referee.profile == "athena-referee"
     assert config.hermes_referee.timeout_seconds == 30.0
     assert config.hermes_referee.credential_id == "HERMES_API_KEY"
+    assert config.hermes_referee.supervision_mode.value == "advisory"
+
+
+@pytest.mark.parametrize("mode", ("off", "advisory", "required"))
+def test_hermes_supervision_policy_roundtrips_as_explicit_mode(mode):
+    config = config_from_dict({"hermes_referee": {"self_host_supervision": mode}})
+
+    assert config.hermes_referee.supervision_mode.value == mode
+    assert config.hermes_referee.enabled is False
+    assert config.hermes_referee.transport_enabled is False
+    serialized = config_to_dict(config)
+    if mode == "off":
+        assert "hermes_referee" not in serialized
+    else:
+        assert serialized["hermes_referee"]["self_host_supervision"] == mode
+
+
+@pytest.mark.parametrize("mode", ("advisory", "required"))
+def test_hermes_policy_does_not_enable_transport_without_explicit_lifecycle(mode):
+    config = config_from_dict({"hermes_referee": {"self_host_supervision": mode}})
+
+    assert config.hermes_referee.enabled is False
+    assert config.hermes_referee.supervision_mode.value == mode
+
+
+@pytest.mark.parametrize("mode", ("off", "advisory", "required"))
+def test_hermes_explicit_lifecycle_is_independent_from_policy(mode):
+    config = config_from_dict({"hermes_referee": {"enabled": True, "self_host_supervision": mode}})
+
+    assert config.hermes_referee.enabled is True
+    assert config.hermes_referee.transport_enabled is True
+    assert config.hermes_referee.supervision_mode.value == mode
+
+
+def test_hermes_supervision_policy_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="off, advisory, required"):
+        HermesRefereeConfig(self_host_supervision="sometimes")
 
 
 def test_save_and_load_roundtrip():

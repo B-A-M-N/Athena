@@ -41,7 +41,17 @@ class _CandidateWorkflows(_Workflows):
                 return workflow
         return None
 
-    async def record_candidate_observation(self, workflow_id, *, task_id, steps=()):
+    async def record_candidate_observation(
+        self,
+        workflow_id,
+        *,
+        task_id,
+        steps=(),
+        workspace_id=None,
+        workspace_revision=None,
+        verification=None,
+        observed_at=None,
+    ):
         from athena.workflows.mining import merge_observation
 
         for workflow in self.saved:
@@ -53,7 +63,7 @@ class _CandidateWorkflows(_Workflows):
 
 
 @pytest.mark.asyncio
-async def test_successful_deterministic_trace_becomes_reviewable_workflow():
+async def test_single_successful_trace_waits_for_repeatability():
     messages = [
         SimpleNamespace(
             blocks=(
@@ -109,7 +119,22 @@ async def test_successful_deterministic_trace_becomes_reviewable_workflow():
     )
 
     await pipeline(
-        SimpleNamespace(id="task-procedure", session_id="session-procedure"),
+        SimpleNamespace(
+            id="task-procedure",
+            session_id="session-procedure",
+            objective="follow these repeatable steps and verify the project",
+        ),
+        SimpleNamespace(status=TaskStatus.COMPLETE),
+    )
+
+    assert workflows.saved == []
+
+    await pipeline(
+        SimpleNamespace(
+            id="task-procedure-2",
+            session_id="session-procedure",
+            objective="follow these repeatable steps and verify the project",
+        ),
         SimpleNamespace(status=TaskStatus.COMPLETE),
     )
 
@@ -119,6 +144,7 @@ async def test_successful_deterministic_trace_becomes_reviewable_workflow():
     assert workflow.task_scope == "task-procedure"
     assert [step.capability_id for step in workflow.steps] == ["fs", "execute"]
     assert workflow.provenance["origin"] == "successful_task_trace"
+    assert workflow.provenance["successful_observations"] == 2
 
 
 @pytest.mark.asyncio
@@ -212,6 +238,62 @@ async def test_partial_task_does_not_create_workflow_candidate():
     await pipeline(
         SimpleNamespace(id="task-partial", session_id="session-partial"),
         SimpleNamespace(status=TaskStatus.PARTIAL),
+    )
+
+    assert workflows.saved == []
+
+
+@pytest.mark.asyncio
+async def test_shared_session_learning_stops_at_next_canonical_turn():
+    messages = [
+        SimpleNamespace(
+            metadata={"canonical_user_turn": True, "task_id": "task-a"},
+            blocks=(),
+        ),
+        SimpleNamespace(
+            metadata={},
+            blocks=(
+                CapabilityCallBlock(
+                    call_id="call-a", capability_id="fs", arguments={"operation": "read"}
+                ),
+                CapabilityResultBlock(call_id="call-a", capability_id="fs", ok=True, output="a"),
+                CapabilityCallBlock(
+                    call_id="call-a-check", capability_id="execute", arguments={"command": "a"}
+                ),
+                CapabilityResultBlock(
+                    call_id="call-a-check",
+                    capability_id="execute",
+                    ok=True,
+                    output="a-check",
+                ),
+            ),
+        ),
+        SimpleNamespace(
+            metadata={"canonical_user_turn": True, "task_id": "task-b"},
+            blocks=(),
+        ),
+        SimpleNamespace(
+            metadata={},
+            blocks=(
+                CapabilityCallBlock(
+                    call_id="call-b", capability_id="execute", arguments={"command": "b"}
+                ),
+                CapabilityResultBlock(
+                    call_id="call-b", capability_id="execute", ok=True, output="b"
+                ),
+            ),
+        ),
+    ]
+    workflows = _Workflows()
+    pipeline = KnowledgePipeline(messages=_Messages(messages), workflow_store=workflows)
+
+    await pipeline(
+        SimpleNamespace(
+            id="task-a",
+            session_id="shared-session",
+            objective="follow these repeatable steps and verify the project",
+        ),
+        SimpleNamespace(status=TaskStatus.COMPLETE),
     )
 
     assert workflows.saved == []

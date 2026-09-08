@@ -220,6 +220,164 @@ async def test_reflection_availability_reports_ready_capability():
 
 
 @pytest.mark.asyncio
+async def test_reflection_environment_passport_is_exhaustive_and_actionable(tmp_path):
+    class _Models:
+        def names(self):
+            return ("local",)
+
+        async def list_models(self):
+            return [SimpleNamespace(id="local-model", provider="local", context_window=4096)]
+
+    class _Delegates:
+        def list(self):
+            return [
+                {
+                    "id": "delegate-1",
+                    "status": "available",
+                    "reason": None,
+                    "remediation": None,
+                }
+            ]
+
+    reflection = CapabilityReflection(
+        CapabilityFabric(CapabilityRegistry()),
+        model_provider=_Models(),
+        mcp_status_provider={"release-mcp": "connection refused"},
+        delegate_provider=_Delegates(),
+    )
+    result = await reflection.invoke(
+        CapabilityRequest(
+            capability_id="capabilities",
+            task_id="task-passport",
+            call_id="call-passport",
+            arguments={"operation": "availability"},
+        ),
+        context=SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path))),
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    passport = json.loads(result.output)
+    assert passport["kind"] == "environment_passport"
+    assert {
+        "platform",
+        "workspace",
+        "runtimes",
+        "backends",
+        "toolchains",
+        "network",
+        "filesystem",
+        "models",
+        "mcp",
+        "delegates",
+        "generated_capabilities",
+        "dependencies",
+        "devices",
+        "environment_fingerprint",
+    } <= passport.keys()
+    assert passport["models"] == {
+        "providers": ["local"],
+        "configured": [
+            {
+                "id": "local-model",
+                "provider": "local",
+                "context_window": 4096,
+                "status": "available",
+            }
+        ],
+        "status": "available",
+        "availability": "available",
+        "reason": None,
+        "remediation": None,
+    }
+    assert passport["mcp"] == [
+        {
+            "id": "release-mcp",
+            "status": "unavailable",
+            "availability": "unavailable",
+            "reason": "connection refused",
+            "remediation": "inspect MCP configuration and reconnect the server",
+        }
+    ]
+    assert passport["delegates"][0]["status"] == "available"
+    assert passport["filesystem"]["workspace_exists"] is True
+    for group in (
+        "platform",
+        "workspace",
+        "network",
+        "filesystem",
+        "models",
+        "dependencies",
+    ):
+        assert passport[group]["status"] in {
+            "available",
+            "unavailable",
+            "partial",
+            "unknown",
+            "blocked",
+            "restricted",
+        }
+        assert passport[group]["reason"] is None or passport[group]["reason"]
+        assert passport[group]["remediation"] is None or passport[group]["remediation"]
+    for item in (
+        passport["runtimes"] + passport["backends"] + passport["delegates"] + passport["devices"]
+    ):
+        assert item["availability"] in {"available", "unavailable"}
+        assert item["reason"] is None or item["reason"]
+        assert item["remediation"] is None or item["remediation"]
+
+
+@pytest.mark.asyncio
+async def test_reflection_environment_passport_explains_unconfigured_machine(tmp_path):
+    reflection = CapabilityReflection(CapabilityFabric(CapabilityRegistry()))
+    result = await reflection.invoke(
+        CapabilityRequest(
+            capability_id="capabilities",
+            task_id="task-first-run-passport",
+            call_id="call-first-run-passport",
+            arguments={"operation": "availability"},
+        ),
+        context=SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path))),
+    )
+
+    passport = json.loads(result.output)
+    assert passport["status"] == "PARTIAL"
+    assert passport["models"]["status"] == "unavailable"
+    assert "no model provider" in passport["models"]["reason"]
+    assert passport["models"]["remediation"]
+    assert passport["delegates"][0]["status"] == "unavailable"
+    assert passport["delegates"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_reflection_environment_passport_includes_service_runtime_health(tmp_path):
+    health = {
+        "scheduler": {"health": "healthy", "running": True},
+        "watch": {
+            "health": "degraded",
+            "rehydration_health": "degraded",
+            "unresolved_rehydrations": [{"watch_id": "watch-1"}],
+        },
+    }
+    reflection = CapabilityReflection(
+        CapabilityFabric(CapabilityRegistry()),
+        runtime_health_provider=lambda: health,
+    )
+    result = await reflection.invoke(
+        CapabilityRequest(
+            capability_id="capabilities",
+            task_id="task-runtime-health",
+            call_id="call-runtime-health",
+            arguments={"operation": "availability"},
+        ),
+        context=SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path))),
+    )
+
+    passport = json.loads(result.output)
+    assert passport["subsystems"] == health
+    assert passport["status"] == "PARTIAL"
+
+
+@pytest.mark.asyncio
 async def test_reflection_availability_reports_missing_generated_prerequisite(tmp_path):
     from athena.affordances.models import AffordanceScope, GeneratedCapability
 

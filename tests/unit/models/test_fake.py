@@ -81,3 +81,80 @@ async def test_scripted_mode_two_turns():
     assert any(
         isinstance(b, TextBlock) and b.text == "final answer here" for b in done.response.blocks
     )
+
+
+async def test_fake_source_aware_history_predicates_use_last_matching_source():
+    request = ModelRequest(
+        messages=(
+            Message(
+                id="u1",
+                role=Role.USER,
+                blocks=(TextBlock(type="text", text="old user marker"),),
+                created_at=None,
+                provenance=None,
+            ),
+            Message(
+                id="a1",
+                role=Role.ASSISTANT,
+                blocks=(TextBlock(type="text", text="old assistant marker"),),
+                created_at=None,
+                provenance=None,
+            ),
+            Message(
+                id="r1",
+                role=Role.CAPABILITY,
+                blocks=(
+                    CapabilityResultBlock(
+                        type="capability_result", ok=False, output="old capability marker"
+                    ),
+                ),
+                created_at=None,
+                provenance=None,
+            ),
+            Message(
+                id="u2",
+                role=Role.USER,
+                blocks=(TextBlock(type="text", text="last user marker"),),
+                created_at=None,
+                provenance=None,
+            ),
+            Message(
+                id="a2",
+                role=Role.ASSISTANT,
+                blocks=(TextBlock(type="text", text="last assistant marker"),),
+                created_at=None,
+                provenance=None,
+            ),
+            Message(
+                id="r2",
+                role=Role.CAPABILITY,
+                blocks=(
+                    CapabilityResultBlock(
+                        type="capability_result", ok=True, output="last capability marker"
+                    ),
+                ),
+                created_at=None,
+                provenance=None,
+            ),
+        ),
+        model="fake",
+        provider="fake",
+        request_id="req-history",
+    )
+    provider = FakeModelProvider(
+        scripts=[
+            {
+                "match": {
+                    "last_user_message_contains": "last user",
+                    "last_capability_result_contains": "last capability",
+                    "assistant_message_contains": "last assistant",
+                },
+                "respond": {"text": "source-aware", "done": True},
+            }
+        ]
+    )
+
+    events = [event async for event in provider.complete(request)]
+    done = next(event for event in events if event.type == ModelEventType.DONE)
+    assert done.response is not None
+    assert done.response.blocks[0].text == "source-aware"

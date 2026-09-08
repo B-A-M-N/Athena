@@ -14,6 +14,7 @@ from athena.protocol.capabilities import (
     CapabilityResult,
     CapabilityResultStatus,
     EffectClass,
+    ResourceClass,
 )
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import Criterion, VerificationSpec, VerificationType
@@ -49,6 +50,7 @@ class MaintenanceCapability:
                         "enable",
                         "disable",
                         "delete",
+                        "reconcile",
                     ],
                 },
                 "contract_id": {"type": "string", "minLength": 1, "maxLength": 128},
@@ -90,10 +92,14 @@ class MaintenanceCapability:
                     },
                     "required": ["contract_id"],
                 },
+                {
+                    "properties": {"operation": {"const": "reconcile"}},
+                },
             ],
             "additionalProperties": False,
         },
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        resources=frozenset({ResourceClass.STATE}),
         origin=CapabilityOrigin.NATIVE,
     )
 
@@ -105,12 +111,14 @@ class MaintenanceCapability:
         workspace=None,
         execution_manager=None,
         fabric=None,
+        principal_id: str | None = None,
     ) -> None:
         self._schedule = schedule_api
         self._watch_registry = watch_registry
         self._workspace = workspace
         self._execution_manager = execution_manager
         self._fabric = fabric
+        self._principal_id = principal_id
 
     async def rehydrate(self) -> int:
         """Restore enabled contract observers after a service restart.
@@ -124,24 +132,47 @@ class MaintenanceCapability:
             return 0
         owner = {
             "project_id": getattr(self._workspace, "id", None),
+            "principal_id": self._principal_id,
         }
         restored = 0
         try:
             contracts = await self._contracts(owner)
         except Exception as exc:
             _logger.warning("maintenance contract rehydration lookup failed: %s", exc)
+            self._watch_registry.record_rehydration_failure(
+                exc, contract_id="maintenance_contracts"
+            )
             return 0
+        # A successful durable-contract lookup proves the aggregate lookup
+        # failure has been reconciled; individual watcher failures remain
+        # tracked by their exact contract/watch identity below.
+        self._watch_registry.record_rehydration_resolved(contract_id="maintenance_contracts")
         for contract in contracts:
             if contract.get("status") != "ACTIVE":
                 continue
+            contract_id = str(contract.get("contract_id") or "") or None
+            observe = contract.get("observe") or {}
+            watch_id = str(observe.get("watch_id") or "") or None
             try:
-                if await self._ensure_watch(contract, workspace=self._workspace):
+                if await self._ensure_watch(
+                    contract,
+                    workspace=self._workspace,
+                    principal_id=self._principal_id,
+                ):
                     restored += 1
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    self._watch_registry.record_rehydration(
+                        1, watch_id=watch_id, contract_id=contract_id
+                    )
+                else:
+                    raise ValueError("active maintenance observer was not restored")
+            except Exception as exc:
                 _logger.warning(
                     "maintenance observer %s could not be restored: %s",
                     contract.get("contract_id"),
                     exc,
+                )
+                self._watch_registry.record_rehydration_failure(
+                    exc, watch_id=watch_id, contract_id=contract_id
                 )
         return restored
 
@@ -151,11 +182,15 @@ class MaintenanceCapability:
             "task_id": request.task_id,
             "session_id": request.session_id,
             "project_id": getattr(getattr(context, "workspace", None), "id", None),
+            "principal_id": getattr(context, "principal_id", None),
         }
         operation = str(args.get("operation") or "")
         try:
             if operation == "create":
                 return await self._create(request, args, owner, context=context)
+            if operation == "reconcile":
+                restored = await self.rehydrate()
+                return _result(request, output=json.dumps({"restored": restored}))
             contracts = await self._contracts(owner)
             contract_id = str(args.get("contract_id") or "")
             selected = next(
@@ -173,7 +208,11 @@ class MaintenanceCapability:
                 for job in selected["jobs"]:
                     job_id = str(job.get("id") or "")
                     changed += int(await self._schedule.enable(job_id, owner=owner))
-                await self._ensure_watch(selected, workspace=self._workspace)
+                await self._ensure_watch(
+                    selected,
+                    workspace=self._workspace,
+                    principal_id=getattr(context, "principal_id", None),
+                )
                 return _result(
                     request,
                     output=json.dumps(
@@ -219,13 +258,23 @@ class MaintenanceCapability:
         trigger = dict(args.get("trigger") or {})
         contract_id = new_id("maintenance")
         observe = dict(args["observe"])
+        requested_policy = str(args.get("policy") or "supervised").casefold()
+        creator_policy = str(
+            getattr(
+                getattr(context, "autonomy", None),
+                "value",
+                getattr(context, "autonomy", "supervised"),
+            )
+            or "supervised"
+        ).casefold()
+        policy = _attenuate_autonomy(requested_policy, creator_policy)
         contract: dict[str, Any] = {
             "contract_id": contract_id,
             "claim": str(args["claim"]),
             "observe": observe,
             "verify": dict(args["verify"]),
             "remediation": dict(args.get("remediation") or {}),
-            "policy": str(args.get("policy") or "supervised"),
+            "policy": policy,
         }
         workspace = getattr(context, "workspace", None) or self._workspace
         if workspace is not None:
@@ -298,6 +347,14 @@ class MaintenanceCapability:
                         acceptance_criteria=acceptance_criteria,
                         owner=owner,
                         metadata={**metadata, "maintenance_role": role},
+                        capability_policy=getattr(context, "capability_policy", None),
+                        model_policy=getattr(context, "model_policy", None),
+                        resource_budget=getattr(context, "resource_budget", None),
+                        # Persist the contract's attenuated autonomy, not the
+                        # creator's broader runtime profile. A maintenance
+                        # request for supervised work must remain supervised
+                        # after restart and on every future occurrence.
+                        autonomy=policy,
                     )
                 )
         except Exception:
@@ -364,6 +421,7 @@ class MaintenanceCapability:
         *,
         workspace=None,
         authority_task_id: str | None = None,
+        principal_id: str | None = None,
     ) -> bool:
         if self._watch_registry is None:
             return False
@@ -392,7 +450,7 @@ class MaintenanceCapability:
                 self._fabric.executor_for(
                     observer_id,
                     project_id=getattr(workspace, "id", None),
-                    user_id="athena",
+                    user_id=principal_id or self._principal_id,
                 )
         if kind == "file":
             if workspace is None:
@@ -416,6 +474,10 @@ class MaintenanceCapability:
                 debounce=float(values.get("debounce") or 0.0),
                 workspace=workspace,
                 observer_id=observer_id,
+            )
+            self._watch_registry.record_rehydration_resolved(
+                watch_id=watch_id,
+                contract_id=str(contract.get("contract_id") or "") or None,
             )
             return True
 
@@ -441,6 +503,10 @@ class MaintenanceCapability:
             workspace=workspace,
             observer_id=observer_id,
         )
+        self._watch_registry.record_rehydration_resolved(
+            watch_id=watch_id,
+            contract_id=str(contract.get("contract_id") or "") or None,
+        )
         return True
 
     def _remove_watch(self, contract: Mapping[str, Any]) -> None:
@@ -454,8 +520,16 @@ class MaintenanceCapability:
 
 
 def _objective(contract: Mapping[str, Any]) -> str:
+    # The leading noun matters: this line feeds the deterministic turn-intent
+    # classifier, which reads "run" as an execution verb and would classify a
+    # purely observational contract as action-shaped — demanding causal work
+    # receipts the observer legitimately never produces (its verify criterion
+    # is machine-checked instead). "check" classifies observation (state-
+    # shaped), so the verified criterion satisfies the observable-work gate;
+    # a remediation-bearing contract still classifies mutation and keeps the
+    # causal-evidence requirement.
     return (
-        "Maintenance run. Claim: {claim}\n"
+        "Maintenance check. Claim: {claim}\n"
         "Observe: {observe}\n"
         "Verify: {verify}\n"
         "Remediation (only under policy): {remediation}\n"
@@ -512,6 +586,14 @@ def _verification_criteria(verify: Mapping[str, Any]) -> tuple[Criterion, ...]:
             required=True,
         ),
     )
+
+
+def _attenuate_autonomy(requested: str, creator: str) -> str:
+    """A maintenance contract can only inherit or narrow creator authority."""
+    order = {"supervised": 0, "coding": 1, "autonomous": 2}
+    requested = requested if requested in order else "supervised"
+    creator = creator if creator in order else "supervised"
+    return requested if order[requested] <= order[creator] else creator
 
 
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):

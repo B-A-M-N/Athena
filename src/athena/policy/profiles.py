@@ -48,7 +48,13 @@ def coding() -> RuleSet:
             _delete(ASK),
             _computer(ASK),
             _financial(ASK),
+            # Delegating spawns model-backed child work; it keeps an
+            # approval floor even though SPAWN_PROCESS alone is otherwise
+            # an execution-class allow.
+            _delegate_spawn(ASK),
+            _read(ALLOW, 50),
             _execute(ALLOW, 80),
+            _spawn(ALLOW, 80),
             _write(ALLOW, 60),
             _net_read(ALLOW, 55),
             _net_write(ASK),
@@ -65,9 +71,11 @@ def autonomous() -> RuleSet:
             _external_publish(ASK),
             _computer(ASK),
             _financial(ASK),
+            _delegate_spawn(ASK),
             _read(ALLOW, 50),
             _write(ALLOW, 90),
             _execute(ALLOW, 85),
+            _spawn(ALLOW, 85),
             _net_read(ALLOW, 70),
             # RealityGate can verify local project state, but it cannot
             # shadow or compensate an arbitrary remote mutation. Keep the
@@ -88,10 +96,12 @@ def offline() -> RuleSet:
             _secret_read(DENY),
             _package(DENY),
             _privileged(DENY),
+            _delegate_spawn(ASK),
             _write(ASK),
             _delete(ASK),
             _local_inference(ALLOW, 80),
             _execute(ALLOW, 70),
+            _spawn(ALLOW, 70),
             _read(ALLOW, 60),
         ),
         default=DENY,
@@ -106,12 +116,28 @@ _BUILDERS = {
 }
 
 
+_RULESET_CACHE: dict[AutonomyLevel, RuleSet] = {}
+
+
 def profile_ruleset(level: AutonomyLevel | str) -> RuleSet:
+    """Return the profile's RuleSet.
+
+    RuleSets are immutable and the profile builders are pure, so the compiled
+    set is shared per level. This is a pure accelerator: the rule CONTENT is
+    unchanged and the builders remain the sole authority — a code change to a
+    builder produces a different RuleSet the next time this process builds
+    it, and tests that need isolation can clear ``_RULESET_CACHE``.
+    """
     key = level if isinstance(level, AutonomyLevel) else AutonomyLevel(level)
+    cached = _RULESET_CACHE.get(key)
+    if cached is not None:
+        return cached
     builder = _BUILDERS.get(key)
     if builder is None:
         raise KeyError(f"unknown autonomy profile: {key}")
-    return builder()
+    ruleset = builder()
+    _RULESET_CACHE[key] = ruleset
+    return ruleset
 
 
 def available_profiles() -> tuple[AutonomyLevel, ...]:
@@ -145,6 +171,23 @@ def _delete(verdict: str, priority: int = 50) -> Rule:
 
 def _execute(verdict: str, priority: int = 50) -> Rule:
     return Rule(verdict, effect=EffectClass.EXECUTE, priority=priority, reason="execute")
+
+
+def _spawn(verdict: str, priority: int = 50) -> Rule:
+    return Rule(
+        verdict, effect=EffectClass.SPAWN_PROCESS, priority=priority, reason="spawn process"
+    )
+
+
+def _delegate_spawn(verdict: str) -> Rule:
+    """Approval floor on delegating model-backed child work."""
+    return Rule(
+        verdict,
+        capability_id="delegate",
+        effect=EffectClass.SPAWN_PROCESS,
+        priority=90,
+        reason="delegate spawn",
+    )
 
 
 def _secret_read(verdict: str) -> Rule:

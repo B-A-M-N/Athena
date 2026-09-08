@@ -11,14 +11,17 @@ wants a whole response.
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import math
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
+from athena.models.media import image_data_path
 from athena.protocol.errors import (
     ContextOverflow,
     ModelUnavailable,
@@ -64,7 +67,30 @@ _ROLE_MAP: dict[Role, str] = {
     Role.ASSISTANT: "assistant",
     Role.CAPABILITY: "tool",
     Role.SYSTEM: "system",
+    # Chat-completions has no compression role.  Preserve the semantic
+    # distinction explicitly at this adapter boundary instead of letting the
+    # generic fallback silently turn a digest into ordinary user input.
+    Role.COMPRESSION: "user",
 }
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_local_host(host: str) -> bool:
+    if _is_loopback_host(host):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private or address.is_link_local
 
 
 def _reported_cost_usd(raw: Any) -> float | None:
@@ -197,16 +223,24 @@ class OpenAICompatProvider:
         model: str = "gpt-4o-mini",
         provider: str = "openai-compat",
         privacy_class: PrivacyClass = PrivacyClass.REMOTE,
+        authentication: str | None = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = 60.0,
         http2: bool = False,
         cost: CostInfo | Mapping[str, object] | None = None,
         latency_class: str | None = None,
+        vision: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.provider = provider
         self._privacy_class = privacy_class
+        self._api_key_configured = bool(api_key)
+        if authentication is not None:
+            authentication = authentication.strip().casefold()
+            if authentication not in {"none", "bearer", "required"}:
+                raise ValueError("authentication must be one of: none, bearer, required")
+        self._authentication = authentication
         if isinstance(cost, Mapping):
             cost = CostInfo(
                 per_1m_input=_optional_float(cost.get("per_1m_input")),
@@ -217,6 +251,7 @@ class OpenAICompatProvider:
             )
         self._cost = cost
         self._latency_class = latency_class
+        self._vision = bool(vision)
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             http2=http2,
@@ -233,11 +268,35 @@ class OpenAICompatProvider:
                 provider=self.provider,
                 streaming=True,
                 tool_calling=True,
+                vision=self._vision,
                 privacy_class=self._privacy_class,
                 cost=self._cost,
                 latency_class=self._latency_class,
             )
         ]
+
+    def readiness(self) -> dict[str, str | bool]:
+        host = (urlsplit(self.base_url).hostname or "").lower()
+        local = _is_local_host(host)
+        authentication = self._authentication
+        if authentication is None:
+            # Loopback is the only automatic no-credential default. Private
+            # and link-local topology is reported as local but still requires
+            # explicit authentication policy or a bearer credential.
+            authentication = "none" if _is_loopback_host(host) else "required"
+        if authentication != "none" and not self._api_key_configured:
+            return {
+                "state": "auth_missing",
+                "kind": "openai-compatible",
+                "local": local,
+                "authentication": authentication,
+            }
+        return {
+            "state": "ready",
+            "kind": "openai-compatible",
+            "local": local,
+            "authentication": authentication,
+        }
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         payload = self._build_request(request)
@@ -310,11 +369,16 @@ class OpenAICompatProvider:
         return payload
 
     def _translate_message(self, msg: Message) -> list[dict[str, Any]] | dict[str, Any]:
+        if msg.role is Role.COMPRESSION:
+            return {
+                "role": "user",
+                "content": "[Athena compressed context]\n" + msg.conversation_text(),
+            }
         role = _ROLE_MAP.get(msg.role, "user")
         if role == "tool":
             results = [b for b in msg.blocks if isinstance(b, CapabilityResultBlock)]
             if results:
-                return [
+                translated: list[dict[str, Any]] = [
                     {
                         "role": "tool",
                         "content": serialize_tool_result(b.output if b.output else b.error),
@@ -322,9 +386,29 @@ class OpenAICompatProvider:
                     }
                     for b in results
                 ]
-            return {"role": "tool", "content": msg.text()}
+                for block in msg.blocks:
+                    if not isinstance(block, ArtifactRefBlock):
+                        continue
+                    image_url = image_data_path(block)
+                    if image_url is None:
+                        continue
+                    translated.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Visual observation from the capability:"},
+                                {"type": "image_url", "image_url": {"url": image_url}},
+                            ],
+                        }
+                    )
+                return translated
+            return {"role": "tool", "content": msg.conversation_text()}
+        replay_reasoning = bool(msg.metadata.get("replay_reasoning", False))
         text = "\n".join(
-            b.text for b in msg.blocks if isinstance(b, (TextBlock, ReasoningBlock)) and b.text
+            b.text
+            for b in msg.blocks
+            if (isinstance(b, TextBlock) or (replay_reasoning and isinstance(b, ReasoningBlock)))
+            and b.text
         )
         content_parts: list[dict[str, Any]] = []
         if text:
@@ -352,6 +436,15 @@ class OpenAICompatProvider:
                 # The generic chat-completions protocol has no portable
                 # artifact part. Preserve the reference as an explicit file
                 # part rather than silently dropping the attachment.
+                image_url = image_data_path(block)
+                if image_url is not None:
+                    content_parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        }
+                    )
+                    continue
                 content_parts.append(
                     {
                         "type": "text",

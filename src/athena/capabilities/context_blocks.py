@@ -95,13 +95,13 @@ class ContextBlocksCapability:
                     content=str(args.get("content") or ""),
                     scope=str(args.get("scope") or scope),
                     scope_id=str(args.get("scope_id") or scope_id),
-                    trust=_trust_for_request(request),
+                    trust=_trust_for_request(request, context),
                     max_tokens=int(args.get("max_tokens") or 2_500),
                     attached=bool(args.get("attached", True)),
                     provenance=prov(
                         SourceType.TASK,
                         source_id=request.task_id,
-                        trust=_trust_for_request(request),
+                        trust=_trust_for_request(request, context),
                         scope=str(args.get("scope") or scope),
                     ),
                     metadata=args.get("metadata") or {},
@@ -170,7 +170,10 @@ def _owner(request: CapabilityRequest, context: Any, args: dict[str, Any]):
         expected["session"] = request.session_id
     if workspace is not None:
         expected["project"] = str(workspace.id)
-    expected.update({"user": "athena", "global": "global"})
+    principal_id = getattr(context, "principal_id", None)
+    if principal_id:
+        expected["user"] = str(principal_id)
+    expected["global"] = "global"
     if scope in expected:
         requested_id = args.get("scope_id")
         if requested_id is not None and str(requested_id) != expected[scope]:
@@ -188,15 +191,21 @@ def _visible_scopes(request: CapabilityRequest, context: Any):
         scopes.append(("session", request.session_id))
     if workspace is not None:
         scopes.append(("project", str(workspace.id)))
-    scopes.extend([("user", "athena"), ("global", "global")])
+    principal_id = getattr(context, "principal_id", None)
+    if principal_id:
+        scopes.append(("user", str(principal_id)))
+    scopes.append(("global", "global"))
     return scopes
 
 
-def _trust_for_request(request: CapabilityRequest) -> TrustClass:
+def _trust_for_request(request: CapabilityRequest, context: Any = None) -> TrustClass:
     # Model-created blocks remain agent-curated; explicit user/system blocks
     # retain their stronger provenance without allowing arbitrary trust input.
-    if getattr(request.origin, "value", request.origin) in {"user_direct", "system"}:
+    origin = getattr(request.origin, "value", request.origin)
+    if origin == "user_direct":
         return TrustClass.USER_CONTENT
+    if origin in {"system", "system_verification"}:
+        return TrustClass.AUTHORITY
     return TrustClass.AGENT_CURATED
 
 

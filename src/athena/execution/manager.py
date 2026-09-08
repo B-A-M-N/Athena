@@ -20,9 +20,10 @@ import asyncio
 import inspect
 import logging
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, AsyncIterator, Mapping, cast
 
+from athena.execution.async_call import run_blocking
 from athena.execution.backend import ExecutionBackend
 from athena.protocol.execution import (
     ExecutionEvent,
@@ -37,6 +38,24 @@ from athena.protocol.ids import new_id
 _DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 
 _logger = logging.getLogger("athena.execution")
+
+
+@dataclass(frozen=True)
+class RuntimeCancellationResult:
+    """Durable evidence returned by :meth:`ExecutionManager.cancel_task`."""
+
+    task_id: str
+    closed_sessions: tuple[str, ...] = ()
+    remaining_sessions: tuple[str, ...] = ()
+    pending_runtime_cancellations: tuple[str, ...] = ()
+    # P1-11: sessions whose process tree survived the close escalation
+    # ladder (SIGTERM → SIGKILL → reap) without observed exit. Shutdown
+    # evidence, not a silent best-effort miss.
+    unproven_process_kills: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def confirmed(self) -> bool:
+        return not self.remaining_sessions and not self.pending_runtime_cancellations
 
 
 class Sink:
@@ -62,6 +81,9 @@ class ExecutionManager:
         ] = {}  # execution_id -> (runtime/backend, session)
         self._task_sessions: dict[str, list[tuple[Any, str]]] = {}
         self._runtime_by_session: dict[str, Any] = {}
+        self._pending_session_persistence: dict[str, tuple[str, Any]] = {}
+        self._pending_runtime_cancellations: dict[str, list[Any]] = {}
+        self._confirmed_runtime_cancellations: dict[str, set[int]] = {}
         self._rt_sessions = runtime_session_store
         self._exec_store = execution_store
         self._event_sink = event_sink
@@ -166,6 +188,14 @@ class ExecutionManager:
     def has_runtime(self, name: str) -> bool:
         return name in self._runtimes
 
+    def has_live_runtime(self, task_id: str) -> bool:
+        """Return whether this task currently owns an execution/session."""
+        if self._task_sessions.get(task_id):
+            return True
+        return any(owner == task_id for owner in self._executions.values()) or bool(
+            self._pending_runtime_cancellations.get(task_id)
+        )
+
     async def create_session(
         self,
         *,
@@ -189,7 +219,26 @@ class ExecutionManager:
             )
             self._task_sessions.setdefault(task_id, []).append((selected_backend, sid))
             self._runtime_by_session[sid] = selected_backend
-            await self._persist_session_start(sid, task_id, backend, cwd=cwd)
+            identity: dict[str, Any] = {}
+            describe = getattr(selected_backend, "describe_session", None)
+            if callable(describe):
+                try:
+                    identity = dict(await describe(sid))
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    _logger.warning("failed to describe runtime session %s: %s", sid, exc)
+            await self._persist_session_start(
+                sid,
+                task_id,
+                backend=backend,
+                runtime=runtime,
+                cwd=cwd,
+                metadata={
+                    "workspace_root": workspace_root,
+                    "network_policy": network_policy,
+                    "env": dict(env or {}),
+                    **identity,
+                },
+            )
             return sid
         rt = self._resolve(runtime)
         kwargs: dict[str, Any] = {"task_id": task_id}
@@ -213,8 +262,47 @@ class ExecutionManager:
             sid = cast(str, rt.create_session(**kwargs))
         self._task_sessions.setdefault(task_id, []).append((rt, sid))
         self._runtime_by_session[sid] = rt
-        await self._persist_session_start(sid, task_id, runtime, cwd=cwd)
+        await self._persist_session_start(
+            sid,
+            task_id,
+            backend=backend,
+            runtime=runtime,
+            cwd=cwd,
+            metadata={
+                "workspace_root": workspace_root,
+                "network_policy": network_policy,
+                "env": dict(env or {}),
+            },
+        )
         return sid
+
+    async def reattach_session(self, record: Mapping[str, Any]) -> bool:
+        """Reattach one persisted backend session after identity proof.
+
+        Local runtimes deliberately return ``False``: their worker processes
+        are service-lifetime resources until a durable supervisor exists.
+        Backend-specific implementations may opt in, but the returned session
+        id must exactly match durable state before ownership is rebuilt.
+        """
+        backend_name = str(record.get("backend") or "")
+        backend = self._backends.get(backend_name)
+        if backend is None or not bool(getattr(backend, "supports_reattach", False)):
+            return False
+        reattach = getattr(backend, "reattach_session", None)
+        if not callable(reattach):
+            return False
+        session_id = str(record.get("id") or "")
+        task_id = str(record.get("task_id") or "")
+        attached_id = await reattach(record)
+        if str(attached_id) != session_id:
+            raise RuntimeError(
+                f"backend {backend_name!r} returned unexpected runtime session id {attached_id!r}"
+            )
+        self._runtime_by_session[session_id] = backend
+        rooms = self._task_sessions.setdefault(task_id, [])
+        if not any(sid == session_id for _runtime, sid in rooms):
+            rooms.append((backend, session_id))
+        return True
 
     async def execute(
         self,
@@ -342,7 +430,13 @@ class ExecutionManager:
                     execution_metadata.update(dict(meta))
                 if meta.get("runtime_session_id"):
                     await self._adopt_runtime_session(
-                        rt, meta["runtime_session_id"], request.task_id
+                        rt,
+                        meta["runtime_session_id"],
+                        request.task_id,
+                        backend=request.backend,
+                        runtime=request.runtime,
+                        cwd=request.cwd,
+                        metadata=meta,
                     )
                     self._exec_runtimes[execution_id] = (rt, meta["runtime_session_id"])
                     if not persisted:
@@ -373,7 +467,15 @@ class ExecutionManager:
             if adopted:
                 rt, sid = adopted
                 if sid:
-                    await self._adopt_runtime_session(rt, sid, request.task_id)
+                    await self._adopt_runtime_session(
+                        rt,
+                        sid,
+                        request.task_id,
+                        backend=request.backend,
+                        runtime=request.runtime,
+                        cwd=request.cwd,
+                        metadata=execution_metadata,
+                    )
         finally:
             self._executions.pop(execution_id, None)
             self._exec_runtimes.pop(execution_id, None)
@@ -411,7 +513,15 @@ class ExecutionManager:
             )
 
     async def _adopt_runtime_session(
-        self, rt: Runtime, runtime_session_id: str, task_id: str
+        self,
+        rt: Runtime,
+        runtime_session_id: str,
+        task_id: str,
+        *,
+        backend: str,
+        runtime: str,
+        cwd: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         if runtime_session_id in self._runtime_by_session:
             return
@@ -422,7 +532,10 @@ class ExecutionManager:
         await self._persist_session_start(
             runtime_session_id,
             task_id,
-            getattr(rt, "name", None),
+            backend=backend,
+            runtime=runtime,
+            cwd=cwd,
+            metadata=dict(metadata or {}),
         )
 
     async def interrupt(self, execution_id: str) -> None:
@@ -444,34 +557,51 @@ class ExecutionManager:
         such as the debugger that own a long-lived auxiliary session but must
         not tear down the rest of the task's execution surface.
         """
-        rt = self._runtime_by_session.pop(runtime_session_id, None)
+        pending_persistence = self._pending_session_persistence.get(runtime_session_id)
+        rt = self._runtime_by_session.get(runtime_session_id)
+        owner_task_id: str | None = pending_persistence[0] if pending_persistence else None
+        if rt is None and pending_persistence is not None:
+            rt = pending_persistence[1]
         if rt is None:
-            for sessions in self._task_sessions.values():
+            for task_id, sessions in self._task_sessions.items():
                 for candidate, sid in sessions:
                     if sid == runtime_session_id:
                         rt = candidate
+                        owner_task_id = task_id
                         break
                 if rt is not None:
                     break
-        for task_id, sessions in list(self._task_sessions.items()):
-            self._task_sessions[task_id] = [
-                (candidate, sid) for candidate, sid in sessions if sid != runtime_session_id
-            ]
-            if not self._task_sessions[task_id]:
-                self._task_sessions.pop(task_id, None)
         if rt is None:
             return
         close = getattr(rt, "close", None) or getattr(rt, "destroy_session", None)
-        if close is not None:
+        if pending_persistence is None and close is not None:
             if asyncio.iscoroutinefunction(close):
                 await close(runtime_session_id)
             else:
                 close(runtime_session_id)
         await self._persist_session_closed(runtime_session_id)
+        self._runtime_by_session.pop(runtime_session_id, None)
+        for task_id, sessions in list(self._task_sessions.items()):
+            remaining = [
+                (candidate, sid) for candidate, sid in sessions if sid != runtime_session_id
+            ]
+            if remaining:
+                self._task_sessions[task_id] = remaining
+            else:
+                self._task_sessions.pop(task_id, None)
+        if owner_task_id is not None:
+            self._pending_session_persistence.pop(runtime_session_id, None)
+            if not self._task_sessions.get(
+                owner_task_id
+            ) and not self._pending_runtime_cancellations.get(owner_task_id):
+                self._confirmed_runtime_cancellations.pop(owner_task_id, None)
 
-    async def cancel_task(self, task_id: str) -> None:
-        """Interrupt/close every runtime session owned by a task (tree cancel)."""
-        loop = asyncio.get_running_loop()
+    async def cancel_task(self, task_id: str) -> RuntimeCancellationResult:
+        """Interrupt/close every runtime session owned by a task (tree cancel).
+
+        Runtime failures are returned to the task cancellation authority. A
+        caller must not convert a failed close into a durable CANCELLED state.
+        """
         rooms = list(self._task_sessions.get(task_id, []))
         # Enumerate sessions across ALL executions of this task, including
         # ones the runtimes adopted implicitly during execute() (BHV-061/062).
@@ -482,34 +612,149 @@ class ExecutionManager:
             if sid and (id(rt), sid) not in seen:
                 rooms.append((rt, sid))
                 seen.add((id(rt), sid))
-        self._task_sessions.pop(task_id, None)
+        owned_runtimes: list[Any] = []
+        owned_runtime_ids: set[int] = set()
+        for rt, _sid in rooms:
+            if id(rt) not in owned_runtime_ids:
+                owned_runtime_ids.add(id(rt))
+                owned_runtimes.append(rt)
+        for rt in self._pending_runtime_cancellations.get(task_id, []):
+            if id(rt) not in owned_runtime_ids:
+                owned_runtime_ids.add(id(rt))
+                owned_runtimes.append(rt)
+        remaining: list[tuple[Any, str]] = []
+        errors: list[BaseException] = []
+        closed_sessions: list[str] = []
+        unproven_kills: list[dict[str, Any]] = []
+        for rt, sid in rooms:
+            close = getattr(rt, "close", None) or getattr(rt, "destroy_session", None)
+            try:
+                if sid in self._pending_session_persistence:
+                    await self._persist_session_closed(sid)
+                    self._pending_session_persistence.pop(sid, None)
+                else:
+                    if close is not None:
+                        # P1-11: capture the kill outcome before/after close so
+                        # a process tree that could not be proven dead is
+                        # structured shutdown evidence, not a log line.
+                        session = getattr(rt, "_sessions", {}).get(sid)
+                        process_before = getattr(session, "process", None)
+                        if asyncio.iscoroutinefunction(close):
+                            await close(sid)
+                        else:
+                            await run_blocking(close, sid)
+                        if (
+                            process_before is not None
+                            and getattr(process_before, "poll", None) is not None
+                            and process_before.poll() is None
+                        ):
+                            unproven_kills.append(
+                                {"session_id": sid, "pid": getattr(process_before, "pid", None)}
+                            )
+                    try:
+                        await self._persist_session_closed(sid)
+                    except Exception:
+                        # The runtime is already closed; retain only the
+                        # persistence obligation so a retry never reopens or
+                        # redundantly closes a successful session.
+                        self._pending_session_persistence[sid] = (task_id, rt)
+                        raise
+            except Exception as exc:
+                remaining.append((rt, sid))
+                errors.append(exc)
+                continue
+            self._runtime_by_session.pop(sid, None)
+            closed_sessions.append(sid)
+        if remaining:
+            self._task_sessions[task_id] = remaining
+        else:
+            self._task_sessions.pop(task_id, None)
 
-        async def _close_all() -> None:
-            for rt, sid in rooms:
-                self._runtime_by_session.pop(sid, None)
-                close = getattr(rt, "close", None) or getattr(rt, "destroy_session", None)
-                if close is not None:
-                    if asyncio.iscoroutinefunction(close):
-                        await close(sid)
-                    else:
-                        await loop.run_in_executor(None, close, sid)
-                await self._persist_session_closed(sid)
-
-        await _close_all()
-        for rt in set(self._runtimes.values()):
+        pending_runtime_ids: set[int] = set()
+        for rt in owned_runtimes:
             cancel = getattr(rt, "cancel_task", None)
-            if cancel is not None:
+            if cancel is not None and id(rt) not in self._confirmed_runtime_cancellations.get(
+                task_id, set()
+            ):
                 try:
                     if asyncio.iscoroutinefunction(cancel):
                         await cancel(task_id)
                     else:
-                        await loop.run_in_executor(None, cancel, task_id)
-                except Exception:
-                    pass
+                        await run_blocking(cancel, task_id)
+                    self._confirmed_runtime_cancellations.setdefault(task_id, set()).add(id(rt))
+                except Exception as exc:
+                    errors.append(exc)
+                    pending_runtime_ids.add(id(rt))
+        if pending_runtime_ids:
+            self._pending_runtime_cancellations[task_id] = [
+                rt for rt in owned_runtimes if id(rt) in pending_runtime_ids
+            ]
+        else:
+            self._pending_runtime_cancellations.pop(task_id, None)
+        if errors:
+            raise RuntimeError(
+                f"runtime cancellation failed for task {task_id}: "
+                + "; ".join(str(error) for error in errors)
+            ) from errors[0]
+        self._confirmed_runtime_cancellations.pop(task_id, None)
+        if unproven_kills:
+            for entry in unproven_kills:
+                _logger.warning(
+                    "process tree for session %s (pid %s) could not be proven dead after close",
+                    entry["session_id"],
+                    entry["pid"],
+                )
+        return RuntimeCancellationResult(
+            task_id=task_id,
+            closed_sessions=tuple(closed_sessions),
+            remaining_sessions=tuple(sid for _rt, sid in remaining),
+            pending_runtime_cancellations=tuple(
+                type(rt).__name__ for rt in self._pending_runtime_cancellations.get(task_id, [])
+            ),
+            unproven_process_kills=tuple(unproven_kills),
+        )
 
-    async def close_all(self) -> None:
-        for task_id in list(self._task_sessions):
-            await self.cancel_task(task_id)
+    async def close_all(self) -> dict[str, Any]:
+        """Shut down every execution resource this manager owns.
+
+        Sole cleanup owner (P0-2): tasks' sessions, pending runtime
+        cancellations, every registered runtime's sessions, and every
+        non-local backend. Returns a structured outcome so shutdown knows
+        when a process tree could not be proven dead instead of the failure
+        hiding in a log line.
+        """
+        outcome: dict[str, Any] = {
+            "tasks_cancelled": 0,
+            "sessions_remaining": [],
+            "runtime_failures": [],
+            "backend_failures": [],
+            "unproven_process_kills": [],
+        }
+        for task_id in set(self._task_sessions) | set(self._pending_runtime_cancellations):
+            try:
+                result = await self.cancel_task(task_id)
+                outcome["tasks_cancelled"] += 1
+                if result.unproven_process_kills:
+                    outcome["unproven_process_kills"].extend(
+                        {"task_id": task_id, **kill} for kill in result.unproven_process_kills
+                    )
+            except Exception as exc:
+                outcome["runtime_failures"].append({"task_id": task_id, "error": str(exc)})
+                _logger.warning("task %s runtime cancellation failed: %s", task_id, exc)
+        for runtime in set(self._runtimes.values()):
+            close_all = getattr(runtime, "close_all", None)
+            if close_all is None:
+                continue
+            try:
+                if asyncio.iscoroutinefunction(close_all):
+                    await close_all()
+                else:
+                    close_all()
+            except Exception as exc:
+                outcome["runtime_failures"].append(
+                    {"runtime": type(runtime).__name__, "error": str(exc)}
+                )
+                _logger.warning("runtime %s close_all failed: %s", type(runtime).__name__, exc)
         for backend in list(self._backends.values()):
             shutdown = getattr(backend, "shutdown", None)
             if shutdown is None:
@@ -520,9 +765,21 @@ class ExecutionManager:
                 else:
                     shutdown()
             except Exception as exc:
+                outcome["backend_failures"].append(
+                    {"backend": getattr(backend, "name", "?"), "error": str(exc)}
+                )
                 _logger.warning(
                     "backend %s shutdown failed: %s", getattr(backend, "name", "?"), exc
                 )
+        outcome["sessions_remaining"] = sorted(
+            {sid for sessions in self._task_sessions.values() for _rt, sid in sessions}
+        )
+        return outcome
+
+    def live_resource_count(self) -> int:
+        """Count execution resources that must be zero after close_all (P0-2)."""
+        live_sessions = sum(len(sessions) for sessions in self._task_sessions.values())
+        return live_sessions + len(self._pending_runtime_cancellations) + len(self._exec_runtimes)
 
     async def _emit_event(self, event_type: str, payload: dict, task_id: str | None = None) -> None:
         """Emit an execution event to the event sink if one is configured."""
@@ -622,7 +879,14 @@ class ExecutionManager:
     # Persistence (P0-22): runtime_sessions + executions behind the stores.
     # ------------------------------------------------------------------ #
     async def _persist_session_start(
-        self, session_id: str, task_id: str, runtime: str | None, cwd: str | None = None
+        self,
+        session_id: str,
+        task_id: str,
+        *,
+        backend: str,
+        runtime: str,
+        cwd: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         store = self._rt_sessions
         if store is None:
@@ -631,9 +895,10 @@ class ExecutionManager:
             await store.start(
                 session_id,
                 task_id=task_id,
-                backend=runtime or "unknown",
+                backend=backend,
                 runtime=runtime,
                 cwd=cwd,
+                metadata=dict(metadata or {}),
             )
         except Exception as exc:
             _logger.warning("failed to persist session start %s: %s", session_id, exc)
@@ -642,10 +907,7 @@ class ExecutionManager:
         store = self._rt_sessions
         if store is None:
             return
-        try:
-            await store.mark_closed(session_id)
-        except Exception as exc:
-            _logger.warning("failed to persist session close %s: %s", session_id, exc)
+        await store.mark_closed(session_id)
 
     async def _update_execution_runtime_session(
         self, execution_id: str, runtime_session_id: str

@@ -81,7 +81,7 @@ class _CommandVerifier:
                 task_id=task.id,
                 session_id=task.session_id,
                 call_id=f"verify_{task.id}_{id(spec)}",
-                origin=CapabilityRequestOrigin.SYSTEM,
+                origin=CapabilityRequestOrigin.SYSTEM_VERIFICATION,
             )
             result = await self._dispatcher.dispatch(
                 request,

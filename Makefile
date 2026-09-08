@@ -1,4 +1,4 @@
-.PHONY: format format-check lint typecheck compile test check scenarios arch-lint native-check native-test native-smoke release-check
+.PHONY: format format-check lint typecheck compile test check scenarios arch-lint native-check native-test native-smoke native-package release-check
 
 UV ?= uv
 RUFF := $(UV) run ruff
@@ -44,6 +44,9 @@ native-check:
 
 native-test:
 	cargo test --manifest-path native/Cargo.toml --offline
+
+native-package:
+	scripts/build-native-package
 
 native-smoke:
 	scripts/native-smoke

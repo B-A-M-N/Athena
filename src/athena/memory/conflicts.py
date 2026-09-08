@@ -25,6 +25,12 @@ def _signature(record: MemoryRecord) -> frozenset[str]:
     return frozenset(tokens)
 
 
+def _subject(record: MemoryRecord) -> str | None:
+    value = record.subject or record.metadata.get("subject")
+    normalized = " ".join(_tokens(str(value))) if value else ""
+    return normalized or None
+
+
 def _scope_id(record: MemoryRecord) -> str | None:
     if "scope_id" in record.metadata:
         return str(record.metadata["scope_id"])
@@ -94,11 +100,17 @@ class MemoryConflictResolver:
                 continue
             if old.scope is not record.scope:
                 continue
-            if scope_id and _scope_id(old) != scope_id:
+            old_scope_id = _scope_id(old)
+            if scope_id != old_scope_id and (scope_id is not None or old_scope_id is not None):
                 continue
             old_key = _signature(old)
             overlap = len(new_key & old_key)
-            if overlap < max(2, len(new_key) // 2) and overlap < max(2, len(old_key) // 2):
+            same_subject = _subject(record) is not None and _subject(record) == _subject(old)
+            if (
+                not same_subject
+                and overlap < max(2, len(new_key) // 2)
+                and overlap < max(2, len(old_key) // 2)
+            ):
                 continue
             conflicts.append(old)
         reason = "conflicting semantic memories in same scope" if conflicts else None

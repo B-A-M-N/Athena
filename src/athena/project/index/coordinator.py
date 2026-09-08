@@ -7,6 +7,7 @@ import os
 from collections.abc import Iterable
 from typing import Any
 
+from athena.execution.async_call import run_blocking
 from athena.project.index.builder import ProjectIndexBuilder
 from athena.project.index.models import ProjectIndex
 from athena.project.index.store import ProjectIndexStore
@@ -101,18 +102,11 @@ class ProjectIndexCoordinator:
                     ):
                         self._cache[canonical] = persisted
                         return persisted
-            loop = asyncio.get_running_loop()
             incremental = getattr(self._builder, "incremental", None)
             if refresh and changed and previous is not None and callable(incremental):
-                index = await loop.run_in_executor(
-                    None,
-                    incremental,
-                    canonical,
-                    previous,
-                    changed,
-                )
+                index = await run_blocking(incremental, canonical, previous, changed)
             else:
-                index = await loop.run_in_executor(None, self._builder.build, canonical)
+                index = await run_blocking(self._builder.build, canonical)
             if self._store is not None:
                 await self._store.save(index)
             self._cache[canonical] = index
@@ -127,9 +121,8 @@ class ProjectIndexCoordinator:
         revision = getattr(self._builder, "source_revision", None)
         if revision is None:
             return False
-        loop = asyncio.get_running_loop()
         try:
-            current = await loop.run_in_executor(None, revision, root)
+            current = await run_blocking(revision, root)
         except (OSError, RuntimeError, ValueError):
             return False
         return str(current) == expected

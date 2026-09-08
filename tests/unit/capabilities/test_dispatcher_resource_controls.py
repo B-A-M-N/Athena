@@ -65,6 +65,10 @@ def _workspace(tmp_path) -> WorkspaceSpec:
 
 
 async def test_dispatch_many_caps_execution_concurrency(tmp_path):
+    """Opaque execute/process calls are ordering-sensitive: they serialize
+    through the batch order lane so that a write→execute or execute→read
+    batch cannot race on ambient workspace state.  The execution semaphore
+    still bounds concurrency for calls that opt into independence."""
     executor = _SlowExecutor(
         CapabilityDescriptor(
             id="slow-execute",
@@ -85,8 +89,38 @@ async def test_dispatch_many_caps_execution_concurrency(tmp_path):
     )
 
     assert [result.status for result in results] == [CapabilityResultStatus.OK] * 6
-    assert executor.max_active == 2
+    # Opaque execute calls serialize through the batch order lane — the
+    # execution semaphore never sees more than one at a time because the
+    # batch_order_lock is acquired first.
+    assert executor.max_active == 1
     assert executor.seen_budgets == [budget] * 6
+
+
+async def test_dispatch_many_parallel_reads_unbounded(tmp_path):
+    """Non-ordering-sensitive pure reads run fully parallel in asyncio.gather."""
+    executor = _SlowExecutor(
+        CapabilityDescriptor(
+            id="slow-read",
+            description="test read capability",
+            input_schema={"type": "object", "additionalProperties": True},
+            effects=frozenset({EffectClass.READ_LOCAL}),
+        )
+    )
+    registry = CapabilityRegistry()
+    registry.register(executor)
+    dispatcher = CapabilityDispatcher(registry, PolicyEngine("autonomous"))
+    budget = ResourceBudget(max_parallel_executions=4)
+
+    results = await dispatcher.dispatch_many(
+        [_request("slow-read", f"call-{i}") for i in range(8)],
+        workspace=_workspace(tmp_path),
+        task_budget=budget,
+    )
+
+    assert [result.status for result in results] == [CapabilityResultStatus.OK] * 8
+    # Pure reads are not ordering-sensitive and not execution-bounded,
+    # so all 8 run concurrently.
+    assert executor.max_active == 8
 
 
 async def test_dispatch_many_serializes_conflicting_paths_but_allows_independent_paths(

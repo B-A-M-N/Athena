@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -86,3 +88,31 @@ def test_list_honors_excluded_family(tmp_path, monkeypatch, capsys):
 
     assert runner.main(["--list", "--exclude-family", "VHS"]) == 0
     assert "VHS-001" not in capsys.readouterr().out
+
+
+def test_artifact_identity_binds_manifest_and_artifact_hashes(tmp_path, monkeypatch):
+    runner = _runner_module()
+    artifact_root = tmp_path / "release-artifacts"
+    artifact_root.mkdir()
+    payload = b"exact-release-artifact"
+    artifact = artifact_root / "distributions" / "athena.whl"
+    artifact.parent.mkdir()
+    artifact.write_bytes(payload)
+    manifest = {
+        "source_sha": "frozen-sha",
+        "artifacts": [
+            {"path": "distributions/athena.whl", "sha256": hashlib.sha256(payload).hexdigest()}
+        ],
+    }
+    manifest_bytes = json.dumps(manifest).encode("utf-8")
+    (artifact_root / "release-manifest.json").write_bytes(manifest_bytes)
+    monkeypatch.setenv("ATHENA_RELEASE_ARTIFACT_DIR", str(artifact_root))
+
+    identity = runner._artifact_identity()
+
+    assert identity["status"] == "available"
+    assert identity["source_sha"] == "frozen-sha"
+    assert identity["manifest_sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
+    assert identity["artifacts"] == [
+        {"path": "distributions/athena.whl", "sha256": hashlib.sha256(payload).hexdigest()}
+    ]

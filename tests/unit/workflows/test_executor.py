@@ -19,7 +19,13 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     DispatchDirectives,
 )
-from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
+from athena.protocol.tasks import (
+    CapabilityPolicy,
+    ModelPolicy,
+    ResourceBudget,
+    TaskSpec,
+    WorkspaceSpec,
+)
 from athena.workflows import Workflow, WorkflowExecutor, WorkflowStep
 from athena.workflows.runs import (
     WorkflowRunIdentityError,
@@ -914,12 +920,15 @@ async def test_nested_workflow_approval_wakes_parent_and_resumes_once(tmp_path):
 
 
 async def test_same_process_approval_replay_keeps_workflow_identity(tmp_path):
+    captured_kwargs = {}
+
     class _ReplayDispatcher:
         def __init__(self):
             self.directives = None
 
         async def dispatch_many(self, requests, **kwargs):
             self.directives = kwargs["_directives_by_call_id"]
+            captured_kwargs.update(kwargs)
             return [
                 CapabilityResult(
                     requests[0].call_id,
@@ -944,7 +953,17 @@ async def test_same_process_approval_replay_keeps_workflow_identity(tmp_path):
         _workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
         _profile=None,
     )
-    task = SimpleNamespace(id="workflow-task", capability_policy=None)
+    # A protocol-faithful TaskSpec: replay must restore the same authority
+    # the original dispatch ran under, not a partial double.
+    task = TaskSpec(
+        id="workflow-task",
+        objective="run the approval-gated workflow",
+        session_id="session-1",
+        capability_policy=CapabilityPolicy(allow=("fs",)),
+        model_policy=ModelPolicy(role="primary", require_tools=True),
+        resource_budget=ResourceBudget(max_agent_iterations=9),
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
+    )
     state = SimpleNamespace(cancel=asyncio.Event())
     kernel = SimpleNamespace(
         _resume={task.id: asyncio.Event()},
@@ -979,6 +998,9 @@ async def test_same_process_approval_replay_keeps_workflow_identity(tmp_path):
     kernel._append_results = _append_results
     kernel._mark_continuations_consumed = _mark_continuations_consumed
     kernel._reconcile_workflow_suspended = _reconcile
+    # The production park (P1-17): resumes on the pre-granted decision's
+    # event, never reaching the slot-release deadline in this test.
+    kernel._park_wait = lambda task, state: AgentKernel._park_wait(kernel, task, state)
 
     directives = DispatchDirectives(
         workflow_run_id="run-1",
@@ -1013,6 +1035,13 @@ async def test_same_process_approval_replay_keeps_workflow_identity(tmp_path):
 
     assert replay.directives == {"workflow-call-1": directives}
     assert run_store.completed == [("workflow-call-1", "approved", ())]
+
+    # The SAME authority that dispatched the original call is restored for
+    # replay: model policy, capability policy, budget, and deadline.
+    assert captured_kwargs["model_policy"] is task.model_policy
+    assert captured_kwargs["task_policy"] is task.capability_policy
+    assert captured_kwargs["task_budget"] is task.resource_budget
+    assert captured_kwargs["task_deadline"] is task.deadline
 
 
 @pytest.mark.asyncio
@@ -1097,6 +1126,7 @@ async def test_workflow_approval_resolves_outer_call_after_child_result(tmp_path
             workspace_root=workspace_root,
         )
     )
+    kernel._park_wait = lambda task, state: AgentKernel._park_wait(kernel, task, state)
     kernel._resume_workflow_parent = lambda *args, **kwargs: AgentKernel._resume_workflow_parent(
         kernel,
         *args,
@@ -1179,11 +1209,12 @@ async def test_durable_workflow_approval_resume_reconstructs_outer_call(tmp_path
     class _Dispatcher:
         def __init__(self):
             self.outer = None
+            self.kwargs = None
 
         async def dispatch(self, request, **kwargs):
-            del kwargs
             if request.capability_id == "workflow":
                 self.outer = request
+                self.kwargs = kwargs
                 return CapabilityResult(
                     request.call_id,
                     request.capability_id,
@@ -1205,11 +1236,14 @@ async def test_durable_workflow_approval_resume_reconstructs_outer_call(tmp_path
         _workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
         _profile=None,
     )
-    task = SimpleNamespace(
+    task = TaskSpec(
         id="workflow-task",
+        objective="run the approval-gated workflow",
         session_id="session-1",
-        capability_policy=None,
-        resource_budget=None,
+        capability_policy=CapabilityPolicy(allow=("fs",)),
+        model_policy=ModelPolicy(role="primary", require_tools=True),
+        resource_budget=ResourceBudget(max_agent_iterations=9),
+        workspace=WorkspaceSpec(id="repo", root=str(tmp_path)),
     )
     appended = []
     kernel = SimpleNamespace(
@@ -1250,6 +1284,11 @@ async def test_durable_workflow_approval_resume_reconstructs_outer_call(tmp_path
         "workflow_id": "workflow-1",
         "run_id": "run-1",
     }
+    # Restart resume restores the same durable authority: the TaskSpec's
+    # model/capability policy and budget survive process loss.
+    assert dispatcher.kwargs["model_policy"] is task.model_policy
+    assert dispatcher.kwargs["task_policy"] is task.capability_policy
+    assert dispatcher.kwargs["task_budget"] is task.resource_budget
     assert [block.call_id for block in appended] == [
         "workflow-child-call",
         "workflow-outer-call",

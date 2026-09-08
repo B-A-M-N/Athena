@@ -30,6 +30,35 @@ class PrivacyClass(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
+class ModelQualityTier(str, enum.Enum):
+    """Declared capability tier of a model (P1-16).
+
+    Advisory routing metadata, not a verdict: providers declare where a
+    model sits on the reasoning/coding/tool-use capability ladder, and
+    routing uses the declaration to hold work-bearing turns to a floor.
+    ``UNDECLARED`` is its own tier — a model with no declaration is
+    never excluded by a floor it could not have known about; the floor
+    only binds declared models.
+    """
+
+    ECONOMY = "economy"  # cheap conversational / high-volume utility tier
+    STANDARD = "standard"  # ordinary work tier
+    FRONTIER = "frontier"  # strongest reasoning / coding / agentic tier
+    UNDECLARED = "undeclared"
+
+    @property
+    def rank(self) -> int:
+        return _TIER_RANK.get(self, -1)
+
+
+_TIER_RANK: dict[ModelQualityTier, int] = {
+    ModelQualityTier.UNDECLARED: 0,
+    ModelQualityTier.ECONOMY: 1,
+    ModelQualityTier.STANDARD: 2,
+    ModelQualityTier.FRONTIER: 3,
+}
+
+
 @dataclass(frozen=True)
 class CostInfo:
     per_1m_input: float | None = None
@@ -55,6 +84,16 @@ class ModelInfo:
     cost: CostInfo | None = None
     latency_class: str | None = None
     privacy_class: PrivacyClass = PrivacyClass.UNKNOWN
+    # Declared capability tier (P1-16). Advisory routing metadata; see
+    # ModelQualityTier. Accepts the bare string value for convenience.
+    quality_tier: ModelQualityTier = ModelQualityTier.UNDECLARED
+
+    def __post_init__(self) -> None:
+        if isinstance(self.quality_tier, str):
+            try:
+                object.__setattr__(self, "quality_tier", ModelQualityTier(self.quality_tier))
+            except ValueError:
+                object.__setattr__(self, "quality_tier", ModelQualityTier.UNDECLARED)
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,19 @@ class ConfigurationError(AthenaError):
     code = "configuration_error"
 
 
+class ServiceNotReady(ConfigurationError):
+    """The service is alive but cannot admit agent work yet."""
+
+    code = "service_not_ready"
+    http_status = 503
+
+
+class ModelProviderUnconfigured(ServiceNotReady):
+    """No model provider is configured for model-backed agent work."""
+
+    code = "model_provider_unconfigured"
+
+
 class TaskError(AthenaError):
     code = "task_error"
 
@@ -50,6 +63,17 @@ class TaskDeadlineExceeded(TaskError):
 
 class IllegalStateTransition(TaskError):
     code = "illegal_state_transition"
+
+
+class TaskOwnershipLost(TaskError):
+    """A worker's task lease was lost (expired, reclaimed, or cleared).
+
+    Raised by the storage layer when a lease-renewal CAS fails: the worker no
+    longer owns the task and MUST stop driving it immediately instead of
+    risking duplicate execution alongside the new owner.
+    """
+
+    code = "task_ownership_lost"
 
 
 class ProviderError(AthenaError):
@@ -96,6 +120,13 @@ class RequestCancelled(AthenaError):
     code = "request_cancelled"
 
 
+class CancellationUncertain(TaskError):
+    """Cancellation was requested but terminal cancellation is unproven."""
+
+    code = "cancellation_uncertain"
+    retryable = True
+
+
 class Cancelled(RequestCancelled):
     code = "cancelled"
 
@@ -106,6 +137,12 @@ class CapabilityError(AthenaError):
 
 class CapabilityUnavailable(CapabilityError):
     code = "capability_unavailable"
+
+
+class CapabilityReadinessError(CapabilityError):
+    """The requested task has no policy-permitted ready capability surface."""
+
+    code = "capability_readiness_error"
 
 
 class CapabilityValidationError(CapabilityError):
@@ -156,10 +193,13 @@ class RecoveryError(AthenaError):
 __all__ = [
     "AthenaError",
     "ConfigurationError",
+    "ServiceNotReady",
+    "ModelProviderUnconfigured",
     "TaskError",
     "TaskBudgetExceeded",
     "TaskDeadlineExceeded",
     "IllegalStateTransition",
+    "CancellationUncertain",
     "ProviderError",
     "ProviderAuthenticationError",
     "ProviderRateLimitError",
@@ -173,6 +213,7 @@ __all__ = [
     "Cancelled",
     "CapabilityError",
     "CapabilityUnavailable",
+    "CapabilityReadinessError",
     "CapabilityValidationError",
     "PolicyDenied",
     "ApprovalExpired",

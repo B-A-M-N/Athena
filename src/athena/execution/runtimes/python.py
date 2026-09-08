@@ -185,6 +185,10 @@ class _PythonSession:
                 try:
                     if self.process.stdin:
                         self.process.stdin.close()
+                    if self.process.stdout:
+                        self.process.stdout.close()
+                    if self.process.stderr:
+                        self.process.stderr.close()
                 except Exception:
                     pass
                 self.process = None

@@ -67,6 +67,7 @@ class EventCategory(str, enum.Enum):
     CANDIDATE_DISCARDED = "CandidateDiscarded"
     RUNTIME_SESSION_CREATED = "RuntimeSessionCreated"
     RUNTIME_STATE_LOST = "RuntimeStateLost"
+    RUNTIME_SCREEN_CHANGED = "RuntimeScreenChanged"
     EXECUTION_STARTED = "ExecutionStarted"
     STDOUT_CHUNK = "StdoutChunk"
     STDERR_CHUNK = "StderrChunk"

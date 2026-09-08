@@ -32,6 +32,9 @@ class _StaticProvider:
     async def complete(self, request):
         yield ModelEvent(type=ModelEventType.DELTA, request_id=request.request_id)
 
+    def readiness(self):
+        return {"state": "ready"}
+
 
 def _info(model_id: str, cost_usd: float) -> ModelInfo:
     return ModelInfo(

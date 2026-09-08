@@ -62,6 +62,7 @@ def test_container_command_is_read_only_and_network_fail_closed(tmp_path: Path, 
     command = calls[-1]
     assert container_id == "container-id"
     assert "--read-only" in command
+    assert "--interactive" in command
     assert "--network" in command
     assert command[command.index("--network") + 1] == "none"
     mount = command[command.index("--mount") + 1]
@@ -69,7 +70,9 @@ def test_container_command_is_read_only_and_network_fail_closed(tmp_path: Path, 
     assert "readonly" in mount
     assert command[command.index("--read-only") + 1] == "--tmpfs"
     assert command[command.index("--workdir") + 1] == "/workspace"
-    assert command[-4] == "python@sha256:" + "a" * 64
+    image = "python@sha256:" + "a" * 64
+    image_index = command.index(image)
+    assert command[image_index + 1 : image_index + 4] == ["python", "-u", "-c"]
     assert backend.environment_identity() == {
         "image": "python@sha256:" + "a" * 64,
         "image_digest": "sha256:" + "a" * 64,
@@ -87,6 +90,64 @@ def test_container_resolves_local_image_id_when_no_repository_digest(monkeypatch
 
     backend = ContainerBackend(runner=runner)
     assert backend._resolve_image() == ("sha256:" + "b" * 64, "sha256:" + "b" * 64)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_container_reattach_proves_identity_and_rejects_tampering(
+    tmp_path: Path, monkeypatch
+):
+    container_id = "container-proven"
+    digest = "sha256:" + "d" * 64
+    record = {
+        "id": "container-session",
+        "task_id": "task-reattach",
+        "backend": "container",
+        "runtime": "python",
+        "cwd": "/workspace",
+        "workspace_identity": str(tmp_path),
+        "network_policy": "deny",
+        "process_identity": container_id,
+        "start_identity": "2026-09-07T12:00:00.000000000Z",
+        "runtime_version": digest,
+        "metadata": {
+            "container_id": container_id,
+            "workspace_root": str(tmp_path),
+            "env": {"ATHENA_TEST": "1"},
+            "image_digest": digest,
+        },
+    }
+    inspected = {
+        "Id": container_id,
+        "Config": {
+            "Image": "python@" + digest,
+            "Labels": {
+                "athena.session_id": "container-session",
+                "athena.task_id": "task-reattach",
+                "athena.backend": "container",
+                "athena.runtime": "python",
+                "athena.workspace_identity": str(tmp_path),
+                "athena.network_policy": "deny",
+                "athena.image_digest": digest,
+            },
+        },
+        "State": {"Running": True, "StartedAt": record["start_identity"]},
+        "HostConfig": {"NetworkMode": "none"},
+        "Mounts": [
+            {"Destination": "/workspace", "Source": str(tmp_path), "RW": False},
+        ],
+    }
+    backend = ContainerBackend()
+    monkeypatch.setattr(backend, "_inspect_container", lambda _container_id: inspected)
+    monkeypatch.setattr(
+        "athena.execution.container._DockerPythonSession.start", lambda _session: None
+    )
+
+    assert await backend.reattach_session(record) == "container-session"
+    assert backend._sessions["container-session"].container_id == container_id  # noqa: SLF001
+
+    tampered = {**record, "start_identity": "2026-09-07T12:01:00.000000000Z"}
+    with pytest.raises(RuntimeError, match="start identity"):
+        backend._reattach(tampered)  # noqa: SLF001
 
 
 @pytest.mark.asyncio

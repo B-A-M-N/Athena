@@ -33,7 +33,7 @@ async def test_finalize_observer_registered(service):
 
 
 async def test_completed_task_records_episodic_memory(service):
-    spec = await service.submit(_req("say the word banana"), wait=True)
+    spec = await service.submit(_req("remember that banana is my favorite word"), wait=True)
     rows = await service._store_tasks.list_by_status(TaskStatus.COMPLETE)
     assert any(r["id"] == spec.id for r in rows)
 
@@ -46,6 +46,20 @@ async def test_completed_task_records_episodic_memory(service):
             return
         await asyncio.sleep(0.1)
     pytest.fail(f"episodic memory not recorded; got {content!r}")
+
+
+async def test_submit_records_one_canonical_user_turn_before_enqueue(service):
+    spec = await service.submit(_req("remember this intake"), wait=False)
+
+    messages = await service._store_messages.list_session_messages(spec.session_id)
+    user_turns = [
+        message
+        for message in messages
+        if (message.metadata or {}).get("canonical_user_turn") is True
+    ]
+    assert len(user_turns) == 1
+    assert user_turns[0].metadata["task_id"] == spec.id
+    assert user_turns[0].text() == "remember this intake"
 
 
 def _req(prompt: str):

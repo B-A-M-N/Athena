@@ -6,8 +6,10 @@
 //! semantic OI content arrives through an explicit serialized projection
 //! bridge, and the compositor never decides or executes anything.
 
+use std::collections::VecDeque;
 use std::env;
 use std::io::{self, BufRead, Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -40,9 +42,19 @@ struct ProjectionFrame {
     schema_version: u32,
     title: Option<String>,
     status: Option<String>,
+    #[serde(default)]
+    self_host_phase: Option<String>,
     semantic_state: Option<String>,
     #[serde(default)]
     oi: Vec<String>,
+    #[serde(default)]
+    instruments: Vec<serde_json::Value>,
+    #[serde(default)]
+    system_status: Option<String>,
+    #[serde(default)]
+    network_status: Option<String>,
+    #[serde(default)]
+    activity_status: Option<String>,
     #[serde(default)]
     entities: Option<Vec<ProjectionEntity>>,
     #[serde(default)]
@@ -81,9 +93,22 @@ struct ProjectionFrame {
     layout: Option<serde_json::Value>,
     #[serde(default)]
     view: Option<ProjectionView>,
+    #[serde(default)]
+    navigation: Option<ProjectionNavigation>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+struct ProjectionNavigation {
+    #[serde(default)]
+    pane: String,
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    amount: i32,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionAction {
     #[serde(default)]
     kind: String,
@@ -138,6 +163,8 @@ struct ProjectionAttention {
     #[serde(default)]
     id: String,
     #[serde(default)]
+    approval_id: String,
+    #[serde(default)]
     kind: String,
     #[serde(default)]
     severity: String,
@@ -148,10 +175,13 @@ struct ProjectionAttention {
     #[serde(default)]
     requires_action: bool,
     #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
     related_object_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionOperation {
     #[serde(default)]
     id: String,
@@ -180,6 +210,7 @@ struct ProjectionOperation {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionCodeView {
     #[serde(default)]
     path: String,
@@ -198,6 +229,7 @@ struct ProjectionCodeView {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionDiagnostic {
     #[serde(default)]
     path: String,
@@ -282,15 +314,27 @@ struct ProjectionBuddy {
 #[derive(Debug, Default, Clone)]
 struct Projection {
     bridge_status: String,
+    bridge_generation: u64,
+    last_frame_sequence: u64,
+    last_frame_at: Option<Instant>,
+    stale: bool,
     title: String,
     status: String,
+    self_host_phase: String,
     semantic_state: String,
     oi: Vec<String>,
+    oi_history: VecDeque<Vec<String>>,
+    history_index: Option<usize>,
+    instruments: Vec<serde_json::Value>,
+    system_status: String,
+    network_status: String,
+    activity_status: String,
     entities: Vec<ProjectionEntity>,
     workspace_entities: Vec<ProjectionEntity>,
     runtime_entities: Vec<ProjectionEntity>,
     alerts: Vec<String>,
     attention_items: Vec<ProjectionAttention>,
+    attention_page: usize,
     active_operation: Option<ProjectionOperation>,
     current_action: Option<ProjectionAction>,
     code_view: Option<ProjectionCodeView>,
@@ -305,6 +349,68 @@ struct Projection {
     stream_tail: Vec<String>,
     layout: Option<serde_json::Value>,
     view: ProjectionView,
+    animation: AnimationState,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AnimationState {
+    key: String,
+    entered_at_sequence: u64,
+    elapsed: f32,
+    transition_progress: f32,
+    cursor_phase: f32,
+    scan_phase: f32,
+    pulse_phase: f32,
+    grid_phase: f32,
+    code_reveal: f32,
+    activity_phase: f32,
+}
+
+impl AnimationState {
+    fn observe(&mut self, key: String, frame_sequence: u64) {
+        if key == self.key {
+            return;
+        }
+        self.key = key;
+        self.entered_at_sequence = frame_sequence;
+        self.elapsed = 0.0;
+        self.transition_progress = 0.0;
+        self.cursor_phase = 0.0;
+        self.scan_phase = 0.0;
+        self.pulse_phase = 0.0;
+        self.grid_phase = 0.0;
+        self.code_reveal = 0.0;
+        self.activity_phase = 0.0;
+    }
+
+    fn advance(&mut self, delta_seconds: f32) {
+        if !delta_seconds.is_finite() || delta_seconds <= 0.0 {
+            return;
+        }
+        self.elapsed += delta_seconds;
+        self.transition_progress = (self.elapsed / 0.42).clamp(0.0, 1.0);
+        self.cursor_phase = (self.cursor_phase + delta_seconds * 1.10).fract();
+        self.scan_phase = (self.scan_phase + delta_seconds * 0.70).fract();
+        self.pulse_phase = (self.pulse_phase + delta_seconds * 0.90).fract();
+        self.grid_phase = (self.grid_phase + delta_seconds * 0.35).fract();
+        self.code_reveal = (self.code_reveal + delta_seconds / 0.70).clamp(0.0, 1.0);
+        self.activity_phase = (self.activity_phase + delta_seconds * 0.42).fract();
+    }
+
+    fn channel(&self, mode: VisualMode, fallback: f32) -> f32 {
+        if self.key.is_empty() {
+            return fallback;
+        }
+        match mode {
+            VisualMode::Approval | VisualMode::Failure => self.transition_progress,
+            VisualMode::Read => self.cursor_phase,
+            VisualMode::Search => self.scan_phase,
+            VisualMode::Think => self.pulse_phase,
+            VisualMode::Code => self.code_reveal,
+            VisualMode::Execute | VisualMode::Generate | VisualMode::Recover => self.activity_phase,
+            _ => self.elapsed,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,6 +429,7 @@ enum VisualMode {
     Approval,
     Recover,
     Failure,
+    Success,
 }
 
 impl VisualMode {
@@ -342,6 +449,7 @@ impl VisualMode {
             Self::Approval => "approval",
             Self::Recover => "recover",
             Self::Failure => "failure",
+            Self::Success => "success",
         }
     }
 
@@ -358,7 +466,7 @@ impl VisualMode {
                 .unwrap_or("")
         };
         match raw.to_ascii_lowercase().as_str() {
-            "think" => Self::Think,
+            "think" | "thinking" => Self::Think,
             "respond" => Self::Respond,
             "inspect" => Self::Inspect,
             "read" | "reading" => Self::Read,
@@ -371,16 +479,28 @@ impl VisualMode {
             "approval" => Self::Approval,
             "recover" | "recovery" | "recovering" => Self::Recover,
             "failure" | "blocked" => Self::Failure,
+            "success" | "successful" | "complete" | "completed" => Self::Success,
             _ => Self::Idle,
         }
     }
 
     fn is_active(self) -> bool {
-        !matches!(self, Self::Idle | Self::Failure | Self::Approval)
+        !matches!(
+            self,
+            Self::Idle | Self::Failure | Self::Approval | Self::Success
+        )
     }
 
-    fn is_animated(self) -> bool {
-        !matches!(self, Self::Idle)
+    fn is_animated(self, projection: &Projection) -> bool {
+        match self {
+            Self::Idle | Self::Success => false,
+            // Approval and failure are entrance/settle animations. Once the
+            // decision surface has settled, a static frame prevents a denied
+            // or failed task from looking like it is still progressing.
+            Self::Approval => projection.animation.elapsed < 0.42,
+            Self::Failure => projection.animation.elapsed < 0.36,
+            _ => true,
+        }
     }
 
     fn prompt_state(self, projection: &Projection) -> &'static str {
@@ -399,20 +519,47 @@ impl VisualMode {
     }
 }
 
+#[allow(dead_code)]
 impl Projection {
     fn apply(&mut self, frame: ProjectionFrame) {
+        let animation_key = frame_animation_key(&frame);
+        self.animation
+            .observe(animation_key, self.last_frame_sequence);
         self.bridge_status = "CONNECTED".to_owned();
+        self.stale = false;
+        self.last_frame_sequence = self.last_frame_sequence.saturating_add(1);
+        self.last_frame_at = Some(Instant::now());
         if let Some(title) = frame.title {
             self.title = title;
         }
         if let Some(status) = frame.status {
             self.status = status;
         }
+        if let Some(self_host_phase) = frame.self_host_phase {
+            self.self_host_phase = self_host_phase;
+        }
         if let Some(semantic_state) = frame.semantic_state {
             self.semantic_state = semantic_state;
         }
         if !frame.oi.is_empty() {
+            if self.oi != frame.oi {
+                self.oi_history.push_back(frame.oi.clone());
+                while self.oi_history.len() > 32 {
+                    self.oi_history.pop_front();
+                }
+                self.history_index = None;
+            }
             self.oi = frame.oi;
+        }
+        self.instruments = frame.instruments;
+        if let Some(system_status) = frame.system_status {
+            self.system_status = system_status;
+        }
+        if let Some(network_status) = frame.network_status {
+            self.network_status = network_status;
+        }
+        if let Some(activity_status) = frame.activity_status {
+            self.activity_status = activity_status;
         }
         if let Some(entities) = frame.entities {
             self.entities = entities;
@@ -437,11 +584,139 @@ impl Projection {
         self.stream_tail = frame.stream_tail.unwrap_or_default();
         self.layout = frame.layout;
         self.view = frame.view.unwrap_or_default();
+        if let Some(navigation) = frame.navigation {
+            self.apply_navigation(navigation);
+        }
     }
 
     fn bridge_error(&mut self, error: String) {
         self.bridge_status = format!("ERROR: {error}");
+        self.stale = true;
     }
+
+    fn bridge_lifecycle(&mut self, status: &str) {
+        match status {
+            "CONNECTING" => self.stale = true,
+            "CONNECTED" if self.bridge_generation == 0 => self.bridge_generation = 1,
+            "RECONNECTING" => {
+                self.bridge_generation = self.bridge_generation.saturating_add(1);
+                self.stale = true;
+            }
+            "DISCONNECTED" | "ERROR" => self.stale = true,
+            _ => {}
+        }
+        if status == "ERROR" {
+            self.bridge_status = "ERROR".to_owned();
+        } else {
+            self.bridge_status = status.to_owned();
+        }
+    }
+
+    fn last_frame_age_ms(&self) -> Option<u128> {
+        self.last_frame_at.map(|at| at.elapsed().as_millis())
+    }
+
+    fn advance_animation(&mut self, delta_seconds: f32) {
+        self.animation.advance(delta_seconds);
+    }
+
+    fn apply_navigation(&mut self, navigation: ProjectionNavigation) {
+        let pane = navigation.pane.to_ascii_lowercase();
+        if !matches!(pane.as_str(), "oi" | "right" | "history") {
+            return;
+        }
+        let direction = navigation.direction.to_ascii_lowercase();
+        match direction.as_str() {
+            "bottom" | "live" => {
+                self.return_to_live_oi();
+            }
+            "up" => {
+                for _ in 0..navigation.amount.clamp(1, 32) {
+                    self.cycle_oi_history(-1);
+                }
+            }
+            "down" => {
+                for _ in 0..navigation.amount.clamp(1, 32) {
+                    self.cycle_oi_history(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn animation_phase(&self, fallback: f32) -> f32 {
+        self.animation
+            .channel(VisualMode::from_projection(self), fallback)
+    }
+
+    fn cycle_oi_history(&mut self, delta: i32) -> bool {
+        let len = self.oi_history.len();
+        if len <= 1 {
+            return false;
+        }
+        let live = len as i32;
+        // The live view is positioned immediately after the newest retained
+        // frame. One wheel step toward history should therefore reveal the
+        // previous frame, while one step toward live returns to the stream.
+        let current = self
+            .history_index
+            .map_or((len - 1) as i32, |index| index as i32);
+        let next = (current + delta).rem_euclid(live + 1);
+        self.history_index = (next < live).then_some(next as usize);
+        true
+    }
+
+    fn return_to_live_oi(&mut self) -> bool {
+        let changed = self.history_index.is_some();
+        self.history_index = None;
+        changed
+    }
+
+    fn display_oi(&self) -> &[String] {
+        self.history_index
+            .and_then(|index| self.oi_history.get(index).map(Vec::as_slice))
+            .unwrap_or(&self.oi)
+    }
+
+    fn navigation_value(&self) -> f32 {
+        if let Some(index) = self.history_index {
+            let count = self.oi_history.len().saturating_sub(1).max(1);
+            return index as f32 / count as f32;
+        }
+        let page_count = self.attention_items.len().div_ceil(3).max(1);
+        if page_count > 1 {
+            return self.attention_page.min(page_count - 1) as f32 / (page_count - 1) as f32;
+        }
+        0.5
+    }
+}
+
+fn frame_animation_key(frame: &ProjectionFrame) -> String {
+    let operation = frame.active_operation.as_ref();
+    let view = frame.view.as_ref();
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        frame.semantic_state.as_deref().unwrap_or_default(),
+        view.map(|item| item.mode.as_str()).unwrap_or_default(),
+        view.map(|item| item.history).unwrap_or_default(),
+        operation.map(|item| item.id.as_str()).unwrap_or_default(),
+        operation
+            .map(|item| item.state.as_str())
+            .unwrap_or_default(),
+        operation
+            .map(|item| item.mutation_state.as_str())
+            .unwrap_or_default(),
+        frame
+            .verification
+            .as_ref()
+            .map(|item| item.status.as_str())
+            .unwrap_or_default(),
+        frame
+            .current_action
+            .as_ref()
+            .map(|item| item.kind.as_str())
+            .unwrap_or_default(),
+    )
 }
 
 #[derive(Debug, Default)]
@@ -459,6 +734,7 @@ struct Args {
     mascot: String,
     animations: bool,
     reduced_motion: bool,
+    text_scale: f32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -473,6 +749,10 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
         dump_height: 800,
         mascot: "owl".to_owned(),
         animations: true,
+        text_scale: env::var("ATHENA_NATIVE_TEXT_SCALE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1.0),
         ..Args::default()
     };
     let mut values = values.into_iter();
@@ -515,9 +795,16 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
             }
             "--no-animations" => args.animations = false,
             "--reduced-motion" => args.reduced_motion = true,
+            "--text-scale" => {
+                args.text_scale = values
+                    .next()
+                    .ok_or("--text-scale needs a multiplier")?
+                    .parse()
+                    .map_err(|_| "--text-scale must be a number")?;
+            }
             "--help" | "-h" => {
                 println!(
-                    "athena-terminal [--headless] [--dump-layout] [--cabinet-only] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot owl|cat|bot|off] [--no-animations] [--reduced-motion]"
+                    "athena-terminal [--headless] [--dump-layout] [--cabinet-only] [--bridge-stdin|--bridge-socket PATH] [--command SHELL_CODE] [--mascot owl|cat|bot|off] [--no-animations] [--reduced-motion] [--text-scale MULTIPLIER]"
                 );
                 println!("  --headless       run the PTY/core slice without opening a window");
                 println!(
@@ -529,6 +816,9 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
                 println!(
                     "  --mascot         select Buddy (default: owl; built-ins: owl, cat, bot, off)"
                 );
+                println!(
+                    "  --text-scale     multiply native UI text size (also ATHENA_NATIVE_TEXT_SCALE)"
+                );
                 return Err(String::new());
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -536,6 +826,9 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
     }
     args.columns = args.columns.max(1);
     args.rows = args.rows.max(1);
+    if !args.text_scale.is_finite() || !(0.75..=2.5).contains(&args.text_scale) {
+        return Err("--text-scale must be between 0.75 and 2.5".to_owned());
+    }
     if !matches!(
         args.mascot.to_ascii_lowercase().as_str(),
         "owl" | "cat" | "bot" | "off"
@@ -575,7 +868,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.dump_layout {
         #[cfg(unix)]
         {
-            match x11::dump_live_layout_json(args.dump_width, args.dump_height) {
+            match x11::dump_live_layout_json(args.dump_width, args.dump_height, args.text_scale) {
                 Ok(dump) => {
                     println!("{}", serde_json::to_string_pretty(&dump)?);
                     return Ok(());
@@ -602,6 +895,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .insert(
                 "metrics_source".to_owned(),
                 serde_json::json!("fallback_static"),
+            );
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert("text_scale".to_owned(), serde_json::json!(args.text_scale));
+        dump.as_object_mut()
+            .expect("NativePixelLayout serializes as an object")
+            .insert(
+                "font_pixel_sizes".to_owned(),
+                serde_json::json!([16, 17, 13, 11]),
             );
         dump.as_object_mut()
             .expect("NativePixelLayout serializes as an object")
@@ -687,6 +989,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mascot: args.mascot,
                     animations: args.animations,
                     reduced_motion: args.reduced_motion,
+                    text_scale: args.text_scale,
                     cabinet_only: args.cabinet_only,
                 },
             )
@@ -740,10 +1043,19 @@ fn spawn_pty_reader(mut reader: std::fs::File, output_tx: SyncSender<Vec<u8>>) {
 struct LatestProjection {
     frame: Arc<Mutex<Option<ProjectionFrame>>>,
     error: Arc<Mutex<Option<String>>>,
+    lifecycle: Arc<Mutex<Vec<String>>>,
+    connected: Arc<AtomicBool>,
+    ever_connected: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
 }
 
 impl LatestProjection {
     fn publish(&self, frame: ProjectionFrame) {
+        let was_connected = self.connected.swap(true, Ordering::SeqCst);
+        if !was_connected && self.ever_connected.swap(true, Ordering::SeqCst) {
+            self.publish_lifecycle("RECONNECTING");
+        }
+        self.publish_lifecycle("CONNECTED");
         if let Ok(mut slot) = self.frame.lock() {
             *slot = Some(frame);
         }
@@ -754,6 +1066,8 @@ impl LatestProjection {
     }
 
     fn publish_error(&self, error: String) {
+        self.connected.store(false, Ordering::SeqCst);
+        self.publish_lifecycle("ERROR");
         if let Ok(mut slot) = self.error.lock() {
             *slot = Some(error);
         }
@@ -761,6 +1075,27 @@ impl LatestProjection {
 
     fn take_error(&self) -> Option<String> {
         self.error.lock().ok()?.take()
+    }
+
+    fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::SeqCst);
+        self.publish_lifecycle("DISCONNECTED");
+    }
+
+    fn publish_lifecycle(&self, status: &str) {
+        if status == "RECONNECTING" {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            lifecycle.push(status.to_owned());
+        }
+    }
+
+    fn take_lifecycle(&self) -> Vec<String> {
+        self.lifecycle
+            .lock()
+            .map(|mut lifecycle| std::mem::take(&mut *lifecycle))
+            .unwrap_or_default()
     }
 }
 
@@ -776,13 +1111,18 @@ fn publish_projection_line(latest: &LatestProjection, line: &str) {
 
 fn spawn_projection_reader() -> LatestProjection {
     let latest = LatestProjection::default();
+    latest.publish_lifecycle("CONNECTING");
     let writer = latest.clone();
     thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
+            let Ok(line) = line else {
+                writer.mark_disconnected();
+                break;
+            };
             publish_projection_line(&writer, &line);
         }
+        writer.mark_disconnected();
     });
     latest
 }
@@ -791,14 +1131,19 @@ fn spawn_projection_reader() -> LatestProjection {
 fn spawn_projection_socket(path: &str) -> Result<LatestProjection, io::Error> {
     let listener = UnixListener::bind(path)?;
     let latest = LatestProjection::default();
+    latest.publish_lifecycle("CONNECTING");
     let writer = latest.clone();
     thread::spawn(move || {
         for connection in listener.incoming() {
-            let Ok(stream) = connection else { break };
+            let Ok(stream) = connection else {
+                writer.mark_disconnected();
+                break;
+            };
             for line in io::BufReader::new(stream).lines() {
                 let Ok(line) = line else { break };
                 publish_projection_line(&writer, &line);
             }
+            writer.mark_disconnected();
         }
     });
     Ok(latest)
@@ -822,6 +1167,10 @@ fn apply_available(
         changed.terminal = true;
     }
     if let Some(bridge_rx) = bridge_rx {
+        for status in bridge_rx.take_lifecycle() {
+            projection.bridge_lifecycle(&status);
+            changed.projection = true;
+        }
         if let Some(error) = bridge_rx.take_error() {
             projection.bridge_error(error);
             changed.projection = true;
@@ -977,7 +1326,7 @@ fn write_projection_tree(
 mod tests {
     use super::{
         LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION, NATIVE_BRIDGE_SCHEMA_VERSION, Projection,
-        ProjectionFrame, VisualMode,
+        ProjectionFrame, ProjectionNavigation, VisualMode,
     };
 
     #[test]
@@ -1020,7 +1369,7 @@ mod tests {
     fn visual_mode_covers_the_shared_action_vocabulary() {
         for value in [
             "idle", "think", "respond", "inspect", "read", "search", "code", "execute", "test",
-            "verify", "generate", "approval", "recover", "failure",
+            "verify", "generate", "approval", "recover", "failure", "success",
         ] {
             let projection = Projection {
                 semantic_state: value.to_owned(),
@@ -1028,6 +1377,11 @@ mod tests {
             };
             assert_eq!(VisualMode::from_projection(&projection).as_str(), value);
         }
+        let thinking = Projection {
+            semantic_state: "thinking".to_owned(),
+            ..Projection::default()
+        };
+        assert_eq!(VisualMode::from_projection(&thinking).as_str(), "think");
     }
 
     #[test]
@@ -1035,6 +1389,7 @@ mod tests {
         let frame: ProjectionFrame = serde_json::from_str(
             r#"{
                 "status":"EXECUTING",
+                "self_host_phase":"REFEREE",
                 "attention_items":[{"id":"approval:1","kind":"approval","severity":"warning","title":"APPROVAL REQUIRED","summary":"write workspace","requires_action":true}],
                 "entities":[
                     {"id":"call-1","kind":"operation","label":"executor","status":"active"}
@@ -1052,6 +1407,7 @@ mod tests {
         projection.apply(frame);
 
         assert_eq!(projection.status, "EXECUTING");
+        assert_eq!(projection.self_host_phase, "REFEREE");
         assert_eq!(projection.entities.len(), 1);
         assert_eq!(projection.entities[0].label, "executor");
         assert_eq!(projection.alerts, vec!["test pulse"]);
@@ -1070,6 +1426,171 @@ mod tests {
         assert_eq!(projection.trace, vec!["> NEXT STEP · executor"]);
         assert_eq!(projection.view.label, "action");
         assert!(!projection.view.history);
+        assert!(projection.last_frame_age_ms().is_some());
+    }
+
+    #[test]
+    fn animation_state_is_keyed_and_advances_deterministically() {
+        let mut projection = Projection::default();
+        projection.apply(ProjectionFrame {
+            semantic_state: Some("think".to_owned()),
+            ..ProjectionFrame::default()
+        });
+        projection.advance_animation(0.10);
+        assert_eq!(projection.animation.entered_at_sequence, 0);
+        assert!((projection.animation.elapsed - 0.10).abs() < f32::EPSILON);
+        assert!(projection.animation.pulse_phase > 0.0);
+
+        projection.apply(ProjectionFrame {
+            semantic_state: Some("think".to_owned()),
+            ..ProjectionFrame::default()
+        });
+        assert!((projection.animation.elapsed - 0.10).abs() < f32::EPSILON);
+
+        projection.apply(ProjectionFrame {
+            semantic_state: Some("search".to_owned()),
+            ..ProjectionFrame::default()
+        });
+        assert_eq!(projection.animation.entered_at_sequence, 2);
+        assert_eq!(projection.animation.elapsed, 0.0);
+        projection.advance_animation(0.10);
+        assert!((projection.animation.channel(VisualMode::Search, 0.0) - 0.07).abs() < 0.0001);
+    }
+
+    #[test]
+    fn dagoal_temporal_modes_and_transitions_have_explicit_settle_contract() {
+        let modes = [
+            "idle", "think", "search", "read", "code", "execute", "test", "verify", "approval",
+            "failure", "success",
+        ];
+        let mut projection = Projection::default();
+        for (sequence, mode) in modes.into_iter().enumerate() {
+            projection.apply(ProjectionFrame {
+                semantic_state: Some(mode.to_owned()),
+                ..ProjectionFrame::default()
+            });
+            let visual = VisualMode::from_projection(&projection);
+            assert_eq!(visual.as_str(), mode);
+            assert_eq!(projection.animation.entered_at_sequence, sequence as u64);
+            assert_eq!(projection.animation.elapsed, 0.0);
+            projection.advance_animation(0.10);
+            assert!(projection.animation.channel(visual, 0.0) > 0.0);
+            if matches!(visual, VisualMode::Approval | VisualMode::Failure) {
+                projection.advance_animation(0.50);
+                assert_eq!(projection.animation.transition_progress, 1.0);
+                assert!(!visual.is_animated(&projection));
+            }
+            if matches!(visual, VisualMode::Idle | VisualMode::Success) {
+                assert!(!visual.is_animated(&projection));
+            }
+        }
+
+        for (from, to) in [
+            ("search", "read"),
+            ("read", "code"),
+            ("code", "test"),
+            ("test", "failure"),
+            ("failure", "recover"),
+            ("verify", "success"),
+            ("execute", "approval"),
+            ("approval", "execute"),
+        ] {
+            projection.apply(ProjectionFrame {
+                semantic_state: Some(from.to_owned()),
+                ..ProjectionFrame::default()
+            });
+            projection.advance_animation(0.12);
+            let prior_key = projection.animation.key.clone();
+            projection.apply(ProjectionFrame {
+                semantic_state: Some(to.to_owned()),
+                ..ProjectionFrame::default()
+            });
+            assert_ne!(projection.animation.key, prior_key);
+            assert_eq!(projection.animation.elapsed, 0.0);
+        }
+
+        let no_animations = super::parse_args_from(vec!["--no-animations".to_owned()])
+            .expect("no-animations should parse");
+        assert!(!no_animations.animations);
+        let reduced_motion = super::parse_args_from(vec!["--reduced-motion".to_owned()])
+            .expect("reduced-motion should parse");
+        assert!(reduced_motion.reduced_motion);
+        let zoomed = super::parse_args_from(vec!["--text-scale".to_owned(), "1.25".to_owned()])
+            .expect("text-scale should parse");
+        assert!((zoomed.text_scale - 1.25).abs() < f32::EPSILON);
+        assert!(super::parse_args_from(vec!["--text-scale".to_owned(), "0.5".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn bridge_lifecycle_marks_stale_and_advances_generation() {
+        let mut projection = Projection::default();
+        projection.bridge_lifecycle("CONNECTING");
+        assert!(projection.stale);
+        projection.bridge_lifecycle("CONNECTED");
+        assert_eq!(projection.bridge_status, "CONNECTED");
+        assert!(projection.stale);
+        assert_eq!(projection.bridge_generation, 1);
+
+        projection.apply(ProjectionFrame::default());
+        assert!(!projection.stale);
+
+        projection.bridge_lifecycle("RECONNECTING");
+        assert!(projection.stale);
+        assert_eq!(projection.bridge_generation, 2);
+
+        projection.bridge_error("socket closed".to_owned());
+        assert!(projection.stale);
+        assert!(projection.bridge_status.starts_with("ERROR:"));
+    }
+
+    #[test]
+    fn oi_history_is_bounded_and_encoder_navigation_is_independent_of_focus() {
+        let mut projection = Projection::default();
+        for index in 0..34 {
+            projection.apply(ProjectionFrame {
+                oi: vec![format!("frame-{index}")],
+                ..ProjectionFrame::default()
+            });
+        }
+        assert_eq!(projection.oi_history.len(), 32);
+        assert_eq!(projection.display_oi(), ["frame-33".to_owned()].as_slice());
+        assert!(projection.cycle_oi_history(-1));
+        assert_eq!(projection.display_oi(), ["frame-32".to_owned()].as_slice());
+        assert!(projection.navigation_value() < 1.0);
+        assert!(projection.return_to_live_oi());
+        assert_eq!(projection.display_oi(), ["frame-33".to_owned()].as_slice());
+    }
+
+    #[test]
+    fn bridge_navigation_control_moves_retained_oi_history() {
+        let mut projection = Projection::default();
+        projection.apply(ProjectionFrame {
+            oi: vec!["frame-1".to_owned()],
+            ..ProjectionFrame::default()
+        });
+        projection.apply(ProjectionFrame {
+            oi: vec!["frame-2".to_owned()],
+            ..ProjectionFrame::default()
+        });
+        projection.apply(ProjectionFrame {
+            navigation: Some(ProjectionNavigation {
+                pane: "oi".to_owned(),
+                direction: "up".to_owned(),
+                amount: 1,
+            }),
+            ..ProjectionFrame::default()
+        });
+
+        assert_eq!(projection.display_oi(), ["frame-1".to_owned()].as_slice());
+        projection.apply(ProjectionFrame {
+            navigation: Some(ProjectionNavigation {
+                pane: "oi".to_owned(),
+                direction: "bottom".to_owned(),
+                amount: 1,
+            }),
+            ..ProjectionFrame::default()
+        });
+        assert_eq!(projection.display_oi(), ["frame-2".to_owned()].as_slice());
     }
 }
 

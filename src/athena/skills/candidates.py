@@ -24,6 +24,67 @@ _EXECUTION_MARKERS = (
 
 _OBJECTIVE_TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{1,}")
 _PROCESS_RE = re.compile(r"(?is)(^|\n)\s*(steps?|procedure|recipe|how to|reusable|repeat)\b")
+_TRIGGER_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "for",
+        "from",
+        "in",
+        "into",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+)
+_TRIGGER_GENERIC = frozenset(
+    {
+        "apply",
+        "check",
+        "do",
+        "execute",
+        "follow",
+        "get",
+        "handle",
+        "inspect",
+        "make",
+        "process",
+        "read",
+        "run",
+        "show",
+        "task",
+        "test",
+        "use",
+        "verify",
+        "work",
+    }
+)
+_TRIGGER_FILE_PARTS = frozenset(
+    {
+        "cfg",
+        "css",
+        "go",
+        "html",
+        "ini",
+        "js",
+        "json",
+        "jsx",
+        "lock",
+        "md",
+        "py",
+        "rs",
+        "toml",
+        "ts",
+        "tsx",
+        "txt",
+        "yaml",
+        "yml",
+    }
+)
 
 
 def _transcript_text(items: Sequence[Any]) -> str:
@@ -34,6 +95,15 @@ def _transcript_text(items: Sequence[Any]) -> str:
         if isinstance(item, str):
             parts.append(item)
             continue
+        conversation_text = getattr(item, "conversation_text", None)
+        if callable(conversation_text):
+            try:
+                value = conversation_text()
+            except Exception:
+                value = ""
+            if isinstance(value, str):
+                parts.append(value)
+                continue
         for getter in ("text", "output"):
             if hasattr(item, getter):
                 try:
@@ -78,7 +148,23 @@ def _objective_tokens(objective: str) -> list[str]:
 
 
 def _triggers(objective: str) -> tuple[str, ...]:
-    tokens = [t for t in _objective_tokens(objective) if len(t) >= 2]
+    tokens: list[str] = []
+    for token in _objective_tokens(objective):
+        if (
+            len(token) < 3
+            or token in _TRIGGER_STOPWORDS
+            or token in _TRIGGER_GENERIC
+            or token in _TRIGGER_FILE_PARTS
+        ):
+            continue
+        # Filenames, paths, UUID-like values, and task ids are evidence
+        # details, not durable activation vocabulary.
+        if "/" in token or "\\" in token or token.isdigit() or re.search(r"\d{2,}", token):
+            continue
+        if token.startswith(("task-", "call-", "run-", "msg-")):
+            continue
+        if token not in tokens:
+            tokens.append(token)
     return tuple(tokens[:5])
 
 
@@ -116,12 +202,22 @@ def _render_body(objective: str, transcript: Sequence[Any]) -> str:
         "> " + objective.strip() + "\n\n"
         "## Procedure\n"
         "1. Identify the concrete inputs for the task.\n"
-        "2. Apply the worked procedure recorded below, adapting to context.\n"
+        "2. Apply the distilled capability sequence below, adapting to context.\n"
         "3. Verify the outcome before finishing.\n"
     )
-    recorded = _transcript_text(transcript)
-    if recorded.strip():
-        body += "\n## Prior worked transcript (evidence)\n\n" + recorded.strip() + "\n"
+    evidence = _successful_ordinary_calls(transcript)
+    if evidence:
+        body += "\n## Distilled sequence\n\n"
+        for index, call in enumerate(evidence, 1):
+            operation = str((getattr(call, "arguments", {}) or {}).get("operation") or "call")
+            keys = sorted(
+                str(key) for key in (getattr(call, "arguments", {}) or {}) if key != "operation"
+            )
+            suffix = f"; inputs: {', '.join(keys)}" if keys else ""
+            body += f"{index}. Use `{call.capability_id}` ({operation}){suffix}.\n"
+        body += (
+            "\nThe original transcript and result records remain separate evidence for review.\n"
+        )
     return body
 
 
@@ -139,7 +235,11 @@ async def candidates_from_task(
     list when there is nothing reusable.
     """
     objective = _objective_of(task)
-    if not objective:
+    if not objective or _is_ephemeral_objective(objective):
+        return []
+
+    evidence = _successful_ordinary_calls(transcript)
+    if not _repeatable_procedure_evidence(transcript, evidence, objective=objective):
         return []
 
     confidence = _confidence(transcript, result)
@@ -168,6 +268,57 @@ async def candidates_from_task(
         confidence=confidence,
     )
     return [candidate]
+
+
+def _is_ephemeral_objective(objective: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"\s*(?:hi|hello|hey|yo|thanks|thank you|good morning|good afternoon|"
+            r"good evening|goodbye|bye|how are you|what(?:'s| is) up)[!.? ]*",
+            objective,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _successful_ordinary_calls(transcript: Sequence[Any]) -> list[Any]:
+    from athena.protocol.messages import CapabilityCallBlock, CapabilityResultBlock
+
+    calls: dict[str, Any] = {}
+    results: dict[str, Any] = {}
+    for item in transcript:
+        for block in getattr(item, "blocks", ()):
+            if isinstance(block, CapabilityCallBlock):
+                calls[block.call_id] = block
+            elif isinstance(block, CapabilityResultBlock):
+                results[block.call_id] = block
+    return [
+        call
+        for call in calls.values()
+        if call.capability_id not in {"delegate", "workflow", "scratch", "synthesis", "capsule"}
+        and getattr(results.get(call.call_id), "ok", False)
+    ]
+
+
+def _repeatable_procedure_evidence(
+    transcript: Sequence[Any], evidence: Sequence[Any], *, objective: str = ""
+) -> bool:
+    if not evidence:
+        return False
+    text = _transcript_text(transcript).casefold()
+    objective_text = objective.casefold()
+    has_process = bool(_PROCESS_RE.search(text)) or any(
+        marker in text or marker in objective_text
+        for marker in ("procedure", "repeatable", "reusable", "steps")
+    )
+    has_verification = any(
+        marker in text or marker in objective_text
+        for marker in ("verify", "verified", "validated", "validation", "passed", "exit_code")
+    )
+    # Two successful calls establish a trace, not a reusable skill. An
+    # explicit process signal plus an observable validation signal is required
+    # before proposing a draft; all durable promotion remains separate.
+    return has_process and has_verification and len(evidence) >= 1
 
 
 def _evidence_refs(transcript: Sequence[Any]) -> list[str]:

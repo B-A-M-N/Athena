@@ -62,14 +62,21 @@ fi
 TMP_PATH="$(mktemp "${DEMO_DIR}/.${DEMO_NAME}.XXXXXX.gif")"
 STATUS_PATH="${TMP_PATH}.status"
 SESSION_NAME="athena-vhs-$$"
+# Use a per-run socket.  A shared tmux server can be unavailable or owned by
+# another user in CI/sandbox environments, which must be reported as an
+# environment/tool error rather than turning into an unbounded render wait.
+TMUX_SOCKET="athena-vhs-$$"
 cleanup() {
     local rc=$?
     # Remove any temp artifact; the previous known-good final gif is left
     # untouched on failure (the whole point of atomic rename).
     rm -f -- "${TMP_PATH}" 2>/dev/null || true
     rm -f -- "${STATUS_PATH}" 2>/dev/null || true
-    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
-        tmux kill-session -t "${SESSION_NAME}" 2>/dev/null || true
+    if command -v tmux >/dev/null 2>&1 && tmux -L "${TMUX_SOCKET}" has-session -t "${SESSION_NAME}" 2>/dev/null; then
+        tmux -L "${TMUX_SOCKET}" kill-session -t "${SESSION_NAME}" 2>/dev/null || true
+    fi
+    if command -v tmux >/dev/null 2>&1; then
+        tmux -L "${TMUX_SOCKET}" kill-server 2>/dev/null || true
     fi
     # Drop the temp symlink/lockfile if we made one (no-op for flock fd).
     return "${rc}"
@@ -98,15 +105,15 @@ else
         printf -v VHS_CMD 'vhs -q -o %q %q' "${TMP_PATH}" "${TAPE_PATH}"
         printf -v STATUS_QUOTED '%q' "${STATUS_PATH}"
         TMUX_CMD="${VHS_CMD}; rc=\$?; printf '%s\\n' \"\$rc\" > ${STATUS_QUOTED}; exit \"\$rc\""
-        if ! tmux new-session -d -s "${SESSION_NAME}" -x 160 -y 45 "${TMUX_CMD}"; then
+        if ! tmux -L "${TMUX_SOCKET}" new-session -d -s "${SESSION_NAME}" -x 160 -y 45 "${TMUX_CMD}"; then
             echo "render-demo: could not create the VHS PTY session" >&2
-            VHS_RC=4
+            VHS_RC=2
         else
             VHS_RC=124
             DEADLINE=$(( $(date +%s) + DEMO_TIMEOUT ))
-            while tmux has-session -t "${SESSION_NAME}" 2>/dev/null; do
+            while tmux -L "${TMUX_SOCKET}" has-session -t "${SESSION_NAME}" 2>/dev/null; do
                 if (( $(date +%s) >= DEADLINE )); then
-                    tmux kill-session -t "${SESSION_NAME}" 2>/dev/null || true
+                    tmux -L "${TMUX_SOCKET}" kill-session -t "${SESSION_NAME}" 2>/dev/null || true
                     break
                 fi
                 sleep 1
@@ -128,6 +135,10 @@ if [[ "${VHS_RC}" -eq 124 ]]; then
     exit 3
 fi
 if [[ "${VHS_RC}" -ne 0 ]]; then
+    if [[ "${VHS_RC}" -eq 2 ]]; then
+        echo "render-demo: renderer/PTY unavailable; previous ${FINAL_PATH} is preserved" >&2
+        exit 2
+    fi
     echo "render-demo: vhs failed (rc=${VHS_RC}); previous ${FINAL_PATH} is preserved" >&2
     exit 4
 fi
@@ -208,7 +219,7 @@ if command -v ffmpeg >/dev/null 2>&1; then
     echo "render-demo: validated ${TMP_PATH} — ${WIDTH_HEX}x${HEIGHT_HEX}, ${DURATION_TOTAL}s, ${FRAMES} frames"
 else
     # No ffmpeg available — surface that as a validation failure rather than
-    # silently accepting an unchecked file.  Stable-beta must not accept
+    # silently accepting an unchecked file.  The stable release must not accept
     # file-existence alone as completion.
     echo "render-demo: ffmpeg not on PATH; cannot verify frame count + duration" >&2
     exit 5

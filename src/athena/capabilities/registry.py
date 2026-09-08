@@ -169,12 +169,37 @@ def _effective_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
     return effective
 
 
+# Maximum nesting depth for a capability's JSON Schema (P2-3). Legitimate
+# tool schemas are a handful of levels deep; unbounded nesting lets an
+# attacker-supplied schema drive the recursive validator into
+# RecursionError at validation time instead of failing admission.
+_MAX_SCHEMA_DEPTH = 32
+
+
+def _schema_depth(node: Any, seen: int = 0) -> int:
+    if seen > _MAX_SCHEMA_DEPTH:
+        return seen
+    if isinstance(node, Mapping):
+        return max(
+            (_schema_depth(value, seen + 1) for value in node.values()),
+            default=seen,
+        )
+    if isinstance(node, (list, tuple)):
+        return max(
+            (_schema_depth(item, seen + 1) for item in node),
+            default=seen,
+        )
+    return seen
+
+
 def _compile_validator(schema: Mapping[str, Any]):
     try:
         from jsonschema.validators import validator_for  # type: ignore[import-untyped]
     except ImportError as exc:  # pragma: no cover - dependency is mandatory
         raise RuntimeError("jsonschema is required for capability schemas") from exc
     effective = _effective_schema(schema)
+    if _schema_depth(effective) > _MAX_SCHEMA_DEPTH:
+        raise ValueError(f"capability schema exceeds maximum nesting depth {_MAX_SCHEMA_DEPTH}")
     validator_cls = validator_for(effective)
     validator_cls.check_schema(effective)
     return validator_cls(effective)

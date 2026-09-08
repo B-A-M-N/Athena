@@ -346,9 +346,23 @@ class ProjectInspector:
         }
         return sorted(found)
 
-    @staticmethod
+    # Toolchain discovery memoization (P0-3): PATH probing via ``shutil.which``
+    # is filesystem work on every inspect() call, and the answer cannot change
+    # within one process unless PATH itself changes. Keyed by (binary, PATH)
+    # so a PATH edit invalidates naturally.
+    _WHICH_CACHE: dict[tuple[str, str], str | None] = {}
+
+    @classmethod
+    def _which(cls, binary: str) -> str | None:
+        path_env = os.environ.get("PATH", "")
+        key = (binary, path_env)
+        if key not in cls._WHICH_CACHE:
+            cls._WHICH_CACHE[key] = shutil.which(binary)
+        return cls._WHICH_CACHE[key]
+
+    @classmethod
     def _commands(
-        languages: set[str], systems: set[str]
+        cls, languages: set[str], systems: set[str]
     ) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
         commands: dict[str, tuple[str, ...]] = {}
         toolchain: dict[str, str] = {}
@@ -363,15 +377,17 @@ class ProjectInspector:
             available = tuple(
                 command
                 for command in candidates.get(language, ())
-                if shutil.which(command.split()[0])
+                if cls._which(command.split()[0])
             )
             if available:
                 commands[language.casefold()] = available
             binary = candidates.get(language, ())[0] if candidates.get(language) else None
-            if binary and shutil.which(binary):
-                toolchain[language.casefold()] = str(shutil.which(binary))
-        if "npm" in systems and shutil.which("npm"):
-            toolchain["npm"] = str(shutil.which("npm"))
+            resolved = cls._which(binary) if binary else None
+            if binary and resolved:
+                toolchain[language.casefold()] = str(resolved)
+        npm_resolved = cls._which("npm")
+        if "npm" in systems and npm_resolved:
+            toolchain["npm"] = str(npm_resolved)
         return commands, toolchain
 
     @staticmethod

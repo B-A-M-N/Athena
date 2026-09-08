@@ -1,17 +1,22 @@
 # Athena
 
 A compact, local-first autonomous agent runtime with durable knowledge,
-structured delegation, universal execution, a programmable computer body, and
-a **single authoritative reasoning loop**.
+structured delegation, universal execution, a programmable execution
+environment, and a **single authoritative reasoning loop**.
 
 Athena brings capability discovery, evidence, execution, policy, and learning
 into one durable kernel. The normative contracts live in `SPEC.md`,
 `BUILDSPEC.md`, `BEHAVIORSPEC.md`, and `RESEARCHSPEC.md`; the architectural
 overview is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-> **Status: stable public beta.** The verified release host is Linux; macOS and
-> Windows are compatibility targets, and the native X11 frontend remains a
-> development preview. Interfaces and subsystem boundaries may still change.
+> **Status: public beta candidate (`0.1.0b1`).** Linux is the certified native
+> and isolation platform. macOS and Windows native/isolation parity and other
+> unlisted integrations are outside the 0.1 support contract. A release stamp
+> requires the core release gate and real X11 desktop acceptance described
+> below. Hermes live evidence is an optional integration certification. The
+> version is a PEP 440 beta pre-release, not stable: it becomes stable only
+> when one frozen SHA has passed every required gate
+> (`./scripts/release-check`).
 
 ## Why this exists
 
@@ -25,16 +30,32 @@ checked and reused. Athena is an attempt to make that behavior durable: one
 reasoning loop, explicit authority, retained evidence, and an auditable path
 from decision to execution.
 
-This is a stable public beta with a deliberately bounded core: capability
-should expand through evidence and disciplined construction, not through an
-unbounded collection of loosely coordinated agents.
+Athena 0.1 has a deliberately bounded core: capability should expand through
+evidence and disciplined construction, not through an unbounded collection of
+loosely coordinated agents.
 
 ## Install
 
-Requires Python 3.12 or newer.
+Requires Python 3.12 or 3.13. Python 3.14 is not part of the certified beta
+matrix yet.
 
 ```bash
-pip install -e ".[dev,cli,glass]"
+pip install athena-agent==0.1.0b1
+```
+
+For local CPU semantic memory, install the optional FastEmbed backend. The
+provider is lazy and downloads the configured model only when semantic indexing
+or retrieval is first used:
+
+```bash
+pip install "athena-agent[semantic]==0.1.0b1"
+```
+
+On a supported Linux host, install the optional native companion alongside the
+matching runtime:
+
+```bash
+pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"
 ```
 
 The optional `glass` extra installs Pillow for the hosted raster OI renderer;
@@ -46,6 +67,7 @@ Athena is easiest to work on from an editable install. The repository provides
 small, repeatable gates for the main development loop:
 
 ```bash
+pip install -e ".[dev,cli,glass]"
 make format          # apply Ruff formatting
 make lint            # correctness-focused Ruff checks
 make typecheck       # run Mypy
@@ -53,8 +75,19 @@ make compile         # catch import and bytecode errors
 make check           # run the full local verification gate
 ```
 
-`make format-check` verifies formatting without changing files. The broader
-formatter baseline is being normalized incrementally while the project evolves.
+`make format-check` verifies formatting without changing files. The release
+gate requires it to be green for the complete `src` and `tests` trees.
+
+The core release gate is `scripts/release-check --sha <clean-commit>`. It
+includes installed wheel/sdist acceptance, the actual Bubblewrap confinement
+matrix, nested workflow/strategy recovery, and native input/visual checks. The
+native input and visual lanes require a usable X display for their automation,
+and the dedicated desktop lane also requires a real Linux X11 display plus
+`xdotool` and ImageMagick; headless/Xvfb-unavailable results fail the core
+release gate. `--skip-e2e` is a partial developer gate and does not produce a
+releasable result. To certify the optional operator-owned Hermes integration on
+the same commit, provide its endpoint and add `--include-hermes-live`; that
+lane is recorded separately and is never required for core publication.
 
 ## Quickstart
 
@@ -68,7 +101,7 @@ athena --display glass chat
 # universal terminal fallback
 athena --display ansi chat
 
-# development native Athena terminal (Alacritty core + Athena compositor)
+# native Athena terminal (Alacritty core + Athena compositor)
 athena native
 
 # inspect the host terminal and renderer decision
@@ -167,15 +200,19 @@ changes; it is not an infinite local prompt store.
 ### Hermes Agent self-host referee
 
 Athena can send one bounded review packet at the candidate and mission
-boundaries to a local Hermes Agent profile. Hermes is advisory only: Athena's
-deterministic proof remains authoritative, and human promotion is always
-required.
+boundaries to a local Hermes Agent profile. Self-host supervision is an explicit
+policy: `off` leaves the core path independent of Hermes, `advisory` records
+Hermes evidence without changing deterministic eligibility, and `required`
+fails closed when Hermes is unavailable or returns a subtractive verdict.
+Athena's deterministic proof remains authoritative, and human promotion is
+always required.
 
 Provision the dedicated service from the Hermes checkout (the command keeps the
 bearer key out of Athena's TOML and passes it to Hermes over stdin):
 
 ```bash
-athena referee setup --hermes-root /path/to/hermes-agent
+athena referee setup --hermes-root /path/to/hermes-agent \
+  --self-host-supervision required
 athena self status
 ```
 
@@ -185,7 +222,11 @@ disables messaging, MCP, multiplexing, and background helpers, installs the
 user service, and proves the live API before enabling Athena. The live contract
 also includes `build.referee_contract = 1`, which detects a stale or different
 Hermes checkout. Re-running setup is safe; use `athena referee repair` to
-reconcile a changed runtime and `athena referee status` to inspect it.
+reconcile a changed runtime and `athena referee status` to inspect it. The
+`athena referee disable` command stops/disables the Hermes transport while
+preserving the selected self-host policy; with `required` still selected,
+self-hosting remains fail-closed until the transport is repaired or the policy
+is explicitly changed to `off`.
 
 The equivalent TOML is:
 
@@ -197,7 +238,7 @@ endpoint = "http://127.0.0.1:8643"
 profile = "athena-referee"
 timeout_seconds = 60
 runtime_root = "/path/to/hermes-agent"
-required_for_self_host = true
+self_host_supervision = "required" # off, advisory, or required
 # allow_remote = true                 # required for a non-loopback endpoint
 # allow_insecure_remote = true        # development-only HTTP exception
 # credential_id = "HERMES_REFEREE_API_KEY"
@@ -220,12 +261,13 @@ disconnected, connected-but-unsafe, and safety-verified states.
 
 Hermes is called at semantic review checkpoints, not for every tool or model
 event. Its profile should be read-only, low-temperature, and free of mutation
-tools. A transport failure or malformed response produces a hold; it cannot
-apply, promote, or write Athena changes.
+tools. In advisory mode, a transport failure or malformed response is retained
+as a hold but does not veto deterministic eligibility. Required mode retains
+the fail-closed veto; Hermes can never apply, promote, or write Athena changes.
 
 For an opt-in live transport check, set `ATHENA_HERMES_E2E_ENDPOINT` (and,
 when required, `ATHENA_HERMES_E2E_API_KEY`) and run
-`uv run --frozen --no-sync pytest -q tests/e2e/test_hermes_agent.py`.
+`ATHENA_HERMES_INTEGRATION_GATE=1 uv run --frozen --no-sync pytest -q tests/e2e/test_hermes_agent.py`.
 
 ## Architecture at a glance
 
@@ -275,7 +317,7 @@ agent while remaining one durable intelligence internally:
                  policy, approvals, budgets, scopes
                               │
                               ▼
-                    Programmable computer body
+                 Programmable execution environment
        execute │ runtimes │ PTY │ files │ processes │ network │ devices
                               │
                               ▼
@@ -446,8 +488,7 @@ The repository exposes the same discipline as repeatable developer gates:
 Ruff rules, `make typecheck` runs Mypy, `make compile` catches import/bytecode
 syntax failures, and `make check` runs those static gates plus the highest-risk
 generated-machinery and model/tool contract tests. The broader formatter check
-is available as `make format-check`; existing legacy formatting is being
-normalized incrementally rather than hidden behind a false clean claim.
+is available as `make format-check` and is part of the complete release gate.
 
 ## Demo (work in progress)
 
@@ -488,9 +529,9 @@ the optional demo wrapper.
 ### Optional host-terminal compatibility smoke test
 
 The Termux script is an optional ANSI/PTY compatibility probe, not an
-Athena stable-beta support target or release gate. Athena's supported terminal
+Athena 0.1 support target or release gate. Athena's supported terminal
 surfaces are hosted Glass over Kitty Graphics Protocol (Kitty and WezTerm),
-the ANSI fallback, and the native Alacritty-core development frontend. From a
+the ANSI fallback, and the Linux native Alacritty-core frontend. From a
 checkout, run the optional probe manually:
 
 ```bash
@@ -513,28 +554,40 @@ For a quick local preview, pass a higher speed multiplier to the driver:
 The demo uses real Athena protocol, validation, event, and operator-surface
 primitives but no model provider, network, database, or host mutation.
 
+For functional product evidence, use the separate deterministic proof workflow:
+
+```bash
+bash scripts/functional-proof
+```
+
+It exercises real service/kernel/dispatcher paths, a persistent Python runtime,
+restart transcript recovery, cross-turn user memory, scheduling, and a
+verified speculative workspace commit. It does not require a commercial model
+API. The VHS recording remains a UI/projection demonstration, not functional
+agent proof.
+
 Research uses the same durable Task and evidence model. A source is fetched
 only after passing source/network policy, retained as an artifact-backed
 snapshot, and linked to claims through locators and supporting excerpts.
-Bounded lexical search, snapshot indexing, evidence verification, gap
-tracking, and the deterministic `research:plan`, `research:assess`,
-`research:bundle`, and `research:run` operations are live. `research:run`
-composes an explicit objective, requirements, selected source captures, exact
-evidence excerpts, contradiction checks, and a final readiness bundle without
-creating a separate research brain. Open-ended retrieval, semantic ranking,
-and autonomous research planning remain in development.
+Bounded lexical search, optional local FastEmbed semantic/hybrid memory
+retrieval, snapshot indexing, evidence verification, gap tracking, and the
+deterministic `research:plan`, `research:assess`, `research:bundle`, and
+`research:run` operations are live. `research:run` composes an explicit
+objective, requirements, selected source captures, exact evidence excerpts,
+contradiction checks, and a final readiness bundle without creating a separate
+research brain. Open-ended autonomous research planning remains in development.
 
 ## Current limitations
 
 Athena is not a giant predefined-tool agent, a collection of independently
 reasoning subagents, or a claim that every present backend is production-ready.
 The architecture document records the current alignment boundary. In
-particular, full host isolation, process reattachment after restart, semantic
-research/indexing, the native terminal frontend, and some specialized
-runtime/UI backends remain active implementation work. A restart deliberately
-marks in-process runtime sessions lost and emits `RuntimeStateLost`; Athena
-does not guess that an old process is still safe to reuse. Types, registries,
-and documentation are not by themselves evidence that a subsystem is complete.
+particular, full cross-platform host isolation, macOS/Windows native parity,
+local-process reattachment, and some specialized runtime/UI backends remain
+active implementation work. The container backend supports proof-based runtime
+reattachment; local in-process runtimes remain service-lifetime only and emit
+`RuntimeStateLost` after restart. Types, registries, and documentation are not
+by themselves evidence that a subsystem is complete.
 
 ## Operator surface
 
@@ -552,12 +605,21 @@ WezTerm are the primary supported hosts for this path; Athena probes the
 active TTY and falls back safely when graphics support is not confirmed.
 `ATHENA_KITTY_CONFIRMED=1` may be used in a controlled launcher when probing
 is unavailable. ANSI is the safe default/fallback and keeps the same scene
-semantics in cell text. The native Athena terminal development slice is documented in
-[`docs/NATIVE_TERMINAL_FRONTEND.md`](docs/NATIVE_TERMINAL_FRONTEND.md); it is
-separate from the Python package and is not yet the default shipped frontend.
+semantics in cell text. The native Athena terminal frontend is documented in
+[`docs/NATIVE_TERMINAL_FRONTEND.md`](docs/NATIVE_TERMINAL_FRONTEND.md). A
+release emits one universal Python wheel/sdist plus a Linux/architecture-specific
+platform-tagged `athena-agent-native` companion wheel containing the native
+executable. The companion uses a `py3-none` wheel tag because it is not a
+CPython extension, but its ELF ABI is explicitly Linux x86_64 GNU/glibc >= 2.34
+and requires X11, Xft, and OpenGL; the release linker policy separately caps
+imported GLIBC symbols at 2.34 and requires those libraries to remain linked.
+It is not OS-, libc-, CPU-, or platform-neutral.
+Install the exact matching pair with
+`pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`. It remains separate from the
+default hosted Glass CLI surface.
 `athena native` launches the native AthenaBOX frontend with a Python service session inside
-its PTY and a Unix-socket projection bridge; build the native binary first with
-`cargo build --manifest-path native/Cargo.toml --offline`.
+its PTY and a Unix-socket projection bridge; build the native release binary first with
+`cargo build --release --manifest-path native/Cargo.toml --locked --offline`.
 Noisy deltas are coalesced, animation is presentation-only, and reduced motion
 is available with `ATHENA_REDUCED_MOTION=1` or `--reduced-motion`.
 
@@ -632,10 +694,13 @@ always wins over role defaults.
 
 ### Post-task knowledge pipeline
 
-Every completed or partial task feeds Athena's durable knowledge: an episodic
-record of the task outcome is saved immediately, conservative lesson
-candidates are stored as `pending_promotion` (never auto-trusted), and skill
-drafts are validated and recorded for explicit promotion later (BHV-099/102/107).
+Eligible completed or partially completed tasks feed Athena's durable
+knowledge: an episodic record of the task outcome is saved immediately,
+conservative lesson candidates are stored as `pending_promotion` (never
+auto-trusted), and skill drafts are validated and recorded for explicit
+promotion later (BHV-099/102/107). Extraction is deliberately conservative —
+trivial conversational turns and tasks without explicit facts or grounded
+procedure evidence produce no durable lessons.
 
 ### Acceptance criteria
 

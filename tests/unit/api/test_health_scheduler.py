@@ -149,6 +149,19 @@ async def test_health_reports_scheduler_false_for_legacy_duck_type():
     assert body["checks"]["scheduler"] is False
 
 
+async def test_app_rejects_non_loopback_client_even_when_embedded_directly():
+    app = create_app(_ready_service())
+    transport = httpx.ASGITransport(
+        app=app,
+        client=("203.0.113.7", 4242),
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://athena") as client:
+        response = await client.get("/v1/live")
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "local_only"
+
+
 async def test_scheduler_is_running_truth_table():
     db = Database(":memory:")
     await db._ensure_ready()

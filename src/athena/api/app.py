@@ -52,6 +52,48 @@ class HTTPError(Exception):
         return {"code": self.code, "message": self.message, **self.data}
 
 
+def _loopback_client(host: object) -> bool:
+    """Accept only loopback clients at the application boundary."""
+    import ipaddress
+
+    value = str(host or "").casefold().rstrip(".")
+    if value == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        # In-process ASGI test transports often use a symbolic client name.
+        # A real socket transport supplies an IP address and is checked below.
+        return not value
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(address.is_loopback or (mapped is not None and mapped.is_loopback))
+
+
+class _LocalOnlyMiddleware:
+    """Prevent an accidentally remote ASGI bind from exposing the operator API."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            client = scope.get("client")
+            host = client[0] if isinstance(client, (tuple, list)) and client else None
+            if host is not None and not _loopback_client(host):
+                from starlette.responses import JSONResponse
+
+                response = JSONResponse(
+                    {
+                        "code": "local_only",
+                        "message": "Athena's operator API accepts loopback clients only",
+                    },
+                    status_code=403,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 class _JSONEncoder(json.JSONEncoder):
     """JSON encoder that renders protocol objects (dataclasses, enums, etc.)."""
 
@@ -193,6 +235,8 @@ def _status_for_error(exc: BaseException) -> HTTPError:
 
     if isinstance(exc, errs.IllegalStateTransition):
         return HTTPError(409, code, message, **data)
+    if isinstance(exc, errs.ServiceNotReady):
+        return HTTPError(503, code, message, **data)
     if isinstance(exc, errs.Cancelled):
         return HTTPError(409, code, message, **data)
     if isinstance(exc, errs.ProviderError):
@@ -446,6 +490,15 @@ def _health_handler(service: Any) -> Any:
                 database_error = str(exc)
         worker = getattr(service, "_worker", None)
         worker_health = worker.health() if worker is not None and hasattr(worker, "health") else {}
+        runtime_health = service.runtime_health() if hasattr(service, "runtime_health") else {}
+        scheduler = getattr(service, "_scheduler", None)
+        scheduler_health = runtime_health.get("scheduler") or (
+            scheduler.health() if scheduler is not None and hasattr(scheduler, "health") else {}
+        )
+        scheduler_running = scheduler is not None and bool(
+            getattr(scheduler, "is_running", lambda: False)()
+        )
+        scheduler_state = str(scheduler_health.get("health") or "")
         startup = service.startup_health() if hasattr(service, "startup_health") else None
         # Optional startup integrations may be degraded while the core
         # service remains ready.  Their state is returned below for operators;
@@ -460,17 +513,23 @@ def _health_handler(service: Any) -> Any:
                 and not getattr(service._worker_task, "done", lambda: True)()
             ),
             "scheduler": (
-                getattr(service, "_scheduler", None) is not None
-                and bool(getattr(service._scheduler, "is_running", lambda: False)())
+                scheduler_running
+                and (not scheduler_health or scheduler_state in {"healthy", "recovering"})
             ),
-            "providers": bool(getattr(service, "_model_registry", None)),
+            "providers": _providers_ready(getattr(service, "_model_registry", None)),
             "worker_persistence": worker_health.get("status", "ok") == "ok",
             "recovery": getattr(service, "_recovery_status", "healthy") in {"healthy", "recovered"},
         }
         if startup is not None:
             checks["startup"] = startup_ok
         ready = all(checks.values())
-        details = {"checks": checks, "worker": worker_health}
+        details = {
+            "checks": checks,
+            "worker": worker_health,
+            "scheduler": scheduler_health,
+            "subsystems": runtime_health,
+            "provider_readiness": _provider_readiness(getattr(service, "_model_registry", None)),
+        }
         if startup is not None:
             details["startup"] = startup
         if database_error is not None:
@@ -481,6 +540,41 @@ def _health_handler(service: Any) -> Any:
         )
 
     return handler
+
+
+def _providers_ready(registry: Any) -> bool:
+    """Return provider readiness without relying on object truthiness."""
+    if registry is None:
+        return False
+    readiness = getattr(registry, "readiness", None)
+    if callable(readiness):
+        try:
+            return readiness().get("state") == "ready"
+        except Exception:
+            return False
+    names = getattr(registry, "names", None)
+    if callable(names):
+        return bool(names())
+    # Preserve compatibility with small transport-test doubles that expose a
+    # truthy registry object but no ProviderRegistry.names() method.
+    return bool(registry)
+
+
+def _provider_readiness(registry: Any) -> dict[str, Any]:
+    if registry is None:
+        return {"state": "unconfigured", "providers": {}}
+    readiness = getattr(registry, "readiness", None)
+    if callable(readiness):
+        try:
+            value = readiness()
+            return dict(value) if isinstance(value, dict) else {"state": "unverified"}
+        except Exception as exc:
+            return {"state": "degraded", "error": str(exc), "providers": {}}
+    names = getattr(registry, "names", None)
+    return {
+        "state": "configured" if callable(names) and names() else "unconfigured",
+        "providers": {},
+    }
 
 
 def _live_handler(service: Any) -> Any:
@@ -548,7 +642,10 @@ def create_app(service: Any = None) -> Any:
 
     app = Starlette(routes=routes, lifespan=_lifespan(service))
     _install_exception_handlers(app)
-    return app
+    # Keep local-only policy in the app itself as well as in the canonical
+    # uvicorn runner. Embedders that preserve the socket client address cannot
+    # accidentally turn an unauthenticated operator surface into a network API.
+    return _LocalOnlyMiddleware(app)
 
 
 def _lifespan(service: Any) -> Any:

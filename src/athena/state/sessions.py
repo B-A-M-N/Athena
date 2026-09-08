@@ -72,6 +72,7 @@ def _serialize_block(block: ContentBlock) -> dict[str, Any]:
                 "hash": ref.hash,
                 "mime_type": ref.mime_type,
                 "size": ref.size,
+                "storage_path": ref.storage_path,
                 "producer": ref.producer,
                 "task_id": ref.task_id,
                 "metadata": dict(ref.metadata),
@@ -129,6 +130,7 @@ def _deserialize_block(data: dict[str, Any]) -> ContentBlock:
                 hash=ref_data.get("hash"),
                 mime_type=ref_data.get("mime_type"),
                 size=ref_data.get("size"),
+                storage_path=ref_data.get("storage_path"),
                 producer=ref_data.get("producer"),
                 task_id=ref_data.get("task_id"),
                 metadata=ref_data.get("metadata") or {},
@@ -236,12 +238,20 @@ class SessionRepository:
         session_id: str,
         parent_id: str | None = None,
         metadata: dict | None = None,
+        *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> str:
         meta = dict(metadata or {})
+        if principal_id is not None:
+            meta.setdefault("principal_id", principal_id)
+        if project_id is not None:
+            meta.setdefault("project_id", project_id)
         now = utcnow().isoformat()
         await self._db.execute(
-            "INSERT INTO sessions(id, parent_id, created_at, updated_at, metadata) VALUES (?, ?, ?, ?, ?)",
-            (session_id, parent_id, now, now, json.dumps(meta)),
+            "INSERT INTO sessions(id, parent_id, created_at, updated_at, metadata, principal_id, project_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, parent_id, now, now, json.dumps(meta), principal_id, project_id),
         )
         self._current_session_id = session_id
         return session_id
@@ -252,6 +262,13 @@ class SessionRepository:
             return None
         if row.get("metadata"):
             row["metadata"] = json.loads(row["metadata"])
+        metadata: dict[str, Any] = (
+            dict(row["metadata"]) if isinstance(row.get("metadata"), dict) else {}
+        )
+        if not row.get("principal_id"):
+            row["principal_id"] = metadata.get("principal_id")
+        if not row.get("project_id"):
+            row["project_id"] = metadata.get("project_id")
         return row
 
     async def list_all(self) -> list[dict]:
@@ -260,6 +277,13 @@ class SessionRepository:
         for row in rows:
             if row.get("metadata"):
                 row["metadata"] = json.loads(row["metadata"])
+            metadata: dict[str, Any] = (
+                dict(row["metadata"]) if isinstance(row.get("metadata"), dict) else {}
+            )
+            if not row.get("principal_id"):
+                row["principal_id"] = metadata.get("principal_id")
+            if not row.get("project_id"):
+                row["project_id"] = metadata.get("project_id")
         return rows
 
     async def delete_if_orphaned(self, session_id: str) -> bool:
@@ -332,28 +356,38 @@ class SessionRepository:
             "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?",
             (session_id, limit),
         )
-        result: list[Message] = []
-        for row in rows:
-            blocks_data = json.loads(row["blocks"]) if row.get("blocks") else []
-            blocks = tuple(_deserialize_block(b) for b in blocks_data)
-            prov_data = json.loads(row["provenance"]) if row.get("provenance") else None
-            prov = (
-                _deserialize_provenance(prov_data)
-                if prov_data
-                else Provenance(source_type=SourceType.RUNTIME)
-            )
-            meta = json.loads(row["metadata"]) if row.get("metadata") else {}
-            result.append(
-                Message(
-                    id=row["id"],
-                    role=Role(row["role"]),
-                    blocks=blocks,
-                    created_at=datetime.fromisoformat(row["created_at"]),
-                    provenance=prov,
-                    metadata=meta,
-                )
-            )
-        return result
+        return [_message_from_row(row) for row in rows]
+
+    async def list_recent_messages(self, session_id: str, limit: int = 100) -> list[Message]:
+        rows = await self._db.fetch_all(
+            "SELECT * FROM ("
+            "SELECT rowid AS _message_rowid, * FROM messages WHERE session_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?"
+            ") ORDER BY created_at ASC, _message_rowid ASC",
+            (session_id, limit),
+        )
+        return [_message_from_row(row) for row in rows]
+
+
+def _message_from_row(row: dict[str, Any]) -> Message:
+    """Decode one persisted message for both chronological list APIs."""
+    blocks_data = json.loads(row["blocks"]) if row.get("blocks") else []
+    blocks = tuple(_deserialize_block(b) for b in blocks_data)
+    prov_data = json.loads(row["provenance"]) if row.get("provenance") else None
+    prov = (
+        _deserialize_provenance(prov_data)
+        if prov_data
+        else Provenance(source_type=SourceType.RUNTIME)
+    )
+    meta = json.loads(row["metadata"]) if row.get("metadata") else {}
+    return Message(
+        id=row["id"],
+        role=Role(row["role"]),
+        blocks=blocks,
+        created_at=datetime.fromisoformat(row["created_at"]),
+        provenance=prov,
+        metadata=meta,
+    )
 
 
 def _serialize_workspace(ws: WorkspaceSpec | None) -> str | None:

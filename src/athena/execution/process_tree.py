@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import asyncio
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
@@ -23,6 +24,22 @@ try:
     import psutil  # type: ignore
 except Exception:  # pragma: no cover - psutil is optional
     psutil = None
+
+
+@dataclass(frozen=True)
+class ProcessKillOutcome:
+    """Structured result of a process-tree kill (P1-11).
+
+    Cleanup may stay best-effort, but shutdown must KNOW when a tree could
+    not be proven dead — silence is how orphaned processes survive a
+    release gate. ``proven_dead`` is True only when the root was observed
+    exited (or was already dead); ``survivors`` lists pids that were still
+    alive after the escalation ladder.
+    """
+
+    proven_dead: bool
+    survivors: tuple[int, ...] = field(default_factory=tuple)
+    already_dead: bool = False
 
 
 _MINIMAL_ENV_KEYS = (
@@ -400,16 +417,20 @@ def _reap(process: "subprocess.Popen", timeout: float) -> None:
         pass
 
 
-def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> None:
+def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> ProcessKillOutcome:
     """SIGTERM then SIGKILL the whole process tree owned by ``process``.
 
     Signals the owning process group first so descendants are covered even
     without ``psutil``; then, within ``timeout``, escalates to SIGKILL on the
     group and any psutil-enumerated descendants. Finally reaps the root and any
     confirmed-dead children so no zombies are left behind (BHV-061/062).
+
+    Returns a structured outcome (P1-11): ``proven_dead`` is False when the
+    root survived the escalation ladder, so shutdown can report it instead
+    of the failure hiding in a log line.
     """
     if process.poll() is not None:
-        return
+        return ProcessKillOutcome(proven_dead=True, already_dead=True)
     pgid = process_group_id(process)
     if os.name == "nt":
         try:
@@ -417,7 +438,8 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> None:
         except Exception:
             pass
         _reap(process, 5.0)
-        return
+        dead = process.poll() is not None
+        return ProcessKillOutcome(proven_dead=dead)
 
     assert pgid is not None  # POSIX + live process (checked above) implies a pgid
     try:
@@ -456,16 +478,23 @@ def kill_tree(process: "subprocess.Popen", *, timeout: float = 3.0) -> None:
         except (ChildProcessError, ProcessLookupError):
             pass
 
+    dead = process.poll() is not None
+    survivors: tuple[int, ...] = ()
+    if not dead:
+        survivors = tuple(child_pids(process.pid))
+    return ProcessKillOutcome(proven_dead=dead, survivors=survivors)
 
-async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> None:
+
+async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> ProcessKillOutcome:
     """Terminate an asyncio subprocess and its owned process group.
 
     This is the async counterpart of :func:`kill_tree`; callers must use it
     for ``asyncio.subprocess.Process`` instances so cancellation cannot leave
-    validation/compiler grandchildren alive.
+    validation/compiler grandchildren alive. Returns the same structured
+    outcome (P1-11): ``proven_dead`` only when the root was observed exited.
     """
     if process is None or process.returncode is not None:
-        return
+        return ProcessKillOutcome(proven_dead=True, already_dead=True)
     pid = int(process.pid)
     if os.name == "nt":
         try:
@@ -473,18 +502,26 @@ async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> None:
         except ProcessLookupError:
             pass
         await _wait_async_process(process, timeout=5.0)
-        return
+        return ProcessKillOutcome(proven_dead=process.returncode is not None)
 
     try:
         pgid = os.getpgid(pid)
     except ProcessLookupError:
         pgid = None
-    if pgid is not None:
+    # Safety: if the child shares OUR process group (spawned without
+    # start_new_session=True), killpg would signal Athena itself. Fall back
+    # to the single-process handle, which is always safe.
+    try:
+        own_pgid = os.getpgid(0)
+    except ProcessLookupError:
+        own_pgid = None
+    if pgid is not None and pgid != own_pgid:
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             pass
     else:
+        pgid = None
         try:
             process.terminate()
         except ProcessLookupError:
@@ -503,6 +540,7 @@ async def kill_tree_async(process: Any, *, timeout: float = 3.0) -> None:
         except ProcessLookupError:
             pass
         await _wait_async_process(process, timeout=5.0)
+    return ProcessKillOutcome(proven_dead=process.returncode is not None)
 
 
 async def _wait_async_process(process: Any, *, timeout: float) -> None:

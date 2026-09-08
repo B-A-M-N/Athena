@@ -57,9 +57,11 @@ the PTY; only a `WM_PROTOCOLS`/`WM_DELETE_WINDOW` client message closes the
 native surface.
 
 The X11 layout has one physical-pixel authority in a canonical 1672×941
-AthenaBOX design space. The complete cabinet is uniformly scaled and
-letterboxed at other window ratios. Fontconfig/Xft metrics drive the operator
-cell size, baseline, PTY resize, text placement, and prompt hit testing.
+AthenaBOX design space. Responsive x/y axes fill the actual drawable at other
+window ratios while retaining the reference anchors; the minimum axis scale
+controls legibility and stroke sizing. Fontconfig/Xft metrics drive the
+operator cell size, baseline, PTY resize, text placement, and prompt hit
+testing.
 Prompt rows are derived from separate body/input/heading/instrument metrics;
 the status, editable input, hint, and caret are independently clipped and
 cannot escape the prompt bay. The CRT scene is rendered into a retained
@@ -82,33 +84,52 @@ owns the instrument prompt, `render/text.rs` owns Xft font metrics/caches,
 and `render/primitives.rs` owns OpenGL geometry and clipping. The platform
 boundary keeps XIM lookup in `native/src/platform/input_method.rs` and
 selection ownership in `native/src/platform/clipboard.rs`. Buddy data and
-pose vocabulary are isolated under `native/src/buddy/`, with separate Owl,
-Cat, and Bot sprite modules.
+pose vocabulary are isolated under `native/src/buddy/`, with authored matrix
+frames and character-specific detail overlays for Owl, Cat, and Bot.
 Projection changes, resize, focus, selection, and prompt edits invalidate the
-full frame. The lower control deck follows the reference rail: speaker,
+full frame. The lower control deck follows the reference rail: passive vent,
 operator prompt/status, system lamps, primary encoder, brightness, focus,
-power, and identity plate. Brightness and focus change OI presentation, while
-power toggles the OI display without affecting the agent session. The window
+CRT, and identity plate. Brightness and focus change OI presentation, while
+CRT toggles the OI display without affecting the agent session. The window
 uses a borderless Motif hint while preserving header-fascia drag through the
 WM moveresize protocol. The invisible 12-pixel perimeter is divided into eight
 edge/corner resize zones; each zone supplies the matching X cursor and EWMH
 moveresize direction. A `ConfigureNotify` remeasures the scale-aware Xft pixel
 sizes, refreshes metrics, recomputes the layout, and resizes the PTY before
 repainting. Static cabinet engraving is a clipped bitmap layer, so labels
-cannot bleed across physical modules; dynamic Xft is reserved for transcript,
-prompt, status, and live conversation text.
+cannot bleed across physical modules. Dynamic transcript, prompt, status, and
+live conversation text prefer Xft and retain a clipped OpenGL bitmap fallback
+for GLX pixmaps where XRender text is not composited reliably.
 
-During development, `athena native` launches the native executable with a
+The physical controls also have keyboard alternatives when the pointer is
+unavailable: F1/F2 lower or raise brightness, F3/F4 lower or raise focus, and
+F5 toggles the CRT display. These shortcuts apply only to the native prompt;
+alternate-screen terminal applications retain their function keys.
+
+`athena native` launches the packaged or release native executable with a
 Python Athena service session as its PTY child. The child publishes the same
 projection state over `ATHENA_NATIVE_BRIDGE_SOCKET`; the bridge is local to the
 native process and carries no credentials. Build the binary with:
 
 ```bash
-cargo build --manifest-path native/Cargo.toml --offline
+cargo build --release --manifest-path native/Cargo.toml --locked --offline
 athena native
 ```
 
-The native binary must be built first. `athena native` starts the Python
+For a release artifact, run `scripts/build-release-artifacts`; the native
+executable is shipped in the platform-tagged `athena-agent-native` companion
+wheel as `athena_native/athena-terminal`, while the universal Python wheel and
+sdist remain binary-free. `make native-package` builds only that companion
+wheel for local inspection. For an installed release, use the exact matching
+pair: `pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`.
+The companion uses `py3-none-<platform>` because it is not a CPython extension;
+that tag does not make the bundled ELF portable. The certified deployment
+floor is Linux x86_64 GNU/glibc >= 2.34 with external X11, Xft, and OpenGL
+libraries; the release linker policy separately caps imported GLIBC symbols
+at 2.34 and requires those libraries to remain linked.
+It remains operating-system, architecture, libc, and native-runtime specific.
+`ATHENA_NATIVE_BIN` remains an explicit override for platform-specific
+installations. `athena native` starts the Python
 service session inside the PTY and connects its local Unix-socket projection
 bridge; credentials are read by the service configuration and are never
 serialized into the projection bridge.
@@ -122,6 +143,12 @@ athena native --mascot off
 athena native --no-animations
 athena native --reduced-motion
 ```
+
+The protected temporal release lane may set
+`ATHENA_PRESENTATION_CLOCK=fixed` (100 ms per presented frame) or
+`ATHENA_PRESENTATION_CLOCK=fixed:<seconds>`. This test-only clock pins DAGOAL
+phase to the presented-frame sequence, making fixed-timestamp transition
+evidence reproducible without changing the normal wall-clock renderer.
 
 Use `athena native` for the AthenaBOX window. `athena chat` remains the
 host-terminal conversation surface and does not open this native compositor.
@@ -138,18 +165,20 @@ scripts/bench-rendering --require-native
 The input smoke asserts the exact line received by a PTY child, including
 middle editing and Unicode, then checks Ctrl-C cancellation leaves the window
 usable. The visual smoke captures the exact Athena window (not the X11 root)
-for 27 fixtures: idle, short typing, 80+ character typing with cursor movement,
-search, read, code, test, approval, and failure, each with Owl, Cat, and Bot.
-It checks dimensions, color complexity, contrast, the current rail schema, and
-a real 384×256 OI framebuffer dump. `--dump-layout` uses live Xft metrics when
+for the 27 baseline fixtures: idle, short typing, 80+ character typing with
+cursor movement, search, read, code, test, approval, and failure, each with
+Owl, Cat, and Bot. It also captures the required reviewed 1672×941
+idle/search/code/approval surfaces, all three Buddys, and fixed-clock temporal
+samples. It checks dimensions, color complexity, contrast, the current rail
+schema, and a real 384×256 OI framebuffer dump. `--dump-layout` uses live Xft metrics when
 an X display is available and explicitly marks `fallback_static` otherwise;
 `ATHENA_NATIVE_LAYOUT_DUMP` records the live runtime dump. The rendering benchmark
 separates idle, terminal activity, and semantic OI animation probes; the OI
 probe is fed a real search projection rather than merely printing terminal
-lines. Set `NATIVE_VISUAL_GOLDEN_DIR=/path/to/goldens` to compare captured
-fixtures against reviewed ImageMagick RMSE goldens; set
-`NATIVE_VISUAL_UPDATE_GOLDENS=1` only when intentionally refreshing that
-directory. No goldens are treated as approved until a human reviews the
+lines. Goldens are tracked under `native/assets/oi/visual-goldens/`; set
+`NATIVE_VISUAL_GOLDEN_DIR=/path/to/goldens` only to use an equivalent reviewed
+fixture set, and set `NATIVE_VISUAL_UPDATE_GOLDENS=1` only when intentionally
+refreshing it. The manifest remains unapproved until a human reviews the
 captures. All X11 checks skip with an explicit reason when a usable Xvfb
 display is unavailable. The same visual command additionally validates all
 five supported review sizes (`1672×941`, `1920×1080`, `1280×800`, `1280×720`,

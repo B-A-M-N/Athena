@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from athena.protocol.errors import PersistenceError, RequestCancelled
+from athena.protocol.errors import PersistenceError, RequestCancelled, TaskOwnershipLost
 from athena.protocol.tasks import TERMINAL_STATUSES, TaskResult, TaskStatus
 
 __all__ = [
@@ -25,6 +25,16 @@ class WorkerConfig:
     max_retries: int = 0
     retryable_statuses: tuple[TaskStatus, ...] = (TaskStatus.INTERRUPTED,)
     poll_wait_s: float = 0.5
+    # Worker lease held on each claimed task. The heartbeat renews it at
+    # ``lease_renewal_divisor`` of the duration so a live worker never lets a
+    # lease lapse while it is still driving the task (P0-1).
+    lease_duration_seconds: float = 300.0
+    lease_renewal_divisor: float = 3.0
+
+    @property
+    def lease_renewal_interval_s(self) -> float:
+        divisor = max(float(self.lease_renewal_divisor), 1.0)
+        return max(self.lease_duration_seconds / divisor, 0.01)
 
 
 class TaskWorker:
@@ -63,17 +73,33 @@ class TaskWorker:
         self._claimed_count = 0
         self._completed_count = 0
         self._active_kernel_tasks: set[asyncio.Task] = set()
+        # task_id -> True while a heartbeat has proven ownership was lost and
+        # the driving kernel is being interrupted (P0-1).
+        self._ownership_lost: dict[str, bool] = {}
 
-    async def stop(self) -> None:
-        """Signal the background loop to stop and await its graceful exit."""
+    async def stop(self, *, grace_seconds: float = 5.0) -> None:
+        """Signal the background loop to stop and quiesce every worker.
+
+        One bounded global deadline covers the whole pool: workers are waited
+        CONCURRENTLY until ``grace_seconds`` elapse, then pending ones are
+        cancelled and awaited to terminal coroutine state before
+        ``_worker_tasks`` is cleared (P0-2). The sequential wait/cancel that
+        previously leaked un-awaited cancelled coroutines is gone.
+        """
         self._stop.set()
         self._wake.set()
         tasks = getattr(self, "_worker_tasks", None) or ([] if self._task is None else [self._task])
-        for t in tasks:
-            try:
-                await asyncio.wait_for(t, timeout=5)
-            except (TimeoutError, asyncio.CancelledError):
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=max(grace_seconds, 0.0))
+            for t in pending:
                 t.cancel()
+            if pending:
+                # Every cancelled coroutine must reach terminal state before
+                # this method returns; results/exceptions are folded away.
+                await asyncio.gather(*pending, return_exceptions=True)
+            # Drain any already-done tasks so their exceptions are observed
+            # and the coroutines are definitely terminal.
+            await asyncio.gather(*done, return_exceptions=True)
         self._task = None
         self._worker_tasks = None
 
@@ -83,10 +109,11 @@ class TaskWorker:
 
     # ------------------------------------------------------------------ #
     async def run_once(self) -> TaskResult | None:
-        task_id = await self._claim(worker_id=f"run-once-{os.getpid()}")
+        worker_id = f"run-once-{os.getpid()}"
+        task_id = await self._claim(worker_id=worker_id)
         if task_id is None:
             return None
-        result = await self._run_claimed(task_id)
+        result = await self._run_claimed(task_id, worker_id=worker_id)
         if await self._maybe_retry(task_id, result):
             await self._tasks.enqueue(task_id)
         return result
@@ -102,10 +129,14 @@ class TaskWorker:
         store = getattr(self._tasks, "_store", None)
         worker_id = f"manual-{os.getpid()}"
         if store is not None:
-            await store.acquire_with_ownership(task_id, worker_id=worker_id)
+            await store.acquire_with_ownership(
+                task_id,
+                worker_id=worker_id,
+                lease_duration_seconds=self._config.lease_duration_seconds,
+            )
         else:
             await self._tasks.acquire(task_id)
-        result = await self._run_claimed(task_id)
+        result = await self._run_claimed(task_id, worker_id=worker_id)
         if await self._maybe_retry(task_id, result):
             await self._tasks.enqueue(task_id)
         return result
@@ -153,11 +184,8 @@ class TaskWorker:
                 except TimeoutError:
                     pass
                 continue
-            current = asyncio.current_task()
-            if current is not None:
-                self._active_kernel_tasks.add(current)
             try:
-                result = await self._run_claimed(task_id)
+                result = await self._run_claimed(task_id, worker_id=wid)
                 if await self._maybe_retry(task_id, result):
                     await self._tasks.enqueue(task_id)
                 self._completed_count += 1
@@ -167,9 +195,6 @@ class TaskWorker:
                 # degraded health signal so operators/recovery can retry it.
                 self._record_store_error("finalization", exc)
                 await asyncio.sleep(self._failure_backoff())
-            finally:
-                if current is not None:
-                    self._active_kernel_tasks.discard(current)
 
     async def _maybe_retry(self, task_id: str, result: TaskResult) -> bool:
         if self._config.max_retries <= 0:
@@ -200,15 +225,116 @@ class TaskWorker:
             return
         await store.set_retry_count(task_id, count)
 
-    async def _run_claimed(self, task_id: str) -> TaskResult:
+    async def _run_claimed(self, task_id: str, *, worker_id: str) -> TaskResult:
+        """Drive one claimed task with a lease heartbeat watching ownership.
+
+        The heartbeat renews the task's lease well inside its expiry. If a
+        renewal fails, the worker re-reads the durable row: only a RUNNING
+        row under a DIFFERENT owner is real ownership loss — the kernel is
+        cancelled immediately (its work is now duplicate work) and the loss
+        surfaces as :class:`TaskOwnershipLost` instead of a fabricated result.
+        Any other state (parked, interrupted by shutdown, terminal) is a
+        legitimate end to ownership that did not hand the task to someone
+        else; the kernel observes it through its normal runnability checks.
+        """
+        current = asyncio.current_task()
+        if current is not None:
+            self._active_kernel_tasks.add(current)
+        heartbeat = asyncio.create_task(
+            self._heartbeat_loop(task_id, worker_id=worker_id, driver=current)
+        )
         try:
             return await self._kernel.run_task(task_id)
+        except asyncio.CancelledError as exc:
+            if self._ownership_lost.get(task_id):
+                # The heartbeat cancelled us because another worker owns this
+                # task now; the new owner owns the final state. Do not write.
+                return _ownership_lost_result(task_id, exc)
+            raise  # shutdown/parent cancellation must keep propagating
+        except TaskOwnershipLost as exc:
+            self._ownership_lost[task_id] = True
+            return _ownership_lost_result(task_id, exc)
         except RequestCancelled as exc:
+            if self._ownership_lost.get(task_id):
+                return _ownership_lost_result(task_id, exc)
             return await self._mark_failed(task_id, TaskStatus.CANCELLED, f"task cancelled: {exc}")
         except Exception as exc:  # noqa: BLE001 - classify every kernel failure truthfully
+            if self._ownership_lost.get(task_id):
+                return _ownership_lost_result(task_id, exc)
             return await self._mark_failed(
                 task_id, TaskStatus.FAILED, f"worker kernel failure: {exc}"
             )
+        finally:
+            self._ownership_lost.pop(task_id, None)
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except (asyncio.CancelledError, Exception):
+                pass
+            if current is not None:
+                self._active_kernel_tasks.discard(current)
+
+    async def _heartbeat_loop(
+        self, task_id: str, *, worker_id: str, driver: asyncio.Task | None
+    ) -> None:
+        """Renew the claimed task's lease until the run ends (P0-1).
+
+        A failed renewal marks ownership lost and hard-cancels the driving
+        kernel task immediately: continuing to execute an unowned task is the
+        duplicate-execution hazard the lease exists to prevent.
+        """
+        store = getattr(self._tasks, "_store", None)
+        if store is None or not hasattr(store, "renew_lease"):
+            return
+        interval = self._config.lease_renewal_interval_s
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            if self._stop.is_set():
+                return
+            try:
+                renewed = await store.renew_lease(
+                    task_id,
+                    worker_id=worker_id,
+                    lease_duration_seconds=self._config.lease_duration_seconds,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - store outage is not ownership loss
+                _logger.warning("lease renewal store error for task %s: %s", task_id, exc)
+                continue
+            if renewed:
+                continue
+            # Distinguish real ownership loss (someone else RUNNING it now)
+            # from benign states (parked/interrupted/shutdown cleared the
+            # lease). Only the first must interrupt the kernel.
+            try:
+                row = await store.get(task_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                row = None
+            status = (row or {}).get("status")
+            if status and status != TaskStatus.RUNNING.value:
+                # Parked or otherwise left RUNNING legitimately; the kernel's
+                # own runnability checks will observe this. Keep heartbeating.
+                continue
+            claimed_by = (row or {}).get("claimed_by")
+            if claimed_by == worker_id:
+                # Renewal CAS failed for the same owner (transient); retry.
+                continue
+            _logger.error(
+                "lease ownership lost for task %s: held by %r, claimed by %r",
+                task_id,
+                worker_id,
+                claimed_by,
+            )
+            self._ownership_lost[task_id] = True
+            if driver is not None and not driver.done():
+                driver.cancel()
+            return
 
     async def _mark_failed(self, task_id: str, status: TaskStatus, reason: str) -> TaskResult:
         try:
@@ -233,7 +359,12 @@ class TaskWorker:
             self._record_store_error("claim", RuntimeError("task store is unavailable"))
             return None
         try:
-            row = await store.claim_with_lease(self._claim_statuses, worker_id=worker_id)
+            row = await store.claim_with_lease(
+                self._claim_statuses,
+                worker_id=worker_id,
+                lease_duration_seconds=self._config.lease_duration_seconds,
+                reclaim_grace_seconds=self._config.lease_renewal_interval_s,
+            )
         except Exception as exc:
             self._record_store_error("claim", exc)
             _logger.exception("task claim failed; queue health is degraded")
@@ -294,6 +425,19 @@ class TaskWorker:
         # tests and operator quiescing.  A negative value remains invalid but
         # must not accidentally create a worker either.
         return max(0, self._config.max_parallel)
+
+
+def _ownership_lost_result(task_id: str, exc: BaseException) -> TaskResult:
+    """A non-authoritative result for a run whose lease was taken over.
+
+    The new owner owns the durable state; this worker must not transition or
+    finalize the task. The result only reports what THIS worker observed.
+    """
+    return TaskResult(
+        task_id=task_id,
+        status=TaskStatus.INTERRUPTED,
+        summary=(f"worker lost task ownership: {exc}; final state belongs to the current owner"),
+    )
 
 
 def _database_is_closed(error: BaseException) -> bool:

@@ -43,6 +43,7 @@ class SkillsCapability:
             "Skills: search the installed skill library, or trigger a skill by "
             "id. Delegates to the skills loader/selector."
         ),
+        tags=frozenset({"skill", "skills", "learn", "activate"}),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.EXECUTE}),
         origin=CapabilityOrigin.NATIVE,

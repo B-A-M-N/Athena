@@ -58,35 +58,92 @@ class TaskTemplate:
     delivery_channel: str | None = None
     acceptance_criteria: tuple[Criterion, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    capability_policy: CapabilityPolicy | None = None
+    model_policy: ModelPolicy | None = None
+    resource_budget: ResourceBudget | None = None
+    autonomy: str = "supervised"
+    # Service-owned, immutable-at-intake authority snapshot. The public
+    # template remains descriptive; future occurrences read this separately
+    # persisted snapshot so a model cannot widen its own schedule.
+    authority_snapshot: Mapping[str, Any] = field(default_factory=dict)
 
     def build_task_spec(self, job_id: str, occurrence_key: str | None = None) -> TaskSpec:
         workspace = None
-        if self.workspace_id or self.workspace_root:
+        authority_workspace = self.authority_snapshot.get("workspace")
+        if not isinstance(authority_workspace, Mapping):
+            authority_workspace = {}
+        workspace_id = authority_workspace.get("id") or self.workspace_id
+        workspace_root = authority_workspace.get("root") or self.workspace_root
+        if workspace_id or workspace_root:
             workspace_kwargs: dict[str, Any] = {}
-            if self.network_policy:
-                workspace_kwargs["network_policy"] = NetworkPolicy(self.network_policy)
-            if self.mutation_mode:
-                workspace_kwargs["mutation_mode"] = MutationMode(self.mutation_mode)
+            network = authority_workspace.get("network_policy") or self.network_policy
+            mutation = authority_workspace.get("mutation_mode") or self.mutation_mode
+            if network:
+                workspace_kwargs["network_policy"] = NetworkPolicy(str(network))
+            if mutation:
+                workspace_kwargs["mutation_mode"] = MutationMode(str(mutation))
             workspace = WorkspaceSpec(
-                id=self.workspace_id or job_id,
-                root=self.workspace_root or ".",
+                id=str(workspace_id or job_id),
+                root=str(workspace_root or "."),
+                readable=_path_rules(authority_workspace.get("readable")),
+                writable=_path_rules(authority_workspace.get("writable")),
+                temp_root=authority_workspace.get("temp_root"),
+                execution_backend=authority_workspace.get("execution_backend"),
+                revision=authority_workspace.get("revision"),
                 **workspace_kwargs,
             )
-        budget = ResourceBudget()
-        if self.max_agent_iterations is not None:
+        budget = _budget_from_record(self.authority_snapshot.get("resource_budget"))
+        if budget is None:
+            budget = self.resource_budget or ResourceBudget()
+        if (
+            self.max_agent_iterations is not None
+            and self.resource_budget is None
+            and not self.authority_snapshot.get("resource_budget")
+        ):
             budget = ResourceBudget(max_agent_iterations=self.max_agent_iterations)
+        capability_policy = (
+            _capability_policy_from_record(self.authority_snapshot.get("capability_policy"))
+            or self.capability_policy
+        )
+        if capability_policy is None:
+            capability_policy = CapabilityPolicy(allow=self.capability_allow)
+        model_policy = (
+            _model_policy_from_record(self.authority_snapshot.get("model_policy"))
+            or self.model_policy
+        )
+        if model_policy is None:
+            model_policy = ModelPolicy(role=self.model_role)
+        if (
+            not self.authority_snapshot
+            and self.capability_policy is None
+            and not self.capability_allow
+        ):
+            # A hand-authored legacy template has no creator authority to
+            # inherit. Keep it capability-free until a service-owned schedule
+            # snapshot is supplied.
+            capability_policy = CapabilityPolicy(deny=("*",))
         metadata = dict(self.metadata)
         if occurrence_key is not None:
             metadata["_occurrence"] = occurrence_key
+        metadata.setdefault(
+            "autonomy", str(self.authority_snapshot.get("autonomy") or self.autonomy)
+        )
+        if self.authority_snapshot:
+            metadata["_authority_snapshot"] = dict(self.authority_snapshot)
+        # A template without a persistent session minted one fresh session per
+        # occurrence (the default). TaskManager._ensure_session creates the
+        # row; the lineage in metadata ties the occurrence back to its
+        # schedule and the conversation that scheduled it.
+        session_id = self.session_id or new_id("session")
         return TaskSpec(
             id=new_id("task"),
             objective=self.objective,
             acceptance_criteria=self.acceptance_criteria,
-            session_id=self.session_id,
+            session_id=session_id,
             parent_task_id=self.parent_task_id,
             workspace=workspace,
-            capability_policy=CapabilityPolicy(allow=self.capability_allow),
-            model_policy=ModelPolicy(role=self.model_role),
+            capability_policy=capability_policy,
+            model_policy=model_policy,
             resource_budget=budget,
             deadline=self.deadline,
             delivery=(
@@ -172,6 +229,8 @@ def _template_from_job(job: dict) -> TaskTemplate:
     template = raw_template if isinstance(raw_template, dict) else src
     itinerary = template.get("task_template")
     active = itinerary if isinstance(itinerary, dict) else template
+    authority = meta.get("_authority_snapshot") if isinstance(meta, dict) else None
+    authority = dict(authority) if isinstance(authority, Mapping) else {}
     deadline = _to_dt(active.get("deadline"))
     return TaskTemplate(
         objective=active.get("objective") or job.get("name") or "",
@@ -188,7 +247,47 @@ def _template_from_job(job: dict) -> TaskTemplate:
         delivery_channel=active.get("delivery_channel"),
         acceptance_criteria=_criteria_from_records(active.get("acceptance_criteria")),
         metadata=dict(active.get("metadata") or {}),
+        authority_snapshot=authority,
     )
+
+
+def _path_rules(raw: Any) -> tuple:
+    from athena.protocol.tasks import PathRule
+
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(
+        PathRule(path=str(item.get("path") or ""), allow=bool(item.get("allow", True)))
+        for item in raw
+        if isinstance(item, Mapping) and item.get("path")
+    )
+
+
+def _capability_policy_from_record(raw: Any) -> CapabilityPolicy | None:
+    if not isinstance(raw, Mapping):
+        return None
+    return CapabilityPolicy(
+        effects=frozenset(str(value) for value in raw.get("effects") or ()),
+        allow=tuple(str(value) for value in raw.get("allow") or ()),
+        ask=tuple(str(value) for value in raw.get("ask") or ()),
+        deny=tuple(str(value) for value in raw.get("deny") or ()),
+    )
+
+
+def _model_policy_from_record(raw: Any) -> ModelPolicy | None:
+    if not isinstance(raw, Mapping):
+        return None
+    from athena.api.decoders import decode_model_policy
+
+    return decode_model_policy(raw)
+
+
+def _budget_from_record(raw: Any) -> ResourceBudget | None:
+    if not isinstance(raw, Mapping):
+        return None
+    from athena.api.decoders import decode_budget
+
+    return decode_budget(raw)
 
 
 def _criteria_from_records(value: Any) -> tuple[Criterion, ...]:
@@ -230,15 +329,29 @@ class Scheduler:
         store: ScheduleStore,
         task_manager: Any,
         *,
+        admission: Any = None,
+        intake: Any = None,
         max_concurrent: int = 0,
         loop_interval_seconds: float = 1.0,
     ) -> None:
         self._store = store
         self._tm = task_manager
+        self._admission = admission
+        self._intake = intake
         self._max_concurrent = max_concurrent
         self._loop_interval = loop_interval_seconds
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._health: dict[str, Any] = {
+            "started_at": None,
+            "last_tick_at": None,
+            "last_success_at": None,
+            "last_error_at": None,
+            "last_error": None,
+            "consecutive_failures": 0,
+            "reconciliation_failures": 0,
+            "health": "stopped",
+        }
 
     async def tick(self, now: datetime | None = None) -> int:
         """Claim and enqueue due jobs for this tick. Returns number fired."""
@@ -257,7 +370,38 @@ class Scheduler:
             fires += 1
         return fires
 
+    async def run_now(self, job_id: str) -> str | None:
+        """Run one enabled job occurrence through the normal claim path.
+
+        Operator-triggered runs retain the same durable claim, task metadata,
+        admission, and receipt semantics as scheduled runs.  They are not a
+        second execution loop and are deliberately refused for disabled or
+        missing jobs.
+        """
+        job = await self._store.get_job_id(job_id)
+        if job is None or not bool(job.get("enabled")):
+            return None
+        scheduled_for = utcnow().isoformat()
+        claim = await self._store.claim_next_due(job_id, scheduled_for)
+        if claim is None:
+            return None
+        try:
+            await self._fire_claim(job, _to_claim(claim))
+        except Exception:
+            # _fire_claim releases an unmaterialized claim; preserve the
+            # exception for the operator instead of reporting a false run.
+            raise
+        run = await self._store.last_run(job_id)
+        return str(run.get("task_id")) if run and run.get("task_id") else None
+
     async def notify_event(self, event: Any) -> int:
+        try:
+            return await self._notify_event(event)
+        except Exception as exc:
+            self._record_error(exc)
+            raise
+
+    async def _notify_event(self, event: Any) -> int:
         """Fire matching EVENT jobs using the same durable claim path.
 
         The event ID is the occurrence identity. Replayed or multiply-delivered
@@ -297,6 +441,7 @@ class Scheduler:
                 continue
             await self._fire_claim(job, _to_claim(claim), event=event)
             fired += 1
+        self._record_success()
         return fired
 
     async def _fire_claim(self, job: dict, claim: Claim, *, event: Any = None) -> None:
@@ -311,14 +456,32 @@ class Scheduler:
             }
         template = replace(template, metadata=metadata)
         spec = template.build_task_spec(job["id"], occurrence_key=occurrence_key)
+        created = None
         try:
-            created = await self._tm.create(spec)
+            if self._intake is not None:
+                result = self._intake(spec, wait=False, trusted=True)
+                created = await result if asyncio.iscoroutine(result) else result
+            else:
+                if self._admission is not None:
+                    result = self._admission(spec)
+                    if asyncio.iscoroutine(result):
+                        await result
+                created = await self._tm.create(spec)
+                if created is None:
+                    raise RuntimeError(
+                        "TaskManager.create returned no Task for scheduled occurrence"
+                    )
+                await self._tm.enqueue(created.id)
+            if created is None:
+                raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")
         except Exception:
-            await self._store.release_claim(claim.claim_id, job["id"], claim.scheduled_for)
+            # A successful create followed by enqueue failure leaves a real
+            # CREATED task that reconciliation can enqueue. Releasing that
+            # claim would permit a duplicate Task for the same occurrence.
+            if created is None:
+                await self._store.release_claim(claim.claim_id, job["id"], claim.scheduled_for)
             raise
-        task_id = created.id if created is not None else None
-        if task_id is not None:
-            await self._tm.enqueue(task_id)
+        task_id = created.id
         trigger = _trigger_from_job(job)
         disable = bool(
             trigger is not None
@@ -360,7 +523,14 @@ class Scheduler:
         """Start the background tick loop."""
         if self._task is not None and not self._task.done():
             return
-        await self.reconcile()
+        self._health["started_at"] = utcnow().isoformat()
+        self._health["health"] = "recovering"
+        try:
+            await self.reconcile()
+        except Exception as exc:
+            self._record_error(exc, reconciliation=True)
+            self._health["health"] = "failed"
+            raise
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
 
@@ -373,7 +543,29 @@ class Scheduler:
         its metadata) the occurrence is marked FIRED; otherwise it is released
         so the next tick reclaims and retries it.
         """
-        await self._store.reconcile_stale_occurrences()
+        reconcile = self._store.reconcile_stale_occurrences
+        if isinstance(self._store, ScheduleStore):
+            await reconcile(
+                task_manager=self._tm,
+                next_run_resolver=self._recovery_schedule,
+            )
+        else:
+            # Keep small test/embedding stores compatible with the original
+            # zero-argument reconciliation protocol.
+            await reconcile()
+
+    async def _recovery_schedule(
+        self, job: dict[str, Any], scheduled_for: str
+    ) -> tuple[str | None, bool]:
+        next_run, exhausted = self._next_run(
+            job,
+            Claim(claim_id="recovery", job_id=str(job["id"]), scheduled_for=scheduled_for),
+        )
+        trigger = _trigger_from_job(job)
+        disable = exhausted
+        if trigger is not None and trigger.times is not None:
+            disable = disable or await self._store.count_runs(job["id"]) >= trigger.times
+        return next_run, disable
 
     async def stop(self) -> None:
         self._stop.set()
@@ -383,6 +575,7 @@ class Scheduler:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
             self._task = None
+        self._health["health"] = "stopped"
 
     def is_running(self) -> bool:
         """True iff the background tick loop task exists and is not done.
@@ -396,28 +589,67 @@ class Scheduler:
             self._task.done() if hasattr(self._task, "done") else True
         )
 
+    def health(self) -> dict[str, Any]:
+        """Return scheduler health independently of coroutine liveness."""
+        report = dict(self._health)
+        report["running"] = self.is_running()
+        # Compatibility for embedders that install a live loop task directly;
+        # a real start() always moves the state to recovering first.
+        if report["running"] and report["health"] == "stopped":
+            report["health"] = "healthy"
+        return report
+
+    def _record_error(self, exc: Exception, *, reconciliation: bool = False) -> None:
+        now = utcnow().isoformat()
+        self._health["last_error_at"] = now
+        self._health["last_error"] = str(exc)
+        self._health["consecutive_failures"] = int(self._health.get("consecutive_failures", 0)) + 1
+        if reconciliation:
+            self._health["reconciliation_failures"] = (
+                int(self._health.get("reconciliation_failures", 0)) + 1
+            )
+        self._health["health"] = (
+            "failed" if self._health["consecutive_failures"] >= 3 else "degraded"
+        )
+
+    def _record_success(self) -> None:
+        previous = str(self._health.get("health") or "")
+        self._health["last_success_at"] = utcnow().isoformat()
+        self._health["consecutive_failures"] = 0
+        self._health["health"] = "recovering" if previous == "failed" else "healthy"
+
     async def _run(self) -> None:
         # Give callers one scheduling turn after startup to finish durable
         # setup or perform an explicit tick.  Immediate first-pass polling
         # makes a due occurrence race with recovery/bootstrap code.
         try:
-            await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
-        except asyncio.TimeoutError:
-            pass
-        while not self._stop.is_set():
-            try:
-                await self.tick()
-            except Exception as exc:
-                _logger.warning("scheduler tick failed: %s", exc)
-                # If a claim was left open, attempt immediate reconciliation
-                try:
-                    await self.reconcile()
-                except Exception:
-                    pass
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
             except asyncio.TimeoutError:
-                continue
+                pass
+            while not self._stop.is_set():
+                self._health["last_tick_at"] = utcnow().isoformat()
+                try:
+                    await self.tick()
+                except Exception as exc:
+                    self._record_error(exc)
+                    _logger.warning("scheduler tick failed: %s", exc)
+                    # If a claim was left open, attempt immediate reconciliation
+                    try:
+                        await self.reconcile()
+                    except Exception as reconcile_error:
+                        self._record_error(reconcile_error, reconciliation=True)
+                        _logger.warning("scheduler reconciliation failed: %s", reconcile_error)
+                else:
+                    self._record_success()
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=self._loop_interval)
+                except asyncio.TimeoutError:
+                    continue
+        except Exception as exc:
+            self._record_error(exc)
+            self._health["health"] = "failed"
+            raise
 
 
 def _filters_match(filters: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:

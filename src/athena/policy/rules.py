@@ -66,13 +66,62 @@ class Rule:
 
 @dataclass(frozen=True)
 class RuleSet:
-    """An ordered set of rules evaluated highest-priority first."""
+    """An ordered set of rules evaluated highest-priority first.
+
+    Two compiled views are built once at construction (the set is frozen,
+    so they can never go stale):
+
+    * ``_compiled`` — all rules in priority order (returned by ``ordered``).
+    * ``_by_effect`` — per-effect sublists in priority order, so an
+      evaluation for a concrete effect scans only rules that could match
+      it, instead of the whole set.
+
+    Semantics are unchanged: first matching rule in priority order wins;
+    the default applies when nothing matches.
+    """
 
     rules: tuple[Rule, ...] = field(default_factory=tuple)
     default: str = "ask"
 
-    def ordered(self) -> list[Rule]:
-        return sorted(self.rules, key=lambda r: r.priority, reverse=True)
+    def __post_init__(self) -> None:
+        compiled = tuple(sorted(self.rules, key=lambda r: r.priority, reverse=True))
+        object.__setattr__(self, "_compiled", compiled)
+        # Per-effect candidate lists: the effect-specific rules for that
+        # effect MERGED with the effect-agnostic rules, in the compiled
+        # priority order. Merging at build time (rather than appending
+        # agnostic rules after the specific ones) preserves exact
+        # first-match-in-priority-order semantics between the two kinds.
+        specific: dict[EffectClass, list[Rule]] = {}
+        agnostic: list[Rule] = []
+        for rule in compiled:
+            if rule.effect is not None:
+                target = (
+                    rule.effect
+                    if isinstance(rule.effect, EffectClass)
+                    else EffectClass(rule.effect)
+                )
+                specific.setdefault(target, []).append(rule)
+            else:
+                agnostic.append(rule)
+        by_effect: dict[EffectClass, tuple[Rule, ...]] = {}
+        for effect, rules_for in specific.items():
+            merged = sorted(
+                [*rules_for, *agnostic],
+                key=lambda r: r.priority,
+                reverse=True,
+            )
+            by_effect[effect] = tuple(merged)
+        if agnostic:
+            # Effect-agnostic rules must also fire for effects with no
+            # specific rules; index the union so such scans find them.
+            agnostic_tuple = tuple(agnostic)
+            for effect in EffectClass:
+                if effect not in by_effect:
+                    by_effect[effect] = agnostic_tuple
+        object.__setattr__(self, "_by_effect", by_effect)
+
+    def ordered(self) -> tuple[Rule, ...]:
+        return self._compiled  # type: ignore[attr-defined]
 
     def evaluate(
         self,
@@ -81,6 +130,14 @@ class RuleSet:
         arguments: dict[str, Any],
     ) -> tuple[str, str] | None:
         """Return (verdict, matched_rule_name) for the first matching rule."""
+        if len(effects) == 1:
+            effect = next(iter(effects))
+            candidates = self._by_effect.get(effect)  # type: ignore[attr-defined]
+            if candidates is not None:
+                for rule in candidates:
+                    if rule.matches(capability_id, effects, arguments):
+                        return rule.verdict, rule.name
+                return None
         for rule in self.ordered():
             if rule.matches(capability_id, effects, arguments):
                 return rule.verdict, rule.name

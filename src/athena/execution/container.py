@@ -12,7 +12,6 @@ closed with an actionable error.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -24,10 +23,12 @@ from collections.abc import Callable
 from typing import Any, AsyncIterator, Mapping
 
 from athena.execution.backend import ExecutionBackend
+from athena.execution.async_call import run_blocking
 from athena.execution.process_tree import spawn_owned
 from athena.execution.runtimes.base import BaseRuntime
 from athena.execution.runtimes.python import _PythonSession, _WORKER_SOURCE
 from athena.execution.runtimes.shell import _SubprocessSession
+from athena.state.runtime_sessions import environment_fingerprint, sanitize_environment
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionEventType,
@@ -85,6 +86,8 @@ class _ContainerSession:
         workspace_root: str,
         image_ref: str,
         image_digest: str,
+        network_policy: str,
+        start_identity: str,
     ) -> None:
         self.id = session_id
         self.task_id = task_id
@@ -96,6 +99,8 @@ class _ContainerSession:
         self.workspace_root = workspace_root
         self.image_ref = image_ref
         self.image_digest = image_digest
+        self.network_policy = network_policy
+        self.start_identity = start_identity
 
     def run(self, request: ExecutionRequest, execution_id: str) -> Any:
         return self.worker.run(request.source, request.timeout, execution_id)
@@ -121,6 +126,7 @@ class ContainerBackend(ExecutionBackend):
     """
 
     name = "container"
+    supports_reattach = True
     _RUNTIME_ALIASES = {
         "python": "python",
         "python3": "python",
@@ -238,6 +244,20 @@ class ContainerBackend(ExecutionBackend):
             raise RuntimeError(error)
         return (result.stdout or "").strip()
 
+    def _inspect_container(self, container_id: str) -> dict[str, Any]:
+        raw = self._run_docker(["inspect", "--format", "{{json .}}", container_id])
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Docker returned invalid container metadata for {container_id}"
+            ) from exc
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Docker returned no metadata for container {container_id}")
+        return value
+
     def _resolve_image(self) -> tuple[str, str]:
         """Resolve the configured image to an immutable local identity.
 
@@ -287,12 +307,18 @@ class ContainerBackend(ExecutionBackend):
         task_id: str,
         workspace_root: str,
         network_policy: NetworkPolicy | str | None,
+        runtime: str = "python",
+        env: Mapping[str, str] | None = None,
         image_ref: str | None = None,
+        session_id: str | None = None,
+        image_digest: str | None = None,
     ) -> str:
+        root = self._workspace_root(workspace_root)
         policy = getattr(network_policy, "value", network_policy) or NetworkPolicy.DENY.value
         command = [
             "run",
             "--detach",
+            "--interactive",
             "--rm",
             "--name",
             f"athena-{uuid.uuid4().hex[:16]}",
@@ -304,17 +330,31 @@ class ContainerBackend(ExecutionBackend):
             "--tmpfs",
             "/tmp:rw,nosuid,nodev",
             "--mount",
-            f"type=bind,source={workspace_root},target={_WORKSPACE_MOUNT},readonly",
+            f"type=bind,source={root},target={_WORKSPACE_MOUNT},readonly",
             "--workdir",
             _CONTAINER_CWD,
         ]
+        for key, value in self._validate_env(env).items():
+            command.extend(("--env", f"{key}={value}"))
+        labels: dict[str, str | None] = {
+            "athena.session_id": session_id,
+            "athena.runtime": runtime,
+            "athena.workspace_identity": root,
+            "athena.network_policy": policy,
+            "athena.image_digest": image_digest,
+        }
+        for label_key, label_value in labels.items():
+            if label_value:
+                command.extend(("--label", f"{label_key}={label_value}"))
         if policy != NetworkPolicy.ALLOW.value:
             # Restricted currently has no allowlist representation at the
             # execution boundary, so it is fail-closed like denied network.
             command.extend(("--network", "none"))
-        command.extend(
-            (image_ref or self._resolve_image()[0], "sh", "-c", "while :; do sleep 3600; done")
-        )
+        if runtime == "shell":
+            container_program: tuple[str, ...] = ("bash", "--norc", "--noprofile")
+        else:
+            container_program = ("python", "-u", "-c", _WORKER_SOURCE)
+        command.extend((image_ref or self._resolve_image()[0], *container_program))
         container_id = self._run_docker(command)
         if not container_id:
             raise RuntimeError("Docker returned an empty container id")
@@ -328,21 +368,12 @@ class ContainerBackend(ExecutionBackend):
         cwd: str,
         env: Mapping[str, str],
     ) -> list[str]:
-        command = [
-            self.docker_command,
-            "exec",
-            "-i",
-            "--workdir",
-            cwd,
-        ]
-        for key, value in env.items():
-            command.extend(("--env", f"{key}={value}"))
-        command.extend((container_id, "bash" if runtime == "shell" else "python"))
-        if runtime == "shell":
-            command.extend(("--norc", "--noprofile"))
-        else:
-            command.extend(("-u", "-c", _WORKER_SOURCE))
-        return command
+        del runtime, cwd, env
+        # The worker is the container's long-lived init process. Attaching to
+        # that exact process is what makes Python/shell state survive an
+        # Athena restart; starting a fresh ``docker exec`` worker would lose
+        # the state while still looking superficially persistent.
+        return [self.docker_command, "attach", container_id]
 
     def _make_session(
         self,
@@ -365,8 +396,15 @@ class ContainerBackend(ExecutionBackend):
             task_id=task_id,
             workspace_root=root,
             network_policy=network_policy,
+            runtime=canonical,
+            env=values,
             image_ref=image_ref,
+            session_id=session_id,
+            image_digest=image_digest,
         )
+        inspected = self._inspect_container(container_id)
+        state = inspected.get("State") or {}
+        start_identity = str(state.get("StartedAt") or container_id)
         command = self._exec_command(
             container_id=container_id,
             runtime=canonical,
@@ -400,6 +438,8 @@ class ContainerBackend(ExecutionBackend):
             workspace_root=root,
             image_ref=image_ref,
             image_digest=image_digest,
+            network_policy=str(getattr(network_policy, "value", network_policy) or "deny"),
+            start_identity=start_identity,
         )
 
     async def create_session(
@@ -413,7 +453,7 @@ class ContainerBackend(ExecutionBackend):
         network_policy: NetworkPolicy | str | None = None,
     ) -> str:
         session_id = f"container_{task_id}_{uuid.uuid4().hex[:10]}"
-        session = await asyncio.to_thread(
+        session = await run_blocking(
             self._make_session,
             session_id=session_id,
             task_id=task_id,
@@ -426,6 +466,145 @@ class ContainerBackend(ExecutionBackend):
         self._sessions[session_id] = session
         self._tasks.setdefault(task_id, []).append(session_id)
         return session_id
+
+    def _reattach(self, record: Mapping[str, Any]) -> _ContainerSession:
+        session_id = str(record.get("id") or "")
+        task_id = str(record.get("task_id") or "")
+        runtime = self._canonical_runtime(str(record.get("runtime") or ""))
+        raw_metadata = record.get("metadata")
+        metadata: Mapping[str, Any] = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+        container_id = str(metadata.get("container_id") or record.get("process_identity") or "")
+        if not session_id or not task_id or not container_id:
+            raise RuntimeError("runtime record lacks container/session ownership identity")
+        inspected = self._inspect_container(container_id)
+        labels = (inspected.get("Config") or {}).get("Labels") or {}
+        expected_labels = {
+            "athena.session_id": session_id,
+            "athena.task_id": task_id,
+            "athena.backend": self.name,
+            "athena.runtime": runtime,
+        }
+        for key, expected in expected_labels.items():
+            if str(labels.get(key) or "") != expected:
+                raise RuntimeError(f"container identity mismatch for {key}")
+        if str(inspected.get("Id") or container_id) != container_id:
+            raise RuntimeError("container process identity does not match durable identity")
+        if not bool((inspected.get("State") or {}).get("Running")):
+            raise RuntimeError("container is not running")
+
+        workspace = str(record.get("workspace_identity") or metadata.get("workspace_root") or "")
+        if not workspace or os.path.realpath(workspace) != str(
+            labels.get("athena.workspace_identity") or ""
+        ):
+            raise RuntimeError("container workspace identity mismatch")
+        network_policy = str(
+            record.get("network_policy") or metadata.get("network_policy") or "deny"
+        )
+        if str(labels.get("athena.network_policy") or "") != network_policy:
+            raise RuntimeError("container network policy identity mismatch")
+        expected_start = str(record.get("start_identity") or metadata.get("start_identity") or "")
+        actual_start = str((inspected.get("State") or {}).get("StartedAt") or "")
+        if expected_start and actual_start and expected_start != actual_start:
+            raise RuntimeError("container start identity mismatch")
+        network_mode = str((inspected.get("HostConfig") or {}).get("NetworkMode") or "")
+        if network_policy != NetworkPolicy.ALLOW.value and network_mode != "none":
+            raise RuntimeError("container network contract no longer matches")
+        if network_policy == NetworkPolicy.ALLOW.value and network_mode == "none":
+            raise RuntimeError("container network contract no longer matches")
+        mounts = inspected.get("Mounts") or []
+        workspace_mount = next(
+            (mount for mount in mounts if mount.get("Destination") == _WORKSPACE_MOUNT), None
+        )
+        if (
+            not isinstance(workspace_mount, Mapping)
+            or os.path.realpath(str(workspace_mount.get("Source") or ""))
+            != os.path.realpath(workspace)
+            or bool(workspace_mount.get("RW"))
+        ):
+            raise RuntimeError("container workspace mount contract no longer matches")
+
+        raw_environment = metadata.get("environment")
+        # ``env`` is the pre-redaction spelling used by older records. Sanitize
+        # it before use and refuse reattachment when a credential-bearing
+        # value was omitted, because the restored environment is then not
+        # provably identical to the original runtime.
+        if not isinstance(raw_environment, Mapping):
+            raw_environment = metadata.get("env")
+        env, redacted_environment_keys = sanitize_environment(raw_environment)
+        if redacted_environment_keys:
+            raise RuntimeError(
+                "container reattachment cannot prove redacted environment identity: "
+                + ", ".join(redacted_environment_keys)
+            )
+        expected_environment = str(
+            record.get("environment_fingerprint") or metadata.get("environment_fingerprint") or ""
+        )
+        if expected_environment and expected_environment != environment_fingerprint(env):
+            raise RuntimeError("container environment identity mismatch")
+        cwd = str(record.get("cwd") or workspace)
+        container_cwd = (
+            cwd
+            if cwd == _WORKSPACE_MOUNT or cwd.startswith(_WORKSPACE_MOUNT + "/")
+            else self._workspace_cwd(workspace, cwd)
+        )
+        image_digest = str(
+            metadata.get("image_digest")
+            or record.get("runtime_version")
+            or labels.get("athena.image_digest")
+            or ""
+        )
+        if image_digest and str(labels.get("athena.image_digest") or "") != image_digest:
+            raise RuntimeError("container image identity mismatch")
+        image_ref = str((inspected.get("Config") or {}).get("Image") or image_digest)
+        command = self._exec_command(
+            container_id=container_id,
+            runtime=runtime,
+            cwd=container_cwd,
+            env=self._validate_env(env),
+        )
+        worker: Any
+        if runtime == "shell":
+            worker = _SubprocessSession(
+                env={}, cwd=None, start_cmd=command, sandbox_root=None, network_policy=None
+            )
+        else:
+            worker = _DockerPythonSession(command=command, env=env)
+        worker.start()
+        return _ContainerSession(
+            session_id=session_id,
+            task_id=task_id,
+            runtime=runtime,
+            container_id=container_id,
+            cwd=container_cwd,
+            env=self._validate_env(env),
+            worker=worker,
+            workspace_root=workspace,
+            image_ref=image_ref,
+            image_digest=image_digest,
+            network_policy=network_policy,
+            start_identity=actual_start or expected_start or container_id,
+        )
+
+    async def describe_session(self, runtime_session_id: str) -> Mapping[str, str]:
+        session = self._sessions.get(runtime_session_id)
+        if session is None:
+            raise RuntimeError(f"unknown container runtime session: {runtime_session_id}")
+        return {
+            "container_id": session.container_id,
+            "process_identity": session.container_id,
+            "start_identity": session.start_identity,
+            "workspace_identity": session.workspace_root,
+            "network_policy": session.network_policy,
+            "runtime_version": session.image_digest,
+            "image_digest": session.image_digest,
+            "image_ref": session.image_ref,
+        }
+
+    async def reattach_session(self, record: Mapping[str, Any]) -> str:
+        session = await run_blocking(self._reattach, record)
+        self._sessions[session.id] = session
+        self._tasks.setdefault(session.task_id, []).append(session.id)
+        return session.id
 
     async def execute(self, request: ExecutionRequest) -> AsyncIterator[ExecutionEvent]:
         execution_id = str(request.metadata.get("__execution_id") or uuid.uuid4().hex)
@@ -461,6 +640,9 @@ class ContainerBackend(ExecutionBackend):
                 "backend": self.name,
                 "image": session.image_ref,
                 "image_digest": session.image_digest,
+                "start_identity": session.start_identity,
+                "workspace_identity": session.workspace_root,
+                "network_policy": session.network_policy,
             },
         )
         try:
@@ -486,7 +668,7 @@ class ContainerBackend(ExecutionBackend):
         if not task_sessions:
             self._tasks.pop(session.task_id, None)
         session.close()
-        await asyncio.to_thread(self._remove_container, session.container_id)
+        await run_blocking(self._remove_container, session.container_id)
 
     def _remove_container(self, container_id: str) -> None:
         try:

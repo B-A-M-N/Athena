@@ -117,3 +117,25 @@ async def test_compression_reuses_summary_for_unchanged_source():
 
     await compressor.compress([_sel("a", "changed"), selections[1]])
     assert len(calls) > first_count
+
+
+async def test_long_summary_maps_complete_range_before_reducing():
+    calls: list[tuple[str, int | None]] = []
+
+    async def summarize(text: str, *, max_tokens: int | None = None) -> str:
+        calls.append((text, max_tokens))
+        if "IMPORTANT DECISION" in text:
+            return "IMPORTANT DECISION: keep the durable transcript anchor."
+        return "bounded chunk summary"
+
+    compressor = ContextCompressor(recent_turns=0, max_summary_chars=600, summarizer=summarize)
+    text = "IMPORTANT DECISION: keep the durable transcript anchor. " + ("later noise " * 1_500)
+
+    result, record = await compressor.compress([_sel("long", text)])
+
+    assert record.occurred
+    assert "IMPORTANT DECISION" in "\n".join(item.text for item in result)
+    assert len(calls) >= 3  # map pass plus final reduction, not a tail-only call
+    await compressor._summarize(text, max_tokens=64)  # noqa: SLF001 - callback contract
+    assert any(budget == 64 for _text, budget in calls)
+    assert all(len(source) <= 8_000 for source, _budget in calls)

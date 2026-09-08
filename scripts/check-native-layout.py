@@ -35,12 +35,12 @@ def main(argv: list[str]) -> int:
         fail(f"unexpected uniform scale: {scale} != {expected_scale}")
 
     canvas = layout["canvas"]
-    if not math.isclose(canvas["width"] / canvas["height"], DESIGN_WIDTH / DESIGN_HEIGHT, abs_tol=0.001):
-        fail("canvas aspect ratio changed")
-    if canvas["x"] < -0.01 or canvas["y"] < -0.01:
-        fail("canvas begins outside the surface")
-    if canvas["x"] + canvas["width"] > width + 0.01 or canvas["y"] + canvas["height"] > height + 0.01:
-        fail("canvas extends outside the surface")
+    if not math.isclose(canvas["x"], 0.0, abs_tol=0.01) or not math.isclose(canvas["y"], 0.0, abs_tol=0.01):
+        fail("responsive canvas is letterboxed")
+    if not math.isclose(canvas["width"], width, abs_tol=0.01) or not math.isclose(canvas["height"], height, abs_tol=0.01):
+        fail("responsive canvas does not fill the surface")
+    if layout.get("scale_x", 0.0) <= 0 or layout.get("scale_y", 0.0) <= 0:
+        fail("responsive axis scales are missing")
 
     for name in (
         "header",
@@ -118,14 +118,20 @@ def main(argv: list[str]) -> int:
         fail("PTY dimensions are not positive")
 
     sizes = layout.get("font_pixel_sizes")
+    if sizes is not None:
+        floors = [16, 17, 13, 11]
+        if len(sizes) != 4 or any(size < floor for size, floor in zip(sizes, floors)):
+            fail(f"native text legibility floor violated: {sizes} < {floors}")
     if layout["metrics_source"] == "live_xft":
         if sizes is None or len(sizes) != 4:
             fail("live layout is missing quantized font sizes")
+        text_scale = float(layout.get("text_scale", 1.0))
+        font_scale = text_scale
         expected_sizes = [
-            max(10, round(14 * scale)),
-            max(10, round(15 * scale)),
-            max(9, round(12 * scale)),
-            max(7, round(9 * scale)),
+            max(16, round(16 * font_scale)),
+            max(17, round(17 * font_scale)),
+            max(13, round(13 * font_scale)),
+            max(11, round(11 * font_scale)),
         ]
         if sizes != expected_sizes:
             fail(f"font sizes do not follow cabinet scale: {sizes} != {expected_sizes}")

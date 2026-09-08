@@ -224,6 +224,7 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "enable": frozenset({EffectClass.WRITE_LOCAL}),
         "disable": frozenset({EffectClass.WRITE_LOCAL}),
         "delete": frozenset({EffectClass.WRITE_LOCAL}),
+        "reconcile": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
     },
     "skills": {
         "search": frozenset({EffectClass.READ_LOCAL}),
@@ -272,6 +273,8 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
     "synthesis": {
         "create": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
         "repair": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        "revalidate": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
+        "migrate_contract": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
         "promote_scratch": frozenset({EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS}),
         "candidates": frozenset({EffectClass.READ_LOCAL}),
         "inspect": frozenset({EffectClass.READ_LOCAL}),

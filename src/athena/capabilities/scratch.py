@@ -36,6 +36,7 @@ class ScratchCapability:
             "Scratch is not registered or retained; use synthesis for a "
             "reusable capability. Operation: run."
         ),
+        tags=frozenset({"scratch", "calculation", "calculate", "compute", "one-off"}),
         input_schema={
             "type": "object",
             "required": ["operation"],

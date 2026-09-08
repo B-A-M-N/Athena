@@ -128,7 +128,7 @@ MARKS = {
     ): ["COMPAT-006"],
     (
         "tests/unit/kernel/test_model_tool_history.py",
-        "test_openai_and_anthropic_replay_preserve_mixed_assistant_turn",
+        "test_openai_and_anthropic_replay_excludes_hidden_reasoning_by_default",
     ): ["COMPAT-002"],
     (
         "tests/unit/models/test_response_accumulator.py",

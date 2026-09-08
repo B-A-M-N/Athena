@@ -54,6 +54,26 @@ class ProjectIndexBuilder:
         )
         self.max_files = max_files
         self.max_file_bytes = max_file_bytes
+        # Repeated snapshots in a long-lived service should reuse parsed
+        # semantic facts while still invalidating on any observable source
+        # change.  Keep one bounded entry per relative path so edits do not
+        # accumulate historical AST records in memory.
+        self._source_fact_cache: dict[str, dict[str, Any]] = {}
+        # Per-file content-hash cache for ``source_revision`` (P0-3): stat is
+        # cheap, read+SHA-256 is not, and a revision check must not re-hash
+        # every unchanged file in the workspace. Keyed by absolute path with a
+        # (mtime_ns, size) validity stamp — identical discipline to the
+        # source-fact cache.
+        self._hash_cache: dict[str, tuple[int, int, str | None]] = {}
+        # Test-corpus token cache (P0-3): the association fallback needs test
+        # identifiers on every incremental, but re-reading and re-tokenizing
+        # every test file each time is O(test corpus), not O(changed).
+        self._test_token_cache: dict[str, tuple[str, int, frozenset[str]]] = {}
+        # Assembled-result cache (P0-3): _assemble_index output is a pure
+        # function of its inputs; reuse the previous snapshot wholesale when
+        # the fingerprint shows no relevant change instead of rebuilding
+        # every reference map, dependency edge, and association.
+        self._assembly_cache: dict[str, ProjectIndex] = {}
 
     def build(self, root: str) -> ProjectIndex:
         root_path = Path(os.path.realpath(os.path.abspath(root)))
@@ -81,11 +101,14 @@ class ProjectIndexBuilder:
                 record["size"] = stat.st_size
                 record["mtime_ns"] = stat.st_mtime_ns
                 if stat.st_size <= self.max_file_bytes:
-                    content = path.read_text(encoding="utf-8", errors="replace")
+                    # The digest is over RAW BYTES (P0-3): hashing re-encoded
+                    # text disagreed with source_revision()'s raw-byte hash on
+                    # binary files, so source_verified freshness checks
+                    # spuriously failed and forced full rebuilds.
+                    raw = path.read_bytes()
+                    content = raw.decode("utf-8", errors="replace")
                     contents[relative] = content
-                    record["sha256"] = hashlib.sha256(
-                        content.encode("utf-8", errors="replace")
-                    ).hexdigest()
+                    record["sha256"] = hashlib.sha256(raw).hexdigest()
             except OSError:
                 records.append(record)
                 continue
@@ -93,15 +116,17 @@ class ProjectIndexBuilder:
             language = record.get("language")
             if not isinstance(language, str):
                 continue
-            imported = extract_imports(contents.get(relative, ""))
-            imports[relative] = tuple(imported)
-            names = extract_symbols(contents.get(relative, ""))
-            symbols[relative] = tuple(names)
-            semantic = analyzer.analyze(
-                path=relative,
+            imported, names, semantic = self._source_facts(
+                relative=relative,
                 content=contents.get(relative, ""),
                 language=language,
+                mtime_ns=int(record.get("mtime_ns") or 0),
+                size=int(record.get("size") or 0),
+                sha256=record.get("sha256"),
+                analyzer=analyzer,
             )
+            imports[relative] = imported
+            symbols[relative] = names
             semantic_files[relative] = semantic
             imports[relative] = tuple(
                 sorted(
@@ -127,23 +152,53 @@ class ProjectIndexBuilder:
             truncated=truncated,
         )
 
+    def _source_facts(
+        self,
+        *,
+        relative: str,
+        content: str,
+        language: str,
+        mtime_ns: int,
+        size: int,
+        sha256: object,
+        analyzer: SemanticProjectAnalyzer,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]:
+        cache_key = (mtime_ns, size, str(sha256) if sha256 is not None else None)
+        cached = self._source_fact_cache.get(relative)
+        if cached is not None and cached.get("key") == cache_key:
+            return (
+                tuple(cached["imports"]),
+                tuple(cached["symbols"]),
+                dict(cached["semantic"]),
+            )
+        imported = tuple(extract_imports(content))
+        names = tuple(extract_symbols(content))
+        semantic = analyzer.analyze(path=relative, content=content, language=language)
+        self._source_fact_cache[relative] = {
+            "key": cache_key,
+            "imports": imported,
+            "symbols": names,
+            "semantic": semantic,
+        }
+        return imported, names, dict(semantic)
+
     def incremental(
         self,
         root: str,
         previous: ProjectIndex,
         changed_paths: list[str] | tuple[str, ...] = (),
     ) -> ProjectIndex:
-        """Update one index while re-parsing only changed source files."""
+        """Update one index while re-parsing only changed source files.
+
+        Change detection is stat-authoritative (P0-3): a requested path whose
+        stat (mtime_ns, size) matches the previous snapshot is NOT re-read or
+        re-parsed — the caller's hint is advisory, the filesystem decides.
+        """
         root_path = Path(os.path.realpath(os.path.abspath(root)))
         files, truncated = self._files(root_path)
         profile = self._inspector.inspect(str(root_path), inventory=files)
         profile_record = profile.to_dict()
         environment = dict(profile_record.pop("environment", {}) or {})
-        requested = {
-            _relative_change(value, root_path)
-            for value in changed_paths
-            if _relative_change(value, root_path)
-        }
         previous_records = {
             str(item.get("path")): dict(item) for item in previous.files if item.get("path")
         }
@@ -166,9 +221,11 @@ class ProjectIndexBuilder:
                 stat = path.stat()
             except OSError:
                 stat = None
+            # Stat decides (P0-3): the requested hint cannot make an
+            # unchanged file expensive, and an unrequested change is never
+            # missed.
             changed = (
-                relative in requested
-                or old is None
+                old is None
                 or stat is None
                 or old.get("mtime_ns") != stat.st_mtime_ns
                 or old.get("size") != stat.st_size
@@ -197,13 +254,14 @@ class ProjectIndexBuilder:
             content = ""
             if stat is not None and stat.st_size <= self.max_file_bytes:
                 try:
-                    content = path.read_text(encoding="utf-8", errors="replace")
+                    raw = path.read_bytes()
+                    content = raw.decode("utf-8", errors="replace")
                 except OSError:
+                    raw = b""
                     content = ""
                 contents[relative] = content
-                record["sha256"] = hashlib.sha256(
-                    content.encode("utf-8", errors="replace")
-                ).hexdigest()
+                # Digest over raw bytes — same basis as source_revision (P0-3).
+                record["sha256"] = hashlib.sha256(raw).hexdigest()
             imports.pop(relative, None)
             symbols.pop(relative, None)
             semantic_files.pop(relative, None)
@@ -262,6 +320,47 @@ class ProjectIndexBuilder:
             truncated=truncated,
         )
 
+    def _assembly_fingerprint(
+        self,
+        *,
+        profile_record: dict[str, Any],
+        records: list[dict[str, Any]],
+        imports: dict[str, tuple[str, ...]],
+        symbols: dict[str, tuple[str, ...]],
+        semantic_files: dict[str, dict[str, Any]],
+        truncated: bool,
+    ) -> str:
+        """Fingerprint of every input that determines _assemble_index output.
+
+        Semantic facts are derivable from file content, so each file is
+        represented by its (path, sha256, size) stamp — the same cheap
+        record stamp used for the revision payload. Computing this is
+        O(total) with string-hash constants (~10ms on a 10k-file
+        workspace) versus O(total) set-building, resolution, and sorting
+        (~0.3-0.9s). When no input changed, the assembled result is reused
+        whole (P0-3).
+        """
+        hasher = hashlib.sha256()
+        hasher.update(
+            f"{str(profile_record.get('fingerprint') or '')}\x1f{int(truncated)}".encode("utf-8")
+        )
+        for key in sorted(imports):
+            hasher.update((f"I\x1f{key}\x1f" + "\x1d".join(imports[key]) + "\x1e").encode("utf-8"))
+        for key in sorted(symbols):
+            hasher.update((f"S\x1f{key}\x1f" + "\x1d".join(symbols[key]) + "\x1e").encode("utf-8"))
+        # Semantic facts change iff content changes; the record stamps cover
+        # them without serializing every per-file AST-derived dict.
+        semantic_keys = sorted(semantic_files)
+        for record in sorted(records, key=lambda item: item["path"]):
+            hasher.update(
+                f"{record['path']}\x1f{record.get('sha256')}\x1f{record.get('size')}\x1e".encode(
+                    "utf-8"
+                )
+            )
+            if str(record["path"]) not in semantic_keys:
+                hasher.update(b"\x1e")  # semantic presence changed for this path
+        return hasher.hexdigest()
+
     def _assemble_index(
         self,
         *,
@@ -275,6 +374,17 @@ class ProjectIndexBuilder:
         semantic_files: dict[str, dict[str, Any]],
         truncated: bool,
     ) -> ProjectIndex:
+        fingerprint = self._assembly_fingerprint(
+            profile_record=profile_record,
+            records=records,
+            imports=imports,
+            symbols=symbols,
+            semantic_files=semantic_files,
+            truncated=truncated,
+        )
+        cached = self._assembly_cache.get(fingerprint)
+        if cached is not None:
+            return cached
         references: dict[str, set[str]] = {}
         for source, names in symbols.items():
             for name in names:
@@ -334,7 +444,11 @@ class ProjectIndexBuilder:
         test_mentions: dict[str, set[str]] = {}
         for test, test_content in contents.items():
             if _is_test(test):
-                for token in _identifier_tokens(test_content):
+                # Tokenize each test file once per content revision (P0-3):
+                # the per-path token cache avoids re-reading and re-tokenizing
+                # the whole test corpus on every incremental update.
+                tokens = self._test_tokens_cached(test, test_content)
+                for token in tokens:
                     test_mentions.setdefault(token, set()).add(test)
         for record in records:
             source = str(record["path"])
@@ -369,7 +483,7 @@ class ProjectIndexBuilder:
             )
         ).hexdigest()
         source_revision = _source_revision(records, truncated)
-        return ProjectIndex(
+        index = ProjectIndex(
             root=str(root_path),
             profile=profile_record,
             environment=environment,
@@ -397,9 +511,18 @@ class ProjectIndexBuilder:
             source_revision=source_revision,
             built_at=utcnow().isoformat(),
         )
+        self._assembly_cache.clear()  # bounded: one entry per workspace state
+        self._assembly_cache[fingerprint] = index
+        return index
 
     def source_revision(self, root: str) -> str:
-        """Return the bounded source revision without building semantic facts."""
+        """Return the bounded source revision without building semantic facts.
+
+        Only files whose stat (mtime_ns, size) changed since the last call
+        are re-read and re-hashed (P0-3); unchanged files reuse the cached
+        digest. The revision value is identical to a full re-hash — the
+        cache changes the cost, not the answer.
+        """
         root_path = Path(os.path.realpath(os.path.abspath(root)))
         files, truncated = self._files(root_path)
         records: list[dict[str, Any]] = []
@@ -414,11 +537,34 @@ class ProjectIndexBuilder:
                 stat = path.stat()
                 record["size"] = stat.st_size
                 if stat.st_size <= self.max_file_bytes:
-                    record["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    stamp = (stat.st_mtime_ns, stat.st_size)
+                    cached = self._hash_cache.get(str(path))
+                    if cached is not None and cached[:2] == stamp:
+                        record["sha256"] = cached[2]
+                    else:
+                        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                        self._hash_cache[str(path)] = (stamp[0], stamp[1], digest)
+                        record["sha256"] = digest
             except OSError:
                 pass
             records.append(record)
         return _source_revision(records, truncated)
+
+    def _test_tokens_cached(self, relative: str, content: str) -> frozenset[str]:
+        """Identifier tokens for one test file, memoized by content hash.
+
+        The association fallback runs on every incremental; tokenizing the
+        same unchanged test content repeatedly is O(test corpus) work with a
+        trivial cache. Keyed by the content itself — test files are small and
+        the key comparison is a string hash already computed by the dict.
+        """
+        key = (relative, hash(content))
+        cached = self._test_token_cache.get(relative)
+        if cached is not None and cached[:2] == key:
+            return cached[2]
+        tokens = frozenset(_identifier_tokens(content))
+        self._test_token_cache[relative] = (key[0], key[1], tokens)
+        return tokens
 
     def _files(self, root: Path) -> tuple[list[Path], bool]:
         if (root / ".git").exists():

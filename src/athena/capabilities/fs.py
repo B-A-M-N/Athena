@@ -203,12 +203,28 @@ class FilesystemCapability:
     descriptor = CapabilityDescriptor(
         id="fs",
         description=(
-            "Structured fs: read_file, write_file, patch_file, list_dir, stat, "
+            "Structured fs for inspecting and reading project files: read_file, "
+            "write_file, patch_file, list_dir, stat, "
             "mkdir, copy, move, delete. Writes respect workspace writable path "
             "scopes and report mutations for the ledger."
         ),
         input_schema=_INPUT_SCHEMA,
         effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL, EffectClass.DELETE}),
+        tags=frozenset(
+            {
+                "file",
+                "files",
+                "filesystem",
+                "read",
+                "inspect",
+                "edit",
+                "fix",
+                "write",
+                "patch",
+                "directory",
+                "project",
+            }
+        ),
         operation_cache_policies={
             "read": CachePolicy.CONTENT_ADDRESS,
             "stat": CachePolicy.CONTENT_ADDRESS,

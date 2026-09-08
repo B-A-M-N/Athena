@@ -2,7 +2,9 @@
 
 MCP servers are tool/data sources, not agents (INV-001). Tools become
 capabilities via :class:`~athena.mcp.adapter.MCPAdapter`; resources become
-context content via :class:`~athena.mcp.resources.MCPResourceProvider`.
+context content via :class:`~athena.mcp.resources.MCPResourceProvider`;
+prompts materialize as untrusted procedural context via
+:class:`~athena.mcp.prompts.MCPPromptProvider`.
 
 No ``mcp`` SDK import happens at module import time; it is imported lazily
 inside :class:`~athena.mcp.client.MCPClient`.
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 from athena.mcp.client import (
     MCPClient,
+    MCPMessage,
     MCPPromptRef,
     MCPResourceRef,
     MCPToolRef,
@@ -19,6 +22,7 @@ from athena.mcp.client import (
 )
 from athena.mcp.adapter import MCPAdapter, MCPToolExecutor
 from athena.mcp.resources import MCPResourceProvider, mcp_provenance
+from athena.mcp.prompts import MCPPromptProvider, mcp_prompt_provenance
 from athena.mcp.tools import (
     canonical_capability_id,
     friendly_alias,
@@ -32,11 +36,14 @@ __all__ = [
     "MCPToolRef",
     "MCPResourceRef",
     "MCPPromptRef",
+    "MCPMessage",
     "MCPToolResult",
     "MCPAdapter",
     "MCPToolExecutor",
     "MCPResourceProvider",
+    "MCPPromptProvider",
     "mcp_provenance",
+    "mcp_prompt_provenance",
     "canonical_capability_id",
     "friendly_alias",
     "sanitize_server_name",

@@ -116,11 +116,16 @@ pub(crate) fn draw_frame(
         }
         with_scissor(height, geometry.operator_viewport, || {
             text.with_clip(geometry.operator_viewport, || {
-                draw_terminal_text(text, core, &geometry);
+                draw_terminal_text(
+                    text,
+                    core,
+                    &geometry,
+                    VisualMode::from_projection(projection) == VisualMode::Idle,
+                );
             });
         });
         text.with_clip(geometry.prompt, || {
-            draw_status_text(text, &geometry, projection, focused, input_buffer);
+            draw_status_text(text, &geometry, projection, focused, input_buffer, phase);
         });
     } else if dirty.terminal && !options.cabinet_only {
         unsafe {
@@ -129,7 +134,7 @@ pub(crate) fn draw_frame(
         }
         with_scissor(height, geometry.operator_viewport, || {
             text.with_clip(geometry.operator_viewport, || {
-                draw_terminal_text(text, core, &geometry);
+                draw_terminal_text(text, core, &geometry, false);
             });
         });
     }

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -107,28 +108,56 @@ def write_user_secret(name: str, value: str) -> Path:
     if not value or "\n" in value or "\r" in value:
         raise ValueError("secret value must be non-empty and single-line")
     root = user_secret_dir()
-    root.mkdir(parents=True, exist_ok=True)
+    _reject_symlinked_path(root)
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    # ``mkdir`` follows a symlink if a path is swapped between the check and
+    # creation. Re-check before opening the directory used for the commit.
+    _reject_symlinked_path(root)
     root.chmod(0o700)
-    temporary = root / f".{name}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(temporary, flags, 0o600)
+    directory_fd = os.open(
+        str(root),
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    fd = -1
+    temporary: Path | None = None
     try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{name}.",
+            suffix=".tmp",
+            dir=str(root),
+        )
+        temporary = Path(temporary_name)
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.chmod(0o600)
         destination = root / str(name)
         os.replace(temporary, destination)
+        os.fsync(directory_fd)
         return destination
     finally:
         if fd != -1:
             os.close(fd)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+
+
+def _reject_symlinked_path(path: Path) -> None:
+    """Reject a secret-store path that redirects through a symlink."""
+    current = path
+    while True:
+        if current.is_symlink():
+            raise ValueError(f"refusing to use symlinked secret directory: {current}")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
 
 
 def delete_user_secret(name: str) -> None:
@@ -184,6 +213,11 @@ class SecretManager:
     allowed SECRET_READ before requesting a lease. This keeps raw values out of
     model context by default (B-072) and resolves strictly after policy
     checks (B-073).
+
+    Runtime-supplied secrets (operator-answered ``request_input`` with
+    ``expected="secret"``) are stored task-scoped and in-memory only: they
+    never touch the durable input-request ``answer`` column or the model
+    transcript, preserving Athena's secret-opacity contract.
     """
 
     def __init__(
@@ -203,6 +237,10 @@ class SecretManager:
         self._leases: list[CredentialLease] = []
         self._delegations: list[SecretDelegation] = []
         self._on_lease = on_lease
+        # Task-scoped runtime secrets (operator-supplied via request_input).
+        # In-memory only; never persisted to the input_request answer column
+        # or the model transcript.
+        self._task_secrets: dict[str, dict[str, str]] = {}
 
     def register_source(self, source: SecretSource) -> None:
         self._sources.append(source)
@@ -357,6 +395,35 @@ class SecretManager:
     def prune_expired(self) -> None:
         now = datetime.now()
         self._leases = [lease for lease in self._leases if lease.is_valid(now)]
+
+    # -- runtime-secret handling (operator-answered request_input) ---------- #
+    def store_task_secret(
+        self,
+        task_id: str,
+        *,
+        name: str,
+        value: str,
+        context: str | None = None,
+    ) -> str:
+        """Store an operator-supplied secret for a task in memory only.
+
+        Returns a stable ref (``runtime:<task>:<name>``) that can be used in
+        input_requests.answer_ref so the durable column never holds the raw
+        value.  The model sees only that a credential is available, never the
+        value itself.
+        """
+        task_entry = self._task_secrets.setdefault(task_id, {})
+        task_entry[name] = value
+        ref = f"runtime:{task_id}:{name}"
+        return ref
+
+    def resolve_task_secret(self, task_id: str, name: str) -> str | None:
+        """Resolve a runtime secret previously stored for a task."""
+        return self._task_secrets.get(task_id, {}).get(name)
+
+    def clear_task_secrets(self, task_id: str) -> None:
+        """Discard all runtime secrets for a task (e.g. on completion/cancel)."""
+        self._task_secrets.pop(task_id, None)
 
     def _resolve(self, name: str) -> str | None:
         for source in self._sources:

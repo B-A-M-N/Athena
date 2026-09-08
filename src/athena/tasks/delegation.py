@@ -66,6 +66,8 @@ class DelegationManager:
         budgets: Any = None,
         sessions: Any = None,
         cancellations: Any = None,
+        execution_manager: Any = None,
+        principal_id: str | None = None,
         default_max_depth: int = _DEFAULT_MAX_DEPTH,
         default_max_children: int = _DEFAULT_MAX_CHILDREN,
     ) -> None:
@@ -80,6 +82,12 @@ class DelegationManager:
             if cancellations is not None
             else getattr(task_manager, "_cancellations", None)
         )
+        self._execution = (
+            execution_manager
+            if execution_manager is not None
+            else getattr(task_manager, "_execution", None)
+        )
+        self._principal_id = principal_id
         self._default_max_depth = default_max_depth
         self._default_max_children = default_max_children
 
@@ -100,7 +108,6 @@ class DelegationManager:
         # lineage root so ancestry is preserved without inheriting the parent's
         # full live transcript.
         child_session = new_id("session")
-        await self._ensure_session(child_session, parent_id=parent.session_id)
         context_refs = (
             ContextRef(
                 kind="task",
@@ -212,11 +219,18 @@ class DelegationManager:
     ) -> TaskStatus:
         """Cancel a child task (P0-17/cancel)."""
         if self._cancellations is not None:
-            try:
-                return await self._cancellations.cancel(child_task_id, reason=reason)
-            except Exception:
-                pass
+            # CancellationManager is the canonical runtime + task-state
+            # authority. Never downgrade its uncertain result to a direct
+            # status write that can leave a live child process behind.
+            return await self._cancellations.cancel(child_task_id, reason=reason)
+        if self._execution is not None:
+            raise DelegationError(
+                "child cancellation has no canonical CancellationManager; "
+                "refusing to mark a runtime-owned child CANCELLED"
+            )
         task = await self._tasks.get(child_task_id)
+        if task is None:
+            raise DelegationError(f"child task not found: {child_task_id}")
         status = _status_of(task)
         if status not in TERMINAL_STATUSES:
             await self._tasks.transition(child_task_id, TaskStatus.CANCELLED)
@@ -238,7 +252,11 @@ class DelegationManager:
             return
         existing = await self._sessions.get(session_id)
         if existing is None:
-            await self._sessions.create(session_id, parent_id=parent_id)
+            await self._sessions.create(
+                session_id,
+                parent_id=parent_id,
+                principal_id=self._principal_id,
+            )
 
     # ------------------------------------------------------------------ #
     async def _assert_parent_runnable(self, parent: TaskSpec) -> None:
@@ -283,10 +301,15 @@ class DelegationManager:
             seen.add(cur)
             try:
                 spec = await self._tasks.get(cur)
-            except Exception:
-                break
+            except Exception as exc:
+                raise DelegationError(
+                    f"cannot establish delegation root for {parent_id}: {exc}",
+                    cause=exc,
+                ) from exc
             if spec is None:
-                break
+                raise DelegationError(
+                    f"cannot establish delegation root for {parent_id}: task {cur} is missing"
+                )
             if spec.resource_budget is not None:
                 root_budget = spec.resource_budget
             cur = spec.parent_task_id
@@ -299,19 +322,32 @@ class DelegationManager:
         if store is not None:
             try:
                 return await store.count_children(parent_id)
-            except Exception:
-                return 0
+            except Exception as exc:
+                raise DelegationError(
+                    f"cannot count children for {parent_id}: {exc}",
+                    cause=exc,
+                ) from exc
         if self._budgets is None:
-            return 0
+            raise DelegationError(
+                f"cannot establish child count for {parent_id}: no durable hierarchy store"
+            )
         count = getattr(self._budgets, "child_count", None)
         if callable(count):
-            return int(count(parent_id))
+            try:
+                return int(count(parent_id))
+            except Exception as exc:
+                raise DelegationError(
+                    f"cannot count children for {parent_id}: {exc}",
+                    cause=exc,
+                ) from exc
         ledgers = getattr(self._budgets, "_ledger", None)
         if isinstance(ledgers, dict):
             entry = ledgers.get(parent_id)
             if entry is not None:
                 return int(getattr(entry, "children", 0))
-        return 0
+        raise DelegationError(
+            f"cannot establish child count for {parent_id}: no authoritative count"
+        )
 
     async def _depth_of(self, task_id: str) -> int:
         depth = 0
@@ -321,9 +357,16 @@ class DelegationManager:
             seen.add(cur)
             try:
                 spec = await self._tasks.get(cur)
-            except Exception:
-                break
-            if spec is None or not spec.parent_task_id:
+            except Exception as exc:
+                raise DelegationError(
+                    f"cannot establish delegation depth for {task_id}: {exc}",
+                    cause=exc,
+                ) from exc
+            if spec is None:
+                raise DelegationError(
+                    f"cannot establish delegation depth for {task_id}: task {cur} is missing"
+                )
+            if not spec.parent_task_id:
                 break
             depth += 1
             cur = spec.parent_task_id
@@ -355,20 +398,27 @@ def _scope_policy(parent: TaskSpec, child: CapabilityPolicy | None = None) -> Ca
     parent_allow = set(parent_cap.allow)
     parent_ask = set(parent_cap.ask)
     child_requested = set(child_cap.allow)
+    parent_restricted = bool(parent_allow or parent_ask)
     if child_requested:
-        # An empty parent allowlist is the protocol's unrestricted value. A
+        # An empty parent allowlist is the protocol's UNRESTRICTED value. A
         # child request narrows that open ceiling to the capabilities it asks
         # for; it must not become impossible merely because the parent did
-        # not enumerate every native capability.
-        allow_set = child_requested & parent_allow if parent_allow else child_requested
-        ask_set = parent_ask & child_requested
-        outside = child_requested - parent_allow - parent_ask
+        # not enumerate every native capability. Only when the parent
+        # actually declared a ceiling does the child's request intersect it.
+        if parent_restricted:
+            allow_set = child_requested & parent_allow
+            ask_set = parent_ask & child_requested
+            outside = child_requested - parent_allow - parent_ask
+        else:
+            allow_set = child_requested
+            ask_set = set()
+            outside = set()
     else:
         allow_set = parent_allow
         ask_set = parent_ask
         outside = set()
     deny_set = set(parent_cap.deny) | set(child_cap.deny) | outside
-    if (parent_allow or parent_ask) and not (allow_set or ask_set):
+    if parent_restricted and not (allow_set or ask_set):
         # Empty ``allow`` means unrestricted to the dispatcher, so use an
         # impossible sentinel when two non-empty ceilings have no overlap.
         allow_set = {_NO_CAPABILITY_INTERSECTION}
@@ -415,7 +465,7 @@ def _as_model_policy(value):
     return ModelPolicy(
         role=getattr(value, "role", "primary"),
         allowed=tuple(getattr(value, "allowed", ()) or ()),
-        require_tools=bool(getattr(value, "require_tools", True)),
+        require_tools=bool(getattr(value, "require_tools", False)),
         privacy=getattr(value, "privacy", "local-preferred"),
         max_cost_usd=getattr(value, "max_cost_usd", None),
         routing_preference=getattr(value, "routing_preference", "balanced"),

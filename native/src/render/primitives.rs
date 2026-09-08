@@ -21,6 +21,23 @@ pub(crate) fn draw_line(x1: f32, y1: f32, x2: f32, y2: f32, color: (f32, f32, f3
     }
 }
 
+pub(crate) fn draw_line_alpha(
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    color: (f32, f32, f32),
+    alpha: f32,
+) {
+    unsafe {
+        glColor4f(color.0, color.1, color.2, alpha.clamp(0.0, 1.0));
+        glBegin(GL_LINES);
+        glVertex2f(x1, y1);
+        glVertex2f(x2, y2);
+        glEnd();
+    }
+}
+
 pub(crate) fn draw_round_rect(
     x: f32,
     y: f32,
@@ -54,9 +71,9 @@ pub(crate) fn draw_round_rect(
 }
 
 pub(crate) fn draw_round_outline(x: f32, y: f32, width: f32, height: f32, color: (f32, f32, f32)) {
-    // Large panels stay rectangular with softened corners. Capping the radius
-    // prevents wide CRTs from degenerating into capsules.
-    let radius = (width.min(height) / 2.0).min(18.0);
+    // CRT apertures need a visible tube radius at physical size; keep other
+    // panels restrained while avoiding a one-pixel rectangle at 1280x800.
+    let radius = (width.min(height) * 0.085).clamp(1.0, 42.0);
     unsafe {
         glColor3f(color.0, color.1, color.2);
         glLineWidth(1.0);
@@ -166,7 +183,7 @@ pub(crate) fn with_crt_mask(
         rect.y,
         rect.width,
         rect.height,
-        26.0,
+        (rect.width.min(rect.height) * 0.09).clamp(4.0, 48.0),
         (0.0, 0.0, 0.0),
     );
     unsafe {

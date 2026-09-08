@@ -123,6 +123,8 @@ class TaskForker:
                 boundary_timestamp=boundary.timestamp if boundary else None,
                 parent_task_id=task_id,
                 after_event_sequence=after_event_sequence,
+                principal_id=getattr(self._service.config, "cache_namespace", None),
+                project_id=getattr(spec.workspace, "id", None),
             )
         except Exception:
             if fork_root is not None:
@@ -181,6 +183,8 @@ class TaskForker:
         boundary_timestamp,
         parent_task_id: str,
         after_event_sequence: int,
+        principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> str | None:
         """Create a session containing only messages at the causal boundary.
 
@@ -210,6 +214,8 @@ class TaskForker:
             await sessions.create(
                 fork_session_id,
                 parent_id=session_id,
+                principal_id=principal_id,
+                project_id=project_id,
                 metadata={
                     "causal_fork_of_task": parent_task_id,
                     "causal_fork_after_event": after_event_sequence,

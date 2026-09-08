@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 
 import pytest
@@ -29,6 +30,18 @@ class _Executor:
             id=capability_id,
             description=capability_id,
             input_schema={"type": "object"},
+            tags=frozenset(
+                [
+                    capability_id,
+                    *{
+                        "fs": "file read inspect fix",
+                        "execute": "run test tests command",
+                        "git": "diff repository",
+                        "research": "source latest release evidence",
+                        "diagnostics": "inspect broken debug",
+                    }.get(capability_id, "").split(),
+                ]
+            ),
             origin=CapabilityOrigin.PROJECT,
         )
 
@@ -55,6 +68,18 @@ class _CandidateProofStore:
         assert capability_id == self.candidate.id
         self.updated = proof_record
         return self.candidate
+
+
+class _ToggleStore:
+    def __init__(self) -> None:
+        self.fail = False
+        self.saved: list[GeneratedCapability] = []
+
+    async def save(self, capability, *, owner):
+        del owner
+        if self.fail:
+            raise OSError("durable store unavailable")
+        self.saved.append(capability)
 
 
 def _generated(
@@ -141,6 +166,31 @@ def test_search_uses_current_generated_prerequisite_evidence(tmp_path):
     item = next(item for item in result if item["id"] == generated.id)
     assert item["optimizer"]["dependency_available"] is False
     assert item["optimizer"]["environment_compatible"] is False
+
+
+def test_real_fabric_search_keeps_casual_prose_out_of_action_surface():
+    registry = CapabilityRegistry()
+    for capability_id in ("fs", "execute", "git", "research", "diagnostics"):
+        registry.register(_Executor(capability_id))
+    fabric = CapabilityFabric(registry)
+
+    cases = {
+        "hello": set(),
+        "thanks": set(),
+        "tell me a short joke": set(),
+        "explain recursion": set(),
+        "what is 2 + 2": set(),
+        "read pyproject.toml": {"fs"},
+        "show me the git diff": {"git"},
+        "run the tests": {"execute"},
+        "fix the failing tests": {"fs", "execute"},
+        "inspect why this app is broken": {"fs", "diagnostics"},
+        "research the latest release": {"research"},
+    }
+
+    for query, expected in cases.items():
+        actual = {item["id"] for item in fabric.search(query)}
+        assert actual == expected, query
 
 
 def test_search_rejects_missing_locked_generated_dependency(tmp_path):
@@ -332,6 +382,87 @@ async def test_generated_candidate_lifecycle_is_durable_and_gc_explicit(tmp_path
     assert await store.garbage_collect() == 1
     assert await store.history(candidate.id, owner="task-1") == []
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_durable_revision_activation_keeps_predecessor_live():
+    store = _ToggleStore()
+    fabric = CapabilityFabric(CapabilityRegistry(), store=store)
+    predecessor = _generated(
+        AffordanceScope.PROJECT,
+        project="repo",
+        capability_id="gen.revision-v1",
+    )
+    predecessor_executor = _Executor(predecessor.id)
+    fabric.register_project("repo", predecessor_executor, generated=predecessor)
+    await fabric.flush()
+
+    successor = replace(
+        predecessor,
+        id="gen.revision-v2",
+        implementation="def run(args):\n    return {'revision': 2, 'args': args}\n",
+        code_hash="",
+        revision=2,
+        parent_revision=1,
+        active_revision=2,
+        supersedes=(predecessor.id,),
+    )
+    successor_executor = _Executor(successor.id)
+    store.fail = True
+    fabric.register_project("repo", successor_executor, generated=successor)
+    with pytest.raises(RuntimeError, match="generated capability persistence failed"):
+        await fabric.flush()
+
+    assert fabric.executor_for(predecessor.id, project_id="repo") is predecessor_executor
+    assert not fabric.has(successor.id, project_id="repo")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_successors_have_one_active_family_winner(tmp_path):
+    path = str(tmp_path / "revision-race.db")
+    seed_db = Database(path)
+    seed_store = GeneratedCapabilityStore(seed_db)
+    predecessor = _generated(
+        AffordanceScope.PROJECT,
+        project="repo",
+        capability_id="gen.race-v1",
+    )
+    await seed_store.save(predecessor, owner="repo")
+
+    first_db = Database(path)
+    second_db = Database(path)
+    first_store = GeneratedCapabilityStore(first_db)
+    second_store = GeneratedCapabilityStore(second_db)
+    first = replace(
+        predecessor,
+        id="gen.race-v2a",
+        revision=2,
+        parent_revision=1,
+        active_revision=2,
+        supersedes=(predecessor.id,),
+    )
+    second = replace(first, id="gen.race-v2b")
+    results = await asyncio.gather(
+        first_store.save(first, owner="repo"),
+        second_store.save(second, owner="repo"),
+        return_exceptions=True,
+    )
+
+    failures = [result for result in results if isinstance(result, BaseException)]
+    assert len(failures) == 1
+    assert "stale generated capability successor" in str(failures[0])
+    active = await first_db.fetch_one(
+        "SELECT capability_id, revision FROM generated_active_families "
+        "WHERE scope = ? AND owner = ? AND family_id = ?",
+        ("project", "repo", predecessor.family_id),
+    )
+    assert active is not None
+    assert active["capability_id"] in {first.id, second.id}
+    assert active["revision"] == 2
+
+    await seed_db.close()
+    await first_db.close()
+    await second_db.close()
 
 
 async def test_candidate_can_be_explicitly_promoted_without_cross_scope_collision(tmp_path):

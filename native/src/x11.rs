@@ -35,7 +35,7 @@ mod input_method;
 mod render;
 use clipboard::Clipboard;
 use input_method::{InputMethod, lookup_key, terminal_key_bytes};
-use render::chassis::PresentationSettings;
+use render::chassis::{PresentationControl, PresentationSettings};
 use render::text::{FontRole, TextRenderer};
 
 type Display = c_void;
@@ -43,6 +43,9 @@ type Window = c_ulong;
 type Atom = c_ulong;
 type Colormap = c_ulong;
 type Cursor = c_ulong;
+type Pixmap = c_ulong;
+type GLXPixmap = c_ulong;
+type GC = *mut c_void;
 type GLXContext = *mut c_void;
 
 const KEY_PRESS: c_int = 2;
@@ -52,6 +55,8 @@ const MOTION_NOTIFY: c_int = 6;
 const SELECTION_CLEAR: c_int = 29;
 const SELECTION_REQUEST: c_int = 30;
 const SELECTION_NOTIFY: c_int = 31;
+const UNMAP_NOTIFY: c_int = 18;
+const MAP_NOTIFY: c_int = 19;
 const DESTROY_NOTIFY: c_int = 17;
 const CONFIGURE_NOTIFY: c_int = 22;
 const EXPOSE: c_int = 12;
@@ -84,6 +89,9 @@ const GL_PROJECTION: u32 = 0x1701;
 const GL_MODELVIEW: u32 = 0x1700;
 const GL_SCISSOR_TEST: u32 = 0x0c11;
 const GL_STENCIL_TEST: u32 = 0x0b90;
+const GL_BLEND: u32 = 0x0be2;
+const GL_SRC_ALPHA: u32 = 0x0302;
+const GL_ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
 const GL_ALWAYS: u32 = 0x0207;
 const GL_EQUAL: u32 = 0x0202;
 const GL_KEEP: u32 = 0x1e00;
@@ -107,6 +115,7 @@ const SHIFT_MASK: CUint = 1;
 const CONTROL_MASK: CUint = 1 << 2;
 const BUTTON1_MASK: CUint = 1 << 8;
 const CURRENT_TIME: c_ulong = 0;
+const IS_VIEWABLE: c_int = 2;
 const PROP_MODE_REPLACE: c_int = 0;
 const P_MIN_SIZE: c_long = 1 << 4;
 const P_BASE_SIZE: c_long = 1 << 8;
@@ -119,6 +128,72 @@ const MAX_CACHED_TEXT_WIDTHS: usize = 512;
 const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RESIZE_EDGE: i32 = 12;
+const GRAB_MODE_ASYNC: c_int = 1;
+
+fn initial_window_size(display: *mut Display, screen: c_int) -> (i32, i32) {
+    let screen_width = unsafe { XDisplayWidth(display, screen) }.max(640);
+    let screen_height = unsafe { XDisplayHeight(display, screen) }.max(480);
+    // Leave a small amount of desktop context while opening large enough to
+    // expose the actual cabinet proportions immediately.
+    (
+        ((screen_width as f32 * 0.88).round() as i32).clamp(640, screen_width),
+        ((screen_height as f32 * 0.88).round() as i32).clamp(480, screen_height),
+    )
+}
+
+/// Supplies the phase used by the composed presentation.
+///
+/// Production rendering follows wall time.  ``ATHENA_PRESENTATION_CLOCK``
+/// enables a deterministic frame clock for temporal release evidence:
+/// ``fixed`` advances by the normal 100 ms frame interval and
+/// ``fixed:<seconds>`` accepts an explicit positive step.  The clock only
+/// controls presentation phase; X11 polling and process lifecycle remain
+/// unchanged.
+#[derive(Debug, Clone, Copy)]
+struct PresentationClock {
+    started_at: Instant,
+    fixed_step_seconds: Option<f32>,
+}
+
+impl PresentationClock {
+    fn from_environment() -> Result<Self, String> {
+        let fixed_step_seconds = match env::var("ATHENA_PRESENTATION_CLOCK") {
+            Ok(value) if value == "fixed" => Some(ACTIVE_FRAME_INTERVAL.as_secs_f32()),
+            Ok(value) => {
+                let raw = value.strip_prefix("fixed:").ok_or_else(|| {
+                    "ATHENA_PRESENTATION_CLOCK must be fixed or fixed:<seconds>".to_owned()
+                })?;
+                let seconds = raw
+                    .parse::<f32>()
+                    .map_err(|_| "fixed presentation clock step must be a number".to_owned())?;
+                if !seconds.is_finite() || seconds <= 0.0 {
+                    return Err("fixed presentation clock step must be positive".to_owned());
+                }
+                Some(seconds)
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(format!("could not read presentation clock: {error}")),
+        };
+        Ok(Self {
+            started_at: Instant::now(),
+            fixed_step_seconds,
+        })
+    }
+
+    #[cfg(test)]
+    fn fixed(step_seconds: f32) -> Self {
+        Self {
+            started_at: Instant::now(),
+            fixed_step_seconds: Some(step_seconds),
+        }
+    }
+
+    fn seconds_at_frame(&self, frame_sequence: u64) -> f32 {
+        self.fixed_step_seconds
+            .map(|step| step * frame_sequence as f32)
+            .unwrap_or_else(|| self.started_at.elapsed().as_secs_f32())
+    }
+}
 
 #[repr(C)]
 struct XVisualInfo {
@@ -162,6 +237,33 @@ struct XSetWindowAttributes {
     override_redirect: c_int,
     colormap: Colormap,
     cursor: c_ulong,
+}
+
+#[repr(C)]
+struct XWindowAttributes {
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+    border_width: c_int,
+    depth: c_int,
+    visual: *mut c_void,
+    root: Window,
+    class: c_int,
+    bit_gravity: c_int,
+    win_gravity: c_int,
+    backing_store: c_int,
+    backing_planes: c_ulong,
+    backing_pixel: c_ulong,
+    save_under: c_int,
+    colormap: Colormap,
+    map_installed: c_int,
+    map_state: c_int,
+    all_event_masks: c_long,
+    your_event_mask: c_long,
+    do_not_propagate_mask: c_long,
+    override_redirect: c_int,
+    screen: *mut c_void,
 }
 
 #[repr(C)]
@@ -320,6 +422,11 @@ const XK_PAGE_UP: c_ulong = 0xff55;
 const XK_PAGE_DOWN: c_ulong = 0xff56;
 const XK_END: c_ulong = 0xff57;
 const XK_DELETE: c_ulong = 0xffff;
+const XK_F1: c_ulong = 0xffbe;
+const XK_F2: c_ulong = 0xffbf;
+const XK_F3: c_ulong = 0xffc0;
+const XK_F4: c_ulong = 0xffc1;
+const XK_F5: c_ulong = 0xffc2;
 
 #[repr(C)]
 struct XComposeStatus {
@@ -380,6 +487,7 @@ pub struct RendererOptions {
     pub mascot: String,
     pub animations: bool,
     pub reduced_motion: bool,
+    pub text_scale: f32,
     pub cabinet_only: bool,
 }
 
@@ -396,6 +504,7 @@ impl Default for RendererOptions {
             mascot: "owl".to_owned(),
             animations: true,
             reduced_motion: false,
+            text_scale: 1.0,
             cabinet_only: false,
         }
     }
@@ -409,7 +518,28 @@ unsafe extern "C" {
     ) -> Option<unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int>;
     fn XDefaultScreen(display: *mut Display) -> c_int;
     fn XRootWindow(display: *mut Display, screen: c_int) -> Window;
+    fn XTranslateCoordinates(
+        display: *mut Display,
+        src_w: Window,
+        dest_w: Window,
+        src_x: c_int,
+        src_y: c_int,
+        dest_x: *mut c_int,
+        dest_y: *mut c_int,
+        child: *mut Window,
+    ) -> c_int;
+    fn XMoveWindow(display: *mut Display, window: Window, x: c_int, y: c_int) -> c_int;
+    fn XMoveResizeWindow(
+        display: *mut Display,
+        window: Window,
+        x: c_int,
+        y: c_int,
+        width: CUint,
+        height: CUint,
+    ) -> c_int;
     fn XDefaultVisual(display: *mut Display, screen: c_int) -> *mut c_void;
+    fn XDisplayWidth(display: *mut Display, screen: c_int) -> c_int;
+    fn XDisplayHeight(display: *mut Display, screen: c_int) -> c_int;
     fn XDefaultDepth(display: *mut Display, screen: c_int) -> c_int;
     fn XDefaultColormap(display: *mut Display, screen: c_int) -> Colormap;
     fn XCreateColormap(
@@ -442,12 +572,56 @@ unsafe extern "C" {
         count: c_int,
     ) -> c_int;
     fn XMapWindow(display: *mut Display, window: Window) -> c_int;
+    fn XCreatePixmap(
+        display: *mut Display,
+        drawable: Window,
+        width: CUint,
+        height: CUint,
+        depth: CUint,
+    ) -> Pixmap;
+    fn XFreePixmap(display: *mut Display, pixmap: Pixmap) -> c_int;
+    fn XCreateGC(
+        display: *mut Display,
+        drawable: Window,
+        valuemask: c_ulong,
+        values: *mut c_void,
+    ) -> GC;
+    fn XFreeGC(display: *mut Display, gc: GC) -> c_int;
+    fn XCopyArea(
+        display: *mut Display,
+        source: Pixmap,
+        destination: Window,
+        gc: GC,
+        source_x: c_int,
+        source_y: c_int,
+        width: CUint,
+        height: CUint,
+        destination_x: c_int,
+        destination_y: c_int,
+    ) -> c_int;
     fn XSetInputFocus(
         display: *mut Display,
         focus: Window,
         revert_to: c_int,
         time: c_ulong,
     ) -> c_int;
+    fn XGetWindowAttributes(
+        display: *mut Display,
+        window: Window,
+        attributes: *mut XWindowAttributes,
+    ) -> c_int;
+    fn XGrabPointer(
+        display: *mut Display,
+        grab_window: Window,
+        owner_events: c_int,
+        event_mask: c_ulong,
+        pointer_mode: c_int,
+        keyboard_mode: c_int,
+        confine_to: Window,
+        cursor: Cursor,
+        time: c_ulong,
+    ) -> c_int;
+    fn XUngrabPointer(display: *mut Display, time: c_ulong) -> c_int;
     fn XCreateFontCursor(display: *mut Display, shape: CUint) -> Cursor;
     fn XDefineCursor(display: *mut Display, window: Window, cursor: Cursor) -> c_int;
     fn XUndefineCursor(display: *mut Display, window: Window) -> c_int;
@@ -535,6 +709,161 @@ unsafe extern "C" fn ignore_shutdown_x_error(
     0
 }
 
+fn set_input_focus_if_mapped(display: *mut Display, window: Window, mapped: bool) -> bool {
+    if !mapped || window == 0 {
+        return false;
+    }
+    let mut attributes: XWindowAttributes = unsafe { std::mem::zeroed() };
+    let viewable = unsafe {
+        XGetWindowAttributes(display, window, &mut attributes) != 0
+            && attributes.map_state == IS_VIEWABLE
+    };
+    if !viewable {
+        return false;
+    }
+    // Xlib reports BadMatch asynchronously for an unmapped/minimized window.
+    // Querying map_state closes the known lifecycle race before requesting
+    // focus; the process-wide nonfatal X error boundary remains a last line of
+    // defense for a hostile window manager.
+    unsafe {
+        XSetInputFocus(display, window, 1, CURRENT_TIME);
+        XSync(display, 0);
+    }
+    true
+}
+
+/// Compose the complete cabinet into one X11 pixmap before copying it to the
+/// visible window. OpenGL and Xft both target this drawable, so the visible
+/// surface never receives a half-GL/half-text frame while a redraw is in
+/// flight.
+struct PresentationSurface {
+    display: *mut Display,
+    window: Window,
+    visual: *mut XVisualInfo,
+    depth: CUint,
+    pixmap: Pixmap,
+    glx_pixmap: GLXPixmap,
+    gc: GC,
+    retired: Vec<(Pixmap, GLXPixmap)>,
+    width: CUint,
+    height: CUint,
+}
+
+impl PresentationSurface {
+    fn new(
+        display: *mut Display,
+        window: Window,
+        visual: *mut XVisualInfo,
+        depth: CUint,
+        width: CUint,
+        height: CUint,
+    ) -> Result<Self, String> {
+        let pixmap = unsafe { XCreatePixmap(display, window, width, height, depth) };
+        if pixmap == 0 {
+            return Err("could not create the native offscreen presentation pixmap".to_owned());
+        }
+        let glx_pixmap = unsafe { glXCreateGLXPixmap(display, visual, pixmap) };
+        if glx_pixmap == 0 {
+            unsafe { XFreePixmap(display, pixmap) };
+            return Err("could not create the native GLX presentation pixmap".to_owned());
+        }
+        let gc = unsafe { XCreateGC(display, window, 0, ptr::null_mut()) };
+        if gc.is_null() {
+            unsafe {
+                glXDestroyGLXPixmap(display, glx_pixmap);
+                XFreePixmap(display, pixmap);
+            }
+            return Err("could not create the native presentation copy context".to_owned());
+        }
+        Ok(Self {
+            display,
+            window,
+            visual,
+            depth,
+            pixmap,
+            glx_pixmap,
+            gc,
+            retired: Vec::new(),
+            width,
+            height,
+        })
+    }
+
+    fn resize(&mut self, width: CUint, height: CUint) -> Result<(), String> {
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+        let pixmap = unsafe { XCreatePixmap(self.display, self.window, width, height, self.depth) };
+        if pixmap == 0 {
+            return Err("could not resize the native offscreen presentation pixmap".to_owned());
+        }
+        let glx_pixmap = unsafe { glXCreateGLXPixmap(self.display, self.visual, pixmap) };
+        if glx_pixmap == 0 {
+            unsafe { XFreePixmap(self.display, pixmap) };
+            return Err("could not resize the native GLX presentation pixmap".to_owned());
+        }
+        self.retired.push((self.pixmap, self.glx_pixmap));
+        self.pixmap = pixmap;
+        self.glx_pixmap = glx_pixmap;
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+
+    fn reap_retired(&mut self) {
+        for (pixmap, glx_pixmap) in self.retired.drain(..) {
+            unsafe {
+                glXDestroyGLXPixmap(self.display, glx_pixmap);
+                XFreePixmap(self.display, pixmap);
+            }
+        }
+    }
+
+    fn present(&self, width: CUint, height: CUint) {
+        unsafe {
+            // Finish the GL command stream, wait for it before issuing the
+            // XCopyArea request, then copy the composed pixmap in one server
+            // request.
+            glFinish();
+            glXWaitGL();
+            XCopyArea(
+                self.display,
+                self.pixmap,
+                self.window,
+                self.gc,
+                0,
+                0,
+                width.min(self.width),
+                height.min(self.height),
+                0,
+                0,
+            );
+            XFlush(self.display);
+        }
+    }
+
+    fn destroy(&mut self) {
+        unsafe {
+            if self.glx_pixmap != 0 {
+                glXDestroyGLXPixmap(self.display, self.glx_pixmap);
+                self.glx_pixmap = 0;
+            }
+            if self.pixmap != 0 {
+                XFreePixmap(self.display, self.pixmap);
+                self.pixmap = 0;
+            }
+            for (pixmap, glx_pixmap) in self.retired.drain(..) {
+                glXDestroyGLXPixmap(self.display, glx_pixmap);
+                XFreePixmap(self.display, pixmap);
+            }
+            if !self.gc.is_null() {
+                XFreeGC(self.display, self.gc);
+                self.gc = ptr::null_mut();
+            }
+        }
+    }
+}
+
 #[link(name = "Xft")]
 unsafe extern "C" {
     fn XftDrawCreate(
@@ -599,6 +928,12 @@ unsafe extern "C" {
     ) -> GLXContext;
     fn glXMakeCurrent(display: *mut Display, drawable: Window, context: GLXContext) -> c_int;
     fn glXDestroyContext(display: *mut Display, context: GLXContext);
+    fn glXCreateGLXPixmap(
+        display: *mut Display,
+        visual: *mut XVisualInfo,
+        pixmap: Pixmap,
+    ) -> GLXPixmap;
+    fn glXDestroyGLXPixmap(display: *mut Display, pixmap: GLXPixmap);
     fn glXWaitGL();
     fn glXWaitX();
     fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32);
@@ -608,6 +943,8 @@ unsafe extern "C" {
     fn glEnable(cap: u32);
     fn glDisable(cap: u32);
     fn glColorMask(red: u8, green: u8, blue: u8, alpha: u8);
+    fn glColor4f(red: f32, green: f32, blue: f32, alpha: f32);
+    fn glBlendFunc(source: u32, destination: u32);
     fn glStencilMask(mask: u32);
     fn glStencilFunc(function: u32, reference: c_int, mask: u32);
     fn glStencilOp(sfail: u32, dpfail: u32, dppass: u32);
@@ -721,6 +1058,161 @@ fn resize_zone(x: i32, y: i32, width: i32, height: i32) -> Option<ResizeZone> {
         (true, _, _, _) => Some(ResizeZone::Left),
         (_, _, true, _) => Some(ResizeZone::Right),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowDragKind {
+    Move,
+    Resize(ResizeZone),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowDrag {
+    kind: WindowDragKind,
+    start_root_x: i32,
+    start_root_y: i32,
+    start_window_x: i32,
+    start_window_y: i32,
+    start_width: i32,
+    start_height: i32,
+}
+
+impl WindowDrag {
+    fn new(
+        display: *mut Display,
+        window: Window,
+        button: &XButtonEvent,
+        width: i32,
+        height: i32,
+        kind: WindowDragKind,
+    ) -> Self {
+        let (start_window_x, start_window_y) = window_root_position(display, window);
+        Self {
+            kind,
+            start_root_x: button.x_root,
+            start_root_y: button.y_root,
+            start_window_x,
+            start_window_y,
+            start_width: width,
+            start_height: height,
+        }
+    }
+
+    fn geometry(self, root_x: i32, root_y: i32) -> (i32, i32, i32, i32) {
+        let dx = root_x.saturating_sub(self.start_root_x);
+        let dy = root_y.saturating_sub(self.start_root_y);
+        match self.kind {
+            WindowDragKind::Move => (
+                self.start_window_x.saturating_add(dx),
+                self.start_window_y.saturating_add(dy),
+                self.start_width,
+                self.start_height,
+            ),
+            WindowDragKind::Resize(zone) => {
+                let left = matches!(
+                    zone,
+                    ResizeZone::TopLeft | ResizeZone::BottomLeft | ResizeZone::Left
+                );
+                let right = matches!(
+                    zone,
+                    ResizeZone::TopRight | ResizeZone::Right | ResizeZone::BottomRight
+                );
+                let top = matches!(
+                    zone,
+                    ResizeZone::TopLeft | ResizeZone::Top | ResizeZone::TopRight
+                );
+                let bottom = matches!(
+                    zone,
+                    ResizeZone::BottomLeft | ResizeZone::Bottom | ResizeZone::BottomRight
+                );
+                let width = if left {
+                    self.start_width.saturating_sub(dx)
+                } else if right {
+                    self.start_width.saturating_add(dx)
+                } else {
+                    self.start_width
+                }
+                .max(900);
+                let height = if top {
+                    self.start_height.saturating_sub(dy)
+                } else if bottom {
+                    self.start_height.saturating_add(dy)
+                } else {
+                    self.start_height
+                }
+                .max(620);
+                let x = if left {
+                    self.start_window_x
+                        .saturating_add(self.start_width.saturating_sub(width))
+                } else {
+                    self.start_window_x
+                };
+                let y = if top {
+                    self.start_window_y
+                        .saturating_add(self.start_height.saturating_sub(height))
+                } else {
+                    self.start_window_y
+                };
+                (x, y, width, height)
+            }
+        }
+    }
+}
+
+fn window_root_position(display: *mut Display, window: Window) -> (i32, i32) {
+    let root = unsafe { XRootWindow(display, XDefaultScreen(display)) };
+    let mut x = 0;
+    let mut y = 0;
+    let mut child = 0;
+    let translated =
+        unsafe { XTranslateCoordinates(display, window, root, 0, 0, &mut x, &mut y, &mut child) };
+    if translated == 0 { (0, 0) } else { (x, y) }
+}
+
+fn apply_window_drag(
+    display: *mut Display,
+    window: Window,
+    drag: WindowDrag,
+    root_x: i32,
+    root_y: i32,
+) {
+    let (x, y, width, height) = drag.geometry(root_x, root_y);
+    unsafe {
+        match drag.kind {
+            WindowDragKind::Move => {
+                XMoveWindow(display, window, x, y);
+            }
+            WindowDragKind::Resize(_) => {
+                XMoveResizeWindow(display, window, x, y, width as CUint, height as CUint);
+            }
+        }
+        glFlush();
+        XFlush(display);
+    }
+}
+
+fn grab_window_pointer(display: *mut Display, window: Window) {
+    unsafe {
+        let status = XGrabPointer(
+            display,
+            window,
+            0,
+            (POINTER_MOTION_MASK | BUTTON_RELEASE_MASK | BUTTON_PRESS_MASK) as c_ulong,
+            GRAB_MODE_ASYNC,
+            GRAB_MODE_ASYNC,
+            0,
+            0,
+            CURRENT_TIME,
+        );
+        if status != 0 {
+            eprintln!("native pointer grab failed with X11 status {status}");
+        }
+        XFlush(display);
+        // Complete the grab request before a fast pointer motion can leave
+        // the surface; otherwise a remote/XTest desktop can race the next
+        // client and drop an edge/corner motion event.
+        XSync(display, 0);
     }
 }
 
@@ -845,7 +1337,11 @@ pub fn run(
 /// CI machines without an X server deliberately fall back in `main.rs`, but
 /// that output is tagged as static so a layout dump can never masquerade as a
 /// live font measurement.
-pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_json::Value, String> {
+pub(crate) fn dump_live_layout_json(
+    width: i32,
+    height: i32,
+    text_scale: f32,
+) -> Result<serde_json::Value, String> {
     let display = unsafe { XOpenDisplay(ptr::null()) };
     if display.is_null() {
         return Err("could not open an X11 display for live layout metrics".to_owned());
@@ -898,8 +1394,7 @@ pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_jso
         return Err("could not create an X11 drawable for live layout metrics".to_owned());
     }
     let result = (|| {
-        let scale = FrameGeometry::scale_for_window(width, height);
-        let text = TextRenderer::new(display, screen, window, visual, colormap, scale)?;
+        let text = TextRenderer::new(display, screen, window, visual, colormap, text_scale)?;
         let metrics = UiFontMetrics {
             body: text.metrics_for(FontRole::Body),
             input: text.metrics_for(FontRole::Input),
@@ -925,6 +1420,7 @@ pub(crate) fn dump_live_layout_json(width: i32, height: i32) -> Result<serde_jso
             .as_object_mut()
             .ok_or_else(|| "native layout did not serialize as an object".to_owned())?;
         object.insert("metrics_source".to_owned(), serde_json::json!("live_xft"));
+        object.insert("text_scale".to_owned(), serde_json::json!(text_scale));
         object.insert("metrics".to_owned(), serde_json::to_value(metrics).unwrap());
         object.insert(
             "font_pixel_sizes".to_owned(),
@@ -956,6 +1452,7 @@ fn run_window(
     projection: &mut Projection,
     options: &RendererOptions,
 ) -> Result<(), String> {
+    let presentation_clock = PresentationClock::from_environment()?;
     let screen = unsafe { XDefaultScreen(display) };
     let stencil_attributes = [
         GLX_RGBA,
@@ -1018,14 +1515,15 @@ fn run_window(
         colormap,
         cursor: 0,
     };
+    let (initial_width, initial_height) = initial_window_size(display, screen);
     let window = unsafe {
         XCreateWindow(
             display,
             root,
             0,
             0,
-            1280,
-            800,
+            initial_width as CUint,
+            initial_height as CUint,
             0,
             (*visual).depth,
             INPUT_OUTPUT as CUint,
@@ -1040,6 +1538,7 @@ fn run_window(
     let title = CString::new(projection.title.as_str()).map_err(|_| "invalid window title")?;
     unsafe { XStoreName(display, window, title.as_ptr()) };
     set_window_hints(display, window);
+    set_window_pid(display, window);
     let delete_atom = unsafe {
         XInternAtom(
             display,
@@ -1052,34 +1551,61 @@ fn run_window(
     unsafe { XMapWindow(display, window) };
     unsafe { XSync(display, 0) };
 
+    let mut presentation_surface = match PresentationSurface::new(
+        display,
+        window,
+        visual,
+        unsafe { (*visual).depth as CUint },
+        initial_width as CUint,
+        initial_height as CUint,
+    ) {
+        Ok(surface) => surface,
+        Err(error) => {
+            unsafe { XDestroyWindow(display, window) };
+            return Err(error);
+        }
+    };
+
     let context = unsafe { glXCreateContext(display, visual, ptr::null_mut(), 1) };
     if context.is_null() {
+        presentation_surface.destroy();
         unsafe { XDestroyWindow(display, window) };
         return Err("could not create the Athena OpenGL context".to_owned());
     }
-    unsafe { glXMakeCurrent(display, window, context) };
+    if unsafe { glXMakeCurrent(display, presentation_surface.glx_pixmap, context) } == 0 {
+        unsafe {
+            glXDestroyContext(display, context);
+            presentation_surface.destroy();
+            XDestroyWindow(display, window);
+        }
+        return Err("could not make the native presentation surface current".to_owned());
+    }
     let visual_ptr = unsafe { (*visual).visual };
-    let initial_scale = FrameGeometry::scale_for_window(1280, 800);
+    let mut text_zoom = options.text_scale.clamp(0.75, 2.5);
     let mut resize_cursors = ResizeCursors::new(display);
-    let mut text =
-        match TextRenderer::new(display, screen, window, visual_ptr, colormap, initial_scale) {
-            Ok(text) => text,
-            Err(error) => {
-                drop(resize_cursors);
-                unsafe {
-                    glXMakeCurrent(display, 0, ptr::null_mut());
-                    glXDestroyContext(display, context);
-                    XDestroyWindow(display, window);
-                }
-                return Err(error);
+    let mut text = match TextRenderer::new(
+        display,
+        screen,
+        presentation_surface.pixmap,
+        visual_ptr,
+        colormap,
+        text_zoom,
+    ) {
+        Ok(text) => text,
+        Err(error) => {
+            drop(resize_cursors);
+            unsafe {
+                glXMakeCurrent(display, 0, ptr::null_mut());
+                glXDestroyContext(display, context);
+                presentation_surface.destroy();
+                XDestroyWindow(display, window);
             }
-        };
+            return Err(error);
+        }
+    };
     let oi_target = render::oi::OiTarget::new();
     let chassis_material = render::chassis::ChassisMaterial::new();
     let mut input_method = InputMethod::new(display, window);
-    if let Some(input_method) = input_method.as_ref() {
-        unsafe { XSetICFocus(input_method.ic) };
-    }
     let mut writer = pty
         .file()
         .try_clone()
@@ -1088,8 +1614,8 @@ fn run_window(
     let mut input_buffer = InputBuffer::default();
     let mut presentation = PresentationSettings::default();
     let mut selection: Option<((usize, usize), (usize, usize))> = None;
-    let mut width = 1280_i32;
-    let mut height = 800_i32;
+    let mut width = initial_width;
+    let mut height = initial_height;
     let mut metrics = UiFontMetrics {
         body: text.metrics_for(FontRole::Body),
         input: text.metrics_for(FontRole::Input),
@@ -1097,13 +1623,25 @@ fn run_window(
         instrument: text.metrics_for(FontRole::Instrument),
     };
     resize_terminal(core, pty, width, height, metrics);
-    write_runtime_layout_dump(width, height, metrics, text.font_pixel_sizes(), 0);
+    write_runtime_layout_dump(
+        width,
+        height,
+        metrics,
+        text.font_pixel_sizes(),
+        text_zoom,
+        0,
+    );
     resize_cursors.set(window, None);
-    unsafe { XSetInputFocus(display, window, 1, CURRENT_TIME) };
+    // XSetInputFocus is a BadMatch until the WM has made the mapped window
+    // viewable.  Defer the first request to MapNotify and only request focus
+    // again after a remap; this also keeps minimize/restore from racing X11.
+    let mut mapped = false;
+    let mut focus_pending = true;
     let mut focused = true;
     let mut running = true;
     let mut window_destroyed = false;
     let mut child_exited = false;
+    let mut window_drag: Option<WindowDrag> = None;
     let mut dirty = true;
     let mut terminal_dirty = false;
     let mut oi_motion_dirty = false;
@@ -1112,6 +1650,7 @@ fn run_window(
     let mut event_redraws = 0_u64;
     let mut idle_redraws = 0_u64;
     let mut redraws = 0_u64;
+    let mut presented_frame_sequence = 0_u64;
     let mut configure_events = 0_u64;
     let mut oi_dumped = false;
     let render_started = Instant::now();
@@ -1156,6 +1695,30 @@ fn run_window(
                 continue;
             }
             match event.type_ {
+                MAP_NOTIFY => {
+                    mapped = true;
+                    if focus_pending
+                        && !window_destroyed
+                        && set_input_focus_if_mapped(display, window, mapped)
+                    {
+                        if let Some(input_method) = input_method.as_ref() {
+                            unsafe { XSetICFocus(input_method.ic) };
+                        }
+                        focus_pending = false;
+                        focused = true;
+                        dirty = true;
+                        activity_dirty = true;
+                    }
+                }
+                UNMAP_NOTIFY => {
+                    mapped = false;
+                    // A minimized window may later be remapped.  Do not
+                    // issue a focus request against its unmapped drawable.
+                    focus_pending = true;
+                    focused = false;
+                    dirty = true;
+                    activity_dirty = true;
+                }
                 KEY_PRESS => {
                     let key_event = unsafe { &mut *(&mut event as *mut XEvent as *mut XKeyEvent) };
                     let lookup = lookup_key(input_method.as_mut(), key_event);
@@ -1196,11 +1759,81 @@ fn run_window(
                         let _ = writer.flush();
                         dirty = true;
                         activity_dirty = true;
+                    } else if control
+                        && matches!(
+                            keysym,
+                            k if k == '+' as c_ulong || k == '=' as c_ulong || k == '-' as c_ulong
+                                || k == '_' as c_ulong || k == '0' as c_ulong
+                        )
+                    {
+                        // Native zoom is presentation-only: it reopens the
+                        // Xft faces and resizes the PTY from the same layout
+                        // contract without changing projection/backend state.
+                        text_zoom = match keysym {
+                            k if k == '+' as c_ulong || k == '=' as c_ulong => {
+                                (text_zoom * 1.10).min(2.5)
+                            }
+                            k if k == '-' as c_ulong || k == '_' as c_ulong => {
+                                (text_zoom / 1.10).max(0.75)
+                            }
+                            _ => options.text_scale.clamp(0.75, 2.5),
+                        };
+                        match text.reconfigure_for_scale(text_zoom) {
+                            Ok(_) => {
+                                metrics = UiFontMetrics {
+                                    body: text.metrics_for(FontRole::Body),
+                                    input: text.metrics_for(FontRole::Input),
+                                    heading: text.metrics_for(FontRole::Heading),
+                                    instrument: text.metrics_for(FontRole::Instrument),
+                                };
+                                resize_terminal(core, pty, width, height, metrics);
+                                configure_events = configure_events.saturating_add(1);
+                                write_runtime_layout_dump(
+                                    width,
+                                    height,
+                                    metrics,
+                                    text.font_pixel_sizes(),
+                                    text_zoom,
+                                    configure_events,
+                                );
+                                dirty = true;
+                                activity_dirty = true;
+                            }
+                            Err(error) => eprintln!("could not apply native text zoom: {error}"),
+                        }
                     } else if terminal_app {
                         let bytes = terminal_key_bytes(keysym, core.mode(), &lookup.bytes);
                         if !bytes.is_empty() {
                             let _ = writer.write_all(&bytes);
                             let _ = writer.flush();
+                        }
+                    } else if matches!(keysym, XK_F1 | XK_F2 | XK_F3 | XK_F4 | XK_F5) {
+                        let changed = match keysym {
+                            XK_F1 => {
+                                presentation.adjust(PresentationControl::Brightness, -0.05);
+                                true
+                            }
+                            XK_F2 => {
+                                presentation.adjust(PresentationControl::Brightness, 0.05);
+                                true
+                            }
+                            XK_F3 => {
+                                presentation.adjust(PresentationControl::Focus, -0.05);
+                                true
+                            }
+                            XK_F4 => {
+                                presentation.adjust(PresentationControl::Focus, 0.05);
+                                true
+                            }
+                            XK_F5 => {
+                                presentation.adjust(PresentationControl::Power, 0.0);
+                                true
+                            }
+                            _ => false,
+                        };
+                        if changed {
+                            dirty = true;
+                            activity_dirty = true;
                         }
                     } else if control {
                         let key = (keysym as u8).to_ascii_lowercase();
@@ -1257,24 +1890,100 @@ fn run_window(
                 BUTTON_PRESS => {
                     let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
                     if button.button == 4 {
-                        core.scroll_display(Scroll::Delta(3));
+                        let geometry = FrameGeometry::for_window(width, height, metrics);
+                        let over_encoder =
+                            geometry.rail.primary_encoder.contains(button.x, button.y);
+                        let over_attention = render::oi::attention_page_contains(
+                            projection,
+                            button.x as f32,
+                            button.y as f32,
+                            geometry.oi_inner,
+                        );
+                        let changed = if over_encoder && projection.attention_items.len() > 1 {
+                            render::oi::cycle_attention_page(projection, -1)
+                        } else if over_encoder || geometry.oi_inner.contains(button.x, button.y) {
+                            projection.cycle_oi_history(-1)
+                        } else if over_attention {
+                            render::oi::cycle_attention_page(projection, -1)
+                        } else {
+                            false
+                        };
+                        if !changed {
+                            core.scroll_display(Scroll::Delta(3));
+                        }
                         dirty = true;
                         activity_dirty = true;
                     } else if button.button == 5 {
-                        core.scroll_display(Scroll::Delta(-3));
+                        let geometry = FrameGeometry::for_window(width, height, metrics);
+                        let over_encoder =
+                            geometry.rail.primary_encoder.contains(button.x, button.y);
+                        let over_attention = render::oi::attention_page_contains(
+                            projection,
+                            button.x as f32,
+                            button.y as f32,
+                            geometry.oi_inner,
+                        );
+                        let changed = if over_encoder && projection.attention_items.len() > 1 {
+                            render::oi::cycle_attention_page(projection, 1)
+                        } else if over_encoder || geometry.oi_inner.contains(button.x, button.y) {
+                            projection.cycle_oi_history(1)
+                        } else if over_attention {
+                            render::oi::cycle_attention_page(projection, 1)
+                        } else {
+                            false
+                        };
+                        if !changed {
+                            core.scroll_display(Scroll::Delta(-3));
+                        }
                         dirty = true;
                         activity_dirty = true;
                     } else if button.button == 1 {
-                        unsafe { XSetInputFocus(display, window, 1, CURRENT_TIME) };
+                        if mapped && !window_destroyed {
+                            set_input_focus_if_mapped(display, window, mapped);
+                        }
                         focused = true;
                         if let Some(zone) = resize_zone(button.x, button.y, width, height) {
                             selection = None;
+                            window_drag = Some(WindowDrag::new(
+                                display,
+                                window,
+                                button,
+                                width,
+                                height,
+                                WindowDragKind::Resize(zone),
+                            ));
+                            grab_window_pointer(display, window);
                             resize_cursors.set(window, Some(zone));
-                            begin_window_resize(display, window, button, zone);
+                            if env::var_os("ATHENA_NATIVE_USE_WM_MOVERESIZE").is_some() {
+                                begin_window_resize(display, window, button, zone);
+                            }
                         } else {
                             let geometry = FrameGeometry::for_window(width, height, metrics);
-                            if geometry.header.contains(button.x, button.y) {
-                                begin_window_move(display, window, button);
+                            let attention_action = render::oi::attention_hit_map(projection)
+                                .hit_physical(button.x as f32, button.y as f32, geometry.oi_inner)
+                                .cloned();
+                            if let Some(action) = attention_action {
+                                if write_attention_action(&mut writer, &action) {
+                                    dirty = true;
+                                    activity_dirty = true;
+                                }
+                            } else if geometry.header.contains(button.x, button.y) {
+                                window_drag = Some(WindowDrag::new(
+                                    display,
+                                    window,
+                                    button,
+                                    width,
+                                    height,
+                                    WindowDragKind::Move,
+                                ));
+                                grab_window_pointer(display, window);
+                                if env::var_os("ATHENA_NATIVE_USE_WM_MOVERESIZE").is_some() {
+                                    begin_window_move(display, window, button);
+                                }
+                            } else if geometry.rail.primary_encoder.contains(button.x, button.y) {
+                                projection.return_to_live_oi();
+                                dirty = true;
+                                activity_dirty = true;
                             } else if let Some(control) =
                                 PresentationSettings::control_at(&geometry, button.x, button.y)
                             {
@@ -1305,12 +2014,38 @@ fn run_window(
                     if motion.state & BUTTON1_MASK == 0 {
                         resize_cursors.set(window, zone);
                     }
+                    if let Some(drag) = window_drag {
+                        // Keep using the button-press-owned drag state even
+                        // when a synthetic XTest motion omits BUTTON1_MASK;
+                        // real pointer motion reports it, while remote/XTest
+                        // desktops commonly do not.
+                        apply_window_drag(display, window, drag, motion.x_root, motion.y_root);
+                        dirty = true;
+                        activity_dirty = true;
+                        continue;
+                    }
                     if motion.state & BUTTON1_MASK != 0 && zone.is_none() {
-                        if let (Some((anchor, _)), Some(cell)) = (
-                            selection,
-                            FrameGeometry::for_window(width, height, metrics)
-                                .cell_at(motion.x, motion.y),
-                        ) {
+                        let geometry = FrameGeometry::for_window(width, height, metrics);
+                        if let Some(control) =
+                            PresentationSettings::control_at(&geometry, motion.x, motion.y)
+                        {
+                            // Brightness/focus are continuous presentation
+                            // controls: dragging updates only their owned
+                            // display setting. Power remains a click/toggle
+                            // control and is intentionally not retriggered
+                            // during motion.
+                            if matches!(
+                                control,
+                                render::chassis::PresentationControl::Brightness
+                                    | render::chassis::PresentationControl::Focus
+                            ) {
+                                presentation.activate(control, motion.x, &geometry);
+                                dirty = true;
+                                activity_dirty = true;
+                            }
+                        } else if let (Some((anchor, _)), Some(cell)) =
+                            (selection, geometry.cell_at(motion.x, motion.y))
+                        {
                             selection = Some((anchor, cell));
                             dirty = true;
                             activity_dirty = true;
@@ -1320,6 +2055,8 @@ fn run_window(
                 BUTTON_RELEASE => {
                     let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
                     if button.button == 1 {
+                        window_drag = None;
+                        unsafe { XUngrabPointer(display, CURRENT_TIME) };
                         if let (Some((anchor, _)), Some(cell)) = (
                             selection,
                             FrameGeometry::for_window(width, height, metrics)
@@ -1337,8 +2074,26 @@ fn run_window(
                         unsafe { &*(&event as *const XEvent as *const XConfigureEvent) };
                     width = configure.width.max(1);
                     height = configure.height.max(1);
-                    let scale = FrameGeometry::scale_for_window(width, height);
-                    match text.reconfigure_for_scale(scale) {
+                    if let Err(error) = (|| {
+                        unsafe { glXMakeCurrent(display, 0, ptr::null_mut()) };
+                        presentation_surface.resize(width as CUint, height as CUint)?;
+                        text.rebind_drawable(presentation_surface.pixmap)?;
+                        presentation_surface.reap_retired();
+                        if unsafe {
+                            glXMakeCurrent(display, presentation_surface.glx_pixmap, context)
+                        } == 0
+                        {
+                            return Err(
+                                "could not bind the resized presentation surface".to_owned()
+                            );
+                        }
+                        Ok::<(), String>(())
+                    })() {
+                        eprintln!("could not resize native presentation surface: {error}");
+                        running = false;
+                        continue;
+                    }
+                    match text.reconfigure_for_scale(text_zoom) {
                         Ok(_) => {
                             metrics = UiFontMetrics {
                                 body: text.metrics_for(FontRole::Body),
@@ -1358,6 +2113,7 @@ fn run_window(
                         height,
                         metrics,
                         text.font_pixel_sizes(),
+                        text_zoom,
                         configure_events,
                     );
                     dirty = true;
@@ -1368,12 +2124,15 @@ fn run_window(
                     activity_dirty = true;
                 }
                 FOCUS_IN => {
-                    if let Some(input_method) = input_method.as_ref() {
-                        unsafe { XSetICFocus(input_method.ic) };
+                    mapped = true;
+                    if set_input_focus_if_mapped(display, window, mapped) {
+                        if let Some(input_method) = input_method.as_ref() {
+                            unsafe { XSetICFocus(input_method.ic) };
+                        }
+                        focused = true;
+                        dirty = true;
+                        activity_dirty = true;
                     }
-                    focused = true;
-                    dirty = true;
-                    activity_dirty = true;
                 }
                 FOCUS_OUT => {
                     if let Some(input_method) = input_method.as_ref() {
@@ -1412,6 +2171,19 @@ fn run_window(
                 _ => {}
             }
         }
+        if focus_pending
+            && mapped
+            && !window_destroyed
+            && set_input_focus_if_mapped(display, window, mapped)
+        {
+            if let Some(input_method) = input_method.as_ref() {
+                unsafe { XSetICFocus(input_method.ic) };
+            }
+            focus_pending = false;
+            focused = true;
+            dirty = true;
+            activity_dirty = true;
+        }
         if matches!(pty.next_child_event(), Some(ChildEvent::Exited(_))) {
             child_exited = true;
             dirty = true;
@@ -1434,6 +2206,9 @@ fn run_window(
             .map(|last| now.duration_since(last) >= ACTIVE_FRAME_INTERVAL)
             .unwrap_or(true);
         if (dirty || terminal_dirty || oi_motion_dirty) && draw_ready {
+            if options.animations && !options.reduced_motion && projection_is_animated(projection) {
+                projection.advance_animation(ACTIVE_FRAME_INTERVAL.as_secs_f32());
+            }
             render::frame::draw_frame(
                 display,
                 width,
@@ -1455,11 +2230,21 @@ fn run_window(
                     oi_motion: oi_motion_dirty,
                 },
                 if options.animations && !options.reduced_motion {
-                    render_started.elapsed().as_secs_f32()
+                    projection.animation_phase(
+                        presentation_clock.seconds_at_frame(presented_frame_sequence),
+                    )
                 } else {
                     0.0
                 },
             );
+            // Xft targets the same offscreen pixmap as GL. Force the XRender
+            // text requests to land before the pixmap is copied to the mapped
+            // window; without this fence the cabinet can present a complete
+            // GL frame while silently dropping the terminal glyph layer.
+            unsafe { XSync(display, 0) };
+            presentation_surface.present(width as CUint, height as CUint);
+            presented_frame_sequence = presented_frame_sequence.saturating_add(1);
+            write_presentation_sync(presented_frame_sequence, width, height, projection);
             if !oi_dumped {
                 if let Ok(path) = env::var("ATHENA_NATIVE_OI_DUMP") {
                     if let Err(error) = render::oi::dump_framebuffer(&oi_target, &path) {
@@ -1532,6 +2317,7 @@ fn run_window(
         initial_redraws,
         event_redraws,
         idle_redraws,
+        presented_frame_sequence,
     );
 
     // Xft owns an XRender picture tied to the window. Tear it down before
@@ -1539,14 +2325,16 @@ fn run_window(
     // window, leaking these process-local handles is safer than asking Xft/XIM
     // to destroy resources whose drawable no longer exists.
     if window_destroyed {
-        std::mem::forget(resize_cursors);
+        drop(resize_cursors);
         std::mem::forget(input_method);
         std::mem::forget(oi_target);
         std::mem::forget(chassis_material);
-        std::mem::forget(text);
-        // The display close in `run` will reclaim the context and any server
-        // resources. Calling GLX unbind/destroy here can itself query the
-        // drawable after a window manager has removed it.
+        drop(text);
+        unsafe {
+            glXMakeCurrent(display, 0, ptr::null_mut());
+            glXDestroyContext(display, context);
+        }
+        presentation_surface.destroy();
         return Ok(());
     } else {
         drop(resize_cursors);
@@ -1562,6 +2350,7 @@ fn run_window(
             XDestroyWindow(display, window);
         }
     }
+    presentation_surface.destroy();
     Ok(())
 }
 
@@ -1607,11 +2396,33 @@ fn set_window_hints(display: *mut Display, window: Window) {
     }
 }
 
+fn set_window_pid(display: *mut Display, window: Window) {
+    // EWMH window identity lets desktop tooling bind an X11 surface to the
+    // process that owns it. This matters for acceptance harnesses and for
+    // window managers that expose process-aware focus/restore behavior.
+    let pid_atom = intern_atom(display, "_NET_WM_PID");
+    let cardinal_atom = intern_atom(display, "CARDINAL");
+    let pid = [std::process::id()];
+    unsafe {
+        XChangeProperty(
+            display,
+            window,
+            pid_atom,
+            cardinal_atom,
+            32,
+            PROP_MODE_REPLACE,
+            pid.as_ptr().cast(),
+            1,
+        );
+    }
+}
+
 fn write_runtime_layout_dump(
     width: i32,
     height: i32,
     metrics: UiFontMetrics,
     font_pixel_sizes: [i32; 4],
+    text_scale: f32,
     configure_events: u64,
 ) {
     let Ok(path) = env::var("ATHENA_NATIVE_LAYOUT_DUMP") else {
@@ -1651,6 +2462,7 @@ fn write_runtime_layout_dump(
         "font_pixel_sizes".to_owned(),
         serde_json::to_value(font_pixel_sizes).expect("font sizes serialize"),
     );
+    object.insert("text_scale".to_owned(), serde_json::json!(text_scale));
     object.insert(
         "terminal_size".to_owned(),
         serde_json::to_value(layout.terminal_size()).expect("terminal size serialize"),
@@ -1670,6 +2482,31 @@ fn write_runtime_layout_dump(
 
 fn begin_window_move(display: *mut Display, window: Window, button: &XButtonEvent) {
     begin_window_moveresize(display, window, button, 8);
+}
+
+fn write_attention_action(writer: &mut impl Write, action: &render::oi::AttentionAction) -> bool {
+    let command = match action {
+        render::oi::AttentionAction::Approve { approval_id, scope } => {
+            if !is_command_token(approval_id) || !is_command_token(scope) {
+                return false;
+            }
+            format!("/approve {approval_id} {scope}\n")
+        }
+        render::oi::AttentionAction::Deny { approval_id } => {
+            if !is_command_token(approval_id) {
+                return false;
+            }
+            format!("/deny {approval_id}\n")
+        }
+    };
+    writer.write_all(command.as_bytes()).is_ok() && writer.flush().is_ok()
+}
+
+fn is_command_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-:.".contains(character))
 }
 
 fn begin_window_resize(
@@ -1739,6 +2576,7 @@ fn write_render_stats(
     initial_redraws: u64,
     event_redraws: u64,
     idle_redraws: u64,
+    presented_frame_sequence: u64,
 ) {
     let Ok(path) = env::var("ATHENA_NATIVE_RENDER_STATS") else {
         return;
@@ -1753,11 +2591,44 @@ fn write_render_stats(
         "initial_redraws": initial_redraws,
         "event_redraws": event_redraws,
         "idle_redraws": idle_redraws,
+        "presented_frame_sequence": presented_frame_sequence,
         "cpu_seconds": cpu_seconds,
         "steady_elapsed_seconds": steady_elapsed_seconds,
         "steady_cpu_seconds": steady_cpu_seconds,
     });
     let _ = std::fs::write(path, value.to_string());
+}
+
+fn write_presentation_sync(sequence: u64, width: i32, height: i32, projection: &Projection) {
+    let Ok(path) = env::var("ATHENA_NATIVE_PRESENTATION_SYNC") else {
+        return;
+    };
+    let value = serde_json::json!({
+        "presented_frame_sequence": sequence,
+        "width": width,
+        "height": height,
+        "status": projection.status.as_str(),
+        "semantic_state": projection.semantic_state.as_str(),
+        "current_action_kind": projection.current_action.as_ref().map(|action| action.kind.as_str()),
+        "bridge_status": projection.bridge_status.as_str(),
+        "bridge_generation": projection.bridge_generation,
+        "last_frame_sequence": projection.last_frame_sequence,
+        "last_frame_age_ms": projection.last_frame_age_ms(),
+        "stale": projection.stale,
+    });
+    let path = std::path::PathBuf::from(path);
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let temporary = path.with_file_name(format!(".{file_name}.tmp"));
+    if let Err(error) = std::fs::write(&temporary, value.to_string()) {
+        eprintln!("could not write native presentation sync: {error}");
+        return;
+    }
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        eprintln!("could not publish native presentation sync: {error}");
+        let _ = std::fs::remove_file(temporary);
+    }
 }
 
 fn finish_steady_interval(
@@ -1797,7 +2668,7 @@ fn resize_terminal(
 }
 
 fn projection_is_animated(projection: &Projection) -> bool {
-    VisualMode::from_projection(projection).is_animated()
+    VisualMode::from_projection(projection).is_animated(projection)
 }
 fn fit_text_in(text: &TextRenderer, role: FontRole, value: &str, available: i32) -> String {
     if text.text_width_in(role, value) <= available {
@@ -1887,8 +2758,10 @@ fn selection_bounds(
 #[cfg(test)]
 mod tests {
     use super::render::chassis::{PresentationControl, PresentationSettings};
+    use super::render::oi::AttentionAction;
     use super::{
-        FrameGeometry, Projection, ResizeZone, VisualMode, is_wm_delete_message, resize_zone,
+        FrameGeometry, PresentationClock, Projection, ResizeZone, VisualMode, is_wm_delete_message,
+        resize_zone, write_attention_action,
     };
     use crate::ProjectionView;
     use alacritty_terminal::term::TermMode;
@@ -1902,6 +2775,14 @@ mod tests {
         assert!((left_end - geometry.left_x - geometry.oi_outer.width).abs() < 0.01);
         assert!((geometry.operator_inner.width - geometry.oi_inner.width).abs() < 0.01);
         assert!((geometry.operator_inner.height - geometry.oi_inner.height).abs() < 0.01);
+    }
+
+    #[test]
+    fn fixed_presentation_clock_is_reproducible_by_frame_sequence() {
+        let clock = PresentationClock::fixed(0.1);
+        assert_eq!(clock.seconds_at_frame(0), 0.0);
+        assert!((clock.seconds_at_frame(3) - 0.3).abs() < f32::EPSILON);
+        assert!((clock.seconds_at_frame(10) - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1962,6 +2843,38 @@ mod tests {
         assert!(settings.display_enabled);
         settings.activate(PresentationControl::Power, power.x as i32 + 20, &geometry);
         assert!(!settings.display_enabled);
+    }
+
+    #[test]
+    fn native_attention_actions_use_the_service_command_bridge() {
+        let mut output = Vec::new();
+        assert!(write_attention_action(
+            &mut output,
+            &AttentionAction::Approve {
+                approval_id: "apr-1".to_owned(),
+                scope: "task".to_owned(),
+            },
+        ));
+        assert_eq!(output, b"/approve apr-1 task\n");
+
+        output.clear();
+        assert!(write_attention_action(
+            &mut output,
+            &AttentionAction::Deny {
+                approval_id: "apr-1".to_owned(),
+            },
+        ));
+        assert_eq!(output, b"/deny apr-1\n");
+
+        output.clear();
+        assert!(!write_attention_action(
+            &mut output,
+            &AttentionAction::Approve {
+                approval_id: "apr 1".to_owned(),
+                scope: "task".to_owned(),
+            },
+        ));
+        assert!(output.is_empty());
     }
 
     #[test]

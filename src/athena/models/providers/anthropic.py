@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
+from athena.models.media import image_data_path
 from athena.protocol.errors import (
     ContextOverflow,
     ModelUnavailable,
@@ -228,6 +229,7 @@ class AnthropicProvider:
         self._cost = cost
         self._latency_class = latency_class
         self._api_key = api_key
+        self._api_key_configured = bool(api_key)
         self._timeout = timeout
         self._headers = dict(headers or {})
         self._anthropic = _load_anthropic() if use_sdk else None
@@ -264,6 +266,11 @@ class AnthropicProvider:
                 latency_class=self._latency_class,
             )
         ]
+
+    def readiness(self) -> dict[str, str | bool]:
+        if not self._api_key_configured:
+            return {"state": "auth_missing", "kind": "anthropic", "local": False}
+        return {"state": "ready", "kind": "anthropic", "local": False}
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         if self._anthropic is not None:
@@ -408,7 +415,7 @@ class AnthropicProvider:
         if request.system:
             return request.system
         sys_msgs = [m for m in request.messages if m.role == Role.SYSTEM]
-        texts = [m.text() for m in sys_msgs if m.text()]
+        texts = [m.conversation_text() for m in sys_msgs if m.conversation_text()]
         return "\n\n".join(texts) if texts else None
 
     def _translate_messages(
@@ -418,9 +425,23 @@ class AnthropicProvider:
         for index, msg in enumerate(request.messages):
             if msg.role == Role.SYSTEM:
                 continue
+            if msg.role is Role.COMPRESSION:
+                # Anthropic also has no wire-level compression role. Keep the
+                # distinction explicit and visible to the model rather than
+                # silently relying on the ordinary assistant/user fallback.
+                text = "[Athena compressed context]\n" + msg.conversation_text()
+                compression_content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+                if index == cache_breakpoint_index:
+                    compression_content[-1]["cache_control"] = {"type": "ephemeral"}
+                out.append({"role": "user", "content": compression_content})
+                continue
             content: list[dict[str, Any]] = []
+            replay_reasoning = bool(msg.metadata.get("replay_reasoning", False))
             for block in msg.blocks:
-                if isinstance(block, (TextBlock, ReasoningBlock)) and block.text:
+                if (
+                    isinstance(block, TextBlock)
+                    or (replay_reasoning and isinstance(block, ReasoningBlock))
+                ) and block.text:
                     content.append({"type": "text", "text": block.text})
                 elif isinstance(block, ImageBlock) and block.data_path:
                     content.append(
@@ -434,15 +455,37 @@ class AnthropicProvider:
                     )
                 elif isinstance(block, ArtifactRefBlock) and block.uri:
                     # Anthropic has no portable artifact-ref block. Keep the
-                    # reference visible to the model instead of silently
-                    # dropping durable context; callers that need native
-                    # media should resolve it to an image/data URL first.
-                    content.append(
-                        {
-                            "type": "text",
-                            "text": f"[artifact attachment: {block.uri}]",
-                        }
-                    )
+                    # reference visible if local hydration is unavailable;
+                    # image artifacts become native model input when readable.
+                    image_url = image_data_path(block)
+                    if image_url is not None:
+                        if image_url.startswith("data:"):
+                            header, encoded = image_url.split(",", 1)
+                            media_type = header[5:].split(";", 1)[0]
+                            content.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": encoded,
+                                    },
+                                }
+                            )
+                        else:
+                            content.append(
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": image_url},
+                                }
+                            )
+                    else:
+                        content.append(
+                            {
+                                "type": "text",
+                                "text": f"[artifact attachment: {block.uri}]",
+                            }
+                        )
                 elif isinstance(block, FileRefBlock) and block.uri:
                     content.append(
                         {
@@ -486,7 +529,7 @@ class AnthropicProvider:
                     **content[-1],
                     "cache_control": {"type": "ephemeral"},
                 }
-            out.append({"role": role, "content": content or msg.text()})
+            out.append({"role": role, "content": content or msg.conversation_text()})
         return out
 
     async def _read_json(self, resp: httpx.Response) -> dict[str, Any]:

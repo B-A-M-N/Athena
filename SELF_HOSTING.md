@@ -38,7 +38,8 @@ athena self status
 To provision the local Hermes Agent referee, use the Hermes checkout explicitly:
 
 ```bash
-athena referee setup --hermes-root /path/to/hermes-agent
+athena referee setup --hermes-root /path/to/hermes-agent \
+  --self-host-supervision required
 athena self status
 ```
 
@@ -54,13 +55,29 @@ refreshes cannot repopulate the effective tool surface.
 The generated bearer key is kept in the owner-only user secret store at
 `~/.config/athena/secrets/HERMES_REFEREE_API_KEY` and is never placed in
 `config.toml`. Use `athena referee status`, `athena referee repair`, or
-`athena referee disable` for lifecycle operations.
+`athena referee disable` for lifecycle operations. Disable stops the Hermes
+transport but preserves the selected self-host policy: a disabled `required`
+referee blocks self-hosting, while `advisory` permits it without Hermes
+evidence. Set `hermes-referee.self-host-supervision` to `off` when the policy
+should no longer apply.
 
 `athena self status` reports Athena proof readiness, Hermes connectivity,
 separate read-only safety verification, profile, and the invariant that human
 promotion remains required. Hermes is called only at semantic
-candidate/mission checkpoints. It receives a bounded read-only `ReviewPacket`;
-a missing, malformed, or failed response holds the review closed.
+candidate/mission checkpoints. It receives a bounded read-only `ReviewPacket`.
+
+Self-host supervision is configured with `off`, `advisory`, or `required`:
+
+- `off` keeps ordinary Athena and self-host paths independent of Hermes.
+- `advisory` records Hermes verdicts as evidence while leaving deterministic
+  candidate eligibility and mission completion unchanged.
+- `required` preserves fail-closed admission and subtractive candidate and
+  mission enforcement when Hermes is unavailable or returns a hold/reject.
+
+The explicit `athena referee setup` command defaults to `required` when no mode
+is supplied; ordinary Athena startup does not enable Hermes. A missing,
+malformed, or failed response is therefore evidence-only in advisory mode and
+holds the review closed in required mode.
 
 ## Completion and performance gates
 

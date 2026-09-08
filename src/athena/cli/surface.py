@@ -12,6 +12,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, TextIO
 
+from athena.execution.async_call import run_blocking
+
 
 @dataclass(frozen=True)
 class ApprovalChoice:
@@ -262,13 +264,27 @@ class OperatorSurface:
             return
 
         if event_type in {
-            "MutationRecorded",
-            "MutationRecordFailed",
-            "MutationRolledBack",
             "MemoryCandidateCreated",
+            "MemoryCandidatesRecorded",
             "MemoryWritten",
             "SkillCandidateCreated",
             "SkillActivated",
+        }:
+            if self.details:
+                labels = {
+                    "MemoryCandidateCreated": "memory candidate recorded",
+                    "MemoryCandidatesRecorded": "memory candidates recorded",
+                    "MemoryWritten": "memory written",
+                    "SkillCandidateCreated": "skill candidate recorded",
+                    "SkillActivated": "skill activated",
+                }
+                self._write(f"  · {labels[event_type]}")
+            return
+
+        if event_type in {
+            "MutationRecorded",
+            "MutationRecordFailed",
+            "MutationRolledBack",
             "InterpreterProposalDispatched",
             "ToolInputCorrectionExhausted",
             "RecoveryStarted",
@@ -278,10 +294,6 @@ class OperatorSurface:
                 "MutationRecorded": "mutation recorded",
                 "MutationRecordFailed": "mutation record failed",
                 "MutationRolledBack": "mutation rolled back",
-                "MemoryCandidateCreated": "memory candidate captured",
-                "MemoryWritten": "knowledge saved",
-                "SkillCandidateCreated": "skill candidate captured",
-                "SkillActivated": "skill activated",
                 "InterpreterProposalDispatched": "computer proposal dispatched",
                 "ToolInputCorrectionExhausted": "tool repair budget exhausted",
                 "RecoveryStarted": "recovery started",
@@ -451,10 +463,7 @@ class OperatorSurface:
         # deliberate pause in the interactive surface.
         reader = getattr(self, "read_prompt", None)
         if callable(reader):
-            import asyncio
-
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, reader, prompt)
+            return await run_blocking(reader, prompt)
         return self._input_fn(prompt)
 
     # ------------------------------------------------------------------

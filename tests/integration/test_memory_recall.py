@@ -13,7 +13,7 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.ids import new_id
 from athena.protocol.memory import MemoryKind, MemoryRecord, MemoryScope
-from athena.protocol.tasks import ResourceBudget, TaskSpec, WorkspaceSpec
+from athena.protocol.tasks import AgentRequest, ResourceBudget, TaskSpec, WorkspaceSpec
 
 _MARKER = "ATOMIC_LEVER_SENTINEL"
 
@@ -243,3 +243,34 @@ async def test_context_compiler_retrieves_capability_written_memory(make_service
 
     compiled = await _compile_task(svc, "recall about the marker", session_id, workspace=workspace)
     assert _MARKER in compiled
+
+
+async def test_explicit_remember_request_is_retrievable_on_next_turn(make_service):
+    svc = await make_service(
+        scripts=[
+            {
+                "match": {"user_contains": "banana"},
+                "respond": {"text": "I will remember that.", "done": True},
+            },
+            {
+                "match": {"user_contains": "favorite word"},
+                "respond": {"text": "Your favorite word is banana.", "done": True},
+            },
+        ]
+    )
+    session_id = new_id("session")
+
+    await svc.submit(
+        AgentRequest(
+            prompt="remember that banana is my favorite word",
+            session_id=session_id,
+        ),
+        wait=True,
+    )
+
+    compiled = await _compile_task(svc, "what is my favorite word?", session_id)
+    assert "banana is my favorite word" in compiled
+    records = await svc._memory.list_pending_candidates()
+    assert not any(
+        record.metadata.get("candidate_type") == "explicit_user_fact" for record in records
+    )

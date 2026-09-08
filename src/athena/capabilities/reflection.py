@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import inspect
+import os
+import platform
 import re
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
 
 from athena.execution.environment import ProjectEnvironmentFingerprint
 from athena.protocol.capabilities import (
@@ -24,6 +32,9 @@ class CapabilityReflection:
             "Reflect on the effective capability fabric: search and describe "
             "available capabilities, inspect dependencies and provenance, "
             "review lifecycle history, and list machinery created this task."
+        ),
+        tags=frozenset(
+            {"capability", "capabilities", "tool", "tools", "affordance", "discover", "discovery"}
         ),
         input_schema={
             "type": "object",
@@ -69,6 +80,10 @@ class CapabilityReflection:
         policy_engine=None,
         approval_store=None,
         health_provider=None,
+        runtime_health_provider=None,
+        model_provider=None,
+        mcp_status_provider=None,
+        delegate_provider=None,
     ) -> None:
         self._fabric = fabric
         self._workflows = workflow_store
@@ -78,6 +93,10 @@ class CapabilityReflection:
         self._policy = policy_engine
         self._approvals = approval_store
         self._health = health_provider
+        self._runtime_health = runtime_health_provider
+        self._models = model_provider
+        self._mcp_status = mcp_status_provider
+        self._delegates = delegate_provider
 
     async def invoke(self, request: CapabilityRequest, **kw) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -89,9 +108,13 @@ class CapabilityReflection:
             raw_workspace if isinstance(raw_workspace, WorkspaceSpec) else None
         )
         project_id = getattr(workspace, "id", None)
-        user_id = "athena"
+        user_id = getattr(context, "principal_id", None)
         try:
             if operation == "search":
+                # Method-local import: fabric imports the capability registry,
+                # which re-enters this package at module load time.
+                from athena.affordances.fabric import EXPLICIT_REFLECTION_SEARCH
+
                 value = self._fabric.search(
                     str(args.get("query") or ""),
                     task_id=task_id,
@@ -102,6 +125,10 @@ class CapabilityReflection:
                     # one affordance family. Keep enough candidates from the
                     # capability surface for workflows and skills to compete.
                     limit=10_000,
+                    # An operator/model-initiated reflection search is an
+                    # explicit query: take it literally instead of applying
+                    # the conservative automatic-disclosure filter.
+                    mode=EXPLICIT_REFLECTION_SEARCH,
                 )
                 value = await self._search_other_affordances(
                     value,
@@ -173,7 +200,7 @@ class CapabilityReflection:
                         context=context,
                     )
                     if capability_id
-                    else self._environment_passport(
+                    else await self._environment_passport(
                         task_id=task_id,
                         project_id=project_id,
                         user_id=user_id,
@@ -195,7 +222,7 @@ class CapabilityReflection:
         *,
         task_id: str | None,
         project_id: str | None,
-        user_id: str,
+        user_id: str | None,
         limit: int,
     ) -> list[dict]:
         """Rank capabilities, workflows, and skills as one surface.
@@ -324,9 +351,59 @@ class CapabilityReflection:
             return []
         status = getattr(self._execution, "runtime_status", None)
         if callable(status):
-            return list(status())
+            return [self._availability_record(item, kind="runtime") for item in status()]
         names = self._execution.available_runtimes()
-        return [{"kind": "runtime", "id": name, "available": True} for name in names]
+        return [
+            self._availability_record(
+                {"kind": "runtime", "id": name, "available": True},
+                kind="runtime",
+            )
+            for name in names
+        ]
+
+    @staticmethod
+    def _availability_record(record: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
+        """Add an actionable reason/remediation without hiding raw health facts."""
+        result = dict(record)
+        result.setdefault("kind", kind)
+        identifier = str(result.get("id") or result.get("name") or kind)
+        raw_status = str(result.get("status") or "")
+        available = result.get("available")
+        normalized_status = raw_status.casefold()
+        unavailable = available is False or normalized_status in {
+            "unavailable",
+            "missing",
+            "unsupported",
+            "error",
+        }
+        known_available = available is True or normalized_status in {
+            "available",
+            "ok",
+            "ready",
+            "healthy",
+            "connected",
+            "active",
+            "configured",
+        }
+        # Retain the provider's status for compatibility. availability is
+        # the canonical two-valued field used by the passport.
+        result["availability"] = (
+            "unavailable" if unavailable or not known_available else "available"
+        )
+        result.setdefault("status", "unavailable" if unavailable else "available")
+        result.setdefault(
+            "reason",
+            f"{kind} {identifier!r} is unavailable"
+            if result["availability"] == "unavailable"
+            else None,
+        )
+        result.setdefault(
+            "remediation",
+            f"configure or install {kind} {identifier!r}"
+            if result["availability"] == "unavailable"
+            else None,
+        )
+        return result
 
     async def _list_permissions(
         self,
@@ -334,7 +411,7 @@ class CapabilityReflection:
         capability_id: str,
         task_id: str | None,
         project_id: str | None,
-        user_id: str,
+        user_id: str | None,
         context=None,
     ) -> list[dict]:
         descriptors = self._fabric.list_descriptors(
@@ -464,7 +541,7 @@ class CapabilityReflection:
         *,
         task_id: str | None,
         project_id: str | None,
-        user_id: str,
+        user_id: str | None,
         context=None,
     ) -> dict:
         """Compute whether a capability can run in this task context.
@@ -668,15 +745,33 @@ class CapabilityReflection:
             ),
         }
 
-    def _environment_passport(
+    async def _environment_passport(
         self,
         *,
         task_id: str | None,
         project_id: str | None,
-        user_id: str,
+        user_id: str | None,
         context=None,
     ) -> dict:
         """Summarize the effective machine/task surface in one graph."""
+        subsystem_health: dict[str, Any] = {}
+        if self._runtime_health is not None:
+            try:
+                raw_health = self._runtime_health()
+                if inspect.isawaitable(raw_health):
+                    raw_health = await raw_health
+                if isinstance(raw_health, Mapping):
+                    subsystem_health = {
+                        str(name): dict(value) if isinstance(value, Mapping) else value
+                        for name, value in raw_health.items()
+                    }
+            except Exception as exc:  # noqa: BLE001 - reflection is advisory
+                subsystem_health = {
+                    "service_runtime": {
+                        "health": "unavailable",
+                        "error": str(exc),
+                    }
+                }
         capabilities = []
         for descriptor in self._fabric.list_descriptors(
             task_id=task_id,
@@ -695,8 +790,17 @@ class CapabilityReflection:
                 {
                     "id": descriptor.id,
                     "status": item["status"],
+                    "availability": (
+                        "available" if item["status"] == "AVAILABLE" else "unavailable"
+                    ),
                     "preconditions": item["preconditions"],
                     "checks": item["checks"],
+                    "reason": item["preconditions"][0] if item["preconditions"] else None,
+                    "remediation": (
+                        "resolve the listed preconditions before invoking"
+                        if item["preconditions"]
+                        else None
+                    ),
                 }
             )
         raw_workspace = getattr(context, "workspace", None)
@@ -709,6 +813,30 @@ class CapabilityReflection:
             status = getattr(self._execution, "backend_status", None)
             if callable(status):
                 backends = list(status())
+        backend_records = [
+            self._availability_record(item, kind="execution_backend") for item in backends
+        ]
+        if not backend_records:
+            backend_records = [
+                {
+                    "kind": "execution_backend_provider",
+                    "status": "unavailable",
+                    "availability": "unavailable",
+                    "reason": "no execution backend inventory is configured",
+                    "remediation": "start the execution manager and register a backend",
+                }
+            ]
+        runtime_records = self._list_runtimes()
+        if not runtime_records:
+            runtime_records = [
+                {
+                    "kind": "runtime_provider",
+                    "status": "unavailable",
+                    "availability": "unavailable",
+                    "reason": "no runtime inventory is configured",
+                    "remediation": "start the execution manager and register a runtime",
+                }
+            ]
         environment_extras = {"backends": backends} if backends else None
         if workspace is not None:
             environment = ProjectEnvironmentFingerprint().describe(
@@ -723,31 +851,329 @@ class CapabilityReflection:
             if workspace is not None
             else None
         )
+        model_registry = self._models() if callable(self._models) else self._models
+        configured_models: list[dict] = []
+        model_provider_names: list[str] = []
+        model_reason = "no model provider is configured"
+        provider_readiness: dict[str, Any] = {}
+        if model_registry is not None:
+            try:
+                model_provider_names = list(model_registry.names())
+                readiness_probe = getattr(model_registry, "readiness", None)
+                if callable(readiness_probe):
+                    raw_readiness = readiness_probe()
+                    if isinstance(raw_readiness, Mapping):
+                        provider_readiness = dict(raw_readiness)
+                models = await model_registry.list_models()
+                provider_states = {
+                    str(name): str(record.get("state") or "unverified")
+                    for name, record in dict(provider_readiness.get("providers") or {}).items()
+                    if isinstance(record, Mapping)
+                }
+                configured_models = [
+                    {
+                        "id": getattr(model, "id", None),
+                        "provider": getattr(model, "provider", None),
+                        "context_window": getattr(model, "context_window", None),
+                        "status": (
+                            "available"
+                            if provider_states.get(str(getattr(model, "provider", "")), "ready")
+                            == "ready"
+                            else "unavailable"
+                        ),
+                    }
+                    for model in models
+                ]
+                if not configured_models:
+                    model_reason = "configured providers expose no models"
+                elif not any(item["status"] == "available" for item in configured_models):
+                    model_reason = "configured providers are not ready"
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                model_reason = f"model inventory unavailable: {exc}"
+
+        model_available = any(item["status"] == "available" for item in configured_models)
+
+        toolchain_names = ("python", "uv", "ruff", "mypy", "pytest", "cargo", "rustc", "node")
+        toolchains = [
+            {
+                "name": name,
+                "executable": shutil.which(name),
+                "status": "available" if shutil.which(name) else "unavailable",
+                "reason": None if shutil.which(name) else f"{name} is not installed or not on PATH",
+                "remediation": None if shutil.which(name) else f"install or configure {name}",
+            }
+            for name in toolchain_names
+        ]
+        workspace_root = Path(workspace.root).resolve() if workspace is not None else None
+        sandbox_available = os.name == "posix" and shutil.which("bwrap") is not None
+        sandbox_status = (
+            "available"
+            if sandbox_available
+            else ("unsupported" if os.name != "posix" else "unavailable")
+        )
+        filesystem = {
+            "workspace_root": str(workspace_root) if workspace_root else None,
+            "workspace_exists": bool(workspace_root and workspace_root.is_dir()),
+            "workspace_writable": bool(workspace_root and os.access(workspace_root, os.W_OK)),
+            "sandbox_backend": "bubblewrap" if sandbox_available else None,
+            "sandbox_status": sandbox_status,
+            "sandbox_remediation": None
+            if sandbox_available
+            else (
+                "restricted execution is supported on POSIX hosts only"
+                if os.name != "posix"
+                else "install bubblewrap before invoking restricted execution"
+            ),
+        }
+        filesystem_available = bool(
+            filesystem["workspace_exists"]
+            and filesystem["workspace_writable"]
+            and filesystem["sandbox_status"] == "available"
+        )
+        filesystem["status"] = "available" if filesystem_available else "unavailable"
+        filesystem["availability"] = filesystem["status"]
+        filesystem["reason"] = (
+            None
+            if filesystem_available
+            else (
+                "workspace context is missing or not writable"
+                if not filesystem["workspace_exists"] or not filesystem["workspace_writable"]
+                else "restricted sandbox backend is unavailable"
+            )
+        )
+        filesystem["remediation"] = (
+            None
+            if filesystem_available
+            else (
+                "supply a writable workspace root"
+                if not filesystem["workspace_exists"] or not filesystem["workspace_writable"]
+                else filesystem["sandbox_remediation"]
+            )
+        )
+        network_policy = (
+            getattr(getattr(workspace, "network_policy", None), "value", None)
+            if workspace is not None
+            else None
+        )
+        configured_connectivity = "configured" if network_policy is not None else "unknown"
+        physical_connectivity = os.environ.get("ATHENA_NETWORK_CONNECTIVITY", "").strip().lower()
+        if physical_connectivity not in {"available", "unavailable"}:
+            physical_connectivity = "unknown"
+        if workspace is None:
+            network_state = "unknown"
+            network_reason = "no workspace context supplied; physical connectivity is unverified"
+        elif network_policy == "deny":
+            network_state = "blocked"
+            network_reason = "workspace network policy is deny"
+        elif network_policy == "restricted":
+            network_state = "restricted"
+            network_reason = "workspace network policy restricts network access"
+        elif physical_connectivity == "available":
+            network_state = "available"
+            network_reason = None
+        else:
+            network_state = "unknown"
+            network_reason = (
+                "workspace policy permits network, but physical connectivity is unverified"
+            )
+        network = {
+            "policy": network_policy,
+            "status": network_state,
+            "configured_connectivity": configured_connectivity,
+            "physical_connectivity": physical_connectivity,
+            "availability": "available" if network_state == "available" else "unavailable",
+            "reason": network_reason,
+            "remediation": (
+                None
+                if network_state == "available"
+                else (
+                    "supply a workspace context before requesting networked work"
+                    if workspace is None
+                    else "verify connectivity or set ATHENA_NETWORK_CONNECTIVITY=available"
+                    if network_state == "unknown"
+                    else "request an explicit network policy that permits this operation"
+                )
+            ),
+        }
+        mcp_status = self._mcp_status() if callable(self._mcp_status) else self._mcp_status
+        mcp = []
+        for name, value in sorted(dict(mcp_status or {}).items()):
+            if isinstance(value, Mapping):
+                state = str(value.get("state") or "unknown")
+                record = dict(value)
+                record.setdefault("id", str(name))
+                record["status"] = "available" if state == "connected" else state
+                record["availability"] = "available" if state == "connected" else "unavailable"
+                record.setdefault(
+                    "reason",
+                    None
+                    if state == "connected"
+                    else str(value.get("last_error") or "MCP server is not connected"),
+                )
+                record.setdefault(
+                    "remediation",
+                    None
+                    if state == "connected"
+                    else "inspect MCP configuration and reconnect the server",
+                )
+                mcp.append(record)
+                continue
+            state = str(value)
+            mcp.append(
+                {
+                    "id": str(name),
+                    "status": "available" if state == "connected" else "unavailable",
+                    "availability": "available" if state == "connected" else "unavailable",
+                    "reason": None if state == "connected" else state,
+                    "remediation": None
+                    if state == "connected"
+                    else "inspect MCP configuration and reconnect the server",
+                }
+            )
+        delegates = self._delegates() if callable(self._delegates) else self._delegates
+        delegate_records = (
+            [self._availability_record(item, kind="delegate") for item in delegates.list()]
+            if delegates is not None
+            else []
+        )
+        if not delegate_records:
+            delegate_records = [
+                {
+                    "status": "unavailable",
+                    "availability": "unavailable",
+                    "reason": "no host-configured delegate is registered",
+                    "remediation": "configure a trusted delegate connector",
+                }
+            ]
+        generated = [
+            item
+            for item in capabilities
+            if str(item["id"]).startswith("synth_") or str(item["id"]).startswith("generated")
+        ]
+        unavailable = [item for item in toolchains if item["status"] == "unavailable"]
+        device_records = [
+            self._availability_record(item, kind="device") for item in self._list_devices()
+        ]
+        device_constraints = [
+            {
+                **item,
+                "availability": item["availability"],
+                "remediation": item.get("remediation")
+                or (
+                    None
+                    if item["availability"] == "available"
+                    else "configure or attach a supported device adapter"
+                ),
+            }
+            for item in device_records
+        ]
+        platform_record = {
+            "os": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": sys.version.split()[0],
+            "status": "available",
+            "availability": "available",
+            "reason": None,
+            "remediation": None,
+        }
+        workspace_exists = bool(workspace is not None and Path(workspace.root).is_dir())
+        workspace_record = {
+            "id": getattr(workspace, "id", None),
+            "execution_backend": getattr(workspace, "execution_backend", None),
+            "network_policy": getattr(
+                getattr(workspace, "network_policy", None),
+                "value",
+                getattr(workspace, "network_policy", None),
+            ),
+            "mutation_mode": getattr(
+                getattr(workspace, "mutation_mode", None),
+                "value",
+                getattr(workspace, "mutation_mode", None),
+            ),
+            "status": "available" if workspace_exists else "unavailable",
+            "availability": "available" if workspace_exists else "unavailable",
+            "reason": None if workspace_exists else "no workspace context supplied",
+            "remediation": None if workspace_exists else "supply an existing workspace root",
+        }
+        environment_record = (
+            {
+                **dict(environment),
+                "status": "available",
+                "availability": "available",
+                "reason": None,
+                "remediation": None,
+            }
+            if environment is not None
+            else {
+                "status": "unavailable",
+                "availability": "unavailable",
+                "reason": "no workspace environment could be described",
+                "remediation": "supply a workspace context",
+            }
+        )
+        passport_status = (
+            "AVAILABLE"
+            if all(item["status"] == "AVAILABLE" for item in capabilities)
+            and model_available
+            and filesystem["availability"] == "available"
+            and workspace_record["availability"] == "available"
+            and any(item["availability"] == "available" for item in backend_records)
+            and any(item["availability"] == "available" for item in runtime_records)
+            and self._execution is not None
+            and not any(
+                isinstance(item, Mapping)
+                and str(item.get("health") or "").casefold()
+                in {"degraded", "failed", "unavailable"}
+                for item in subsystem_health.values()
+            )
+            else "PARTIAL"
+        )
         return {
             "kind": "environment_passport",
-            "status": "AVAILABLE"
-            if all(item["status"] == "AVAILABLE" for item in capabilities)
-            else "PARTIAL",
+            "status": passport_status,
             "capabilities": capabilities,
-            "runtimes": self._list_runtimes(),
-            "backends": backends,
-            "devices": self._list_devices(),
-            "environment": environment,
-            "workspace": {
-                "id": getattr(workspace, "id", None),
-                "execution_backend": getattr(workspace, "execution_backend", None),
-                "network_policy": getattr(
-                    getattr(workspace, "network_policy", None),
-                    "value",
-                    getattr(workspace, "network_policy", None),
+            "platform": platform_record,
+            "runtimes": runtime_records,
+            "backends": backend_records,
+            "toolchains": toolchains,
+            "models": {
+                "providers": model_provider_names,
+                "configured": configured_models,
+                **({"provider_readiness": provider_readiness} if provider_readiness else {}),
+                "status": (
+                    "available"
+                    if model_available
+                    else ("partial" if configured_models else "unavailable")
                 ),
-                "mutation_mode": getattr(
-                    getattr(workspace, "mutation_mode", None),
-                    "value",
-                    getattr(workspace, "mutation_mode", None),
-                ),
+                "availability": "available" if model_available else "unavailable",
+                "reason": None if model_available else model_reason,
+                "remediation": None
+                if model_available
+                else "configure a provider and model before submitting agent work",
             },
+            "mcp": mcp,
+            "delegates": delegate_records,
+            "generated_capabilities": generated,
+            "dependencies": {
+                "status": "available" if not unavailable else "partial",
+                "availability": "available" if not unavailable else "unavailable",
+                "toolchain_unavailable": [item["name"] for item in unavailable],
+                "reason": None
+                if not unavailable
+                else "one or more declared development/toolchain dependencies are unavailable",
+                "remediation": None
+                if not unavailable
+                else "install the missing tools or use a host with the required toolchain",
+            },
+            "devices": device_records,
+            "device_constraints": device_constraints,
+            "network": network,
+            "filesystem": filesystem,
+            "environment": environment_record,
+            "workspace": workspace_record,
             "environment_fingerprint": environment_fingerprint,
+            "subsystems": subsystem_health,
         }
 
     async def _describe_workflow(self, workflow_id: str, *, task_id, project_id, user_id) -> dict:

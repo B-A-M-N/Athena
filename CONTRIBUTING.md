@@ -17,4 +17,4 @@ scripts/architecture-lint
 
 Do not include credentials, generated local databases, or host-specific
 artifacts. Visual VHS capture is an optional manual demo concern, not part of
-the stable-beta release gate.
+the 0.1 stable release gate.

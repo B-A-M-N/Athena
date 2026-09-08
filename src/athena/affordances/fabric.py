@@ -19,9 +19,105 @@ from athena.affordances.store import GeneratedCapabilityStore
 from athena.capabilities.registry import CapabilityRegistry, _compile_validator
 from athena.protocol.capabilities import Availability, CapabilityDescriptor
 from athena.protocol.errors import CapabilityUnavailable
+from athena.protocol.messages import utcnow
 from athena.protocol.tasks import WorkspaceSpec
 
 _logger = logging.getLogger("athena.affordances")
+_UNUSABLE_LIFECYCLE_STATES = frozenset(
+    {
+        "STALE",
+        "DEGRADED",
+        "REVALIDATION_REQUIRED",
+        "REJECTED",
+        "SUPERSEDED",
+        "DEPRECATED",
+    }
+)
+
+# Search is progressive disclosure, not a full-text index.  These terms are
+# intentionally small and operator-facing: a capability earns visibility from
+# an identity/tag/synonym hit, while arbitrary prose in a long descriptor
+# cannot make it appear relevant to a casual question.
+_SEARCH_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "be",
+        "can",
+        "do",
+        "for",
+        "from",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "me",
+        "my",
+        "of",
+        "on",
+        "or",
+        "please",
+        "the",
+        "tell",
+        "that",
+        "this",
+        "to",
+        "what",
+        "with",
+        "you",
+        "your",
+    }
+)
+_SEARCH_WEAK_TERMS = frozenset(
+    {
+        "all",
+        "bounded",
+        "current",
+        "local",
+        "normal",
+        "output",
+        "project",
+        "return",
+        "short",
+        "task",
+        "use",
+        "used",
+        "using",
+        "work",
+    }
+)
+# Tags are the primary vocabulary. This tiny table exists only for legacy
+# vocabulary that cannot be expressed by a canonical descriptor ID alone;
+# native, MCP, pack, and generated descriptors should publish their own tags.
+_CAPABILITY_SYNONYMS: dict[str, frozenset[str]] = {
+    "fs": frozenset({"file_ops"}),
+    "execute": frozenset({"command_runner"}),
+    "research": frozenset({"web_lookup"}),
+}
+
+
+def _search_tokens(value: Any, *, include_weak: bool = True) -> frozenset[str]:
+    """Tokenize human words without turning prose substrings into matches."""
+    tokens = {
+        token.casefold()
+        for token in re.findall(r"[a-zA-Z0-9]+", str(value or ""))
+        if len(token) >= 2 and token.casefold() not in _SEARCH_STOPWORDS
+    }
+    if not include_weak:
+        tokens.difference_update(_SEARCH_WEAK_TERMS)
+    return frozenset(tokens)
+
+
+# Two relevance policies serve two distinct callers. Automatic initial
+# disclosure filters weak generic terms so ordinary prose cannot expose the
+# whole fabric. An explicit reflection search requested through the
+# ``capabilities`` capability takes the user's query literally: a
+# meaningful-but-generic term like "project" must find ``project.inspect``.
+AUTOMATIC_DISCLOSURE = "automatic_disclosure"
+EXPLICIT_REFLECTION_SEARCH = "explicit_reflection_search"
 
 
 class CapabilityFabric:
@@ -80,9 +176,11 @@ class CapabilityFabric:
         if not task_id:
             raise ValueError("task overlay requires task_id")
         self._check(executor)
+        self._validate_revision_links(generated, "task", task_id)
         self._install(self._task.setdefault(task_id, {}), executor)
         self._invalidate_availability()
         self._record(executor, generated, "task", task_id)
+        self._supersede_active(generated, "task", task_id)
 
     def register_project(self, project_id: str, executor: Any, *, generated=None) -> None:
         if not project_id:
@@ -97,10 +195,18 @@ class CapabilityFabric:
                 }
             )
             return
+        self._validate_revision_links(generated, "project", project_id)
+        if self._store is not None and generated is not None:
+            self._schedule_durable_activation(
+                generated,
+                executor,
+                owner=project_id,
+            )
+            return
         self._install(self._project.setdefault(project_id, {}), executor)
         self._invalidate_availability()
         self._record(executor, generated, "project", project_id)
-        self._persist_if_durable(generated, owner=project_id)
+        self._supersede_active(generated, "project", project_id)
 
     def register_user(self, user_id: str, executor: Any, *, generated=None) -> None:
         if not user_id:
@@ -115,10 +221,119 @@ class CapabilityFabric:
                 }
             )
             return
+        self._validate_revision_links(generated, "user", user_id)
+        if self._store is not None and generated is not None:
+            self._schedule_durable_activation(
+                generated,
+                executor,
+                owner=user_id,
+            )
+            return
         self._install(self._user.setdefault(user_id, {}), executor)
         self._invalidate_availability()
         self._record(executor, generated, "user", user_id)
-        self._persist_if_durable(generated, owner=user_id)
+        self._supersede_active(generated, "user", user_id)
+
+    async def activate_generated_revision(
+        self,
+        generated: GeneratedCapability,
+        executor: Any,
+        *,
+        owner: str,
+    ) -> None:
+        """Durably activate a generated project/user revision.
+
+        Authority-changing activation is awaitable so callers can keep the
+        previous task or project overlay live until the durable transaction
+        has committed.  The synchronous registration methods retain their
+        compatibility behavior for non-authoritative callers.
+        """
+        self._check(executor)
+        if generated.scope not in {AffordanceScope.PROJECT, AffordanceScope.USER}:
+            raise ValueError("generated revision activation requires project or user scope")
+        if not owner:
+            raise ValueError("generated revision activation requires an owner")
+        scope = generated.scope.value
+        if self._equivalent(generated, scope, owner):
+            self._history.setdefault(generated.id, []).append(
+                {
+                    "event": "deduplicated",
+                    "scope": scope,
+                    "owner": owner,
+                }
+            )
+            return
+        self._validate_revision_links(generated, scope, owner)
+        owner_map = (
+            self._project.setdefault(owner, {})
+            if generated.scope is AffordanceScope.PROJECT
+            else self._user.setdefault(owner, {})
+        )
+        if generated.id in owner_map:
+            raise ValueError(f"overlay capability '{generated.id}' already registered")
+        if self._store is not None:
+            await self._store.save(generated, owner=owner)
+        self._install(owner_map, executor)
+        self._invalidate_availability()
+        self._record(executor, generated, scope, owner)
+        self._supersede_active(generated, scope, owner)
+
+    async def activate_revalidated(
+        self,
+        generated: GeneratedCapability,
+        executor: Any,
+        *,
+        owner: str,
+    ) -> None:
+        """Persist a revalidated record before restoring its live overlay."""
+        self._check(executor)
+        scope = generated.scope
+        if scope not in {
+            AffordanceScope.TASK,
+            AffordanceScope.CANDIDATE,
+            AffordanceScope.PROJECT,
+            AffordanceScope.USER,
+        }:
+            raise ValueError("only task/candidate/project/user capabilities can be reactivated")
+        if not owner:
+            raise ValueError("revalidated capability requires an owner")
+        if scope is AffordanceScope.CANDIDATE:
+            if self._store is not None:
+                await self._store.save(generated, owner=owner)
+            self._records[generated.id] = generated
+            self._history.setdefault(generated.id, []).append(
+                {
+                    "event": "revalidated",
+                    "scope": scope.value,
+                    "owner": owner,
+                    "revision": generated.revision,
+                }
+            )
+            self._invalidate_availability()
+            return
+        owner_map = (
+            self._task.setdefault(owner, {})
+            if scope is AffordanceScope.TASK
+            else self._project.setdefault(owner, {})
+            if scope is AffordanceScope.PROJECT
+            else self._user.setdefault(owner, {})
+        )
+        if self._store is not None and scope in {
+            AffordanceScope.PROJECT,
+            AffordanceScope.USER,
+        }:
+            await self._store.save(generated, owner=owner)
+        owner_map[generated.id] = executor
+        self._records[generated.id] = generated
+        self._history.setdefault(generated.id, []).append(
+            {
+                "event": "revalidated",
+                "scope": scope.value,
+                "owner": owner,
+                "revision": generated.revision,
+            }
+        )
+        self._invalidate_availability()
 
     def _record(
         self, executor: Any, generated: GeneratedCapability | None, scope: str, owner: str
@@ -136,6 +351,102 @@ class CapabilityFabric:
             }
         )
 
+    def _validate_revision_links(
+        self,
+        generated: GeneratedCapability | None,
+        scope: str,
+        owner: str,
+    ) -> None:
+        if generated is None:
+            return
+        for predecessor_id in generated.supersedes:
+            predecessor = self._records.get(predecessor_id)
+            if predecessor is None:
+                continue
+            predecessor_owner = (
+                predecessor.project_scope
+                if scope == "project"
+                else predecessor.user_scope
+                if scope == "user"
+                else predecessor.task_scope
+            )
+            if predecessor.scope.value != scope or predecessor_owner != owner:
+                continue
+            if (
+                predecessor.family_id
+                and generated.family_id
+                and predecessor.family_id != generated.family_id
+            ):
+                raise ValueError(
+                    f"generated capability {generated.id} cannot supersede a different family"
+                )
+            if generated.parent_revision != predecessor.revision:
+                raise ValueError(
+                    f"generated capability {generated.id} must name predecessor revision "
+                    f"{predecessor.revision}"
+                )
+            if generated.revision <= predecessor.revision:
+                raise ValueError(
+                    f"generated capability {generated.id} must advance predecessor revision "
+                    f"{predecessor.revision}"
+                )
+
+    def _supersede_active(
+        self,
+        generated: GeneratedCapability | None,
+        scope: str,
+        owner: str,
+    ) -> None:
+        if generated is None:
+            return
+        owner_map = (
+            self._project.get(owner, {})
+            if scope == "project"
+            else self._user.get(owner, {})
+            if scope == "user"
+            else self._task.get(owner, {})
+        )
+        for predecessor_id in generated.supersedes:
+            predecessor = self._records.get(predecessor_id)
+            if predecessor is None:
+                continue
+            predecessor_owner = (
+                predecessor.project_scope
+                if scope == "project"
+                else predecessor.user_scope
+                if scope == "user"
+                else predecessor.task_scope
+            )
+            if predecessor.scope.value != scope or predecessor_owner != owner:
+                continue
+            owner_map.pop(predecessor_id, None)
+            history = list(predecessor.lifecycle_history)
+            history.append(
+                {
+                    "event": "lifecycle_transition",
+                    "from": predecessor.lifecycle_state,
+                    "to": "SUPERSEDED",
+                    "replacement": generated.id,
+                    "at": utcnow().isoformat(),
+                }
+            )
+            self._records[predecessor_id] = replace(
+                predecessor,
+                lifecycle_state="SUPERSEDED",
+                active_revision=generated.revision,
+                superseded_by=generated.id,
+                lifecycle_history=tuple(history[-100:]),
+            )
+            self._history.setdefault(predecessor_id, []).append(
+                {
+                    "event": "superseded",
+                    "scope": scope,
+                    "owner": owner,
+                    "replacement": generated.id,
+                }
+            )
+        self._invalidate_availability()
+
     def _equivalent(
         self,
         generated: GeneratedCapability,
@@ -148,7 +459,7 @@ class CapabilityFabric:
             if (
                 existing.scope.value == scope
                 and existing_owner == owner
-                and existing.lifecycle_state != "DEPRECATED"
+                and existing.lifecycle_state not in _UNUSABLE_LIFECYCLE_STATES
                 and existing.code_hash == generated.code_hash
                 and existing.schema_hash == generated.schema_hash
                 and existing.declared_effects == generated.declared_effects
@@ -157,24 +468,32 @@ class CapabilityFabric:
                 return True
         return False
 
-    def _persist_if_durable(
+    async def _persist_and_activate(
         self,
-        generated: GeneratedCapability | None,
+        generated: GeneratedCapability,
+        executor: Any,
         *,
         owner: str,
     ) -> None:
-        if self._store is None or generated is None:
-            return
-        if generated.scope not in {AffordanceScope.PROJECT, AffordanceScope.USER}:
-            return
+        """Commit durable state before exposing a new live overlay."""
+        if self._store is None:
+            raise RuntimeError("durable activation requires a generated capability store")
+        await self.activate_generated_revision(generated, executor, owner=owner)
+
+    def _schedule_durable_activation(
+        self,
+        generated: GeneratedCapability,
+        executor: Any,
+        *,
+        owner: str,
+    ) -> None:
+        """Schedule a persist-then-switch activation and track its outcome."""
         try:
-            task = asyncio.create_task(self._store.save(generated, owner=owner))
-        except RuntimeError:
-            _logger.warning(
-                "cannot persist generated capability %s without a running loop",
-                generated.id,
-            )
-            return
+            task = asyncio.create_task(self._persist_and_activate(generated, executor, owner=owner))
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cannot activate durable capability {generated.id} without a running loop"
+            ) from exc
         self._persistence_tasks.add(task)
         task.add_done_callback(self._persistence_done)
 
@@ -331,11 +650,7 @@ class CapabilityFabric:
             return []
         loaded: list[str] = []
         for generated in await self._store.list(project_id=project_id, user_id=user_id):
-            if generated.lifecycle_state in {
-                "STALE",
-                "REVALIDATION_REQUIRED",
-                "DEPRECATED",
-            }:
+            if generated.lifecycle_state in _UNUSABLE_LIFECYCLE_STATES:
                 _logger.info(
                     "skipping unavailable generated capability %s (%s)",
                     generated.id,
@@ -520,11 +835,7 @@ class CapabilityFabric:
         else:
             executor = self.global_registry.executor_for(capability_id)
         record = self._records.get(capability_id)
-        if record is not None and record.lifecycle_state in {
-            "STALE",
-            "REVALIDATION_REQUIRED",
-            "DEPRECATED",
-        }:
+        if record is not None and record.lifecycle_state in _UNUSABLE_LIFECYCLE_STATES:
             raise CapabilityUnavailable(
                 f"capability '{capability_id}' requires revalidation "
                 f"({record.lifecycle_state.lower()})"
@@ -556,6 +867,11 @@ class CapabilityFabric:
                 e.descriptor
                 for e in executors.values()
                 if e.descriptor.availability is Availability.AVAILABLE
+                and (
+                    self._records.get(e.descriptor.id) is None
+                    or self._records[e.descriptor.id].lifecycle_state
+                    not in _UNUSABLE_LIFECYCLE_STATES
+                )
             ],
             key=lambda descriptor: descriptor.id,
         )
@@ -639,29 +955,63 @@ class CapabilityFabric:
         task_id: str | None = None,
         project_id: str | None = None,
         user_id: str | None = None,
-        limit: int = 20,
+        limit: int = 12,
         workspace: WorkspaceSpec | None = None,
+        mode: str = AUTOMATIC_DISCLOSURE,
     ) -> list[dict[str, Any]]:
-        terms = {term.casefold() for term in re.findall(r"[a-zA-Z0-9_.-]+", query)}
+        explicit = mode == EXPLICIT_REFLECTION_SEARCH
+        terms = _search_tokens(query, include_weak=explicit)
         ranked: list[tuple[float, dict[str, Any]]] = []
         for descriptor in self.list_descriptors(
             task_id=task_id, project_id=project_id, user_id=user_id
         ):
-            capability_id = descriptor.id.casefold()
-            description = descriptor.description.casefold()
-            if not terms:
-                score = 0
-            else:
-                # Deterministic lexical ranking: exact capability identity
-                # beats descriptive matches, while partial overlap remains
-                # useful for queries such as "typescript verification".
-                score = sum(
-                    3 if term in capability_id else 1 if term in description else 0
-                    for term in terms
-                )
-                if score == 0:
-                    continue
+            capability_id = _search_tokens(descriptor.id)
+            descriptor_tags = _search_tokens(descriptor.tags)
             record = self._records.get(descriptor.id)
+            record_name = _search_tokens(getattr(record, "name", ""))
+            record_terms = _search_tokens(getattr(record, "description", ""))
+            aliases = frozenset().union(
+                *(
+                    _CAPABILITY_SYNONYMS.get(part, frozenset())
+                    for part in descriptor.id.casefold().split(".")
+                )
+            )
+            description = _search_tokens(descriptor.description, include_weak=explicit)
+            identity_hits = terms & (capability_id | record_name)
+            tag_hits = terms & descriptor_tags
+            alias_hits = terms & aliases
+            description_hits = terms & (description | record_terms)
+            # Descriptor prose is a weak signal under automatic disclosure: it
+            # can supplement a strong identity/tag/synonym hit, or stand alone
+            # only when two meaningful words agree; one generic word must not
+            # expose a primitive to ordinary conversation ("short joke" ->
+            # scratch). An explicit reflection search takes the operator's
+            # query literally — a single meaningful term matching an id, tag,
+            # alias, description, workflow, or skill is a real hit.
+            strong_hits = identity_hits | tag_hits | alias_hits
+            if explicit:
+                if not (strong_hits or description_hits):
+                    continue
+            elif not strong_hits and len(description_hits) < 2:
+                continue
+            partial_hits = {
+                term
+                for term in terms
+                if len(term) >= 6
+                and any(
+                    candidate != term and len(candidate) >= 6 and candidate.startswith(term)
+                    for candidate in capability_id | descriptor_tags | aliases | description
+                )
+            }
+            score = (
+                len(identity_hits) * 12
+                + len(tag_hits) * 10
+                + len(alias_hits) * 8
+                + len(description_hits) * 2
+                + len(partial_hits)
+            )
+            if score <= 0:
+                continue
             scope = record.scope.value if record is not None else "system"
             # A scoped/generated affordance is more useful in the context in
             # which it was discovered.  Historical proof only breaks ties;
@@ -742,12 +1092,10 @@ class CapabilityFabric:
 
         lifecycle = str(record.lifecycle_state or "").upper()
         validation = str(record.validation_state or "").upper()
-        if lifecycle in {
-            "STALE",
-            "REVALIDATION_REQUIRED",
-            "REJECTED",
-            "DEPRECATED",
-        } or validation not in {"VALIDATED", "PROMOTED"}:
+        if lifecycle in _UNUSABLE_LIFECYCLE_STATES or validation not in {
+            "VALIDATED",
+            "PROMOTED",
+        }:
             return False, False
 
         dependency_available = True

@@ -2,9 +2,9 @@
 
 Defines :class:`AthenaConfig` — the dataclass that configures the application
 composition root (:class:`~athena.service.service.AthenaService`). Every field
-has a sane default so ``AthenaService(config=AthenaConfig())`` is a working
-in-memory/demo runtime, and ``AthenaService.in_memory()`` is specialised for
-tests.
+has a safe setup/inspection default; ``AthenaService(config=AthenaConfig())``
+starts without a model provider and reports an explicit unconfigured state.
+``AthenaService.in_memory()`` is the explicit deterministic test/demo factory.
 
 Config layering (deterministic precedence, lowest to highest):
 
@@ -20,13 +20,19 @@ Config layering (deterministic precedence, lowest to highest):
 from __future__ import annotations
 
 import json
+from enum import StrEnum
 from importlib import import_module
 import os
-from dataclasses import dataclass, field
+import re
+import tempfile
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from athena.protocol.tasks import AutonomyLevel
+from athena.protocol.policy import DEFAULT_PRINCIPAL_ID
+from athena.policy.credentials import write_user_secret
+from athena.memory.embeddings import DEFAULT_FASTEMBED_MODEL
 
 try:
     tomllib = import_module("tomllib")
@@ -35,12 +41,14 @@ except ModuleNotFoundError:  # pragma: no cover - legacy/minimal Python builds
 
 __all__ = [
     "AthenaConfig",
+    "HermesSupervisionMode",
     "HermesRefereeConfig",
     "ProviderConfig",
     "MCPConfig",
     "DEFAULT_DB_PATH",
     "load_config",
     "merge_configs",
+    "write_toml_atomic_private",
 ]
 
 
@@ -103,6 +111,11 @@ class ProviderConfig:
     credential_id: str | None = None
     api_key: str | None = None
     base_url: str | None = None
+    # Authentication is explicit route policy: ``none`` is appropriate for a
+    # deliberately unauthenticated local endpoint; ``bearer``/``required``
+    # require a configured credential. ``None`` lets the adapter choose its
+    # conservative topology-based default.
+    authentication: str | None = None
     # ``None`` uses the provider-profile default. Hosted OpenAI-compatible
     # routes default to automatic prefix caching; local presets default off.
     cache_mode: str | None = None
@@ -118,6 +131,8 @@ class ProviderConfig:
             kwargs.setdefault("api_key", self.api_key)
         if self.base_url is not None:
             kwargs.setdefault("base_url", self.base_url)
+        if self.authentication is not None:
+            kwargs.setdefault("authentication", self.authentication)
         if self.latency_class is not None:
             kwargs.setdefault("latency_class", self.latency_class)
         return kwargs
@@ -136,6 +151,14 @@ class MCPConfig:
     connect_timeout: float = 10.0
 
 
+class HermesSupervisionMode(StrEnum):
+    """Operator-selected strength of the optional Hermes boundary."""
+
+    OFF = "off"
+    ADVISORY = "advisory"
+    REQUIRED = "required"
+
+
 @dataclass(frozen=True)
 class HermesRefereeConfig:
     """Optional operator-configured Hermes Agent governance endpoint."""
@@ -151,7 +174,43 @@ class HermesRefereeConfig:
     allow_insecure_remote: bool = False
     managed: bool = False
     runtime_root: str | None = None
-    required_for_self_host: bool = True
+    # ``enabled`` controls the transport lifecycle.  Supervision policy is a
+    # separate explicit choice so an optional referee cannot become a core
+    # Athena dependency by accident.
+    self_host_supervision: str | HermesSupervisionMode | None = None
+    # Deprecated compatibility input for pre-policy config files.  It is
+    # normalized to ``self_host_supervision`` and is not serialized.
+    required_for_self_host: bool | None = None
+
+    def __post_init__(self) -> None:
+        raw_mode = self.self_host_supervision
+        if raw_mode is None:
+            if not self.enabled:
+                mode = HermesSupervisionMode.OFF
+            elif self.required_for_self_host is False:
+                mode = HermesSupervisionMode.ADVISORY
+            else:
+                mode = HermesSupervisionMode.REQUIRED
+        else:
+            try:
+                mode = HermesSupervisionMode(str(raw_mode).strip().lower())
+            except ValueError as exc:
+                valid = ", ".join(item.value for item in HermesSupervisionMode)
+                raise ValueError(
+                    f"hermes_referee.self_host_supervision must be one of: {valid}"
+                ) from exc
+        object.__setattr__(self, "self_host_supervision", mode.value)
+        object.__setattr__(self, "required_for_self_host", mode is HermesSupervisionMode.REQUIRED)
+
+    @property
+    def supervision_mode(self) -> HermesSupervisionMode:
+        """Return the normalized self-host supervision policy."""
+        return HermesSupervisionMode(str(self.self_host_supervision))
+
+    @property
+    def transport_enabled(self) -> bool:
+        """Whether the configured Hermes transport should be constructed."""
+        return self.enabled
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +235,31 @@ class AthenaConfig:
     # Stable cache namespace for one authenticated user/tenant. Keep this
     # distinct between principals when one service process serves multiple
     # users; the value is hashed before it reaches a provider.
-    cache_namespace: str = "athena"
-    worker_max_parallel: int = 16
+    cache_namespace: str = DEFAULT_PRINCIPAL_ID
+    # Optional process-injected embedding provider. It is intentionally not
+    # serialized to TOML; deployments may replace the default FastEmbed
+    # provider with a concrete local/remote adapter at composition time.
+    memory_embedding_provider: Any | None = None
+    # The default provider is lazy and only loads/downloads this model when a
+    # semantic index or query is requested.
+    memory_embedding_model: str = DEFAULT_FASTEMBED_MODEL
+    memory_embedding_cache_dir: str | None = None
+    # ``max_parallel_tasks`` is the canonical concurrency setting.  The
+    # legacy constructor/key remains accepted so old configs migrate without
+    # silently changing their limit.
+    worker_max_parallel: int | None = None
+    max_parallel_tasks: int = 4
+    # Worker slot release (P1-17): how long a parked wait (WAITING_INPUT,
+    # WAITING_APPROVAL) may hold its worker coroutine before the run returns
+    # and the slot frees. The durable continuation (open question / pending
+    # approval) relaunches the task on the operator's action.
+    parked_slot_wait_s: float = 300.0
+    # Worker task lease (P0-1): how long a claimed task's lease runs before it
+    # could be reclaimed, and the heartbeat cadence divisor. The heartbeat
+    # renews at lease_duration/divisor, so a live worker never lets a healthy
+    # lease expire; only a genuinely dead process's leases are reclaimable.
+    worker_lease_duration_seconds: float = 300.0
+    worker_lease_renewal_divisor: float = 3.0
     scheduler_interval_seconds: float = 1.0
     scheduler_max_concurrent: int = 0
     profile: str | None = None
@@ -190,6 +272,29 @@ class AthenaConfig:
     research_allowed_domains: tuple[str, ...] = ()
     research_denied_domains: tuple[str, ...] = ()
     research_allow_private_network: bool = False
+    # Optional first-party JSON discovery endpoint. Discovery returns
+    # untrusted candidate metadata only; source acquisition still goes through
+    # ResearchCapability's immutable snapshot + SSRF policy path.
+    research_discovery_endpoint: str | None = None
+    # Multiple first-party discovery indexes may be queried and fused. The
+    # singular field remains a compatibility alias for older config files.
+    research_discovery_endpoints: tuple[str, ...] = ()
+    research_discovery_timeout: float = 10.0
+    # Structured browser automation (P1-28): a zero-arg callable returning a
+    # BrowserDriver (Playwright-shaped). ``browser_enabled`` opts into the
+    # first-party Playwright launcher for file/TOML configuration; the
+    # injectable factory remains available for remote and test drivers.
+    browser_enabled: bool = False
+    browser_engine: str = "chromium"
+    browser_headless: bool = True
+    browser_launch_args: tuple[str, ...] = ()
+    browser_executable_path: str | None = None
+    browser_channel: str | None = None
+    browser_cdp_endpoint: str | None = None
+    browser_session_scope: str = "task"
+    browser_timeout_ms: int = 12_000
+    browser_viewport: tuple[int, int] | None = (1024, 768)
+    browser_driver_factory: Any | None = None
     # Terminal UI: which mascot/buddy the surfaces show (a registered
     # character name, or "off" to hide the mascot column). ``mascots``
     # registers user-defined characters ([mascots.<name>] in TOML) with
@@ -202,6 +307,51 @@ class AthenaConfig:
     animations: bool = True
     reduced_motion: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.worker_max_parallel is not None:
+            self.max_parallel_tasks = int(self.worker_max_parallel)
+        self.max_parallel_tasks = max(1, int(self.max_parallel_tasks))
+        # Keep the legacy read surface truthful after a canonical setting is
+        # loaded; it is an alias, not a second concurrency authority.
+        self.worker_max_parallel = self.max_parallel_tasks
+        self.parked_slot_wait_s = max(0.0, float(self.parked_slot_wait_s))
+        self.worker_lease_duration_seconds = max(1.0, float(self.worker_lease_duration_seconds))
+        self.worker_lease_renewal_divisor = max(1.0, float(self.worker_lease_renewal_divisor))
+        self.research_discovery_timeout = max(0.1, float(self.research_discovery_timeout))
+        self.memory_embedding_model = str(
+            self.memory_embedding_model or DEFAULT_FASTEMBED_MODEL
+        ).strip()
+        if not self.memory_embedding_model:
+            self.memory_embedding_model = DEFAULT_FASTEMBED_MODEL
+        if self.memory_embedding_cache_dir is not None:
+            cache_dir = str(self.memory_embedding_cache_dir).strip()
+            self.memory_embedding_cache_dir = cache_dir or None
+        endpoints = tuple(
+            str(value).strip() for value in self.research_discovery_endpoints if str(value).strip()
+        )
+        if self.research_discovery_endpoint:
+            endpoint = str(self.research_discovery_endpoint).strip()
+            if endpoint and endpoint not in endpoints:
+                endpoints = (endpoint, *endpoints)
+        self.research_discovery_endpoints = endpoints
+        if self.research_discovery_endpoint is None and len(endpoints) == 1:
+            self.research_discovery_endpoint = endpoints[0]
+        engine = str(self.browser_engine or "chromium").strip().lower()
+        if engine not in {"chromium", "firefox", "webkit"}:
+            raise ValueError("browser_engine must be chromium, firefox, or webkit")
+        self.browser_engine = engine
+        self.browser_launch_args = tuple(str(arg) for arg in self.browser_launch_args)
+        scope = str(self.browser_session_scope or "task").strip().lower()
+        if scope not in {"task", "session"}:
+            raise ValueError("browser_session_scope must be task or session")
+        self.browser_session_scope = scope
+        self.browser_timeout_ms = max(1, int(self.browser_timeout_ms))
+        if self.browser_viewport is not None:
+            width, height = (int(value) for value in self.browser_viewport)
+            if width <= 0 or height <= 0:
+                raise ValueError("browser_viewport dimensions must be positive")
+            self.browser_viewport = (width, height)
 
     @property
     def autonomy_level(self) -> AutonomyLevel:
@@ -262,6 +412,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         "credential_id",
         "api_key",
         "base_url",
+        "authentication",
         "cache_mode",
         "latency_class",
     ):
@@ -276,6 +427,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         credential_id=data.get("credential_id"),
         api_key=data.get("api_key"),
         base_url=data.get("base_url"),
+        authentication=data.get("authentication"),
         cache_mode=data.get("cache_mode"),
         latency_class=data.get("latency_class"),
         extra=extra,
@@ -314,8 +466,23 @@ def _parse_hermes_referee(data: Any) -> HermesRefereeConfig:
     if timeout <= 0:
         raise ValueError("hermes_referee.timeout_seconds must be positive")
     credential_id = data.get("credential_id")
+    raw_mode = data.get("self_host_supervision")
+    legacy_required = data.get("required_for_self_host")
+    if raw_mode is None:
+        # Preserve the old configuration's secure behavior while making the
+        # new policy explicit in the normalized object.
+        enabled = bool(data.get("enabled", False))
+        mode = None
+        required_for_self_host = bool(legacy_required) if legacy_required is not None else None
+    else:
+        mode = str(raw_mode).strip().lower()
+        # Policy selection must not provision or connect a transport.  The
+        # lifecycle is enabled only by an explicit setting (or by the
+        # manager's successful setup/repair transaction).
+        enabled = bool(data.get("enabled", False))
+        required_for_self_host = None
     return HermesRefereeConfig(
-        enabled=bool(data.get("enabled", False)),
+        enabled=enabled,
         endpoint=endpoint,
         profile=profile,
         timeout_seconds=timeout,
@@ -324,7 +491,8 @@ def _parse_hermes_referee(data: Any) -> HermesRefereeConfig:
         allow_insecure_remote=bool(data.get("allow_insecure_remote", False)),
         managed=bool(data.get("managed", False)),
         runtime_root=str(data.get("runtime_root")) if data.get("runtime_root") else None,
-        required_for_self_host=bool(data.get("required_for_self_host", True)),
+        self_host_supervision=mode,
+        required_for_self_host=required_for_self_host,
     )
 
 
@@ -351,10 +519,20 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["context_window"] = config.context_window
     if config.reserve_output != 4096:
         d["reserve_output"] = config.reserve_output
-    if config.cache_namespace != "athena":
+    if config.cache_namespace != DEFAULT_PRINCIPAL_ID:
         d["cache_namespace"] = config.cache_namespace
-    if config.worker_max_parallel != 4:
-        d["worker_max_parallel"] = config.worker_max_parallel
+    if config.memory_embedding_model != DEFAULT_FASTEMBED_MODEL:
+        d["memory_embedding_model"] = config.memory_embedding_model
+    if config.memory_embedding_cache_dir is not None:
+        d["memory_embedding_cache_dir"] = config.memory_embedding_cache_dir
+    if config.max_parallel_tasks != 4:
+        d["max_parallel_tasks"] = config.max_parallel_tasks
+    if config.parked_slot_wait_s != 300.0:
+        d["parked_slot_wait_s"] = config.parked_slot_wait_s
+    if config.worker_lease_duration_seconds != 300.0:
+        d["worker_lease_duration_seconds"] = config.worker_lease_duration_seconds
+    if config.worker_lease_renewal_divisor != 3.0:
+        d["worker_lease_renewal_divisor"] = config.worker_lease_renewal_divisor
     if config.scheduler_interval_seconds != 1.0:
         d["scheduler_interval_seconds"] = config.scheduler_interval_seconds
     if config.scheduler_max_concurrent != 0:
@@ -364,28 +542,40 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
     if config.providers:
         d["providers"] = [
             {
-                "kind": p.kind,
-                "name": p.name,
-                "model": p.model,
-                "credential_id": p.credential_id,
-                "api_key": p.api_key,
-                "base_url": p.base_url,
-                "cache_mode": p.cache_mode,
-                "latency_class": p.latency_class,
-                **dict(p.extra),
+                key: value
+                for key, value in {
+                    "kind": p.kind,
+                    "name": p.name,
+                    "model": p.model,
+                    "credential_id": p.credential_id,
+                    "base_url": p.base_url,
+                    "authentication": p.authentication,
+                    "cache_mode": p.cache_mode,
+                    "latency_class": p.latency_class,
+                    **{
+                        key: value
+                        for key, value in p.extra.items()
+                        if str(key).casefold() not in {"api_key", "apikey", "access_token"}
+                    },
+                }.items()
+                if value is not None
             }
             for p in config.providers
         ]
     if config.mcp_servers:
         d["mcp_servers"] = [
             {
-                "name": m.name,
-                "command": m.command,
-                "args": list(m.args),
-                "url": m.url,
-                "env": dict(m.env),
-                "secret_env": dict(m.secret_env),
-                "connect_timeout": m.connect_timeout,
+                key: value
+                for key, value in {
+                    "name": m.name,
+                    "command": m.command,
+                    "args": list(m.args),
+                    "url": m.url,
+                    "env": dict(m.env),
+                    "secret_env": dict(m.secret_env),
+                    "connect_timeout": m.connect_timeout,
+                }.items()
+                if value is not None
             }
             for m in config.mcp_servers
         ]
@@ -398,7 +588,7 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
             "allow_remote": config.hermes_referee.allow_remote,
             "allow_insecure_remote": config.hermes_referee.allow_insecure_remote,
             "managed": config.hermes_referee.managed,
-            "required_for_self_host": config.hermes_referee.required_for_self_host,
+            "self_host_supervision": config.hermes_referee.supervision_mode.value,
             **(
                 {"credential_id": config.hermes_referee.credential_id}
                 if config.hermes_referee.credential_id
@@ -418,6 +608,32 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["research_denied_domains"] = list(config.research_denied_domains)
     if config.research_allow_private_network:
         d["research_allow_private_network"] = True
+    if len(config.research_discovery_endpoints) > 1:
+        d["research_discovery_endpoints"] = list(config.research_discovery_endpoints)
+    elif config.research_discovery_endpoint is not None:
+        d["research_discovery_endpoint"] = config.research_discovery_endpoint
+    if config.research_discovery_timeout != 10.0:
+        d["research_discovery_timeout"] = config.research_discovery_timeout
+    if config.browser_enabled:
+        d["browser_enabled"] = True
+    if config.browser_engine != "chromium":
+        d["browser_engine"] = config.browser_engine
+    if not config.browser_headless:
+        d["browser_headless"] = False
+    if config.browser_launch_args:
+        d["browser_launch_args"] = list(config.browser_launch_args)
+    if config.browser_executable_path is not None:
+        d["browser_executable_path"] = config.browser_executable_path
+    if config.browser_channel is not None:
+        d["browser_channel"] = config.browser_channel
+    if config.browser_cdp_endpoint is not None:
+        d["browser_cdp_endpoint"] = config.browser_cdp_endpoint
+    if config.browser_session_scope != "task":
+        d["browser_session_scope"] = config.browser_session_scope
+    if config.browser_timeout_ms != 12_000:
+        d["browser_timeout_ms"] = config.browser_timeout_ms
+    if config.browser_viewport != (1024, 768):
+        d["browser_viewport"] = list(config.browser_viewport) if config.browser_viewport else None
     if config.mascot is not None:
         d["mascot"] = config.mascot
     if config.mascots:
@@ -450,9 +666,29 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
             return tuple(v.strip() for v in value.split(",") if v.strip())
         return tuple(str(v).strip() for v in (value or ()) if str(v).strip())
 
+    def _endpoints(value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            return tuple(v.strip() for v in value.split(",") if v.strip())
+        return tuple(str(v).strip() for v in (value or ()) if str(v).strip())
+
+    discovery_endpoints = _endpoints(data.get("research_discovery_endpoints"))
+    legacy_discovery_endpoint = (
+        str(data["research_discovery_endpoint"]).strip()
+        if data.get("research_discovery_endpoint")
+        else None
+    )
+
     display = str(data.get("display", "auto")).strip().lower()
     if display not in {"auto", "glass", "ansi", "plain"}:
         display = "auto"
+    browser_args = data.get("browser_launch_args", ())
+    if isinstance(browser_args, str):
+        browser_args = (browser_args,)
+    else:
+        browser_args = tuple(str(value) for value in (browser_args or ()))
+    viewport = data.get("browser_viewport", (1024, 768))
+    if viewport is not None:
+        viewport = tuple(int(value) for value in viewport)
 
     return AthenaConfig(
         db_path=data.get("db_path"),
@@ -465,8 +701,23 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         hermes_referee=_parse_hermes_referee(data.get("hermes_referee")),
         context_window=int(data.get("context_window", 128_000)),
         reserve_output=int(data.get("reserve_output", 4096)),
-        cache_namespace=str(data.get("cache_namespace", "athena") or "athena").strip() or "athena",
-        worker_max_parallel=int(data.get("worker_max_parallel", 4)),
+        cache_namespace=str(
+            data.get("cache_namespace", DEFAULT_PRINCIPAL_ID) or DEFAULT_PRINCIPAL_ID
+        ).strip()
+        or DEFAULT_PRINCIPAL_ID,
+        memory_embedding_model=str(
+            data.get("memory_embedding_model", DEFAULT_FASTEMBED_MODEL) or DEFAULT_FASTEMBED_MODEL
+        ).strip()
+        or DEFAULT_FASTEMBED_MODEL,
+        memory_embedding_cache_dir=(
+            str(data["memory_embedding_cache_dir"]).strip()
+            if data.get("memory_embedding_cache_dir")
+            else None
+        ),
+        max_parallel_tasks=int(data.get("max_parallel_tasks", data.get("worker_max_parallel", 4))),
+        parked_slot_wait_s=float(data.get("parked_slot_wait_s", 300.0)),
+        worker_lease_duration_seconds=float(data.get("worker_lease_duration_seconds", 300.0)),
+        worker_lease_renewal_divisor=float(data.get("worker_lease_renewal_divisor", 3.0)),
         scheduler_interval_seconds=float(data.get("scheduler_interval_seconds", 1.0)),
         scheduler_max_concurrent=int(data.get("scheduler_max_concurrent", 0)),
         profile=data.get("profile"),
@@ -474,6 +725,23 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         research_allowed_domains=_domains(data.get("research_allowed_domains")),
         research_denied_domains=_domains(data.get("research_denied_domains")),
         research_allow_private_network=bool(data.get("research_allow_private_network", False)),
+        research_discovery_endpoint=legacy_discovery_endpoint,
+        research_discovery_endpoints=discovery_endpoints,
+        research_discovery_timeout=float(data.get("research_discovery_timeout", 10.0)),
+        browser_enabled=bool(data.get("browser_enabled", False)),
+        browser_engine=str(data.get("browser_engine", "chromium") or "chromium"),
+        browser_headless=bool(data.get("browser_headless", True)),
+        browser_launch_args=browser_args,
+        browser_executable_path=(
+            str(data["browser_executable_path"]) if data.get("browser_executable_path") else None
+        ),
+        browser_channel=str(data["browser_channel"]) if data.get("browser_channel") else None,
+        browser_cdp_endpoint=(
+            str(data["browser_cdp_endpoint"]) if data.get("browser_cdp_endpoint") else None
+        ),
+        browser_session_scope=str(data.get("browser_session_scope", "task")),
+        browser_timeout_ms=int(data.get("browser_timeout_ms", 12_000)),
+        browser_viewport=viewport if "browser_viewport" in data else (1024, 768),
         mascot=data.get("mascot"),
         mascots={
             str(k): dict(v) for k, v in (data.get("mascots") or {}).items() if isinstance(v, dict)
@@ -496,7 +764,8 @@ def _env_map() -> dict[str, Any]:
     Supported variables:
         ATHENA_DB_PATH, ATHENA_WORKSPACE, ATHENA_AUTONOMY,
         ATHENA_ARTIFACT_ROOT, ATHENA_CONTEXT_WINDOW,
-        ATHENA_CACHE_NAMESPACE, ATHENA_WORKER_MAX_PARALLEL,
+        ATHENA_CACHE_NAMESPACE, ATHENA_MEMORY_EMBEDDING_MODEL,
+        ATHENA_MEMORY_EMBEDDING_CACHE_DIR, ATHENA_WORKER_MAX_PARALLEL,
         ATHENA_SCHEDULER_INTERVAL_SECONDS,
         ATHENA_SCHEDULER_MAX_CONCURRENT, ATHENA_PROFILE,
         ATHENA_SKILLS_PATHS (comma-separated), ATHENA_MASCOT,
@@ -513,7 +782,15 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_CONTEXT_WINDOW": ("context_window", int),
         "ATHENA_RESERVE_OUTPUT": ("reserve_output", int),
         "ATHENA_CACHE_NAMESPACE": ("cache_namespace", str),
-        "ATHENA_WORKER_MAX_PARALLEL": ("worker_max_parallel", int),
+        "ATHENA_MEMORY_EMBEDDING_MODEL": ("memory_embedding_model", str),
+        "ATHENA_MEMORY_EMBEDDING_CACHE_DIR": ("memory_embedding_cache_dir", str),
+        "ATHENA_MAX_PARALLEL_TASKS": ("max_parallel_tasks", int),
+        "ATHENA_PARKED_SLOT_WAIT_S": ("parked_slot_wait_s", float),
+        "ATHENA_WORKER_LEASE_DURATION_SECONDS": ("worker_lease_duration_seconds", float),
+        "ATHENA_WORKER_LEASE_RENEWAL_DIVISOR": ("worker_lease_renewal_divisor", float),
+        # Deprecated alias; canonical serialization always writes
+        # max_parallel_tasks.
+        "ATHENA_WORKER_MAX_PARALLEL": ("max_parallel_tasks", int),
         "ATHENA_SCHEDULER_INTERVAL_SECONDS": ("scheduler_interval_seconds", float),
         "ATHENA_SCHEDULER_MAX_CONCURRENT": ("scheduler_max_concurrent", int),
         "ATHENA_PROFILE": ("profile", str),
@@ -547,6 +824,12 @@ def _env_map() -> dict[str, Any]:
             "research_allow_private_network",
             lambda v: str(v).strip().lower() in {"1", "true", "yes"},
         ),
+        "ATHENA_RESEARCH_DISCOVERY_ENDPOINT": ("research_discovery_endpoint", str),
+        "ATHENA_RESEARCH_DISCOVERY_ENDPOINTS": (
+            "research_discovery_endpoints",
+            lambda v: tuple(p.strip() for p in v.split(",") if p.strip()),
+        ),
+        "ATHENA_RESEARCH_DISCOVERY_TIMEOUT": ("research_discovery_timeout", float),
     }
     for env_name, (key, cast) in env_map.items():
         value = os.environ.get(env_name)
@@ -566,6 +849,7 @@ def _env_map() -> dict[str, Any]:
         ("ATHENA_HERMES_REFEREE_PROFILE", "profile", str),
         ("ATHENA_HERMES_REFEREE_TIMEOUT_SECONDS", "timeout_seconds", float),
         ("ATHENA_HERMES_REFEREE_CREDENTIAL_ID", "credential_id", str),
+        ("ATHENA_HERMES_REFEREE_SELF_HOST_SUPERVISION", "self_host_supervision", str),
     )
     for env_name, key, cast in hermes_env:
         value = os.environ.get(env_name)
@@ -668,14 +952,83 @@ def _extract_profile(data: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def save_config(config: AthenaConfig, path: str | Path) -> None:
-    """Save an ``AthenaConfig`` to a TOML file."""
+    """Save an ``AthenaConfig`` without placing provider secrets in TOML.
+
+    A legacy in-memory ``api_key`` is migrated to the owner-only secret store
+    at the explicit save boundary.  The serialized config keeps only the
+    credential name; callers that construct a config programmatically remain
+    backward-compatible until they save it.
+    """
+    providers = []
+    for provider in config.providers:
+        if provider.api_key:
+            credential_id = provider.credential_id or _generated_credential_id(provider.name)
+            write_user_secret(credential_id, provider.api_key)
+            provider = replace(provider, credential_id=credential_id, api_key=None)
+        providers.append(provider)
+    if providers != list(config.providers):
+        config = replace(config, providers=tuple(providers))
+    write_toml_atomic_private(path, config_to_dict(config))
+
+
+def write_toml_atomic_private(path: str | Path, data: Mapping[str, Any]) -> None:
+    """Write TOML through an owner-private, durable atomic replacement.
+
+    This is the common writer for operator configuration.  It refuses
+    symlinked destinations and parent traversal, creates Athena-owned config
+    directories privately, fsyncs both the temporary file and its directory,
+    and removes an incomplete temporary file on failure.
+    """
     try:
         import tomli_w
     except ImportError as exc:
         raise RuntimeError("Saving config requires tomli_w (pip install tomli_w)") from exc
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("wb") as f:
-        import tomli_w
 
-        tomli_w.dump(config_to_dict(config), f)
+    p = Path(path)
+    if p.is_symlink():
+        raise ValueError(f"refusing to replace symlinked config path: {p}")
+    _reject_symlinked_parents(p.parent)
+    # New Athena-owned directories are private. An existing parent may be a
+    # deliberately shared project directory and must keep its operator-chosen
+    # permissions.
+    p.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    temp_fd, temp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent))
+    try:
+        os.fchmod(temp_fd, 0o600)
+        with os.fdopen(temp_fd, "wb") as handle:
+            temp_fd = -1
+            tomli_w.dump(dict(data), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, p)
+        directory_fd = os.open(str(p.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temp_fd != -1:
+            os.close(temp_fd)
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _generated_credential_id(provider_name: str) -> str:
+    """Create a valid private-store name for a legacy provider key."""
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(provider_name)).strip("._-")
+    safe_name = safe_name or "provider"
+    return f"{safe_name[:119]}_api_key"
+
+
+def _reject_symlinked_parents(path: Path) -> None:
+    """Reject a config destination whose directory path redirects elsewhere."""
+    current = path
+    while True:
+        if current.is_symlink():
+            raise ValueError(f"refusing to use symlinked config directory: {current}")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent

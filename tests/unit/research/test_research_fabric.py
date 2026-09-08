@@ -8,7 +8,7 @@ from typing import ClassVar
 
 import pytest
 
-from athena.capabilities.research import ResearchCapability
+from athena.capabilities.research import ResearchCapability, ResearchDiscoveryProvider
 from athena.protocol.artifacts import ArtifactRef
 from athena.protocol.capabilities import (
     CapabilityRequest,
@@ -138,6 +138,23 @@ class _MemoryArtifacts:
         return self.data[ref]
 
 
+class _DiscoveryProvider:
+    def __init__(self, name: str, rows):
+        self.name = name
+        self.rows = rows
+        self.queries = []
+
+    async def search(self, *, query: str, limit: int, **kwargs):
+        del kwargs
+        self.queries.append((query, limit))
+        return list(self.rows)
+
+
+def test_discovery_provider_protocol_is_structural():
+    provider = _DiscoveryProvider("fixture-a", [])
+    assert isinstance(provider, ResearchDiscoveryProvider)
+
+
 @pytest.mark.asyncio
 async def test_record_source_cannot_import_another_tasks_artifact():
     store = _MemoryResearchStore()
@@ -168,6 +185,50 @@ async def test_record_source_cannot_import_another_tasks_artifact():
 
     assert result.status is CapabilityResultStatus.FAILED
     assert "not visible" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_discover_queries_all_providers_and_deduplicates_canonical_uris():
+    store = _MemoryResearchStore()
+    first = _DiscoveryProvider(
+        "provider-a",
+        [{"uri": "HTTPS://docs.example.test/guide#intro", "title": "Guide"}],
+    )
+    second = _DiscoveryProvider(
+        "provider-b",
+        [
+            {"uri": "https://docs.example.test/guide", "title": "Duplicate"},
+            {"uri": "https://papers.example.test/result", "title": "Paper"},
+        ],
+    )
+    capability = ResearchCapability(
+        store,
+        source_policy=SourcePolicy(allowed_domains=("docs.example.test", "papers.example.test")),
+        discovery_providers=(first, second),
+    )
+
+    result = await capability.invoke(
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-discovery",
+            call_id="discover-multi",
+            arguments={"operation": "discover", "query": "release", "limit": 10},
+        )
+    )
+
+    assert result.status is CapabilityResultStatus.OK
+    payload = json.loads(result.output)
+    assert [row["uri"] for row in payload["candidates"]] == [
+        "https://docs.example.test/guide",
+        "https://papers.example.test/result",
+    ]
+    assert [row["origin"] for row in payload["candidates"]] == ["provider-a", "provider-b"]
+    assert first.queries == [("release", 10)]
+    assert second.queries == [("release", 10)]
+    assert payload["providers"] == [
+        {"provider": "provider-a", "status": "ok", "candidates": 1},
+        {"provider": "provider-b", "status": "ok", "candidates": 2},
+    ]
 
 
 @pytest.mark.asyncio

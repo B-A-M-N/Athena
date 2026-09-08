@@ -15,6 +15,8 @@ from athena.policy.engine import PolicyDecision, PolicyVerdict
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
     CapabilityRequest,
+    CapabilityRequestOrigin,
+    CapabilityResult,
     CapabilityResultStatus,
     CapabilityOrigin,
     EffectClass,
@@ -37,13 +39,12 @@ class _CountingExecutor:
 
     async def invoke(self, request, *, output_accumulator=None, context=None):
         self.invoked += 1
-        result = CapabilityRequest(
-            capability_id="fs",
-            arguments={"operation": "read", "path": "x"},
-            task_id=request.task_id,
+        return CapabilityResult(
+            call_id=getattr(request, "call_id", ""),
+            capability_id=self.descriptor.id,
+            status=CapabilityResultStatus.OK,
+            output="spy-ok",
         )
-        object.__setattr__(result, "call_id", getattr(request, "call_id", ""))
-        return result
 
 
 def _fs_request(task_id="task-1") -> CapabilityRequest:
@@ -113,6 +114,65 @@ class TestPolicyEnforcement:
             _fs_request(),
             workspace=_workspace(),
             task_policy=CapabilityPolicy(allow=("fs",)),
+        )
+        assert result.status == CapabilityResultStatus.FAILED
+        assert executor.invoked == 0
+
+    async def test_wildcard_deny_ceiling_blocks_model_calls(self):
+        executor = _CountingExecutor()
+        dispatcher = _dispatcher(_AllowEngine(), executor)
+        result = await dispatcher.dispatch(
+            _fs_request(),
+            workspace=_workspace(),
+            task_policy=CapabilityPolicy(deny=("*",)),
+        )
+        assert result.status == CapabilityResultStatus.FAILED
+        assert executor.invoked == 0
+
+    async def test_host_system_observation_is_not_narrowed_by_task_ceiling(self):
+        """SYSTEM-origin calls are the host auditing the task's own state.
+
+        Acceptance-criteria verification and internal memory recall dispatch
+        with SYSTEM origin from kernel-owned code paths — never from model
+        input or natural language. A task that denies every capability must
+        still be verifiable against the criteria it declared, so the task
+        ceiling does not apply to the host's own observation floor. The
+        global policy engine still applies in full.
+        """
+        executor = _CountingExecutor()
+        dispatcher = _dispatcher(_AllowEngine(), executor)
+        request = CapabilityRequest(
+            capability_id="fs",
+            arguments={"operation": "stat", "path": "release-maintained.txt"},
+            task_id="task-1",
+            origin=CapabilityRequestOrigin.SYSTEM,
+        )
+        result = await dispatcher.dispatch(
+            request,
+            workspace=_workspace(),
+            task_policy=CapabilityPolicy(deny=("*",)),
+        )
+        assert result.status != CapabilityResultStatus.FAILED
+        assert executor.invoked == 1
+
+    async def test_host_system_observation_still_bounded_by_global_policy(self):
+        """The SYSTEM-origin exemption lifts only the task ceiling.
+
+        The global policy engine keeps full authority: a globally denied
+        capability stays denied even for host observation.
+        """
+        executor = _CountingExecutor()
+        dispatcher = _dispatcher(_DenyEngine(), executor)
+        request = CapabilityRequest(
+            capability_id="fs",
+            arguments={"operation": "stat", "path": "x"},
+            task_id="task-1",
+            origin=CapabilityRequestOrigin.SYSTEM,
+        )
+        result = await dispatcher.dispatch(
+            request,
+            workspace=_workspace(),
+            task_policy=CapabilityPolicy(deny=("*",)),
         )
         assert result.status == CapabilityResultStatus.FAILED
         assert executor.invoked == 0

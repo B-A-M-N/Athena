@@ -84,6 +84,31 @@ class ProviderRegistry:
     def names(self) -> tuple[str, ...]:
         return tuple(self._providers)
 
+    def readiness(self) -> dict[str, object]:
+        """Return usable provider states, not merely registered names."""
+        providers: dict[str, dict[str, object]] = {}
+        for name, provider in self._providers.items():
+            probe = getattr(provider, "readiness", None)
+            try:
+                value = probe() if callable(probe) else {"state": "unverified"}
+            except Exception as exc:  # readiness must remain diagnostic
+                value = {"state": "degraded", "error": str(exc)}
+            state = (
+                str(value.get("state", "unverified")) if isinstance(value, dict) else "unverified"
+            )
+            providers[name] = {
+                **(dict(value) if isinstance(value, dict) else {}),
+                "state": state,
+            }
+        states = {str(item.get("state")) for item in providers.values()}
+        if "ready" in states:
+            overall = "ready"
+        elif not providers:
+            overall = "unconfigured"
+        else:
+            overall = "degraded"
+        return {"state": overall, "providers": providers}
+
     def __contains__(self, provider_name: str) -> bool:
         return provider_name in self._providers
 

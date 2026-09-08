@@ -142,10 +142,21 @@ class ContinuationStore:
     async def mark_resolved(self, id: str, decision: str = "granted") -> None:
         await self.ensure_table()
         now = utcnow().isoformat()
-        await self._db.execute(
-            "UPDATE continuations SET resolved_at = ?, decision = ? WHERE id = ?",
-            (now, decision, id),
-        )
+        async with self._db.transaction():
+            row = await self._db.fetch_one_raw(
+                "SELECT resolved_at FROM continuations WHERE id = ?", (id,)
+            )
+            if row is None:
+                raise KeyError(f"unknown continuation {id}")
+            if row.get("resolved_at") is not None:
+                raise ValueError(f"continuation {id} is already resolved")
+            cursor = await self._db.execute_raw(
+                "UPDATE continuations SET resolved_at = ?, decision = ? "
+                "WHERE id = ? AND resolved_at IS NULL",
+                (now, decision, id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"continuation {id} resolution compare-and-swap failed")
 
     async def claim_resolved(self, task_id: str) -> dict | None:
         """Atomically claim one approved continuation for post-restart work.
@@ -239,6 +250,26 @@ class ContinuationStore:
             (approval_id,),
         )
         return [_decode_row(row) for row in rows]
+
+    async def resolved_unconsumed_for_task(
+        self, task_id: str, *, records: bool = False
+    ) -> bool | list[dict]:
+        """Whether a task has an approval decision ready for consumption.
+
+        This is a readiness probe only; it does not claim or consume the
+        canonical call.  The kernel uses it to distinguish a real timeout
+        from a decision that arrived at the slot-release boundary.
+        """
+        await self.ensure_table()
+        rows = await self._db.fetch_all(
+            "SELECT * FROM continuations "
+            "WHERE task_id = ? AND resolved_at IS NOT NULL AND consumed_at IS NULL "
+            "ORDER BY resolved_at ASC",
+            (task_id,),
+        )
+        if records:
+            return [_decode_row(row) for row in rows]
+        return bool(rows)
 
 
 def _decode_row(row: dict) -> dict:

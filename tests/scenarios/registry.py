@@ -1,6 +1,6 @@
 """Scenario registry: named release-gate families bound to real evidence.
 
-The stable-beta audit (items P1.29/P1.30) requires that the release gate be
+The 0.1 stable audit (items P1.29/P1.30) requires that the release gate be
 expressed as *named scenario families* with *machine-readable* pass/fail
 evidence, rather than an opaque pytest exit code.  This module is the
 declarative mapping the runner (``scripts/scenarios``) executes; it contains
@@ -51,6 +51,19 @@ Family               Meaning
 ``RECOVERY-*``       hard-kill/restart truthfulness
 ``PROJECTION-*``     consistent CLI/OI/raw/body/API views
 ``VHS-*``            deterministic demo rendering and artifact validation
+``CONTEXT-*``        bounded compression and durable digest continuity
+``MEMORY-*``         personal memory and evidence-linked learning
+``HISTORY-*``        principal-scoped historical transcript recovery
+``PRINCIPAL-*``      configured principal propagation across subsystems
+``RESEARCH-*``       discover/capture/evidence/claim research journeys
+``BROWSER-*``        persistent browser state and network containment
+``COMPUTER-*``       real framebuffer capture and honest computer health
+``MCP-*``            real protocol transport and conservative tool policy
+``SKILL-*``          skill selection, behavior, and review persistence
+``DELEGATION-*``     bounded child-task isolation and budgets
+``SCHEDULE-*``       scheduled occurrences becoming durable work
+``RUNTIME-*``        runtime identity and restart continuity
+``PROOF-*``          deterministic real-agent product proof workflow
 ===================  ====================================================
 """
 
@@ -162,6 +175,19 @@ FUSE = (
             "An unknown external result remains APPLYING until a durable receipt "
             "is verified; recovery then resumes the exact workflow item without "
             "issuing the external mutation again."
+        ),
+    ),
+    Scenario(
+        id="FUSE-007",
+        family="FUSE",
+        title="Installed artifacts complete a natural-language capability task",
+        nodeids=(
+            "tests/e2e/test_release_black_box.py::test_installed_artifacts_cover_application_entry_paths",
+        ),
+        notes=(
+            "The installed wheel and sdist receive a natural-language request; "
+            "the compiled model context exposes fs, the model selects it, the "
+            "dispatcher performs the read, and the result returns to the model."
         ),
     ),
 )
@@ -315,7 +341,7 @@ COMPAT = (
         family="COMPAT",
         title="Assistant-turn replay preserves mixed text/tool history across providers",
         nodeids=(
-            "tests/unit/kernel/test_model_tool_history.py::test_openai_and_anthropic_replay_preserve_mixed_assistant_turn",
+            "tests/unit/kernel/test_model_tool_history.py::test_openai_and_anthropic_replay_excludes_hidden_reasoning_by_default",
             "tests/unit/kernel/test_model_tool_history.py::test_kernel_stream_assembly_keeps_text_and_tool_delta",
         ),
     ),
@@ -934,6 +960,325 @@ VHS = (
     ),
 )
 
+# ---------------------------------------------------------------------------
+# CONTEXT — bounded compression and durable digest continuity
+# ---------------------------------------------------------------------------
+CONTEXT = (
+    Scenario(
+        id="CONTEXT-001",
+        family="CONTEXT",
+        title="Compression stays within budget and covers complete omitted ranges",
+        nodeids=(
+            "tests/unit/context/test_compiler.py::test_compression_respects_input_budget_after_summary_insertion",
+            "tests/unit/context/test_compression.py::test_long_summary_maps_complete_range_before_reducing",
+        ),
+    ),
+    Scenario(
+        id="CONTEXT-002",
+        family="CONTEXT",
+        title="Durable digest survives restart and preserves evidence semantics",
+        nodeids=(
+            "tests/unit/context/test_digest.py::test_context_compiler_persists_and_rehydrates_digest_before_history_tail",
+            "tests/unit/context/test_digest.py::test_digest_builder_requires_evidence_for_decisions_and_completed_work",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# MEMORY — personal memory and evidence-linked learning
+# ---------------------------------------------------------------------------
+MEMORY = (
+    Scenario(
+        id="MEMORY-001",
+        family="MEMORY",
+        title="Promoted memory retains canonical scope and metadata",
+        nodeids=(
+            "tests/unit/memory/test_memory_store.py::test_promoted_candidate_preserves_canonical_metadata_and_scope_retrieval",
+            "tests/unit/service/test_knowledge_wiring.py::test_completed_task_records_episodic_memory",
+        ),
+    ),
+    Scenario(
+        id="MEMORY-002",
+        family="MEMORY",
+        title="Learned conclusions retain evidence and require review",
+        nodeids=(
+            "tests/unit/memory/test_candidates.py::test_agent_lesson_requires_later_conclusion_linked_to_successful_result",
+            "tests/unit/skills/test_candidate_lifecycle.py::test_skill_candidate_survives_restart_and_requires_explicit_promotion",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# HISTORY — principal-scoped transcript recovery
+# ---------------------------------------------------------------------------
+HISTORY = (
+    Scenario(
+        id="HISTORY-001",
+        family="HISTORY",
+        title="Principal history search returns source-session provenance",
+        nodeids=(
+            "tests/unit/state/test_session_search.py::test_principal_history_search_and_anchor_read_are_host_scoped",
+            "tests/unit/state/test_session_search.py::test_search_finds_historical_turn_by_content",
+        ),
+    ),
+    Scenario(
+        id="HISTORY-002",
+        family="HISTORY",
+        title="Historical transcript search cannot cross principal ownership",
+        nodeids=(
+            "tests/unit/state/test_session_search.py::test_principal_history_search_and_anchor_read_are_host_scoped",
+            "tests/unit/state/test_session_search.py::test_search_never_matches_unscoped",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# PRINCIPAL — configured principal propagation
+# ---------------------------------------------------------------------------
+PRINCIPAL = (
+    Scenario(
+        id="PRINCIPAL-001",
+        family="PRINCIPAL",
+        title="Configured namespace controls cache and service ownership",
+        nodeids=(
+            "tests/unit/service/test_config_roundtrip.py::test_roundtrip_providers_mcp_model_roles",
+            "tests/unit/kernel/test_kernel_loop.py::test_cache_namespace_uses_compiler_identity_not_public_task_metadata",
+        ),
+    ),
+    Scenario(
+        id="PRINCIPAL-002",
+        family="PRINCIPAL",
+        title="Principal ownership is enforced in durable session state",
+        nodeids=(
+            "tests/unit/context/test_digest.py::test_context_digest_round_trips_structured_state_and_is_principal_scoped",
+            "tests/unit/state/test_session_search.py::test_principal_history_search_and_anchor_read_are_host_scoped",
+        ),
+    ),
+    Scenario(
+        id="PRINCIPAL-003",
+        family="PRINCIPAL",
+        title="Durable user state survives restart without crossing principals",
+        nodeids=(
+            "tests/e2e/test_principal_isolation.py::test_user_scoped_state_isolated_across_service_restarts",
+        ),
+        notes=(
+            "One durable database is exercised by Alice, Bob, and Alice again. "
+            "User memory, context, workflow, and generated capability state must "
+            "survive Alice's restart while remaining invisible and unrehydrated for Bob."
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# RESEARCH — first-party discovery and evidence journey
+# ---------------------------------------------------------------------------
+RESEARCH = (
+    Scenario(
+        id="RESEARCH-001",
+        family="RESEARCH",
+        title="Research runs through capture, evidence, verification, and bundle",
+        nodeids=(
+            "tests/e2e/test_research_journey.py::test_local_research_discover_capture_evidence_and_contradiction",
+            "tests/unit/research/test_research_fabric.py::test_run_composes_objective_capture_search_evidence_and_verification",
+            "tests/unit/research/test_research_fabric.py::test_plan_assess_and_bundle_require_verified_evidence",
+        ),
+    ),
+    Scenario(
+        id="RESEARCH-002",
+        family="RESEARCH",
+        title="Discovery providers are policy-filtered and provenance-preserving",
+        nodeids=(
+            "tests/unit/research/test_research_fabric.py::test_discover_queries_all_providers_and_deduplicates_canonical_uris",
+            "tests/unit/research/test_discovery_provider.py::test_http_discovery_provider_rechecks_resolved_addresses",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# BROWSER — persistent state and network containment
+# ---------------------------------------------------------------------------
+BROWSER = (
+    Scenario(
+        id="BROWSER-001",
+        family="BROWSER",
+        title="Browser state persists across navigation and interaction calls",
+        nodeids=(
+            "tests/unit/capabilities/test_interaction_packs.py::test_browser_navigates_snapshots_queries_fills_clicks",
+            "tests/unit/capabilities/test_interaction_packs.py::test_browser_preserves_state_per_task_until_shutdown",
+        ),
+    ),
+    Scenario(
+        id="BROWSER-002",
+        family="BROWSER",
+        title="Restricted browser navigation and subresources fail closed",
+        nodeids=(
+            "tests/unit/network/test_target_policy.py::test_browser_applies_workspace_policy_before_navigation",
+            "tests/unit/network/test_target_policy.py::test_playwright_driver_policy_intercepts_private_subresources",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# COMPUTER — framebuffer capture and honest availability
+# ---------------------------------------------------------------------------
+COMPUTER = (
+    Scenario(
+        id="COMPUTER-001",
+        family="COMPUTER",
+        title="Computer observe persists a PNG artifact and model reference",
+        nodeids=(
+            "tests/unit/capabilities/test_interaction_packs.py::test_computer_observe_persists_visual_artifact_and_reports_model_input",
+            "tests/unit/capabilities/test_interaction_packs.py::test_visual_result_transcript_keeps_reference_without_pixels",
+        ),
+    ),
+    Scenario(
+        id="COMPUTER-002",
+        family="COMPUTER",
+        title="Computer health reports unavailable backends honestly",
+        nodeids=(
+            "tests/unit/capabilities/test_interaction_packs.py::test_computer_honest_failure_when_backend_missing",
+            "tests/unit/capabilities/test_interaction_packs.py::test_computer_drives_backend_and_reports_shape",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# MCP — real transport and conservative policy
+# ---------------------------------------------------------------------------
+MCP = (
+    Scenario(
+        id="MCP-001",
+        family="MCP",
+        title="Stdio MCP transport discovers, calls, closes, and reconnects",
+        nodeids=(
+            "tests/e2e/test_mcp_transport.py::test_mcp_stdio_transport_discovers_calls_and_reconnects",
+        ),
+    ),
+    Scenario(
+        id="MCP-002",
+        family="MCP",
+        title="MCP annotations cannot downgrade conservative network effects",
+        nodeids=(
+            "tests/unit/mcp/test_adapter.py::test_malicious_annotations_cannot_downgrade_effects",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# SKILL — selection, execution evidence, and review persistence
+# ---------------------------------------------------------------------------
+SKILL = (
+    Scenario(
+        id="SKILL-001",
+        family="SKILL",
+        title="Relevant skills are selected by the deterministic selector",
+        nodeids=("tests/unit/skills/test_selector.py::test_selector_ranks_by_keyword_match",),
+    ),
+    Scenario(
+        id="SKILL-002",
+        family="SKILL",
+        title="Skill candidates survive restart and require explicit promotion",
+        nodeids=(
+            "tests/unit/skills/test_candidate_lifecycle.py::test_skill_candidate_survives_restart_and_requires_explicit_promotion",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# DELEGATION — bounded child tasks and ownership
+# ---------------------------------------------------------------------------
+DELEGATION = (
+    Scenario(
+        id="DELEGATION-001",
+        family="DELEGATION",
+        title="Delegated children inherit explicit lineage and budgets",
+        nodeids=(
+            "tests/unit/tasks/test_delegation_unit.py::test_spawn_child_sets_parent_task_id",
+            "tests/unit/tasks/test_delegation_unit.py::test_child_budget_derived_from_parent",
+        ),
+    ),
+    Scenario(
+        id="DELEGATION-002",
+        family="DELEGATION",
+        title="Delegation refuses unsafe depth and preserves ownership",
+        nodeids=(
+            "tests/unit/tasks/test_delegation_unit.py::test_descendant_ownership_is_explicit",
+            "tests/unit/tasks/test_delegation_unit.py::test_max_child_depth_blocks_grandchildren",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# SCHEDULE — durable occurrence admission
+# ---------------------------------------------------------------------------
+SCHEDULE = (
+    Scenario(
+        id="SCHEDULE-001",
+        family="SCHEDULE",
+        title="A due occurrence is admitted before its fired claim",
+        nodeids=(
+            "tests/unit/scheduler/test_scheduler_reconciliation.py::test_reconcile_enqueues_created_occurrence_before_firing_claim",
+        ),
+    ),
+    Scenario(
+        id="SCHEDULE-002",
+        family="SCHEDULE",
+        title="Schedule API enforces owner visibility and durable round trips",
+        nodeids=(
+            "tests/unit/capabilities/test_schedule_capability.py::test_schedule_api_round_trips_jobs_and_enforces_owner_visibility",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# RUNTIME — runtime identity and restart continuity
+# ---------------------------------------------------------------------------
+RUNTIME = (
+    Scenario(
+        id="RUNTIME-001",
+        family="RUNTIME",
+        title="Runtime sessions persist backend, runtime, and identity separately",
+        nodeids=(
+            "tests/unit/execution/test_runtime_sessions.py::test_runtime_session_persists_backend_and_runtime_independently",
+            "tests/unit/execution/test_execution_cancellation.py::test_real_execution_manager_preserves_remaining_session_for_retry",
+        ),
+    ),
+    Scenario(
+        id="RUNTIME-002",
+        family="RUNTIME",
+        title="Container runtime identity is bounded by workspace and network policy",
+        nodeids=(
+            "tests/unit/execution/test_container.py::test_container_command_is_read_only_and_network_fail_closed",
+            "tests/unit/execution/test_container.py::test_container_reattach_proves_identity_and_rejects_tampering",
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# PROOF — deterministic real-agent product proof
+# ---------------------------------------------------------------------------
+PROOF = (
+    Scenario(
+        id="PROOF-001",
+        family="PROOF",
+        title="Real service/runtime/memory/schedule/reality product proof",
+        probe=("bash", "scripts/functional-proof"),
+        notes=(
+            "Separate from VHS: this drives real Athena paths with deterministic "
+            "offline fixtures and no commercial model API."
+        ),
+    ),
+    Scenario(
+        id="PROOF-002",
+        family="PROOF",
+        title="Installed artifact acceptance exercises the public application surface",
+        nodeids=(
+            "tests/e2e/test_release_black_box.py::test_installed_artifacts_cover_application_entry_paths",
+        ),
+        notes="Artifact identity is attached by the release lane when a frozen bundle exists.",
+    ),
+)
+
 SCENARIOS: tuple[Scenario, ...] = (
     *FUSE,
     *SYNTH,
@@ -948,6 +1293,19 @@ SCENARIOS: tuple[Scenario, ...] = (
     *RECOVERY,
     *PROJECTION,
     *VHS,
+    *CONTEXT,
+    *MEMORY,
+    *HISTORY,
+    *PRINCIPAL,
+    *RESEARCH,
+    *BROWSER,
+    *COMPUTER,
+    *MCP,
+    *SKILL,
+    *DELEGATION,
+    *SCHEDULE,
+    *RUNTIME,
+    *PROOF,
     *REALITY,
 )
 
@@ -965,6 +1323,19 @@ FAMILY_ORDER: tuple[str, ...] = (
     "RECOVERY",
     "PROJECTION",
     "VHS",
+    "CONTEXT",
+    "MEMORY",
+    "HISTORY",
+    "PRINCIPAL",
+    "RESEARCH",
+    "BROWSER",
+    "COMPUTER",
+    "MCP",
+    "SKILL",
+    "DELEGATION",
+    "SCHEDULE",
+    "RUNTIME",
+    "PROOF",
     "REALITY",
 )
 
@@ -982,6 +1353,19 @@ FAMILY_DESCRIPTIONS: dict[str, str] = {
     "RECOVERY": "hard-kill/restart truthfulness",
     "PROJECTION": "consistent CLI/OI/raw/body/API views",
     "VHS": "deterministic demo rendering and artifact validation",
+    "CONTEXT": "bounded compression and durable digest continuity",
+    "MEMORY": "personal memory and evidence-linked learning",
+    "HISTORY": "principal-scoped historical transcript recovery",
+    "PRINCIPAL": "configured principal propagation across subsystems",
+    "RESEARCH": "discover/capture/evidence/claim research journeys",
+    "BROWSER": "persistent browser state and network containment",
+    "COMPUTER": "real framebuffer capture and honest computer health",
+    "MCP": "real protocol transport and conservative tool policy",
+    "SKILL": "skill selection, behavior, and review persistence",
+    "DELEGATION": "bounded child-task isolation and budgets",
+    "SCHEDULE": "scheduled occurrences becoming durable work",
+    "RUNTIME": "runtime identity and restart continuity",
+    "PROOF": "deterministic real-agent product proof workflow",
     "REALITY": "exact-base commit, mutation CAS, retained recovery state",
 }
 
@@ -991,6 +1375,12 @@ _expected = set(FAMILY_ORDER)
 _registered = {s.family for s in SCENARIOS}
 _missing_families = _expected - _registered
 assert not _missing_families, f"families without scenarios: {_missing_families}"
+_underspecified_families = {
+    family for family in FAMILY_ORDER if sum(s.family == family for s in SCENARIOS) < 2
+}
+assert not _underspecified_families, (
+    f"families need at least two release scenarios: {_underspecified_families}"
+)
 _ids = [s.id for s in SCENARIOS]
 assert len(_ids) == len(set(_ids)), "duplicate scenario id"
 

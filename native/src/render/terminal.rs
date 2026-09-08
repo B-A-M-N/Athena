@@ -1,6 +1,7 @@
 use super::super::*;
+use super::chassis::draw_bitmap_text;
 use super::primitives::{draw_outline_rect, draw_rect};
-use super::text::TextRenderer;
+use super::text::{FontRole, TextRenderer};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
@@ -43,7 +44,32 @@ pub(crate) fn draw_terminal_text(
     text: &TextRenderer,
     core: &NativeTerminalCore,
     geometry: &FrameGeometry,
+    show_idle_hint: bool,
 ) {
+    if show_idle_hint && !core.has_visible_text() {
+        let body = text.metrics_for(FontRole::Body);
+        let x =
+            geometry.operator_viewport.x as c_int + (geometry.cell_width * 2.0).round() as c_int;
+        let body_scale = (body.height / 7.0).round().max(2.0);
+        draw_bitmap_text(
+            x as f32,
+            geometry.operator_viewport.y,
+            "ATHENA // SESSION READY",
+            body_scale,
+            (0.37, 0.49, 0.60),
+            geometry.operator_viewport.right(),
+        );
+        draw_bitmap_text(
+            x as f32,
+            geometry.operator_viewport.y + body_scale * 9.0,
+            "TYPE A COMMAND TO BEGIN",
+            (text.metrics_for(FontRole::Instrument).height / 7.0)
+                .round()
+                .max(2.0),
+            (0.23, 0.34, 0.40),
+            geometry.operator_viewport.right(),
+        );
+    }
     let content = core.renderable_content();
     let columns = core.size().columns.max(1);
     let mut run_text = String::new();
@@ -59,7 +85,7 @@ pub(crate) fn draw_terminal_text(
             .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
             || cell.c == ' '
         {
-            if has_run {
+            if has_run && !run_text.is_ascii() {
                 draw_terminal_run(
                     text,
                     geometry,
@@ -87,7 +113,7 @@ pub(crate) fn draw_terminal_text(
             );
         }
         if !has_run || run_row != row || run_next_column != column || run_color != foreground {
-            if has_run {
+            if has_run && !run_text.is_ascii() {
                 draw_terminal_run(
                     text,
                     geometry,
@@ -106,7 +132,7 @@ pub(crate) fn draw_terminal_text(
         run_text.push(cell.c);
         run_next_column = column + 1;
     }
-    if has_run {
+    if has_run && !run_text.is_ascii() {
         draw_terminal_run(
             text,
             geometry,
@@ -114,6 +140,53 @@ pub(crate) fn draw_terminal_text(
             run_start_column,
             &run_text,
             run_color,
+        );
+    }
+
+    // Keep a GL-authored pixel fallback on the same offscreen surface as the
+    // chassis. Xft remains the preferred full glyph path, while this makes
+    // terminal copy/paste and readiness text visible on compositors that do
+    // not composite XRender over a GLX pixmap reliably.
+    draw_terminal_bitmap_text(core, geometry);
+}
+
+fn draw_terminal_bitmap_text(core: &NativeTerminalCore, geometry: &FrameGeometry) {
+    let content = core.renderable_content();
+    let columns = core.size().columns.max(1);
+    let scale = (geometry.cell_width / 6.0).clamp(1.4, 2.6);
+    for (index, indexed) in content.display_iter.enumerate() {
+        let cell = indexed.cell;
+        if cell
+            .flags
+            .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
+            || cell.c == ' '
+        {
+            continue;
+        }
+        let row = index / columns;
+        let column = index % columns;
+        let mut foreground = resolve_term_color(cell.fg, content.colors, true);
+        if cell.flags.contains(Flags::INVERSE) {
+            foreground = resolve_term_color(cell.bg, content.colors, false);
+        }
+        if cell.flags.contains(Flags::DIM) {
+            foreground = (
+                foreground.0.saturating_mul(2) / 3,
+                foreground.1.saturating_mul(2) / 3,
+                foreground.2.saturating_mul(2) / 3,
+            );
+        }
+        if !cell.c.is_ascii() {
+            continue;
+        }
+        let glyph = cell.c.to_string();
+        draw_bitmap_text(
+            geometry.operator_viewport.x + column as f32 * geometry.cell_width,
+            geometry.operator_viewport.y + row as f32 * geometry.cell_height,
+            &glyph,
+            scale,
+            rgb_f32(foreground),
+            geometry.operator_viewport.right(),
         );
     }
 }

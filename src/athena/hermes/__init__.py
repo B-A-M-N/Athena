@@ -8,6 +8,7 @@ from athena.hermes.referee import (
     ReviewPacket,
 )
 from athena.hermes.manager import (
+    HermesRefereeDisconnectedError,
     HermesRefereeManager,
     HermesRefereeManagerError,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "HermesReferee",
     "HermesVerdict",
     "ReviewPacket",
+    "HermesRefereeDisconnectedError",
     "HermesRefereeManager",
     "HermesRefereeManagerError",
 ]

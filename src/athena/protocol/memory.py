@@ -25,12 +25,22 @@ class MemoryScope(str, enum.Enum):
     SESSION = "session"
     TASK = "task"
     PROJECT = "project"
+    USER = "user"
     GLOBAL = "global"
 
 
 class RetrievalMode(str, enum.Enum):
+    """How memory candidates are selected.
+
+    ``SEMANTIC`` uses the optional embedding provider. ``HYBRID`` fuses
+    lexical FTS/BM25 with embedding similarity. Both modes are explicitly
+    unavailable when no embedding provider is configured.
+    """
+
     EXACT = "exact"
+    RELEVANCE = "relevance"
     SEMANTIC = "semantic"
+    HYBRID = "hybrid"
     RECENCY = "recency"
 
 

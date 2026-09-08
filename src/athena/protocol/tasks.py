@@ -61,8 +61,12 @@ TERMINAL_STATUSES = FINAL_STATUSES
 
 
 LEGAL_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.CREATED: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
-    TaskStatus.QUEUED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
+    TaskStatus.CREATED: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
+    TaskStatus.QUEUED: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
     TaskStatus.RUNNING: frozenset(
         {
             TaskStatus.WAITING_APPROVAL,
@@ -76,9 +80,15 @@ LEGAL_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.RECOVERY_REQUIRED,
         }
     ),
-    TaskStatus.WAITING_APPROVAL: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
-    TaskStatus.WAITING_INPUT: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
-    TaskStatus.BLOCKED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
+    TaskStatus.WAITING_APPROVAL: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
+    TaskStatus.WAITING_INPUT: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
+    TaskStatus.BLOCKED: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.RECOVERY_REQUIRED}
+    ),
     TaskStatus.INTERRUPTED: frozenset(
         {
             TaskStatus.RUNNING,
@@ -101,6 +111,31 @@ class AutonomyLevel(str, enum.Enum):
     CODING = "coding"
     AUTONOMOUS = "autonomous"
     OFFLINE = "offline"
+
+
+class Durability(str, enum.Enum):
+    """Persistence contract for a durable write (P1-27).
+
+    Codifies the durability split established by the manager's authority
+    commit: authority state commits synchronously and its failure blocks the
+    operation; bookkeeping may defer and its failure is logged, never
+    surfaced to the caller. Every durable write site declares which side of
+    the split it is on, so the contract is auditable at the call site instead
+    of living only in comments.
+    """
+
+    # The write IS the source of truth being admitted. It commits before the
+    # caller observes success, and a failure propagates: the operation did
+    # not happen. Examples: task-row insert in TaskManager.create, durable
+    # status transitions, input-request answer columns, branch verification
+    # records.
+    AUTHORITY = "authority"
+
+    # Derived or reproducible state that must not mask or roll back an
+    # already-committed authority write. A failure is logged and non-fatal.
+    # Examples: budget ledger registration, cancellation-key resets,
+    # lifecycle event emission, usage bookkeeping.
+    BOOKKEEPING = "bookkeeping"
 
 
 class VerificationType(str, enum.Enum):
@@ -179,6 +214,10 @@ class WorkspaceSpec:
     execution_backend: str | None = None
     network_policy: NetworkPolicy = NetworkPolicy.ALLOW
     mutation_mode: MutationMode = MutationMode.DIRECT
+    # Child workspace mode for delegation (SHARED_READ, SHADOW_WRITE, SUBTREE, DETACHED).
+    delegate_mode: str | None = None
+    # Whether the child is required (parent can't complete without it) vs detached.
+    required_child: bool = True
     # Optional revision supplied by a persisted project/workspace index.  A
     # cache policy may use it, but the dispatcher never invents one by hashing
     # the entire workspace synchronously.
@@ -187,12 +226,14 @@ class WorkspaceSpec:
 
 @dataclass(frozen=True)
 class ResourceBudget:
-    max_agent_iterations: int = 500
+    # A bounded default keeps ordinary tasks in the tens; callers with a
+    # genuinely long mission must opt into a larger budget explicitly.
+    max_agent_iterations: int = 50
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     max_cost_usd: Decimal | None = None
     max_wall_time: timedelta | None = None
-    max_children: int = 16
+    max_children: int = 4
     max_child_depth: int = 1
     max_parallel_model_calls: int = 4
     max_parallel_executions: int = 16
@@ -231,7 +272,10 @@ def _min_opt(a, b):
 class ModelPolicy:
     role: str = "primary"
     allowed: tuple[str, ...] = ()
-    require_tools: bool = True
+    # Tool use is selected by the current task/context. This flag is an
+    # explicit requirement for callers that need a tool-capable route; it is
+    # not the default for ordinary conversational turns.
+    require_tools: bool = False
     privacy: str = "local-preferred"
     max_cost_usd: Decimal | None = None
     # Routing preference is advisory only; privacy, capability, and cost
@@ -239,6 +283,12 @@ class ModelPolicy:
     # latency/reliability-aware route, while ``latency`` and ``cost`` let a
     # configured role state its operational priority explicitly.
     routing_preference: str = "balanced"
+    # Quality floor (P1-16): when set, routing excludes models that DECLARE
+    # a tier below this floor. Undeclared models stay selectable — the floor
+    # never excludes a model that could not have known about it, so a
+    # deployment whose providers declare no tiers is unaffected. Accepts the
+    # bare string value ("standard"); invalid values are ignored.
+    min_quality_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -247,6 +297,27 @@ class CapabilityPolicy:
     allow: tuple[str, ...] = ()
     ask: tuple[str, ...] = ()
     deny: tuple[str, ...] = ()
+
+
+def capability_id_permitted(capability_id: str, policy: CapabilityPolicy | None) -> bool:
+    """Return whether an id may enter a task's visible capability surface.
+
+    This is the same fail-closed ID ceiling the dispatcher enforces at call
+    time. Keeping the predicate beside the policy prevents context compilation
+    from advertising capabilities that the execution boundary will reject.
+
+    Semantics (P0): visible/callable = allow ∪ ask − deny. An ``ask`` entry
+    is callable but carries a task-level forced approval; it must not be
+    masked by the presence of an ``allow`` list. ``deny`` is a hard exclude
+    that wins over both.
+    """
+    if policy is None:
+        return True
+    if capability_id in policy.deny or "*" in policy.deny:
+        return False
+    if policy.allow or policy.ask:
+        return capability_id in policy.allow or capability_id in policy.ask
+    return True
 
 
 @dataclass(frozen=True)
@@ -321,6 +392,11 @@ class AgentRequest:
     autonomy: AutonomyLevel = AutonomyLevel.SUPERVISED
     attachments: tuple[ArtifactRef, ...] = ()
     requested_capabilities: frozenset[str] | None = None
+    # Authority-bearing: explicit mutation mode (defaults to workspace or SUPERVISED default).
+    mutation_mode: MutationMode | None = None
+    # Authority-bearing: explicit acceptance criteria for the task.
+    acceptance_criteria: tuple[Criterion, ...] = ()
+    # Descriptive metadata (should not change where effects land or whether a task may complete).
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -341,6 +417,7 @@ __all__ = [
     "ResourceBudget",
     "ModelPolicy",
     "CapabilityPolicy",
+    "capability_id_permitted",
     "DeliverySpec",
     "TaskSpec",
     "UsageSummary",

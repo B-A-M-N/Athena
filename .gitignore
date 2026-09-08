@@ -65,3 +65,10 @@ demos/*.gif
 
 # Native Rust build output
 native/target/
+
+# Visual review runtime state and latest captures (reproducible, non-canonical)
+.ui-loop/
+.visual-loop/
+assets/Screenshot from *.png
+ui-reference/
+.release-evidence/

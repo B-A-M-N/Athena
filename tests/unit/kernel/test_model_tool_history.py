@@ -56,7 +56,7 @@ def test_assistant_message_preserves_reasoning_text_and_calls():
 
 
 @pytest.mark.athena_scenario("COMPAT-002")
-def test_openai_and_anthropic_replay_preserve_mixed_assistant_turn():
+def test_openai_and_anthropic_replay_excludes_hidden_reasoning_by_default():
     assistant = _assistant_message(
         TaskSpec(id="task-1", objective="inspect", session_id="session-1"),
         _response(),
@@ -82,7 +82,7 @@ def test_openai_and_anthropic_replay_preserve_mixed_assistant_turn():
     )
     oai_assistant = openai._translate_message(assistant)
     oai_result = openai._translate_message(result)
-    assert oai_assistant["content"] == "I need to inspect the file.\nI'll inspect that."
+    assert oai_assistant["content"] == "I'll inspect that."
     assert oai_assistant["tool_calls"][0]["id"] == "tool-1"
     assert oai_result[0]["content"] == "184 passed, 2 failed"
 
@@ -96,11 +96,7 @@ def test_openai_and_anthropic_replay_preserve_mixed_assistant_turn():
         )
     )
     assert anthropic_messages[0]["role"] == "assistant"
-    assert [part["type"] for part in anthropic_messages[0]["content"]] == [
-        "text",
-        "text",
-        "tool_use",
-    ]
+    assert [part["type"] for part in anthropic_messages[0]["content"]] == ["text", "tool_use"]
     assert anthropic_messages[0]["content"][-1]["id"] == "tool-1"
     assert anthropic_messages[1]["content"][0]["tool_use_id"] == "tool-1"
     assert anthropic_messages[1]["content"][0]["content"][0]["text"] == ("184 passed, 2 failed")

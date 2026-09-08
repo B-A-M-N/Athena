@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/athena-uv-cache}"
+build_python=(uv run --frozen --no-sync --extra dev python)
+
+output_dir="dist"
+if [[ "${1:-}" == "--output-dir" ]]; then
+  [[ -n "${2:-}" ]] || {
+    printf '%s\n' 'build-release-artifacts: --output-dir needs a path' >&2
+    exit 2
+  }
+  output_dir="$2"
+fi
+mkdir -p "$output_dir"
+# A release directory is an exact-artifact boundary. Remove only its direct
+# files so an earlier build cannot be mistaken for a publishable artifact.
+find "$output_dir" -mindepth 1 -maxdepth 1 -type f -delete
+distributions_dir="$output_dir/distributions"
+mkdir -p "$distributions_dir"
+find "$distributions_dir" -mindepth 1 -maxdepth 1 -type f -delete
+
+# Build every publish artifact once into one immutable directory. Acceptance
+# receives these exact paths and the manifest below records their inputs.
+scripts/build-native-package --output-dir "$distributions_dir"
+# setuptools reuses ``build/`` and can otherwise carry a removed native
+# payload from an earlier developer build into the universal wheel.
+rm -rf "$repo_root/build"
+"${build_python[@]}" -m build --no-isolation --wheel --sdist --outdir "$distributions_dir" .
+
+"${build_python[@]}" - "$output_dir" "$distributions_dir" <<'PY'
+import hashlib
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+import tomllib
+
+out = Path(sys.argv[1]).resolve()
+distributions = Path(sys.argv[2]).resolve()
+root = Path.cwd()
+import sys as _sys
+_sys.path.insert(0, str(root / "src"))
+from athena.release.native_abi import inspect_native_abi
+
+
+def run(*args: str) -> str:
+    try:
+        return subprocess.run(
+            args, cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"unavailable: {exc}"
+
+
+def sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+project = tomllib.loads((root / "pyproject.toml").read_text())
+native = tomllib.loads((root / "native" / "Cargo.toml").read_text())
+native_package = tomllib.loads((root / "native" / "package" / "pyproject.toml").read_text())
+source_sha = os.environ.get("ATHENA_RELEASE_SHA") or run("git", "rev-parse", "HEAD")
+release_run_id = os.environ.get("ATHENA_RELEASE_RUN_ID", "local")
+
+
+def canonical_version(value: str) -> str:
+    """Map Cargo's prerelease spelling to the wheel/PEP 440 spelling."""
+    match = re.fullmatch(r"(\d+\.\d+\.\d+)-(alpha|beta|rc)\.(\d+)", value)
+    if match is None:
+        return value
+    suffix = {"alpha": "a", "beta": "b", "rc": "rc"}[match.group(2)]
+    return f"{match.group(1)}{suffix}{match.group(3)}"
+
+
+python_version = project["project"]["version"]
+native_version = native["package"]["version"]
+native_package_version = native_package["project"]["version"]
+if python_version != native_package_version:
+    raise SystemExit(
+        "native companion version does not match the Python distribution: "
+        f"{native_package_version} != {python_version}"
+    )
+expected_companion_dependency = f"athena-agent=={python_version}"
+if expected_companion_dependency not in native_package["project"].get("dependencies", []):
+    raise SystemExit(
+        "native companion must depend on the exact Python distribution version: "
+        f"{expected_companion_dependency}"
+    )
+if canonical_version(native_version) != python_version:
+    raise SystemExit(
+        "native Cargo version does not match the Python distribution: "
+        f"{native_version} != {python_version}"
+    )
+lock_text = (root / "native" / "Cargo.lock").read_text()
+binary = root / "native" / "target" / "release" / "athena-terminal"
+bridge = (root / "src" / "athena" / "cli" / "native_bridge.py").read_text()
+bridge_version = next(
+    line.split("=", 1)[1].strip()
+    for line in bridge.splitlines()
+    if line.startswith("NATIVE_BRIDGE_SCHEMA_VERSION")
+)
+rustc_details = run("rustc", "-vV")
+host = (
+    rustc_details.split("host:", 1)[1].splitlines()[0].strip()
+    if "host:" in rustc_details
+    else platform.machine()
+)
+artifacts = [
+    {
+        "path": str(Path("distributions") / path.name),
+        "sha256": sha(path),
+        "size": path.stat().st_size,
+        "commit_sha": source_sha,
+        "release_run_id": release_run_id,
+    }
+    for path in sorted(distributions.iterdir())
+    if path.is_file()
+]
+native_dynamic = run("readelf", "-d", str(binary))
+needed = re.findall(r"Shared library: \[([^]]+)\]", native_dynamic)
+native_abi = inspect_native_abi(binary)
+if native_abi["status"] != "PASS":
+    raise SystemExit("native ABI policy failed: " + "; ".join(native_abi["violations"]))
+alacritty_match = re.search(
+    r'name = "alacritty_terminal"\nversion = "[^"]+"\n'
+    r'source = "git\+[^#]+#([0-9a-f]+)"',
+    lock_text,
+)
+record = {
+    "format": 1,
+    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    "source_sha": source_sha,
+    "release_run_id": release_run_id,
+    "source_status": (
+        "frozen-clean"
+        if os.environ.get("ATHENA_FROZEN_SOURCE") == "1"
+        else run("git", "status", "--porcelain", "--untracked-files=all")
+    ),
+    "python_version": python_version,
+    "native_version": native_version,
+    "native_package_version": native_package_version,
+    "cargo_lock_sha256": sha(root / "native" / "Cargo.lock"),
+    "alacritty_git_revision": (
+        alacritty_match.group(1) if alacritty_match is not None else "unavailable"
+    ),
+    "rustc_verbose": rustc_details,
+    "cargo_version": run("cargo", "--version"),
+    "target": host,
+    "native_binary": {
+        "path": str(binary),
+        "sha256": sha(binary),
+        "file": run("file", str(binary)),
+        "needed": needed,
+        "dynamic_section": native_dynamic,
+    },
+    "native_abi_policy": native_abi,
+    "bridge_schema_version": int(bridge_version),
+    "artifacts": artifacts,
+}
+(out / "release-manifest.json").write_text(
+    json.dumps(record, indent=2, sort_keys=True) + "\n"
+)
+PY
+printf '%s\n' "release-artifacts: built and hashed exact artifacts in $output_dir"

@@ -139,6 +139,11 @@ class Message:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def text(self) -> str:
+        """Return all durable text, including private reasoning and audit markers.
+
+        Durable inspection uses this lossless view. Provider replay and
+        learning should use :meth:`conversation_text` instead.
+        """
         parts: list[str] = []
         for b in self.blocks:
             if isinstance(b, (TextBlock, ReasoningBlock)) and getattr(b, "text", None):
@@ -148,6 +153,18 @@ class Message:
             elif isinstance(b, CapabilityCallBlock):
                 if getattr(b, "call_id", None):
                     parts.append(f"capability_call:{b.call_id}")
+        return "\n".join(parts)
+
+    def conversation_text(self) -> str:
+        """Return model-visible conversational text without hidden reasoning."""
+        parts: list[str] = []
+        for block in self.blocks:
+            if isinstance(block, TextBlock) and block.text:
+                parts.append(block.text)
+            elif isinstance(block, CapabilityResultBlock) and block.output:
+                parts.append(block.output)
+            elif isinstance(block, CapabilityCallBlock) and block.call_id:
+                parts.append(f"capability_call:{block.call_id}")
         return "\n".join(parts)
 
 

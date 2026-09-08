@@ -764,6 +764,12 @@ When policy returns `DENY`:
 * the denial MUST be observable to the agent;
 * the denial MUST be inspectable later.
 
+If the denied call was the task's requested observable work, the task MUST
+finalise `PARTIAL` — never `COMPLETE`: an objective whose requested effect
+never occurred is not satisfied. `COMPLETE` is reserved for objectives whose
+requested work is genuinely done; an operator refusal that leaves the
+objective's work undone is recorded as unresolved observable work.
+
 ---
 
 # 14. Approval Behavior

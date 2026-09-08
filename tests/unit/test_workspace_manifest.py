@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import subprocess
+import pytest
 
-from athena.workspace_manifest import copy_ignore, tree_paths
+from athena.workspace_manifest import copy_ignore, copy_workspace_tree, tree_paths
 
 
 def _git_repo(root):
@@ -87,3 +88,118 @@ def test_tracked_manifest_cache_refreshes_after_git_add(tmp_path):
 
     paths = {path.relative_to(tmp_path).as_posix() for path in tree_paths(tmp_path)}
     assert "target/second.txt" in paths
+
+
+def _symlink_or_skip(link, target, *, target_is_directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError:
+        pytest.skip("symlinks not supported")
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "chain", "broken", "sibling-prefix"])
+def test_copy_workspace_tree_rejects_unsafe_symlinks(tmp_path, kind):
+    source = tmp_path / "workspace"
+    source.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret\n")
+
+    if kind == "file":
+        target = outside / "secret.txt"
+    elif kind == "directory":
+        target = outside
+    elif kind == "chain":
+        first = source / "first"
+        _symlink_or_skip(first, outside / "secret.txt")
+        target = first
+    elif kind == "broken":
+        target = outside / "does-not-exist"
+    else:
+        sibling = tmp_path / "workspace-sibling"
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("secret\n")
+        target = sibling / "secret.txt"
+    _symlink_or_skip(source / "link", target, target_is_directory=kind == "directory")
+
+    with pytest.raises(ValueError, match="symlink"):
+        copy_workspace_tree(source, tmp_path / f"clone-{kind}")
+
+
+def test_copy_workspace_tree_rewrites_safe_internal_symlinks(tmp_path):
+    source = tmp_path / "workspace"
+    source.mkdir()
+    target = source / "data.txt"
+    target.write_text("inside\n")
+    _symlink_or_skip(source / "link.txt", target)
+
+    clone = tmp_path / "clone"
+    copy_workspace_tree(source, clone)
+
+    link = clone / "link.txt"
+    assert link.is_symlink()
+    assert link.resolve() == clone / "data.txt"
+    assert link.read_text(encoding="utf-8") == "inside\n"
+
+
+# ---------------------------------------------------------------- #
+# Reflink (copy-on-write) shadow cloning (P1-21): on FICLONE-capable
+# filesystems the clone shares extents until first write; everywhere else
+# the copy degrades to a byte-identical copy2. Isolation is the invariant
+# either way: writing the clone never touches the source, and vice versa.
+# ---------------------------------------------------------------- #
+
+
+def _make_pair(tmp_path):
+    source = tmp_path / "workspace"
+    source.mkdir()
+    (source / "sub").mkdir()
+    (source / "a.txt").write_text("hello world\n")
+    (source / "sub" / "b.bin").write_bytes(b"x" * 10_000)
+    return source, tmp_path / "clone"
+
+
+async def test_reflink_copy_preserves_bytes_and_isolation(tmp_path):
+    from athena.execution.async_call import run_blocking
+    from athena.workspace_manifest import _copy_file
+
+    source, clone = _make_pair(tmp_path)
+    clone.parent.mkdir(parents=True, exist_ok=True)
+    (clone / "sub").mkdir(parents=True)
+    await run_blocking(_copy_file, source / "a.txt", clone / "a.txt")
+    await run_blocking(_copy_file, source / "sub" / "b.bin", clone / "sub" / "b.bin")
+    assert clone.joinpath("a.txt").read_text(encoding="utf-8") == "hello world\n"
+    assert clone.joinpath("sub", "b.bin").read_bytes() == b"x" * 10_000
+    # Clone-side write must not reach the source.
+    clone.joinpath("a.txt").write_text("hello clone\n")
+    assert source.joinpath("a.txt").read_text() == "hello world\n"
+    # Source-side write must not reach the clone.
+    source.joinpath("sub", "b.bin").write_bytes(b"y" * 10_000)
+    assert clone.joinpath("sub", "b.bin").read_bytes() == b"x" * 10_000
+
+
+async def test_tree_copy_degrades_cleanly_when_reflink_unavailable(tmp_path, monkeypatch):
+    """Forcing the probe to False yields a byte-identical plain copy."""
+    import athena.workspace_manifest as wm
+    from athena.execution.async_call import run_blocking
+
+    monkeypatch.setattr(wm, "_reflink_supported", lambda directory: False)
+    source, clone = _make_pair(tmp_path)
+    await run_blocking(wm.copy_workspace_tree, source, clone)
+    assert clone.joinpath("a.txt").read_text(encoding="utf-8") == "hello world\n"
+    assert clone.joinpath("sub", "b.bin").read_bytes() == b"x" * 10_000
+    # Metadata contract still holds on the fallback path.
+    src_stat = source.joinpath("a.txt").stat()
+    dst_stat = clone.joinpath("a.txt").stat()
+    assert src_stat.st_mode == dst_stat.st_mode
+
+
+def test_reflink_probe_never_raises(tmp_path):
+    from athena.workspace_manifest import _reflink_supported
+
+    # Whatever the filesystem answers, the probe itself must be side-effect
+    # free and boolean.
+    result = _reflink_supported(str(tmp_path))
+    assert isinstance(result, bool)
+    # Cached: repeated asks are stable.
+    assert _reflink_supported(str(tmp_path)) is result

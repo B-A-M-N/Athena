@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -9,6 +10,7 @@ import pytest
 from athena.hermes import HermesAgentEvaluator, HermesReferee, ReviewPacket
 from athena.hermes.agent_adapter import HermesRefereeSafetyError
 from athena.service.config import AthenaConfig, HermesRefereeConfig
+from athena.self_host.gates import SelfHostGateBundle
 from athena.service.service import AthenaService
 
 
@@ -19,6 +21,16 @@ def _packet() -> ReviewPacket:
         verification_results=({"id": "pytest", "passed": True},),
         release_results={"review_eligible": True},
     )
+
+
+def test_default_core_policy_does_not_activate_injected_hermes_referee():
+    service = AthenaService(
+        config=AthenaConfig(),
+        hermes_referee=HermesReferee(AsyncMock(return_value={"decision": "HOLD"})),
+    )
+
+    assert service.config.hermes_referee.supervision_mode.value == "off"
+    assert service._hermes_supervision_active is False  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -160,6 +172,45 @@ async def test_service_status_marks_unsafe_without_preflight_health_bypass():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("off", "advisory", "required"))
+async def test_service_status_keeps_disabled_transport_disabled_for_every_policy(mode):
+    service = AthenaService(
+        config=AthenaConfig(
+            hermes_referee=HermesRefereeConfig(
+                enabled=False,
+                self_host_supervision=mode,
+            )
+        )
+    )
+    adapter = type("Adapter", (), {})()
+    adapter.preflight = AsyncMock(side_effect=AssertionError("disabled transport was probed"))
+    service._hermes_adapter = adapter  # noqa: SLF001 - stale transport regression
+
+    status = await service.hermes_referee_status()
+
+    assert status["enabled"] is False
+    assert status["self_host_supervision"] == mode
+    assert status["state"] == "disabled"
+    adapter.preflight.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enabled_off_configures_transport_but_does_not_activate_self_host_supervision():
+    service = AthenaService(
+        config=AthenaConfig(
+            hermes_referee=HermesRefereeConfig(enabled=True, self_host_supervision="off")
+        )
+    )
+
+    service._configure_hermes_referee()  # noqa: SLF001 - lifecycle/policy matrix
+    try:
+        assert service._hermes_adapter is not None  # noqa: SLF001
+        assert service._hermes_supervision_active is False  # noqa: SLF001
+    finally:
+        await service._hermes_adapter.aclose()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_service_builds_configured_referee_after_secret_boundary():
     service = AthenaService(
         config=AthenaConfig(
@@ -176,3 +227,91 @@ async def test_service_builds_configured_referee_after_secret_boundary():
         assert service.startup_health()["checks"]["hermes_referee"]["state"] == "configured"
     finally:
         await service._hermes_adapter.aclose()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "must_raise"),
+    (("off", False), ("advisory", False), ("required", True)),
+)
+async def test_self_host_admission_only_blocks_required_hermes_mode(mode, must_raise):
+    service = AthenaService(
+        config=AthenaConfig(
+            hermes_referee=HermesRefereeConfig(
+                enabled=False,
+                self_host_supervision=mode,
+            )
+        )
+    )
+
+    if must_raise:
+        with pytest.raises(RuntimeError, match="configured as required"):
+            await service._require_verified_hermes_referee()  # noqa: SLF001
+    else:
+        await service._require_verified_hermes_referee()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected_eligible"),
+    (("advisory", True), ("required", False)),
+)
+async def test_hermes_candidate_verdict_is_subtractive_only_when_required(
+    mode, expected_eligible, monkeypatch
+):
+    service = AthenaService(
+        config=AthenaConfig(
+            hermes_referee=HermesRefereeConfig(
+                enabled=True,
+                self_host_supervision=mode,
+            ),
+        )
+    )
+    service._hermes_referee = HermesReferee(  # noqa: SLF001 - exercise policy boundary
+        AsyncMock(return_value={"decision": "HOLD", "rationale": "needs another look"})
+    )
+    bundle = SimpleNamespace(
+        source_revision="source",
+        design_bundle_hash="design",
+        gate_bundle_hash="gates",
+        retrieve_design_context=lambda **_kwargs: "frozen contract",
+    )
+    monkeypatch.setattr(
+        SelfHostGateBundle,
+        "capture",
+        staticmethod(lambda _root, allow_dirty=False: bundle),
+    )
+    service._candidate_diff_text = AsyncMock(return_value="diff")  # noqa: SLF001
+    candidate = {
+        "task_id": "task-1",
+        "base_workspace_root": "/tmp/athena-base",
+        "base_fingerprint": "base",
+        "candidate_fingerprint": "candidate",
+        "certificate_hash": "certificate",
+        "branch_id": "branch",
+        "changed_resources": (),
+        "verification": ({"id": "proof", "passed": True},),
+        "proof_authority": {"source_revision": "source"},
+        "risk": {"level": "low"},
+    }
+    task_row = {
+        "status": "complete",
+        "metadata": {
+            "_athena_gate_bundle": {
+                "source_revision": "source",
+                "design_bundle_hash": "design",
+                "gate_bundle_hash": "gates",
+            }
+        },
+    }
+    review = {"eligible": True, "certificate_hash": "certificate"}
+
+    result = await service._run_hermes_candidate_referee(  # noqa: SLF001
+        {"id": "mission-1", "objective": "test", "status": "review", "plan": {}},
+        task_row,
+        candidate,
+        review,
+    )
+
+    assert result["hermes"]["decision"] == "HOLD"
+    assert result["eligible"] is expected_eligible

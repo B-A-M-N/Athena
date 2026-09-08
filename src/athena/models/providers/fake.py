@@ -1,4 +1,4 @@
-"""Deterministic scripted fake model provider (tests / offline default).
+"""Deterministic scripted fake model provider (tests / explicit offline demo).
 
 This is the canonical implementation. ``athena.models.fake`` re-exports it for
 backward compatibility so both import paths reference the SAME class.
@@ -13,6 +13,7 @@ from athena.protocol.messages import (
     CapabilityCallBlock,
     CapabilityResultBlock,
     ContentBlock,
+    Role,
     TextBlock,
 )
 from athena.protocol.models import (
@@ -42,7 +43,7 @@ class _InfoKwargs(TypedDict, total=False):
 
 
 class FakeModelProvider:
-    """Deterministic fake model provider for tests and offline reasoning."""
+    """Deterministic fake model provider for tests and explicit offline demos."""
 
     def __init__(
         self,
@@ -74,6 +75,10 @@ class FakeModelProvider:
                 per_1m_cache_write_input=_optional_float(cost.get("per_1m_cache_write_input")),
             )
         self._response_cost_usd = response_cost_usd
+        # Test/demo consumers can verify the provider received the compiled
+        # capability inventory. Keeping the immutable request objects here is
+        # observability only; it does not alter model selection or execution.
+        self.requests: list[ModelRequest] = []
         self._info_kwargs: _InfoKwargs = {
             "tool_calling": tool_calling,
             "vision": vision,
@@ -96,7 +101,11 @@ class FakeModelProvider:
             )
         ]
 
+    def readiness(self) -> dict[str, str]:
+        return {"state": "ready", "kind": "fake"}
+
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        self.requests.append(request)
         script = self._select_script(request)
         respond = script.get("respond", {}) if isinstance(script, dict) else {}
         text = respond.get("text")
@@ -138,7 +147,7 @@ class FakeModelProvider:
                     )
 
         output_tokens = len(text) if text else 0
-        input_tokens = sum(len(msg.text() or "") for msg in request.messages)
+        input_tokens = sum(len(msg.conversation_text() or "") for msg in request.messages)
         response_cost = respond.get("cost_usd", self._response_cost_usd)
         usage = UsageInfo(
             input_tokens=input_tokens,
@@ -166,14 +175,24 @@ class FakeModelProvider:
 
     def _select_script(self, request: ModelRequest) -> dict:
         user_text = ""
+        user_messages: list[str] = []
+        assistant_messages: list[str] = []
+        capability_result_texts: list[str] = []
         capability_result_ok: bool | None = None
         for msg in request.messages:
-            t = msg.text() or ""
+            t = msg.conversation_text() or ""
             if t:
                 user_text = user_text + "\n" + t
+                role = getattr(msg.role, "value", msg.role)
+                if role == Role.USER.value:
+                    user_messages.append(t)
+                elif role == Role.ASSISTANT.value:
+                    assistant_messages.append(t)
             for block in msg.blocks:
                 if isinstance(block, CapabilityResultBlock):
                     capability_result_ok = block.ok
+                    result_text = block.output or block.error or ""
+                    capability_result_texts.append(str(result_text))
 
         for script in self._scripts:
             if not isinstance(script, dict):
@@ -181,10 +200,31 @@ class FakeModelProvider:
             match = script.get("match", {}) or {}
             user_contains = match.get("user_contains")
             cap_ok = match.get("capability_result_ok")
+            last_user_contains = match.get("last_user_message_contains")
+            last_capability_contains = match.get("last_capability_result_contains")
+            capability_contains = match.get("capability_result_contains")
+            assistant_contains = match.get("assistant_message_contains")
 
             if user_contains is not None and user_contains not in user_text:
                 continue
             if cap_ok is not None and capability_result_ok != cap_ok:
+                continue
+            if last_user_contains is not None and (
+                not user_messages or last_user_contains not in user_messages[-1]
+            ):
+                continue
+            if last_capability_contains is not None and (
+                not capability_result_texts
+                or last_capability_contains not in capability_result_texts[-1]
+            ):
+                continue
+            if capability_contains is not None and not any(
+                capability_contains in text for text in capability_result_texts
+            ):
+                continue
+            if assistant_contains is not None and not any(
+                assistant_contains in text for text in assistant_messages
+            ):
                 continue
             return script
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,6 +17,7 @@ from athena.protocol.errors import (
 from athena.protocol.messages import utcnow
 from athena.protocol.tasks import (
     ContextRef,
+    Durability,
     TaskResult,
     TaskSpec,
     TaskStatus,
@@ -86,12 +88,16 @@ class TaskManager:
         sessions: SessionRepository | None = None,
         budgets: Any = None,
         cancellations: Any = None,
+        admission: Any = None,
+        principal_id: str | None = None,
     ) -> None:
         self._store = task_store
         self._events = events
         self._sessions = sessions
         self._budgets = budgets
         self._cancellations = cancellations
+        self._admission = admission
+        self._principal_id = principal_id
         self._running_emitted: set[str] = set()
         # Optional post-finalization observers (knowledge pipeline). Each is an
         # async callable ``(task, result)`` invoked AFTER the terminal state is
@@ -116,6 +122,10 @@ class TaskManager:
         """Late-bind the cancellation authority (construction-order tolerant, §20)."""
         self._cancellations = cancellations
 
+    def set_admission(self, admission: Any) -> None:
+        """Late-bind the service-owned task admission predicate."""
+        self._admission = admission
+
     def set_wakeup_callback(self, callback: Any) -> None:
         """Bind the local worker wakeup without making it task authority."""
         self._wakeup_callback = callback
@@ -132,7 +142,21 @@ class TaskManager:
     # Creation / intake (BHV-002, BHV-011..013)
     # ------------------------------------------------------------------ #
     async def create(self, spec: TaskSpec) -> Task:
+        # Admission must precede session allocation and the durable Task row.
+        # This is the canonical boundary shared by API, scheduler, delegation,
+        # ACP, self-host, and future Task producers.
+        if self._admission is not None:
+            result = self._admission(spec)
+            if inspect.isawaitable(result):
+                await result
         await self._ensure_session(spec)
+        # AUTHORITY (Durability.AUTHORITY): the durable task row is the single
+        # source of truth for the task's existence and state. It commits first
+        # and is allowed to surface a real error (the task was NOT admitted).
+        # Anything after it is BOOKKEEPING and must never roll back or mask
+        # the authority commit (durability split, P1-27): a budget/cancellation
+        # registration or event-emit failure cannot surface as a failed
+        # ``create`` for a task that was actually admitted.
         await self._store.insert_task(
             spec.id,
             spec.session_id,
@@ -150,19 +174,76 @@ class TaskManager:
             metadata=dict(spec.metadata),
             status=TaskStatus.CREATED,
         )
+
+        # ---- BOOKKEEPING (Durability.BOOKKEEPING), after the commit ------ #
+        # Derived in-memory state (budget ledger, cancellation reset) and the
+        # lifecycle event. Not authority: if one fails, the task still exists
+        # and is runnable. Failures are logged and non-fatal, matching
+        # ``_finalize_observers`` semantics.
+        await self._bookkeeping(
+            spec.id,
+            Durability.BOOKKEEPING,
+            "bookkeeping registration",
+            self._register_bookkeeping,
+            spec,
+        )
+        await self._bookkeeping(
+            spec.id,
+            Durability.BOOKKEEPING,
+            "CREATED event emit",
+            self._emit_created,
+            spec,
+        )
+        return spec
+
+    def _register_bookkeeping(self, spec: TaskSpec) -> None:
         if self._budgets is not None:
             self._budgets.register(spec)
         if self._cancellations is not None:
             self._cancellations.reset(spec.id)
+
+    async def _emit_created(self, spec: TaskSpec) -> None:
         await self._emit(spec, TaskStatus.CREATED)
-        return spec
+
+    async def _bookkeeping(self, task_id: str, durability: Durability, what: str, op, *args):
+        """Run a deferred write under its declared Durability contract.
+
+        The classification is what makes the split mechanical: a BOOKKEEPING
+        failure is logged and swallowed (the authority row already committed);
+        anything else — an AUTHORITY-classified write routed here by mistake,
+        or a future Durability member — is re-raised, so the contract cannot
+        silently erode.
+        """
+        try:
+            result = op(*args)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            if durability is not Durability.BOOKKEEPING:
+                raise
+            _logger.warning(
+                "task %s committed but %s failed (non-fatal): %s",
+                task_id,
+                what,
+                exc,
+            )
 
     async def _ensure_session(self, spec: TaskSpec) -> None:
         if self._sessions is None or not spec.session_id:
             return
         existing = await self._sessions.get(spec.session_id)
         if existing is None:
-            await self._sessions.create(spec.session_id)
+            parent_session_id = None
+            if spec.parent_task_id:
+                parent = await self._store.get(spec.parent_task_id)
+                if parent is not None:
+                    parent_session_id = parent.get("session_id")
+            await self._sessions.create(
+                spec.session_id,
+                parent_id=parent_session_id,
+                principal_id=self._principal_id,
+                project_id=getattr(spec.workspace, "id", None),
+            )
 
     async def enqueue(self, task_id: str) -> Task:
         await self.transition(task_id, TaskStatus.QUEUED)
@@ -249,7 +330,7 @@ class TaskManager:
     async def transition(self, task_id: str, to: TaskStatus, *, reason: str = "") -> None:
         await self._store.transition(task_id, to)
         spec = await self.get(task_id)
-        await self._emit(spec, to)
+        await self._emit(spec, to, reason=reason)
 
     # ------------------------------------------------------------------ #
     # Finalization (§18; §72 TaskResult)
@@ -431,10 +512,18 @@ class TaskManager:
             usage=usage,
         )
 
-    async def _emit(self, task: Task, status: TaskStatus) -> None:
+    async def _emit(self, task: Task, status: TaskStatus, *, reason: str = "") -> None:
         if self._events is None:
             return
         payload: dict[str, Any] = {"status": status.value}
+        if reason:
+            payload["reason"] = reason
+        mission_plan = (task.metadata or {}).get("_athena_mission_plan")
+        if isinstance(mission_plan, dict) and mission_plan.get("phase"):
+            # Self-host phase is durable mission state, not a renderer guess.
+            # Repeating it on lifecycle events lets every projection recover
+            # the operator-visible phase after a restart or replay.
+            payload["self_host_phase"] = str(mission_plan["phase"])
         # Scheduler event triggers are durable observations. Preserve the
         # bounded trigger envelope on the task lifecycle event so the task's
         # world-state view can explain what caused this maintenance run.
@@ -481,6 +570,7 @@ def _event_type(status: TaskStatus) -> str:
         TaskStatus.INTERRUPTED: "TaskInterrupted",
         TaskStatus.BLOCKED: "TaskBlocked",
         TaskStatus.QUEUED: "TaskQueued",
+        TaskStatus.RECOVERY_REQUIRED: "TaskRecoveryRequired",
     }.get(status, "TaskStateChanged")
 
 

@@ -24,12 +24,11 @@ import re
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 from typing import Any
 
 from athena.capabilities.registry import CapabilityRegistry, validate_schema
-from athena.policy.approvals import args_digest
 from athena.policy.engine import PolicyEngine
 from athena.protocol.capabilities import (
     CapabilityRequest,
@@ -41,18 +40,28 @@ from athena.protocol.capabilities import (
     ExternalEffectPhase,
     InvocationContext,
 )
-from athena.protocol.errors import CapabilityUnavailable, PersistenceError
+from athena.capabilities.dispatch_mechanisms import (
+    DispatchOrdering,
+    DispatchRepair,
+    PolicyGate,
+    ResultCache,
+)
+from athena.capabilities.mutation_recorder import MutationRecorder
 from athena.reality.gate import ExecutionDisposition
 from athena.protocol.events import EV, make_event
 from athena.protocol.ids import new_id
 from athena.protocol.policy import (
-    ApprovalScope,
+    DEFAULT_PRINCIPAL_ID,
     PolicyDecision,
     PolicyRequest,
     PolicyVerdict,
     Principal,
 )
-from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
+from athena.protocol.tasks import (
+    CapabilityPolicy,
+    ResourceBudget,
+    WorkspaceSpec,
+)
 from athena.state.approvals import ApprovalStore
 from athena.state.mutations import MutationStore
 
@@ -139,7 +148,7 @@ class CapabilityDispatcher:
     ) -> None:
         self.registry = registry
         self.policy = policy_engine
-        self._principal = principal or Principal("agent", "athena")
+        self._principal = principal or Principal("agent", DEFAULT_PRINCIPAL_ID)
         # Inference Compatibility Kernel: deterministic tool-input repair.
         from athena.models.compat.profiles import CompatibilityCandidates
         from athena.models.compat.toolrepair import ToolInputRepairer
@@ -252,6 +261,7 @@ class CapabilityDispatcher:
         workspace: WorkspaceSpec,
         profile: str | None = None,
         task_policy: CapabilityPolicy | None = None,
+        model_policy: Any = None,
         task_budget: ResourceBudget | None = None,
         task_deadline: datetime | None = None,
         runtime_remaining_s: float | None = None,
@@ -484,14 +494,54 @@ class CapabilityDispatcher:
             workspace=workspace,
             execution_backend=workspace.execution_backend or "local",
             effects=frozenset(effects),
+            resources=executor.descriptor.resolve_resources(),
             session_id=getattr(request, "session_id", None),
             call_id=request.call_id,
         )
         decision = self.policy.evaluate(policy_request, autonomy=profile)
         global_verdict = _verdict(decision.decision)
 
-        task_verdict = self._eval_task_policy(
-            request.capability_id, task_policy, request_effects=frozenset(effects)
+        # The task capability policy is a ceiling on the task's work surface.
+        # SYSTEM-origin calls are the host auditing the task's own declared
+        # state (acceptance-criteria verification, internal memory recall):
+        # never model-controlled, never dispatched from natural language. A
+        # task that denies every capability must still be verifiable against
+        # the criteria it declared, so the host's own observation floor is not
+        # narrowed by the task's ceiling.
+        origin_value = getattr(request.origin, "value", request.origin)
+        host_observation = origin_value == CapabilityRequestOrigin.SYSTEM.value
+        # SYSTEM_VERIFICATION is the bounded verifier authority (P0-7): the
+        # acceptance verifier may execute operator-declared criteria, but it
+        # inherits none of the task's capability ceiling. It is still held to
+        # a restricted effect envelope — observation plus bounded execution,
+        # never secrets, privilege, external publication, or computer input.
+        verifier_authority = origin_value == CapabilityRequestOrigin.SYSTEM_VERIFICATION.value
+        if verifier_authority and not _VERIFICATION_EFFECT_FLOOR.issuperset(effects):
+            await self._emit(
+                EV["CAPABILITY_FAILED"],
+                {
+                    "call_id": request.call_id,
+                    "capability_id": request.capability_id,
+                    "reason": "verification_effect_ceiling",
+                    "effects": sorted(effect.value for effect in effects),
+                },
+                request.task_id,
+                causal_id=request.call_id,
+            )
+            return CapabilityResult(
+                request.call_id,
+                request.capability_id,
+                CapabilityResultStatus.FAILED,
+                error=(
+                    "verification call requires effects outside the bounded verification envelope"
+                ),
+            )
+        task_verdict = (
+            None
+            if host_observation or verifier_authority
+            else self._eval_task_policy(
+                request.capability_id, task_policy, request_effects=frozenset(effects)
+            )
         )
         combined, reason = _combine_verdicts(task_verdict, global_verdict, decision.reason)
         external_contract = executor.descriptor.resolve_external_effect_contract(
@@ -741,9 +791,11 @@ class CapabilityDispatcher:
             )
             context = InvocationContext(
                 task_id=request.task_id,
+                principal_id=self._principal.id,
                 workspace=routed_workspace,
                 execution_backend=routed_workspace.execution_backend or "local",
                 capability_policy=task_policy,
+                model_policy=model_policy,
                 resource_budget=task_budget,
                 deadline=task_deadline,
                 runtime_remaining_s=runtime_remaining_s,
@@ -808,6 +860,18 @@ class CapabilityDispatcher:
                 metadata = dict(result.metadata or {})
                 metadata["reality"] = reality_metadata
                 object.__setattr__(result, "metadata", metadata)
+            # Canonical receipt: stamp the resolved effects and execution
+            # identity onto the result metadata so downstream evidence
+            # classification can consume the dispatcher's authoritative
+            # resolution instead of reverse-engineering from names.
+            if "resolved_effects" not in (result.metadata or {}):
+                receipt_meta = dict(result.metadata or {})
+                receipt_meta["resolved_effects"] = sorted(effect.value for effect in effects)
+                if execution_backend := getattr(routed_workspace, "execution_backend", None):
+                    receipt_meta["execution_backend"] = execution_backend
+                if route is not None and route.disposition is not None:
+                    receipt_meta["reality_disposition"] = route.disposition.value
+                object.__setattr__(result, "metadata", receipt_meta)
             await self._attach_failure_memory(request, result, workspace)
             if result.status == CapabilityResultStatus.OK:
                 instrument = (result.metadata or {}).get("instrument")
@@ -904,52 +968,17 @@ class CapabilityDispatcher:
                 await self._reality_gate.discard_ephemeral(request.call_id)
 
     async def _persist_health(self, capability_id: str) -> None:
-        persist = getattr(self._health, "persist", None)
-        if persist is None:
-            return
-        try:
-            await persist(capability_id)
-            mark_persisted = getattr(self._health, "mark_persisted", None)
-            if callable(mark_persisted):
-                mark_persisted(capability_id)
-        except Exception as exc:  # health persistence must not alter call truth
-            await self._emit(
-                "CapabilityHealthChanged",
-                {
-                    "capability_id": capability_id,
-                    "persistence_error": str(exc)[:500],
-                },
-                None,
-                causal_id=capability_id,
-            )
+        return await ResultCache(self)._persist_health(capability_id)
 
     def _health_should_persist(self, capability_id: str, state_changed: bool) -> bool:
-        should_persist = getattr(self._health, "should_persist", None)
-        if callable(should_persist):
-            return bool(should_persist(capability_id, state_changed=state_changed))
-        return True
+        return ResultCache(self)._health_should_persist(capability_id, state_changed=state_changed)
 
     async def _emit_result_observations(
         self,
         request: CapabilityRequest,
         result: CapabilityResult,
     ) -> None:
-        """Publish structured result evidence for projections and replay."""
-        metadata = result.metadata or {}
-        diagnostics = metadata.get("diagnostics")
-        if not isinstance(diagnostics, (list, tuple)) or not diagnostics:
-            return
-        await self._emit(
-            EV["DIAGNOSTICS_PRODUCED"],
-            {
-                "call_id": request.call_id,
-                "capability_id": request.capability_id,
-                "diagnostics": _bounded_diagnostics(diagnostics),
-                "count": len(diagnostics),
-            },
-            request.task_id,
-            causal_id=request.call_id,
-        )
+        return await ResultCache(self)._emit_result_observations(request, result)
 
     async def _attach_failure_memory(
         self,
@@ -957,56 +986,16 @@ class CapabilityDispatcher:
         result: CapabilityResult,
         workspace,
     ) -> None:
-        """Attach advisory deterministic repair history to failed results."""
-        if self._failure_memory is None or result.status is CapabilityResultStatus.OK:
-            return
-        diagnostics = (result.metadata or {}).get("diagnostics")
-        if not isinstance(diagnostics, (list, tuple)):
-            return
-        suggestions: list[dict[str, Any]] = []
-        environment = str((result.metadata or {}).get("failure_environment_fingerprint") or "")
-        for item in diagnostics[:8]:
-            if not isinstance(item, Mapping):
-                continue
-            signature = str(item.get("signature_fingerprint") or item.get("fingerprint") or "")
-            if not signature:
-                continue
-            try:
-                suggestions.extend(
-                    await self._failure_memory.retrieve(
-                        signature_fingerprint=signature,
-                        capability_id=request.capability_id,
-                        environment_fingerprint=environment,
-                        project_scope=getattr(workspace, "id", None),
-                        limit=4,
-                    )
-                )
-            except Exception:
-                continue
-        if suggestions:
-            metadata = dict(result.metadata or {})
-            metadata["failure_memory"] = suggestions[:8]
-            object.__setattr__(result, "metadata", metadata)
+        return await ResultCache(self)._attach_failure_memory(request, result, workspace)
 
     def _cached_result(
         self,
         key: tuple[str | None, str, str, str, str | None],
     ) -> CapabilityResult | None:
-        entry = self._result_cache.get(key)
-        if entry is None:
-            return None
-        expires_at, result = entry
-        if time.monotonic() >= expires_at:
-            self._result_cache.pop(key, None)
-            return None
-        self._result_cache.move_to_end(key)
-        return result
+        return ResultCache(self)._cached_result(key)
 
     def _invalidate_result_cache(self, workspace_root: str) -> None:
-        root = os.path.realpath(os.path.abspath(workspace_root))
-        for key in list(self._result_cache):
-            if key[1] == root:
-                self._result_cache.pop(key, None)
+        return ResultCache(self)._invalidate_result_cache(workspace_root)
 
     async def dispatch_many(
         self,
@@ -1015,6 +1004,7 @@ class CapabilityDispatcher:
         workspace: WorkspaceSpec,
         profile: str | None = None,
         task_policy: CapabilityPolicy | None = None,
+        model_policy: Any = None,
         task_budget: ResourceBudget | None = None,
         task_deadline: datetime | None = None,
         runtime_remaining_s: float | None = None,
@@ -1060,6 +1050,7 @@ class CapabilityDispatcher:
                 )
                 return [result]
 
+        batch_lock = asyncio.Lock()
         results = await asyncio.gather(
             *[
                 self._dispatch_with_controls(
@@ -1067,12 +1058,14 @@ class CapabilityDispatcher:
                     workspace=workspace,
                     profile=profile,
                     task_policy=task_policy,
+                    model_policy=model_policy,
                     task_budget=task_budget,
                     task_deadline=task_deadline,
                     runtime_remaining_s=runtime_remaining_s,
                     verification_environment=verification_environment,
                     directives=(_directives_by_call_id or {}).get(r.call_id),
                     prepared=preflight,
+                    batch_order_lock=batch_lock,
                 )
                 for r in requests
             ],
@@ -1083,6 +1076,15 @@ class CapabilityDispatcher:
             for i, r in enumerate(results)
         ]
 
+    def _batch_order(
+        self,
+        request: CapabilityRequest,
+        workspace: WorkspaceSpec,
+        effects: tuple[EffectClass, ...],
+        batch_order_lock: asyncio.Lock | None,
+    ) -> list[asyncio.Lock] | list[asyncio.Lock]:
+        return DispatchOrdering(self)._batch_order(request, workspace, effects, batch_order_lock)
+
     async def _dispatch_with_controls(
         self,
         request: CapabilityRequest,
@@ -1090,71 +1092,29 @@ class CapabilityDispatcher:
         workspace: WorkspaceSpec,
         profile: str | None,
         task_policy: CapabilityPolicy | None,
+        model_policy: Any,
         task_budget: ResourceBudget | None,
         task_deadline: datetime | None,
         runtime_remaining_s: float | None,
         verification_environment: Any,
         directives: DispatchDirectives | None,
         prepared: bool,
+        batch_order_lock: asyncio.Lock | None = None,
     ):
-        """Apply task concurrency and resource conflict controls.
-
-        The capability itself remains the authority for effects.  This helper
-        only uses the already-declared contract to prevent an unbounded batch
-        from exceeding the task budget or racing requests targeting the same
-        resource.
-        """
-        effects: tuple[EffectClass, ...] = ()
-        try:
-            executor = self._executor_for(request, workspace)
-            effects = self._resolve_effects_for(executor.descriptor, request.arguments or {})
-        except (CapabilityUnavailable, KeyError, TypeError, ValueError):
-            # dispatch() will return the canonical validation/effect error.
-            pass
-
-        locks = self._locks_for_request(request, workspace, effects)
-
-        async def invoke_with_locks():
-            for lock in locks:
-                await lock.acquire()
-            try:
-                return await self.dispatch(
-                    request,
-                    workspace=workspace,
-                    profile=profile,
-                    task_policy=task_policy,
-                    task_budget=task_budget,
-                    task_deadline=task_deadline,
-                    runtime_remaining_s=runtime_remaining_s,
-                    verification_environment=verification_environment,
-                    _directives=directives,
-                    _prepared=prepared,
-                )
-            finally:
-                for lock in reversed(locks):
-                    lock.release()
-
-        lease = None
-        if request.task_id and _is_execution(effects):
-            if self._budgets is not None:
-                lease = self._budgets.execution_lease(request.task_id)
-            elif task_budget is not None:
-                # Compatibility for standalone dispatcher users that have not
-                # composed a BudgetTracker yet.  Service wiring always binds
-                # the hierarchical authority above.
-                semaphore = self._execution_semaphores.get(request.task_id)
-                if semaphore is None:
-                    semaphore = asyncio.Semaphore(max(1, int(task_budget.max_parallel_executions)))
-                    self._execution_semaphores[request.task_id] = semaphore
-                await semaphore.acquire()
-                try:
-                    return await invoke_with_locks()
-                finally:
-                    semaphore.release()
-        if lease is None:
-            return await invoke_with_locks()
-        async with lease:
-            return await invoke_with_locks()
+        return await DispatchOrdering(self)._dispatch_with_controls(
+            request,
+            workspace=workspace,
+            profile=profile,
+            task_policy=task_policy,
+            model_policy=model_policy,
+            task_budget=task_budget,
+            task_deadline=task_deadline,
+            runtime_remaining_s=runtime_remaining_s,
+            verification_environment=verification_environment,
+            directives=directives,
+            prepared=prepared,
+            batch_order_lock=batch_order_lock,
+        )
 
     def _locks_for_request(
         self,
@@ -1162,37 +1122,10 @@ class CapabilityDispatcher:
         workspace: WorkspaceSpec,
         effects: tuple[EffectClass, ...],
     ) -> list[asyncio.Lock]:
-        if not set(effects) & {
-            EffectClass.READ_LOCAL,
-            EffectClass.WRITE_LOCAL,
-            EffectClass.DELETE,
-        }:
-            return []
-        args = request.arguments or {}
-        raw_resources = [args.get("path"), args.get("destination")]
-        resources = {
-            _resource_key(workspace, value)
-            for value in raw_resources
-            if isinstance(value, str) and value
-        }
-        if not resources:
-            return []
-        locks: list[asyncio.Lock] = []
-        for resource in sorted(resources):
-            key = (workspace.id or workspace.root, resource)
-            locks.append(self._resource_locks.setdefault(key, asyncio.Lock()))
-        return locks
+        return DispatchOrdering(self)._locks_for_request(request, workspace, effects)
 
     def _executor_for(self, request: CapabilityRequest, workspace: WorkspaceSpec):
-        fabric = self._fabric
-        if fabric is not None:
-            return fabric.executor_for(
-                request.capability_id,
-                task_id=request.task_id,
-                project_id=workspace.id,
-                user_id=self._principal.id,
-            )
-        return self.registry.executor_for(request.capability_id)
+        return DispatchOrdering(self)._executor_for(request, workspace)
 
     def resolve_effects(
         self,
@@ -1214,92 +1147,7 @@ class CapabilityDispatcher:
         *,
         workspace: WorkspaceSpec,
     ) -> list[str]:
-        """Validate/repair EVERY call before ANY executes; mutate nothing but
-        canonicalize repaired arguments via ``object.__setattr__`` (same as
-        ``dispatch``). Returns a list of issue paths (empty = all clear)."""
-        from athena.models.compat.candidates import get_raw_candidate
-
-        issues: list[str] = []
-        for index, request in enumerate(requests):
-            path = f"[{index}] {request.capability_id}"
-            if not request.call_id:
-                object.__setattr__(request, "call_id", new_id("call"))
-            try:
-                executor = self._executor_for(request, workspace)
-            except (CapabilityUnavailable, KeyError, TypeError, ValueError) as exc:
-                issues.append(f"{path}: unknown-capability ({exc})")
-                continue
-
-            # Mirror dispatch()'s repair inputs (raw-candidate aware).
-            repair_arguments = dict(request.arguments or {})
-            candidate = request.candidate or get_raw_candidate(request.call_id)
-            completion_state = "CLEAN"
-            if (
-                candidate is not None
-                and candidate.parsed_arguments is None
-                and isinstance(candidate.raw_arguments, str)
-                # Empty raw input is significant: it is an incomplete or
-                # malformed model candidate, not a valid empty object.
-                and candidate.raw_arguments.strip() != "{}"
-            ):
-                repair_arguments = candidate.raw_arguments  # type: ignore[assignment]
-                completion_state = candidate.completion_state
-
-            if getattr(request.origin, "value", request.origin) == "model":
-                repaired_args, receipt = self.repairer.repair(
-                    call_id=request.call_id,
-                    tool_name=request.capability_id,
-                    arguments=repair_arguments,
-                    input_schema=executor.descriptor.input_schema,
-                    validate_fn=validate_schema,
-                    mcp_origin=(getattr(executor.descriptor.origin, "value", None) == "MCP"),
-                    provider_profile_id=(
-                        getattr(candidate, "provider_profile_id", None) or self._provider_profile_id
-                    ),
-                    model_id=getattr(candidate, "model_id", None) or self._model_id,
-                    completion_state=completion_state,
-                    mode=self._repair_mode,
-                )
-                if receipt.outcome == "INVALID":
-                    await self._persist_repair(
-                        request,
-                        receipt,
-                        original_arguments=repair_arguments,
-                        canonical_arguments=None,
-                    )
-                    issues.append(
-                        f"{path}: tool_input_invalid "
-                        + ("; ".join(receipt.issue_codes) or "invalid arguments")
-                    )
-                    continue
-                if receipt.outcome == "REPAIRED":
-                    await self._persist_repair(
-                        request,
-                        receipt,
-                        original_arguments=repair_arguments,
-                        canonical_arguments=repaired_args,
-                    )
-                    object.__setattr__(request, "arguments", repaired_args)
-                    await self._emit_repair(request, receipt, repaired_args)
-                else:
-                    await self._persist_repair(
-                        request,
-                        receipt,
-                        original_arguments=repair_arguments,
-                        canonical_arguments=request.arguments,
-                    )
-
-            errors = validate_schema(executor.descriptor.input_schema, request.arguments or {})
-            if errors:
-                issues.append(f"{path}: schema_validation ({'; '.join(errors)})")
-                continue
-
-            try:
-                self._resolve_effects_for(executor.descriptor, request.arguments or {})
-            except ValueError as exc:
-                issues.append(f"{path}: effects_unresolved ({exc})")
-
-        return issues
+        return await DispatchRepair(self)._preflight_batch(requests, workspace=workspace)
 
     async def _persist_repair(
         self,
@@ -1309,42 +1157,15 @@ class CapabilityDispatcher:
         original_arguments: Any,
         canonical_arguments: Mapping[str, Any] | None,
     ) -> None:
-        """Make a repair receipt durable before policy or execution."""
-        if self._repair_store is None:
-            return
-        try:
-            await self._repair_store.record(
-                task_id=request.task_id,
-                capability_id=request.capability_id,
-                origin=str(getattr(request.origin, "value", request.origin)),
-                receipt=receipt.to_dict(),
-                original_arguments=original_arguments,
-                canonical_arguments=canonical_arguments,
-            )
-        except Exception as exc:
-            raise PersistenceError(
-                f"tool repair receipt persistence failed for {request.call_id}: {exc}",
-                cause=exc,
-            ) from exc
+        return await DispatchRepair(self)._persist_repair(
+            request,
+            receipt,
+            original_arguments=original_arguments,
+            canonical_arguments=canonical_arguments,
+        )
 
     async def _emit_repair(self, request: CapabilityRequest, receipt, canonical_arguments) -> None:
-        await self._emit(
-            "ToolRepaired",
-            {
-                "call_id": request.call_id,
-                "tool_name": request.capability_id,
-                "rules": receipt.rules,
-                "policy_version": receipt.repair_policy_version,
-                "schema_hash": receipt.schema_hash,
-                "provider_profile_id": receipt.provider_profile_id,
-                "model_id": receipt.model_id,
-                "original_shape_hash": receipt.original_shape_hash,
-                "repaired_shape_hash": receipt.repaired_shape_hash,
-                "canonical_arguments": dict(canonical_arguments or {}),
-            },
-            request.task_id,
-            causal_id=request.call_id,
-        )
+        return await DispatchRepair(self)._emit_repair(request, receipt, canonical_arguments)
 
     # ------------------------------------------------------------------ #
     # Resolution / mutation
@@ -1357,64 +1178,11 @@ class CapabilityDispatcher:
 
     @staticmethod
     def _resolve_effects_for(descriptor, arguments: Mapping[str, Any]) -> tuple[EffectClass, ...]:
-        """Contract-first effect resolution (P0-9).
-
-        Capabilities with declared operation maps use their own exact
-        classification; unknown operations FAIL rather than guess. Legacy
-        heuristic applies only to capabilities without a map.
-        """
-        from athena.capabilities.operations import (
-            CapabilityEffectError,
-            resolve_operation_effects,
-        )
-
-        try:
-            contract_effects = resolve_operation_effects(descriptor, arguments)
-        except CapabilityEffectError as exc:
-            raise ValueError(str(exc)) from None
-        if contract_effects:
-            return contract_effects
-        return CapabilityDispatcher._resolve_effects(descriptor, arguments)
+        return PolicyGate._resolve_effects_for(descriptor, arguments)
 
     @staticmethod
     def _resolve_effects(descriptor, arguments: Mapping[str, Any]) -> tuple[EffectClass, ...]:
-        """Resolve the full concrete effect set for bound arguments (BHV-041).
-
-        Multi-effect operations (copy/move, execute) return the combined set so
-        the PolicyEngine evaluates every effect, not just one.
-        """
-        available = descriptor.effects
-        op = str(arguments.get("operation") or arguments.get("action") or "").lower()
-        want: tuple[EffectClass, ...]
-
-        if descriptor.id in CapabilityDispatcher._EXEC_CAPABILITIES:
-            # Code/process capabilities: every operation is execution-shaped.
-            # READ_LOCAL covers screen/output inspection; WRITE_LOCAL covers
-            # side effects the spawned process may have.
-            want = (EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS)
-        elif op in ("copy", "move"):
-            want = (EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL)
-        elif op in ("write", "patch", "mkdir", "create", "update", "save"):
-            want = (EffectClass.WRITE_LOCAL,)
-        elif op in ("delete", "remove", "rmtree", "unlink"):
-            want = (EffectClass.DELETE,)
-        elif op in ("read", "list", "stat", "get", "exists", "open", "recall"):
-            want = (EffectClass.READ_LOCAL,)
-        elif op in ("", "execute", "run", "exec"):
-            want = (EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS)
-        else:
-            want = ()
-        effects = tuple(e for e in want if e in available)
-        if effects:
-            return effects
-        if EffectClass.EXECUTE in available or EffectClass.SPAWN_PROCESS in available:
-            return tuple(
-                e for e in (EffectClass.EXECUTE, EffectClass.SPAWN_PROCESS) if e in available
-            )
-        fallback = _primary_effect(available)
-        if fallback is not None:
-            return (fallback,)
-        return tuple(sorted(available, key=lambda e: e.value))
+        return PolicyGate._resolve_effects(descriptor, arguments)
 
     @staticmethod
     def _eval_task_policy(
@@ -1422,37 +1190,7 @@ class CapabilityDispatcher:
         task_policy: CapabilityPolicy | None,
         request_effects: frozenset[EffectClass] | None = None,
     ) -> PolicyVerdict | None:
-        """Evaluate the task's capability policy as a HARD ceiling (P0-7).
-
-        Returns None when the task fully allows the capability (no narrowing);
-        otherwise a PolicyVerdict.DENY (hard, no override) or ASK. ``deny`` is a
-        hard no (BHV-043); global policy can only narrow, never expand.
-
-        Enforces both capability-ID allowlists AND effect ceilings: if the task
-        policy declares effects, the request's resolved effects must be a subset.
-        """
-        if task_policy is None:
-            return None
-        if capability_id in task_policy.deny:
-            return PolicyVerdict.DENY
-        if task_policy.allow and capability_id not in task_policy.allow:
-            return PolicyVerdict.DENY
-        if (
-            task_policy.ask
-            and capability_id not in task_policy.ask
-            and capability_id not in task_policy.allow
-        ):
-            return PolicyVerdict.DENY
-        if capability_id in task_policy.ask:
-            return PolicyVerdict.ASK
-        # Enforce effect ceiling: task effects must cover request effects
-        if (
-            request_effects
-            and task_policy.effects
-            and not request_effects.issubset(task_policy.effects)
-        ):
-            return PolicyVerdict.DENY
-        return None
+        return PolicyGate._eval_task_policy(capability_id, task_policy, request_effects)
 
     async def _park_for_approval(
         self,
@@ -1465,111 +1203,15 @@ class CapabilityDispatcher:
         receipt=None,
         directives: DispatchDirectives | None = None,
     ) -> str | None:
-        """Persist an ApprovalRequest and register it for later resolution.
-
-        Durable persistence (ApprovalStore) and the in-memory ApprovalManager
-        record use the SAME approval_id so ``AthenaService.approve`` can resolve
-        either. The grant binds to the exact argument digest (TOCTOU guard).
-        """
-        scope = ApprovalScope.CALL
-        if decision.approval_scope_options:
-            scope = decision.approval_scope_options[0]
-        digest = args_digest(arguments)
-        # ApprovalManager currently stores naive UTC datetimes. Keep that
-        # legacy contract while deriving the value from an explicit UTC clock.
-        from athena.protocol.messages import utcnow
-
-        expires_at = utcnow().replace(tzinfo=None) + timedelta(hours=24)
-        approval_id = new_id("apr")
-        metadata = {
-            "call_id": request.call_id,
-            "args_digest": digest,
-            "capability_id": request.capability_id,
-            "effects": [e.value for e in effects],
-            "workspace": workspace.id,
-            "execution_backend": workspace.execution_backend or "local",
-            "scope": scope.value,
-            "requested_scope": [s.value for s in decision.approval_scope_options],
-            "expires_at": expires_at.isoformat(),
-            # SESSION-scoped grants must survive resolution; keyed on this.
-            "session_id": getattr(request, "session_id", None),
-        }
-
-        if self._approval_store is not None:
-            persisted = await self._approval_store.create_request(
-                task_id=request.task_id,
-                capability_id=request.capability_id,
-                arguments=dict(arguments),
-                approval_id=approval_id,
-                metadata=metadata,
-            )
-            approval_id = persisted
-
-        manager = getattr(self.policy, "approvals", None)
-        if manager is not None and manager.state(approval_id) is None:
-            primary = _primary_effect(tuple(effects))
-            manager.create_request(
-                self._principal,
-                scope,
-                capability=request.capability_id,
-                effect=str(primary.value) if primary is not None else None,
-                task_id=request.task_id,
-                session_id=getattr(request, "session_id", None),
-                expires_at=expires_at,
-                approval_id=approval_id,
-                args_digest=digest,
-                call_id=request.call_id,
-            )
-
-        if self._continuation_store is not None:
-            # Durable continuation (review item 19): the kernel's parked call
-            # is in-memory only, so persist enough to reconstruct it after a
-            # restart. Failure-isolated — approval parking must not break.
-            try:
-                await self._continuation_store.record(
-                    task_id=request.task_id,
-                    call_id=request.call_id,
-                    capability_id=request.capability_id,
-                    canonical_arguments=dict(arguments),
-                    schema_hash=getattr(receipt, "schema_hash", None),
-                    effects=tuple(effects or ()),
-                    workspace_id=workspace.id,
-                    approval_id=approval_id,
-                    provider_profile_id=(
-                        getattr(request.candidate, "provider_profile_id", None)
-                        or self._provider_profile_id
-                    ),
-                    model_id=(getattr(request.candidate, "model_id", None) or self._model_id),
-                    repair_policy_version=getattr(receipt, "repair_policy_version", None),
-                    policy_context={
-                        "origin": getattr(request.origin, "value", request.origin),
-                        "session_id": getattr(request, "session_id", None),
-                        **(
-                            {
-                                "workflow_run_id": directives.workflow_run_id,
-                                "workflow_step_id": directives.workflow_step_id,
-                                "workflow_item_index": directives.workflow_item_index,
-                                "workflow_execution_id": directives.workflow_execution_id,
-                                "workflow_parent_call_id": directives.workflow_parent_call_id,
-                                "workflow_parent_capability_id": directives.workflow_parent_capability_id,
-                                "workflow_id": directives.workflow_id,
-                            }
-                            if directives is not None and directives.workflow_run_id
-                            else {}
-                        ),
-                    },
-                )
-            except Exception as exc:
-                # An approval without a durable canonical continuation is not
-                # safe to expose as resumable work. Fail closed instead of
-                # silently reverting to process-local SuspendedCall state.
-                raise PersistenceError(
-                    f"approval continuation persistence failed: {exc}",
-                    cause=exc,
-                ) from exc
-
-        self._resume_expiry[approval_id] = expires_at
-        return approval_id
+        return await PolicyGate(self)._park_for_approval(
+            request,
+            decision=decision,
+            workspace=workspace,
+            arguments=arguments,
+            effects=effects,
+            receipt=receipt,
+            directives=directives,
+        )
 
     def _inject_stores(self, executor) -> None:
         """Hand the dispatcher's durable stores to mutating executors.
@@ -1591,125 +1233,20 @@ class CapabilityDispatcher:
             except AttributeError:
                 pass
 
+    # Mutation bookkeeping mechanism (P1-10): bodies live in
+    # :mod:`athena.capabilities.mutation_recorder`. The dispatcher keeps the
+    # entrypoints and remains the only caller that decides WHEN recording runs.
+
     async def _record_mutation(
         self,
         request: CapabilityRequest,
         result: CapabilityResult,
     ) -> None:
-        if self._mutation_store is None:
-            return
-        mutation = (result.metadata or {}).get("mutation")
-        if not mutation:
-            return
-        mutation_id = mutation.get("mutation_id")
-        mutation_sequence = None
-        if mutation_id and self._mutation_store is not None:
-            mutation_sequence = await self._mutation_sequence_for(self._mutation_store, mutation_id)
-        if mutation.get("mutation_id"):
-            event = await self._emit(
-                EV["MUTATION_RECORDED"],
-                {
-                    "call_id": request.call_id,
-                    "capability_id": request.capability_id,
-                    "resource": mutation.get("resource"),
-                    "operation": mutation.get("operation"),
-                    "mutation_id": mutation.get("mutation_id"),
-                    "mutation_sequence": mutation_sequence,
-                },
-                request.task_id,
-                causal_id=request.call_id,
-            )
-            self._attach_mutation_boundary(
-                result,
-                event_sequence=getattr(event, "sequence", None),
-                mutation_sequence=mutation_sequence,
-            )
-            if self._mutation_observer is not None:
-                await self._mutation_observer(
-                    request.task_id,
-                    mutation.get("resource", ""),
-                    mutation.get("mutation_id"),
-                    getattr(event, "sequence", None),
-                    mutation_sequence,
-                )
-            return
-        try:
-            mid = await self._mutation_store.record(
-                task_id=request.task_id,
-                resource=mutation.get("resource", ""),
-                operation=mutation.get("operation", ""),
-                before_state=mutation.get("before_hash"),
-                after_state=mutation.get("after_hash"),
-                reversible=bool(mutation.get("reversible", False)),
-                before_ref=mutation.get("before_ref"),
-                inverse=mutation.get("inverse"),
-                metadata={
-                    "capability_call_id": request.call_id,
-                    "capability_id": request.capability_id,
-                },
-            )
-        except Exception as e:
-            await self._emit(
-                "MUTATION_RECORD_FAILED",
-                {
-                    "call_id": request.call_id,
-                    "capability_id": request.capability_id,
-                    "resource": mutation.get("resource"),
-                    "operation": mutation.get("operation"),
-                    "error": str(e),
-                },
-                request.task_id,
-                causal_id=request.call_id,
-            )
-            import logging
-
-            logging.getLogger("athena.dispatcher").warning(
-                "mutation record failed: %s",
-                e,
-                exc_info=True,
-            )
-            raise
-
-        mutation_sequence = await self._mutation_sequence_for(self._mutation_store, mid)
-        event = await self._emit(
-            EV["MUTATION_RECORDED"],
-            {
-                "call_id": request.call_id,
-                "capability_id": request.capability_id,
-                "resource": mutation.get("resource"),
-                "operation": mutation.get("operation"),
-                "mutation_id": mid,
-                "mutation_sequence": mutation_sequence,
-            },
-            request.task_id,
-            causal_id=request.call_id,
-        )
-        self._attach_mutation_boundary(
-            result,
-            event_sequence=getattr(event, "sequence", None),
-            mutation_sequence=mutation_sequence,
-        )
-        if self._mutation_observer is not None:
-            await self._mutation_observer(
-                request.task_id,
-                mutation.get("resource", ""),
-                mid,
-                getattr(event, "sequence", None),
-                mutation_sequence,
-            )
+        return await MutationRecorder(self)._record_mutation(request, result)
 
     @staticmethod
     async def _mutation_sequence_for(store, mutation_id: str) -> int | None:
-        """Read a sequence when the configured store supports the extension.
-
-        A few embedders provide a compatible pre-sequence MutationStore. They
-        must retain the mutation path without losing the newer world-state
-        boundary metadata.
-        """
-        sequence_for = getattr(store, "sequence_for", None)
-        if sequence_for is None:
-            return None
-        return await sequence_for(mutation_id)
+        return await MutationRecorder._mutation_sequence_for(store, mutation_id)
 
     @staticmethod
     def _attach_mutation_boundary(
@@ -1718,11 +1255,9 @@ class CapabilityDispatcher:
         event_sequence: int | None,
         mutation_sequence: int | None,
     ) -> None:
-        """Expose the durable mutation boundary to downstream orchestration."""
-        metadata = dict(result.metadata or {})
-        metadata["mutation_event_sequence"] = event_sequence
-        metadata["mutation_sequence"] = mutation_sequence
-        object.__setattr__(result, "metadata", metadata)
+        return MutationRecorder._attach_mutation_boundary(
+            result, event_sequence=event_sequence, mutation_sequence=mutation_sequence
+        )
 
 
 def _bounded_diagnostics(values: list[Any] | tuple[Any, ...]) -> list[Any]:
@@ -1745,6 +1280,35 @@ def _is_execution(effects: tuple[EffectClass, ...]) -> bool:
     return bool(
         set(effects)
         & {
+            EffectClass.EXECUTE,
+            EffectClass.SPAWN_PROCESS,
+        }
+    )
+
+
+def _is_ordering_sensitive(effects: tuple[EffectClass, ...]) -> bool:
+    """Whether a resource-less call must serialize against sibling mutations.
+
+    Write/delete/external/network-write/execute calls that name NO concrete
+    resource act on ambient state and cannot prove independence, so they join
+    the batch order lane. Named-path mutations already serialize per-resource
+    (different paths run parallel) — defined there, they bypass the lane.
+    Opaque execution/process is ordering-sensitive: arbitrary code reads and
+    writes ambient workspace state that no per-resource lock can capture, so
+    a write→execute or execute→read batch would race without serialization.
+    Pure reads are never ordering-sensitive.
+    """
+    return bool(
+        set(effects)
+        & {
+            EffectClass.WRITE_LOCAL,
+            EffectClass.DELETE,
+            EffectClass.NETWORK_WRITE,
+            EffectClass.EXTERNAL_PUBLISH,
+            EffectClass.EXTERNAL_MESSAGE,
+            EffectClass.FINANCIAL,
+            EffectClass.PRIVILEGED,
+            EffectClass.COMPUTER_INPUT,
             EffectClass.EXECUTE,
             EffectClass.SPAWN_PROCESS,
         }
@@ -1897,6 +1461,20 @@ _STRICTNESS = {
     PolicyVerdict.DENY.value: 2,
 }
 
+# Bounded verification authority envelope (P0-7). The acceptance verifier
+# may observe and execute; it may never read secrets, escalate privilege,
+# publish externally, or drive computer input. Hard workspace/global
+# boundaries still apply through the normal PolicyEngine path.
+_VERIFICATION_EFFECT_FLOOR = frozenset(
+    {
+        EffectClass.READ_LOCAL,
+        EffectClass.WRITE_LOCAL,
+        EffectClass.EXECUTE,
+        EffectClass.SPAWN_PROCESS,
+        EffectClass.NETWORK_READ,
+    }
+)
+
 
 def _combine_verdicts(
     task_verdict: PolicyVerdict | None,
@@ -1942,6 +1520,24 @@ def _primary_effect(available) -> EffectClass | None:
     for eff in available:
         return eff
     return None
+
+
+# High-risk effects that should default to CALL scope even when the operator
+# chooses TASK or SESSION.  These effects have blast radius beyond a single
+# localized operation: network egress, external messages, privilege, secrets,
+# financial impact, and computer input.  Reusable grants for these are too
+# coarse — the operator should bind an explicit authority envelope.
+HIGH_RISK_EFFECTS = frozenset(
+    {
+        EffectClass.NETWORK_WRITE,
+        EffectClass.EXTERNAL_MESSAGE,
+        EffectClass.EXTERNAL_PUBLISH,
+        EffectClass.COMPUTER_INPUT,
+        EffectClass.SECRET_READ,
+        EffectClass.FINANCIAL,
+        EffectClass.PRIVILEGED,
+    }
+)
 
 
 def _wrap_exception(exc, request) -> CapabilityResult:

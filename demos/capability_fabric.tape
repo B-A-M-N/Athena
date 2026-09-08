@@ -8,9 +8,9 @@ Set Height 720
 Set Padding 18
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 25ms
-# The interface is intentionally restrained; 10 fps keeps the long GIF
-# reviewable without spending minutes encoding redundant terminal frames.
-Set Framerate 10
+# The interface is intentionally restrained; 2 fps keeps the long GIF
+# reviewable while keeping GIF encoding inside the release probe's bound.
+Set Framerate 2
 
 # Clear the shell line before revealing the app.  The fixture is committed;
 # the recording only replays it through the production DualPaneSurface.

@@ -1,7 +1,7 @@
 [package]
 name = "athena-terminal"
-version = "0.1.0"
-description = "Athena's native terminal frontend (development preview)"
+version = "0.1.0-beta.1"
+description = "Athena's native terminal frontend"
 license = "MIT"
 edition = "2024"
 rust-version = "1.85"

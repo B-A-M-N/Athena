@@ -41,6 +41,88 @@ async def test_full_loop_returns_complete_with_answer(make_service):
     assert any("4" in (e.payload or {}).get("text", "") for e in deltas)
 
 
+@pytest.mark.athena_claim("BHV-002", "BHV-039")
+@pytest.mark.athena_evidence("test", "integration")
+async def test_greeting_uses_response_route_without_learning(make_service):
+    svc = await make_service(
+        scripts=[
+            {
+                "match": {"last_user_message_contains": "hello"},
+                "respond": {"text": "Hello there.", "done": True},
+            }
+        ]
+    )
+
+    task = await svc.submit(AgentRequest(prompt="hello"), wait=True)
+    events = await _gather_events(svc, task.id)
+    types = [event.type for event in events]
+    strategy = next(event for event in events if event.type == "StrategySelected")
+
+    assert strategy.payload["route"] == "respond"
+    assert "CapabilityRequested" not in types
+    assert not any(
+        event_type.startswith(("Memory", "Skill", "WorkflowCandidate")) for event_type in types
+    )
+    result = await svc.get_result(task.id)
+    assert result is not None
+    assert result.status == TaskStatus.COMPLETE
+
+
+@pytest.mark.athena_claim("BHV-005", "BHV-039")
+@pytest.mark.athena_evidence("test", "complexity-budget")
+async def test_response_frames_keep_advanced_machinery_dormant(make_service):
+    """Conversation-only frames use one response call and no tool surface."""
+    svc = await make_service(
+        scripts=[
+            {
+                "match": {"last_user_message_contains": "Python file"},
+                "respond": {"text": "Create the file with Python's open function.", "done": True},
+            },
+            {
+                "match": {"last_user_message_contains": "winter"},
+                "respond": {"text": "Snow settles softly.", "done": True},
+            },
+        ]
+    )
+
+    for objective in (
+        "how do I create a Python file?",
+        "create a poem about winter",
+        "explain recursion in plain language",
+    ):
+        task = await svc.submit(AgentRequest(prompt=objective), wait=True)
+        events = await _gather_events(svc, task.id)
+        types = [event.type for event in events]
+        strategy = next(event for event in events if event.type == "StrategySelected")
+
+        assert strategy.payload["route"] == "respond"
+        assert "CapabilityRequested" not in types
+        assert "CapabilityCompleted" not in types
+        assert not any(
+            event_type.startswith(("Synthesis", "Workflow", "Delegation")) for event_type in types
+        )
+
+
+@pytest.mark.athena_claim("BHV-005", "BHV-006")
+@pytest.mark.athena_evidence("test", "integration")
+async def test_action_task_pure_prose_is_partial_without_observable_proof(make_service):
+    svc = await make_service(
+        scripts=[
+            {
+                "match": {"user_contains": "PROSE_READ"},
+                "respond": {"text": "I read the file and everything looks good.", "done": True},
+            }
+        ]
+    )
+
+    task = await svc.submit(AgentRequest(prompt="PROSE_READ the project file"), wait=True)
+    result = await svc.get_result(task.id)
+
+    assert result is not None
+    assert result.status == TaskStatus.PARTIAL
+    assert "observable_work" in result.unresolved
+
+
 @pytest.mark.athena_claim("BHV-016")
 @pytest.mark.athena_evidence("test", "e2e")
 async def test_non_blocking_submit_runs_via_worker(make_service):

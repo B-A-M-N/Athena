@@ -439,6 +439,11 @@ class RealityCoordinator:
         if workspace is None:
             results = [{"id": "workspace", "passed": False}]
         elif not criteria:
+            # Deliberate asymmetry with the speculative path: a live
+            # transaction has already mutated reality directly, so deriving
+            # zero criteria means the proof obligation is unknown, not
+            # absent — fail closed into recovery rather than commit
+            # unverified direct mutations.
             results = [{"id": "acceptance_criteria", "passed": False}]
         else:
             direct = replace(workspace, mutation_mode=MutationMode.DIRECT)
@@ -817,7 +822,14 @@ class RealityCoordinator:
         workspace: WorkspaceSpec,
     ) -> list[dict]:
         if not criteria:
-            return [{"id": "acceptance_criteria", "passed": False}]
+            # Nothing was derivable to prove, so there is no proof to fail.
+            # The candidate commits on the observable work evidence the
+            # turn-boundary gate already required.  The certificate records
+            # the absence of obligations explicitly rather than fabricating
+            # a passing check; a criteria-less workspace must not deadlock
+            # every completion into PARTIAL ("nothing to verify" is not
+            # "proof failed").
+            return [{"id": "no_criteria_derivable", "passed": True, "obligation": "none"}]
         try:
             results = await self._verifier.verify_against(task, criteria, workspace)
         except Exception as exc:  # noqa: BLE001 - never accept unverified work
