@@ -52,21 +52,26 @@ ATHENA_NATIVE_LAYOUT_DUMP="$resize_dump" \
   >/dev/null 2>&1 &
 native_pid=$!
 cleanup_native() {
-  if [[ -n "${native_pid:-}" ]]; then
-    kill "$native_pid" 2>/dev/null || true
-    wait "$native_pid" 2>/dev/null || true
-    native_pid=""
-  fi
-  if [[ -n "${clipboard_pid:-}" ]]; then
-    kill "$clipboard_pid" 2>/dev/null || true
-    wait "$clipboard_pid" 2>/dev/null || true
-    clipboard_pid=""
-  fi
-  if [[ -n "${focus_probe_pid:-}" ]]; then
-    kill "$focus_probe_pid" 2>/dev/null || true
-    wait "$focus_probe_pid" 2>/dev/null || true
-    focus_probe_pid=""
-  fi
+  cleanup_pid() {
+    local pid="$1"
+    [[ -n "$pid" ]] || return 0
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+      done
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  }
+
+  cleanup_pid "${native_pid:-}"
+  native_pid=""
+  cleanup_pid "${clipboard_pid:-}"
+  clipboard_pid=""
+  cleanup_pid "${focus_probe_pid:-}"
+  focus_probe_pid=""
 }
 trap 'cleanup_native; rm -rf "$tmp_dir"' EXIT
 
@@ -88,9 +93,9 @@ focus_window() {
   # Retry activation/focus rather than letting an asynchronous BadMatch from
   # X_SetInputFocus abort the acceptance lane before it tests the product.
   for _ in $(seq 1 30); do
-    if xdotool windowmap "$target" 2>/dev/null \
-      && (xdotool windowactivate --sync "$target" 2>/dev/null \
-        || xdotool windowfocus --sync "$target" 2>/dev/null); then
+    if timeout 2s xdotool windowmap "$target" 2>/dev/null \
+      && (timeout 2s xdotool windowactivate --sync "$target" 2>/dev/null \
+        || timeout 2s xdotool windowfocus --sync "$target" 2>/dev/null); then
       return 0
     fi
     sleep 0.1
