@@ -182,6 +182,13 @@ class ModelRouter:
             require_tools=bool(policy.require_tools or role_policy.require_tools),
             privacy=_stricter_policy_privacy(policy.privacy, role_policy.privacy),
             max_cost_usd=_min_cost(policy.max_cost_usd, role_policy.max_cost_usd),
+            min_quality_tier=_stricter_quality_tier(
+                policy.min_quality_tier,
+                role_policy.min_quality_tier,
+            ),
+            require_declared_quality=bool(
+                policy.require_declared_quality or role_policy.require_declared_quality
+            ),
             routing_preference=(
                 policy.routing_preference
                 if policy.routing_preference != "balanced"
@@ -416,8 +423,17 @@ class ModelRouter:
         deployment without tier declarations routes exactly as before.
         """
         raw = getattr(policy, "min_quality_tier", None)
-        if not raw:
+        require_declared = bool(getattr(policy, "require_declared_quality", False))
+        if not raw and not require_declared:
             return True
+        if not raw:
+            tier = getattr(info, "quality_tier", ModelQualityTier.UNDECLARED)
+            if isinstance(tier, str):
+                try:
+                    tier = ModelQualityTier(tier)
+                except ValueError:
+                    return not require_declared
+            return tier is not ModelQualityTier.UNDECLARED
         try:
             floor = ModelQualityTier(str(raw))
         except ValueError:
@@ -429,7 +445,7 @@ class ModelRouter:
             except ValueError:
                 return True
         if tier is ModelQualityTier.UNDECLARED:
-            return not bool(getattr(policy, "require_declared_quality", False))
+            return not require_declared
         return tier.rank >= floor.rank
 
     def _meets_cost(
@@ -525,3 +541,18 @@ def _min_cost(left, right):
     if right is None:
         return left
     return min(left, right)
+
+
+def _stricter_quality_tier(left: str | None, right: str | None) -> str | None:
+    """Intersect quality floors without allowing a role to weaken a task."""
+    values = [value for value in (left, right) if value]
+    valid: list[tuple[int, str]] = []
+    for value in values:
+        try:
+            tier = ModelQualityTier(str(value))
+        except ValueError:
+            continue
+        valid.append((tier.rank, tier.value))
+    if valid:
+        return max(valid)[1]
+    return left or right

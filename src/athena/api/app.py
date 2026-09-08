@@ -460,6 +460,20 @@ def _get_session_handler(service: Any) -> Any:
     return handler
 
 
+def _close_session_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        session_id = request.path_params["session_id"]
+        try:
+            closed = await service.close_session(session_id)
+        except Exception as exc:  # noqa: BLE001
+            raise _status_for_error(exc)
+        if not closed:
+            raise HTTPError(404, "session_not_found", f"session {session_id!r} not found")
+        return json_response({"session_id": session_id, "closed": True}, status=200)
+
+    return handler
+
+
 def _models_handler(service: Any) -> Any:
     async def handler(request: Any) -> Any:
         registry = getattr(service, "_model_registry", None)
@@ -642,6 +656,7 @@ def create_app(service: Any = None) -> Any:
         Route("/v1/approvals/{approval_id}", _approve_handler(service), methods=["POST"]),
         Route("/v1/sessions", _list_sessions_handler(service), methods=["GET"]),
         Route("/v1/sessions/{session_id}", _get_session_handler(service), methods=["GET"]),
+        Route("/v1/sessions/{session_id}", _close_session_handler(service), methods=["DELETE"]),
         Route("/v1/sessions/{session_id}/resume", _resume_handler(service), methods=["POST"]),
         Route("/v1/models", _models_handler(service), methods=["GET"]),
         Route("/v1/capabilities", _capabilities_handler(service), methods=["GET"]),

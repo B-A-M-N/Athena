@@ -790,6 +790,18 @@ class ServiceLifecycle:
                     "error": str(exc),
                 }
 
+        # 13.5 Deployment capability contract. This runs after MCP discovery
+        # and pack rehydration so every configured surface is checked in its
+        # live, final form before a worker can claim work.
+        capability_profile = await self._svc._validate_required_capabilities()
+        self._svc._startup_health["checks"]["capability_profile"] = capability_profile
+        if capability_profile.get("status") != "ok":
+            missing = ", ".join(
+                f"{item['id']}: {item['reason']}"
+                for item in capability_profile.get("missing", ())
+            )
+            raise RuntimeError(f"required capability profile is not ready: {missing}")
+
         # 14. Worker + scheduler. Packs and any dependent resumable tasks are
         # settled before a worker can claim fresh work.
         worker = TaskWorker(

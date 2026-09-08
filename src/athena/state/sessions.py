@@ -295,6 +295,24 @@ class SessionRepository:
                 row["project_id"] = metadata.get("project_id")
         return rows
 
+    async def close(self, session_id: str) -> bool:
+        """Mark a session closed without deleting its transcript."""
+        row = await self.get(session_id)
+        if row is None:
+            return False
+        metadata = dict(row.get("metadata") or {})
+        if metadata.get("state") == "closed":
+            return True
+        now = utcnow().isoformat()
+        metadata.update({"state": "closed", "closed_at": now})
+        await self._db.execute(
+            "UPDATE sessions SET updated_at = ?, metadata = ? WHERE id = ?",
+            (now, json.dumps(metadata), session_id),
+        )
+        if self._current_session_id == session_id:
+            self._current_session_id = None
+        return True
+
     async def delete_if_orphaned(self, session_id: str) -> bool:
         """Delete a session created speculatively when it has no owners.
 

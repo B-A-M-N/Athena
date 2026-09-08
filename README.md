@@ -683,6 +683,8 @@ max_cost_usd = 0.01
 
 [model_roles.judge]
 allowed = ["anthropic/claude-sonnet-4"]   # acceptance-criteria judging
+min_quality_tier = "standard"
+require_declared_quality = true
 
 [model_roles.primary]
 allowed = ["anthropic/claude-opus-4"]     # main reasoning loop
@@ -691,6 +693,25 @@ allowed = ["anthropic/claude-opus-4"]     # main reasoning loop
 Built-in roles: `primary` (task reasoning), `summarizer` (context compression),
 `judge` (model-judged acceptance criteria). A caller's explicit allowlist
 always wins over role defaults.
+
+### Required capability profiles
+
+Deployments can fail closed at startup when a configured capability surface is
+missing or unhealthy. Native ids and owned external surfaces are supported:
+
+```toml
+required_capabilities = ["execute", "browser", "mcp:research"]
+capability_profile = "desktop"
+
+[capability_profiles.desktop]
+required_capabilities = ["computer", "terminal", "skill:workspace-review"]
+```
+
+Use `skill:ID`, `pack:ID`, `delegate:ID`, or `mcp:NAME` for explicit owned
+dependencies. The selected profile and its live resolution state are exposed
+through `/v1/health` and `runtime_health`; missing requirements prevent workers
+from starting. `ATHENA_REQUIRED_CAPABILITIES` and
+`ATHENA_CAPABILITY_PROFILE` provide equivalent environment configuration.
 
 ### Post-task knowledge pipeline
 

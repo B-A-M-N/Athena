@@ -192,6 +192,14 @@ class AthenaService:
             "active_sessions": 0,
         }
         self._optional_capability_health: dict[str, dict[str, Any]] = {}
+        self._capability_profile_status: dict[str, Any] = {
+            "profile": getattr(self.config, "capability_profile", None),
+            "required": [],
+            "resolved": [],
+            "missing": [],
+            "status": "not_started",
+            "blocking": False,
+        }
         self._hermes_referee = hermes_referee
         self._hermes_adapter: HermesAgentEvaluator | None = None
         self._hermes_referee_owned = False
@@ -431,6 +439,106 @@ class AthenaService:
             ),
             "shutdown": dict(self._shutdown_status),
         }
+
+    async def _validate_required_capabilities(self) -> dict[str, Any]:
+        """Resolve the configured deployment capability contract.
+
+        Required capability ids are host configuration, never model input. The
+        contract accepts native capability ids plus explicit ``mcp:``,
+        ``skill:``, ``pack:``, and ``delegate:`` references. A missing or
+        unhealthy required surface fails startup before workers can claim work.
+        """
+        configured = tuple(self.config.effective_required_capabilities)
+        status: dict[str, Any] = {
+            "profile": self.config.capability_profile,
+            "required": list(configured),
+            "resolved": [],
+            "missing": [],
+            "blocking": bool(configured),
+        }
+        if not configured:
+            status["status"] = "ok"
+            self._capability_profile_status = dict(status)
+            return status
+
+        registry = self._registry
+        aliases = {
+            "terminal": "terminal_session",
+            "external_delegate": "external_delegate",
+            "external-delegate": "external_delegate",
+            "external delegates": "external_delegate",
+        }
+        from athena.protocol.capabilities import Availability
+
+        for requested in configured:
+            requirement = str(requested).strip()
+            kind, separator, identifier = requirement.partition(":")
+            kind = kind.casefold() if separator else "capability"
+            identifier = identifier.strip() if separator else requirement
+            reason: str | None = None
+
+            if kind == "mcp":
+                mcp = self.mcp_status().get(identifier)
+                if mcp is None:
+                    reason = "MCP server is not configured"
+                elif mcp.get("state") != "connected":
+                    reason = str(mcp.get("last_error") or mcp.get("state") or "not connected")
+            elif kind == "skill":
+                lifecycle = self._skill_lifecycle
+                skill = await lifecycle.get(identifier) if lifecycle is not None else None
+                if skill is None:
+                    reason = "skill is not installed"
+                elif not bool(getattr(skill, "enabled", False)):
+                    reason = "skill is disabled"
+            elif kind == "pack":
+                manager = self._pack_manager
+                if manager is None:
+                    reason = "pack manager is not initialized"
+                else:
+                    try:
+                        detail = await manager.inspect_installed(identifier)
+                    except KeyError:
+                        detail = None
+                    if detail is None:
+                        reason = "pack is not installed"
+                    elif not bool(detail.get("enabled")):
+                        reason = "pack is disabled"
+                    elif (detail.get("health_detail") or {}).get("status") != "healthy":
+                        health = detail.get("health_detail") or {}
+                        reason = str(health.get("reason") or health.get("status"))
+            elif kind == "delegate":
+                try:
+                    spec = self._delegate_registry.get(identifier)
+                    if (
+                        not spec.command
+                        and self._delegate_registry.connector_for(identifier) is None
+                    ):
+                        reason = "delegate has no trusted connector"
+                except KeyError:
+                    reason = "delegate is not configured"
+            elif kind == "capability":
+                resolved_name = aliases.get(identifier.casefold(), identifier)
+                if registry is None:
+                    reason = "capability registry is not initialized"
+                else:
+                    try:
+                        descriptor = registry.resolve(resolved_name)
+                    except Exception:
+                        reason = "capability is not registered"
+                    else:
+                        if descriptor.availability is not Availability.AVAILABLE:
+                            reason = f"capability is {descriptor.availability.value}"
+            else:
+                reason = f"unknown capability requirement kind: {kind}"
+
+            if reason is None:
+                status["resolved"].append(requirement)
+            else:
+                status["missing"].append({"id": requirement, "reason": reason})
+
+        status["status"] = "ok" if not status["missing"] else "failed"
+        self._capability_profile_status = dict(status)
+        return status
 
     def mcp_status(self) -> dict[str, dict[str, Any]]:
         """Return configured MCP transport/discovery state for operators."""
@@ -1232,6 +1340,27 @@ class AthenaService:
     async def list_sessions(self) -> list[dict]:
         return await OperatorInteractionService(self).list_sessions()
 
+    async def close_session(self, session_id: str) -> bool:
+        """Close one durable conversation and its session-scoped resources."""
+        sessions = self._sessions
+        if sessions is None:
+            raise RuntimeError("AthenaService not started")
+        if await sessions.get(session_id) is None:
+            return False
+        browser = self._browser
+        if browser is not None:
+            close_session = getattr(browser, "close_session", None)
+            if callable(close_session):
+                await close_session(session_id)
+        closed = await sessions.close(session_id)
+        if closed and self._store_events is not None:
+            await self._store_events.append_event(
+                "SessionClosed",
+                {"session_id": session_id},
+                session_id=session_id,
+            )
+        return closed
+
     async def resume(self, session_id: str, *, prompt: str = "") -> TaskSpec:
         return await OperatorInteractionService(self).resume(session_id, prompt=prompt)
 
@@ -1888,6 +2017,12 @@ class AthenaService:
                 require_tools=bool(spec.get("require_tools", False)),
                 max_cost_usd=max_cost,
                 routing_preference=str(spec.get("routing_preference") or "balanced"),
+                min_quality_tier=(
+                    str(spec["min_quality_tier"]).strip()
+                    if spec.get("min_quality_tier") is not None
+                    else None
+                ),
+                require_declared_quality=bool(spec.get("require_declared_quality", False)),
             )
         return out
 

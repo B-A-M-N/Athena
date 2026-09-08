@@ -66,6 +66,30 @@ class TestFloorFilter:
         sel = await router.select(policy=ModelPolicy(min_quality_tier="mega"))
         assert sel.model == "cheap"
 
+    async def test_role_floor_intersects_task_floor(self):
+        router = ModelRouter(
+            _StaticRegistry(
+                [_info("standard", "standard"), _info("frontier", "frontier")]
+            ),
+            role_policies={"judge": ModelPolicy(role="judge", min_quality_tier="frontier")},
+        )
+        effective = router.effective_policy(ModelPolicy(role="judge", min_quality_tier="standard"))
+        assert effective.min_quality_tier == "frontier"
+        sel = await router.select(policy=ModelPolicy(role="judge", min_quality_tier="standard"))
+        assert sel.model == "frontier"
+
+    async def test_role_strict_quality_requirement_intersects_task_policy(self):
+        router = ModelRouter(
+            _StaticRegistry([_info("mystery", None), _info("standard", "standard")]),
+            role_policies={
+                "judge": ModelPolicy(role="judge", require_declared_quality=True),
+            },
+        )
+        effective = router.effective_policy(ModelPolicy(role="judge"))
+        assert effective.require_declared_quality is True
+        sel = await router.select(policy=ModelPolicy(role="judge"))
+        assert sel.model == "standard"
+
 
 class TestTierParsing:
     def test_string_tier_coerces(self):

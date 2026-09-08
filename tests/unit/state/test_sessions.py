@@ -43,6 +43,16 @@ async def test_list_all_sessions(db):
     assert rows[0]["metadata"] == {"foo": "bar"}
 
 
+async def test_close_marks_session_without_deleting_transcript(repo):
+    assert await repo.close("sess_1") is True
+    row = await repo.get("sess_1")
+    assert row is not None
+    assert row["metadata"]["state"] == "closed"
+    assert "closed_at" in row["metadata"]
+    assert await repo.close("sess_1") is True
+    assert await repo.close("missing") is False
+
+
 async def test_task_transition_legal(repo, db):
     store = TaskStore(db)
     await store.insert_task("task_1", "sess_1", None, "do a thing")
