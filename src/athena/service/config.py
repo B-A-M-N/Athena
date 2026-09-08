@@ -149,6 +149,7 @@ class MCPConfig:
     env: Mapping[str, str] = field(default_factory=dict)
     secret_env: Mapping[str, str] = field(default_factory=dict)
     connect_timeout: float = 10.0
+    required: bool = False
 
 
 class HermesSupervisionMode(StrEnum):
@@ -449,6 +450,7 @@ def _parse_mcp(data: dict[str, Any]) -> MCPConfig:
         env=data.get("env") or {},
         secret_env=data.get("secret_env") or {},
         connect_timeout=float(data.get("connect_timeout", 10.0)),
+        required=bool(data.get("required", False)),
     )
 
 
@@ -574,6 +576,7 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
                     "env": dict(m.env),
                     "secret_env": dict(m.secret_env),
                     "connect_timeout": m.connect_timeout,
+                    "required": m.required,
                 }.items()
                 if value is not None
             }

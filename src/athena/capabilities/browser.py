@@ -478,6 +478,28 @@ class BrowserCapability:
             except Exception:  # noqa: BLE001 - shutdown is best effort
                 pass
 
+    async def close_task(self, task_id: str) -> None:
+        """Close a task-scoped driver after its task reaches a final state."""
+        if self._session_scope != "task":
+            return
+        async with self._lock:
+            driver = self._drivers.pop(str(task_id), None)
+            if driver is not None:
+                self._driver_policies.pop(id(driver), None)
+        if driver is not None:
+            await driver.close()
+
+    async def close_session(self, session_id: str) -> None:
+        """Close a session-scoped driver when its owning session is closed."""
+        if self._session_scope != "session":
+            return
+        async with self._lock:
+            driver = self._drivers.pop(str(session_id), None)
+            if driver is not None:
+                self._driver_policies.pop(id(driver), None)
+        if driver is not None:
+            await driver.close()
+
     def _scope_key(self, request: CapabilityRequest) -> str:
         preferred = request.task_id if self._session_scope == "task" else request.session_id
         return str(

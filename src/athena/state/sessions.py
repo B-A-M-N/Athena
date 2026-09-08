@@ -26,6 +26,15 @@ from athena.protocol.messages import (
     utcnow,
 )
 from athena.protocol.models import ToolCallCandidate
+from athena.protocol.task_codec import (
+    encode_budget,
+    encode_capability_policy,
+    encode_context_refs,
+    encode_criteria,
+    encode_delivery,
+    encode_model_policy,
+    encode_workspace,
+)
 from athena.protocol.tasks import (
     CapabilityPolicy,
     Criterion,
@@ -391,108 +400,31 @@ def _message_from_row(row: dict[str, Any]) -> Message:
 
 
 def _serialize_workspace(ws: WorkspaceSpec | None) -> str | None:
-    if ws is None:
-        return None
-    return json.dumps(
-        {
-            "id": ws.id,
-            "root": ws.root,
-            "readable": [{"path": r.path, "allow": r.allow} for r in ws.readable],
-            "writable": [{"path": r.path, "allow": r.allow} for r in ws.writable],
-            "temp_root": ws.temp_root,
-            "execution_backend": ws.execution_backend,
-            "network_policy": ws.network_policy.value,
-            "mutation_mode": ws.mutation_mode.value,
-            "revision": ws.revision,
-        }
-    )
+    return encode_workspace(ws)
 
 
 def _serialize_criteria(crits: tuple[Criterion, ...]) -> str:
-    out = []
-    for c in crits:
-        v = c.verification
-        out.append(
-            {
-                "id": c.id,
-                "description": c.description,
-                "required": c.required,
-                "verification": {
-                    "type": v.type.value,
-                    "command": v.command,
-                    "path": v.path,
-                    "predicate": v.predicate,
-                    "capability": v.capability,
-                }
-                if v
-                else None,
-            }
-        )
-    return json.dumps(out)
+    return encode_criteria(crits)
 
 
 def _serialize_resource_budget(rb: ResourceBudget) -> str:
-    return json.dumps(
-        {
-            "max_agent_iterations": rb.max_agent_iterations,
-            "max_input_tokens": rb.max_input_tokens,
-            "max_output_tokens": rb.max_output_tokens,
-            "max_cost_usd": str(rb.max_cost_usd) if rb.max_cost_usd is not None else None,
-            "max_wall_time": rb.max_wall_time.total_seconds()
-            if rb.max_wall_time is not None
-            else None,
-            "max_children": rb.max_children,
-            "max_child_depth": rb.max_child_depth,
-            "max_parallel_model_calls": rb.max_parallel_model_calls,
-            "max_parallel_executions": rb.max_parallel_executions,
-            "max_artifact_bytes": rb.max_artifact_bytes,
-        }
-    )
+    return encode_budget(rb)
 
 
 def _serialize_model_policy(mp: ModelPolicy) -> str:
-    return json.dumps(
-        {
-            "role": mp.role,
-            "allowed": list(mp.allowed),
-            "require_tools": mp.require_tools,
-            "privacy": mp.privacy,
-            "max_cost_usd": str(mp.max_cost_usd) if mp.max_cost_usd is not None else None,
-            "routing_preference": mp.routing_preference,
-        }
-    )
+    return encode_model_policy(mp)
 
 
 def _serialize_capability_policy(cp: CapabilityPolicy) -> str:
-    return json.dumps(
-        {
-            "effects": sorted(cp.effects),
-            "allow": list(cp.allow),
-            "ask": list(cp.ask),
-            "deny": list(cp.deny),
-        }
-    )
+    return encode_capability_policy(cp)
 
 
 def _serialize_context_refs(refs: tuple) -> str:
-    return json.dumps(
-        [
-            {
-                "kind": r.kind,
-                "ref": r.ref,
-                "source_id": r.source_id,
-                "summary": r.summary,
-                "mime_type": getattr(r, "mime_type", None),
-            }
-            for r in refs
-        ]
-    )
+    return encode_context_refs(refs)
 
 
 def _serialize_delivery(d) -> str | None:
-    if d is None:
-        return None
-    return json.dumps({"channel": d.channel, "destination": d.destination})
+    return encode_delivery(d)
 
 
 _JSON_FIELDS = (

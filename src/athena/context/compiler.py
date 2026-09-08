@@ -1101,10 +1101,16 @@ class ContextCompiler:
                     "cannot satisfy BHV-032 without overflow."
                 )
 
-        # Fill any remaining verbatim room with oldest-mentioned older turns.
-        for e in older:
+        # Fill remaining room by value and causal recency. Oldest-first made
+        # a bounded context retain stale chatter while dropping the decision
+        # or evidence immediately preceding the current turn.
+        for e in sorted(
+            older,
+            key=lambda item: (float(item.value), str(item.created_at or ""), item.name),
+            reverse=True,
+        ):
             if not try_append(e):
-                break
+                continue
 
         # Summarize what did not fit (older transcript) with provenance retained.
         summarized_subject = [e for e in older if e not in kept]
@@ -1118,6 +1124,14 @@ class ContextCompiler:
                 cache_key=_entry_group_cache_key(summarized_subject, task=task),
                 max_tokens=summary_budget,
             )
+            if not summary_text:
+                # The source range still needs an explicit reversible summary
+                # even when no provider tokens remain for the model-facing
+                # summary. The digest/receipt carries this marker.
+                summary_text = (
+                    f"{len(summarized_subject)} older context entries omitted; "
+                    "recover from transcript anchors"
+                )
             markers.append(
                 CompressionMarker(
                     message_ids=tuple(e.name for e in summarized_subject),
@@ -1152,7 +1166,9 @@ class ContextCompiler:
                 "cannot form a bounded context."
             )
 
-        return kept, CompressionRecord(tuple(markers)), omitted
+        return kept, CompressionRecord(
+            tuple(markers), self._compressor.consume_degraded()
+        ), omitted
 
     async def _persist_context_digest(
         self,

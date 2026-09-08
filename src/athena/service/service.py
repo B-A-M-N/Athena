@@ -120,6 +120,7 @@ from athena.protocol.tasks import (
     TERMINAL_STATUSES,
     WorkspaceSpec,
 )
+from athena.protocol.task_codec import decode_criteria, encode_criteria
 
 from athena.service.candidates import CandidateService
 from athena.service.interaction import OperatorInteractionService
@@ -182,6 +183,9 @@ class AthenaService:
             "state": "not_started",
             "backend": "unknown",
         }
+        self._terminals: Any = None
+        self._debugger: Any = None
+        self._browser: Any = None
         self._browser_health: dict[str, Any] = {
             "state": "not_started",
             "configured": False,
@@ -256,6 +260,8 @@ class AthenaService:
         self._approval_recovery_tasks: set[asyncio.Task] = set()
         self._watch_poll_task: asyncio.Task | None = None
         self._shutdown_hooks: list[tuple[str, Any]] = []
+        self._resource_finalizer: Any = None
+        self._shutdown_status: dict[str, Any] = {"state": "not_started"}
         self._budgets: BudgetTracker | None = None
         self._cancellations: CancellationManager | None = None
         self._delegation: DelegationManager | None = None
@@ -285,6 +291,7 @@ class AthenaService:
 
         self._mcp_clients: list[MCPClient] = []
         self._mcp_connection_status: dict[str, dict[str, Any]] = {}
+        self._mcp_reconnect_failures: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Factories for tests / smoke
@@ -333,6 +340,26 @@ class AthenaService:
 
     async def stop(self) -> None:
         return await ServiceLifecycle(self).stop()
+
+    async def _mark_execution_uncertain(self, task_id: str, marker: dict[str, Any]) -> None:
+        """Park a task when an executed effect outlives its finish journal."""
+        tasks = self._store_tasks
+        if tasks is None:
+            raise RuntimeError("task store unavailable while recording execution uncertainty")
+        await tasks.record_recovery_marker(task_id, marker)
+        row = await tasks.get(task_id)
+        current = TaskStatus(row["status"]) if row else None
+        if current in {
+            TaskStatus.CREATED,
+            TaskStatus.QUEUED,
+            TaskStatus.RUNNING,
+            TaskStatus.INTERRUPTED,
+        } and self._task_manager is not None:
+            await self._task_manager.transition(
+                task_id,
+                TaskStatus.RECOVERY_REQUIRED,
+                reason="execution effect occurred but finish journal persistence failed",
+            )
 
     def startup_health(self) -> dict[str, Any]:
         """Return startup checks for readiness and operator diagnostics."""
@@ -393,6 +420,12 @@ class AthenaService:
                 name: dict(value)
                 for name, value in sorted(self._optional_capability_health.items())
             },
+            "resources": (
+                self._resource_finalizer.health()
+                if self._resource_finalizer is not None
+                else {"state": "not_started"}
+            ),
+            "shutdown": dict(self._shutdown_status),
         }
 
     def mcp_status(self) -> dict[str, dict[str, Any]]:
@@ -405,6 +438,7 @@ class AthenaService:
                 {
                     "id": name,
                     "configured": True,
+                    "required": bool(server.required),
                     "state": "configured",
                     "transport": "http" if server.url else "stdio",
                     "tool_count": 0,
@@ -1464,7 +1498,22 @@ class AthenaService:
                 network_policy=NetworkPolicy.DENY,
                 mutation_mode=MutationMode.SPECULATIVE,
             )
-        raw_mutation_mode = meta.pop("mutation_mode", None)
+        legacy_mutation_mode = meta.pop("mutation_mode", None)
+        typed_mutation_mode = request.mutation_mode
+        if typed_mutation_mode is not None and legacy_mutation_mode is not None:
+            try:
+                legacy_value = MutationMode(str(legacy_mutation_mode))
+            except ValueError as exc:
+                raise ValueError("legacy mutation_mode conflicts with typed mutation_mode") from exc
+            if legacy_value is not typed_mutation_mode:
+                raise ValueError(
+                    "typed mutation_mode conflicts with legacy metadata mutation_mode"
+                )
+        raw_mutation_mode = (
+            typed_mutation_mode
+            if typed_mutation_mode is not None
+            else legacy_mutation_mode
+        )
         # OFFLINE autonomy is a hard egress boundary (P0): the task's model
         # routing is narrowed to local-only models, not merely biased toward
         # them. Model calls do not pass through PolicyEngine; ModelRouter's
@@ -1486,7 +1535,11 @@ class AthenaService:
             ws = replace(ws, mutation_mode=MutationMode.SPECULATIVE)
         elif raw_mutation_mode is not None:
             try:
-                mutation_mode = MutationMode(str(raw_mutation_mode))
+                mutation_mode = (
+                    raw_mutation_mode
+                    if isinstance(raw_mutation_mode, MutationMode)
+                    else MutationMode(str(raw_mutation_mode))
+                )
             except ValueError as exc:
                 raise ValueError(
                     "mutation_mode must be one of: "
@@ -1497,38 +1550,22 @@ class AthenaService:
             # Coding tasks are protected by default.  The escape hatch is
             # explicit metadata (mutation_mode=direct), never a model choice.
             ws = replace(ws, mutation_mode=MutationMode.SPECULATIVE)
-        # Acceptance criteria (BHV-005): ``metadata["acceptance_criteria"]``
-        # carries human-specified checks. Each entry becomes a required
-        # Criterion so the termination evaluator audits claimed completion.
-        criteria: list = []
+        # Typed acceptance criteria are authoritative. The legacy metadata
+        # spelling remains a compatibility input, but a request carrying both
+        # forms must agree canonically instead of silently choosing one.
         raw_criteria = meta.pop("acceptance_criteria", None)
-        if isinstance(raw_criteria, (list, tuple)):
-            from athena.protocol.tasks import Criterion, VerificationSpec, VerificationType
-
-            for i, item in enumerate(raw_criteria):
-                text = str(item or "").strip()
-                if not text:
-                    continue
-                # "command:..." prefix selects an executable probe; otherwise
-                # the criterion is model-judged against task evidence.
-                if text.lower().startswith("command:"):
-                    verification = VerificationSpec(
-                        type=VerificationType.COMMAND,
-                        command=text.split(":", 1)[1].strip(),
-                    )
-                else:
-                    verification = VerificationSpec(
-                        type=VerificationType.MODEL_JUDGMENT,
-                        predicate=text,
-                    )
-                criteria.append(
-                    Criterion(
-                        id=f"ac_{i + 1}",
-                        description=text,
-                        verification=verification,
-                        required=True,
-                    )
+        typed_criteria = tuple(request.acceptance_criteria or ())
+        legacy_criteria = decode_criteria(raw_criteria) if raw_criteria is not None else ()
+        if self_host:
+            criteria = legacy_criteria
+        elif typed_criteria and legacy_criteria:
+            if encode_criteria(typed_criteria) != encode_criteria(legacy_criteria):
+                raise ValueError(
+                    "typed acceptance_criteria conflicts with legacy metadata acceptance_criteria"
                 )
+            criteria = typed_criteria
+        else:
+            criteria = typed_criteria or legacy_criteria
         # Normalize requested_capabilities into the task's capability policy
         cap_policy = None
         if request.requested_capabilities:
@@ -2141,6 +2178,7 @@ class AthenaService:
             if DebuggerCapability.available():
                 self._debugger = DebuggerCapability(
                     execution_manager=self._execution,
+                    event_sink=self._forward_events(self._require_events()),
                 )
                 registry.register(self._debugger)
                 self._optional_capability_health["debugger"] = {
@@ -2378,9 +2416,9 @@ class AthenaService:
         registry.register(FusionCapability(self))
 
         # Capability-owned resource teardown (P1-32).
-        if hasattr(self, "_terminals"):
+        if self._terminals is not None:
             self.register_shutdown_hook("terminal_sessions", self._terminals.close_all)
-        if hasattr(self, "_debugger"):
+        if self._debugger is not None:
             self.register_shutdown_hook("debugger_sessions", self._debugger.close_all)
         if hasattr(self, "_watch_registry"):
             self.register_shutdown_hook("watch_registry", self._watch_registry.close)
@@ -2447,7 +2485,8 @@ class AthenaService:
         """Register a capability-owned resource teardown (P1-32)."""
         self._shutdown_hooks.append((name, hook))
 
-    async def _run_shutdown_hooks(self) -> None:
+    async def _run_shutdown_hooks(self) -> dict[str, Any]:
+        outcome: dict[str, Any] = {"failures": [], "hooks": []}
         for name, hook in reversed(self._shutdown_hooks):
             try:
                 if asyncio.iscoroutinefunction(hook):
@@ -2456,9 +2495,14 @@ class AthenaService:
                     result = hook()
                     if inspect.isawaitable(result):
                         await result
+                outcome["hooks"].append({"name": name, "status": "ok"})
             except Exception as exc:
                 _logger.warning("shutdown hook %s failed: %s", name, exc)
+                failure = {"name": name, "error": str(exc)}
+                outcome["hooks"].append({"name": name, "status": "failed", **failure})
+                outcome["failures"].append(failure)
         self._shutdown_hooks.clear()
+        return outcome
 
     # ------------------------------------------------------------------ #
     # Fusion engines: shadow execution + execution-grounded world state
@@ -2752,12 +2796,19 @@ class AthenaService:
     async def _connect_mcp(self) -> None:
         for server in self.config.mcp_servers:
             await self._connect_mcp_server(server)
+            status = self._mcp_connection_status.get(server.name, {})
+            if server.required and status.get("state") != "connected":
+                raise RuntimeError(
+                    f"required MCP server {server.name!r} is not ready: "
+                    f"{status.get('last_error') or status.get('state') or 'unknown'}"
+                )
 
     async def _connect_mcp_server(self, server: MCPConfig) -> dict[str, Any]:
         transport = "http" if server.url else "stdio"
         self._mcp_connection_status[server.name] = {
             "id": server.name,
             "configured": True,
+            "required": bool(server.required),
             "state": "connecting",
             "transport": transport,
             "tool_count": 0,
@@ -2789,6 +2840,7 @@ class AthenaService:
                 "state": "connected",
                 "tool_count": len(descriptors),
             }
+            self._mcp_reconnect_failures[server.name] = 0
         except Exception as exc:
             _logger.warning("MCP server %s failed to connect: %s", server.name, exc)
             if client is not None:
@@ -2800,9 +2852,13 @@ class AthenaService:
                     await client.close()
                 except Exception as close_exc:  # noqa: BLE001 - preserve original failure
                     _logger.info("MCP failed-connection cleanup failed: %s", close_exc)
+            failures = self._mcp_reconnect_failures.get(server.name, 0) + 1
+            self._mcp_reconnect_failures[server.name] = failures
             self._mcp_connection_status[server.name] = {
                 **self._mcp_connection_status[server.name],
-                "state": "failed",
+                "state": "circuit_open" if failures >= 3 else "failed",
+                "consecutive_failures": failures,
+                "circuit_open": failures >= 3,
                 "last_error": f"{type(exc).__name__}: {exc}",
             }
         return dict(self._mcp_connection_status[server.name])

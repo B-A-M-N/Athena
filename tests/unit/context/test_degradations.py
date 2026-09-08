@@ -1,10 +1,8 @@
-"""P1-6: optional-context failures must be observable.
+"""Context failures must remain truthful and observable.
 
-Graceful degradation is correct — a broken memory store must not fail the
-task — but "memory storage failed" and "no memories exist" were
-observationally identical. The compiler now records degradations and the
-compiled context carries them, so operator inspection can tell the two
-states apart.
+Graceful degradation is correct for optional memory/skill sources, but the
+canonical transcript is authority-bearing and cannot be replaced with an
+empty context after a read failure.
 """
 
 from __future__ import annotations
@@ -12,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from athena.context.compiler import ContextCompiler
+from athena.protocol.errors import ContextIntegrityError
 from athena.protocol.tasks import TaskSpec
 
 
@@ -70,18 +69,14 @@ async def test_empty_memory_store_is_not_a_degradation():
 
 
 @pytest.mark.athena_claim("OBS-006")
-async def test_failing_transcript_and_skills_record_degradations():
+async def test_failing_transcript_raises_context_integrity_error():
     compiler = ContextCompiler(
         message_store=_BrokenTranscriptStore(),
         skill_loader=_BrokenSkillLoader(),
     )
     task = _task(session_id="sess-1")
-    compiled = await compiler.compile(task)
-    sources = {d.source for d in compiled.degradations}
-    assert "transcript" in sources
-    assert "skills" in sources
-    transcript_degradation = next(d for d in compiled.degradations if d.source == "transcript")
-    assert transcript_degradation.scope == "sess-1"
+    with pytest.raises(ContextIntegrityError, match="canonical transcript"):
+        await compiler.compile(task)
 
 
 @pytest.mark.athena_claim("OBS-006")

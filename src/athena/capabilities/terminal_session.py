@@ -18,7 +18,6 @@ Operations:
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import logging
 import os
@@ -457,6 +456,10 @@ class TerminalSessionCapability:
                     EV["RUNTIME_SCREEN_CHANGED"],
                     session,
                     screen_chars=len(screen_text),
+                    # Keep the observation useful to the interpreter while
+                    # bounding event size. The capability result remains the
+                    # full normal screen response.
+                    screen_text=_tail_text(data, limit=16_000),
                     cursor_row=row,
                     cursor_col=col,
                     rows=session.rows,
@@ -567,7 +570,24 @@ class TerminalSessionCapability:
 
         return _result(request, ok=False, error=f"unknown operation: {op}")
 
-    def close_all(self) -> None:
+    async def close_task(self, task_id: str) -> None:
+        """Close and await all PTYs owned by one completed task."""
+        sessions = [s for s in self._sessions.values() if s.task_id == task_id]
+        for session in sessions:
+            try:
+                await run_blocking(session.child.terminate, True)
+            except (OSError, pexpect.exceptions.ExceptionPexpect) as exc:
+                _logger.debug("terminal session cleanup failed: %s", exc)
+            self._sessions.pop(session.id, None)
+            await self._emit_runtime(EV["RUNTIME_STATE_LOST"], session, reason="task_finalized")
+
+    def close_all(self):
+        """Close every PTY, returning an awaitable for lifecycle events.
+
+        Direct synchronous callers still get immediate process cleanup; the
+        service shutdown hook awaits the returned coroutine when event
+        persistence is configured.
+        """
         sessions = list(self._sessions.values())
         for s in self._sessions.values():
             try:
@@ -575,15 +595,13 @@ class TerminalSessionCapability:
             except (OSError, pexpect.exceptions.ExceptionPexpect) as exc:
                 _logger.debug("terminal session cleanup failed: %s", exc)
         self._sessions.clear()
-        if self._event_sink is not None:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop is not None:
-                for session in sessions:
-                    loop.create_task(
-                        self._emit_runtime(
-                            EV["RUNTIME_STATE_LOST"], session, reason="service_shutdown"
-                        )
-                    )
+        if self._event_sink is None:
+            return None
+
+        async def emit_events() -> None:
+            for session in sessions:
+                await self._emit_runtime(
+                    EV["RUNTIME_STATE_LOST"], session, reason="service_shutdown"
+                )
+
+        return emit_events()

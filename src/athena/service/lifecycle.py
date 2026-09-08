@@ -44,6 +44,7 @@ from athena.project.index.store import ProjectIndexStore
 from athena.protocol.tasks import TaskStatus
 from athena.protocol.tasks import WorkspaceSpec
 from athena.protocol.policy import Principal
+from athena.protocol.events import EV, make_event
 from athena.scheduler.scheduler import Scheduler
 from athena.service.config import DEFAULT_DB_PATH
 from athena.skills.lifecycle import SkillLifecycle
@@ -123,6 +124,7 @@ class ServiceLifecycle:
             "checks": {},
             "blocking_failures": [],
         }
+        self._svc._shutdown_status = {"state": "running"}
         self._svc._recovery_status = "starting"
         self._svc._recovery_summary = {}
         self._svc._recovery_error = None
@@ -199,6 +201,7 @@ class ServiceLifecycle:
             runtime_session_store=runtime_sessions,
             execution_store=execution_store,
             event_sink=self._svc._forward_events(events),
+            durability_mandatory=True,
         )
         # Keep container execution optional, but register the real backend so
         # a workspace selecting ``execution_backend="container"`` reaches the
@@ -331,6 +334,7 @@ class ServiceLifecycle:
             principal_id=cfg.cache_namespace,
         )
         self._svc._task_manager = task_manager
+        execution.set_recovery_sink(self._svc._mark_execution_uncertain)
 
         cancellations = CancellationManager(
             task_manager=task_manager,
@@ -453,6 +457,7 @@ class ServiceLifecycle:
             context_compiler=compiler,
             termination=TerminationEvaluator(
                 acceptance_verifier=verifier,
+                required_child_state=task_manager.required_child_state,
                 defer_reality_verification=lambda task: (
                     self._svc._reality_gate.active_branch(task.id) is not None
                     or self._svc._reality_gate.checkpoint_id(task.id) is not None
@@ -486,6 +491,32 @@ class ServiceLifecycle:
             event_types={"RuntimeScreenChanged"},
         )
 
+        def _on_debugger_stopped(event) -> None:
+            payload = dict(getattr(event, "payload", None) or {})
+            if not payload.get("session"):
+                return
+            from athena.interpreter.protocol import BodyObservationKind, InterpreterObservation
+
+            observation = InterpreterObservation(
+                kind=BodyObservationKind.DEBUGGER_STOPPED,
+                payload={
+                    "reason": payload.get("reason"),
+                    "thread_id": payload.get("thread_id"),
+                    "location": payload.get("location"),
+                    "frames": list(payload.get("frames") or [])[:8],
+                    "frames_head": "\n".join(
+                        str(frame.get("name") or "")
+                        for frame in list(payload.get("frames") or [])[:8]
+                    ),
+                },
+                task_id=getattr(event, "task_id", None),
+                session_id=getattr(event, "session_id", None),
+                runtime_session_id=payload.get("runtime_session_id"),
+            )
+            asyncio.ensure_future(kernel.offer_body_observation(observation))
+
+        events.subscribe(_on_debugger_stopped, event_types={"DebuggerStopped"})
+
         # 11. Delegation (needs kernel).
         delegation = DelegationManager(
             task_manager=task_manager,
@@ -506,6 +537,13 @@ class ServiceLifecycle:
             skills_store=skills_store,
             research_store=self._svc._research_store,
         )
+
+        from athena.service.resource_finalizer import TaskResourceFinalizer
+
+        finalizer = TaskResourceFinalizer(event_sink=self._svc._forward_events(events))
+        finalizer.bind_service(self._svc)
+        self._svc._resource_finalizer = finalizer
+        task_manager.add_finalize_observer(finalizer.finalize)
 
         # Rehydrate only validated project/user machinery. Task-local
         # capabilities are intentionally recreated by the owning task and
@@ -866,9 +904,11 @@ class ServiceLifecycle:
             self._svc._watch_poll_task = None
 
         # Capability-owned resources via shutdown registry (P1-32).
-        await self._svc._run_shutdown_hooks()
+        hook_outcome = await self._svc._run_shutdown_hooks()
         self._svc._computer = None
         self._svc._browser = None
+        self._svc._terminals = None
+        self._svc._debugger = None
         self._svc._computer_health = {
             "state": "stopped",
             "backend": "unknown",
@@ -905,9 +945,16 @@ class ServiceLifecycle:
         # (P0-2): its close_all covers task sessions, adopted execution
         # sessions, registered runtimes, and non-local backends. The service
         # must not reach into the manager's private runtime collection.
+        execution_outcome: dict = {
+            "runtime_failures": [],
+            "backend_failures": [],
+            "sessions_remaining": [],
+            "unproven_process_kills": [],
+        }
         if self._svc._execution is not None:
             try:
                 outcome = await self._svc._execution.close_all()
+                execution_outcome = dict(outcome)
             except Exception as exc:
                 _logger.warning("execution close_all failed: %s", exc)
             else:
@@ -923,6 +970,32 @@ class ServiceLifecycle:
                     self._svc._execution.live_resource_count(),
                 )
             self._svc._execution = None
+
+        shutdown_clean = not (
+            hook_outcome.get("failures")
+            or execution_outcome.get("runtime_failures")
+            or execution_outcome.get("backend_failures")
+            or execution_outcome.get("sessions_remaining")
+            or execution_outcome.get("unproven_process_kills")
+            or (self._svc._resource_finalizer and self._svc._resource_finalizer.health().get("failures"))
+        )
+        self._svc._shutdown_status = {
+            "state": "clean" if shutdown_clean else "incomplete",
+            "hooks": hook_outcome,
+            "execution": execution_outcome,
+            "resources": (
+                self._svc._resource_finalizer.health()
+                if self._svc._resource_finalizer is not None
+                else None
+            ),
+        }
+        if not shutdown_clean and self._svc._store_events is not None:
+            try:
+                await self._svc._store_events.append(
+                    make_event(EV["SHUTDOWN_INCOMPLETE"], self._svc._shutdown_status)
+                )
+            except Exception as exc:
+                _logger.warning("shutdown incomplete marker failed: %s", exc)
 
         # DB last.
         if self._svc._db is not None:
@@ -967,9 +1040,7 @@ class ServiceLifecycle:
 
 def _body_observation_from_screen_event(event, payload: dict):
     """Convert a RuntimeScreenChanged event into a typed interpreter
-    observation (P1-15). Returns None when the event carries no screen
-    render (defensive: the capability announces the size, the full text
-    comes from a bounded screen read the bridge performs itself).
+    observation (P1-15).
     """
     from athena.interpreter.protocol import (
         BodyObservationKind,
@@ -984,6 +1055,7 @@ def _body_observation_from_screen_event(event, payload: dict):
         payload={
             "session": session_id,
             "screen_chars": int(payload.get("screen_chars") or 0),
+            "screen_text": str(payload.get("screen_text") or "")[:16_000],
             "rows": payload.get("rows"),
             "cols": payload.get("cols"),
         },

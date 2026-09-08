@@ -26,7 +26,9 @@ from typing import Any, AsyncIterator, Mapping
 from athena.api.decoders import (
     decode_budget,
     decode_capability_policy,
+    decode_criteria,
     decode_model_policy,
+    decode_mutation_mode,
     decode_workspace,
 )
 from athena.protocol.ids import new_id
@@ -41,6 +43,7 @@ from athena.protocol.tasks import (
     AutonomyLevel,
     CapabilityPolicy,
     DeliverySpec,
+    MutationMode,
     NetworkPolicy,
     TaskSpec,
 )
@@ -68,6 +71,8 @@ class ACPRequest:
     deadline: str | None = None
     delivery: Mapping[str, Any] | None = None
     autonomy: str | None = None
+    mutation_mode: str | None = None
+    acceptance_criteria: Any = ()
 
 
 @dataclass(frozen=True)
@@ -171,11 +176,19 @@ class ACPAdapter:
             capability = CapabilityPolicy(deny=("*",))
         autonomy = _map_autonomy(request.autonomy)
         model_policy = decode_model_policy(request.model_policy)
+        mutation_mode = decode_mutation_mode(request.mutation_mode)
+        if mutation_mode is not None and workspace is not None:
+            if (
+                workspace.mutation_mode is not MutationMode.DIRECT
+                and workspace.mutation_mode is not mutation_mode
+            ):
+                raise ValueError("ACP mutation_mode conflicts with workspace mutation_mode")
+            workspace = replace(workspace, mutation_mode=mutation_mode)
         return TaskSpec(
             id=task_id,
             objective=request.objective,
             session_id=session_id,
-            acceptance_criteria=(),
+            acceptance_criteria=decode_criteria(request.acceptance_criteria),
             context_refs=(),
             workspace=workspace,
             capability_policy=capability,

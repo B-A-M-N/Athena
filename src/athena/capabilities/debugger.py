@@ -27,6 +27,7 @@ from athena.protocol.capabilities import (
     EffectClass,
     InvocationContext,
 )
+from athena.protocol.events import EV, make_event
 from athena.protocol.execution import ExecutionRequest
 from athena.protocol.tasks import NetworkPolicy
 
@@ -195,9 +196,10 @@ class DebuggerCapability:
         availability=_DEBUGGER_AVAILABILITY,
     )
 
-    def __init__(self, execution_manager=None, workspace=None) -> None:
+    def __init__(self, execution_manager=None, workspace=None, event_sink=None) -> None:
         self._execution = execution_manager
         self._workspace = workspace
+        self._event_sink = event_sink
         self._sessions: dict[str, dict[str, Any]] = {}
 
     @staticmethod
@@ -273,8 +275,7 @@ class DebuggerCapability:
             raise ValueError("thread_id is required after the debugger stops")
         return int(value)
 
-    @staticmethod
-    def _refresh_events(session: dict[str, Any]) -> None:
+    async def _refresh_events(self, session: dict[str, Any]) -> None:
         client = session.get("client")
         if client is None:
             return
@@ -284,6 +285,56 @@ class DebuggerCapability:
             if event.get("event") == "stopped":
                 session["paused"] = True
                 session["thread_id"] = body.get("threadId")
+                if self._event_sink is not None:
+                    payload: dict[str, Any] = {
+                        "session": session.get("session_id"),
+                        "runtime_session_id": session.get("runtime_session_id"),
+                        "reason": str(body.get("reason") or "stopped"),
+                        "thread_id": body.get("threadId"),
+                        "description": body.get("description"),
+                        "all_threads_stopped": body.get("allThreadsStopped"),
+                        "frames": [],
+                    }
+                    thread_id = body.get("threadId")
+                    if thread_id is not None:
+                        try:
+                            stack = await self._request(
+                                client,
+                                "stackTrace",
+                                {"threadId": int(thread_id), "levels": 8},
+                            )
+                            frames = []
+                            for frame in list(stack.get("stackFrames") or [])[:8]:
+                                source = frame.get("source") or {}
+                                frames.append(
+                                    {
+                                        "id": frame.get("id"),
+                                        "name": str(frame.get("name") or "")[:256],
+                                        "path": str(source.get("path") or "")[:1024],
+                                        "line": frame.get("line"),
+                                        "column": frame.get("column"),
+                                    }
+                                )
+                            payload["frames"] = frames
+                            if frames:
+                                payload["location"] = {
+                                    "path": frames[0]["path"],
+                                    "line": frames[0]["line"],
+                                    "column": frames[0]["column"],
+                                }
+                        except (ConnectionError, OSError, RuntimeError, ValueError, TypeError):
+                            pass
+                    try:
+                        await self._event_sink(
+                            make_event(
+                                EV["DEBUGGER_STOPPED"],
+                                payload,
+                                task_id=session.get("task_id"),
+                                session_id=session.get("session_id"),
+                            )
+                        )
+                    except Exception as exc:
+                        _logger.debug("debugger stopped event failed: %s", exc)
             elif event.get("event") in {"continued", "running"}:
                 session["paused"] = False
                 session["thread_id"] = body.get("threadId", session.get("thread_id"))
@@ -404,7 +455,7 @@ class DebuggerCapability:
         if owned_session is None:
             return _result(request, ok=False, error="unknown or unowned debugger session")
         session = owned_session
-        self._refresh_events(session)
+        await self._refresh_events(session)
         client: _DAPClient | None = session.get("client")
 
         if op == "status":
@@ -464,7 +515,7 @@ class DebuggerCapability:
                         "threadId": self._thread_id(args, session),
                     },
                 )
-                self._refresh_events(session)
+                await self._refresh_events(session)
                 return _result(request, output=json.dumps(body, sort_keys=True), meta=body)
             if op == "pause":
                 body = await self._request(
@@ -544,9 +595,16 @@ class DebuggerCapability:
                 _logger.debug("debugger session cleanup failed: %s", exc)
         self._sessions.pop(sid, None)
 
-    def close_all(self) -> None:
-        """Schedule governed cleanup without making shutdown hooks sync-only."""
+    async def close_task(self, task_id: str) -> None:
+        """Await cleanup for debugger sessions owned by one task."""
+        for sid, session in list(self._sessions.items()):
+            if session.get("task_id") == task_id:
+                await self._close_session(sid, session)
+
+    def close_all(self):
+        """Close DAP clients synchronously and return an awaitable sweep."""
         sessions = list(self._sessions.items())
+        pending: list[dict[str, Any]] = []
         for sid, session in sessions:
             client = session.get("client")
             if client is not None:
@@ -557,13 +615,20 @@ class DebuggerCapability:
             task = session.get("execution_task")
             if task is not None and not task.done():
                 task.cancel()
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop is not None and self._execution is not None:
-                loop.create_task(self._execution.destroy_session(session["runtime_session_id"]))
+            pending.append(session)
             self._sessions.pop(sid, None)
+
+        if self._execution is None or not pending:
+            return None
+
+        async def destroy_sessions() -> None:
+            for session in pending:
+                try:
+                    await self._execution.destroy_session(session["runtime_session_id"])
+                except Exception as exc:
+                    _logger.warning("debugger session cleanup failed: %s", exc)
+
+        return destroy_sessions()
 
 
 __all__ = ["DebuggerCapability"]

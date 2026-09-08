@@ -90,6 +90,7 @@ class CompressionMarker:
 @dataclass(frozen=True)
 class CompressionRecord:
     markers: tuple[CompressionMarker, ...] = ()
+    compression_degraded: bool = False
 
     @property
     def occurred(self) -> bool:
@@ -164,6 +165,12 @@ class ContextCompressor:
         self.max_cached_summary_chars = max(1024, int(max_cached_summary_chars))
         self._summary_cache: OrderedDict[str, str] = OrderedDict()
         self._summary_cache_size = 0
+        self._compression_degraded = False
+
+    def consume_degraded(self) -> bool:
+        value = self._compression_degraded
+        self._compression_degraded = False
+        return value
 
     def _cached_summary(self, key: str) -> str | None:
         value = self._summary_cache.get(key)
@@ -226,7 +233,9 @@ class ContextCompressor:
                     self._remember_summary(key, summary)
                     return summary
             except Exception:
-                pass
+                self._compression_degraded = True
+        else:
+            self._compression_degraded = True
         if len(text) <= max_chars:
             summary = _truncate_to_tokens(text, max_tokens, max_chars)
         else:
@@ -404,7 +413,7 @@ class ContextCompressor:
                 )
             )
 
-        return result, CompressionRecord(tuple(markers))
+        return result, CompressionRecord(tuple(markers), self.consume_degraded())
 
 
 CompressedRecord = CompressionRecord

@@ -146,6 +146,8 @@ _COMPUTER_DESCRIPTOR = CapabilityDescriptor(
             "amount": {"type": "integer"},
             "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 30},
             "button": {"enum": ["left", "right", "middle"]},
+            "window": {"type": "string", "maxLength": 256},
+            "focus": {"type": "boolean"},
         },
         "required": ["operation"],
         "additionalProperties": False,
@@ -182,6 +184,7 @@ class ComputerCapability:
         self._health: dict[str, Any] = {
             "state": "unknown",
             "backend": type(backend).__name__ if backend is not None else "pyautogui",
+            "observation_revision": 0,
         }
 
     @staticmethod
@@ -267,6 +270,9 @@ class ComputerCapability:
             return _result(request, output=json.dumps({"waited_s": seconds}))
 
         if operation == "click":
+            focus_error = await self._prepare_input(backend, args)
+            if focus_error:
+                return _result(request, ok=False, error=focus_error)
             button = str(args.get("button") or "left")
             x, y = args.get("x"), args.get("y")
             await run_blocking(
@@ -281,6 +287,9 @@ class ComputerCapability:
             )
 
         if operation == "type":
+            focus_error = await self._prepare_input(backend, args)
+            if focus_error:
+                return _result(request, ok=False, error=focus_error)
             text = str(args.get("text") or "")
             if not text:
                 return _result(request, ok=False, error="type requires text")
@@ -291,6 +300,9 @@ class ComputerCapability:
             )
 
         if operation == "key":
+            focus_error = await self._prepare_input(backend, args)
+            if focus_error:
+                return _result(request, ok=False, error=focus_error)
             keys = [str(k) for k in (args.get("keys") or []) if str(k)]
             if not keys:
                 return _result(request, ok=False, error="key requires keys")
@@ -298,6 +310,9 @@ class ComputerCapability:
             return _result(request, output=json.dumps({"pressed": keys}))
 
         if operation == "scroll":
+            focus_error = await self._prepare_input(backend, args)
+            if focus_error:
+                return _result(request, ok=False, error=focus_error)
             amount = int(args.get("amount") or 0)
             if amount == 0:
                 return _result(request, ok=False, error="scroll requires a non-zero amount")
@@ -311,6 +326,9 @@ class ComputerCapability:
             return _result(request, output=json.dumps({"scrolled": amount}))
 
         if operation == "move":
+            focus_error = await self._prepare_input(backend, args)
+            if focus_error:
+                return _result(request, ok=False, error=focus_error)
             x, y = args.get("x"), args.get("y")
             if x is None or y is None:
                 return _result(request, ok=False, error="move requires x and y")
@@ -318,6 +336,22 @@ class ComputerCapability:
             return _result(request, output=json.dumps({"moved_to": [int(x), int(y)]}))
 
         return _result(request, ok=False, error=f"unknown computer operation: {operation!r}")
+
+    async def _prepare_input(self, backend: ScreenBackend, args: dict[str, Any]) -> str | None:
+        """Enforce the foreground/window contract before computer input."""
+        window = str(args.get("window") or "").strip()
+        if not window:
+            return None
+        focus_window = getattr(backend, "focus_window", None)
+        if not callable(focus_window):
+            return "window targeting requested but the computer backend cannot focus windows"
+        try:
+            result = await run_blocking(focus_window, window)
+            if result is False:
+                return f"computer backend could not focus window {window!r}"
+        except Exception as exc:  # focus is a safety boundary, not best effort
+            return f"window focus failed: {type(exc).__name__}: {exc}"
+        return None
 
     async def _observe(
         self,
@@ -355,7 +389,7 @@ class ComputerCapability:
         screen_size = None
         if size is not None:
             try:
-                dim = size()
+                dim = await run_blocking(size)
                 screen_size = [int(dim.width), int(dim.height)]
             except Exception:  # noqa: BLE001 - size probe is best-effort
                 screen_size = None
@@ -390,6 +424,7 @@ class ComputerCapability:
             "state": "ready",
             "backend": type(backend).__name__,
             "screen_size": screen_size,
+            "observation_revision": int(self._health.get("observation_revision", 0)) + 1,
             "last_artifact_uri": ref.uri,
         }
         artifact_ref = {
@@ -411,6 +446,7 @@ class ComputerCapability:
             "artifact_bytes": ref.size,
             "model_input": "image",
             "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "observation_revision": self._health["observation_revision"],
             "note": (
                 "screenshot captured as an immutable image artifact; the next "
                 "model turn receives the visual input when its provider supports it"

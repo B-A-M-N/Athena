@@ -289,6 +289,9 @@ class ModelPolicy:
     # deployment whose providers declare no tiers is unaffected. Accepts the
     # bare string value ("standard"); invalid values are ignored.
     min_quality_tier: str | None = None
+    # Safety-sensitive deployments may require a provider to declare its tier;
+    # undeclared metadata is otherwise treated conservatively as advisory.
+    require_declared_quality: bool = False
 
 
 @dataclass(frozen=True)

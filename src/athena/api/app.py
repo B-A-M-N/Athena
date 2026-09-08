@@ -20,7 +20,13 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from athena.api.decoders import DecodeError, decode_model_policy, decode_workspace
+from athena.api.decoders import (
+    DecodeError,
+    decode_criteria,
+    decode_model_policy,
+    decode_mutation_mode,
+    decode_workspace,
+)
 from athena.protocol.tasks import AgentRequest, AutonomyLevel
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids forced runtime dep
@@ -206,6 +212,8 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
     try:
         workspace = decode_workspace(body.get("workspace"))
         model_policy = decode_model_policy(body.get("model_policy"))
+        mutation_mode = decode_mutation_mode(body.get("mutation_mode"))
+        acceptance_criteria = decode_criteria(body.get("acceptance_criteria"))
     except DecodeError as exc:
         raise HTTPError(400, "validation_error", str(exc))
 
@@ -216,6 +224,8 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
         autonomy=autonomy_value,
         workspace=workspace,
         model_policy=model_policy,
+        mutation_mode=mutation_mode,
+        acceptance_criteria=acceptance_criteria,
         attachments=tuple(attachments),
         requested_capabilities=(frozenset(requested) if requested is not None else None),
         metadata=dict(metadata),

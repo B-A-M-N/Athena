@@ -10,10 +10,7 @@ authority to ``TaskManager``.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from decimal import Decimal
 from typing import Any
 
 from athena.protocol.tasks import (
@@ -22,15 +19,20 @@ from athena.protocol.tasks import (
     Criterion,
     DeliverySpec,
     ModelPolicy,
-    MutationMode,
-    NetworkPolicy,
-    PathRule,
     ResourceBudget,
     TaskSpec,
     TaskStatus,
-    VerificationSpec,
-    VerificationType,
     WorkspaceSpec,
+)
+from athena.protocol.task_codec import (
+    decode_budget as _decode_budget_canonical,
+    decode_capability_policy as _decode_capability_policy_canonical,
+    decode_context_refs as _decode_context_refs_canonical,
+    decode_criteria as _decode_criteria_canonical,
+    decode_delivery as _decode_delivery_canonical,
+    decode_model_policy as _decode_model_policy_canonical,
+    decode_task_spec,
+    decode_workspace as _decode_workspace_canonical,
 )
 from athena.state.tasks import TaskStore
 
@@ -104,162 +106,35 @@ class TaskLifecycle:
 
 def deserialize_task(row: dict[str, Any]) -> TaskSpec:
     """Rebuild a ``TaskSpec`` from a ``TaskStore.get`` row."""
-    deadline = _ds(row.get("deadline"))
-
-    # Ground work on the persisted status so lifecycle events are accurate.
-    metadata = dict(row.get("metadata") or {})
-    metadata["status"] = row.get("status")
-
-    return TaskSpec(
-        id=row["id"],
-        objective=row.get("objective") or "",
-        session_id=row.get("session_id"),
-        parent_task_id=row.get("parent_task_id"),
-        acceptance_criteria=_decode_criteria(row.get("acceptance_criteria")),
-        context_refs=_decode_context_refs(row.get("context_refs")),
-        workspace=_decode_workspace(row.get("workspace")),
-        capability_policy=_decode_capability_policy(row.get("capability_policy")),
-        model_policy=_decode_model_policy(row.get("model_policy")),
-        resource_budget=_decode_budget(row.get("resource_budget")),
-        deadline=deadline,
-        delivery=_decode_delivery(row.get("delivery")),
-        metadata=metadata,
-    )
-
-
-def _ds(value: Any) -> datetime | None:
-    from datetime import datetime as _dt
-
-    if isinstance(value, _dt):
-        return value
-    if isinstance(value, str):
-        try:
-            return _dt.fromisoformat(value)
-        except ValueError:
-            return None
-    return None
+    return decode_task_spec(row, status=row.get("status"))
 
 
 def _decode_criteria(raw: Any) -> tuple[Criterion, ...]:
-    if not raw:
-        return ()
-    items = raw if isinstance(raw, list) else json.loads(raw)
-    out = []
-    for item in items:
-        v = item.get("verification")
-        verification = None
-        if v:
-            verification = VerificationSpec(
-                type=VerificationType(v.get("type", "model_judgment")),
-                command=v.get("command"),
-                path=v.get("path"),
-                predicate=v.get("predicate"),
-                capability=v.get("capability"),
-            )
-        out.append(
-            Criterion(
-                id=item.get("id", ""),
-                description=item.get("description", ""),
-                verification=verification,
-                required=bool(item.get("required", True)),
-            )
-        )
-    return tuple(out)
+    return _decode_criteria_canonical(raw)
 
 
 def _decode_context_refs(raw: Any) -> tuple[ContextRef, ...]:
-    if not raw:
-        return ()
-    items = raw if isinstance(raw, list) else json.loads(raw)
-    out = []
-    for item in items:
-        out.append(
-            ContextRef(
-                kind=item.get("kind", "session"),
-                ref=item.get("ref", ""),
-                source_id=item.get("source_id"),
-                summary=item.get("summary"),
-                mime_type=item.get("mime_type"),
-            )
-        )
-    return tuple(out)
+    return _decode_context_refs_canonical(raw)
 
 
 def _decode_workspace(raw: Any) -> WorkspaceSpec | None:
-    if not raw:
-        return None
-    data = raw if isinstance(raw, dict) else json.loads(raw)
-    return WorkspaceSpec(
-        id=data.get("id", ""),
-        root=data.get("root", ""),
-        readable=tuple(
-            PathRule(path=r.get("path", ""), allow=bool(r.get("allow", True)))
-            for r in (data.get("readable") or [])
-        ),
-        writable=tuple(
-            PathRule(path=r.get("path", ""), allow=bool(r.get("allow", True)))
-            for r in (data.get("writable") or [])
-        ),
-        temp_root=data.get("temp_root"),
-        execution_backend=data.get("execution_backend"),
-        network_policy=NetworkPolicy(data.get("network_policy", "allow")),
-        mutation_mode=MutationMode(data.get("mutation_mode", MutationMode.DIRECT.value)),
-        revision=data.get("revision"),
-    )
+    return _decode_workspace_canonical(raw)
 
 
 def _decode_capability_policy(raw: Any) -> CapabilityPolicy:
-    if not raw:
-        return CapabilityPolicy()
-    data = raw if isinstance(raw, dict) else json.loads(raw)
-    return CapabilityPolicy(
-        effects=frozenset(data.get("effects") or []),
-        allow=tuple(data.get("allow") or []),
-        ask=tuple(data.get("ask") or []),
-        deny=tuple(data.get("deny") or []),
-    )
+    return _decode_capability_policy_canonical(raw)
 
 
 def _decode_model_policy(raw: Any) -> ModelPolicy:
-    if not raw:
-        return ModelPolicy()
-    data = raw if isinstance(raw, dict) else json.loads(raw)
-    cost = data.get("max_cost_usd")
-    return ModelPolicy(
-        role=data.get("role", "primary"),
-        allowed=tuple(data.get("allowed") or []),
-        require_tools=bool(data.get("require_tools", False)),
-        privacy=data.get("privacy", "local-preferred"),
-        max_cost_usd=Decimal(str(cost)) if cost else None,
-        routing_preference=data.get("routing_preference", "balanced"),
-    )
+    return _decode_model_policy_canonical(raw)
 
 
 def _decode_budget(raw: Any) -> ResourceBudget:
-    if not raw:
-        return ResourceBudget()
-    data = raw if isinstance(raw, dict) else json.loads(raw)
-    wall = data.get("max_wall_time")
-    cost = data.get("max_cost_usd")
-    return ResourceBudget(
-        max_agent_iterations=int(data.get("max_agent_iterations", 50)),
-        max_input_tokens=_opt_int(data.get("max_input_tokens")),
-        max_output_tokens=_opt_int(data.get("max_output_tokens")),
-        max_cost_usd=Decimal(str(cost)) if cost else None,
-        max_wall_time=timedelta(seconds=float(wall)) if wall else None,
-        max_children=int(data.get("max_children", 4)),
-        max_child_depth=int(data.get("max_child_depth", 1)),
-        max_parallel_model_calls=int(data.get("max_parallel_model_calls", 4)),
-        max_parallel_executions=int(data.get("max_parallel_executions", 16)),
-        max_artifact_bytes=int(data.get("max_artifact_bytes", 100 * 1024 * 1024)),
-    )
+    return _decode_budget_canonical(raw)
 
 
 def _decode_delivery(raw: Any) -> DeliverySpec | None:
-    if not raw:
-        return None
-    data = raw if isinstance(raw, dict) else json.loads(raw)
-    return DeliverySpec(channel=data.get("channel"), destination=data.get("destination"))
+    return _decode_delivery_canonical(raw)
 
 
 def _opt_int(value: Any) -> int | None:

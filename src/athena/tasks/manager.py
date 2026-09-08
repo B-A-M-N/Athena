@@ -271,6 +271,32 @@ class TaskManager:
         rows = await self._store.list_by_session(session_id) or []
         return [_deserialize(r) for r in rows]
 
+    async def required_child_state(self, parent_task_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Return (pending, failed) required direct children.
+
+        Detached children have their own lifecycle and never hold the parent
+        completion gate. A required child must reach COMPLETE, not merely a
+        terminal status such as PARTIAL.
+        """
+        rows = await self._store.list_children(parent_task_id)
+        pending: list[str] = []
+        failed: list[str] = []
+        for child in [_deserialize(row) for row in rows or []]:
+            workspace = child.workspace
+            if workspace is not None and (
+                not workspace.required_child
+                or str(workspace.delegate_mode or "").upper() == "DETACHED"
+            ):
+                continue
+            status = TaskStatus((child.metadata or {}).get("status", TaskStatus.CREATED.value))
+            if status is TaskStatus.COMPLETE:
+                continue
+            if status in TERMINAL_STATUSES:
+                failed.append(f"child:{child.id}:{status.value}")
+            else:
+                pending.append(f"child:{child.id}:{status.value}")
+        return tuple(pending), tuple(failed)
+
     # ------------------------------------------------------------------ #
     # Acquisition / runnability (§17-18: acquire -> assert_runnable)
     # ------------------------------------------------------------------ #

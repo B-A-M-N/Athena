@@ -35,6 +35,7 @@ from athena.models.router import (
     ModelSelection,
 )
 from athena.protocol.errors import (
+    ContextIntegrityError,
     ProviderError,
     RequestCancelled,
     TaskBudgetExceeded,
@@ -789,7 +790,15 @@ class AgentKernel:
                     return approval_result
                 continue
 
-            compiled = await self._compile(task)
+            try:
+                compiled = await self._compile(task)
+            except ContextIntegrityError as exc:
+                return await self._finalize(
+                    task,
+                    state,
+                    TaskStatus.RECOVERY_REQUIRED,
+                    f"canonical context unavailable; recovery required: {exc}",
+                )
             # Rebuild the observable-work bit from durable results when a
             # process restarted or an approval continuation resumed. The
             # in-memory RunState is intentionally disposable.
@@ -864,12 +873,11 @@ class AgentKernel:
                             loader = self._messages.list_session_messages
                         recent = await loader(task.session_id)
             except Exception as exc:
-                _logger.warning(
-                    "context compilation fallback: could not load session messages for %s: %s",
-                    task.session_id,
-                    exc,
-                )
-                recent = []
+                raise ContextIntegrityError(
+                    f"canonical transcript unavailable for session {task.session_id}",
+                    cause=exc,
+                    session_id=task.session_id,
+                ) from exc
         compiled = await self._compiler.compile(
             task,
             recent_messages=_textable_messages(recent),

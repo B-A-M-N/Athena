@@ -177,13 +177,21 @@ class MemoryCapability:
                 tags=tuple(args.get("tags") or ()),
                 source_refs=((str(args["source_id"]),) if args.get("source_id") else ()),
             )
-            await self.memory_store.save(record)
+            outcome = await self.memory_store.save_with_outcome(record)
+            outcome_data = {
+                "status": outcome.status,
+                "memory_id": outcome.memory_id,
+                "reason": outcome.reason,
+            }
+            write_failed = outcome.status in {"REJECTED", "CONFLICT"}
             return CapabilityResult(
                 call_id,
                 request.capability_id,
-                CapabilityResultStatus.OK,
-                output="saved",
-                ref_uri=f"memory:{record.id}",
+                CapabilityResultStatus.FAILED if write_failed else CapabilityResultStatus.OK,
+                output=json.dumps(outcome_data, sort_keys=True),
+                error=outcome.reason if write_failed else None,
+                ref_uri=(f"memory:{outcome.memory_id}" if outcome.memory_id else None),
+                metadata={"operation": "save", **outcome_data},
             )
         return CapabilityResult(
             call_id,

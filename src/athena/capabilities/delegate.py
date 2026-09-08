@@ -65,6 +65,16 @@ _INPUT_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "delegate_mode": {
+            "type": "string",
+            "enum": ["SHARED_READ", "SHADOW_WRITE", "SUBTREE", "DETACHED"],
+        },
+        "required_child": {"type": "boolean"},
+        "detached": {"type": "boolean"},
+        "workspace": {"type": "object"},
+        "model_policy": {"type": "object"},
+        "resource_budget": {"type": "object"},
+        "capability_policy": {"type": "object"},
     },
     "oneOf": [
         {"properties": {"operation": {"const": "spawn"}}, "required": ["objective"]},
@@ -150,12 +160,24 @@ class DelegateCapability:
     ) -> CapabilityResult:
         objective = args.get("objective") or ""
         context = self._decode_context(args.get("context") or ())
-        child_id = await self._handle.spawn_child(
-            objective=objective,
-            parent_task_id=request.task_id,
-            metadata=args.get("metadata") or {},
-            context=context,
-        )
+        options = {
+            "objective": objective,
+            "parent_task_id": request.task_id,
+            "metadata": args.get("metadata") or {},
+            "context": context,
+        }
+        for key in (
+            "delegate_mode",
+            "required_child",
+            "detached",
+            "workspace",
+            "model_policy",
+            "resource_budget",
+            "capability_policy",
+        ):
+            if key in args:
+                options[key] = args[key]
+        child_id = await self._handle.spawn_child(**options)
         return CapabilityResult(
             call_id,
             request.capability_id,
