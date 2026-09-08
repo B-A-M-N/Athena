@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import threading
+
+import httpx
+import pytest
+
+from athena.capabilities import research as research_module
+from athena.capabilities.research import HttpDiscoveryProvider
+from athena.research.policy import SourcePolicy, SourcePolicyError
+
+
+@pytest.mark.asyncio
+async def test_http_discovery_provider_returns_bounded_candidate_metadata(monkeypatch):
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"results": [{"uri": "https://docs.example.test/guide", "title": "Guide"}]},
+        )
+
+    monkeypatch.setattr(
+        research_module,
+        "pinned_async_transport",
+        lambda host, addresses: httpx.MockTransport(handler),
+    )
+
+    provider = HttpDiscoveryProvider(
+        "https://index.example.test/search",
+        source_policy=SourcePolicy(allowed_domains=("index.example.test",)),
+        host_resolver=lambda host, port, type: [(None, None, None, None, ("93.184.216.34", port))],
+    )
+
+    rows = await provider(query="release", limit=3)
+
+    assert rows == [{"uri": "https://docs.example.test/guide", "title": "Guide"}]
+    assert dict(requests[0].url.params) == {"q": "release", "limit": "3"}
+
+
+@pytest.mark.asyncio
+async def test_http_discovery_provider_rechecks_resolved_addresses(monkeypatch):
+    monkeypatch.setattr(
+        research_module,
+        "pinned_async_transport",
+        lambda host, addresses: httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"results": []})
+        ),
+    )
+    provider = HttpDiscoveryProvider(
+        "https://index.example.test/search",
+        source_policy=SourcePolicy(allowed_domains=("index.example.test",)),
+        host_resolver=lambda host, port, type: [(None, None, None, None, ("127.0.0.1", port))],
+    )
+
+    with pytest.raises(SourcePolicyError, match="private/local"):
+        await provider(query="release", limit=3)
+
+
+@pytest.mark.asyncio
+async def test_http_discovery_provider_bounds_stuck_dns_resolution():
+    started = threading.Event()
+    release = threading.Event()
+
+    def stuck_resolver(host, port, type):
+        del host, port, type
+        started.set()
+        release.wait()
+        return []
+
+    provider = HttpDiscoveryProvider(
+        "https://index.example.test/search",
+        source_policy=SourcePolicy(allowed_domains=("index.example.test",)),
+        timeout=0.1,
+        host_resolver=stuck_resolver,
+    )
+
+    with pytest.raises(RuntimeError, match="DNS resolution timed out"):
+        await provider(query="release", limit=3)
+    assert started.is_set()
+    release.set()

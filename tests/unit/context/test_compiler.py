@@ -10,6 +10,7 @@ from athena.context.blocks import ContextBlock
 from athena.protocol.capabilities import CapabilityDescriptor
 from athena.protocol.messages import (
     AudioBlock,
+    CapabilityResultBlock,
     ImageBlock,
     Message,
     Provenance,
@@ -357,6 +358,34 @@ async def test_bounded_context_within_token_budget():
 
 
 @pytest.mark.asyncio
+async def test_compression_respects_input_budget_after_summary_insertion():
+    """Compression may not spend the reserved output budget on input text."""
+    compiler = ContextCompiler(
+        context_window=700,
+        reserve_output=128,
+        recent_verbatim_turns=2,
+        safety_margin=0,
+    )
+    history = tuple(
+        Message(
+            id=f"history-{index}",
+            role=Role.USER if index % 2 == 0 else Role.ASSISTANT,
+            blocks=(TextBlock(text=f"turn {index} " + ("detail " * 35)),),
+            created_at=utcnow(),
+            provenance=Provenance(source_type=SourceType.SESSION),
+        )
+        for index in range(12)
+    )
+
+    context = await compiler.compile(
+        _task(objective="continue the bounded context test"), recent_messages=history
+    )
+
+    assert context.compression.occurred
+    assert context.estimated_tokens <= 700 - 128
+
+
+@pytest.mark.asyncio
 async def test_context_refs_preserve_multimodal_blocks_and_requirements():
     task = _task(
         model_policy=ModelPolicy(require_tools=False),
@@ -373,6 +402,28 @@ async def test_context_refs_preserve_multimodal_blocks_and_requirements():
     assert any(isinstance(block, AudioBlock) for block in blocks)
     assert context.requirements.vision is True
     assert context.requirements.audio is True
+
+
+@pytest.mark.asyncio
+async def test_recent_visual_capability_result_requires_vision_capability():
+    recent = Message(
+        id="m-visual-result",
+        role=Role.CAPABILITY,
+        blocks=(
+            CapabilityResultBlock(
+                call_id="call-visual",
+                capability_id="computer",
+                output='{"model_input":"image"}',
+                metadata={"mime_type": "image/png", "artifact_uri": "artifact://frame"},
+            ),
+        ),
+        created_at=utcnow(),
+        provenance=Provenance(source_type=SourceType.CAPABILITY),
+    )
+
+    context = await ContextCompiler().compile(_task(), recent_messages=(recent,))
+
+    assert context.requirements.vision is True
 
 
 class _ResearchStore:

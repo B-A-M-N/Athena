@@ -14,8 +14,9 @@ import hashlib
 import json
 import socket
 import sqlite3
+import threading
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit
 
 from athena.network import pinned_async_transport
@@ -46,6 +47,135 @@ _GAP_KINDS = (
     "source_quality",
     "unanswered_question",
 )
+
+
+@runtime_checkable
+class ResearchDiscoveryProvider(Protocol):
+    """Provider boundary for bounded candidate discovery.
+
+    Providers return untrusted metadata only. The research capability remains
+    the authority that applies source policy and performs immutable capture.
+    """
+
+    name: str
+
+    async def search(
+        self, *, query: str, limit: int, context: Any = None, **kwargs: Any
+    ) -> list[Mapping[str, Any]]: ...
+
+
+class HttpDiscoveryProvider:
+    """First-party JSON source-discovery adapter.
+
+    The endpoint is an index, not a source of truth. Its response is bounded
+    and returned as candidate metadata; every candidate is still checked by
+    ``ResearchCapability`` and must be separately acquired into an immutable
+    snapshot before it can support a claim.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        source_policy: SourcePolicy,
+        timeout: float = 10.0,
+        host_resolver=None,
+        max_bytes: int = 1_000_000,
+    ) -> None:
+        self._endpoint = str(endpoint).strip()
+        self._source_policy = source_policy
+        self._timeout = max(0.1, float(timeout))
+        self._host_resolver = host_resolver or socket.getaddrinfo
+        self._max_bytes = max(1, min(int(max_bytes), 5_000_000))
+        self.name = "http-index"
+
+    async def search(self, *, query: str, limit: int, **_context: Any) -> list[dict[str, Any]]:
+        canonical = self._source_policy.check(self._endpoint)
+        parsed = urlsplit(canonical)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        infos = await _resolve_with_timeout(
+            self._host_resolver,
+            host,
+            port,
+            timeout=self._timeout,
+        )
+        addresses = self._source_policy.check_resolved(host, [str(info[4][0]) for info in infos])
+        import httpx
+
+        transport = pinned_async_transport(host, addresses)
+        async with httpx.AsyncClient(
+            timeout=self._timeout,
+            follow_redirects=False,
+            trust_env=False,
+            headers={"User-Agent": "Athena-Research-Discovery/1"},
+            transport=transport,
+        ) as client:
+            async with client.stream(
+                "GET", canonical, params={"q": query, "limit": max(1, min(int(limit), 50))}
+            ) as response:
+                if response.status_code >= 300:
+                    raise RuntimeError(f"discovery endpoint returned HTTP {response.status_code}")
+                body = await response.aread()
+        if len(body) > self._max_bytes:
+            raise RuntimeError(f"discovery response exceeds max_bytes={self._max_bytes}")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("discovery endpoint returned invalid JSON") from exc
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, Mapping):
+            records = payload.get("results", payload.get("candidates", payload.get("items")))
+        else:
+            records = None
+        if not isinstance(records, list):
+            raise RuntimeError("discovery response must contain a results array")
+        return [dict(item) for item in records if isinstance(item, Mapping)]
+
+    async def __call__(self, *, query: str, limit: int, **context: Any) -> list[dict[str, Any]]:
+        """Compatibility call surface for pre-provider deployments."""
+        return await self.search(query=query, limit=limit, **context)
+
+
+async def _resolve_with_timeout(resolver, host: str, port: int, *, timeout: float):
+    """Run potentially blocking DNS resolution without leaking an executor.
+
+    ``socket.getaddrinfo`` has no per-call timeout and the default asyncio
+    executor is process-lifetime state. A daemon thread gives resolution a
+    hard upper bound without allowing a stuck libc resolver to keep Athena
+    alive during shutdown.
+    """
+    loop = asyncio.get_running_loop()
+    result: asyncio.Future = loop.create_future()
+
+    def finish(value: tuple[str, object]) -> None:
+        if not result.done():
+            result.set_result(value)
+
+    def resolve() -> None:
+        try:
+            value = resolver(host, port, type=socket.SOCK_STREAM)
+        except BaseException as exc:  # surface resolver failures to the caller
+            payload: tuple[str, object] = ("error", exc)
+        else:
+            payload = ("ok", value)
+        try:
+            loop.call_soon_threadsafe(finish, payload)
+        except RuntimeError:
+            # The loop may close immediately after a timeout; the thread is
+            # daemonized specifically so this late callback cannot pin exit.
+            pass
+
+    threading.Thread(target=resolve, name="athena-dns-resolver", daemon=True).start()
+    try:
+        status, value = await asyncio.wait_for(result, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"discovery DNS resolution timed out after {timeout}s") from exc
+    if status == "error":
+        assert isinstance(value, BaseException)
+        raise value
+    return value
 
 
 class ResearchCapability:
@@ -227,12 +357,16 @@ class ResearchCapability:
         source_policy: SourcePolicy | None = None,
         host_resolver=None,
         discovery_provider=None,
+        discovery_providers: Sequence[ResearchDiscoveryProvider | Any] | None = None,
     ) -> None:
         self._store = store
         self._artifacts = artifact_store
         self._source_policy = source_policy or SourcePolicy()
         self._host_resolver = host_resolver or socket.getaddrinfo
-        self._discovery_provider = discovery_provider
+        configured = tuple(discovery_providers or ())
+        if discovery_provider is not None and discovery_provider not in configured:
+            configured = (*configured, discovery_provider)
+        self._discovery_providers = configured
 
     async def invoke(self, request: CapabilityRequest, **kw) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -307,7 +441,7 @@ class ResearchCapability:
                 continue
             source_id = str(source.get("id") or "")
             uri = str(source.get("canonical_uri") or "")
-            key = source_id or uri
+            key = uri or source_id
             if not key or key in seen:
                 continue
             seen.add(key)
@@ -336,7 +470,7 @@ class ResearchCapability:
                     continue
                 source_id = str(record.get("id") or "")
                 uri = str(record.get("canonical_uri") or "")
-                key = source_id or uri
+                key = uri or source_id
                 if not key or key in seen:
                     continue
                 seen.add(key)
@@ -353,47 +487,78 @@ class ResearchCapability:
                 if len(candidates) >= limit:
                     break
 
-        provider = self._discovery_provider
         rejected: list[dict[str, str]] = []
-        if provider is not None and len(candidates) < limit:
+        provider_status: list[dict[str, Any]] = []
+        if self._discovery_providers:
             network_policy = getattr(workspace, "network_policy", None)
             if getattr(network_policy, "value", network_policy) == "deny":
                 return _result(request, ok=False, error="network denied by workspace policy")
-            provided = provider(
-                query=query,
-                limit=limit,
-                task_id=request.task_id,
-                project_id=project_id,
-                context=context,
-            )
-            if asyncio.iscoroutine(provided):
-                provided = await provided
-            if not isinstance(provided, list):
-                return _result(request, ok=False, error="discovery provider returned a non-list")
-            for item in provided[:limit]:
-                if not isinstance(item, Mapping):
-                    rejected.append({"reason": "candidate is not an object"})
-                    continue
-                uri = str(item.get("uri") or item.get("url") or "")
-                try:
-                    canonical = self._source_policy.check(uri)
-                except SourcePolicyError as exc:
-                    rejected.append({"uri": uri[:4096], "reason": str(exc)})
-                    continue
-                if canonical in seen:
-                    continue
-                seen.add(canonical)
-                candidates.append(
-                    {
-                        "uri": canonical,
-                        "title": str(item.get("title") or "")[:1000],
-                        "source_type": str(item.get("source_type") or "web"),
-                        "snippet": str(item.get("snippet") or "")[:2000],
-                        "origin": "configured_provider",
-                    }
+            for provider in self._discovery_providers:
+                provider_name = str(
+                    getattr(provider, "name", None)
+                    or getattr(provider, "provider_name", None)
+                    or type(provider).__name__
                 )
-                if len(candidates) >= limit:
-                    break
+                try:
+                    search = getattr(provider, "search", None)
+                    if callable(search):
+                        provided = search(
+                            query=query,
+                            limit=limit,
+                            task_id=request.task_id,
+                            project_id=project_id,
+                            context=context,
+                        )
+                    elif callable(provider):
+                        provided = provider(
+                            query=query,
+                            limit=limit,
+                            task_id=request.task_id,
+                            project_id=project_id,
+                            context=context,
+                        )
+                    else:
+                        raise TypeError("provider has no search() or callable interface")
+                    if asyncio.iscoroutine(provided):
+                        provided = await provided
+                    if not isinstance(provided, list):
+                        raise TypeError("provider returned a non-list")
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    provider_status.append(
+                        {"provider": provider_name, "status": "failed", "reason": str(exc)[:600]}
+                    )
+                    continue
+                provider_status.append(
+                    {"provider": provider_name, "status": "ok", "candidates": len(provided)}
+                )
+                for item in provided[:limit]:
+                    if not isinstance(item, Mapping):
+                        rejected.append(
+                            {"provider": provider_name, "reason": "candidate is not an object"}
+                        )
+                        continue
+                    uri = str(item.get("uri") or item.get("url") or "")
+                    try:
+                        canonical = self._source_policy.check(uri)
+                    except SourcePolicyError as exc:
+                        rejected.append(
+                            {"provider": provider_name, "uri": uri[:4096], "reason": str(exc)}
+                        )
+                        continue
+                    if canonical in seen:
+                        continue
+                    seen.add(canonical)
+                    candidates.append(
+                        {
+                            "uri": canonical,
+                            "title": str(item.get("title") or "")[:1000],
+                            "source_type": str(item.get("source_type") or "web"),
+                            "snippet": str(item.get("snippet") or "")[:2000],
+                            "origin": provider_name,
+                        }
+                    )
+                    if len(candidates) >= limit:
+                        break
 
         return _result(
             request,
@@ -401,8 +566,9 @@ class ResearchCapability:
                 {
                     "query": query,
                     "candidates": candidates[:limit],
-                    "provider": "configured" if provider is not None else "local_corpus",
-                    "network_used": provider is not None,
+                    "provider": "configured" if self._discovery_providers else "local_corpus",
+                    "providers": provider_status,
+                    "network_used": bool(self._discovery_providers),
                     "rejected": rejected[:limit],
                 }
             ),
@@ -434,11 +600,13 @@ class ResearchCapability:
         parsed = urlsplit(canonical)
         host = parsed.hostname or ""
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        loop = asyncio.get_running_loop()
+        timeout = min(float(args.get("timeout") or 15.0), 30.0)
         try:
-            infos = await loop.run_in_executor(
-                None,
-                lambda: self._host_resolver(host, port, type=socket.SOCK_STREAM),
+            infos = await _resolve_with_timeout(
+                self._host_resolver,
+                host,
+                port,
+                timeout=timeout,
             )
             addresses = [str(info[4][0]) for info in infos]
             resolved_addresses = self._source_policy.check_resolved(host, addresses)
@@ -447,7 +615,6 @@ class ResearchCapability:
 
         import httpx
 
-        timeout = min(float(args.get("timeout") or 15.0), 30.0)
         max_bytes = min(int(args.get("max_bytes") or 2_000_000), 10_000_000)
         chunks: list[bytes] = []
         size = 0
@@ -1428,4 +1595,4 @@ async def _artifact_visible(artifacts: Any, uri: str, task_id: str) -> bool:
     return any(getattr(ref, "uri", None) == uri for ref in refs)
 
 
-__all__ = ["ResearchCapability"]
+__all__ = ["HttpDiscoveryProvider", "ResearchDiscoveryProvider", "ResearchCapability"]

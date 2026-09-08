@@ -75,6 +75,10 @@ class FakeModelProvider:
                 per_1m_cache_write_input=_optional_float(cost.get("per_1m_cache_write_input")),
             )
         self._response_cost_usd = response_cost_usd
+        # Test/demo consumers can verify the provider received the compiled
+        # capability inventory. Keeping the immutable request objects here is
+        # observability only; it does not alter model selection or execution.
+        self.requests: list[ModelRequest] = []
         self._info_kwargs: _InfoKwargs = {
             "tool_calling": tool_calling,
             "vision": vision,
@@ -101,6 +105,7 @@ class FakeModelProvider:
         return {"state": "ready", "kind": "fake"}
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        self.requests.append(request)
         script = self._select_script(request)
         respond = script.get("respond", {}) if isinstance(script, dict) else {}
         text = respond.get("text")

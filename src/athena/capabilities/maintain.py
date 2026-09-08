@@ -111,12 +111,14 @@ class MaintenanceCapability:
         workspace=None,
         execution_manager=None,
         fabric=None,
+        principal_id: str | None = None,
     ) -> None:
         self._schedule = schedule_api
         self._watch_registry = watch_registry
         self._workspace = workspace
         self._execution_manager = execution_manager
         self._fabric = fabric
+        self._principal_id = principal_id
 
     async def rehydrate(self) -> int:
         """Restore enabled contract observers after a service restart.
@@ -130,6 +132,7 @@ class MaintenanceCapability:
             return 0
         owner = {
             "project_id": getattr(self._workspace, "id", None),
+            "principal_id": self._principal_id,
         }
         restored = 0
         try:
@@ -151,7 +154,11 @@ class MaintenanceCapability:
             observe = contract.get("observe") or {}
             watch_id = str(observe.get("watch_id") or "") or None
             try:
-                if await self._ensure_watch(contract, workspace=self._workspace):
+                if await self._ensure_watch(
+                    contract,
+                    workspace=self._workspace,
+                    principal_id=self._principal_id,
+                ):
                     restored += 1
                     self._watch_registry.record_rehydration(
                         1, watch_id=watch_id, contract_id=contract_id
@@ -201,7 +208,11 @@ class MaintenanceCapability:
                 for job in selected["jobs"]:
                     job_id = str(job.get("id") or "")
                     changed += int(await self._schedule.enable(job_id, owner=owner))
-                await self._ensure_watch(selected, workspace=self._workspace)
+                await self._ensure_watch(
+                    selected,
+                    workspace=self._workspace,
+                    principal_id=getattr(context, "principal_id", None),
+                )
                 return _result(
                     request,
                     output=json.dumps(
@@ -410,6 +421,7 @@ class MaintenanceCapability:
         *,
         workspace=None,
         authority_task_id: str | None = None,
+        principal_id: str | None = None,
     ) -> bool:
         if self._watch_registry is None:
             return False
@@ -438,7 +450,7 @@ class MaintenanceCapability:
                 self._fabric.executor_for(
                     observer_id,
                     project_id=getattr(workspace, "id", None),
-                    user_id="athena",
+                    user_id=principal_id or self._principal_id,
                 )
         if kind == "file":
             if workspace is None:

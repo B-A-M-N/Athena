@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from athena.kernel.continuations import ContinuationStore
 from athena.protocol.policy import ApprovalScope, Principal
 from athena.protocol.tasks import AgentRequest, TaskSpec, TaskStatus
+from athena.service.config import AthenaConfig
 from athena.state.approvals import ApprovalStore
 
 if TYPE_CHECKING:
@@ -88,12 +89,17 @@ class OperatorInteractionService:
         request = await self._svc._store_input_requests.pending_for_task(task_id)
         if request is None:
             raise KeyError(f"No pending input request for task: {task_id}")
-        await self._svc._store_input_requests.resolve(request["id"], str(answer))
+        resolved = await self._svc._store_input_requests.resolve(request["id"], str(answer))
+        if resolved is None:
+            raise ValueError(f"Input request already resolved: {request['id']}")
         kernel = self._svc._kernel
         active = bool(kernel is not None and task_id in getattr(kernel, "_runs", {}))
         if active and kernel is not None:
-            await kernel.notify_input_provided(task_id, str(answer))
-            return
+            armed = await kernel.notify_input_provided(task_id, str(answer))
+            if armed:
+                return
+            # The run crossed its slot-release boundary while the answer was
+            # being committed. Fall through to the durable relaunch check.
         if kernel is None or self._svc._task_manager is None:
             return
         row = await self._svc._store_tasks.get(task_id) if self._svc._store_tasks else None
@@ -208,8 +214,15 @@ class OperatorInteractionService:
         )
         try:
             if active and kernel is not None and task_id is not None:
-                await kernel.notify_approval_resolved(task_id, "granted" if granted else "denied")
-            elif task_id is not None and kernel is not None and self._svc._task_manager is not None:
+                armed = await kernel.notify_approval_resolved(
+                    task_id, "granted" if granted else "denied"
+                )
+                if armed:
+                    return
+                # The live run released its parked slot while the durable
+                # decision was being committed. Fall through to the same-task
+                # relaunch path below.
+            if task_id is not None and kernel is not None and self._svc._task_manager is not None:
                 row = await self._svc._store_tasks.get(task_id) if self._svc._store_tasks else None
                 if row and row.get("status") == TaskStatus.WAITING_APPROVAL.value:
                     await self._svc._task_manager.transition(task_id, TaskStatus.RUNNING)
@@ -281,7 +294,7 @@ class OperatorInteractionService:
 
         if manager.state(approval_id) is None:
             manager.create_request(
-                Principal("agent", "athena"),
+                Principal("agent", self._principal_id()),
                 scope_choice,
                 capability=cap,
                 effect=str(primary_name) if primary_name else None,
@@ -300,6 +313,17 @@ class OperatorInteractionService:
                 expires_at=expires_at,
             )
         manager.grant(approval_id, resolver="user")
+
+    def _principal_id(self) -> str:
+        """Read the composition-root principal without a second authority.
+
+        Fully constructed services always carry the configured namespace. The
+        default only supports narrowly scoped, partially initialized facade
+        doubles used by legacy callers/tests; it is still sourced from the
+        canonical config object rather than a subsystem-specific literal.
+        """
+        configured = getattr(getattr(self._svc, "config", None), "cache_namespace", None)
+        return str(configured or AthenaConfig().cache_namespace)
 
     async def _rehydrate_approval_grants(
         self,

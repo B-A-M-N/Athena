@@ -34,10 +34,13 @@ _WIDEN_AUTHORITY = frozenset(
 
 _INPUT_SCHEMA = {
     "type": "object",
-    "required": ["query"],
+    "required": [],
     "additionalProperties": False,
     "properties": {
+        "operation": {"type": "string", "enum": ["search", "read"]},
         "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "scope": {"type": "string", "enum": ["current_session", "principal"]},
+        "project_id": {"type": "string", "minLength": 1, "maxLength": 256},
         "limit": {"type": "integer", "minimum": 1, "maximum": 50},
         "context_window": {"type": "integer", "minimum": 0, "maximum": 20},
         "session_ids": {
@@ -45,6 +48,10 @@ _INPUT_SCHEMA = {
             "maxItems": 16,
             "items": {"type": "string", "minLength": 1, "maxLength": 128},
         },
+        "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "anchor": {"type": "string", "minLength": 1, "maxLength": 128},
+        "before": {"type": "integer", "minimum": 0, "maximum": 20},
+        "after": {"type": "integer", "minimum": 0, "maximum": 20},
     },
 }
 
@@ -58,7 +65,9 @@ class SessionSearchCapability:
             "Full-text search over past conversation history. Returns matching "
             "messages with session, timestamp, and task provenance, optionally "
             "with surrounding context. Scoped to the current session unless "
-            "explicitly widened."
+            "explicitly widened. A principal scope is resolved by the host and "
+            "does not accept model-supplied session ids. Read can recover a "
+            "bounded window around a returned message anchor."
         ),
         tags=frozenset({"history", "transcript", "search", "conversation", "earlier"}),
         input_schema=_INPUT_SCHEMA,
@@ -82,6 +91,66 @@ class SessionSearchCapability:
                 error="message store not available",
             )
         args = dict(request.arguments or {})
+        operation = str(args.get("operation") or "search")
+        principal_id = getattr(context, "principal_id", None)
+        workspace_id = getattr(getattr(context, "workspace", None), "id", None)
+        requested_project = str(args.get("project_id") or "") or None
+        if requested_project and workspace_id and requested_project != str(workspace_id):
+            return CapabilityResult(
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
+                error="project history is limited to the current workspace",
+            )
+        project_id = requested_project
+        if operation == "read":
+            anchor = str(args.get("anchor") or "").strip()
+            if not anchor:
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.FAILED,
+                    error="anchor is required for read",
+                )
+            requested_session = str(args.get("session_id") or request.session_id or "") or None
+            if context is not None and not principal_id:
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.FAILED,
+                    error="principal identity is required for historical reads",
+                )
+            try:
+                detail = await self._messages.read_context(
+                    anchor,
+                    session_id=requested_session,
+                    principal_id=principal_id,
+                    project_id=project_id,
+                    before=int(args.get("before") or 3),
+                    after=int(args.get("after") or 3),
+                )
+            except Exception as exc:
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.FAILED,
+                    error=f"session read failed: {exc}",
+                )
+            if detail is None:
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.FAILED,
+                    error="message anchor not found in the permitted history",
+                )
+            return CapabilityResult(
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.OK,
+                output=json.dumps(detail, default=str),
+                metadata={"operation": "read", "anchor": anchor},
+            )
+
         query = str(args.get("query") or "").strip()
         if not query:
             return CapabilityResult(
@@ -90,18 +159,35 @@ class SessionSearchCapability:
                 CapabilityResultStatus.FAILED,
                 error="query is required",
             )
-        # Closed scope: the requesting session by default. Widening to other
-        # sessions requires caller authority — a model-issued call from inside
-        # a task cannot enumerate sessions it was never told about.
-        session_ids: list[str] = [request.session_id] if request.session_id else []
+        scope = str(args.get("scope") or "current_session")
+        if scope not in {"current_session", "principal"}:
+            return CapabilityResult(
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
+                error="scope must be current_session or principal",
+            )
+        # Closed scope: the requesting session by default. Principal scope is
+        # resolved entirely by the host so model text cannot widen ownership.
+        if scope == "principal":
+            if not principal_id:
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.FAILED,
+                    error="principal identity is required for principal history",
+                )
+            session_ids: list[str] = []
+        else:
+            session_ids = [request.session_id] if request.session_id else []
         requested = [str(s) for s in (args.get("session_ids") or ()) if str(s).strip()]
-        if requested:
+        if requested and scope == "current_session":
             origin = getattr(request, "origin", None)
             if origin in _WIDEN_AUTHORITY:
                 for extra in requested:
                     if extra not in session_ids:
                         session_ids.append(extra)
-        if not session_ids:
+        if not session_ids and not principal_id:
             return CapabilityResult(
                 call_id,
                 self.descriptor.id,
@@ -113,6 +199,8 @@ class SessionSearchCapability:
         try:
             hits = await self._messages.search(
                 query,
+                principal_id=principal_id,
+                project_id=project_id if scope == "principal" else None,
                 session_ids=tuple(session_ids),
                 limit=limit,
                 context_window=context_window,
@@ -126,7 +214,9 @@ class SessionSearchCapability:
             )
         payload: dict[str, Any] = {
             "query": query,
-            "scope": session_ids,
+            "scope": session_ids if scope == "current_session" else "principal",
+            "scope_kind": scope,
+            "sessions": session_ids,
             "matches": hits,
             "count": len(hits),
         }
@@ -140,7 +230,7 @@ class SessionSearchCapability:
             self.descriptor.id,
             CapabilityResultStatus.OK,
             output=output,
-            metadata={"operation": "search", "count": len(hits)},
+            metadata={"operation": "search", "scope": scope, "count": len(hits)},
         )
 
 

@@ -370,6 +370,30 @@ class Scheduler:
             fires += 1
         return fires
 
+    async def run_now(self, job_id: str) -> str | None:
+        """Run one enabled job occurrence through the normal claim path.
+
+        Operator-triggered runs retain the same durable claim, task metadata,
+        admission, and receipt semantics as scheduled runs.  They are not a
+        second execution loop and are deliberately refused for disabled or
+        missing jobs.
+        """
+        job = await self._store.get_job_id(job_id)
+        if job is None or not bool(job.get("enabled")):
+            return None
+        scheduled_for = utcnow().isoformat()
+        claim = await self._store.claim_next_due(job_id, scheduled_for)
+        if claim is None:
+            return None
+        try:
+            await self._fire_claim(job, _to_claim(claim))
+        except Exception:
+            # _fire_claim releases an unmaterialized claim; preserve the
+            # exception for the operator instead of reporting a false run.
+            raise
+        run = await self._store.last_run(job_id)
+        return str(run.get("task_id")) if run and run.get("task_id") else None
+
     async def notify_event(self, event: Any) -> int:
         try:
             return await self._notify_event(event)

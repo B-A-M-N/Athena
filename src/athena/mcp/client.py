@@ -13,6 +13,8 @@ methods that need it; if it is absent, use raises a clear :class:`MCPError`.
 from __future__ import annotations
 
 import importlib
+import asyncio
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -120,6 +122,10 @@ class MCPClient:
         self._session: Any = None
         self._exit_stack: Any = None
         self._connected = False
+        self._last_error: str | None = None
+        self._connected_at: str | None = None
+        self._last_successful_connection: str | None = None
+        self._tool_count = 0
         self._resource_cache: dict[str, object] = {}
         self._lock = _new_lock()
 
@@ -129,6 +135,21 @@ class MCPClient:
     @property
     def connected(self) -> bool:
         return self._connected and self._session is not None
+
+    def health(self) -> dict[str, Any]:
+        """Return operator-safe transport and discovery health."""
+        transport = "http" if self.url is not None else "stdio"
+        return {
+            "id": self.connection_id,
+            "configured": True,
+            "state": "connected"
+            if self.connected
+            else ("failed" if self._last_error else "stopped"),
+            "transport": transport,
+            "tool_count": self._tool_count,
+            "last_successful_connection": self._last_successful_connection,
+            "last_error": self._last_error,
+        }
 
     async def connect(self) -> "MCPClient":
         """Establish the transport and an MCP session (idempotent)."""
@@ -142,12 +163,22 @@ class MCPClient:
             async with self._lock:
                 if self.connected:
                     return self
+                stale_stack, self._exit_stack = self._exit_stack, None
+                self._session = None
+                self._connected = False
+                if stale_stack is not None:
+                    try:
+                        await self._bounded(stale_stack.aclose())
+                    except Exception:
+                        # The new connection attempt owns the recovery path;
+                        # retain the new error if this cleanup also fails.
+                        pass
                 if self.url is not None:
                     streamablehttp_client = importlib.import_module(
                         "mcp.client.streamable_http"
                     ).streamablehttp_client
                     http_ctx = streamablehttp_client(self.url, timeout=float(self.connect_timeout))
-                    read, write, _ = await stack.enter_async_context(http_ctx)
+                    read, write, _ = await self._bounded(stack.enter_async_context(http_ctx))
                 else:
                     stdio_client = importlib.import_module("mcp.client.stdio").stdio_client
                     StdioServerParameters = importlib.import_module("mcp").StdioServerParameters
@@ -158,18 +189,27 @@ class MCPClient:
                         cwd=self.cwd,
                     )
                     stdio_ctx = stdio_client(server_params)
-                    read, write = await stack.enter_async_context(stdio_ctx)
-                session = await stack.enter_async_context(mcp.ClientSession(read, write))
-                await session.initialize()
+                    read, write = await self._bounded(stack.enter_async_context(stdio_ctx))
+                session = await self._bounded(
+                    stack.enter_async_context(mcp.ClientSession(read, write))
+                )
+                await self._bounded(session.initialize())
                 self._session = session
                 self._exit_stack = stack
                 self._connected = True
+                self._last_error = None
+                self._connected_at = datetime.now(timezone.utc).isoformat()
+                self._last_successful_connection = self._connected_at
                 return self
-        except Exception:
-            await stack.aclose()
+        except Exception as exc:
+            try:
+                await self._bounded(stack.aclose())
+            except Exception:
+                pass
             self._session = None
             self._exit_stack = None
             self._connected = False
+            self._last_error = f"{type(exc).__name__}: {exc}"
             raise MCPError(
                 f"failed to connect to MCP server {self.connection_id!r}: "
                 "transport error or server unavailable"
@@ -180,9 +220,10 @@ class MCPClient:
         stack, self._exit_stack = self._exit_stack, None
         self._session = None
         self._connected = False
+        self._connected_at = None
         if stack is not None:
             try:
-                await stack.aclose()
+                await self._bounded(stack.aclose())
             except Exception:
                 pass
 
@@ -202,6 +243,15 @@ class MCPClient:
             )
         return self._session
 
+    async def _bounded(self, awaitable: Any) -> Any:
+        """Bound SDK transport operations and process teardown.
+
+        The official stdio transport does not apply ``connect_timeout`` to
+        session initialization or exit-stack teardown. Without a host-side
+        bound, a crashed or non-MCP child can hang an Athena worker forever.
+        """
+        return await asyncio.wait_for(awaitable, timeout=max(0.1, self.connect_timeout))
+
     # ------------------------------------------------------------------ #
     # Discovery
     # ------------------------------------------------------------------ #
@@ -210,8 +260,9 @@ class MCPClient:
         session = self._require()
         try:
             async with self._lock:
-                result = await session.list_tools()
+                result = await self._bounded(session.list_tools())
         except Exception as exc:
+            self._mark_transport_failure(exc)
             raise MCPError(f"MCP list_tools failed on {self.connection_id!r}: {exc}") from exc
         out: list[MCPToolRef] = []
         for t in result.tools:
@@ -224,14 +275,16 @@ class MCPClient:
                     server=self.connection_id,
                 )
             )
+        self._tool_count = len(out)
         return out
 
     async def list_resources(self) -> list[MCPResourceRef]:
         session = self._require()
         try:
             async with self._lock:
-                result = await session.list_resources()
+                result = await self._bounded(session.list_resources())
         except Exception as exc:
+            self._mark_transport_failure(exc)
             raise MCPError(f"MCP list_resources failed on {self.connection_id!r}: {exc}") from exc
         refs = [
             MCPResourceRef(
@@ -249,8 +302,9 @@ class MCPClient:
         session = self._require()
         try:
             async with self._lock:
-                result = await session.list_prompts()
+                result = await self._bounded(session.list_prompts())
         except Exception as exc:
+            self._mark_transport_failure(exc)
             raise MCPError(f"MCP list_prompts failed on {self.connection_id!r}: {exc}") from exc
         return [
             MCPPromptRef(
@@ -276,8 +330,9 @@ class MCPClient:
         session = self._require()
         try:
             async with self._lock:
-                result = await session.get_prompt(name, dict(arguments or {}))
+                result = await self._bounded(session.get_prompt(name, dict(arguments or {})))
         except Exception as exc:
+            self._mark_transport_failure(exc)
             raise MCPError(
                 f"mcp get_prompt {name!r} failed on {self.connection_id!r}: {exc}"
             ) from exc
@@ -301,8 +356,9 @@ class MCPClient:
         session = self._require()
         try:
             async with self._lock:
-                result = await session.call_tool(name, dict(arguments or {}))
+                result = await self._bounded(session.call_tool(name, dict(arguments or {})))
         except Exception as exc:
+            self._mark_transport_failure(exc)
             raise MCPError(
                 f"mcp call_tool {name!r} failed on {self.connection_id!r}: {exc}"
             ) from exc
@@ -317,8 +373,9 @@ class MCPClient:
         session = self._require()
         try:
             async with self._lock:
-                result = await session.read_resource(uri)
+                result = await self._bounded(session.read_resource(uri))
         except Exception as exc:
+            self._mark_transport_failure(exc)
             raise MCPError(
                 f"mcp read_resource {uri!r} failed on {self.connection_id!r}: {exc}"
             ) from exc
@@ -328,6 +385,18 @@ class MCPClient:
             content=_render_resource_contents(blocks),
             structured=blocks,
         )
+
+    def _mark_transport_failure(self, exc: BaseException) -> None:
+        """Make a mid-session transport loss visible to health and policy.
+
+        The failed session is not usable for subsequent capability calls.  We
+        retain the exit stack for the explicit reconnect/close operation so a
+        transport cleanup failure cannot hide the original error or strand a
+        child process.  ``MCPToolExecutor`` will now fail closed instead of
+        reporting a stale connected state.
+        """
+        self._connected = False
+        self._last_error = f"{type(exc).__name__}: {exc}"
 
 
 def _normalize_annotations(annotations: Any) -> dict[str, Any]:

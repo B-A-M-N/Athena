@@ -4,7 +4,8 @@
 The developer checkout may be dirty while work is in progress.  This command
 does not pretend that such a checkout is a release candidate: it extracts one
 resolved commit into a temporary clean tree and runs every release lane there.
-Pass ``--evidence-dir`` when the lane records must survive the temporary tree.
+    Pass ``--evidence-dir`` when the lane records must survive the temporary tree;
+    records are published transactionally under ``<root>/<commit-sha>/<run-id>``.
 
 Usage::
 
@@ -28,6 +29,7 @@ import sys
 import tempfile
 import tarfile
 import time
+import uuid
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -114,7 +116,12 @@ def _run_static_concurrently(
         }
         for future in concurrent.futures.as_completed(futures):
             results[futures[future]] = future.result()
-    return [results[name] for name, _ in lanes_to_run]
+    ordered = []
+    for name, _ in lanes_to_run:
+        record = results[name]
+        record["name"] = name
+        ordered.append(record)
+    return ordered
 
 
 def _extract_commit(commit: str, checkout: Path, *, timeout: float) -> None:
@@ -165,6 +172,16 @@ def _evidence_record(record: dict[str, object]) -> dict[str, object]:
     return {key: value for key, value in record.items() if key != "output"} | {
         "output_tail": str(record.get("output") or "")[-4000:]
     }
+
+
+def _release_run_id() -> str:
+    """Choose a stable CI run id or generate one for local certification."""
+    value = os.environ.get("ATHENA_RELEASE_RUN_ID") or os.environ.get("GITHUB_RUN_ID")
+    if value:
+        value = value.strip()
+        if value and all(char.isalnum() or char in {"-", "_"} for char in value):
+            return value
+    return uuid.uuid4().hex
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -248,16 +265,23 @@ def main(argv: list[str] | None = None) -> int:
 
     temp_root = Path(tempfile.mkdtemp(prefix="athena-release-check-"))
     checkout = temp_root / "checkout"
-    evidence_dir = Path(args.evidence_dir).expanduser().resolve() if args.evidence_dir else None
+    evidence_root = Path(args.evidence_dir).expanduser().resolve() if args.evidence_dir else None
+    run_id = _release_run_id()
+    evidence_dir = evidence_root / resolved / run_id if evidence_root is not None else None
+    evidence_stage: Path | None = None
+    if evidence_root is not None:
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        evidence_stage = Path(tempfile.mkdtemp(prefix=f".{run_id}.", dir=evidence_root))
     lanes: list[dict[str, object]] = []
     final_status = "FAIL"
     error: str | None = None
     try:
         if evidence_dir is not None:
             _write_json(
-                evidence_dir / "release-identity.json",
+                evidence_stage / "release-identity.json",
                 {
                     "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "requested_sha": requested_sha,
                     "explicit_sha": explicit_sha,
                     "skip_e2e": bool(args.skip_e2e),
@@ -266,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
                     "optional_integrations": {
                         "hermes_referee": {
                             "required_for_core_release": False,
+                            "commit_sha": resolved,
+                            "release_run_id": run_id,
                             "status": (
                                 "pending_live_certification"
                                 if args.include_hermes_live
@@ -283,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         env.pop("PYTHONHOME", None)
         env["ATHENA_RELEASE_SHA"] = resolved
+        env["ATHENA_RELEASE_RUN_ID"] = run_id
         env["ATHENA_FROZEN_SOURCE"] = "1"
         env["ATHENA_RELEASE_GATE"] = "1"
         if args.include_hermes_live:
@@ -303,9 +330,7 @@ def main(argv: list[str] | None = None) -> int:
             stage=args.stage,
         )
         static_lanes = [
-            (name, command)
-            for name, command in lanes_to_run
-            if lane_stage(name) == "static"
+            (name, command) for name, command in lanes_to_run if lane_stage(name) == "static"
         ]
         if len(static_lanes) > 1:
             static_records = _run_static_concurrently(
@@ -320,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
             record["name"] = name
+            record["commit_sha"] = resolved
+            record["release_run_id"] = run_id
             lanes.append(record)
             if name == "release-artifacts" and int(record.get("exit_code") or 0) == 0:
                 manifest_path = checkout / "release-artifacts" / "release-manifest.json"
@@ -331,11 +358,12 @@ def main(argv: list[str] | None = None) -> int:
                         "release artifact manifest source_sha does not match frozen commit"
                     )
                 if evidence_dir is not None:
+                    manifest["release_run_id"] = run_id
                     _write_text(
-                        evidence_dir / "release-manifest.json",
-                        manifest_path.read_text(encoding="utf-8"),
+                        evidence_stage / "release-manifest.json",
+                        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                     )
-                    artifact_evidence = evidence_dir / "distributions"
+                    artifact_evidence = evidence_stage / "distributions"
                     if artifact_evidence.exists():
                         raise RuntimeError(
                             "release distributions evidence path already exists; "
@@ -347,7 +375,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
             if evidence_dir is not None:
                 _write_text(
-                    evidence_dir
+                    evidence_stage
                     / {
                         "architecture-lint": "architecture-lint.txt",
                         "native-check": "native-check.txt",
@@ -374,24 +402,30 @@ def main(argv: list[str] | None = None) -> int:
                 else "not_certified_live"
             )
             optional_integrations = {
+                "commit_sha": resolved,
+                "release_run_id": run_id,
                 "hermes_referee": {
                     "required_for_core_release": False,
                     "source_sha": resolved,
+                    "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "status": hermes_status,
-                }
+                },
             }
-            _write_json(evidence_dir / "optional-integrations.json", optional_integrations)
+            _write_json(evidence_stage / "optional-integrations.json", optional_integrations)
             static_names = {
                 "ruff-format",
                 "ruff-check",
                 "mypy",
                 "compileall",
                 "dependency-audit",
+                "uv-lock-check",
             }
             _write_json(
-                evidence_dir / "static-checks.json",
+                evidence_stage / "static-checks.json",
                 {
                     "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "lanes": [
                         _evidence_record(item) for item in lanes if item.get("name") in static_names
                     ],
@@ -402,17 +436,21 @@ def main(argv: list[str] | None = None) -> int:
                 None,
             )
             _write_json(
-                evidence_dir / "pytest-summary.json",
+                evidence_stage / "pytest-summary.json",
                 {
                     "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "lane": _evidence_record(pytest_lane) if pytest_lane else None,
                 },
             )
             scenario_path = checkout / "release-scenarios.json"
             if scenario_path.exists():
+                scenario_manifest = json.loads(scenario_path.read_text(encoding="utf-8"))
+                scenario_manifest["commit_sha"] = resolved
+                scenario_manifest["release_run_id"] = run_id
                 _write_text(
-                    evidence_dir / "release-scenarios.json",
-                    scenario_path.read_text(encoding="utf-8"),
+                    evidence_stage / "release-scenarios.json",
+                    json.dumps(scenario_manifest, indent=2, sort_keys=True) + "\n",
                 )
             else:
                 scenario_lane = next(
@@ -420,15 +458,16 @@ def main(argv: list[str] | None = None) -> int:
                     None,
                 )
                 _write_json(
-                    evidence_dir / "release-scenarios.json",
+                    evidence_stage / "release-scenarios.json",
                     {
                         "commit_sha": resolved,
+                        "release_run_id": run_id,
                         "lane": _evidence_record(scenario_lane) if scenario_lane else None,
                     },
                 )
             if args.skip_e2e:
                 _write_text(
-                    evidence_dir / "e2e.txt",
+                    evidence_stage / "e2e.txt",
                     "SKIPPED: installed-artifact acceptance was explicitly omitted\n",
                 )
         if args.stage is not None:
@@ -448,16 +487,26 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"release-check: PASS {resolved}", flush=True)
         return 0
+    except KeyboardInterrupt:
+        error = "release check interrupted"
+        final_status = "INTERRUPTED"
+        print("release-check: interrupted; evidence remains unpublished", file=sys.stderr)
+        return 130
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         error = str(exc)
         print(f"release-check: FAIL {exc}", file=sys.stderr)
         return 1
     finally:
-        if evidence_dir is not None:
+        if (
+            evidence_dir is not None
+            and evidence_stage is not None
+            and final_status != "INTERRUPTED"
+        ):
             _write_json(
-                evidence_dir / "final-release-result.json",
+                evidence_stage / "final-release-result.json",
                 {
                     "commit_sha": resolved,
+                    "release_run_id": run_id,
                     "status": final_status,
                     "releasable": final_status == "PASS",
                     "error": error,
@@ -465,6 +514,8 @@ def main(argv: list[str] | None = None) -> int:
                         "hermes_referee": {
                             "required_for_core_release": False,
                             "source_sha": resolved,
+                            "commit_sha": resolved,
+                            "release_run_id": run_id,
                             "status": (
                                 "PASS"
                                 if any(
@@ -481,7 +532,14 @@ def main(argv: list[str] | None = None) -> int:
                     "lanes": [_evidence_record(item) for item in lanes],
                 },
             )
+            evidence_dir.parent.mkdir(parents=True, exist_ok=True)
+            if evidence_dir.exists():
+                raise RuntimeError(f"release evidence target already exists: {evidence_dir}")
+            os.replace(evidence_stage, evidence_dir)
+            evidence_stage = None
         shutil.rmtree(temp_root, ignore_errors=True)
+        if evidence_dir is not None:
+            print(f"release-check: evidence published at {evidence_dir}", flush=True)
 
 
 if __name__ == "__main__":

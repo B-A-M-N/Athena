@@ -7,8 +7,6 @@ import os
 import shutil
 import stat
 import subprocess
-import sys
-import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -172,34 +170,16 @@ _FICLONE = 0x40049409  # Linux ioctl: clone a file's extents (reflink)
 
 @lru_cache(maxsize=8)
 def _reflink_supported(directory: str) -> bool:
-    """Probe whether the filesystem under ``directory`` supports FICLONE.
+    """Return whether reflinks are enabled for this process.
 
-    Copy-on-write reflinks make shadow clones near-free on btrfs/xfs/zfs/
-    NFSv4.2 while degrading to a plain byte copy on ext4 — silently, so a
-    probe failure never surfaces as an error. The probe clones a scratch
-    file onto ITSELF (a no-op rewrite): the cheapest way to ask the kernel
-    without touching real data.
+    ``FICLONE`` is not safe to probe synchronously: some overlay filesystems
+    can leave the ioctl in uninterruptible kernel sleep. Athena therefore
+    makes the portable byte-copy path the default, preserving isolation and
+    bounded teardown. Platforms may opt into a known-safe implementation by
+    replacing this capability probe at integration time.
     """
-    if os.name != "posix" or sys.platform == "darwin":
-        return False
-    probe_path: str | None = None
-    try:
-        fd, probe_path = tempfile.mkstemp(dir=directory, prefix=".athena-reflink-probe-")
-        os.close(fd)
-        probe_fd = os.open(probe_path, os.O_RDONLY)
-        try:
-            fcntl.ioctl(probe_fd, _FICLONE, probe_fd)
-            return True
-        finally:
-            os.close(probe_fd)
-    except (OSError, AttributeError, ValueError):
-        return False
-    finally:
-        if probe_path:
-            try:
-                os.unlink(probe_path)
-            except OSError:
-                pass
+    del directory
+    return False
 
 
 def _copy_file(source: Path, destination: Path) -> None:

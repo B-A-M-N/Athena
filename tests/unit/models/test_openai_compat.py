@@ -4,7 +4,9 @@ from athena.models.providers.openai_compat import (
     OpenAICompatProvider,
     parse_tool_arguments,
 )
+from athena.protocol.artifacts import ArtifactRef
 from athena.protocol.messages import (
+    ArtifactRefBlock,
     AudioBlock,
     CapabilityResultBlock,
     ImageBlock,
@@ -136,6 +138,24 @@ def test_openai_compatible_local_profile_does_not_emit_prompt_cache_key():
     )
 
     assert "prompt_cache_key" not in provider._build_request(request)
+
+
+def test_openai_translation_handles_compression_role_explicitly():
+    provider = _provider()
+    message = Message(
+        id="compressed",
+        role=Role.COMPRESSION,
+        blocks=(TextBlock(text="preserve this decision"),),
+        created_at=None,
+        provenance=None,
+    )
+
+    translated = provider._translate_message(message)
+
+    assert translated == {
+        "role": "user",
+        "content": "[Athena compressed context]\npreserve this decision",
+    }
 
 
 async def test_stream_events_delta_and_done_with_usage(monkeypatch):
@@ -311,3 +331,50 @@ def test_translate_multimodal_blocks_without_dropping_them():
         {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
         {"type": "input_audio", "input_audio": {"data": "BASE64", "format": "wav"}},
     ]
+
+
+def test_translate_durable_visual_result_to_model_image_input(tmp_path):
+    blob = tmp_path / "frame.png"
+    blob.write_bytes(b"\x89PNG\r\n\x1a\nframe")
+    uri = "artifact://sha256/frame"
+    ref = ArtifactRef(
+        id=uri,
+        uri=uri,
+        hash="frame",
+        mime_type="image/png",
+        size=13,
+        storage_path=str(blob),
+    )
+    message = Message(
+        id="m-visual-result",
+        role=Role.CAPABILITY,
+        blocks=(
+            CapabilityResultBlock(call_id="call-visual", capability_id="computer", output="seen"),
+            ArtifactRefBlock(uri=uri, ref=ref),
+        ),
+        created_at=None,
+        provenance=None,
+    )
+
+    translated = OpenAICompatProvider(
+        base_url="http://127.0.0.1:1",
+        api_key="",
+    )._translate_message(message)
+
+    assert isinstance(translated, list)
+    assert translated[0]["role"] == "tool"
+    assert translated[1]["role"] == "user"
+    assert translated[1]["content"][1]["type"] == "image_url"
+    assert translated[1]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+async def test_openai_compat_declares_configured_vision_capability():
+    provider = OpenAICompatProvider(
+        base_url="https://fake.invalid",
+        api_key="test-key",
+        vision=True,
+    )
+
+    models = await provider.list_models()
+
+    assert models[0].vision is True

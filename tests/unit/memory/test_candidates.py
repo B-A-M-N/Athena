@@ -1,6 +1,8 @@
 from athena.memory.candidates import candidates_from_task
 from athena.protocol.memory import MemoryKind
 from athena.protocol.messages import (
+    CapabilityCallBlock,
+    CapabilityResultBlock,
     Message,
     Provenance,
     ReasoningBlock,
@@ -57,3 +59,73 @@ async def test_greeting_and_hidden_reasoning_produce_no_memory_candidates():
     candidates = await candidates_from_task(task, [message], None)
 
     assert candidates == []
+
+
+async def test_agent_lesson_requires_later_conclusion_linked_to_successful_result():
+    task = TaskSpec(id="task-evidence", session_id="sess-evidence", objective="inspect config")
+    transcript = [
+        Message(
+            id="call-message",
+            role=Role.ASSISTANT,
+            blocks=(CapabilityCallBlock(call_id="call-1", capability_id="files.read"),),
+            created_at=utcnow(),
+            provenance=Provenance(source_type=SourceType.GENERATED),
+        ),
+        Message(
+            id="result-message",
+            role=Role.CAPABILITY,
+            blocks=(
+                CapabilityResultBlock(
+                    call_id="call-1",
+                    capability_id="files.read",
+                    ok=True,
+                    output="config uses bounded retries",
+                    ref_uri="evidence:config-1",
+                    metadata={"result_id": "result-1"},
+                ),
+            ),
+            created_at=utcnow(),
+            provenance=Provenance(source_type=SourceType.CAPABILITY),
+        ),
+        Message(
+            id="conclusion-message",
+            role=Role.ASSISTANT,
+            blocks=(TextBlock(text="The service uses bounded retries for remote calls."),),
+            created_at=utcnow(),
+            provenance=Provenance(source_type=SourceType.GENERATED),
+        ),
+    ]
+
+    candidates = await candidates_from_task(task, transcript, None, principal_id="alice")
+
+    lessons = [c for c in candidates if c.kind is MemoryKind.SEMANTIC]
+    assert len(lessons) == 1
+    assert lessons[0].source_refs == ("result-1", "evidence:config-1", "call-1")
+    assert lessons[0].metadata["candidate_type"] == "evidence_linked_lesson"
+    assert lessons[0].metadata["session_id"] == "sess-evidence"
+
+
+async def test_failed_result_or_unlinked_assistant_prose_cannot_create_lesson():
+    task = TaskSpec(id="task-unproven", objective="inspect config")
+    failed = Message(
+        id="failed-result",
+        role=Role.CAPABILITY,
+        blocks=(
+            CapabilityResultBlock(
+                call_id="call-failed", capability_id="files.read", ok=False, error="denied"
+            ),
+        ),
+        created_at=utcnow(),
+        provenance=Provenance(source_type=SourceType.CAPABILITY),
+    )
+    conclusion = Message(
+        id="unlinked-conclusion",
+        role=Role.ASSISTANT,
+        blocks=(TextBlock(text="The service always uses safe bounded retries."),),
+        created_at=utcnow(),
+        provenance=Provenance(source_type=SourceType.GENERATED),
+    )
+
+    candidates = await candidates_from_task(task, [failed, conclusion], None)
+
+    assert not [c for c in candidates if c.kind is MemoryKind.SEMANTIC]

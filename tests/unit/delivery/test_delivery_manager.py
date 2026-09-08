@@ -264,11 +264,48 @@ async def test_connection_error_retries_then_records_failure():
     assert calls["n"] == 2
     etype, payload, *_ = events.appended[0]
     assert etype == "DeliveryFailed"
-    assert payload["delivery_status"] == "RETRYABLE" or payload["attempts"] == 2
+    assert payload["delivery_status"] == "RETRYABLE"
+    assert payload["attempts"] == 2
+    assert payload["attempted_at"]
+    assert payload["destination"].startswith("destination:")
     # Each failed attempt leaves an explicit recovery-required receipt —
     # never an APPLYING row pretending the outcome is known.
     statuses = [r["status"] for r in store.receipts.values()]
     assert statuses.count("RECOVERY_REQUIRED") == 2
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_success_after_retry_records_actual_attempt_and_redacts_destination():
+    events = _FakeEvents()
+    store = _FakeExternalStore()
+    calls = {"n": 0}
+
+    def runner(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("temporary failure")
+        return {"status": 204}
+
+    manager = DeliveryManager(
+        event_store=events,
+        external_store=store,
+        adapters={"webhook": WebhookAdapter(store, http_runner=runner)},
+        max_attempts=3,
+        base_backoff_s=0.0,
+    )
+    await _run(
+        manager,
+        DeliverySpec(
+            channel="webhook",
+            destination="https://hooks.example/x?token=do-not-leak",
+        ),
+    )
+
+    assert calls["n"] == 2
+    payload = events.appended[0][1]
+    assert payload["delivery_status"] == "DELIVERED"
+    assert payload["attempts"] == 2
+    assert "do-not-leak" not in json.dumps(payload)
 
 
 @pytest.mark.athena_evidence("test", "unit")

@@ -33,6 +33,8 @@ from athena.context.compression import (
     ContextCompressor,
     is_capability_block,
 )
+from athena.context.digest import ContextDigestStore
+from athena.context.digest_builder import ContextDigestBuilder
 from athena.context.instructions import (
     INSTRUCTION_ORDER,
     provider_role_for_source,
@@ -49,8 +51,11 @@ from athena.models.router import (
 )
 from athena.protocol.capabilities import CapabilityDescriptor
 from athena.protocol.ids import new_id
+from athena.protocol.policy import DEFAULT_PRINCIPAL_ID
 from athena.protocol.messages import (
     AudioBlock,
+    ArtifactRefBlock,
+    CapabilityResultBlock,
     ContentBlock,
     ImageBlock,
     Message,
@@ -312,7 +317,7 @@ def _memory_context_needed(objective: str) -> bool:
 # strongest authority over "how we do things here", then the project, then
 # the user-global store. Applied during retrieval ranking so a global
 # memory cannot outrank a session-local one on text overlap alone.
-_MEMORY_SCOPE_WEIGHTS = {"SESSION": 1.0, "PROJECT": 0.6, "GLOBAL": 0.3}
+_MEMORY_SCOPE_WEIGHTS = {"SESSION": 1.0, "PROJECT": 0.6, "USER": 0.45, "GLOBAL": 0.3}
 
 # WORK-mode floor: a memory must overlap at least this fraction of the
 # objective's tokens to earn context space on an ordinary work turn.
@@ -367,6 +372,7 @@ class ContextCompiler:
         artifact_store: Any = None,
         research_store: Any = None,
         context_block_store: Any = None,
+        context_digest_store: ContextDigestStore | None = None,
         compressor: ContextCompressor | None = None,
         summarizer: Any = None,
         context_window: int = 128_000,
@@ -374,7 +380,7 @@ class ContextCompiler:
         recent_verbatim_turns: int = 8,
         skill_limit: int = 3,
         safety_margin: int = 1024,
-        principal_id: str = "athena",
+        principal_id: str = DEFAULT_PRINCIPAL_ID,
         capability_limit: int = 12,
     ) -> None:
         self._message_store = message_store
@@ -385,6 +391,8 @@ class ContextCompiler:
         self._artifact_store = artifact_store
         self._research_store = research_store
         self._context_block_store = context_block_store
+        self._context_digest_store = context_digest_store
+        self._context_digest_builder = ContextDigestBuilder()
         self._compressor = compressor or ContextCompressor(
             recent_turns=recent_verbatim_turns, summarizer=summarizer
         )
@@ -450,6 +458,7 @@ class ContextCompiler:
         recent_messages: Sequence[Message] | None = None,
         workspace: str | None = None,
         attachments: Sequence[ContentBlock | Any] = (),
+        context_window: int | None = None,
     ) -> CompiledContext:
         # Task context refs are durable request context. Normalize them at the
         # compiler boundary so selection, budgeting, provenance, and model
@@ -499,7 +508,8 @@ class ContextCompiler:
         # reserved output. Required/compressed content is counted inside
         # ``_bound_and_compress`` starting from used = required, so required
         # tokens must NOT also be subtracted here (that double-counts them).
-        input_budget = max(0, self.context_window - self.reserve_output)
+        effective_context_window = max(0, int(context_window or self.context_window))
+        input_budget = max(0, effective_context_window - self.reserve_output)
 
         corpus = await self._collect_entries(task, transcript, static)
 
@@ -514,6 +524,8 @@ class ContextCompiler:
         final_entries, record, omitted = await self._bound_and_compress(
             required, corpus, input_budget, task=task
         )
+        if record.occurred and self._context_digest_store is not None:
+            await self._persist_context_digest(task, required, corpus, record, omitted)
 
         messages = tuple(_render_entry(e) for e in final_entries)
         stable_count = 0
@@ -524,7 +536,11 @@ class ContextCompiler:
         provenance_map = _index_provenance(messages)
         estimated = estimate_tokens("\n\n".join(m.conversation_text() for m in messages))
         requirements = self._build_requirements(
-            task, normalized_attachments, estimated, capabilities=capabilities
+            task,
+            normalized_attachments,
+            estimated,
+            capabilities=capabilities,
+            recent_messages=messages,
         )
         return CompiledContext(
             messages=messages,
@@ -965,6 +981,7 @@ class ContextCompiler:
         compiled_tokens: int,
         *,
         capabilities: Sequence[CapabilityDescriptor] = (),
+        recent_messages: Sequence[Message] = (),
     ) -> ModelRequirements:
         caps: set[str] = set()
         needs_tools = bool(capabilities) or bool(task.model_policy.require_tools)
@@ -973,17 +990,19 @@ class ContextCompiler:
         needs_tools = needs_tools or not is_explicit_response_turn(task.objective)
         if needs_tools:
             caps.add(CAP_TOOLS)
-        if _has_visuals(attachments):
+        visual_inputs = tuple(attachments) + tuple(recent_messages)
+        audio_inputs = tuple(attachments)
+        if _has_visuals(visual_inputs):
             caps.add(CAP_VISION)
-        if _has_audio(attachments):
+        if _has_audio(audio_inputs):
             caps.add(CAP_AUDIO_INPUT)
         minimum_tokens = compiled_tokens + self.reserve_output + self.safety_margin
         return ModelRequirements(
             required_capabilities=frozenset(caps),
             minimum_context_tokens=minimum_tokens,
             needs_tools=needs_tools,
-            vision=_has_visuals(attachments),
-            audio=_has_audio(attachments),
+            vision=_has_visuals(visual_inputs),
+            audio=_has_audio(audio_inputs),
             reserved_output=self.reserve_output,
         )
 
@@ -1029,15 +1048,28 @@ class ContextCompiler:
         is retained (BHV-033) and recorded as a reversible marker.
         """
         budget = max(budget, 0)
-        kept: list[_Entry] = list(required)
-        used = sum(e.tokens for e in kept)
+        kept: list[_Entry] = []
+        used = 0
         omitted: list[str] = []
 
-        if used > budget:
-            raise OverflowError(
-                "Required context categories exceed the model context window; "
-                "cannot form a bounded context."
-            )
+        def try_append(entry: _Entry) -> bool:
+            """Append through the single accounting path for every insertion."""
+            nonlocal used
+            candidate = (*kept, entry)
+            candidate_text = "\n\n".join(_entry_text(item) for item in candidate)
+            candidate_tokens = estimate_tokens(candidate_text)
+            if candidate_tokens > budget:
+                return False
+            kept.append(entry)
+            used = candidate_tokens
+            return True
+
+        for entry in required:
+            if not try_append(entry):
+                raise OverflowError(
+                    "Required context categories exceed the model context window; "
+                    "cannot form a bounded context."
+                )
 
         transcript = [e for e in corpus if not e.droppable]
         droppable = [e for e in corpus if e.droppable]
@@ -1063,21 +1095,15 @@ class ContextCompiler:
 
         # Protected transcript MUST always be retained verbatim (BHV-032).
         for e in protected:
-            protected_tokens = used + e.tokens
-            if protected_tokens > budget:
+            if not try_append(e):
                 raise OverflowError(
                     "protected recent/capability context exceeds budget; "
                     "cannot satisfy BHV-032 without overflow."
                 )
-            kept.append(e)
-            used = protected_tokens
 
         # Fill any remaining verbatim room with oldest-mentioned older turns.
         for e in older:
-            if used + e.tokens <= budget:
-                kept.append(e)
-                used += e.tokens
-            else:
+            if not try_append(e):
                 break
 
         # Summarize what did not fit (older transcript) with provenance retained.
@@ -1085,10 +1111,12 @@ class ContextCompiler:
         markers: list[CompressionMarker] = []
         if summarized_subject:
             merged = _merged_provenance(summarized_subject)
+            summary_budget = max(0, budget - used - (1 if kept else 0))
             summary_text = await self._compressor._summarize(
                 "\n".join(e.text for e in summarized_subject if e.text),
                 task=task,
                 cache_key=_entry_group_cache_key(summarized_subject, task=task),
+                max_tokens=summary_budget,
             )
             markers.append(
                 CompressionMarker(
@@ -1097,28 +1125,78 @@ class ContextCompiler:
                     provenance=merged,
                 )
             )
-            kept.append(
-                _Entry(
-                    name="summary:compressed",
-                    text=summary_text,
-                    tokens=estimate_tokens(summary_text),
-                    role=Role.COMPRESSION,
-                    category="recent_conversation",
-                    trust=merged.trust,
-                    mandatory=False,
-                    provenance=merged,
-                )
+            summary_entry = _Entry(
+                name="summary:compressed",
+                text=summary_text,
+                tokens=estimate_tokens(summary_text),
+                role=Role.COMPRESSION,
+                category="recent_conversation",
+                trust=merged.trust,
+                mandatory=False,
+                provenance=merged,
             )
+            if summary_text and not try_append(summary_entry):
+                # The shared accounting path is authoritative. A summary that
+                # cannot fit is retained in the compression receipt, not
+                # smuggled into an over-budget provider request.
+                omitted.append(summary_entry.name)
 
         # Droppable evidence (memory/skill/artifact): include by value, else omit.
         for e in sorted(droppable, key=lambda x: -x.value):
-            if used + e.tokens <= budget:
-                kept.append(e)
-                used += e.tokens
-            else:
+            if not try_append(e):
                 omitted.append(e.name)
 
+        if used > budget:
+            raise OverflowError(
+                f"Compiled context exceeds input budget ({used} > {budget}); "
+                "cannot form a bounded context."
+            )
+
         return kept, CompressionRecord(tuple(markers)), omitted
+
+    async def _persist_context_digest(
+        self,
+        task: TaskSpec,
+        required: Sequence[_Entry],
+        corpus: Sequence[_Entry],
+        record: CompressionRecord,
+        omitted: Sequence[str],
+    ) -> None:
+        store = self._context_digest_store
+        if store is None:
+            return
+        previous = None
+        if task.session_id:
+            previous = await store.latest_for_session(task.session_id, self._principal_id)
+        if previous is None:
+            previous = await store.latest_for_task(task.id, self._principal_id)
+        metadata = dict(task.metadata or {})
+        runtime_sessions = (
+            metadata.get("runtime_sessions") or metadata.get("_runtime_sessions") or ()
+        )
+        child_tasks = metadata.get("child_tasks") or ()
+        digest = self._context_digest_builder.build(
+            task,
+            required=required,
+            corpus=corpus,
+            previous=previous,
+            principal_id=self._principal_id,
+            omitted=omitted,
+            compression=record,
+            runtime_sessions=(
+                tuple(item for item in runtime_sessions if isinstance(item, Mapping))
+                if isinstance(runtime_sessions, Sequence)
+                and not isinstance(runtime_sessions, (str, bytes, bytearray))
+                else ()
+            ),
+            child_tasks=(
+                tuple(item for item in child_tasks if isinstance(item, Mapping))
+                if isinstance(child_tasks, Sequence)
+                and not isinstance(child_tasks, (str, bytes, bytearray))
+                else ()
+            ),
+        )
+        await store.save(digest)
 
     def __repr__(self) -> str:
         return (
@@ -1634,6 +1712,13 @@ def _maybe_created(value: Any) -> Any:
     return value
 
 
+def _entry_text(entry: _Entry) -> str:
+    """Return exactly the text used by the provider-neutral token estimate."""
+    if entry.message is not None:
+        return entry.message.conversation_text()
+    return entry.text
+
+
 def _entry_time(e: _Entry):
     import datetime as _dt
 
@@ -1652,12 +1737,33 @@ def _msg_has_capability(msg: Message) -> bool:
 
 
 def _has_visuals(blocks: Sequence[Any]) -> bool:
-    return any(
-        isinstance(b, ImageBlock)
-        or (isinstance(b, dict) and str(b.get("mime_type", "")).startswith("image/"))
-        or (getattr(b, "mime_type", "") or "").startswith("image/")
-        for b in blocks
-    )
+    for value in blocks:
+        if isinstance(value, Message):
+            if _has_visuals(value.blocks):
+                return True
+            continue
+        if isinstance(value, ImageBlock):
+            return True
+        if isinstance(value, ArtifactRefBlock):
+            ref = value.ref
+            if str(getattr(ref, "mime_type", "") or "").startswith("image/"):
+                return True
+            continue
+        if isinstance(value, CapabilityResultBlock):
+            metadata = value.metadata
+            if str(metadata.get("mime_type", "") or "").startswith("image/"):
+                return True
+            artifact_ref = metadata.get("artifact_ref")
+            if isinstance(artifact_ref, Mapping) and str(
+                artifact_ref.get("mime_type", "") or ""
+            ).startswith("image/"):
+                return True
+            continue
+        if isinstance(value, dict) and str(value.get("mime_type", "")).startswith("image/"):
+            return True
+        if str(getattr(value, "mime_type", "") or "").startswith("image/"):
+            return True
+    return False
 
 
 def _has_audio(blocks: Sequence[Any]) -> bool:

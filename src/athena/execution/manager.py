@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, AsyncIterator, Mapping, cast
 
+from athena.execution.async_call import run_blocking
 from athena.execution.backend import ExecutionBackend
 from athena.protocol.execution import (
     ExecutionEvent,
@@ -218,7 +219,26 @@ class ExecutionManager:
             )
             self._task_sessions.setdefault(task_id, []).append((selected_backend, sid))
             self._runtime_by_session[sid] = selected_backend
-            await self._persist_session_start(sid, task_id, backend, cwd=cwd)
+            identity: dict[str, Any] = {}
+            describe = getattr(selected_backend, "describe_session", None)
+            if callable(describe):
+                try:
+                    identity = dict(await describe(sid))
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    _logger.warning("failed to describe runtime session %s: %s", sid, exc)
+            await self._persist_session_start(
+                sid,
+                task_id,
+                backend=backend,
+                runtime=runtime,
+                cwd=cwd,
+                metadata={
+                    "workspace_root": workspace_root,
+                    "network_policy": network_policy,
+                    "env": dict(env or {}),
+                    **identity,
+                },
+            )
             return sid
         rt = self._resolve(runtime)
         kwargs: dict[str, Any] = {"task_id": task_id}
@@ -242,8 +262,47 @@ class ExecutionManager:
             sid = cast(str, rt.create_session(**kwargs))
         self._task_sessions.setdefault(task_id, []).append((rt, sid))
         self._runtime_by_session[sid] = rt
-        await self._persist_session_start(sid, task_id, runtime, cwd=cwd)
+        await self._persist_session_start(
+            sid,
+            task_id,
+            backend=backend,
+            runtime=runtime,
+            cwd=cwd,
+            metadata={
+                "workspace_root": workspace_root,
+                "network_policy": network_policy,
+                "env": dict(env or {}),
+            },
+        )
         return sid
+
+    async def reattach_session(self, record: Mapping[str, Any]) -> bool:
+        """Reattach one persisted backend session after identity proof.
+
+        Local runtimes deliberately return ``False``: their worker processes
+        are service-lifetime resources until a durable supervisor exists.
+        Backend-specific implementations may opt in, but the returned session
+        id must exactly match durable state before ownership is rebuilt.
+        """
+        backend_name = str(record.get("backend") or "")
+        backend = self._backends.get(backend_name)
+        if backend is None or not bool(getattr(backend, "supports_reattach", False)):
+            return False
+        reattach = getattr(backend, "reattach_session", None)
+        if not callable(reattach):
+            return False
+        session_id = str(record.get("id") or "")
+        task_id = str(record.get("task_id") or "")
+        attached_id = await reattach(record)
+        if str(attached_id) != session_id:
+            raise RuntimeError(
+                f"backend {backend_name!r} returned unexpected runtime session id {attached_id!r}"
+            )
+        self._runtime_by_session[session_id] = backend
+        rooms = self._task_sessions.setdefault(task_id, [])
+        if not any(sid == session_id for _runtime, sid in rooms):
+            rooms.append((backend, session_id))
+        return True
 
     async def execute(
         self,
@@ -371,7 +430,13 @@ class ExecutionManager:
                     execution_metadata.update(dict(meta))
                 if meta.get("runtime_session_id"):
                     await self._adopt_runtime_session(
-                        rt, meta["runtime_session_id"], request.task_id
+                        rt,
+                        meta["runtime_session_id"],
+                        request.task_id,
+                        backend=request.backend,
+                        runtime=request.runtime,
+                        cwd=request.cwd,
+                        metadata=meta,
                     )
                     self._exec_runtimes[execution_id] = (rt, meta["runtime_session_id"])
                     if not persisted:
@@ -402,7 +467,15 @@ class ExecutionManager:
             if adopted:
                 rt, sid = adopted
                 if sid:
-                    await self._adopt_runtime_session(rt, sid, request.task_id)
+                    await self._adopt_runtime_session(
+                        rt,
+                        sid,
+                        request.task_id,
+                        backend=request.backend,
+                        runtime=request.runtime,
+                        cwd=request.cwd,
+                        metadata=execution_metadata,
+                    )
         finally:
             self._executions.pop(execution_id, None)
             self._exec_runtimes.pop(execution_id, None)
@@ -440,7 +513,15 @@ class ExecutionManager:
             )
 
     async def _adopt_runtime_session(
-        self, rt: Runtime, runtime_session_id: str, task_id: str
+        self,
+        rt: Runtime,
+        runtime_session_id: str,
+        task_id: str,
+        *,
+        backend: str,
+        runtime: str,
+        cwd: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         if runtime_session_id in self._runtime_by_session:
             return
@@ -451,7 +532,10 @@ class ExecutionManager:
         await self._persist_session_start(
             runtime_session_id,
             task_id,
-            getattr(rt, "name", None),
+            backend=backend,
+            runtime=runtime,
+            cwd=cwd,
+            metadata=dict(metadata or {}),
         )
 
     async def interrupt(self, execution_id: str) -> None:
@@ -518,7 +602,6 @@ class ExecutionManager:
         Runtime failures are returned to the task cancellation authority. A
         caller must not convert a failed close into a durable CANCELLED state.
         """
-        loop = asyncio.get_running_loop()
         rooms = list(self._task_sessions.get(task_id, []))
         # Enumerate sessions across ALL executions of this task, including
         # ones the runtimes adopted implicitly during execute() (BHV-061/062).
@@ -559,7 +642,7 @@ class ExecutionManager:
                         if asyncio.iscoroutinefunction(close):
                             await close(sid)
                         else:
-                            await loop.run_in_executor(None, close, sid)
+                            await run_blocking(close, sid)
                         if (
                             process_before is not None
                             and getattr(process_before, "poll", None) is not None
@@ -597,7 +680,7 @@ class ExecutionManager:
                     if asyncio.iscoroutinefunction(cancel):
                         await cancel(task_id)
                     else:
-                        await loop.run_in_executor(None, cancel, task_id)
+                        await run_blocking(cancel, task_id)
                     self._confirmed_runtime_cancellations.setdefault(task_id, set()).add(id(rt))
                 except Exception as exc:
                     errors.append(exc)
@@ -796,7 +879,14 @@ class ExecutionManager:
     # Persistence (P0-22): runtime_sessions + executions behind the stores.
     # ------------------------------------------------------------------ #
     async def _persist_session_start(
-        self, session_id: str, task_id: str, runtime: str | None, cwd: str | None = None
+        self,
+        session_id: str,
+        task_id: str,
+        *,
+        backend: str,
+        runtime: str,
+        cwd: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         store = self._rt_sessions
         if store is None:
@@ -805,9 +895,10 @@ class ExecutionManager:
             await store.start(
                 session_id,
                 task_id=task_id,
-                backend=runtime or "unknown",
+                backend=backend,
                 runtime=runtime,
                 cwd=cwd,
+                metadata=dict(metadata or {}),
             )
         except Exception as exc:
             _logger.warning("failed to persist session start %s: %s", session_id, exc)

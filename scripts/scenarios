@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import subprocess
@@ -93,6 +94,52 @@ RENDER_DEMO_EXIT_NAMES = {
     4: "vhs-failure",
     5: "artifact-validation-failure",
 }
+
+
+def _artifact_identity() -> dict[str, object]:
+    """Return hashes for the installed-artifact bundle when one is present.
+
+    Release scenarios run after the artifact lane in the frozen checkout, so
+    attaching this record to every scenario prevents a green scenario result
+    from being mistaken for proof against some other wheel or source archive.
+    Developer runs retain an explicit ``not_available`` status instead of
+    inventing an artifact hash.
+    """
+    configured = os.environ.get("ATHENA_RELEASE_ARTIFACT_DIR")
+    root = Path(configured).resolve() if configured else REPO_ROOT / "release-artifacts"
+    manifest_path = root / "release-manifest.json"
+    if not manifest_path.is_file():
+        return {
+            "status": "not_available",
+            "manifest": None,
+            "artifacts": [],
+            "reason": "scenario run was not supplied a release artifact bundle",
+        }
+    try:
+        raw = manifest_path.read_bytes()
+        manifest = json.loads(raw)
+        artifacts = [
+            {
+                "path": str(item.get("path") or ""),
+                "sha256": str(item.get("sha256") or ""),
+            }
+            for item in manifest.get("artifacts") or ()
+            if isinstance(item, dict)
+        ]
+        return {
+            "status": "available",
+            "manifest": str(manifest_path),
+            "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+            "source_sha": manifest.get("source_sha"),
+            "artifacts": artifacts,
+        }
+    except (OSError, TypeError, ValueError) as exc:
+        return {
+            "status": "invalid",
+            "manifest": str(manifest_path),
+            "artifacts": [],
+            "reason": f"release manifest could not be read: {type(exc).__name__}: {exc}",
+        }
 
 # Keep the scenario-process allowance aligned with scripts/render-demo's
 # default timeout (420s) plus a small parent-process margin.  This used to
@@ -159,6 +206,7 @@ def _release_identity() -> dict[str, str | bool]:
             if frozen_source
             else git("rev-parse", "HEAD")
         ),
+        "release_run_id": os.environ.get("ATHENA_RELEASE_RUN_ID", "local"),
         "dirty": bool(status),
         "status_digest": __import__("hashlib").sha256(status.encode("utf-8")).hexdigest(),
         "python": runner,
@@ -202,11 +250,10 @@ def _run(argv: list[str], *, timeout: float) -> dict:
 
 def _run_pytest(nodeids: list[str]) -> dict:
     """Run one pytest invocation over the scenario's node IDs."""
-    # Do not pass pytest's ``--no-header`` here.  In this repository's plugin
-    # stack that option can leave the subprocess with no flushed output and
-    # hang otherwise fast scenario tests; the header is irrelevant to the
-    # machine-readable receipt anyway.
-    argv = [_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider", *nodeids]
+    # Keep the scenario subprocess on the repository's normal pytest plugin
+    # path. Disabling cacheprovider here makes real-runtime groups hang during
+    # teardown even though the same node IDs pass through the normal suite.
+    argv = [_python(), "-m", "pytest", "-q", *nodeids]
     started = time.monotonic()
     try:
         proc = subprocess.run(
@@ -236,16 +283,18 @@ def _run_pytest(nodeids: list[str]) -> dict:
 
 
 def _vhs_probe_skipped(record: dict) -> bool:
-    """Probe exited 2 because the renderer is not installed -> 'skipped'.
+    """Probe exited 2 because rendering is unavailable -> 'skipped'.
 
     render-demo exits 2 for tool/argument errors; when the failure is simply
-    ``vhs not on PATH`` the evidence exists but could not be produced in this
-    environment, so the scenario is *skipped*, not failed.  Any other exit
-    (3/4/5, or 2 with a different message) is a real failure.
+    ``vhs not on PATH`` or a sized PTY cannot be created in this environment,
+    the evidence exists but could not be produced, so the scenario is
+    *skipped*, not failed. Any other exit (3/4/5, or 2 with a different
+    message) is a real failure.
     """
     if record["exit_code"] != 2:
         return False
-    return "vhs not on PATH" in record.get("tail", "")
+    tail = record.get("tail", "")
+    return "vhs not on PATH" in tail or "could not create the VHS PTY session" in tail
 
 
 def execute_scenario(
@@ -275,10 +324,13 @@ def execute_scenario(
         "family": sc.family,
         "title": sc.title,
         "required": sc.required,
+        "commit_sha": identity["head_sha"],
+        "release_run_id": identity["release_run_id"],
         "status": None,
         "evidence": [],
         "duration_s": 0.0,
         "source_identity": identity,
+        "artifact_identity": _artifact_identity(),
     }
     if sc.notes:
         entry["notes"] = sc.notes
@@ -293,6 +345,8 @@ def execute_scenario(
     started = time.monotonic()
     if sc.nodeids:
         record = _run_pytest(list(sc.nodeids))
+        record["commit_sha"] = str(identity["head_sha"])
+        record["release_run_id"] = str(identity["release_run_id"])
         entry["evidence"].append(record)
         entry["status"] = "passed" if record["exit_code"] == 0 else "failed"
     elif sc.probe:
@@ -303,6 +357,8 @@ def execute_scenario(
         record["probe_exit"] = RENDER_DEMO_EXIT_NAMES.get(
             record["exit_code"], f"exit-{record['exit_code']}"
         )
+        record["commit_sha"] = str(identity["head_sha"])
+        record["release_run_id"] = str(identity["release_run_id"])
         entry["evidence"].append(record)
         if record["exit_code"] == 0:
             entry["status"] = "passed"
@@ -457,6 +513,8 @@ def main(argv: list[str] | None = None) -> int:
     manifest = {
         "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "repo_root": str(REPO_ROOT),
+        "commit_sha": identity["head_sha"],
+        "release_run_id": identity["release_run_id"],
         "source_identity": identity,
         "resumed": bool(args.resume),
         "scenarios": entries,

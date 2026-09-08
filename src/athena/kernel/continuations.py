@@ -251,6 +251,26 @@ class ContinuationStore:
         )
         return [_decode_row(row) for row in rows]
 
+    async def resolved_unconsumed_for_task(
+        self, task_id: str, *, records: bool = False
+    ) -> bool | list[dict]:
+        """Whether a task has an approval decision ready for consumption.
+
+        This is a readiness probe only; it does not claim or consume the
+        canonical call.  The kernel uses it to distinguish a real timeout
+        from a decision that arrived at the slot-release boundary.
+        """
+        await self.ensure_table()
+        rows = await self._db.fetch_all(
+            "SELECT * FROM continuations "
+            "WHERE task_id = ? AND resolved_at IS NOT NULL AND consumed_at IS NULL "
+            "ORDER BY resolved_at ASC",
+            (task_id,),
+        )
+        if records:
+            return [_decode_row(row) for row in rows]
+        return bool(rows)
+
 
 def _decode_row(row: dict) -> dict:
     for key in ("canonical_arguments", "effects", "policy_context"):

@@ -10,6 +10,8 @@ startup stays a transaction over resources acquired in dependency order.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from athena.affordances import CapabilityFabric
 from athena.affordances import GeneratedCapabilityStore
 from athena.artifacts.store import ArtifactStore
@@ -18,6 +20,7 @@ from athena.capabilities.registry import CapabilityRegistry
 from athena.capabilities.schedule import ScheduleAPI
 from athena.capabilities.schedule import ScheduleCapability
 from athena.context.compiler import ContextCompiler
+from athena.context.digest import ContextDigestStore
 from athena.execution.container import ContainerBackend
 from athena.execution.manager import ExecutionManager
 from athena.execution.runtimes import PythonRuntime
@@ -30,6 +33,7 @@ from athena.kernel.termination import TerminationEvaluator
 from athena.knowledge.pipeline import KnowledgePipeline
 from athena.mcp.adapter import MCPAdapter
 from athena.memory.store import MemoryStore
+from athena.memory.embeddings import FastEmbedProvider
 from athena.models.registry import ProviderRegistry
 from athena.packs.store import PackStore
 from athena.policy.credentials import SecretManager
@@ -39,6 +43,7 @@ from athena.project.index.coordinator import ProjectIndexCoordinator
 from athena.project.index.store import ProjectIndexStore
 from athena.protocol.tasks import TaskStatus
 from athena.protocol.tasks import WorkspaceSpec
+from athena.protocol.policy import Principal
 from athena.scheduler.scheduler import Scheduler
 from athena.service.config import DEFAULT_DB_PATH
 from athena.skills.lifecycle import SkillLifecycle
@@ -240,9 +245,21 @@ class ServiceLifecycle:
             }
 
         # 4. Memory + skills.
-        memory = MemoryStore(db)
+        embedding_provider = cfg.memory_embedding_provider or FastEmbedProvider(
+            model=cfg.memory_embedding_model,
+            cache_dir=cfg.memory_embedding_cache_dir,
+        )
+        memory = MemoryStore(db, embedding_provider=embedding_provider)
         self._svc._memory = memory
-        skill_loader = SkillLoader(search_paths=tuple(cfg.skills_paths))
+        # Bundled skills are a small, versioned first-party library. Explicit
+        # project/user paths remain higher precedence and can shadow a bundled
+        # name+version, while an empty config still gives a useful out-of-box
+        # release/debugging workflow.
+        bundled_skills = Path(__file__).resolve().parents[1] / "bundled_skills"
+        skill_loader = SkillLoader(
+            search_paths=tuple(cfg.skills_paths),
+            bundled_dir=bundled_skills,
+        )
         skill_lifecycle = SkillLifecycle(db, events=events)
         skills_store = SkillStore(loader=skill_loader, lifecycle=skill_lifecycle)
         self._svc._skills = skills_store
@@ -282,6 +299,7 @@ class ServiceLifecycle:
         dispatcher = CapabilityDispatcher(
             registry,
             policy,
+            principal=Principal("agent", cfg.cache_namespace),
             mutation_store=mutations,
             approval_store=approvals,
             continuation_store=continuations,
@@ -310,6 +328,7 @@ class ServiceLifecycle:
             sessions=sessions,
             budgets=budgets,
             admission=self._svc.require_task_ready,
+            principal_id=cfg.cache_namespace,
         )
         self._svc._task_manager = task_manager
 
@@ -330,6 +349,7 @@ class ServiceLifecycle:
             skill_lifecycle=skill_lifecycle,
             workflow_store=self._svc._workflow_store,
             events=events,
+            principal_id=cfg.cache_namespace,
         )
         task_manager.add_finalize_observer(self._svc._knowledge)
 
@@ -391,6 +411,7 @@ class ServiceLifecycle:
             artifact_store=self._svc._artifacts,
             research_store=self._svc._research_store,
             context_block_store=self._svc._context_block_store,
+            context_digest_store=ContextDigestStore(db),
             summarizer=self._svc._make_model_summarizer(model_registry),
             context_window=cfg.context_window,
             reserve_output=cfg.reserve_output,
@@ -534,7 +555,7 @@ class ServiceLifecycle:
                 workspace_root=workspace.root,
             ),
             project_id=workspace.id,
-            user_id="athena",
+            user_id=cfg.cache_namespace,
             record_validator=_current_generated_evidence,
         )
         # Generated proof metrics are rebuilt from canonical events and then
@@ -579,6 +600,7 @@ class ServiceLifecycle:
             workspace=workspace,
             execution_manager=self._svc._execution,
             fabric=self._svc._fabric,
+            principal_id=cfg.cache_namespace,
         )
         registry.register(maintenance)
         try:
@@ -609,6 +631,7 @@ class ServiceLifecycle:
             mutation_store=mutations,
             execution_store=execution_store,
             runtime_session_store=runtime_sessions,
+            execution_manager=execution,
             event_store=events,
         )
         recovery_result = await recovery.recover()
@@ -843,6 +866,17 @@ class ServiceLifecycle:
 
         # Capability-owned resources via shutdown registry (P1-32).
         await self._svc._run_shutdown_hooks()
+        self._svc._computer = None
+        self._svc._browser = None
+        self._svc._computer_health = {
+            "state": "stopped",
+            "backend": "unknown",
+        }
+        self._svc._browser_health = {
+            "state": "stopped",
+            "configured": False,
+            "active_sessions": 0,
+        }
 
         # MCP clients.
         for client in self._svc._mcp_clients:
@@ -851,6 +885,9 @@ class ServiceLifecycle:
             except Exception as exc:
                 _logger.warning("MCP client close failed: %s", exc)
         self._svc._mcp_clients = []
+        for status in self._svc._mcp_connection_status.values():
+            status["state"] = "stopped"
+            status["tool_count"] = 0
 
         # External Hermes transport is optional and owns only its HTTP client.
         if self._svc._hermes_adapter is not None:

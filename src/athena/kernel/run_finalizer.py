@@ -13,7 +13,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from athena.kernel.termination import TerminationDecision, result_qualifies_as_work_evidence
-from athena.protocol.messages import CapabilityResultBlock
+from athena.protocol.artifacts import ArtifactRef
+from athena.protocol.messages import ArtifactRefBlock, CapabilityResultBlock
 from athena.protocol.models import ModelResponse
 from athena.protocol.tasks import TaskResult, TaskSpec, TaskStatus, UsageSummary
 
@@ -29,7 +30,41 @@ def _assistant_message(task, response):
 
 
 def _results_message(task, blocks):
-    return _mod()._results_message(task, blocks)
+    # A visual capability result is durable as a normal result plus a typed
+    # artifact reference.  Keeping the image outside the result text avoids
+    # putting pixels in the transcript while allowing provider adapters to
+    # hydrate a model-visible image input on the next turn.
+    expanded = []
+    for block in blocks:
+        expanded.append(block)
+        if not isinstance(block, CapabilityResultBlock):
+            continue
+        metadata = dict(block.metadata or {})
+        raw_ref = metadata.get("artifact_ref")
+        if not isinstance(raw_ref, dict) or not str(metadata.get("mime_type", "")).startswith(
+            "image/"
+        ):
+            continue
+        uri = str(block.ref_uri or raw_ref.get("uri") or "")
+        if not uri:
+            continue
+        expanded.append(
+            ArtifactRefBlock(
+                uri=uri,
+                ref=ArtifactRef(
+                    id=str(raw_ref.get("id") or uri),
+                    uri=uri,
+                    hash=raw_ref.get("hash"),
+                    mime_type=raw_ref.get("mime_type") or metadata.get("mime_type"),
+                    size=raw_ref.get("size"),
+                    storage_path=raw_ref.get("storage_path"),
+                    producer=raw_ref.get("producer"),
+                    task_id=raw_ref.get("task_id") or task.id,
+                    metadata=raw_ref.get("metadata") or {},
+                ),
+            )
+        )
+    return _mod()._results_message(task, expanded)
 
 
 if TYPE_CHECKING:

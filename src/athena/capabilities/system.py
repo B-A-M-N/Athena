@@ -11,7 +11,6 @@ CPU/memory/disk/network/ports/environment/toolchain. No mutation ops.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import platform
@@ -20,6 +19,7 @@ import shutil
 import subprocess
 from typing import Any, ClassVar
 
+from athena.execution.async_call import run_blocking
 from athena.execution.process_tree import process_start_identity
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
@@ -149,8 +149,6 @@ class ProcessCapability:
     async def invoke(self, request: CapabilityRequest, **kwargs) -> CapabilityResult:
         args = dict(request.arguments or {})
         op = str(args.get("operation") or "")
-        loop = asyncio.get_running_loop()
-
         if op == "list":
             limit = max(int(args.get("limit") or 40), 1)
 
@@ -161,7 +159,7 @@ class ProcessCapability:
                 lines = out.splitlines()[:limit]
                 return "\n".join(lines)
 
-            out = await loop.run_in_executor(None, _ps)
+            out = await run_blocking(_ps)
             return _result(request, output=out or "(none)")
 
         pid = int(args.get("pid") or 0)
@@ -202,7 +200,7 @@ class ProcessCapability:
                     return {"pid": pid, "error": str(exc)}
                 return info
 
-            info = await loop.run_in_executor(None, _inspect)
+            info = await run_blocking(_inspect)
             if info is None:
                 return _result(request, ok=False, error=f"no such pid {pid}")
             return _result(request, output=json.dumps(info, indent=2))
@@ -261,7 +259,7 @@ class ProcessCapability:
                 finally:
                     os.close(fd_handle)
 
-            await loop.run_in_executor(None, _write)
+            await run_blocking(_write)
             return _result(request, output="written")
 
         if op == "signal":
@@ -281,7 +279,7 @@ class ProcessCapability:
                 os.kill(pid, sig)
 
             try:
-                await loop.run_in_executor(None, _kill)
+                await run_blocking(_kill)
             except ProcessLookupError:
                 return _result(request, ok=False, error=f"no such pid {pid}")
             except PermissionError:
@@ -301,7 +299,7 @@ class ProcessCapability:
                     time.sleep(0.1)
                 return not os.path.exists(f"/proc/{pid}")
 
-            exited = await loop.run_in_executor(None, _wait)
+            exited = await run_blocking(_wait)
             return _result(
                 request,
                 ok=exited,
@@ -364,7 +362,6 @@ class MachineCapability:
     async def invoke(self, request: CapabilityRequest, **kwargs) -> CapabilityResult:
         args = dict(request.arguments or {})
         op = str(args.get("operation") or "overview")
-        loop = asyncio.get_running_loop()
 
         def _out(cmd: list[str]) -> str:
             _rc, out, err = _run(cmd)
@@ -405,7 +402,7 @@ class MachineCapability:
             return _result(request, output=text)
 
         if op == "cpu":
-            out = await loop.run_in_executor(None, lambda: _out(["lscpu"]))
+            out = await run_blocking(_out, ["lscpu"])
             return _result(request, output=out[:3000])
 
         if op == "memory":
@@ -415,28 +412,26 @@ class MachineCapability:
                     head = [next(f) for _ in range(8)]
                 return "".join(head)
 
-            text = await loop.run_in_executor(None, _mem)
+            text = await run_blocking(_mem)
             return _result(request, output=text)
 
         if op == "disk":
-            out = await loop.run_in_executor(
-                None,
-                lambda: _out(
-                    [
-                        "df",
-                        "-h",
-                        "--output=source,fstype,size,used,avail,pcent,target",
-                    ]
-                ),
+            out = await run_blocking(
+                _out,
+                [
+                    "df",
+                    "-h",
+                    "--output=source,fstype,size,used,avail,pcent,target",
+                ],
             )
             return _result(request, output=out)
 
         if op == "network":
-            out = await loop.run_in_executor(None, lambda: _out(["ip", "-brief", "addr"]))
+            out = await run_blocking(_out, ["ip", "-brief", "addr"])
             return _result(request, output=out)
 
         if op == "ports":
-            out = await loop.run_in_executor(None, lambda: _out(["ss", "-tlnp"]))
+            out = await run_blocking(_out, ["ss", "-tlnp"])
             return _result(request, output=out[:4000])
 
         if op == "toolchain":
@@ -493,7 +488,7 @@ class MachineCapability:
                     ]
                 )
 
-            text = await loop.run_in_executor(None, _svc)
+            text = await run_blocking(_svc)
             return _result(request, output=text[:6000])
 
         if op == "gpu":
@@ -516,7 +511,7 @@ class MachineCapability:
                 ]
                 return "\n".join(gpu_lines) or "(no gpu info)"
 
-            text = await loop.run_in_executor(None, _gpu)
+            text = await run_blocking(_gpu)
             return _result(request, output=text)
 
         if op == "env":

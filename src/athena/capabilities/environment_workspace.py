@@ -8,11 +8,11 @@ from athena.protocol.capabilities import CapabilityRequest
 from athena.protocol.capabilities import CapabilityResult
 from athena.protocol.capabilities import EffectClass
 from typing import Any
-import asyncio
 import json
 import os
 
 from athena.capabilities.environment_common import _result
+from athena.execution.async_call import run_blocking
 
 
 class WorkspaceCapability:
@@ -94,7 +94,6 @@ class WorkspaceCapability:
         args = dict(request.arguments or {})
         op = str(args.get("operation") or "")
         root = self._bind_context(context)
-        loop = asyncio.get_running_loop()
         refresh_index = bool(args.get("refresh", False))
         if root is None:
             return _result(request, ok=False, error="no workspace bound to this call")
@@ -112,7 +111,7 @@ class WorkspaceCapability:
                 git = "yes" if os.path.isdir(os.path.join(root, ".git")) else "no"
                 return f"root={root}\nfiles={files}\nbytes={size}\ngit={git}"
 
-            return _result(request, output=await loop.run_in_executor(None, _st))
+            return _result(request, output=await run_blocking(_st))
 
         if op == "changed_files":
 
@@ -134,10 +133,10 @@ class WorkspaceCapability:
                 entries.sort(reverse=True)
                 return "\n".join(f"{e[1]}" for e in entries[:25])
 
-            return _result(request, output=await loop.run_in_executor(None, _changed))
+            return _result(request, output=await run_blocking(_changed))
 
         if op == "profile":
-            index = await self._build_index(root, loop, refresh=refresh_index)
+            index = await self._build_index(root, refresh=refresh_index)
             profile_data = dict(index.profile)
             profile_data["environment"] = dict(index.environment)
             profile_data["index_revision"] = index.index_revision
@@ -148,7 +147,7 @@ class WorkspaceCapability:
             )
 
         if op == "index":
-            index = await self._build_index(root, loop, refresh=refresh_index)
+            index = await self._build_index(root, refresh=refresh_index)
             record = index.to_record()
             return _result(
                 request,
@@ -182,7 +181,7 @@ class WorkspaceCapability:
                         error=f"impact path outside workspace: {raw_path}",
                     )
             try:
-                index = await self._build_index(root, loop, refresh=refresh_index)
+                index = await self._build_index(root, refresh=refresh_index)
                 impact = index.impact([str(path) for path in raw_paths])
             except ValueError as exc:
                 return _result(request, ok=False, error=str(exc))
@@ -282,14 +281,13 @@ class WorkspaceCapability:
     async def _build_index(
         self,
         root: str,
-        loop,
         *,
         refresh: bool = False,
     ) -> Any:
         """Return the central index, rebuilding only when requested/stale."""
         if self._project_index_coordinator is not None:
             return await self._project_index_coordinator.current(root, refresh=refresh)
-        index = await loop.run_in_executor(None, self._project_index_builder.build, root)
+        index = await run_blocking(self._project_index_builder.build, root)
         if self._project_index_store is not None:
             await self._project_index_store.save(index)
         return index

@@ -52,6 +52,48 @@ class HTTPError(Exception):
         return {"code": self.code, "message": self.message, **self.data}
 
 
+def _loopback_client(host: object) -> bool:
+    """Accept only loopback clients at the application boundary."""
+    import ipaddress
+
+    value = str(host or "").casefold().rstrip(".")
+    if value == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        # In-process ASGI test transports often use a symbolic client name.
+        # A real socket transport supplies an IP address and is checked below.
+        return not value
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(address.is_loopback or (mapped is not None and mapped.is_loopback))
+
+
+class _LocalOnlyMiddleware:
+    """Prevent an accidentally remote ASGI bind from exposing the operator API."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            client = scope.get("client")
+            host = client[0] if isinstance(client, (tuple, list)) and client else None
+            if host is not None and not _loopback_client(host):
+                from starlette.responses import JSONResponse
+
+                response = JSONResponse(
+                    {
+                        "code": "local_only",
+                        "message": "Athena's operator API accepts loopback clients only",
+                    },
+                    status_code=403,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 class _JSONEncoder(json.JSONEncoder):
     """JSON encoder that renders protocol objects (dataclasses, enums, etc.)."""
 
@@ -600,7 +642,10 @@ def create_app(service: Any = None) -> Any:
 
     app = Starlette(routes=routes, lifespan=_lifespan(service))
     _install_exception_handlers(app)
-    return app
+    # Keep local-only policy in the app itself as well as in the canonical
+    # uvicorn runner. Embedders that preserve the socket client address cannot
+    # accidentally turn an unauthenticated operator surface into a network API.
+    return _LocalOnlyMiddleware(app)
 
 
 def _lifespan(service: Any) -> Any:

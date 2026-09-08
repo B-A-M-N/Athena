@@ -14,13 +14,14 @@ result still belongs to ``SynthesisEngine`` and its restricted backend.
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
 
 class ValidationTier(str, Enum):
@@ -36,7 +37,7 @@ class ValidationTier(str, Enum):
 @dataclass(frozen=True)
 class ValidationCheck:
     name: str
-    status: str  # passed | failed | skipped
+    status: str  # passed | failed | skipped | timed_out | unavailable | tool_error
     detail: str = ""
     tool: str | None = None
 
@@ -58,15 +59,43 @@ class SourceValidation:
 
     @property
     def passed(self) -> bool:
-        return all(check.status != "failed" for check in self.checks)
+        # A timeout or infrastructure failure is not evidence that source is
+        # invalid.  It is still a non-passing validation result, so callers
+        # cannot accidentally promote unvalidated code.
+        return all(check.status in {"passed", "skipped"} for check in self.checks)
+
+    @property
+    def outcome(self) -> str:
+        """Classify why validation did or did not produce admissible proof."""
+        statuses = {check.status for check in self.checks}
+        if "timed_out" in statuses:
+            return "timed_out"
+        if "unavailable" in statuses:
+            return "environment_unavailable"
+        if "tool_error" in statuses:
+            return "tool_failed"
+        if "failed" in statuses:
+            return "invalid_source"
+        return "valid"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "tier": self.tier.value,
             "passed": self.passed,
             "checks": [check.to_dict() for check in self.checks],
-            "metadata": dict(self.metadata),
+            "metadata": {"outcome": self.outcome, **dict(self.metadata)},
         }
+
+
+@dataclass(frozen=True)
+class _ToolResult:
+    """Small subprocess result with an explicit infrastructure outcome."""
+
+    command: list[str]
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+    status: str = "failed"
 
 
 class GeneratedSourceValidator:
@@ -86,8 +115,23 @@ class GeneratedSourceValidator:
         ValidationTier.USER: ("ruff", "mypy"),
     }
 
-    def __init__(self, *, timeout: float = 10.0) -> None:
-        self._timeout = timeout
+    def __init__(
+        self,
+        *,
+        timeout: float = 30.0,
+        tool_timeouts: Mapping[str, float] | None = None,
+        cache_size: int = 128,
+    ) -> None:
+        if timeout <= 0:
+            raise ValueError("validation timeout must be positive")
+        self._timeout = float(timeout)
+        self._tool_timeouts = {
+            str(tool): float(value) for tool, value in (tool_timeouts or {}).items()
+        }
+        if any(value <= 0 for value in self._tool_timeouts.values()):
+            raise ValueError("validation tool timeouts must be positive")
+        self._cache: dict[str, SourceValidation] = {}
+        self._cache_size = max(0, int(cache_size))
 
     def validate(
         self,
@@ -98,6 +142,10 @@ class GeneratedSourceValidator:
         selected = tier if isinstance(tier, ValidationTier) else ValidationTier(tier)
         checks: list[ValidationCheck] = []
         source = str(code or "")
+        cache_key = self._cache_key(source, selected)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         try:
             tree = ast.parse(source, filename="generated_capability.py")
@@ -121,7 +169,7 @@ class GeneratedSourceValidator:
                 checks.append(
                     ValidationCheck(
                         "format",
-                        "failed" if "ruff" in self._REQUIRED_TOOLS[selected] else "skipped",
+                        "unavailable" if "ruff" in self._REQUIRED_TOOLS[selected] else "skipped",
                         "ruff is not installed",
                         tool="ruff",
                     )
@@ -129,7 +177,7 @@ class GeneratedSourceValidator:
                 checks.append(
                     ValidationCheck(
                         "lint",
-                        "failed" if "ruff" in self._REQUIRED_TOOLS[selected] else "skipped",
+                        "unavailable" if "ruff" in self._REQUIRED_TOOLS[selected] else "skipped",
                         "ruff is not installed",
                         tool="ruff",
                     )
@@ -138,9 +186,9 @@ class GeneratedSourceValidator:
                 format_result = _run_tool(
                     [ruff, "format", path],
                     cwd=root,
-                    timeout=self._timeout,
+                    timeout=self._timeout_for("ruff"),
                 )
-                if format_result.returncode == 0:
+                if format_result.status == "passed":
                     # Formatter output is canonical input to subsequent checks
                     # and to the eventual code hash.
                     with open(path, encoding="utf-8") as handle:
@@ -153,7 +201,10 @@ class GeneratedSourceValidator:
                 else:
                     checks.append(
                         ValidationCheck(
-                            "format", "failed", _tool_detail(format_result), tool="ruff"
+                            "format",
+                            format_result.status,
+                            _tool_detail(format_result),
+                            tool="ruff",
                         )
                     )
 
@@ -168,12 +219,12 @@ class GeneratedSourceValidator:
                 lint_result = _run_tool(
                     [ruff, "check", "--select", "E4,E7,E9,F,B,I,UP", path],
                     cwd=root,
-                    timeout=self._timeout,
+                    timeout=self._timeout_for("ruff"),
                 )
                 checks.append(
                     ValidationCheck(
                         "lint",
-                        "passed" if lint_result.returncode == 0 else "failed",
+                        lint_result.status,
                         _tool_detail(lint_result),
                         tool="ruff",
                     )
@@ -184,7 +235,7 @@ class GeneratedSourceValidator:
                 checks.append(
                     ValidationCheck(
                         "typecheck",
-                        "failed" if "mypy" in self._REQUIRED_TOOLS[selected] else "skipped",
+                        "unavailable" if "mypy" in self._REQUIRED_TOOLS[selected] else "skipped",
                         "mypy is not installed",
                         tool="mypy",
                     )
@@ -197,12 +248,12 @@ class GeneratedSourceValidator:
                 type_result = _run_tool(
                     [mypy, "--ignore-missing-imports", "--follow-imports=skip", path],
                     cwd=root,
-                    timeout=self._timeout,
+                    timeout=self._timeout_for("mypy"),
                 )
                 checks.append(
                     ValidationCheck(
                         "typecheck",
-                        "passed" if type_result.returncode == 0 else "failed",
+                        type_result.status,
                         _tool_detail(type_result),
                         tool="mypy",
                     )
@@ -214,15 +265,43 @@ class GeneratedSourceValidator:
                     )
                 )
 
-        return SourceValidation(
+        result = SourceValidation(
             selected,
             source,
             tuple(checks),
             metadata={
                 "required_tools": list(self._REQUIRED_TOOLS[selected]),
                 "available_tools": [tool for tool in ("ruff", "mypy") if shutil.which(tool)],
+                "timeouts": {tool: self._timeout_for(tool) for tool in ("ruff", "mypy")},
+                "cache_size": self._cache_size,
             },
         )
+        # Tool failures and timeouts are intentionally not cached: a transient
+        # CI/process failure must be retryable and must not become durable
+        # negative proof. Valid and source-invalid outcomes are deterministic
+        # for the keyed source/tool environment and safely avoid repeated
+        # expensive Mypy runs during promotion/revalidation.
+        if self._cache_size and result.outcome in {"valid", "invalid_source"}:
+            if len(self._cache) >= self._cache_size:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[cache_key] = result
+        return result
+
+    def _timeout_for(self, tool: str) -> float:
+        return self._tool_timeouts.get(tool, self._timeout)
+
+    def _cache_key(self, source: str, tier: ValidationTier) -> str:
+        tools = tuple((tool, shutil.which(tool) or "") for tool in ("ruff", "mypy"))
+        material = repr(
+            (
+                source,
+                tier.value,
+                tools,
+                self._timeout_for("ruff"),
+                self._timeout_for("mypy"),
+            )
+        ).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
 
 
 def _contract_checks(tree: ast.AST) -> list[ValidationCheck]:
@@ -293,9 +372,9 @@ def _security_checks(tree: ast.AST) -> list[ValidationCheck]:
     return [ValidationCheck("security", "passed")]
 
 
-def _run_tool(command: list[str], *, cwd: str, timeout: float) -> subprocess.CompletedProcess[str]:
+def _run_tool(command: list[str], *, cwd: str, timeout: float) -> _ToolResult:
     try:
-        return subprocess.run(
+        result = subprocess.run(
             command,
             cwd=cwd,
             capture_output=True,
@@ -304,10 +383,32 @@ def _run_tool(command: list[str], *, cwd: str, timeout: float) -> subprocess.Com
             env=_tool_env(),
             check=False,
         )
+        return _ToolResult(
+            command,
+            result.returncode,
+            result.stdout or "",
+            result.stderr or "",
+            (
+                "passed"
+                if result.returncode == 0
+                # Ruff and Mypy use exit 1 for ordinary source diagnostics.
+                # Other non-zero codes are tool/ invocation failures and must
+                # not be misreported as evidence that the source is invalid.
+                else "failed"
+                if result.returncode == 1
+                else "tool_error"
+            ),
+        )
     except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(command, 124, "", f"timed out after {exc.timeout}s")
+        return _ToolResult(
+            command,
+            124,
+            "",
+            f"timed out after {exc.timeout}s",
+            "timed_out",
+        )
     except OSError as exc:
-        return subprocess.CompletedProcess(command, 127, "", str(exc))
+        return _ToolResult(command, 127, "", str(exc), "unavailable")
 
 
 def _tool_env() -> dict[str, str]:
@@ -320,7 +421,7 @@ def _tool_env() -> dict[str, str]:
     return env
 
 
-def _tool_detail(result: subprocess.CompletedProcess[str]) -> str:
+def _tool_detail(result: _ToolResult | subprocess.CompletedProcess[str]) -> str:
     output = (result.stdout or "") + (result.stderr or "")
     return output.strip()[-2000:]
 

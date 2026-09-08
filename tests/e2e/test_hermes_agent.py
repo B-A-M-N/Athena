@@ -28,6 +28,7 @@ def _write_certification_evidence(
     path: str | Path,
     *,
     source_sha: str,
+    release_run_id: str = "local",
     profile: str,
     preflight: Any,
     packet: ReviewPacket,
@@ -40,6 +41,7 @@ def _write_certification_evidence(
     build_record = build if isinstance(build, Mapping) else {}
     evidence = {
         "source_sha": source_sha,
+        "release_run_id": release_run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "profile": profile,
         "certification_scope": "live_transport_and_read_only_contract",
@@ -137,6 +139,9 @@ async def test_live_hermes_referee_transport() -> None:
             source_sha=os.environ.get("ATHENA_RELEASE_SHA")
             or os.environ.get("GITHUB_SHA")
             or "unknown",
+            release_run_id=os.environ.get("ATHENA_RELEASE_RUN_ID")
+            or os.environ.get("GITHUB_RUN_ID")
+            or "local",
             profile=profile,
             preflight=preflight,
             packet=packet,

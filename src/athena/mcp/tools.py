@@ -145,10 +145,13 @@ def infer_effects(
         if destructive:
             effects.add(EffectClass.DELETE)
             effects.add(EffectClass.NETWORK_WRITE)
+        elif _name_has_mutating_verb(name):
+            # Server hints can be forged. A mutating tool name is enough to
+            # retain the conservative network-write floor; readOnlyHint may
+            # never downgrade it.
+            effects.add(EffectClass.NETWORK_WRITE)
         elif read_only:
             effects.add(EffectClass.NETWORK_READ)
-        elif verb in _MUTATING_VERBS:
-            effects.add(EffectClass.NETWORK_WRITE)
         else:
             effects.add(EffectClass.NETWORK_WRITE)
         return _frozenset_or_default(effects)
@@ -246,6 +249,11 @@ def _looks_networky(name: str, input_schema: Mapping[str, Any] | None) -> bool:
 
 def _frozenset_or_default(effects: set[EffectClass]) -> frozenset[EffectClass]:
     return frozenset(effects) if effects else frozenset({EffectClass.READ_LOCAL})
+
+
+def _name_has_mutating_verb(name: str) -> bool:
+    """Recognize mutating words in snake/kebab/dotted MCP tool names."""
+    return bool(set(re.findall(r"[a-z0-9]+", name)) & _MUTATING_VERBS)
 
 
 __all__ = [

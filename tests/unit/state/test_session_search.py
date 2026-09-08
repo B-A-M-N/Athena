@@ -11,6 +11,7 @@ from athena.protocol.ids import new_id
 from athena.protocol.messages import Message, Provenance, Role, SourceType, TextBlock, utcnow
 from athena.state.database import Database
 from athena.state.messages import MessageStore, sanitize_fts_query
+from athena.state.sessions import SessionRepository
 from athena.capabilities.session_search import SessionSearchCapability
 
 
@@ -156,3 +157,46 @@ async def test_session_search_capability_refuses_model_scope_widening():
     payload = json.loads(result.output)
     # The unprivileged request stays scoped to its own session.
     assert payload["scope"] == [session]
+
+
+@pytest.mark.asyncio
+async def test_principal_history_search_and_anchor_read_are_host_scoped():
+    db = Database(":memory:")
+    sessions = SessionRepository(db)
+    store = MessageStore(db)
+    alice = new_id("session")
+    bob = new_id("session")
+    await sessions.create(alice, principal_id="alice", project_id="project-a")
+    await sessions.create(bob, principal_id="bob", project_id="project-b")
+    anchor = new_id("msg")
+    await store.append_to_session(
+        alice,
+        Message(
+            id=anchor,
+            role=Role.ASSISTANT,
+            blocks=(TextBlock(text="the durable decision is use postgres"),),
+            created_at=utcnow(),
+            provenance=Provenance(source_type=SourceType.SESSION),
+            metadata={},
+        ),
+    )
+    await store.append_to_session(
+        bob,
+        Message(
+            id=new_id("msg"),
+            role=Role.ASSISTANT,
+            blocks=(TextBlock(text="the durable decision is use sqlite"),),
+            created_at=utcnow(),
+            provenance=Provenance(source_type=SourceType.SESSION),
+            metadata={},
+        ),
+    )
+
+    hits = await store.search("postgres", principal_id="alice")
+    assert [hit["session_id"] for hit in hits] == [alice]
+    assert await store.search("sqlite", principal_id="alice") == []
+    assert await store.read_context(anchor, principal_id="bob") is None
+    detail = await store.read_context(anchor, principal_id="alice", before=0, after=0)
+    assert detail is not None
+    assert detail["session_id"] == alice
+    assert [item["message_id"] for item in detail["anchor"]["context"]] == [anchor]

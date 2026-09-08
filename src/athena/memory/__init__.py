@@ -8,6 +8,12 @@ generation.
 
 from athena.memory.store import MemoryStore, new_memory_id
 from athena.memory.retrieval import MemoryRetriever
+from athena.memory.embeddings import (
+    DEFAULT_FASTEMBED_MODEL,
+    FastEmbedProvider,
+    MemoryEmbeddingProvider,
+    SemanticRetrievalUnavailable,
+)
 from athena.memory.conflicts import (
     MemoryConflictResolver,
     ConflictReport,
@@ -23,6 +29,10 @@ __all__ = [
     "ConflictReport",
     "ConflictResult",
     "ConflictResolution",
+    "DEFAULT_FASTEMBED_MODEL",
+    "FastEmbedProvider",
+    "MemoryEmbeddingProvider",
+    "SemanticRetrievalUnavailable",
     "candidates_from_task",
     "new_memory_id",
 ]

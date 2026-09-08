@@ -51,6 +51,13 @@ _PROTECTED_CATEGORIES = frozenset(
     }
 )
 
+# A summarizer must see the beginning of an omitted range as well as its tail.
+# Keep each utility-inference input bounded, then reduce the bounded partials.
+# The estimate used by the context compiler is four characters per token, so
+# this is roughly a two-thousand-token source chunk.
+_SUMMARY_CHUNK_CHARS = 8_000
+_SUMMARY_CHUNK_OUTPUT_TOKENS = 256
+
 
 @dataclass(frozen=True)
 class CompressionMarker:
@@ -183,11 +190,13 @@ class ContextCompressor:
         *,
         task=None,
         cache_key: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         identity = {
             "source": cache_key or hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "max_summary_chars": self.max_summary_chars,
             "recent_turns": self.recent_turns,
+            "max_tokens": max_tokens,
             "summarizer": (
                 type(self._summarizer).__qualname__
                 if self._summarizer is not None
@@ -197,29 +206,124 @@ class ContextCompressor:
         key = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        max_chars = self.max_summary_chars
+        if max_tokens is not None:
+            max_chars = min(max_chars, max(0, int(max_tokens)) * 4)
+        if max_chars <= 0:
+            return ""
         cached = self._cached_summary(key)
         if cached is not None:
-            return cached
+            return _truncate_to_tokens(cached, max_tokens, max_chars)
         if self._summarizer is not None:
             try:
-                try:
-                    result = await self._summarizer(text, task=task)
-                except TypeError:
-                    # Preserve the small public ``text -> str`` callback
-                    # contract used by standalone compiler clients.
-                    result = await self._summarizer(text)
+                result = await self._hierarchical_model_summary(
+                    text,
+                    task=task,
+                    max_tokens=max_tokens,
+                )
                 if result:
-                    summary = str(result)[: self.max_summary_chars]
+                    summary = _truncate_to_tokens(result, max_tokens, max_chars)
                     self._remember_summary(key, summary)
                     return summary
             except Exception:
                 pass
-        if len(text) <= self.max_summary_chars:
-            summary = text
+        if len(text) <= max_chars:
+            summary = _truncate_to_tokens(text, max_tokens, max_chars)
         else:
-            summary = text[: self.max_summary_chars] + " …"
+            summary = _truncate_to_tokens(text[:max_chars] + " …", max_tokens, max_chars)
         self._remember_summary(key, summary)
         return summary
+
+    async def _hierarchical_model_summary(
+        self,
+        text: str,
+        *,
+        task=None,
+        max_tokens: int | None = None,
+    ) -> str | None:
+        """Summarize complete input through bounded map/reduce passes.
+
+        The first pass covers the entire omitted range in order-preserving
+        chunks. Later passes only see summaries, so a large transcript cannot
+        silently turn into a tail-only model request. The callback receives
+        the output budget when it supports the new keyword; older ``text`` or
+        ``text, task=`` callbacks remain valid.
+        """
+        if len(text) <= _SUMMARY_CHUNK_CHARS:
+            return await self._call_summarizer(text, task=task, max_tokens=max_tokens)
+
+        chunk_budget = max_tokens
+        if chunk_budget is None:
+            chunk_budget = _SUMMARY_CHUNK_OUTPUT_TOKENS
+        else:
+            chunk_budget = max(1, min(_SUMMARY_CHUNK_OUTPUT_TOKENS, int(chunk_budget)))
+
+        summaries: list[str] = []
+        for chunk in _bounded_text_chunks(text, _SUMMARY_CHUNK_CHARS):
+            summary = await self._call_summarizer(
+                chunk,
+                task=task,
+                max_tokens=chunk_budget,
+            )
+            if summary:
+                summaries.append(summary)
+        if not summaries:
+            return None
+
+        # Reduce in bounded groups if many chunk summaries still exceed one
+        # utility request. This retains order and gives the final pass a
+        # compact, complete representation of every source chunk.
+        while len("\n\n".join(summaries)) > _SUMMARY_CHUNK_CHARS:
+            reduced: list[str] = []
+            group: list[str] = []
+            group_chars = 0
+            for summary in summaries:
+                if group and group_chars + len(summary) + 2 > _SUMMARY_CHUNK_CHARS:
+                    reduced_summary = await self._call_summarizer(
+                        "\n\n".join(group),
+                        task=task,
+                        max_tokens=chunk_budget,
+                    )
+                    if reduced_summary:
+                        reduced.append(reduced_summary)
+                    group = []
+                    group_chars = 0
+                group.append(summary)
+                group_chars += len(summary) + 2
+            if group:
+                reduced_summary = await self._call_summarizer(
+                    "\n\n".join(group),
+                    task=task,
+                    max_tokens=chunk_budget,
+                )
+                if reduced_summary:
+                    reduced.append(reduced_summary)
+            if not reduced:
+                return None
+            summaries = reduced
+
+        reduced_input = "\n\n".join(summaries)
+        final = await self._call_summarizer(
+            reduced_input,
+            task=task,
+            max_tokens=max_tokens,
+        )
+        return final or reduced_input
+
+    async def _call_summarizer(self, text: str, *, task=None, max_tokens: int | None) -> str | None:
+        """Call the configured summarizer across the supported callback APIs."""
+        try:
+            result = await self._summarizer(text, task=task, max_tokens=max_tokens)
+        except TypeError:
+            try:
+                result = await self._summarizer(text, max_tokens=max_tokens)
+            except TypeError:
+                try:
+                    result = await self._summarizer(text, task=task)
+                except TypeError:
+                    # Preserve the original standalone ``text -> str`` contract.
+                    result = await self._summarizer(text)
+        return str(result) if result else None
 
     async def compress(
         self,
@@ -326,6 +430,21 @@ def _selection_group_cache_key(selections: list[Selection]) -> str:
     )
 
 
+def _bounded_text_chunks(text: str, max_chars: int) -> list[str]:
+    """Split text in order without dropping any source characters."""
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        cut = remaining.rfind(" ", 0, max_chars + 1)
+        if cut <= 0:
+            cut = max_chars
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 __all__ = [
     "CompressionMarker",
     "CompressionRecord",
@@ -333,3 +452,18 @@ __all__ = [
     "selection_is_protected",
     "is_capability_block",
 ]
+
+
+def _truncate_to_tokens(text: str, max_tokens: int | None, max_chars: int) -> str:
+    """Bound summary text using the same deterministic estimator as context."""
+    text = text[:max_chars]
+    if max_tokens is None or estimate_tokens(text) <= max_tokens:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if estimate_tokens(text[:mid]) <= max_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]

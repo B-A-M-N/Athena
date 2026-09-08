@@ -4,7 +4,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from athena.cli.app import Options, _arg_parse, _cmd_run, _config_set, build_config
+from athena.cli.app import (
+    Options,
+    _arg_parse,
+    _cmd_run,
+    _cmd_workflows,
+    _config_set,
+    build_config,
+)
 from athena.protocol.errors import ModelProviderUnconfigured
 from athena.protocol.tasks import TaskStatus
 
@@ -79,6 +86,32 @@ def test_argparse_oi_stream_preserves_task_and_db_options():
     assert options.command == "oi-stream"
     assert options.db_path == "/tmp/athena-events.db"
     assert options.args == ["task-42"]
+
+
+def test_argparse_workflows_preserves_actions():
+    options = _arg_parse(["workflows", "describe", "workflow-1", "task-1"])
+
+    assert options.command == "workflows"
+    assert options.args == ["describe", "workflow-1", "task-1"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_command_renders_durable_view(capsys):
+    class Service:
+        async def list_workflows(self, *, task_id=None):
+            assert task_id is None
+            return [
+                {
+                    "id": "workflow-1",
+                    "scope": "project",
+                    "lifecycle_state": "ACTIVE",
+                    "enabled": True,
+                    "name": "release procedure",
+                }
+            ]
+
+    assert await _cmd_workflows(Options(command="workflows", args=["list"]), Service()) == 0
+    assert "workflow-1\tproject\tACTIVE\tenabled\trelease procedure" in capsys.readouterr().out
 
 
 def test_argparse_config_set_preserves_operator_key_and_value():
@@ -159,6 +192,36 @@ def test_config_set_reports_the_actual_boolean_field(capsys, tmp_path, monkeypat
 
     assert result == 2
     assert "hermes-referee.allow-remote expects true or false" in capsys.readouterr().err
+
+
+def test_config_set_rejects_raw_credentials_in_structured_values(capsys, tmp_path):
+    result = _config_set(
+        Options(
+            command="config",
+            config_action="set",
+            config_path=str(tmp_path / "config.toml"),
+            config_key="providers",
+            config_value='[{"kind":"openai-compat","api_key":"raw-secret"}]',
+        )
+    )
+
+    assert result == 2
+    assert "raw credentials" in capsys.readouterr().err
+
+
+def test_config_set_allows_secret_env_references(tmp_path):
+    path = tmp_path / "config.toml"
+    result = _config_set(
+        Options(
+            command="config",
+            config_action="set",
+            config_path=str(path),
+            config_key="mcp_servers",
+            config_value='[{"name":"local","secret_env":{"API_KEY":"ATHENA_API_KEY"}}]',
+        )
+    )
+
+    assert result == 0
 
 
 class _RunSurface:

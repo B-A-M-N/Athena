@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
+from athena.models.media import image_data_path
 from athena.protocol.errors import (
     ContextOverflow,
     ModelUnavailable,
@@ -424,6 +425,16 @@ class AnthropicProvider:
         for index, msg in enumerate(request.messages):
             if msg.role == Role.SYSTEM:
                 continue
+            if msg.role is Role.COMPRESSION:
+                # Anthropic also has no wire-level compression role. Keep the
+                # distinction explicit and visible to the model rather than
+                # silently relying on the ordinary assistant/user fallback.
+                text = "[Athena compressed context]\n" + msg.conversation_text()
+                compression_content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+                if index == cache_breakpoint_index:
+                    compression_content[-1]["cache_control"] = {"type": "ephemeral"}
+                out.append({"role": "user", "content": compression_content})
+                continue
             content: list[dict[str, Any]] = []
             replay_reasoning = bool(msg.metadata.get("replay_reasoning", False))
             for block in msg.blocks:
@@ -444,15 +455,37 @@ class AnthropicProvider:
                     )
                 elif isinstance(block, ArtifactRefBlock) and block.uri:
                     # Anthropic has no portable artifact-ref block. Keep the
-                    # reference visible to the model instead of silently
-                    # dropping durable context; callers that need native
-                    # media should resolve it to an image/data URL first.
-                    content.append(
-                        {
-                            "type": "text",
-                            "text": f"[artifact attachment: {block.uri}]",
-                        }
-                    )
+                    # reference visible if local hydration is unavailable;
+                    # image artifacts become native model input when readable.
+                    image_url = image_data_path(block)
+                    if image_url is not None:
+                        if image_url.startswith("data:"):
+                            header, encoded = image_url.split(",", 1)
+                            media_type = header[5:].split(";", 1)[0]
+                            content.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": encoded,
+                                    },
+                                }
+                            )
+                        else:
+                            content.append(
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": image_url},
+                                }
+                            )
+                    else:
+                        content.append(
+                            {
+                                "type": "text",
+                                "text": f"[artifact attachment: {block.uri}]",
+                            }
+                        )
                 elif isinstance(block, FileRefBlock) and block.uri:
                     content.append(
                         {

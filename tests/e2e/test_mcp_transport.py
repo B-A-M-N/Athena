@@ -38,7 +38,9 @@ if __name__ == '__main__':
         command=sys.executable,
         args=[str(server)],
         cwd=str(tmp_path),
-        connect_timeout=15,
+        # The stdio server is a real child process; allow cold Python/MCP
+        # imports to complete while retaining a hard upper bound.
+        connect_timeout=30,
     )
     try:
         await client.connect()

@@ -16,8 +16,6 @@ from athena.state.external_effects import ExternalEffectRecoveryRequired
 from athena.state.external_effects import ExternalEffectStore
 from typing import Any
 from urllib.parse import urlparse
-import asyncio
-import ipaddress
 import json
 import socket
 
@@ -31,6 +29,8 @@ from athena.capabilities.environment_common import _external_receipt_result
 from athena.capabilities.environment_common import _external_request_digest
 from athena.capabilities.environment_common import _safe_external_response
 from athena.capabilities.environment_common import _network_effects
+from athena.execution.async_call import run_blocking
+from athena.network.target_policy import validate_target
 
 
 class NetworkCapability:
@@ -177,7 +177,6 @@ class NetworkCapability:
         args = dict(request.arguments or {})
         op = str(args.get("operation") or "")
         timeout = min(float(args.get("timeout") or 10.0), 30.0)
-        loop = asyncio.get_running_loop()
         context = kw.get("context")
         network_policy = getattr(getattr(context, "workspace", None), "network_policy", None)
         policy_name = getattr(network_policy, "value", network_policy)
@@ -205,38 +204,12 @@ class NetworkCapability:
             )
 
         def _restricted_addresses(host: str) -> tuple[str | None, tuple[str, ...]]:
-            """Reject localhost/private/metadata targets in restricted mode.
-
-            Resolve names before connecting so a public-looking hostname that
-            resolves into a private or link-local address cannot be used as a
-            basic SSRF primitive.  The HTTP branch also disables redirects in
-            restricted mode because a redirect target is a new destination.
-            """
-            if policy_name != "restricted":
-                return None, ()
-            candidate = host.strip().strip("[]").lower().rstrip(".")
-            if not candidate or candidate in {"localhost", "localhost.localdomain"}:
-                return "restricted network policy rejects local targets", ()
-            try:
-                addresses = {ipaddress.ip_address(candidate)}
-                address_strings: tuple[str, ...] = (candidate,)
-            except ValueError:
-                try:
-                    address_strings = _facade.resolve_addresses(candidate, 0)
-                    addresses = {ipaddress.ip_address(address) for address in address_strings}
-                except (OSError, socket.gaierror):
-                    return f"unable to resolve host under restricted network policy: {host}", ()
-            if any(
-                address.is_private
-                or address.is_loopback
-                or address.is_link_local
-                or address.is_reserved
-                or address.is_multicast
-                or address.is_unspecified
-                for address in addresses
-            ):
-                return f"restricted network policy rejects private/local host: {host}", ()
-            return None, tuple(address_strings)
+            validated, error = validate_target(
+                host,
+                policy_name,
+                resolver=_facade.resolve_addresses,
+            )
+            return error, validated.addresses if validated is not None else ()
 
         if op == "http":
             url = str(args.get("url") or "")
@@ -322,7 +295,7 @@ class NetworkCapability:
                 finally:
                     s.close()
 
-            open_ = await loop.run_in_executor(None, _tcp)
+            open_ = await run_blocking(_tcp)
             return _result(
                 request,
                 output=f"{host}:{port} " + ("open" if open_ else "closed"),
@@ -341,7 +314,7 @@ class NetworkCapability:
                 return f"{name} -> {', '.join(uniq)}"
 
             try:
-                text = await loop.run_in_executor(None, _dns)
+                text = await run_blocking(_dns)
             except socket.gaierror as exc:
                 return _result(request, ok=False, error=str(exc))
             return _result(request, output=text)
@@ -352,7 +325,7 @@ class NetworkCapability:
                 _rc, out, err = _facade._run(["ss", "-tlnp"])
                 return out or err
 
-            return _result(request, output=(await loop.run_in_executor(None, _ls))[:5000])
+            return _result(request, output=(await run_blocking(_ls))[:5000])
 
         if op == "connections":
 
@@ -360,7 +333,7 @@ class NetworkCapability:
                 _rc, out, err = _facade._run(["ss", "-tnp"])
                 return out or err
 
-            return _result(request, output=(await loop.run_in_executor(None, _cx))[:5000])
+            return _result(request, output=(await run_blocking(_cx))[:5000])
 
         if op == "ping":
             host = str(args.get("host") or "")
@@ -375,7 +348,7 @@ class NetworkCapability:
                 rc, out, err = _facade._run(["ping", "-c", "3", "-W", "2", target])
                 return rc, out or err
 
-            rc, out = await loop.run_in_executor(None, _pg)
+            rc, out = await run_blocking(_pg)
             return _result(request, ok=rc == 0, output=out[:3000])
 
         return _result(request, ok=False, error=f"unknown operation: {op}")

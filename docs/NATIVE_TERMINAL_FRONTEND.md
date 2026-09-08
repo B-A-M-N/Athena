@@ -121,7 +121,7 @@ executable is shipped in the platform-tagged `athena-agent-native` companion
 wheel as `athena_native/athena-terminal`, while the universal Python wheel and
 sdist remain binary-free. `make native-package` builds only that companion
 wheel for local inspection. For an installed release, use the exact matching
-pair: `pip install "athena-agent==0.1.0" "athena-agent-native==0.1.0"`.
+pair: `pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`.
 The companion uses `py3-none-<platform>` because it is not a CPython extension;
 that tag does not make the bundled ELF portable. The certified deployment
 floor is Linux x86_64 GNU/glibc >= 2.34 with external X11, Xft, and OpenGL

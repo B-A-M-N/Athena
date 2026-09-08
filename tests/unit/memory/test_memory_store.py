@@ -1,16 +1,18 @@
+import json
 from datetime import timedelta
 
 import pytest
 
 from athena.state.database import Database
-from athena.memory.store import MemoryStore
+from athena.memory.embeddings import SemanticRetrievalUnavailable
+from athena.memory.store import MemoryStore, memory_content_hash
 from athena.protocol.memory import (
     MemoryKind,
     MemoryRecord,
     MemoryScope,
     RetrievalMode,
 )
-from athena.protocol.messages import TrustClass, utcnow
+from athena.protocol.messages import Provenance, SourceType, TrustClass, utcnow
 
 
 @pytest.fixture
@@ -63,6 +65,59 @@ async def test_lower_trust_same_id_rejected(store):
     assert got.content == higher.content
 
 
+async def test_same_subject_equal_trust_is_flagged_not_overwritten(store):
+    original = MemoryRecord(
+        id="mem_pref_a",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.GLOBAL,
+        content="Use dark mode for the operator interface.",
+        subject="operator theme",
+        trust=TrustClass.USER_CONTENT,
+    )
+    correction = MemoryRecord(
+        id="mem_pref_b",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.GLOBAL,
+        content="Use light mode for the operator interface.",
+        subject="operator theme",
+        trust=TrustClass.USER_CONTENT,
+    )
+
+    await store.save(original)
+    saved = await store.save(correction)
+
+    assert saved.id != correction.id
+    assert saved.contradicted_by == (original.id,)
+    assert len(await store.list_by_kind(MemoryKind.SEMANTIC)) == 2
+
+
+async def test_project_conflicts_do_not_cross_project_boundaries(store):
+    first = MemoryRecord(
+        id="mem_project_a",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.PROJECT,
+        content="The deployment branch is main.",
+        subject="deployment branch",
+        metadata={"scope_id": "project-a"},
+        trust=TrustClass.USER_CONTENT,
+    )
+    second = MemoryRecord(
+        id="mem_project_b",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.PROJECT,
+        content="The deployment branch is release.",
+        subject="deployment branch",
+        metadata={"scope_id": "project-b"},
+        trust=TrustClass.USER_CONTENT,
+    )
+
+    await store.save(first)
+    saved = await store.save(second)
+
+    assert saved.id == second.id
+    assert saved.contradicted_by == ()
+
+
 async def test_recall_and_search_filter_by_tags_and_scope(store):
     project = MemoryRecord(
         id="mem_sem_1",
@@ -86,7 +141,7 @@ async def test_recall_and_search_filter_by_tags_and_scope(store):
         tags=("deploy",),
         scope=MemoryScope.PROJECT,
         scope_id=None,
-        mode=RetrievalMode.SEMANTIC,
+        mode=RetrievalMode.RELEVANCE,
         limit=5,
     )
     assert {r.id for r in by_scope} == {"mem_sem_1"}
@@ -96,10 +151,62 @@ async def test_recall_and_search_filter_by_tags_and_scope(store):
         limit=5,
         scope=MemoryScope.PROJECT,
         scope_id=None,
-        mode=RetrievalMode.SEMANTIC,
+        mode=RetrievalMode.RELEVANCE,
         tags=("deploy",),
     )
     assert {r.id for r in via_search} == {"mem_sem_1"}
+
+
+class _EmbeddingProvider:
+    model = "test-embedding"
+    version = "v1"
+
+    async def embed(self, text: str) -> tuple[float, float]:
+        text = text.casefold()
+        return (1.0, 0.0) if any(word in text for word in ("brief", "verbose")) else (0.0, 1.0)
+
+
+async def test_semantic_mode_requires_explicit_embedding_provider(store):
+    with pytest.raises(SemanticRetrievalUnavailable, match="no MemoryEmbeddingProvider"):
+        await store.search(
+            "How verbose should I be?",
+            scope=MemoryScope.USER,
+            scope_id="alice",
+            mode=RetrievalMode.SEMANTIC,
+        )
+
+
+async def test_semantic_retrieval_uses_persisted_embedding_for_paraphrase():
+    db = Database(":memory:")
+    embedding_store = MemoryStore(db, embedding_provider=_EmbeddingProvider())
+    record = MemoryRecord(
+        id="mem-paraphrase",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.USER,
+        content="The operator prefers brief technical responses.",
+        metadata={"scope_id": "alice"},
+        confidence=0.95,
+    )
+    await embedding_store.save(record)
+
+    found = await embedding_store.search(
+        "How verbose should I be?",
+        scope=MemoryScope.USER,
+        scope_id="alice",
+        mode=RetrievalMode.SEMANTIC,
+        limit=5,
+    )
+    row = await db.fetch_one(
+        "SELECT content_hash, embedding_model, embedding_version FROM memory_embeddings "
+        "WHERE memory_id = ?",
+        (record.id,),
+    )
+
+    assert [item.id for item in found] == [record.id]
+    assert row["content_hash"] == memory_content_hash(record)
+    assert row["embedding_model"] == "test-embedding"
+    assert row["embedding_version"] == "v1"
+    await db.close()
 
 
 async def test_record_round_trips_section62_fields(store):
@@ -177,3 +284,66 @@ async def test_pending_candidate_has_promote_discard_and_expire_lifecycle(store)
     )
     assert await store.expire_pending_candidates(utcnow() - timedelta(days=30)) == 1
     assert await store.get("mem_expire") is None
+
+
+async def test_promoted_candidate_preserves_canonical_metadata_and_scope_retrieval(store):
+    pending = MemoryRecord(
+        id="mem_promote_canonical",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.TASK,
+        content="The operator prefers concise release notes.",
+        summary="release-note preference",
+        source=Provenance(
+            source_type=SourceType.USER,
+            source_id="task-1",
+            trust=TrustClass.USER_CONTENT,
+            scope="task:task-1",
+        ),
+        trust=TrustClass.USER_CONTENT,
+        metadata={
+            "pending_promotion": True,
+            "candidate_type": "explicit_user_fact",
+            "scope_id": "task-1",
+            "custom": "retained",
+        },
+        retrieval_mode=RetrievalMode.RELEVANCE,
+        subject="release notes",
+        tags=("release", "preference"),
+        source_refs=("msg-1",),
+        confidence=0.91,
+        supersedes=("mem-old",),
+        contradicted_by=("mem-conflict",),
+    )
+    await store.save(pending)
+
+    promoted = await store.promote_pending_candidate(
+        pending.id,
+        scope=MemoryScope.USER,
+        scope_id="principal-1",
+    )
+
+    assert promoted is not None
+    assert promoted.scope is MemoryScope.USER
+    assert promoted.trust is TrustClass.USER_CONTENT
+    assert promoted.source is not None and promoted.source.source_id == "task-1"
+    assert promoted.metadata["custom"] == "retained"
+    assert promoted.metadata["pending_promotion"] is False
+    assert promoted.metadata["promotion"] == "promoted"
+    assert promoted.retrieval_mode is RetrievalMode.RELEVANCE
+    assert promoted.tags == ("release", "preference")
+    assert promoted.confidence == 0.91
+    assert promoted.supersedes == ("mem-old",)
+    assert promoted.contradicted_by == ("mem-conflict",)
+    assert [
+        item.id
+        for item in await store.search(
+            "concise release notes",
+            scope=MemoryScope.USER,
+            scope_id="principal-1",
+        )
+    ] == [pending.id]
+
+    raw = await store._db.fetch_one("SELECT metadata FROM memories WHERE id = ?", (pending.id,))
+    metadata = json.loads(raw["metadata"])
+    assert metadata["_athena:scope_id"] == "principal-1"
+    assert metadata["_athena:provenance"]["source_id"] == "task-1"

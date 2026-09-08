@@ -30,7 +30,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from athena.protocol.tasks import AutonomyLevel
+from athena.protocol.policy import DEFAULT_PRINCIPAL_ID
 from athena.policy.credentials import write_user_secret
+from athena.memory.embeddings import DEFAULT_FASTEMBED_MODEL
 
 try:
     tomllib = import_module("tomllib")
@@ -233,7 +235,15 @@ class AthenaConfig:
     # Stable cache namespace for one authenticated user/tenant. Keep this
     # distinct between principals when one service process serves multiple
     # users; the value is hashed before it reaches a provider.
-    cache_namespace: str = "athena"
+    cache_namespace: str = DEFAULT_PRINCIPAL_ID
+    # Optional process-injected embedding provider. It is intentionally not
+    # serialized to TOML; deployments may replace the default FastEmbed
+    # provider with a concrete local/remote adapter at composition time.
+    memory_embedding_provider: Any | None = None
+    # The default provider is lazy and only loads/downloads this model when a
+    # semantic index or query is requested.
+    memory_embedding_model: str = DEFAULT_FASTEMBED_MODEL
+    memory_embedding_cache_dir: str | None = None
     # ``max_parallel_tasks`` is the canonical concurrency setting.  The
     # legacy constructor/key remains accepted so old configs migrate without
     # silently changing their limit.
@@ -262,10 +272,28 @@ class AthenaConfig:
     research_allowed_domains: tuple[str, ...] = ()
     research_denied_domains: tuple[str, ...] = ()
     research_allow_private_network: bool = False
+    # Optional first-party JSON discovery endpoint. Discovery returns
+    # untrusted candidate metadata only; source acquisition still goes through
+    # ResearchCapability's immutable snapshot + SSRF policy path.
+    research_discovery_endpoint: str | None = None
+    # Multiple first-party discovery indexes may be queried and fused. The
+    # singular field remains a compatibility alias for older config files.
+    research_discovery_endpoints: tuple[str, ...] = ()
+    research_discovery_timeout: float = 10.0
     # Structured browser automation (P1-28): a zero-arg callable returning a
-    # BrowserDriver (Playwright-shaped). The browser capability registers
-    # only when an operator wires a driver — the service never constructs a
-    # browser session on its own.
+    # BrowserDriver (Playwright-shaped). ``browser_enabled`` opts into the
+    # first-party Playwright launcher for file/TOML configuration; the
+    # injectable factory remains available for remote and test drivers.
+    browser_enabled: bool = False
+    browser_engine: str = "chromium"
+    browser_headless: bool = True
+    browser_launch_args: tuple[str, ...] = ()
+    browser_executable_path: str | None = None
+    browser_channel: str | None = None
+    browser_cdp_endpoint: str | None = None
+    browser_session_scope: str = "task"
+    browser_timeout_ms: int = 12_000
+    browser_viewport: tuple[int, int] | None = (1024, 768)
     browser_driver_factory: Any | None = None
     # Terminal UI: which mascot/buddy the surfaces show (a registered
     # character name, or "off" to hide the mascot column). ``mascots``
@@ -287,6 +315,43 @@ class AthenaConfig:
         # Keep the legacy read surface truthful after a canonical setting is
         # loaded; it is an alias, not a second concurrency authority.
         self.worker_max_parallel = self.max_parallel_tasks
+        self.parked_slot_wait_s = max(0.0, float(self.parked_slot_wait_s))
+        self.worker_lease_duration_seconds = max(1.0, float(self.worker_lease_duration_seconds))
+        self.worker_lease_renewal_divisor = max(1.0, float(self.worker_lease_renewal_divisor))
+        self.research_discovery_timeout = max(0.1, float(self.research_discovery_timeout))
+        self.memory_embedding_model = str(
+            self.memory_embedding_model or DEFAULT_FASTEMBED_MODEL
+        ).strip()
+        if not self.memory_embedding_model:
+            self.memory_embedding_model = DEFAULT_FASTEMBED_MODEL
+        if self.memory_embedding_cache_dir is not None:
+            cache_dir = str(self.memory_embedding_cache_dir).strip()
+            self.memory_embedding_cache_dir = cache_dir or None
+        endpoints = tuple(
+            str(value).strip() for value in self.research_discovery_endpoints if str(value).strip()
+        )
+        if self.research_discovery_endpoint:
+            endpoint = str(self.research_discovery_endpoint).strip()
+            if endpoint and endpoint not in endpoints:
+                endpoints = (endpoint, *endpoints)
+        self.research_discovery_endpoints = endpoints
+        if self.research_discovery_endpoint is None and len(endpoints) == 1:
+            self.research_discovery_endpoint = endpoints[0]
+        engine = str(self.browser_engine or "chromium").strip().lower()
+        if engine not in {"chromium", "firefox", "webkit"}:
+            raise ValueError("browser_engine must be chromium, firefox, or webkit")
+        self.browser_engine = engine
+        self.browser_launch_args = tuple(str(arg) for arg in self.browser_launch_args)
+        scope = str(self.browser_session_scope or "task").strip().lower()
+        if scope not in {"task", "session"}:
+            raise ValueError("browser_session_scope must be task or session")
+        self.browser_session_scope = scope
+        self.browser_timeout_ms = max(1, int(self.browser_timeout_ms))
+        if self.browser_viewport is not None:
+            width, height = (int(value) for value in self.browser_viewport)
+            if width <= 0 or height <= 0:
+                raise ValueError("browser_viewport dimensions must be positive")
+            self.browser_viewport = (width, height)
 
     @property
     def autonomy_level(self) -> AutonomyLevel:
@@ -454,10 +519,20 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["context_window"] = config.context_window
     if config.reserve_output != 4096:
         d["reserve_output"] = config.reserve_output
-    if config.cache_namespace != "athena":
+    if config.cache_namespace != DEFAULT_PRINCIPAL_ID:
         d["cache_namespace"] = config.cache_namespace
+    if config.memory_embedding_model != DEFAULT_FASTEMBED_MODEL:
+        d["memory_embedding_model"] = config.memory_embedding_model
+    if config.memory_embedding_cache_dir is not None:
+        d["memory_embedding_cache_dir"] = config.memory_embedding_cache_dir
     if config.max_parallel_tasks != 4:
         d["max_parallel_tasks"] = config.max_parallel_tasks
+    if config.parked_slot_wait_s != 300.0:
+        d["parked_slot_wait_s"] = config.parked_slot_wait_s
+    if config.worker_lease_duration_seconds != 300.0:
+        d["worker_lease_duration_seconds"] = config.worker_lease_duration_seconds
+    if config.worker_lease_renewal_divisor != 3.0:
+        d["worker_lease_renewal_divisor"] = config.worker_lease_renewal_divisor
     if config.scheduler_interval_seconds != 1.0:
         d["scheduler_interval_seconds"] = config.scheduler_interval_seconds
     if config.scheduler_max_concurrent != 0:
@@ -533,6 +608,32 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["research_denied_domains"] = list(config.research_denied_domains)
     if config.research_allow_private_network:
         d["research_allow_private_network"] = True
+    if len(config.research_discovery_endpoints) > 1:
+        d["research_discovery_endpoints"] = list(config.research_discovery_endpoints)
+    elif config.research_discovery_endpoint is not None:
+        d["research_discovery_endpoint"] = config.research_discovery_endpoint
+    if config.research_discovery_timeout != 10.0:
+        d["research_discovery_timeout"] = config.research_discovery_timeout
+    if config.browser_enabled:
+        d["browser_enabled"] = True
+    if config.browser_engine != "chromium":
+        d["browser_engine"] = config.browser_engine
+    if not config.browser_headless:
+        d["browser_headless"] = False
+    if config.browser_launch_args:
+        d["browser_launch_args"] = list(config.browser_launch_args)
+    if config.browser_executable_path is not None:
+        d["browser_executable_path"] = config.browser_executable_path
+    if config.browser_channel is not None:
+        d["browser_channel"] = config.browser_channel
+    if config.browser_cdp_endpoint is not None:
+        d["browser_cdp_endpoint"] = config.browser_cdp_endpoint
+    if config.browser_session_scope != "task":
+        d["browser_session_scope"] = config.browser_session_scope
+    if config.browser_timeout_ms != 12_000:
+        d["browser_timeout_ms"] = config.browser_timeout_ms
+    if config.browser_viewport != (1024, 768):
+        d["browser_viewport"] = list(config.browser_viewport) if config.browser_viewport else None
     if config.mascot is not None:
         d["mascot"] = config.mascot
     if config.mascots:
@@ -565,9 +666,29 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
             return tuple(v.strip() for v in value.split(",") if v.strip())
         return tuple(str(v).strip() for v in (value or ()) if str(v).strip())
 
+    def _endpoints(value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            return tuple(v.strip() for v in value.split(",") if v.strip())
+        return tuple(str(v).strip() for v in (value or ()) if str(v).strip())
+
+    discovery_endpoints = _endpoints(data.get("research_discovery_endpoints"))
+    legacy_discovery_endpoint = (
+        str(data["research_discovery_endpoint"]).strip()
+        if data.get("research_discovery_endpoint")
+        else None
+    )
+
     display = str(data.get("display", "auto")).strip().lower()
     if display not in {"auto", "glass", "ansi", "plain"}:
         display = "auto"
+    browser_args = data.get("browser_launch_args", ())
+    if isinstance(browser_args, str):
+        browser_args = (browser_args,)
+    else:
+        browser_args = tuple(str(value) for value in (browser_args or ()))
+    viewport = data.get("browser_viewport", (1024, 768))
+    if viewport is not None:
+        viewport = tuple(int(value) for value in viewport)
 
     return AthenaConfig(
         db_path=data.get("db_path"),
@@ -580,8 +701,23 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         hermes_referee=_parse_hermes_referee(data.get("hermes_referee")),
         context_window=int(data.get("context_window", 128_000)),
         reserve_output=int(data.get("reserve_output", 4096)),
-        cache_namespace=str(data.get("cache_namespace", "athena") or "athena").strip() or "athena",
+        cache_namespace=str(
+            data.get("cache_namespace", DEFAULT_PRINCIPAL_ID) or DEFAULT_PRINCIPAL_ID
+        ).strip()
+        or DEFAULT_PRINCIPAL_ID,
+        memory_embedding_model=str(
+            data.get("memory_embedding_model", DEFAULT_FASTEMBED_MODEL) or DEFAULT_FASTEMBED_MODEL
+        ).strip()
+        or DEFAULT_FASTEMBED_MODEL,
+        memory_embedding_cache_dir=(
+            str(data["memory_embedding_cache_dir"]).strip()
+            if data.get("memory_embedding_cache_dir")
+            else None
+        ),
         max_parallel_tasks=int(data.get("max_parallel_tasks", data.get("worker_max_parallel", 4))),
+        parked_slot_wait_s=float(data.get("parked_slot_wait_s", 300.0)),
+        worker_lease_duration_seconds=float(data.get("worker_lease_duration_seconds", 300.0)),
+        worker_lease_renewal_divisor=float(data.get("worker_lease_renewal_divisor", 3.0)),
         scheduler_interval_seconds=float(data.get("scheduler_interval_seconds", 1.0)),
         scheduler_max_concurrent=int(data.get("scheduler_max_concurrent", 0)),
         profile=data.get("profile"),
@@ -589,6 +725,23 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         research_allowed_domains=_domains(data.get("research_allowed_domains")),
         research_denied_domains=_domains(data.get("research_denied_domains")),
         research_allow_private_network=bool(data.get("research_allow_private_network", False)),
+        research_discovery_endpoint=legacy_discovery_endpoint,
+        research_discovery_endpoints=discovery_endpoints,
+        research_discovery_timeout=float(data.get("research_discovery_timeout", 10.0)),
+        browser_enabled=bool(data.get("browser_enabled", False)),
+        browser_engine=str(data.get("browser_engine", "chromium") or "chromium"),
+        browser_headless=bool(data.get("browser_headless", True)),
+        browser_launch_args=browser_args,
+        browser_executable_path=(
+            str(data["browser_executable_path"]) if data.get("browser_executable_path") else None
+        ),
+        browser_channel=str(data["browser_channel"]) if data.get("browser_channel") else None,
+        browser_cdp_endpoint=(
+            str(data["browser_cdp_endpoint"]) if data.get("browser_cdp_endpoint") else None
+        ),
+        browser_session_scope=str(data.get("browser_session_scope", "task")),
+        browser_timeout_ms=int(data.get("browser_timeout_ms", 12_000)),
+        browser_viewport=viewport if "browser_viewport" in data else (1024, 768),
         mascot=data.get("mascot"),
         mascots={
             str(k): dict(v) for k, v in (data.get("mascots") or {}).items() if isinstance(v, dict)
@@ -611,7 +764,8 @@ def _env_map() -> dict[str, Any]:
     Supported variables:
         ATHENA_DB_PATH, ATHENA_WORKSPACE, ATHENA_AUTONOMY,
         ATHENA_ARTIFACT_ROOT, ATHENA_CONTEXT_WINDOW,
-        ATHENA_CACHE_NAMESPACE, ATHENA_WORKER_MAX_PARALLEL,
+        ATHENA_CACHE_NAMESPACE, ATHENA_MEMORY_EMBEDDING_MODEL,
+        ATHENA_MEMORY_EMBEDDING_CACHE_DIR, ATHENA_WORKER_MAX_PARALLEL,
         ATHENA_SCHEDULER_INTERVAL_SECONDS,
         ATHENA_SCHEDULER_MAX_CONCURRENT, ATHENA_PROFILE,
         ATHENA_SKILLS_PATHS (comma-separated), ATHENA_MASCOT,
@@ -628,7 +782,12 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_CONTEXT_WINDOW": ("context_window", int),
         "ATHENA_RESERVE_OUTPUT": ("reserve_output", int),
         "ATHENA_CACHE_NAMESPACE": ("cache_namespace", str),
+        "ATHENA_MEMORY_EMBEDDING_MODEL": ("memory_embedding_model", str),
+        "ATHENA_MEMORY_EMBEDDING_CACHE_DIR": ("memory_embedding_cache_dir", str),
         "ATHENA_MAX_PARALLEL_TASKS": ("max_parallel_tasks", int),
+        "ATHENA_PARKED_SLOT_WAIT_S": ("parked_slot_wait_s", float),
+        "ATHENA_WORKER_LEASE_DURATION_SECONDS": ("worker_lease_duration_seconds", float),
+        "ATHENA_WORKER_LEASE_RENEWAL_DIVISOR": ("worker_lease_renewal_divisor", float),
         # Deprecated alias; canonical serialization always writes
         # max_parallel_tasks.
         "ATHENA_WORKER_MAX_PARALLEL": ("max_parallel_tasks", int),
@@ -665,6 +824,12 @@ def _env_map() -> dict[str, Any]:
             "research_allow_private_network",
             lambda v: str(v).strip().lower() in {"1", "true", "yes"},
         ),
+        "ATHENA_RESEARCH_DISCOVERY_ENDPOINT": ("research_discovery_endpoint", str),
+        "ATHENA_RESEARCH_DISCOVERY_ENDPOINTS": (
+            "research_discovery_endpoints",
+            lambda v: tuple(p.strip() for p in v.split(",") if p.strip()),
+        ),
+        "ATHENA_RESEARCH_DISCOVERY_TIMEOUT": ("research_discovery_timeout", float),
     }
     for env_name, (key, cast) in env_map.items():
         value = os.environ.get(env_name)

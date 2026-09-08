@@ -29,6 +29,7 @@ from athena.models.router import (
     ModelSelection,
 )
 from athena.protocol.errors import (
+    ContextOverflow,
     ModelUnavailable,
     ProviderError,
     RequestCancelled,
@@ -118,6 +119,7 @@ class InferenceBroker:
         *,
         state: RunState | None = None,
         exclude: frozenset[str | tuple[str, str]] = frozenset(),
+        relax_context: bool = False,
     ) -> ModelSelection:
         from athena.models.router import ModelRequirements
 
@@ -136,7 +138,11 @@ class InferenceBroker:
             # The compiler's requirement field is ``minimum_context_tokens``
             # (P0 fix: the old name silently dropped the constraint and let
             # an undersized-context model survive routing).
-            minimum_context_tokens=getattr(compiled.requirements, "minimum_context_tokens", None),
+            minimum_context_tokens=(
+                None
+                if relax_context
+                else getattr(compiled.requirements, "minimum_context_tokens", None)
+            ),
             max_output_tokens=getattr(compiled.requirements, "reserved_output", None),
         )
         # Quality floor (P1-16): the task policy's declared floor is the
@@ -170,6 +176,7 @@ class InferenceBroker:
         # provider does not ban that provider's healthy sibling models.
         attempted: set[tuple[str, str]] = set()
         selection_for_attempt = selection
+        compiled_for_attempt = compiled
         for attempt in range(self._fallback_attempts):
             if state.cancel.is_set():
                 raise RequestCancelled("task cancelled")
@@ -183,9 +190,9 @@ class InferenceBroker:
                 )
             provider = self._k._registry.provider_for(selection_for_attempt.provider)
             attempt_metadata = await self._k._attempt_metadata(
-                task, compiled, selection_for_attempt
+                task, compiled_for_attempt, selection_for_attempt
             )
-            request = compiled.to_request(
+            request = compiled_for_attempt.to_request(
                 provider=selection_for_attempt.provider,
                 model=selection_for_attempt.model,
                 request_id=new_id("call"),
@@ -434,8 +441,24 @@ class InferenceBroker:
                 # models on the same provider remain candidates.
                 attempted.add((selection_for_attempt.provider, selection_for_attempt.model))
                 selection_for_attempt = await self._k._select_model(
-                    task, compiled, exclude=frozenset(attempted)
+                    task,
+                    compiled_for_attempt,
+                    exclude=frozenset(attempted),
+                    relax_context=isinstance(exc, ContextOverflow),
                 )
+                if isinstance(exc, ContextOverflow):
+                    fallback_limit = getattr(selection_for_attempt.info, "context_limit", None)
+                    current_need = getattr(
+                        compiled_for_attempt.requirements, "minimum_context_tokens", None
+                    )
+                    if (
+                        fallback_limit is not None
+                        and current_need is not None
+                        and fallback_limit < current_need
+                    ):
+                        compiled_for_attempt = await self._k._compile(
+                            task, context_window=int(fallback_limit)
+                        )
             except BaseException:
                 if self._k._budgets is not None and reservation and worst_cost is not None:
                     await self._k._budgets.release_model_cost(task.id, worst_cost)

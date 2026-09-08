@@ -12,9 +12,14 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
 )
 from athena.protocol.tasks import WorkspaceSpec
+from athena.protocol.memory import MemoryKind, MemoryRecord, MemoryScope
+from athena.protocol.messages import TrustClass
 from athena.service.config import AthenaConfig
 from athena.service.service import AthenaService
 from athena.models.registry import ProviderRegistry
+from athena.affordances.models import AffordanceScope
+from athena.skills.models import Skill, SkillCandidate
+from athena.workflows.models import Workflow, WorkflowStep
 
 
 @pytest.fixture
@@ -90,6 +95,106 @@ async def test_operator_context_summary(service):
 
 async def test_operator_artifacts_empty(service):
     assert isinstance(await service.operator_artifacts(), list)
+
+
+async def test_memory_candidate_review_surface_preserves_evidence_and_requires_operator(service):
+    candidate = MemoryRecord(
+        id="mem_candidate_1",
+        kind=MemoryKind.SEMANTIC,
+        scope=MemoryScope.TASK,
+        content="Prefer the project's strict validation command.",
+        source=None,
+        trust=TrustClass.AGENT_CURATED,
+        source_refs=("artifact://evidence-1",),
+        metadata={
+            "pending_promotion": True,
+            "task_id": "task-source",
+            "observation_count": 2,
+        },
+    )
+    await service._memory.save(candidate)
+
+    rows = await service.operator_memory_candidates()
+    assert rows[0]["id"] == candidate.id
+    assert rows[0]["required_action"] == "operator_review"
+    assert rows[0]["evidence"] == ["artifact://evidence-1"]
+    assert rows[0]["observation_count"] == 2
+
+    promoted = await service.operator_promote_memory_candidate(
+        candidate.id,
+        "project",
+        "project-1",
+    )
+    assert promoted["status"] == "promoted"
+    assert await service.operator_memory_candidates() == []
+
+
+async def test_shared_candidate_queue_includes_durable_skill_candidates_and_workflows(service):
+    await service._sessions.create("session-candidate")
+    await service._store_tasks.insert_task(
+        "task-candidate",
+        "session-candidate",
+        None,
+        "candidate review task",
+        autonomy="supervised",
+        workspace=service._default_workspace,
+    )
+    candidate = SkillCandidate(
+        draft=Skill(
+            id="",
+            name="operator-review-helper",
+            description="A reviewable helper",
+            body="Keep verification evidence with the result.",
+            triggers=("review",),
+        ),
+        source_task_id="task-candidate",
+        target_skill=None,
+        evidence=("receipt://one",),
+        confidence=0.8,
+    )
+    await service._skill_lifecycle.record_candidate(candidate, task_id="task-candidate")
+    await service._workflow_store.save(
+        Workflow.create(
+            name="candidate procedure",
+            description="review me",
+            steps=(
+                WorkflowStep(id="step", capability_id="truth", arguments={"operation": "status"}),
+            ),
+            scope=AffordanceScope.CANDIDATE,
+            task_scope="task-candidate",
+            lifecycle_state="CANDIDATE",
+            provenance={
+                "observations": [{"task_id": "task-candidate"}],
+                "successful_observations": 1,
+            },
+        )
+    )
+
+    rows = await service.operator_candidates("task-candidate")
+    kinds = {row["type"] for row in rows}
+    assert "skill" in kinds
+    assert "workflow" in kinds
+    assert any(
+        row["id"] == candidate.id and row["required_action"] == "operator_review" for row in rows
+    )
+    assert all("evidence" in row for row in rows)
+
+
+async def test_workflow_operator_view_preserves_scope_and_definition(service):
+    created = Workflow.create(
+        name="visible procedure",
+        description="operator inspection",
+        steps=(WorkflowStep(id="step", capability_id="truth", arguments={"operation": "status"}),),
+        scope=AffordanceScope.PROJECT,
+        project_scope=service._default_workspace.id,
+    )
+    await service._workflow_store.save(created)
+
+    listed = await service.list_workflows()
+    inspected = await service.inspect_workflow(created.id)
+    assert any(row["id"] == created.id and row["scope"] == "project" for row in listed)
+    assert inspected is not None
+    assert inspected["steps"][0]["capability"] == "truth"
 
 
 async def test_generated_capability_operator_methods_use_synthesis_dispatcher():

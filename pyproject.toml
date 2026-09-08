@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "athena-agent"
 version = "0.1.0b1"
 description = "Compact, local-first autonomous agent runtime with durable knowledge, structured delegation, universal execution, open capability protocols, and a single authoritative reasoning loop."
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 license = "MIT"
 authors = [{ name = "Athena Contributors" }]
 readme = "README.md"
@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
+semantic = ["fastembed>=0.8,<0.9"]
 anthropic = ["anthropic>=0.39"]
 container = ["docker>=7.0"]
 debug = ["debugpy>=1.8"]
@@ -54,7 +55,7 @@ athena = "athena.cli.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-athena = ["state/migrations/*.sql"]
+athena = ["state/migrations/*.sql", "bundled_skills/**/SKILL.md"]
 
 [tool.ruff]
 target-version = "py312"

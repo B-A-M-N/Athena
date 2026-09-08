@@ -131,6 +131,7 @@ from athena.service.self_host import SelfHostService
 from athena.service.config import (
     AthenaConfig,
     HermesSupervisionMode,
+    MCPConfig,
     ProviderConfig,
 )
 
@@ -177,6 +178,16 @@ class AthenaService:
         # configured provider at registration time instead of silently
         # reporting "unsupported" for a provider owned by the host.
         self._device_provider = device_provider
+        self._computer_health: dict[str, Any] = {
+            "state": "not_started",
+            "backend": "unknown",
+        }
+        self._browser_health: dict[str, Any] = {
+            "state": "not_started",
+            "configured": False,
+            "active_sessions": 0,
+        }
+        self._optional_capability_health: dict[str, dict[str, Any]] = {}
         self._hermes_referee = hermes_referee
         self._hermes_adapter: HermesAgentEvaluator | None = None
         self._hermes_referee_owned = False
@@ -273,6 +284,7 @@ class AthenaService:
         self._candidates = CandidateService(self)
 
         self._mcp_clients: list[MCPClient] = []
+        self._mcp_connection_status: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ #
     # Factories for tests / smoke
@@ -339,10 +351,70 @@ class AthenaService:
         """Return live subsystem health for reflection and operator APIs."""
         scheduler = getattr(self, "_scheduler", None)
         watches = getattr(self, "_watch_registry", None)
+        computer = getattr(self, "_computer", None)
+        browser = getattr(self, "_browser", None)
+        memory = getattr(self, "_memory", None)
+        model_registry = getattr(self, "_model_registry", None)
+        model_readiness = (
+            model_registry.readiness()
+            if model_registry is not None and callable(getattr(model_registry, "readiness", None))
+            else {"state": "unconfigured", "providers": {}}
+        )
+        embedding_provider = (
+            getattr(memory, "embedding_provider", None) if memory is not None else None
+        )
+        embedding_health = (
+            embedding_provider.health()
+            if embedding_provider is not None
+            and callable(getattr(embedding_provider, "health", None))
+            else {
+                "configured": False,
+                "available": False,
+                "state": "unconfigured",
+                "reason": "no embedding provider configured",
+            }
+        )
         return {
             "scheduler": scheduler.health() if scheduler is not None else {"health": "stopped"},
             "watch": watches.health() if watches is not None else {"health": "stopped"},
+            "computer": computer.health() if computer is not None else dict(self._computer_health),
+            "browser": browser.health() if browser is not None else dict(self._browser_health),
+            "memory_embeddings": embedding_health,
+            "model": {
+                "state": model_readiness.get("state", "unknown"),
+                "configured": bool(model_readiness.get("providers")),
+                "providers": model_readiness.get("providers", {}),
+                "reason": (
+                    None if model_readiness.get("state") == "ready" else "no ready model provider"
+                ),
+            },
+            "mcp": self.mcp_status(),
+            "optional_capabilities": {
+                name: dict(value)
+                for name, value in sorted(self._optional_capability_health.items())
+            },
         }
+
+    def mcp_status(self) -> dict[str, dict[str, Any]]:
+        """Return configured MCP transport/discovery state for operators."""
+        status = dict(self._mcp_connection_status)
+        configured = {server.name: server for server in self.config.mcp_servers}
+        for name, server in configured.items():
+            status.setdefault(
+                name,
+                {
+                    "id": name,
+                    "configured": True,
+                    "state": "configured",
+                    "transport": "http" if server.url else "stdio",
+                    "tool_count": 0,
+                    "last_successful_connection": None,
+                    "last_error": None,
+                },
+            )
+        for client in self._mcp_clients:
+            status[client.connection_id] = client.health()
+        return {name: dict(status[name]) for name in sorted(status)}
 
     @property
     def _hermes_supervision_mode(self) -> HermesSupervisionMode:
@@ -882,7 +954,16 @@ class AthenaService:
         )
 
         if self._sessions is not None and await self._sessions.get(session_id) is None:
-            await self._sessions.create(session_id)
+            create_session = self._sessions.create
+            kwargs: dict[str, Any] = {}
+            try:
+                if "principal_id" in inspect.signature(create_session).parameters:
+                    kwargs["principal_id"] = self.config.cache_namespace
+            except (TypeError, ValueError):
+                # A legacy adapter may not expose an inspectable signature;
+                # its positional create(session_id) contract remains valid.
+                pass
+            await create_session(session_id, **kwargs)
         call_id = getattr(result, "call_id", "") or new_id("call")
         block_call = CapabilityCallBlock(
             call_id=call_id,
@@ -922,6 +1003,124 @@ class AthenaService:
 
     async def get_task(self, task_id: str) -> TaskSpec:
         return await TaskAPI(self).get_task(task_id)
+
+    async def list_tasks(self, status: TaskStatus | None = None) -> list[dict]:
+        """Return durable tasks for operator/CLI inspection."""
+        if self._store_tasks is None:
+            return []
+        if status is not None:
+            return await self._store_tasks.list_by_status(status)
+        rows: list[dict] = []
+        for task_status in TaskStatus:
+            rows.extend(await self._store_tasks.list_by_status(task_status))
+        return sorted(rows, key=lambda row: str(row.get("created_at") or ""))
+
+    async def list_jobs(self, *, enabled_only: bool = False) -> list[dict]:
+        """Return scheduled jobs with their latest durable run receipt."""
+        if self._store_schedules is None:
+            return []
+        jobs = await self._store_schedules.list_jobs(enabled_only=enabled_only)
+        for job in jobs:
+            job["last_run_receipt"] = await self._store_schedules.last_run(job["id"])
+        return jobs
+
+    async def list_workflows(self, *, task_id: str | None = None) -> list[dict[str, Any]]:
+        """Return workflow definitions visible to the operator.
+
+        The workflow store remains the authority for scope filtering.  Task
+        candidates are included only when their owning task id is supplied;
+        project and user workflows remain visible without one.
+        """
+        store = self._workflow_store
+        if store is None:
+            return []
+        workflows = await store.list(
+            task_id=task_id,
+            project_id=getattr(self._default_workspace, "id", None),
+            user_id=self.config.cache_namespace,
+        )
+        return [workflow.to_record() for workflow in workflows]
+
+    async def inspect_workflow(
+        self,
+        workflow_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Inspect one visible workflow definition through the durable store."""
+        store = self._workflow_store
+        if store is None:
+            return None
+        workflow = await store.get(
+            workflow_id,
+            task_id=task_id,
+            project_id=getattr(self._default_workspace, "id", None),
+            user_id=self.config.cache_namespace,
+        )
+        return workflow.to_record() if workflow is not None else None
+
+    async def job_set_enabled(self, job_id: str, enabled: bool) -> bool:
+        if self._store_schedules is None:
+            return False
+        return await self._store_schedules.set_enabled(job_id, enabled)
+
+    async def job_run_now(self, job_id: str) -> str | None:
+        if self._scheduler is None:
+            return None
+        return await self._scheduler.run_now(job_id)
+
+    async def list_packs(self, query: str | None = None) -> list[dict[str, Any]]:
+        """List installed declarative packs and their live health."""
+        manager = self._pack_manager
+        if manager is None:
+            return []
+        rows = list(await manager.list())
+        if query:
+            needle = query.casefold()
+            rows = [
+                row
+                for row in rows
+                if needle in str(row.get("id", "")).casefold()
+                or needle in str(row.get("publisher", "")).casefold()
+            ]
+        for row in rows:
+            state = await manager._store.get(str(row["id"]))
+            if state is not None:
+                row["health_detail"] = manager.health(state)
+        return rows
+
+    async def inspect_pack(self, pack_id: str) -> dict[str, Any] | None:
+        if self._pack_manager is None:
+            return None
+        try:
+            return await self._pack_manager.inspect_installed(pack_id)
+        except KeyError:
+            return None
+
+    async def install_pack(self, source_path: str, *, enable: bool = True) -> dict[str, Any]:
+        if self._pack_manager is None:
+            raise RuntimeError("pack manager is unavailable")
+        state = await self._pack_manager.install(
+            source_path,
+            allowed_root=self.config.workspace_root,
+            enable=enable,
+        )
+        return state.to_record()
+
+    async def enable_pack(self, pack_id: str) -> dict[str, Any]:
+        if self._pack_manager is None:
+            raise RuntimeError("pack manager is unavailable")
+        return (await self._pack_manager.enable(pack_id)).to_record()
+
+    async def disable_pack(self, pack_id: str) -> dict[str, Any]:
+        if self._pack_manager is None:
+            raise RuntimeError("pack manager is unavailable")
+        return (await self._pack_manager.disable(pack_id)).to_record()
+
+    async def remove_pack(self, pack_id: str) -> bool:
+        if self._pack_manager is None:
+            return False
+        return await self._pack_manager.uninstall(pack_id)
 
     async def get_result(self, task_id: str):
         return await TaskAPI(self).get_result(task_id)
@@ -1148,6 +1347,51 @@ class AthenaService:
 
     async def operator_generated_capabilities(self, task_id: str | None = None) -> list[dict]:
         return await OperatorQueryService(self).operator_generated_capabilities(task_id)
+
+    async def operator_memory_candidates(self, *, limit: int = 100) -> list[dict]:
+        return await OperatorQueryService(self).operator_memory_candidates(limit=limit)
+
+    async def operator_candidates(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        """Return the shared operator review queue for learned candidates."""
+        return await OperatorQueryService(self).operator_candidates(task_id)
+
+    async def operator_candidate_item(
+        self, candidate_id: str, task_id: str | None = None
+    ) -> dict[str, Any] | None:
+        return await OperatorQueryService(self).operator_candidate_item(candidate_id, task_id)
+
+    async def operator_promote_candidate(
+        self,
+        candidate_id: str,
+        *,
+        target_scope: str,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        return await OperatorQueryService(self).operator_promote_candidate(
+            candidate_id,
+            target_scope=target_scope,
+            task_id=task_id,
+        )
+
+    async def operator_deprecate_candidate(
+        self, candidate_id: str, *, task_id: str | None = None
+    ) -> dict[str, Any]:
+        return await OperatorQueryService(self).operator_deprecate_candidate(
+            candidate_id, task_id=task_id
+        )
+
+    async def operator_memory_candidate(self, memory_id: str) -> dict | None:
+        return await OperatorQueryService(self).operator_memory_candidate(memory_id)
+
+    async def operator_promote_memory_candidate(
+        self, memory_id: str, scope: str, scope_id: str | None = None
+    ) -> dict:
+        return await OperatorQueryService(self).operator_promote_memory_candidate(
+            memory_id, scope, scope_id
+        )
+
+    async def operator_discard_memory_candidate(self, memory_id: str) -> dict:
+        return await OperatorQueryService(self).operator_discard_memory_candidate(memory_id)
 
     async def operator_generated_capability(
         self, capability_id: str, task_id: str | None = None
@@ -1622,15 +1866,17 @@ class AthenaService:
         if model_registry is None:
             return None
 
-        async def _summarize(text: str, *, task=None) -> str | None:
+        async def _summarize(text: str, *, task=None, max_tokens: int | None = None) -> str | None:
             kernel = self._kernel
             if kernel is None:
                 return None
             prompt = (
-                "Summarize the following agent-work transcript excerpt into "
-                "at most 6 sentences, preserving decisions, file changes, "
-                "and unresolved issues. Output ONLY the summary.\n\n" + text[-8000:]
+                "Summarize the following complete agent-work transcript excerpt "
+                "into at most 6 sentences, preserving decisions, file changes, "
+                "and unresolved issues. Output ONLY the summary.\n\n" + text
             )
+            if max_tokens is not None:
+                prompt += f"\n\nKeep the response within {max_tokens} estimated tokens."
             if task is not None:
                 return await kernel.task_utility_inference(
                     task=task,
@@ -1751,7 +1997,7 @@ class AthenaService:
         from athena.capabilities.dependency import DependencyCapability
         from athena.capabilities.reflection import CapabilityReflection
         from athena.capabilities.truth import TruthCapability
-        from athena.capabilities.research import ResearchCapability
+        from athena.capabilities.research import HttpDiscoveryProvider, ResearchCapability
         from athena.capabilities.scratch import ScratchCapability
         from athena.capabilities.observer import ObserverCapability
         from athena.capabilities.capsule import ProcedureCapsuleCapability
@@ -1798,7 +2044,19 @@ class AthenaService:
                 event_sink=self._forward_events(self._require_events()),
             )
             registry.register(self._terminals)
+            self._optional_capability_health["terminal"] = {
+                "installed": True,
+                "configured": True,
+                "state": "available",
+                "reason": None,
+            }
         else:
+            self._optional_capability_health["terminal"] = {
+                "installed": False,
+                "configured": True,
+                "state": "unavailable",
+                "reason": "pexpect and pyte are required",
+            }
             _logger.info("terminal_session capability unavailable: install pexpect and pyte")
         self._processes = ProcessCapability(execution)
         registry.register(self._processes)
@@ -1815,10 +2073,7 @@ class AthenaService:
                 health_provider=self._capability_health,
                 runtime_health_provider=self.runtime_health,
                 model_provider=lambda: self._model_registry,
-                mcp_status_provider=lambda: {
-                    **{client.connection_id: "connected" for client in self._mcp_clients},
-                    **getattr(self, "_mcp_connection_status", {}),
-                },
+                mcp_status_provider=self.mcp_status,
                 delegate_provider=lambda: self._delegate_registry,
             )
         )
@@ -1834,15 +2089,30 @@ class AthenaService:
 
             registry.register(InputRequestCapability())
         if research_store is not None:
+            research_policy = SourcePolicy(
+                allowed_domains=tuple(self.config.research_allowed_domains),
+                denied_domains=tuple(self.config.research_denied_domains),
+                allow_private_network=self.config.research_allow_private_network,
+            )
+            discovery_endpoints = self.config.research_discovery_endpoints or (
+                (self.config.research_discovery_endpoint,)
+                if self.config.research_discovery_endpoint
+                else ()
+            )
+            discovery_providers = tuple(
+                HttpDiscoveryProvider(
+                    endpoint,
+                    source_policy=research_policy,
+                    timeout=self.config.research_discovery_timeout,
+                )
+                for endpoint in discovery_endpoints
+            )
             registry.register(
                 ResearchCapability(
                     research_store,
                     artifact_store=self._artifacts,
-                    source_policy=SourcePolicy(
-                        allowed_domains=tuple(self.config.research_allowed_domains),
-                        denied_domains=tuple(self.config.research_denied_domains),
-                        allow_private_network=self.config.research_allow_private_network,
-                    ),
+                    source_policy=research_policy,
+                    discovery_providers=discovery_providers,
                 )
             )
         if self._workflow_store is not None and self._fabric is not None:
@@ -1873,9 +2143,27 @@ class AthenaService:
                     execution_manager=self._execution,
                 )
                 registry.register(self._debugger)
+                self._optional_capability_health["debugger"] = {
+                    "installed": True,
+                    "configured": True,
+                    "state": "available",
+                    "reason": None,
+                }
             else:
+                self._optional_capability_health["debugger"] = {
+                    "installed": False,
+                    "configured": True,
+                    "state": "unavailable",
+                    "reason": "debugpy is not installed",
+                }
                 _logger.info("debugger capability unavailable: debugpy is not installed")
         except Exception as exc:  # debugpy optional
+            self._optional_capability_health["debugger"] = {
+                "installed": False,
+                "configured": True,
+                "state": "degraded",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
             _logger.info("debugger capability unavailable: %s", exc)
 
         # Computer + browser interaction (P1-20/P1-28, SPEC 36/65): optional
@@ -1887,22 +2175,140 @@ class AthenaService:
             from athena.capabilities.browser import BrowserCapability
             from athena.capabilities.computer import ComputerCapability
 
+            self._computer = None
+            self._browser = None
             if ComputerCapability.available():
-                self._computer = ComputerCapability()
-                registry.register(self._computer)
+                computer = ComputerCapability(artifact_store=self._artifacts)
+                self._computer_health = await computer.probe_health()
+                self._optional_capability_health["computer"] = {
+                    "installed": True,
+                    "configured": True,
+                    "state": self._computer_health.get("state", "unknown"),
+                    "reason": self._computer_health.get("reason"),
+                }
+                if self._computer_health.get("state") == "ready":
+                    self._computer = computer
+                    registry.register(self._computer)
+                else:
+                    _logger.info(
+                        "computer capability unavailable at runtime: %s",
+                        self._computer_health.get("reason", "display probe failed"),
+                    )
             else:
+                self._computer_health = {
+                    "state": "unavailable",
+                    "backend": "none",
+                    "reason": "pyautogui is not importable",
+                }
+                self._optional_capability_health["computer"] = {
+                    "installed": False,
+                    "configured": True,
+                    "state": "unavailable",
+                    "reason": self._computer_health["reason"],
+                }
                 _logger.info(
                     "computer capability unavailable: install the 'computer' extra (pyautogui)"
                 )
-            if self.config.browser_driver_factory is not None:
-                self._browser = BrowserCapability(driver_factory=self.config.browser_driver_factory)
+            browser_factory = self.config.browser_driver_factory
+            if browser_factory is None and self.config.browser_enabled:
+                if BrowserCapability.available():
+                    from athena.capabilities.browser import PlaywrightBrowserDriver
+
+                    preflight = await PlaywrightBrowserDriver.preflight(
+                        browser_name=self.config.browser_engine,
+                        executable_path=self.config.browser_executable_path,
+                        channel=self.config.browser_channel,
+                        cdp_endpoint=self.config.browser_cdp_endpoint,
+                    )
+                    if preflight.get("state") in {"available", "configured"}:
+
+                        async def browser_factory():
+                            return await PlaywrightBrowserDriver.launch(
+                                browser_name=self.config.browser_engine,
+                                headless=self.config.browser_headless,
+                                launch_args=self.config.browser_launch_args,
+                                executable_path=self.config.browser_executable_path,
+                                channel=self.config.browser_channel,
+                                cdp_endpoint=self.config.browser_cdp_endpoint,
+                                timeout_ms=self.config.browser_timeout_ms,
+                                viewport=self.config.browser_viewport,
+                            )
+                    else:
+                        self._browser_health = {
+                            "state": "unavailable",
+                            "configured": True,
+                            "active_sessions": 0,
+                            "reason": preflight.get("reason") or "browser preflight failed",
+                        }
+                        self._optional_capability_health["browser"] = {
+                            "installed": True,
+                            "configured": True,
+                            "state": "unavailable",
+                            "reason": self._browser_health["reason"],
+                        }
+
+                else:
+                    self._browser_health = {
+                        "state": "unavailable",
+                        "configured": True,
+                        "active_sessions": 0,
+                        "reason": "browser_enabled but Playwright is not installed",
+                    }
+                    self._optional_capability_health["browser"] = {
+                        "installed": False,
+                        "configured": True,
+                        "state": "unavailable",
+                        "reason": self._browser_health["reason"],
+                    }
+            if browser_factory is not None:
+                self._browser = BrowserCapability(
+                    driver_factory=browser_factory,
+                    session_scope=self.config.browser_session_scope,
+                )
+                self._browser_health = self._browser.health()
+                self._optional_capability_health["browser"] = {
+                    "installed": True,
+                    "configured": True,
+                    "state": self._browser_health.get("state", "unknown"),
+                    "reason": self._browser_health.get("reason"),
+                }
                 registry.register(self._browser)
-            else:
+                self.register_shutdown_hook("browser_sessions", self._browser.close)
+            elif not self.config.browser_enabled:
+                self._browser_health = {
+                    "state": "unavailable",
+                    "configured": False,
+                    "active_sessions": 0,
+                    "reason": "browser_driver_factory is not configured",
+                }
+                self._optional_capability_health["browser"] = {
+                    "installed": BrowserCapability.available(),
+                    "configured": False,
+                    "state": "unavailable",
+                    "reason": self._browser_health["reason"],
+                }
                 _logger.info(
                     "browser capability not wired: set browser_driver_factory to enable "
                     "structured browser automation"
                 )
         except Exception as exc:  # optional interaction packs
+            self._computer_health = {
+                "state": "degraded",
+                "backend": "unknown",
+                "reason": f"computer setup failed: {type(exc).__name__}: {exc}",
+            }
+            self._optional_capability_health["computer"] = {
+                "installed": False,
+                "configured": True,
+                "state": "degraded",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            self._optional_capability_health["browser"] = {
+                "installed": False,
+                "configured": bool(self.config.browser_enabled),
+                "state": "degraded",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
             _logger.info("computer/browser capability unavailable: %s", exc)
 
         # P1/P2 environment families.
@@ -2284,6 +2690,7 @@ class AthenaService:
                     model=pc.model,
                     provider=pc.name,
                     scripts=list(pc.extra.get("scripts") or []),
+                    vision=bool(pc.extra.get("vision", False)),
                     cost=pc.extra.get("cost"),
                     latency_class=pc.latency_class or pc.extra.get("latency_class"),
                 )
@@ -2315,6 +2722,7 @@ class AthenaService:
                     authentication=pc.authentication,
                     cost=pc.extra.get("cost"),
                     latency_class=pc.latency_class or pc.extra.get("latency_class"),
+                    vision=bool(pc.extra.get("vision", False)),
                 )
             elif profile.protocol == "anthropic":
                 provider = AnthropicProvider(
@@ -2343,29 +2751,75 @@ class AthenaService:
 
     async def _connect_mcp(self) -> None:
         for server in self.config.mcp_servers:
-            try:
-                env = dict(server.env)
-                if server.secret_env and self._secrets is not None:
-                    for env_name, credential_id in server.secret_env.items():
-                        env[env_name] = self._secrets.resolve(credential_id)
-                client = MCPClient(
-                    server.name,
-                    command=server.command,
-                    args=list(server.args),
-                    url=server.url,
-                    env=env,
-                    connect_timeout=server.connect_timeout,
-                )
-                await client.connect()
-                self._mcp_clients.append(client)
+            await self._connect_mcp_server(server)
+
+    async def _connect_mcp_server(self, server: MCPConfig) -> dict[str, Any]:
+        transport = "http" if server.url else "stdio"
+        self._mcp_connection_status[server.name] = {
+            "id": server.name,
+            "configured": True,
+            "state": "connecting",
+            "transport": transport,
+            "tool_count": 0,
+            "last_successful_connection": None,
+            "last_error": None,
+        }
+        client: MCPClient | None = None
+        try:
+            env = dict(server.env)
+            if server.secret_env and self._secrets is not None:
+                for env_name, credential_id in server.secret_env.items():
+                    env[env_name] = self._secrets.resolve(credential_id)
+            client = MCPClient(
+                server.name,
+                command=server.command,
+                args=list(server.args),
+                url=server.url,
+                env=env,
+                connect_timeout=server.connect_timeout,
+            )
+            await client.connect()
+            self._mcp_clients.append(client)
+            if self._mcp is not None:
+                descriptors = await self._mcp.collect_and_register(client, server_alias=server.name)
+            else:
+                descriptors = []
+            self._mcp_connection_status[server.name] = {
+                **client.health(),
+                "state": "connected",
+                "tool_count": len(descriptors),
+            }
+        except Exception as exc:
+            _logger.warning("MCP server %s failed to connect: %s", server.name, exc)
+            if client is not None:
+                if client in self._mcp_clients:
+                    self._mcp_clients.remove(client)
                 if self._mcp is not None:
-                    await self._mcp.collect_and_register(client, server_alias=server.name)
-            except Exception as exc:
-                _logger.warning("MCP server %s failed to connect: %s", server.name, exc)
-                # Track failed connections for visibility
-                self._mcp_connection_status = getattr(self, "_mcp_connection_status", {})
-                self._mcp_connection_status[server.name] = f"failed: {exc}"
+                    self._mcp.unregister_connection(server.name)
+                try:
+                    await client.close()
+                except Exception as close_exc:  # noqa: BLE001 - preserve original failure
+                    _logger.info("MCP failed-connection cleanup failed: %s", close_exc)
+            self._mcp_connection_status[server.name] = {
+                **self._mcp_connection_status[server.name],
+                "state": "failed",
+                "last_error": f"{type(exc).__name__}: {exc}",
+            }
+        return dict(self._mcp_connection_status[server.name])
+
+    async def mcp_reconnect(self, name: str) -> dict[str, Any]:
+        """Reconnect one configured MCP server and refresh its tool inventory."""
+        server = next((item for item in self.config.mcp_servers if item.name == name), None)
+        if server is None:
+            return {"id": name, "state": "failed", "last_error": "server is not configured"}
+        for client in list(self._mcp_clients):
+            if client.connection_id != name:
                 continue
+            if self._mcp is not None:
+                self._mcp.unregister_connection(name)
+            await client.close()
+            self._mcp_clients.remove(client)
+        return await self._connect_mcp_server(server)
 
     def _resolve_api_key(self, pc: ProviderConfig) -> str:
         """Return the key for a provider, preferring a leased credential.

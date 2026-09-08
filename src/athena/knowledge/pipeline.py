@@ -23,6 +23,7 @@ from datetime import timedelta
 from typing import Any
 
 from athena.protocol.messages import TrustClass, utcnow
+from athena.protocol.policy import DEFAULT_PRINCIPAL_ID
 
 __all__ = ["KnowledgePipeline"]
 
@@ -43,12 +44,14 @@ class KnowledgePipeline:
         skill_lifecycle: Any = None,
         workflow_store: Any = None,
         events: Any = None,
+        principal_id: str = DEFAULT_PRINCIPAL_ID,
     ) -> None:
         self._messages = messages
         self._memory = memory_store
         self._skills = skill_lifecycle
         self._workflows = workflow_store
         self._events = events
+        self._principal_id = principal_id
         # Compatibility fallback for lightweight stores that do not implement
         # durable workflow observations. The production WorkflowStore keeps
         # this evidence outside the workflow-definition table.
@@ -232,7 +235,10 @@ class KnowledgePipeline:
         from athena.memory.candidates import candidates_from_task
 
         candidates = await candidates_from_task(
-            task, transcript if transcript is not None else await self._transcript(task), result
+            task,
+            transcript if transcript is not None else await self._transcript(task),
+            result,
+            principal_id=self._principal_id,
         )
         saved = 0
         for rec in candidates:

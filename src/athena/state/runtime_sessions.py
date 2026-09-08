@@ -14,7 +14,7 @@ class RuntimeSessionStore:
     Backs the ``runtime_sessions`` table so crash recovery (RecoveryManager)
     can tell the truth about which sessions were owned by Athena vs lost on
     restart. ``is_alive`` encodes session state: ``1`` == active, ``0`` ==
-    closed. ``backend`` identifies the runtime (shell / python / node / ...).
+    closed. ``backend`` and ``runtime`` are independent durable identities.
     """
 
     def __init__(self, db: Database) -> None:
@@ -34,20 +34,28 @@ class RuntimeSessionStore:
         now = utcnow().isoformat()
         await self._db.execute(
             "INSERT INTO runtime_sessions("
-            "id, task_id, backend, pid, is_alive, started_at, last_heartbeat, ended_at, metadata"
-            ") VALUES (?, ?, ?, ?, 1, ?, ?, NULL, ?)",
+            "id, task_id, backend, runtime, cwd, workspace_identity, network_policy, "
+            "process_identity, environment_fingerprint, runtime_version, pid, is_alive, "
+            "start_identity, started_at, last_heartbeat, ended_at, metadata"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)",
             (
                 session_id,
                 task_id,
                 backend,
+                runtime,
+                cwd,
+                _metadata_value(metadata, "workspace_identity", "workspace_root"),
+                _metadata_value(metadata, "network_policy"),
+                _metadata_value(metadata, "process_identity"),
+                _metadata_value(metadata, "environment_fingerprint"),
+                _metadata_value(metadata, "runtime_version"),
                 pid,
+                _metadata_value(metadata, "start_identity"),
                 now,
                 now,
                 json.dumps(
                     {
                         **dict(metadata or {}),
-                        **({"runtime": runtime} if runtime else {}),
-                        **({"cwd": cwd} if cwd else {}),
                     }
                 ),
             ),
@@ -115,9 +123,21 @@ def _decode(row: dict) -> dict:
     if val:
         try:
             row["metadata"] = json.loads(val)
-            row["runtime"] = row["metadata"].get("runtime")
-            row["cwd"] = row["metadata"].get("cwd")
+            row["runtime"] = row.get("runtime") or row["metadata"].get("runtime")
+            row["cwd"] = row.get("cwd") or row["metadata"].get("cwd")
+            row["start_identity"] = row.get("start_identity") or row["metadata"].get(
+                "start_identity"
+            )
         except (TypeError, ValueError):
             pass
     row["is_alive"] = bool(row.get("is_alive", 0))
     return row
+
+
+def _metadata_value(metadata: dict | None, *keys: str) -> str | None:
+    values = metadata or {}
+    for key in keys:
+        value = values.get(key)
+        if value is not None:
+            return str(value)
+    return None

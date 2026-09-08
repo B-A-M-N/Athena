@@ -127,32 +127,30 @@ class InputRequestStore:
         into the task's session.
         """
         await self.ensure_table()
-        row = await self._db.fetch_one(
-            "SELECT * FROM input_requests WHERE id = ? AND status = 'OPEN'",
-            (request_id,),
-        )
-        if row is None:
-            return None
-        await self._db.execute(
+        now = utcnow().isoformat()
+        cursor = await self._db.execute(
             "UPDATE input_requests "
             "SET status = 'ANSWERED_PENDING_RESUME', answer = ?, answer_ref = ?, "
             "resolved_at = ? "
             "WHERE id = ? AND status = 'OPEN'",
-            (str(answer), answer_ref, utcnow().isoformat(), request_id),
+            (str(answer), answer_ref, now, request_id),
         )
+        if cursor.rowcount != 1:
+            return None
         updated = await self._db.fetch_one(
             "SELECT * FROM input_requests WHERE id = ?", (request_id,)
         )
-        return _decode(updated) if updated else _decode(row)
+        return _decode(updated) if updated else None
 
-    async def consume(self, request_id: str) -> None:
-        """Mark an answered input request as consumed by the kernel."""
+    async def consume(self, request_id: str) -> bool:
+        """Mark an answered input request as consumed exactly once."""
         await self.ensure_table()
-        await self._db.execute(
+        cursor = await self._db.execute(
             "UPDATE input_requests SET status = 'CONSUMED', consumed_at = ? "
             "WHERE id = ? AND status = 'ANSWERED_PENDING_RESUME'",
             (utcnow().isoformat(), request_id),
         )
+        return cursor.rowcount == 1
 
     async def pending_resumable(self, task_id: str) -> dict | None:
         """An answered-but-not-consumed input request for a task, if any.

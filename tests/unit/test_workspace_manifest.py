@@ -160,15 +160,14 @@ def _make_pair(tmp_path):
 
 
 async def test_reflink_copy_preserves_bytes_and_isolation(tmp_path):
-    import asyncio
-
+    from athena.execution.async_call import run_blocking
     from athena.workspace_manifest import _copy_file
 
     source, clone = _make_pair(tmp_path)
     clone.parent.mkdir(parents=True, exist_ok=True)
     (clone / "sub").mkdir(parents=True)
-    await asyncio.to_thread(_copy_file, source / "a.txt", clone / "a.txt")
-    await asyncio.to_thread(_copy_file, source / "sub" / "b.bin", clone / "sub" / "b.bin")
+    await run_blocking(_copy_file, source / "a.txt", clone / "a.txt")
+    await run_blocking(_copy_file, source / "sub" / "b.bin", clone / "sub" / "b.bin")
     assert clone.joinpath("a.txt").read_text(encoding="utf-8") == "hello world\n"
     assert clone.joinpath("sub", "b.bin").read_bytes() == b"x" * 10_000
     # Clone-side write must not reach the source.
@@ -181,13 +180,12 @@ async def test_reflink_copy_preserves_bytes_and_isolation(tmp_path):
 
 async def test_tree_copy_degrades_cleanly_when_reflink_unavailable(tmp_path, monkeypatch):
     """Forcing the probe to False yields a byte-identical plain copy."""
-    import asyncio
-
     import athena.workspace_manifest as wm
+    from athena.execution.async_call import run_blocking
 
     monkeypatch.setattr(wm, "_reflink_supported", lambda directory: False)
     source, clone = _make_pair(tmp_path)
-    await asyncio.to_thread(wm.copy_workspace_tree, source, clone)
+    await run_blocking(wm.copy_workspace_tree, source, clone)
     assert clone.joinpath("a.txt").read_text(encoding="utf-8") == "hello world\n"
     assert clone.joinpath("sub", "b.bin").read_bytes() == b"x" * 10_000
     # Metadata contract still holds on the fallback path.

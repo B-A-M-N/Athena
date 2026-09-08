@@ -52,6 +52,12 @@ def test_roundtrip_providers_mcp_model_roles():
             }
         },
         cache_namespace="tenant-a",
+        memory_embedding_model="intfloat/e5-small-v2",
+        memory_embedding_cache_dir="/var/cache/athena/embeddings",
+        research_discovery_endpoints=(
+            "https://index-a.example.test/search",
+            "https://index-b.example.test/search",
+        ),
     )
     d = config_to_dict(config)
     assert "providers" in d and "mcp_servers" in d
@@ -85,6 +91,12 @@ def test_roundtrip_providers_mcp_model_roles():
         }
     }
     assert restored.cache_namespace == "tenant-a"
+    assert restored.memory_embedding_model == "intfloat/e5-small-v2"
+    assert restored.memory_embedding_cache_dir == "/var/cache/athena/embeddings"
+    assert restored.research_discovery_endpoints == (
+        "https://index-a.example.test/search",
+        "https://index-b.example.test/search",
+    )
 
 
 def test_roundtrip_hermes_referee_config():
@@ -104,6 +116,46 @@ def test_roundtrip_hermes_referee_config():
     restored = config_from_dict(config_to_dict(config))
 
     assert restored.hermes_referee == config.hermes_referee
+
+
+def test_roundtrip_serializable_browser_config():
+    config = AthenaConfig(
+        browser_enabled=True,
+        browser_engine="firefox",
+        browser_headless=False,
+        browser_launch_args=("--safe-mode",),
+        browser_executable_path="/opt/firefox/firefox",
+        browser_channel="nightly",
+        browser_session_scope="session",
+        browser_timeout_ms=12_000,
+        browser_viewport=(1024, 768),
+    )
+
+    restored = config_from_dict(config_to_dict(config))
+
+    assert restored.browser_enabled is True
+    assert restored.browser_engine == "firefox"
+    assert restored.browser_headless is False
+    assert restored.browser_launch_args == ("--safe-mode",)
+    assert restored.browser_executable_path == "/opt/firefox/firefox"
+    assert restored.browser_channel == "nightly"
+    assert restored.browser_session_scope == "session"
+
+
+def test_roundtrip_runtime_recovery_and_worker_timing_config():
+    config = AthenaConfig(
+        parked_slot_wait_s=0.25,
+        worker_lease_duration_seconds=42.0,
+        worker_lease_renewal_divisor=2.0,
+    )
+
+    restored = config_from_dict(config_to_dict(config))
+
+    assert restored.parked_slot_wait_s == 0.25
+    assert restored.worker_lease_duration_seconds == 42.0
+    assert restored.worker_lease_renewal_divisor == 2.0
+    assert restored.browser_timeout_ms == 12_000
+    assert restored.browser_viewport == (1024, 768)
 
 
 def test_legacy_hermes_required_flag_normalizes_to_explicit_policy():

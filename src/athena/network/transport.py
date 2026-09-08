@@ -45,10 +45,8 @@ def pinned_sync_transport(host: str, addresses: Iterable[str]):
     pinned = _address_map(host, addresses)
 
     class _PinnedBackend(httpcore.SyncBackend):
-        def connect_tcp(
-            self, target_host, port, timeout=None, local_address=None, socket_options=None
-        ):
-            target = pinned.get(_normalize_host(target_host), target_host)
+        def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+            target = pinned.get(_normalize_host(host), host)
             return super().connect_tcp(target, port, timeout, local_address, socket_options)
 
     transport = httpx.HTTPTransport(
@@ -75,9 +73,9 @@ def pinned_async_transport(host: str, addresses: Iterable[str]):
 
     class _PinnedBackend(httpcore.AnyIOBackend):
         async def connect_tcp(
-            self, target_host, port, timeout=None, local_address=None, socket_options=None
+            self, host, port, timeout=None, local_address=None, socket_options=None
         ):
-            target = pinned.get(_normalize_host(target_host), target_host)
+            target = pinned.get(_normalize_host(host), host)
             return await super().connect_tcp(target, port, timeout, local_address, socket_options)
 
     transport = httpx.AsyncHTTPTransport(

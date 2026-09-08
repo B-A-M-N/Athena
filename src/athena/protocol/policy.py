@@ -15,6 +15,8 @@ from typing import Any, Mapping
 from athena.protocol.capabilities import EffectClass, ResourceClass
 from athena.protocol.tasks import WorkspaceSpec
 
+DEFAULT_PRINCIPAL_ID = "athena"
+
 
 class PolicyVerdict(str, enum.Enum):
     ALLOW = "allow"
@@ -88,6 +90,7 @@ class ApprovalGrant:
 
 
 __all__ = [
+    "DEFAULT_PRINCIPAL_ID",
     "PolicyVerdict",
     "ApprovalScope",
     "ApprovalState",

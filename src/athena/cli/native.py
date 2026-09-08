@@ -8,7 +8,6 @@ of Athena rather than a second service or agent loop.
 
 from __future__ import annotations
 
-import asyncio
 import ctypes
 import ctypes.util
 import importlib.util
@@ -20,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from athena.execution.async_call import run_blocking
 from typing import Any
 
 
@@ -237,7 +238,7 @@ def launch(options: Any) -> int:
 
 async def launch_async(options: Any) -> int:
     """Async wrapper used by callers that already own an event loop."""
-    return await asyncio.to_thread(launch, options)
+    return await run_blocking(launch, options)
 
 
 __all__ = [

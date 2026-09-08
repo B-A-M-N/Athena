@@ -187,7 +187,7 @@ class ContextRetrieval:
                 self._c._memory_cache.move_to_end(cache_key)
                 return list(cached)
         # Scope weighting (P1-12): the current session outranks the project,
-        # which outranks user-global. The weighted retrieval applies the
+        # which outranks user memory, which outranks global. The weighted retrieval applies the
         # preference during ranking; the per-scope limits bound how much
         # each scope may contribute before merge.
         combined = getattr(store, "search_scopes", None)
@@ -196,6 +196,7 @@ class ContextRetrieval:
             if task.session_id:
                 scopes.append((MemoryScope.SESSION, task.session_id))
             scopes.append((MemoryScope.PROJECT, task.workspace.id if task.workspace else None))
+            scopes.append((MemoryScope.USER, self._c._principal_id))
             scopes.append((MemoryScope.GLOBAL, None))
             try:
                 retrieve_scopes = getattr(store, "retrieve_scopes_weighted", None)
@@ -205,7 +206,7 @@ class ContextRetrieval:
                             task.objective,
                             scopes,
                             limit=24,
-                            mode="semantic",
+                            mode="relevance",
                             weights=_mod()._MEMORY_SCOPE_WEIGHTS,
                         )
                     )
@@ -251,6 +252,16 @@ class ContextRetrieval:
             )
         except Exception as exc:
             self._c._record_degradation("memory", exc, scope="project")
+        try:
+            out.extend(
+                await store.search(
+                    task.objective,
+                    scope=MemoryScope.USER,
+                    scope_id=self._c._principal_id,
+                )
+            )
+        except Exception as exc:
+            self._c._record_degradation("memory", exc, scope="user")
         try:
             out.extend(await store.search(task.objective, scope=MemoryScope.GLOBAL))
         except Exception as exc:
@@ -526,6 +537,7 @@ class ContextRetrieval:
         static: "_StaticContextT",
     ) -> list[_EntryT]:
         out: list[_EntryT] = []
+        out.extend(await self._load_context_digests(task))
         transcript = list(recent) if recent else await self._c._load_transcript(task)
         # ``!!`` direct escapes are durable audit records, but explicitly opt
         # out of the next model context. Keeping this at the compiler boundary
@@ -548,6 +560,51 @@ class ContextRetrieval:
             out.append(_skill_entry(s))
         out.extend(static.research)
         return out
+
+    async def _load_context_digests(self, task: TaskSpec) -> list[_EntryT]:
+        store = self._c._context_digest_store
+        if store is None or not task.session_id:
+            return []
+        try:
+            digest = await store.latest_for_session(task.session_id, self._c._principal_id)
+        except Exception as exc:
+            self._c._record_degradation("context_digest", exc, scope=task.session_id)
+            return []
+        entries: list[_EntryT] = []
+        if digest is None:
+            return entries
+        fields = digest.normalized_fields()
+        rendered = "\n".join(
+            f"{name}: {json.dumps(value, sort_keys=True, default=str)}"
+            for name, value in fields.items()
+            if value
+        )
+        if not rendered:
+            return entries
+        text = (
+            f"[durable context digest level {digest.level}; "
+            f"task={digest.task_id}; anchors={','.join(digest.transcript_anchors[:8])}]\n"
+            f"{rendered}\nRecovery queries: " + ", ".join(digest.recovery_queries[:8])
+        )[:8_000]
+        entries.append(
+            _types()._Entry(
+                name=f"digest:{digest.id}",
+                text=text,
+                tokens=estimate_tokens(text),
+                role=Role.USER,
+                category="task_state",
+                trust=TrustClass.AGENT_CURATED,
+                mandatory=True,
+                provenance=prov(
+                    SourceType.RUNTIME,
+                    source_id=digest.id,
+                    trust=TrustClass.AGENT_CURATED,
+                    scope="context_digest",
+                ),
+                cache_zone="dynamic",
+            )
+        )
+        return entries
 
     def _project_entries(self, workspace: str | None) -> list[_EntryT]:
         reader = self._c._workspace_reader

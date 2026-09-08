@@ -4,7 +4,9 @@ import re
 from typing import Any, Iterable
 
 from athena.protocol.memory import MemoryKind, MemoryRecord, MemoryScope
+from athena.protocol.policy import DEFAULT_PRINCIPAL_ID
 from athena.protocol.messages import (
+    ArtifactRefBlock,
     CapabilityResultBlock,
     Message,
     ReasoningBlock,
@@ -78,6 +80,8 @@ async def candidates_from_task(
     task: TaskSpec | Any,
     transcript: Iterable[Any],
     result: TaskResult | None,
+    *,
+    principal_id: str = DEFAULT_PRINCIPAL_ID,
 ) -> list[MemoryRecord]:
     """Propose memory candidates from a completed task without fabricating facts.
 
@@ -90,17 +94,17 @@ async def candidates_from_task(
     task_id = getattr(task, "id", None) or str(task or "task")
     session_id = getattr(task, "session_id", None)
 
-    texts: list[str] = []
+    conclusions: list[tuple[str, tuple[str, ...]]] = []
     explicit_facts: list[str] = []
-    successful_observations: list[str] = []
+    pending_successes: list[CapabilityResultBlock] = []
+    pending_failures = False
+    pending_artifacts: list[str] = []
     if transcript is not None:
         items = list(transcript) if not isinstance(transcript, str) else [str(transcript)]
         for item in items:
             if isinstance(item, str):
                 if _EXPLICIT_FACT.search(item):
                     explicit_facts.append(item)
-                else:
-                    texts.append(item)
                 continue
             item_blocks = getattr(item, "blocks", None)
             if isinstance(item, Message) or isinstance(item_blocks, (list, tuple)):
@@ -108,12 +112,21 @@ async def candidates_from_task(
                 role_value = getattr(role, "value", role)
                 user_text: list[str] = []
                 assistant_text: list[str] = []
+                has_capability_call = False
                 for block in item_blocks or ():
                     if isinstance(block, ReasoningBlock):
                         continue
                     if isinstance(block, CapabilityResultBlock):
-                        if block.ok and block.output:
-                            successful_observations.append(block.output)
+                        if block.ok:
+                            pending_successes.append(block)
+                        else:
+                            pending_failures = True
+                        continue
+                    if isinstance(block, ArtifactRefBlock) and block.uri:
+                        pending_artifacts.append(block.uri)
+                        continue
+                    if getattr(block, "type", None) == "capability_call":
+                        has_capability_call = True
                         continue
                     if isinstance(block, TextBlock) and block.text:
                         if role is Role.USER or role_value == Role.USER.value:
@@ -123,27 +136,44 @@ async def candidates_from_task(
                 for text in user_text:
                     if _EXPLICIT_FACT.search(text):
                         explicit_facts.append(text)
-                # Explicit facts receive a user-scoped candidate below; do
-                # not also pass them through generic lesson extraction.
-                # Assistant prose is semantic evidence only when the same
-                # transcript contains a successful observable result. It is
-                # never inferred from hidden reasoning.
-                if successful_observations:
-                    texts.extend(assistant_text)
-                texts.extend(successful_observations)
-                successful_observations.clear()
+                # A new user turn ends the previous causal group. A later
+                # assistant conclusion is eligible only when it follows a
+                # successful result and is not itself another tool-call plan.
+                if role is Role.USER or role_value == Role.USER.value:
+                    pending_successes.clear()
+                    pending_failures = False
+                    pending_artifacts.clear()
+                elif (
+                    assistant_text
+                    and pending_successes
+                    and not pending_failures
+                    and not has_capability_call
+                ):
+                    refs = _result_refs(pending_successes) + tuple(pending_artifacts)
+                    conclusions.extend((text, refs) for text in assistant_text if text.strip())
+                    pending_successes.clear()
+                    pending_failures = False
+                    pending_artifacts.clear()
                 continue
             # Legacy/raw transcript fixtures have no role contract. Preserve
             # their explicit text while structured messages use the gates above.
             t = _text_of(item)
-            if t:
-                texts.append(t)
+            # Unstructured legacy text has no causal evidence relationship.
+            # It may still carry an explicit user fact, but cannot establish a
+            # generalized agent-derived semantic lesson.
+            if t and _EXPLICIT_FACT.search(t):
+                explicit_facts.append(t)
 
-    lessons = _extract_lessons(task_id=task_id, texts=texts)
+    lessons = _extract_lessons(
+        task_id=task_id,
+        session_id=session_id,
+        conclusions=conclusions,
+    )
     lessons.extend(
         _explicit_fact_records(
             task_id=task_id,
             session_id=session_id,
+            principal_id=principal_id,
             texts=explicit_facts,
         )
     )
@@ -177,7 +207,7 @@ async def candidates_from_task(
 
 
 def _explicit_fact_records(
-    *, task_id: str, session_id: str | None, texts: list[str]
+    *, task_id: str, session_id: str | None, principal_id: str, texts: list[str]
 ) -> list[MemoryRecord]:
     records: list[MemoryRecord] = []
     seen: set[str] = set()
@@ -193,31 +223,34 @@ def _explicit_fact_records(
                 MemoryRecord(
                     id=new_memory_id(MemoryKind.SEMANTIC),
                     kind=MemoryKind.SEMANTIC,
-                    scope=MemoryScope.SESSION,
+                    scope=MemoryScope.USER,
                     content=sentence,
                     summary="explicit user fact or preference",
                     source=Provenance(
                         source_type=SourceType.USER,
                         source_id=task_id,
-                        scope=MemoryScope.SESSION.value,
+                        scope=MemoryScope.USER.value,
                     ),
                     trust=TrustClass.USER_CONTENT,
                     created_at=utcnow(),
                     metadata={
                         "promotion": "required",
                         "candidate_type": "explicit_user_fact",
-                        "scope_id": session_id,
+                        "scope_id": principal_id,
                         "session_id": session_id,
+                        "principal_id": principal_id,
                     },
                 )
             )
     return records
 
 
-def _extract_lessons(*, task_id: str, texts: list[str]) -> list[MemoryRecord]:
+def _extract_lessons(
+    *, task_id: str, session_id: str | None, conclusions: list[tuple[str, tuple[str, ...]]]
+) -> list[MemoryRecord]:
     records: list[MemoryRecord] = []
     seen: set[str] = set()
-    for text in texts or []:
+    for text, source_refs in conclusions:
         for sentence in _split_sentences(text):
             if not (12 <= len(sentence) <= 400):
                 continue
@@ -241,10 +274,36 @@ def _extract_lessons(*, task_id: str, texts: list[str]) -> list[MemoryRecord]:
                     ),
                     trust=TrustClass.AGENT_CURATED,
                     created_at=utcnow(),
-                    metadata={"promotion": "required", "candidate_type": MemoryKind.SEMANTIC.value},
+                    source_refs=tuple(dict.fromkeys(source_refs)),
+                    confidence=0.75 if source_refs else None,
+                    metadata={
+                        "promotion": "required",
+                        "candidate_type": "evidence_linked_lesson",
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "evidence_backed": bool(source_refs),
+                    },
                 )
             )
     return records
+
+
+def _result_refs(results: list[CapabilityResultBlock]) -> tuple[str, ...]:
+    refs: list[str] = []
+    for result in results:
+        metadata = result.metadata or {}
+        candidates: list[Any] = [
+            metadata.get("result_id"),
+            result.ref_uri,
+            result.call_id,
+        ]
+        for key in ("evidence_refs", "artifact_refs"):
+            raw = metadata.get(key) or ()
+            candidates.extend(raw if isinstance(raw, (list, tuple, set)) else (raw,))
+        for ref in candidates:
+            if ref and str(ref) not in refs:
+                refs.append(str(ref))
+    return tuple(refs)
 
 
 __all__ = ["candidates_from_task"]

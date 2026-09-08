@@ -58,6 +58,7 @@ from athena.protocol.models import (
     ModelRequest,
     ModelResponse,
 )
+from athena.protocol.policy import DEFAULT_PRINCIPAL_ID
 from athena.protocol.tasks import (
     ModelPolicy,
     ResourceBudget,
@@ -552,6 +553,13 @@ class AgentKernel:
         self._completion_events: dict[str, asyncio.Event] = {}
         self._resume: dict[str, asyncio.Event] = {}
         self._resume_decision: dict[str, str] = {}
+        # A resume event is only a wakeup hint.  ``_resume_armed`` tracks the
+        # durable wait boundary so a notification racing with slot release can
+        # tell the service whether a live waiter will consume it or whether a
+        # fresh worker must be launched.  The per-task lock closes the final
+        # timeout/notification handoff window.
+        self._resume_armed: set[str] = set()
+        self._resume_locks: dict[str, asyncio.Lock] = {}
         self._stored_responses: set[str] = set()
         self._prefix_trackers: dict[tuple[str, str, str], Any] = {}
 
@@ -597,6 +605,7 @@ class AgentKernel:
             if end_compute is not None and compute_started:
                 await end_compute(task.id)
             self._runs.pop(task_id, None)
+            self._resume_armed.discard(task_id)
             completion.set()
 
     async def wait_for_completion(self, task_id: str, *, timeout: float | None = None) -> None:
@@ -648,11 +657,15 @@ class AgentKernel:
                 # P1-11: best-effort stream interrupt, but the miss is visible.
                 _bookkeeping_failure("provider stream interrupt", task_id, exc)
 
-    async def notify_approval_resolved(self, task_id: str, decision: str) -> None:
+    async def notify_approval_resolved(self, task_id: str, decision: str) -> bool:
         self._resume_decision[task_id] = decision
-        self._resume.setdefault(task_id, asyncio.Event()).set()
+        event = self._resume.setdefault(task_id, asyncio.Event())
+        async with self._resume_locks.setdefault(task_id, asyncio.Lock()):
+            armed = task_id in self._resume_armed
+            event.set()
+        return armed
 
-    async def notify_input_provided(self, task_id: str, answer: str) -> None:
+    async def notify_input_provided(self, task_id: str, answer: str) -> bool:
         """Resume a WAITING_INPUT task with the operator's answer.
 
         The answer is already durably stored by ``InputRequestStore.resolve``
@@ -661,8 +674,28 @@ class AgentKernel:
         answer from the store on resume, so a crash between DB-write and
         wakeup cannot strand the task.
         """
-        self._input_answers[task_id] = answer
-        self._resume.setdefault(task_id, asyncio.Event()).set()
+        # The answer has already been committed by InputRequestStore.  Keep
+        # plaintext out of process-local side channels; the durable row is the
+        # authority and the event only reduces resume latency.
+        event = self._resume.setdefault(task_id, asyncio.Event())
+        async with self._resume_locks.setdefault(task_id, asyncio.Lock()):
+            armed = task_id in self._resume_armed
+            event.set()
+        return armed
+
+    def _arm_resume_wait(self, task_id: str) -> None:
+        """Arm one durable continuation boundary before publishing it.
+
+        Clearing is legal only here, before the request/approval becomes
+        externally actionable.  ``_park_wait`` must never clear the event:
+        doing so after publication can erase a valid operator wakeup.
+        """
+        self._resume_armed.add(task_id)
+        self._resume.setdefault(task_id, asyncio.Event()).clear()
+        self._resume_decision.pop(task_id, None)
+
+    def _resume_waiter_armed(self, task_id: str) -> bool:
+        return task_id in self._resume_armed
 
     @staticmethod
     def _replay_policy_context(task) -> dict:
@@ -812,7 +845,9 @@ class AgentKernel:
     # ------------------------------------------------------------------ #
     # Steps
     # ------------------------------------------------------------------ #
-    async def _compile(self, task: TaskSpec) -> CompiledContext:
+    async def _compile(
+        self, task: TaskSpec, *, context_window: int | None = None
+    ) -> CompiledContext:
         recent: list[Message] = []
         if task.session_id:
             try:
@@ -839,6 +874,7 @@ class AgentKernel:
             task,
             recent_messages=_textable_messages(recent),
             workspace=task.workspace.root if task.workspace else None,
+            context_window=context_window,
         )
         strategy = compiled.strategy
         await self._emit("StrategySelected", strategy.to_dict(), task)
@@ -876,9 +912,10 @@ class AgentKernel:
         *,
         state: RunState | None = None,
         exclude: frozenset[str | tuple[str, str]] = frozenset(),
+        relax_context: bool = False,
     ) -> ModelSelection:
         return await InferenceBroker(self)._select_model(
-            task, compiled, state=state, exclude=exclude
+            task, compiled, state=state, exclude=exclude, relax_context=relax_context
         )
 
     async def _invoke(
@@ -1162,8 +1199,8 @@ class AgentKernel:
         internal = None
         if task is not None:
             internal = (task.metadata or {}).get("_athena_cache_namespace")
-        value = internal or getattr(self._compiler, "principal_id", "athena")
-        return str(value).strip() or "athena"
+        value = internal or getattr(self._compiler, "principal_id", DEFAULT_PRINCIPAL_ID)
+        return str(value).strip() or DEFAULT_PRINCIPAL_ID
 
     def _replay_metadata(
         self,
@@ -1232,6 +1269,10 @@ class AgentKernel:
             await self._append_results(task, not_executed, calls=calls)
             return None
 
+        # The dispatcher may create and publish an approval request before it
+        # returns a SuspendedCall.  Arm the task's resume boundary before that
+        # call so an operator decision cannot arrive into an unarmed window.
+        self._arm_resume_wait(task.id)
         shim = self._dispatch_factory(task)
         # Bind the producing inference turn to repair receipts before any
         # capability request is translated or dispatched.

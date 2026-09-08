@@ -65,7 +65,12 @@ class TaskAPI:
             spec = replace(spec, session_id=session_id)
         if self._svc._sessions is not None and spec.session_id:
             if await self._svc._sessions.get(spec.session_id) is None:
-                await self._svc._sessions.create(spec.session_id, metadata={"origin": "service"})
+                await self._svc._sessions.create(
+                    spec.session_id,
+                    metadata={"origin": "service"},
+                    principal_id=self._svc.config.cache_namespace,
+                    project_id=getattr(spec.workspace, "id", None),
+                )
         return await self._enqueue_spec(tm, spec, wait=wait, user_request=user_request)
 
     async def _enqueue_spec(

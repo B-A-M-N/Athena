@@ -120,11 +120,12 @@ class WorkflowCapability:
     async def invoke(self, request: CapabilityRequest, *, context=None, **kw):
         args = dict(request.arguments or {})
         operation = str(args.get("operation") or "")
+        principal_id = getattr(context, "principal_id", None)
         if operation == "list":
             workflows = await self._store.list(
                 task_id=request.task_id,
                 project_id=getattr(getattr(context, "workspace", None), "id", None),
-                user_id="athena",
+                user_id=principal_id,
             )
             return _result(request, output=json.dumps([w.to_record() for w in workflows]))
         workflow_id = str(args.get("workflow_id") or "")
@@ -133,7 +134,7 @@ class WorkflowCapability:
                 workflow_id,
                 task_id=request.task_id,
                 project_id=getattr(getattr(context, "workspace", None), "id", None),
-                user_id="athena",
+                user_id=principal_id,
             )
             if workflow is None:
                 return _result(request, ok=False, error=f"unknown workflow: {workflow_id}")
@@ -181,12 +182,16 @@ class WorkflowCapability:
                     error="workflow promotion requires task and workspace context",
                 )
             scope = str(args.get("scope") or "")
+            if scope == "user" and not principal_id:
+                return _result(
+                    request, ok=False, error="user workflow promotion requires principal"
+                )
             try:
                 candidate = await self._store.get(
                     workflow_id,
                     task_id=request.task_id,
                     project_id=context.workspace.id,
-                    user_id="athena",
+                    user_id=principal_id,
                 )
                 if candidate is None or candidate.scope.value != "candidate":
                     return _result(
@@ -218,7 +223,7 @@ class WorkflowCapability:
                     task_id=request.task_id,
                     scope=scope,
                     project_id=context.workspace.id if scope == "project" else None,
-                    user_id="athena" if scope == "user" else None,
+                    user_id=principal_id if scope == "user" else None,
                     validation=replay,
                 )
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -262,7 +267,7 @@ class WorkflowCapability:
                 workflow,
                 task_id=request.task_id,
                 project_id=getattr(getattr(context, "workspace", None), "id", None),
-                user_id="athena",
+                user_id=principal_id,
             )
 
             def create_resolver(identifier):
@@ -288,7 +293,7 @@ class WorkflowCapability:
             workflow_id,
             task_id=request.task_id,
             project_id=context.workspace.id,
-            user_id="athena",
+            user_id=principal_id,
         )
         if workflow is None:
             return _result(request, ok=False, error=f"unknown workflow: {workflow_id}")
@@ -297,7 +302,7 @@ class WorkflowCapability:
             workflow,
             task_id=request.task_id,
             project_id=context.workspace.id,
-            user_id="athena",
+            user_id=principal_id,
         )
 
         def resolver(identifier):
@@ -308,7 +313,7 @@ class WorkflowCapability:
                 identifier,
                 task_id=request.task_id,
                 project_id=context.workspace.id,
-                user_id="athena",
+                user_id=principal_id,
             ).descriptor
 
         trial_root = None
@@ -420,7 +425,7 @@ class WorkflowCapability:
             workflow,
             task_id=request.task_id,
             project_id=context.workspace.id,
-            user_id="athena",
+            user_id=getattr(context, "principal_id", None),
         )
 
         def resolver(identifier):
@@ -431,7 +436,7 @@ class WorkflowCapability:
                 identifier,
                 task_id=request.task_id,
                 project_id=context.workspace.id,
-                user_id="athena",
+                user_id=getattr(context, "principal_id", None),
             ).descriptor
 
         trial_root = tempfile.mkdtemp(prefix="athena-workflow-replay-")

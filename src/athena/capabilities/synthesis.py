@@ -314,6 +314,7 @@ class SynthesisCapability:
             return _result(request, ok=False, error="generated capabilities require a task scope")
         args = dict(request.arguments or {})
         operation = str(args.get("operation") or "")
+        principal_id = getattr(context, "principal_id", None)
         if operation == "promote_scratch":
             if self._scratch is None:
                 return _result(request, ok=False, error="scratch promotion is unavailable")
@@ -447,7 +448,7 @@ class SynthesisCapability:
                     str(args.get("capability_id") or ""),
                     task_id=request.task_id,
                     project_id=getattr(workspace, "id", None),
-                    user_id="athena",
+                    user_id=principal_id,
                     scope=args.get("scope"),
                 )
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -490,7 +491,11 @@ class SynthesisCapability:
                     return _result(request, ok=False, error=f"candidate restore failed: {exc}")
             scope = str(args.get("scope") or "")
             project_id = context.workspace.id if scope == "project" else None
-            user_id = "athena" if scope == "user" else ""
+            if scope == "user" and not principal_id:
+                return _result(
+                    request, ok=False, error="user capability promotion requires principal"
+                )
+            user_id = principal_id if scope == "user" else ""
             try:
                 cap = self._engine.synthetic_for(capability_id)
                 if cap is None:
@@ -587,7 +592,7 @@ class SynthesisCapability:
                     for lookup in (
                         {"task_id": request.task_id},
                         {"project_id": getattr(workspace, "id", None)},
-                        {"user_id": "athena"},
+                        {"user_id": principal_id},
                     ):
                         if not any(lookup.values()):
                             continue
@@ -617,7 +622,7 @@ class SynthesisCapability:
             owner_allowed = (
                 target.get("task_scope") == request.task_id
                 or target.get("project_scope") == getattr(workspace, "id", None)
-                or target.get("user_scope") == "athena"
+                or target.get("user_scope") == principal_id
             )
             if not owner_allowed:
                 return _result(

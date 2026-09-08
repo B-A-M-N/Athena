@@ -69,6 +69,35 @@ def test_anthropic_translation_preserves_image_parts():
     ]
 
 
+def test_anthropic_translation_handles_compression_role_explicitly():
+    provider = AnthropicProvider(api_key="key", use_sdk=False)
+    message = Message(
+        id="compressed",
+        role=Role.COMPRESSION,
+        blocks=(TextBlock(text="preserve this decision"),),
+        created_at=None,
+        provenance=None,
+    )
+
+    translated = provider._translate_messages(
+        ModelRequest(
+            messages=(message,),
+            model="claude-test",
+            provider="anthropic",
+            request_id="request-compression",
+        )
+    )
+
+    assert translated == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "[Athena compressed context]\npreserve this decision"}
+            ],
+        }
+    ]
+
+
 def test_anthropic_cache_breakpoint_covers_stable_context_before_task():
     provider = AnthropicProvider(api_key="key", use_sdk=False)
     messages = (

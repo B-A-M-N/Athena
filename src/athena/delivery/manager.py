@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from athena.delivery.adapters import (
@@ -38,6 +39,18 @@ _logger = logging.getLogger("athena.delivery")
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_BASE_BACKOFF_S = 0.5
 _MAX_BACKOFF_S = 8.0
+
+
+def _destination_identifier(destination: object) -> str | None:
+    """Hash a delivery destination before it enters an operator receipt."""
+    value = str(destination or "")
+    if not value:
+        return None
+    if value.startswith("destination:"):
+        return value
+    import hashlib
+
+    return f"destination:{hashlib.sha256(value.encode()).hexdigest()[:24]}"
 
 
 class DeliveryManager:
@@ -88,7 +101,11 @@ class DeliveryManager:
             return
 
         last: DeliveryOutcome | None = None
+        attempted_at: str | None = None
+        attempts = 0
         for attempt in range(1, self._max_attempts + 1):
+            attempts = attempt
+            attempted_at = datetime.now(timezone.utc).isoformat()
             outcome = await self._send(adapter, spec, result, task)
             if outcome.ok or not outcome.retryable:
                 last = outcome
@@ -104,10 +121,16 @@ class DeliveryManager:
                 "delivery for task %s via %s failed after %d attempt(s): %s",
                 result.task_id,
                 channel,
-                self._max_attempts,
+                attempts,
                 last.error,
             )
-        await self._record(task, result, last, attempts=self._max_attempts)
+        await self._record(
+            task,
+            result,
+            last,
+            attempts=attempts,
+            attempted_at=attempted_at,
+        )
 
     # ------------------------------------------------------------------ #
     # Internal
@@ -142,6 +165,7 @@ class DeliveryManager:
         outcome: DeliveryOutcome,
         *,
         attempts: int,
+        attempted_at: str | None = None,
     ) -> None:
         """Emit the delivery receipt as an event; never raise past here."""
         events = None
@@ -151,17 +175,24 @@ class DeliveryManager:
         if events is None:
             return
         receipt = dict(outcome.receipt or {})
+        attempted_at = attempted_at or datetime.now(timezone.utc).isoformat()
         receipt.update(
             {
                 "delivery_channel": str(getattr(task.delivery, "channel", None) or "event_log"),
-                "destination": getattr(task.delivery, "destination", None),
+                "destination": _destination_identifier(getattr(task.delivery, "destination", None)),
                 "delivery_status": outcome.status,
                 "ok": outcome.ok,
                 "attempts": attempts,
+                "attempted_at": attempted_at,
                 "result_status": getattr(result.status, "value", None) or str(result.status),
                 "summary": result.summary,
             }
         )
+        # External transaction receipts can carry the same identity under a
+        # provider-specific field. Never let a raw webhook URL leak through
+        # the operator-facing delivery event.
+        if "external_identity" in receipt:
+            receipt["external_identity"] = _destination_identifier(receipt.get("external_identity"))
         if outcome.error:
             receipt["error"] = outcome.error
         try:

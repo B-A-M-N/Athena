@@ -10,9 +10,6 @@ call time, so patching ``environment_common.<name>`` propagates.
 from __future__ import annotations
 
 
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import hashlib
 import ipaddress
 import inspect
@@ -30,6 +27,7 @@ from athena.network import (  # noqa: F401 (patch seams for family modules)
     pinned_sync_transport,
     resolve_addresses,
 )
+from athena.execution.async_call import run_blocking
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityResult,
@@ -235,21 +233,13 @@ _SERVICE_ROLLBACK = {
 
 
 async def _service_offload(function, *args, **kwargs):
-    """Run one bounded systemd probe without reusing a broken default pool.
+    """Run one bounded systemd probe on an owned daemon thread.
 
     The service transaction is deliberately one synchronous probe/action per
-    capability call. A short-lived executor also keeps a previous systemd
-    probe from sharing a worker with a later approval/replay path.
+    capability call. The owned bridge keeps a stuck systemd operation from
+    sharing a process-lifetime executor with a later approval/replay path.
     """
-    loop = asyncio.get_running_loop()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="athena-service")
-    try:
-        return await loop.run_in_executor(
-            executor,
-            partial(function, *args, **kwargs),
-        )
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    return await run_blocking(function, *args, **kwargs)
 
 
 def _service_effects(arguments: Mapping[str, Any]) -> frozenset[EffectClass]:

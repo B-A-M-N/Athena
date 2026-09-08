@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from athena.affordances import validation as validation_module
 from athena.affordances.validation import GeneratedSourceValidator, ValidationTier
 from athena.capabilities.synthesis import infer_input_schema
 
@@ -42,6 +43,73 @@ def test_candidate_validation_requires_type_and_lint_tools_when_present():
     assert result.passed
     assert result.metadata["required_tools"] == ["ruff"]
     assert {check.name for check in result.checks} >= {"format", "lint", "typecheck"}
+
+
+def test_validation_classifies_mypy_timeout_without_calling_source_invalid(monkeypatch):
+    calls: list[tuple[str, float]] = []
+
+    def fake_tool(command, *, cwd, timeout):
+        del cwd
+        tool = command[0].rsplit("/", 1)[-1]
+        calls.append((tool, timeout))
+        if tool == "mypy":
+            return validation_module._ToolResult(
+                list(command), 124, stderr="timed out", status="timed_out"
+            )
+        return validation_module._ToolResult(list(command), 0, status="passed")
+
+    monkeypatch.setattr(validation_module.shutil, "which", lambda tool: f"/{tool}")
+    monkeypatch.setattr(validation_module, "_run_tool", fake_tool)
+    result = GeneratedSourceValidator(timeout=2.0, tool_timeouts={"mypy": 45.0}).validate(
+        "def run(args):\n return {'ok': True}\n",
+        tier=ValidationTier.PROJECT,
+    )
+
+    assert not result.passed
+    assert result.outcome == "timed_out"
+    assert result.to_dict()["metadata"]["outcome"] == "timed_out"
+    assert ("mypy", 45.0) in calls
+
+
+def test_validation_distinguishes_invalid_source_from_environment_unavailable(monkeypatch):
+    invalid = GeneratedSourceValidator().validate("def run(args):\n return\n  broken\n")
+    assert invalid.outcome == "invalid_source"
+
+    monkeypatch.setattr(
+        validation_module.shutil,
+        "which",
+        lambda tool: None if tool == "mypy" else f"/{tool}",
+    )
+    unavailable = GeneratedSourceValidator().validate(
+        "def run(args):\n return {'ok': True}\n",
+        tier=ValidationTier.PROJECT,
+    )
+
+    assert unavailable.outcome == "environment_unavailable"
+    assert any(check.status == "unavailable" for check in unavailable.checks)
+
+
+def test_validation_distinguishes_tool_failure_from_source_diagnostics(monkeypatch):
+    monkeypatch.setattr(
+        validation_module.shutil,
+        "which",
+        lambda tool: f"/{tool}",
+    )
+
+    def failed_tool(command, *, cwd, timeout):
+        del cwd, timeout
+        return validation_module._ToolResult(
+            list(command), 2, stderr="tool configuration failed", status="tool_error"
+        )
+
+    monkeypatch.setattr(validation_module, "_run_tool", failed_tool)
+    result = GeneratedSourceValidator().validate(
+        "def run(args):\n return {'ok': True}\n",
+        tier=ValidationTier.PROJECT,
+    )
+
+    assert result.outcome == "tool_failed"
+    assert any(check.status == "tool_error" for check in result.checks)
 
 
 def test_input_schema_is_generated_from_validation_fixtures_when_omitted():

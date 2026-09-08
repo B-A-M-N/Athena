@@ -22,6 +22,7 @@ import json
 
 import pytest
 
+from athena.artifacts.store import ArtifactStore
 from athena.capabilities.browser import (
     BrowserCapability,
     ElementSnapshot,
@@ -35,13 +36,13 @@ from athena.protocol.capabilities import (
 )
 
 
-def _request(operation: str, **extra) -> CapabilityRequest:
+def _request(operation: str, *, task_id: str = "task-1", **extra) -> CapabilityRequest:
     return CapabilityRequest(
         capability_id="computer"
         if operation in {"observe", "click", "type", "key", "scroll", "move", "wait"}
         else "browser",
         arguments={"operation": operation, **extra},
-        task_id="task-1",
+        task_id=task_id,
         call_id="call-1",
     )
 
@@ -73,7 +74,7 @@ class _FakeScreen:
 
     def screenshot(self):
         self.calls.append(("screenshot",))
-        return object()  # opaque image handle
+        return _FakeImage()
 
     def click(self, x=None, y=None, button="left", **kw):
         self.calls.append(("click", x, y, button))
@@ -97,6 +98,12 @@ class _FakeScreen:
         return type("S", (), {"width": 800, "height": 600})()
 
 
+class _FakeImage:
+    def save(self, target, format="PNG"):
+        assert format == "PNG"
+        target.write(b"\x89PNG\r\n\x1a\nathena-test-frame")
+
+
 @pytest.mark.athena_evidence("test", "unit")
 async def test_computer_drives_backend_and_reports_shape():
     screen = _FakeScreen()
@@ -117,13 +124,78 @@ async def test_computer_drives_backend_and_reports_shape():
 
 
 @pytest.mark.athena_evidence("test", "unit")
-async def test_computer_observe_reports_bounded_note_without_pixels():
-    cap = ComputerCapability(backend=_FakeScreen())
+async def test_computer_observe_persists_visual_artifact_and_reports_model_input(tmp_path):
+    artifacts = ArtifactStore(root=tmp_path / "artifacts")
+    cap = ComputerCapability(backend=_FakeScreen(), artifact_store=artifacts)
+    assert (await cap.probe_health())["state"] == "ready"
     outcome = await cap.invoke(_request("observe"))
+    assert outcome.status.name == "OK"
     note = json.loads(outcome.output)
     assert note["observed"] is True
     assert note["screen_size"] == [800, 600]
+    assert note["model_input"] == "image"
+    assert outcome.ref_uri == note["artifact_uri"]
+    assert await artifacts.load(outcome.ref_uri) == b"\x89PNG\r\n\x1a\nathena-test-frame"
     assert len(outcome.output) < 1024  # bounded; no raw image in context
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_computer_observe_rejects_opaque_capture_without_fabricating_success(tmp_path):
+    class OpaqueScreen(_FakeScreen):
+        def screenshot(self):
+            return object()
+
+    cap = ComputerCapability(
+        backend=OpaqueScreen(),
+        artifact_store=ArtifactStore(root=tmp_path / "artifacts"),
+    )
+    outcome = await cap.invoke(_request("observe"))
+    assert outcome.status.name == "FAILED"
+    assert "serializable image" in outcome.error
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_computer_observe_rejects_unbounded_capture_without_retaining_it(tmp_path):
+    class OversizedImage:
+        def save(self, target, format="PNG"):
+            target.write(b"x" * (4 * 1024 * 1024 + 1))
+
+    class OversizedScreen(_FakeScreen):
+        def screenshot(self):
+            return OversizedImage()
+
+    cap = ComputerCapability(
+        backend=OversizedScreen(),
+        artifact_store=ArtifactStore(root=tmp_path / "artifacts"),
+    )
+    outcome = await cap.invoke(_request("observe"))
+
+    assert outcome.status.name == "FAILED"
+    assert "too large" in outcome.error
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_visual_result_transcript_keeps_reference_without_pixels(tmp_path):
+    from athena.kernel.run_finalizer import _results_message
+    from athena.protocol.messages import ArtifactRefBlock, CapabilityResultBlock
+
+    artifacts = ArtifactStore(root=tmp_path / "artifacts")
+    outcome = await ComputerCapability(backend=_FakeScreen(), artifact_store=artifacts).invoke(
+        _request("observe")
+    )
+    block = CapabilityResultBlock(
+        call_id=outcome.call_id,
+        capability_id=outcome.capability_id,
+        output=outcome.output,
+        metadata=outcome.metadata,
+        ref_uri=outcome.ref_uri,
+    )
+    message = _results_message(
+        type("Task", (), {"id": "task-visual", "session_id": None})(), (block,)
+    )
+
+    assert any(isinstance(item, ArtifactRefBlock) for item in message.blocks)
+    assert all(not isinstance(item, bytes) for item in message.blocks)
 
 
 @pytest.mark.athena_evidence("test", "unit")
@@ -150,8 +222,10 @@ def test_browser_operation_effects_split_network_from_computer_input():
     d = BrowserCapability.descriptor
     assert d.operation_effects["navigate"] >= {EffectClass.NETWORK_WRITE}
     assert d.operation_effects["snapshot"] == frozenset({EffectClass.NETWORK_READ})
-    for op in ("fill", "click"):
-        assert d.operation_effects[op] == frozenset({EffectClass.COMPUTER_INPUT})
+    assert d.operation_effects["fill"] == frozenset({EffectClass.COMPUTER_INPUT})
+    assert d.operation_effects["click"] == frozenset(
+        {EffectClass.COMPUTER_INPUT, EffectClass.NETWORK_WRITE}
+    )
     assert d.resolve_resources() == frozenset({ResourceClass.NETWORK})
 
 
@@ -221,7 +295,30 @@ async def test_browser_navigates_snapshots_queries_fills_clicks():
     text = await cap.invoke(_request("text"))
     assert text.output == "Example Domain"
 
+    await cap.close()
     assert driver.closed  # the capability closes what it opened
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_browser_preserves_state_per_task_until_shutdown():
+    created: list[_FakeDriver] = []
+
+    def factory():
+        driver = _FakeDriver()
+        created.append(driver)
+        return driver
+
+    cap = BrowserCapability(driver_factory=factory)
+    await cap.invoke(_request("navigate", url="https://example.com"))
+    await cap.invoke(_request("snapshot"))
+    await cap.invoke(_request("snapshot", task_id="task-2"))
+
+    assert len(created) == 2
+    assert created[0].calls[0] == ("navigate", "https://example.com")
+    assert created[0].calls[1] == ("snapshot",)
+    assert not created[0].closed
+    await cap.close()
+    assert all(driver.closed for driver in created)
 
 
 @pytest.mark.athena_evidence("test", "unit")
@@ -240,6 +337,31 @@ async def test_browser_honest_failure_without_driver_factory():
     outcome = await cap.invoke(_request("navigate", url="https://example.com"))
     assert outcome.status.name == "FAILED"
     assert "unavailable" in outcome.error
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_playwright_preflight_reports_missing_optional_dependency(monkeypatch):
+    import athena.capabilities.browser as browser_module
+
+    monkeypatch.setattr(browser_module, "_playwright", None)
+    result = await browser_module.PlaywrightBrowserDriver.preflight()
+
+    assert result == {
+        "state": "unavailable",
+        "installed": False,
+        "reason": "Playwright is not installed",
+    }
+
+
+@pytest.mark.athena_evidence("test", "unit")
+async def test_playwright_preflight_rejects_invalid_cdp_configuration(monkeypatch):
+    import athena.capabilities.browser as browser_module
+
+    monkeypatch.setattr(browser_module, "_playwright", object())
+    result = await browser_module.PlaywrightBrowserDriver.preflight(cdp_endpoint="not-a-url")
+
+    assert result["state"] == "unavailable"
+    assert "http(s) URL" in result["reason"]
 
 
 # --------------------------------------------------------------------------- #

@@ -14,6 +14,7 @@ from athena.cli.app import Options, _autonomy, _model_policy, build_config, work
 from athena.cli.native_bridge import write_native_projection
 from athena.cli.operator_commands import OperatorCommandRouter
 from athena.cli.projection import ProjectionState
+from athena.execution.async_call import run_blocking
 from athena.protocol.tasks import AgentRequest
 
 _FORCE_PROJECTION_EVENTS = frozenset(
@@ -50,6 +51,8 @@ class NativeSession:
         self._projection_lock = asyncio.Lock()
         self._projection_dirty = False
         self._projection_interval = 0.05
+        self._bridge_state = "disconnected"
+        self._bridge_error: str | None = None
         self._navigation: dict[str, Any] | None = None
         self._operator_router = OperatorCommandRouter(
             lambda: self.service,
@@ -97,6 +100,8 @@ class NativeSession:
         if not socket_path:
             raise RuntimeError("ATHENA_NATIVE_BRIDGE_SOCKET is not set")
         self._writer = await self._connect(socket_path)
+        self._bridge_state = "connected"
+        self._bridge_error = None
         from athena.service.service import AthenaService
 
         self.service = AthenaService(config=build_config(self.options))
@@ -154,8 +159,9 @@ class NativeSession:
             except Exception:
                 pass
         if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
+            writer, self._writer = self._writer, None
+            writer.close()
+            await writer.wait_closed()
 
     async def _connect(self, path: str) -> asyncio.StreamWriter:
         last_error: Exception | None = None
@@ -199,9 +205,20 @@ class NativeSession:
             self._projection_dirty = False
             try:
                 await self._send_projection()
-            except Exception:
-                self._projection_dirty = True
-                raise
+            except (ConnectionError, OSError, RuntimeError) as exc:
+                # The native compositor is a projection client. If it
+                # disappears, detach it explicitly while leaving the
+                # service/kernel and durable task state alive for recovery.
+                self._bridge_state = "detached"
+                self._bridge_error = f"{type(exc).__name__}: {exc}"
+                self._projection_dirty = False
+                writer, self._writer = self._writer, None
+                if writer is not None:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except (ConnectionError, OSError, RuntimeError):
+                        pass
 
     async def _send_projection(self) -> None:
         if self._writer is None:
@@ -239,6 +256,7 @@ class NativeSession:
                         "/approve ID [call|task|session|project]  /deny ID  /cancel ID\n"
                         "/permissions  /diff [N]  /undo ID  /context  /criteria LIST\n"
                         "/interrupted  /resume [TASK]  /sessions  /model NAME\n"
+                        "/jobs ...  /workflows ...  /skills ...  /packs ...  /health\n"
                         "/candidates  /candidate ID  /promote ID project|user\n"
                         "/deprecate ID  /mascot [owl|cat|bot|off]\n"
                         "/autonomy LEVEL  /scroll oi up|down|bottom [N]  /exit"
@@ -264,7 +282,7 @@ class NativeSession:
     async def _readline(self) -> str:
         """Read one completed native-editor line without worker-thread leaks."""
         if not sys.stdin.isatty():
-            return await asyncio.to_thread(sys.stdin.readline)
+            return await run_blocking(sys.stdin.readline)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
         fd = sys.stdin.fileno()

@@ -431,8 +431,6 @@ class ContinuationCoordinator:
     # ------------------------------------------------------------------
     async def _approval_path(self, task, state, outcome: DispatchResult) -> TaskResult | None:
         await self._k._transition(task, TaskStatus.WAITING_APPROVAL)
-        ev = self._k._resume.setdefault(task.id, asyncio.Event())
-        ev.clear()
         await self._k._emit("ApprovalRequested", {"calls": len(outcome.suspended)}, task)
         woke = await self._k._park_wait(task, state)
         if woke == "cancelled":
@@ -441,13 +439,18 @@ class ContinuationCoordinator:
             )
         if woke == "slot_released":
             decision = self._k._resume_decision.get(task.id)
+            if decision is None:
+                decision = await self._durable_approval_decision(task, outcome)
             if decision is not None:
                 woke = "resumed"
             else:
                 return await self._k._paused_result(
                     task, state, TaskStatus.WAITING_APPROVAL, "awaiting approval decision"
                 )
-        decision = self._k._resume_decision.get(task.id, "denied")
+        decision = self._k._resume_decision.get(task.id)
+        if decision is None:
+            decision = await self._durable_approval_decision(task, outcome)
+        decision = decision or "denied"
         try:
             await self._k._transition(task, TaskStatus.RUNNING)
         except Exception:
@@ -589,6 +592,10 @@ class ContinuationCoordinator:
                 calls=[call],
             )
             return None
+        # ``record`` makes the question externally answerable.  Arm before
+        # that authority commit so an answer cannot be delivered into a gap
+        # before the in-memory wait is prepared.
+        self._arm_resume_wait(task.id)
         request_id = await self._k._input_request_store.record(
             task_id=task.id,
             session_id=task.session_id,
@@ -660,10 +667,21 @@ class ContinuationCoordinator:
         wakes the task again.
         """
         ev = self._k._resume.setdefault(task.id, asyncio.Event())
-        ev.clear()
+        lock = self._resume_lock(task.id)
+        async with lock:
+            if state.cancel.is_set():
+                self._disarm_resume_wait(task.id)
+                return "cancelled"
+            # Durable state is authoritative.  The event is only a fast path
+            # and may already be set because the decision arrived between
+            # arming and this call.
+            durable_ready = await self._durable_resume_ready(task)
+            if durable_ready or (ev.is_set() and not self._has_durable_source(task)):
+                self._disarm_resume_wait(task.id)
+                return "resumed"
         resume_task = asyncio.create_task(ev.wait())
         cancel_task = asyncio.create_task(state.cancel.wait())
-        wait_s = getattr(self, "_parked_slot_wait_s", 300.0)
+        wait_s = getattr(self._k, "_parked_slot_wait_s", 300.0)
         timeout_task = asyncio.create_task(asyncio.sleep(wait_s))
         try:
             await asyncio.wait(
@@ -673,11 +691,94 @@ class ContinuationCoordinator:
             for pending in (resume_task, cancel_task, timeout_task):
                 if not pending.done():
                     pending.cancel()
-        if not resume_task.done() or state.cancel.is_set():
+        async with lock:
             if state.cancel.is_set():
+                self._disarm_resume_wait(task.id)
                 return "cancelled"
+            # Re-check after BOTH wakeup and timeout.  This closes the slot
+            # release boundary: an answer/approval committed concurrently with
+            # timeout is consumed by this run or handed to a relaunch, never
+            # stranded behind a cleared event.
+            durable_ready = await self._durable_resume_ready(task)
+            if durable_ready or (resume_task.done() and not self._has_durable_source(task)):
+                self._disarm_resume_wait(task.id)
+                return "resumed"
+            self._disarm_resume_wait(task.id)
             return "slot_released"
-        return "resumed"
+
+    def _arm_resume_wait(self, task_id: str) -> None:
+        arm = getattr(self._k, "_arm_resume_wait", None)
+        if arm is not None:
+            arm(task_id)
+            return
+        # Small test doubles that exercise this mechanism directly predate the
+        # kernel helper.  Preserve their behavior without creating a second
+        # authority path.
+        getattr(self._k, "_resume", {}).setdefault(task_id, asyncio.Event()).clear()
+
+    def _disarm_resume_wait(self, task_id: str) -> None:
+        armed = getattr(self._k, "_resume_armed", None)
+        if armed is not None:
+            armed.discard(task_id)
+
+    def _resume_lock(self, task_id: str) -> asyncio.Lock:
+        locks = getattr(self._k, "_resume_locks", None)
+        if locks is None:
+            locks = {}
+            setattr(self._k, "_resume_locks", locks)
+        return locks.setdefault(task_id, asyncio.Lock())
+
+    async def _durable_resume_ready(self, task) -> bool:
+        input_store = getattr(self._k, "_input_request_store", None)
+        if input_store is not None:
+            try:
+                if await input_store.pending_resumable(task.id) is not None:
+                    return True
+            except Exception as exc:
+                _logger.warning("input resume readiness lookup failed for %s: %s", task.id, exc)
+
+        continuations = getattr(self._k, "_continuation_store", None)
+        if continuations is not None:
+            ready = getattr(continuations, "resolved_unconsumed_for_task", None)
+            if ready is not None:
+                try:
+                    if await ready(task.id):
+                        return True
+                except Exception as exc:
+                    _logger.warning(
+                        "approval resume readiness lookup failed for %s: %s", task.id, exc
+                    )
+        return False
+
+    def _has_durable_source(self, task) -> bool:
+        return bool(
+            getattr(self._k, "_input_request_store", None)
+            or getattr(self._k, "_continuation_store", None)
+        )
+
+    async def _durable_approval_decision(self, task, outcome: DispatchResult) -> str | None:
+        """Read a resolved decision when the in-memory notification is absent."""
+        continuations = getattr(self._k, "_continuation_store", None)
+        if continuations is None:
+            return None
+        ready = getattr(continuations, "resolved_unconsumed_for_task", None)
+        if ready is None:
+            return None
+        try:
+            rows = await ready(task.id, records=True)
+        except TypeError:
+            # Older test doubles expose only the boolean readiness signature;
+            # the durable production store supports record retrieval.
+            if await ready(task.id):
+                return self._k._resume_decision.get(task.id)
+            return None
+        by_call_id = {item.call_id for item in outcome.suspended}
+        for row in rows or ():
+            if row.get("call_id") in by_call_id:
+                decision = row.get("decision")
+                if decision:
+                    return str(decision)
+        return None
 
     async def _resume_paused_entry(self, task, state) -> TaskResult | None:
         """Resume-or-re-park entry for a relaunched paused task (P1-17).
@@ -694,10 +795,14 @@ class ContinuationCoordinator:
         Returns a TaskResult only when the run should end here (cancelled,
         or re-parked past the slot deadline); None continues into the loop.
         """
-        if self._k._input_request_store is None:
+        input_store = getattr(self._k, "_input_request_store", None)
+        if input_store is None:
             return None
+        # Arm before checking durable state. The request existed before this
+        # process restarted and is already externally answerable.
+        self._arm_resume_wait(task.id)
         try:
-            answered = await self._k._input_request_store.pending_resumable(task.id)
+            answered = await input_store.pending_resumable(task.id)
         except Exception:
             answered = None
         if answered is not None:
@@ -706,7 +811,7 @@ class ContinuationCoordinator:
                 return await self._k._consume_pending_input(task, state, request_id)
             return None
         try:
-            open_request = await self._k._input_request_store.pending_for_task(task.id)
+            open_request = await input_store.pending_for_task(task.id)
         except Exception:
             open_request = None
         if open_request is None:
@@ -749,10 +854,13 @@ class ContinuationCoordinator:
         """
         args = args or {}
         durable = await self._k._input_request_store.pending_resumable(task.id)
-        answer = str(self._k._input_answers.pop(task.id, "") or (durable or {}).get("answer") or "")
+        if durable is None:
+            # A second runner must not consume or append the same operator
+            # answer.  Durable input state, not the in-memory event, decides.
+            return None
+        answer = str((durable or {}).get("answer") or "")
         answer_ref = (durable or {}).get("answer_ref") or None
         expected = str((durable or {}).get("expected") or "text").lower()
-        await self._k._input_request_store.consume(request_id)
         if expected == "secret" and self._k._secret_manager is not None:
             secret_name = (
                 (durable or {}).get("context", {}).get("secret_name")
@@ -766,7 +874,7 @@ class ContinuationCoordinator:
             answer = f"Credential '{secret_name}' is now available for this task."
         elif task.session_id:
             try:
-                await self._k._messages.append_to_session(
+                await self._k._messages.append_user_turn(
                     task.session_id,
                     Message(
                         id=f"msg_input_{request_id}",
@@ -783,6 +891,9 @@ class ContinuationCoordinator:
                 )
             except Exception:
                 _logger.warning("input answer persistence failed for %s", request_id, exc_info=True)
+        consumed = await self._k._input_request_store.consume(request_id)
+        if consumed is False:
+            return None
         try:
             row = await self._k._task_store.get(task.id)
             if row and (row.get("status") or "").upper() == TaskStatus.WAITING_INPUT.value:

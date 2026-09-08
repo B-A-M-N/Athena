@@ -89,6 +89,7 @@ class TaskManager:
         budgets: Any = None,
         cancellations: Any = None,
         admission: Any = None,
+        principal_id: str | None = None,
     ) -> None:
         self._store = task_store
         self._events = events
@@ -96,6 +97,7 @@ class TaskManager:
         self._budgets = budgets
         self._cancellations = cancellations
         self._admission = admission
+        self._principal_id = principal_id
         self._running_emitted: set[str] = set()
         # Optional post-finalization observers (knowledge pipeline). Each is an
         # async callable ``(task, result)`` invoked AFTER the terminal state is
@@ -236,7 +238,12 @@ class TaskManager:
                 parent = await self._store.get(spec.parent_task_id)
                 if parent is not None:
                     parent_session_id = parent.get("session_id")
-            await self._sessions.create(spec.session_id, parent_id=parent_session_id)
+            await self._sessions.create(
+                spec.session_id,
+                parent_id=parent_session_id,
+                principal_id=self._principal_id,
+                project_id=getattr(spec.workspace, "id", None),
+            )
 
     async def enqueue(self, task_id: str) -> Task:
         await self.transition(task_id, TaskStatus.QUEUED)

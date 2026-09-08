@@ -107,7 +107,7 @@ class TestScopeWeighting:
                 (MemoryScope.PROJECT, "p-1"),
                 (MemoryScope.GLOBAL, None),
             ],
-            mode="semantic",
+            mode="relevance",
             limit=5,
             weights=weights,
         )
@@ -126,7 +126,7 @@ class TestScopeWeighting:
         out = await MemoryRetriever(store).retrieve_scopes_weighted(
             query="fix the import",
             scopes=[(MemoryScope.SESSION, "s-1")],
-            mode="semantic",
+            mode="relevance",
             limit=5,
             weights={"SESSION": 1.0},
         )
@@ -144,7 +144,7 @@ class TestScopeWeighting:
         out = await MemoryRetriever(store).retrieve_scopes_weighted(
             query="deploy with the release script",
             scopes=[(MemoryScope.SESSION, "s-1"), (MemoryScope.GLOBAL, None)],
-            mode="semantic",
+            mode="relevance",
             limit=5,
             weights={"SESSION": 1.0},  # GLOBAL unweighted
         )

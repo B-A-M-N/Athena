@@ -51,6 +51,7 @@ from athena.reality.gate import ExecutionDisposition
 from athena.protocol.events import EV, make_event
 from athena.protocol.ids import new_id
 from athena.protocol.policy import (
+    DEFAULT_PRINCIPAL_ID,
     PolicyDecision,
     PolicyRequest,
     PolicyVerdict,
@@ -147,7 +148,7 @@ class CapabilityDispatcher:
     ) -> None:
         self.registry = registry
         self.policy = policy_engine
-        self._principal = principal or Principal("agent", "athena")
+        self._principal = principal or Principal("agent", DEFAULT_PRINCIPAL_ID)
         # Inference Compatibility Kernel: deterministic tool-input repair.
         from athena.models.compat.profiles import CompatibilityCandidates
         from athena.models.compat.toolrepair import ToolInputRepairer

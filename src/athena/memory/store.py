@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import inspect
+import logging
+import math
 import uuid
 from datetime import datetime
 from typing import Any, Mapping, Sequence
@@ -8,6 +12,8 @@ from typing import Any, Mapping, Sequence
 from athena.protocol.memory import MemoryKind, MemoryRecord, MemoryScope, RetrievalMode
 from athena.protocol.messages import Provenance, SourceType, TrustClass, utcnow
 from athena.state.database import Database
+
+_logger = logging.getLogger("athena.memory.store")
 
 _NSP = "_athena"
 _TRUST_KEY = f"{_NSP}:trust"
@@ -204,9 +210,15 @@ class MemoryStore:
     mirrors it into the FTS index.
     """
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, *, embedding_provider: Any = None) -> None:
         self._db = db
         self._generation = 0
+        self._embedding_provider = embedding_provider
+
+    @property
+    def embedding_provider(self) -> Any:
+        """Configured optional provider, exposed for retrieval checks."""
+        return self._embedding_provider
 
     @property
     def generation(self) -> int:
@@ -344,8 +356,135 @@ class MemoryStore:
             json.dumps(md, default=str),
         )
         await self._db.execute(sql, params)
+        if bool(getattr(self._embedding_provider, "eager_index", True)):
+            await self._index_embedding(record)
         self._generation += 1
         return record
+
+    async def _index_embedding(self, record: MemoryRecord) -> bool:
+        provider = self._embedding_provider
+        if provider is None or not callable(getattr(provider, "embed", None)):
+            return False
+        text = " ".join(filter(None, (record.content, record.summary)))
+        try:
+            raw = provider.embed(text)
+            vector = await raw if inspect.isawaitable(raw) else raw
+            values = tuple(float(item) for item in vector)
+            if not values or not all(math.isfinite(item) for item in values):
+                raise ValueError("embedding provider returned an invalid vector")
+            model = str(getattr(provider, "model", type(provider).__name__))
+            version = str(getattr(provider, "version", "1"))
+            await self._db.execute(
+                "INSERT INTO memory_embeddings(memory_id, content_hash, embedding_model, "
+                "embedding_version, vector, created_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(memory_id) DO UPDATE SET content_hash=excluded.content_hash, "
+                "embedding_model=excluded.embedding_model, embedding_version=excluded.embedding_version, "
+                "vector=excluded.vector, created_at=excluded.created_at",
+                (
+                    record.id,
+                    memory_content_hash(record),
+                    model,
+                    version,
+                    json.dumps(values),
+                    utcnow().isoformat(),
+                ),
+            )
+            return True
+        except Exception as exc:
+            # Embeddings are derived retrieval acceleration; canonical memory
+            # remains durable even when an optional provider is unavailable.
+            _logger.warning("memory embedding index failed for %s: %s", record.id, exc)
+            return False
+
+    async def ensure_embeddings(
+        self,
+        scope: MemoryScope | None = None,
+        scope_id: str | None = None,
+        *,
+        tags: Sequence[str] | None = None,
+        limit: int = 5000,
+    ) -> int:
+        """Backfill missing/stale vectors when semantic retrieval is requested.
+
+        Vectors are a derived index, not canonical memory. This method keeps
+        ordinary writes fast and lets an explicitly semantic query pay the
+        one-time local model initialization/backfill cost. Content hashes and
+        provider identity make model/content changes invalidate old vectors.
+        """
+        provider = self._embedding_provider
+        if provider is None or not callable(getattr(provider, "embed", None)):
+            return 0
+        scope_where, params = await self._scope_where(scope, scope_id, tags)
+        where = f"WHERE {scope_where}" if scope_where else ""
+        rows = await self._db.fetch_all(
+            "SELECT m.*, e.content_hash AS embedding_content_hash, "
+            "e.embedding_model, e.embedding_version "
+            "FROM memories m LEFT JOIN memory_embeddings e ON e.memory_id = m.id "
+            f"{where} ORDER BY m.created_at DESC LIMIT ?",
+            [*params, max(1, min(int(limit), 10_000))],
+        )
+        model = str(getattr(provider, "model", type(provider).__name__))
+        version = str(getattr(provider, "version", "1"))
+        indexed = 0
+        for row in rows:
+            record = _row_to_record(row)
+            if (
+                row.get("embedding_content_hash") == memory_content_hash(record)
+                and row.get("embedding_model") == model
+                and row.get("embedding_version") == version
+            ):
+                continue
+            if await self._index_embedding(record):
+                indexed += 1
+        return indexed
+
+    async def retrieve_by_embedding(
+        self,
+        vector: Sequence[float],
+        scope: MemoryScope | None,
+        scope_id: str | None,
+        limit: int,
+        tags: Sequence[str] | None = None,
+    ) -> list[tuple[MemoryRecord, float]]:
+        scope_w, params = await self._scope_where(scope, scope_id, tags)
+        where = f"WHERE {scope_w}" if scope_w else ""
+        rows = await self._db.fetch_all(
+            "SELECT m.*, e.vector AS embedding_vector FROM memories m "
+            "JOIN memory_embeddings e ON e.memory_id = m.id "
+            f"{where}",
+            params,
+        )
+        query = tuple(float(item) for item in vector)
+        scored: list[tuple[MemoryRecord, float]] = []
+        for row in rows:
+            try:
+                candidate = tuple(float(item) for item in json.loads(row["embedding_vector"]))
+                score = _cosine_similarity(query, candidate)
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                continue
+            scored.append((_row_to_record(row), score))
+        scored.sort(key=lambda item: (item[1], item[0].created_at, item[0].id), reverse=True)
+        return scored[: max(1, int(limit))]
+
+    async def retrieve_by_embedding_scopes(
+        self,
+        vector: Sequence[float],
+        scopes: Sequence[tuple[MemoryScope, str | None]],
+        limit: int,
+        tags: Sequence[str] | None = None,
+    ) -> list[tuple[MemoryRecord, float]]:
+        rows: list[tuple[MemoryRecord, float]] = []
+        for scope, scope_id in scopes:
+            rows.extend(await self.retrieve_by_embedding(vector, scope, scope_id, limit, tags))
+        by_id: dict[str, tuple[MemoryRecord, float]] = {}
+        for record, score in rows:
+            if record.id not in by_id or score > by_id[record.id][1]:
+                by_id[record.id] = (record, score)
+        return sorted(
+            by_id.values(),
+            key=lambda item: (item[1], item[0].created_at, item[0].id),
+            reverse=True,
+        )[: max(1, int(limit))]
 
     async def _merge_superseded(self, superseded_ids: Sequence[str], by_id: str) -> None:
         for old_id in superseded_ids:
@@ -401,18 +540,37 @@ class MemoryStore:
         record = await self.get(id)
         if record is None or (record.metadata or {}).get("pending_promotion") is not True:
             return None
+        target_scope_id = scope_id
+        if target_scope_id is None and scope in (MemoryScope.TASK, MemoryScope.SESSION):
+            target_scope_id = record.source.source_id if record.source else None
         metadata = {
             **dict(record.metadata),
             "pending_promotion": False,
             "promotion": "promoted",
-            **({"scope_id": scope_id} if scope_id else {}),
+            **({"scope_id": target_scope_id} if target_scope_id else {}),
         }
+        promoted = _replace(record, scope=scope, metadata=metadata)
+        source = promoted.source or Provenance(
+            source_type=SourceType.RUNTIME,
+            source_id=promoted.id,
+            trust=promoted.trust,
+        )
+        now = utcnow().isoformat()
+        canonical_metadata = self._record_metadata(promoted, source, now)
+        text_content = " ".join(filter(None, (promoted.content, promoted.summary)))
         await self._db.execute(
-            "UPDATE memories SET scope = ?, metadata = ?, updated_at = ? WHERE id = ?",
-            (scope.value, json.dumps(metadata, default=str), utcnow().isoformat(), id),
+            "UPDATE memories SET scope = ?, text_content = ?, metadata = ?, updated_at = ? "
+            "WHERE id = ?",
+            (
+                scope.value,
+                text_content,
+                json.dumps(canonical_metadata, default=str),
+                now,
+                id,
+            ),
         )
         self._generation += 1
-        return _replace(record, scope=scope, metadata=metadata)
+        return await self.get(id)
 
     async def discard_pending_candidate(self, id: str) -> bool:
         record = await self.get(id)
@@ -471,7 +629,7 @@ class MemoryStore:
     def _scope_id(record: MemoryRecord) -> str | None:
         if "scope_id" in record.metadata:
             return str(record.metadata["scope_id"])
-        if record.scope in (MemoryScope.TASK, MemoryScope.SESSION):
+        if record.scope in (MemoryScope.TASK, MemoryScope.SESSION, MemoryScope.USER):
             return record.source.source_id if record.source else None
         return None
 
@@ -484,7 +642,7 @@ class MemoryStore:
         *,
         scope: MemoryScope | None = None,
         scope_id: str | None = None,
-        mode: RetrievalMode | str = RetrievalMode.SEMANTIC,
+        mode: RetrievalMode | str = RetrievalMode.RELEVANCE,
         limit: int = 10,
     ) -> list[MemoryRecord]:
         from athena.memory.retrieval import MemoryRetriever
@@ -505,7 +663,7 @@ class MemoryStore:
         *,
         scope: MemoryScope | None = MemoryScope.SESSION,
         scope_id: str | None = None,
-        mode: RetrievalMode | str = RetrievalMode.SEMANTIC,
+        mode: RetrievalMode | str = RetrievalMode.RELEVANCE,
         tags: Sequence[str] | None = None,
     ) -> list[MemoryRecord]:
         from athena.memory.retrieval import MemoryRetriever
@@ -525,7 +683,7 @@ class MemoryStore:
         scopes: Sequence[tuple[MemoryScope, str | None]],
         *,
         limit: int = 10,
-        mode: RetrievalMode | str = RetrievalMode.SEMANTIC,
+        mode: RetrievalMode | str = RetrievalMode.RELEVANCE,
         tags: Sequence[str] | None = None,
     ) -> list[MemoryRecord]:
         """Search several authority scopes with one retrieval operation."""
@@ -545,7 +703,7 @@ class MemoryStore:
         scopes: Sequence[tuple[MemoryScope, str | None]],
         *,
         limit: int = 10,
-        mode: RetrievalMode | str = RetrievalMode.SEMANTIC,
+        mode: RetrievalMode | str = RetrievalMode.RELEVANCE,
         tags: Sequence[str] | None = None,
         weights: Mapping[str, float] | None = None,
     ) -> list[MemoryRecord]:
@@ -684,4 +842,21 @@ class MemoryStore:
         return " OR ".join(f'"{t}"' for t in seen[:32])
 
 
-__all__ = ["MemoryStore", "new_memory_id"]
+def memory_content_hash(record: MemoryRecord) -> str:
+    """Hash the exact canonical text represented by a stored vector."""
+    content = " ".join(filter(None, (record.content, record.summary)))
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if not left or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+__all__ = ["MemoryStore", "memory_content_hash", "new_memory_id"]

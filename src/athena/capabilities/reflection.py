@@ -108,7 +108,7 @@ class CapabilityReflection:
             raw_workspace if isinstance(raw_workspace, WorkspaceSpec) else None
         )
         project_id = getattr(workspace, "id", None)
-        user_id = "athena"
+        user_id = getattr(context, "principal_id", None)
         try:
             if operation == "search":
                 # Method-local import: fabric imports the capability registry,
@@ -222,7 +222,7 @@ class CapabilityReflection:
         *,
         task_id: str | None,
         project_id: str | None,
-        user_id: str,
+        user_id: str | None,
         limit: int,
     ) -> list[dict]:
         """Rank capabilities, workflows, and skills as one surface.
@@ -411,7 +411,7 @@ class CapabilityReflection:
         capability_id: str,
         task_id: str | None,
         project_id: str | None,
-        user_id: str,
+        user_id: str | None,
         context=None,
     ) -> list[dict]:
         descriptors = self._fabric.list_descriptors(
@@ -541,7 +541,7 @@ class CapabilityReflection:
         *,
         task_id: str | None,
         project_id: str | None,
-        user_id: str,
+        user_id: str | None,
         context=None,
     ) -> dict:
         """Compute whether a capability can run in this task context.
@@ -750,7 +750,7 @@ class CapabilityReflection:
         *,
         task_id: str | None,
         project_id: str | None,
-        user_id: str,
+        user_id: str | None,
         context=None,
     ) -> dict:
         """Summarize the effective machine/task surface in one graph."""
@@ -996,18 +996,40 @@ class CapabilityReflection:
             ),
         }
         mcp_status = self._mcp_status() if callable(self._mcp_status) else self._mcp_status
-        mcp = [
-            {
-                "id": str(name),
-                "status": "available" if str(value) == "connected" else "unavailable",
-                "availability": "available" if str(value) == "connected" else "unavailable",
-                "reason": None if str(value) == "connected" else str(value),
-                "remediation": None
-                if str(value) == "connected"
-                else "inspect MCP configuration and reconnect the server",
-            }
-            for name, value in sorted(dict(mcp_status or {}).items())
-        ]
+        mcp = []
+        for name, value in sorted(dict(mcp_status or {}).items()):
+            if isinstance(value, Mapping):
+                state = str(value.get("state") or "unknown")
+                record = dict(value)
+                record.setdefault("id", str(name))
+                record["status"] = "available" if state == "connected" else state
+                record["availability"] = "available" if state == "connected" else "unavailable"
+                record.setdefault(
+                    "reason",
+                    None
+                    if state == "connected"
+                    else str(value.get("last_error") or "MCP server is not connected"),
+                )
+                record.setdefault(
+                    "remediation",
+                    None
+                    if state == "connected"
+                    else "inspect MCP configuration and reconnect the server",
+                )
+                mcp.append(record)
+                continue
+            state = str(value)
+            mcp.append(
+                {
+                    "id": str(name),
+                    "status": "available" if state == "connected" else "unavailable",
+                    "availability": "available" if state == "connected" else "unavailable",
+                    "reason": None if state == "connected" else state,
+                    "remediation": None
+                    if state == "connected"
+                    else "inspect MCP configuration and reconnect the server",
+                }
+            )
         delegates = self._delegates() if callable(self._delegates) else self._delegates
         delegate_records = (
             [self._availability_record(item, kind="delegate") for item in delegates.list()]

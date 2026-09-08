@@ -12,6 +12,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, TextIO
 
+from athena.execution.async_call import run_blocking
+
 
 @dataclass(frozen=True)
 class ApprovalChoice:
@@ -461,10 +463,7 @@ class OperatorSurface:
         # deliberate pause in the interactive surface.
         reader = getattr(self, "read_prompt", None)
         if callable(reader):
-            import asyncio
-
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, reader, prompt)
+            return await run_blocking(reader, prompt)
         return self._input_fn(prompt)
 
     # ------------------------------------------------------------------

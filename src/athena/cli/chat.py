@@ -11,10 +11,10 @@ via ``ExecutionManager`` without routing them through the model loop.
 
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any, AsyncIterator
 
+from athena.execution.async_call import run_blocking
 from athena.protocol.events import Event, make_event
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, TaskResult
@@ -26,6 +26,11 @@ _META_HELP = """\
 /exit  /quit     leave the REPL
 /cancel          cancel the running task
 /sessions        list sessions
+/jobs list|show|enable|disable|run-now  inspect scheduled jobs
+/workflows list [TASK_ID]|show ID [TASK_ID]  inspect durable workflows
+/skills list|search|enable|disable       inspect installed skills
+/packs list|search|enable|disable|remove inspect capability packs
+/health          show live subsystem health
 /new             start a fresh session
 /autonomy LEVEL  set autonomy (supervised|coding|autonomous|offline)
 /model POLICY    set model policy
@@ -39,10 +44,11 @@ _META_HELP = """\
 /criteria LIST   set acceptance criteria (';'-separated; 'command:' prefix = probe); bare to clear
 /interrupted     list tasks parked by shutdown or crash
 /resume [TASK]   re-queue an interrupted task (or the most recent one)
-/candidates      list generated-tool candidates from the last task
+/candidates      list generated-tool and pending-memory candidates
 /candidate ID    inspect one generated-tool candidate
 /promote ID project|user  explicitly promote a generated tool
 /deprecate ID    retire a generated tool
+/memory candidates|inspect ID|promote ID SCOPE|discard ID  memory review
 /mascot [NAME]   list or switch the mascot/buddy ('off' hides it)
 !cmd             execute a shell command directly
 !!cmd            execute a shell command (output not injected into model context)
@@ -64,7 +70,8 @@ def _autonomy(value: str | None) -> AutonomyLevel:
     try:
         return AutonomyLevel(value.strip().lower())
     except ValueError:
-        return AutonomyLevel.SUPERVISED
+        valid = ", ".join(a.value for a in AutonomyLevel)
+        raise ValueError(f"unknown autonomy {value!r}; choose one of: {valid}") from None
 
 
 def _workspace_spec(root: str | None):
@@ -227,8 +234,6 @@ class ChatREPL:
     # -- input ------------------------------------------------------------
 
     async def _read_line(self, prompt: str = "athena> ") -> str:
-        loop = asyncio.get_running_loop()
-
         def _get() -> str:
             try:
                 reader = getattr(self.surface, "read_prompt", None)
@@ -238,7 +243,7 @@ class ChatREPL:
             except EOFError:
                 return ""
 
-        return await loop.run_in_executor(None, _get)
+        return await run_blocking(_get)
 
     # -- main loop --------------------------------------------------------
 

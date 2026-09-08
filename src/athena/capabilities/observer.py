@@ -182,7 +182,7 @@ class ObserverCapability:
                 observer_id,
                 task_id=request.task_id,
                 project_id=getattr(getattr(context, "workspace", None), "id", None),
-                user_id="athena",
+                user_id=getattr(context, "principal_id", None),
             )
         except Exception as exc:  # noqa: BLE001 - capability boundary
             return _result(request, ok=False, error=f"unknown observer: {exc}")

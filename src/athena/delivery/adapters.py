@@ -118,6 +118,11 @@ def _delivery_digest(spec: DeliverySpec, result: TaskResult) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
+def _destination_identifier(destination: str) -> str:
+    """Return a stable destination id without persisting URL credentials/query data."""
+    return f"destination:{hashlib.sha256(destination.encode()).hexdigest()[:24]}"
+
+
 class WebhookAdapter:
     """Deliver to an HTTP endpoint through the external-transaction lifecycle.
 
@@ -166,7 +171,7 @@ class WebhookAdapter:
                 transaction_id=transaction_id,
                 task_id=task_id,
                 capability_id=capability_id,
-                external_identity=destination,
+                external_identity=_destination_identifier(destination),
                 request_digest=request_digest,
                 idempotency_key=idempotency_key,
                 phase=ExternalEffectPhase.PREPARE,

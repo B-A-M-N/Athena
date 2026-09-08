@@ -1214,7 +1214,7 @@ class SynthesisEngine:
         *,
         scope,
         project_id: str | None = None,
-        user_id: str = "athena",
+        user_id: str | None = None,
     ) -> bool:
         return await Promotion(self).promote(
             surface,

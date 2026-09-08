@@ -190,7 +190,7 @@ class Promotion:
         *,
         scope: AffordanceScope,
         project_id: str | None = None,
-        user_id: str = "athena",
+        user_id: str | None = None,
     ) -> bool:
         """Explicitly promote validated task machinery to a wider overlay.
 

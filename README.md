@@ -36,17 +36,26 @@ loosely coordinated agents.
 
 ## Install
 
-Requires Python 3.12 or newer.
+Requires Python 3.12 or 3.13. Python 3.14 is not part of the certified beta
+matrix yet.
 
 ```bash
-pip install athena-agent==0.1.0
+pip install athena-agent==0.1.0b1
+```
+
+For local CPU semantic memory, install the optional FastEmbed backend. The
+provider is lazy and downloads the configured model only when semantic indexing
+or retrieval is first used:
+
+```bash
+pip install "athena-agent[semantic]==0.1.0b1"
 ```
 
 On a supported Linux host, install the optional native companion alongside the
 matching runtime:
 
 ```bash
-pip install "athena-agent==0.1.0" "athena-agent-native==0.1.0"
+pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"
 ```
 
 The optional `glass` extra installs Pillow for the hosted raster OI renderer;
@@ -545,28 +554,40 @@ For a quick local preview, pass a higher speed multiplier to the driver:
 The demo uses real Athena protocol, validation, event, and operator-surface
 primitives but no model provider, network, database, or host mutation.
 
+For functional product evidence, use the separate deterministic proof workflow:
+
+```bash
+bash scripts/functional-proof
+```
+
+It exercises real service/kernel/dispatcher paths, a persistent Python runtime,
+restart transcript recovery, cross-turn user memory, scheduling, and a
+verified speculative workspace commit. It does not require a commercial model
+API. The VHS recording remains a UI/projection demonstration, not functional
+agent proof.
+
 Research uses the same durable Task and evidence model. A source is fetched
 only after passing source/network policy, retained as an artifact-backed
 snapshot, and linked to claims through locators and supporting excerpts.
-Bounded lexical search, snapshot indexing, evidence verification, gap
-tracking, and the deterministic `research:plan`, `research:assess`,
-`research:bundle`, and `research:run` operations are live. `research:run`
-composes an explicit objective, requirements, selected source captures, exact
-evidence excerpts, contradiction checks, and a final readiness bundle without
-creating a separate research brain. Open-ended retrieval, semantic ranking,
-and autonomous research planning remain in development.
+Bounded lexical search, optional local FastEmbed semantic/hybrid memory
+retrieval, snapshot indexing, evidence verification, gap tracking, and the
+deterministic `research:plan`, `research:assess`, `research:bundle`, and
+`research:run` operations are live. `research:run` composes an explicit
+objective, requirements, selected source captures, exact evidence excerpts,
+contradiction checks, and a final readiness bundle without creating a separate
+research brain. Open-ended autonomous research planning remains in development.
 
 ## Current limitations
 
 Athena is not a giant predefined-tool agent, a collection of independently
 reasoning subagents, or a claim that every present backend is production-ready.
 The architecture document records the current alignment boundary. In
-particular, full cross-platform host isolation, process reattachment after
-restart, semantic research/indexing, macOS/Windows native parity, and some
-specialized runtime/UI backends remain active implementation work. A restart deliberately
-marks in-process runtime sessions lost and emits `RuntimeStateLost`; Athena
-does not guess that an old process is still safe to reuse. Types, registries,
-and documentation are not by themselves evidence that a subsystem is complete.
+particular, full cross-platform host isolation, macOS/Windows native parity,
+local-process reattachment, and some specialized runtime/UI backends remain
+active implementation work. The container backend supports proof-based runtime
+reattachment; local in-process runtimes remain service-lifetime only and emit
+`RuntimeStateLost` after restart. Types, registries, and documentation are not
+by themselves evidence that a subsystem is complete.
 
 ## Operator surface
 
@@ -594,7 +615,7 @@ and requires X11, Xft, and OpenGL; the release linker policy separately caps
 imported GLIBC symbols at 2.34 and requires those libraries to remain linked.
 It is not OS-, libc-, CPU-, or platform-neutral.
 Install the exact matching pair with
-`pip install "athena-agent==0.1.0" "athena-agent-native==0.1.0"`. It remains separate from the
+`pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`. It remains separate from the
 default hosted Glass CLI surface.
 `athena native` launches the native AthenaBOX frontend with a Python service session inside
 its PTY and a Unix-socket projection bridge; build the native release binary first with

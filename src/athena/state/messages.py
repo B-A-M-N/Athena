@@ -237,56 +237,138 @@ class MessageStore:
         self,
         query: str,
         *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
         session_ids: tuple[str, ...] | list[str] | None = None,
         limit: int = 20,
         context_window: int = 0,
     ) -> list[dict]:
         """FTS5 search over historical conversation text.
 
-        Scope is explicit and closed: the caller names the session ids it may
-        see. There is no cross-principal or unbounded-global mode. Each hit
+        Scope is explicit and closed: either the caller names session ids or
+        the host supplies a principal ownership filter. There is no
+        cross-principal or unbounded-global mode. Each hit
         carries provenance (session, role, timestamp, message id) and, on
         request, a bounded chronological context window read from the same
         session. Matches are ordered by bm25 relevance, newest first on ties.
         """
         match = sanitize_fts_query(query)
-        if not match or limit <= 0 or not session_ids:
+        if not match or limit <= 0 or (not session_ids and not principal_id):
             return []
-        placeholders = ", ".join("?" for _ in session_ids)
+        predicates = ["messages_fts MATCH ?"]
+        params: list[Any] = [match]
+        if session_ids:
+            placeholders = ", ".join("?" for _ in session_ids)
+            predicates.append(f"messages.session_id IN ({placeholders})")
+            params.extend(session_ids)
+        if principal_id:
+            predicates.append(
+                "COALESCE(sessions.principal_id, json_extract(sessions.metadata, '$.principal_id')) = ?"
+            )
+            params.append(principal_id)
+        if project_id:
+            predicates.append(
+                "COALESCE(sessions.project_id, json_extract(sessions.metadata, '$.project_id')) = ?"
+            )
+            params.append(project_id)
+        params.append(limit)
         rows = await self._db.fetch_all(
-            "SELECT messages.*, bm25(messages_fts) AS _rank "
+            "SELECT messages.*, messages.rowid AS _rowid, bm25(messages_fts) AS _rank "
             "FROM messages JOIN messages_fts ON messages_fts.rowid = messages.rowid "
-            f"WHERE messages_fts MATCH ? AND messages.session_id IN ({placeholders}) "
+            "JOIN sessions ON sessions.id = messages.session_id "
+            "WHERE " + " AND ".join(predicates) + " "
             "ORDER BY _rank ASC, messages.created_at DESC, messages.rowid DESC "
             "LIMIT ?",
-            (match, *session_ids, limit),
+            tuple(params),
         )
         results = [_hit_to_record(row) for row in rows]
+        for result, row in zip(results, rows, strict=True):
+            result["_rowid"] = row.get("_rowid")
         if context_window > 0:
             for hit in results:
                 hit["context"] = await self._context_around_hit(hit, context_window)
+        for hit in results:
+            hit.pop("_rowid", None)
         return results
+
+    async def read_context(
+        self,
+        anchor: str,
+        *,
+        session_id: str | None = None,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+        before: int = 3,
+        after: int = 3,
+    ) -> dict | None:
+        """Read bounded detail around an anchor after host-side ownership checks."""
+        if not anchor or not (session_id or principal_id) or before < 0 or after < 0:
+            return None
+        predicates = ["messages.id = ?"]
+        params: list[Any] = [anchor]
+        if session_id:
+            predicates.append("messages.session_id = ?")
+            params.append(session_id)
+        if principal_id:
+            predicates.append(
+                "COALESCE(sessions.principal_id, json_extract(sessions.metadata, '$.principal_id')) = ?"
+            )
+            params.append(principal_id)
+        if project_id:
+            predicates.append(
+                "COALESCE(sessions.project_id, json_extract(sessions.metadata, '$.project_id')) = ?"
+            )
+            params.append(project_id)
+        row = await self._db.fetch_one(
+            "SELECT messages.*, messages.rowid AS _rowid FROM messages "
+            "JOIN sessions ON sessions.id = messages.session_id "
+            "WHERE " + " AND ".join(predicates),
+            tuple(params),
+        )
+        if row is None:
+            return None
+        hit = _hit_to_record(row)
+        hit["context"] = await self._context_around_anchor(
+            {**hit, "_rowid": row.get("_rowid")}, before=before, after=after
+        )
+        return {
+            "anchor": hit,
+            "session_id": row["session_id"],
+            "message_id": row["id"],
+            "before": before,
+            "after": after,
+        }
 
     async def _context_around_hit(self, hit: dict, context_window: int) -> list[dict]:
         """Return N messages before and after the hit from the SAME session."""
+        return await self._context_around_anchor(hit, before=context_window, after=context_window)
+
+    async def _context_around_anchor(self, hit: dict, *, before: int, after: int) -> list[dict]:
+        """Return bounded messages around one owned transcript anchor."""
         session_id = hit["session_id"]
         hit_rowid = hit.get("_rowid") or hit.get("rowid")
         if hit_rowid is None:
             return [
                 _context_record(message)
                 for message in await self.list_recent_session_messages(
-                    session_id, limit=context_window * 2 + 1
+                    session_id, limit=before + after + 1
                 )
             ]
-        before_rows = await self._db.fetch_all(
-            "SELECT * FROM messages "
-            "WHERE session_id = ? AND rowid <= ? "
-            "ORDER BY rowid DESC LIMIT ?",
-            (session_id, hit_rowid, context_window + 1),
+        before_rows = (
+            await self._db.fetch_all(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND rowid <= ? "
+                "ORDER BY rowid DESC LIMIT ?",
+                (session_id, hit_rowid, before + 1),
+            )
+            if before >= 0
+            else []
         )
+        if before == 0:
+            before_rows = before_rows[:1]
         after_rows = await self._db.fetch_all(
             "SELECT * FROM messages WHERE session_id = ? AND rowid > ? ORDER BY rowid ASC LIMIT ?",
-            (session_id, hit_rowid, context_window),
+            (session_id, hit_rowid, after),
         )
         before_messages = [_row_to_message(r) for r in reversed(before_rows)]
         after_messages = [_row_to_message(r) for r in after_rows]

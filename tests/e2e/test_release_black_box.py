@@ -420,6 +420,25 @@ def _installed_acceptance_program() -> str:
 
         async def run():
             scripts = [
+                {
+                    "match": {"capability_result_contains": "NATURAL_NOTE"},
+                    "respond": {
+                        "text": "I read the verification note and found NATURAL_NOTE.",
+                        "done": True,
+                    },
+                },
+        {
+            "match": {"user_contains": "inspect the verification note"},
+                    "respond": {
+                        "capability_call": {
+                            "capability_id": "fs",
+                            "arguments": {
+                                "operation": "read",
+                                "path": "natural-verification-note.txt",
+                            },
+                        }
+                    },
+                },
                 {"match": {"capability_result_ok": True},
                  "respond": {"text": "CAPABILITY_OK", "done": True}},
                 {"match": {"capability_result_ok": False},
@@ -449,6 +468,47 @@ def _installed_acceptance_program() -> str:
                 assert isinstance(service._mcp, MCPAdapter)
                 assert service._registry is not None
                 assert service._dispatcher is not None
+
+                # Natural-language acceptance: the installed model path gets
+                # a user request, discovers fs from the compiled capability
+                # inventory, performs meaningful work, and sees the durable
+                # capability result before producing its final answer. The
+                # fake provider is deterministic, but the request still goes
+                # through Service -> TaskWorker -> AgentKernel -> dispatcher.
+                natural_note = Path(service._default_workspace.root) / (
+                    "natural-verification-note.txt"
+                )
+                natural_note.write_text("NATURAL_NOTE", encoding="utf-8")
+                provider = service._model_registry.provider_for("fake")
+                requests_before = len(provider.requests)
+                natural = await service.submit(
+                    AgentRequest(
+                        prompt=(
+                            "Please inspect the verification note and tell me what it says."
+                        )
+                    ),
+                    wait=True,
+                )
+                assert await service.get_task_status(natural.id) == TaskStatus.COMPLETE.value
+                natural_events = await events_for(service, natural.id)
+                assert any(
+                    event.type == "CapabilityRequested"
+                    and event.payload.get("capability_id") == "fs"
+                    for event in natural_events
+                )
+                assert any(
+                    event.type == "CapabilityCompleted"
+                    and event.payload.get("capability_id") == "fs"
+                    for event in natural_events
+                )
+                assert "NATURAL_NOTE" in (await service.get_result(natural.id)).summary
+                natural_requests = provider.requests[requests_before:]
+                assert natural_requests
+                assert any(
+                    descriptor.id == "fs"
+                    for request in natural_requests
+                    for descriptor in request.capabilities
+                )
                 mcp_descriptor = service._mcp.register_tool(
                     MCPToolRef(
                         name="release_echo",

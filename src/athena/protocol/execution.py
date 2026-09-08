@@ -124,6 +124,7 @@ class Runtime(Protocol):
 
 class ExecutionBackend(Protocol):
     name: str
+    supports_reattach: bool
 
     async def create_session(
         self,
@@ -141,6 +142,10 @@ class ExecutionBackend(Protocol):
     async def interrupt(self, execution_id: str) -> None: ...
 
     async def destroy_session(self, runtime_session_id: str) -> None: ...
+
+    async def describe_session(self, runtime_session_id: str) -> Mapping[str, Any]: ...
+
+    async def reattach_session(self, record: Mapping[str, Any]) -> str: ...
 
 
 __all__ = [

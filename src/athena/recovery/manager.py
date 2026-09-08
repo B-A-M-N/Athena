@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import enum
 import logging
-from typing import Mapping
+from typing import Any, Mapping
 
 from athena.protocol.tasks import TaskStatus
 from athena.state.tasks import TaskStore
@@ -45,6 +45,7 @@ class RecoveryManager:
         mutation_store: MutationStore | None = None,
         execution_store: ExecutionStore | None = None,
         runtime_session_store: RuntimeSessionStore | None = None,
+        execution_manager: Any = None,
         event_store=None,
         lease_timeout_seconds: float = 300.0,
     ) -> None:
@@ -52,19 +53,23 @@ class RecoveryManager:
         self._mutations = mutation_store
         self._executions = execution_store
         self._runtime_sessions = runtime_session_store
+        self._execution_manager = execution_manager
         self._events = event_store
         self._runtime_state_loss_count = 0
+        self._runtime_sessions_reattached = 0
         self._lease_timeout = lease_timeout_seconds
         self._recovery_required = False
 
     async def recover(self) -> RecoveryResult:
         """Run every recovery pass without treating unreadable state as empty."""
         self._runtime_state_loss_count = 0
+        self._runtime_sessions_reattached = 0
         self._recovery_required = False
         summary = {
             "tasks_interrupted": 0,
             "executions_interrupted": 0,
             "runtime_sessions_cleaned": 0,
+            "runtime_sessions_reattached": 0,
             "runtime_state_lost": 0,
             "mutations_recovered": 0,
         }
@@ -72,6 +77,7 @@ class RecoveryManager:
             summary["tasks_interrupted"] = await self._recover_tasks()
             summary["executions_interrupted"] = await self._recover_executions()
             summary["runtime_sessions_cleaned"] = await self._recover_runtime_sessions()
+            summary["runtime_sessions_reattached"] = self._runtime_sessions_reattached
             summary["runtime_state_lost"] = self._runtime_state_loss_count
             if self._mutations is not None:
                 summary["mutations_recovered"] = await self._recover_mutations()
@@ -133,7 +139,7 @@ class RecoveryManager:
         return count
 
     async def _recover_runtime_sessions(self) -> int:
-        """Mark runtime sessions as not-alive after a process restart."""
+        """Reattach proven backend sessions; mark the rest as lost."""
         if self._runtime_sessions is None:
             return 0
         count = 0
@@ -143,6 +149,25 @@ class RecoveryManager:
             if not sid:
                 continue
             try:
+                reattach = getattr(self._execution_manager, "reattach_session", None)
+                if callable(reattach):
+                    try:
+                        if await reattach(row):
+                            self._runtime_sessions_reattached += 1
+                            if self._events is not None:
+                                await self._events.append_event(
+                                    "RuntimeSessionReattached",
+                                    {
+                                        "runtime_session_id": sid,
+                                        "backend": row.get("backend"),
+                                        "runtime": row.get("runtime"),
+                                        "proof": "backend_identity_and_contract",
+                                    },
+                                    task_id=row.get("task_id"),
+                                )
+                            continue
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        _logger.warning("runtime session %s reattach rejected: %s", sid, exc)
                 await self._runtime_sessions.mark_dead(sid)
                 count += 1
                 if self._events is not None:
