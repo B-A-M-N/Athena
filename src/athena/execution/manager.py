@@ -556,7 +556,9 @@ class ExecutionManager:
         if not any(sid == runtime_session_id for _r, sid in rooms):
             rooms.append((rt, runtime_session_id))
 
-    async def _destroy_unpersisted_session(self, runtime: Any, session_id: str, task_id: str) -> None:
+    async def _destroy_unpersisted_session(
+        self, runtime: Any, session_id: str, task_id: str
+    ) -> None:
         """Destroy a newly-created session whose durable start failed."""
         close = getattr(runtime, "close", None) or getattr(runtime, "destroy_session", None)
         if close is not None:
@@ -939,7 +941,9 @@ class ExecutionManager:
         store = self._rt_sessions
         if store is None:
             if self._durability_mandatory:
-                raise RuntimeError("runtime session durability is mandatory but no store is configured")
+                raise RuntimeError(
+                    "runtime session durability is mandatory but no store is configured"
+                )
             return
         try:
             await store.start(

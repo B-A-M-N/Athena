@@ -119,12 +119,8 @@ def encode_workspace(workspace: WorkspaceSpec | None) -> str | None:
         {
             "id": workspace.id,
             "root": workspace.root,
-            "readable": [
-                {"path": rule.path, "allow": rule.allow} for rule in workspace.readable
-            ],
-            "writable": [
-                {"path": rule.path, "allow": rule.allow} for rule in workspace.writable
-            ],
+            "readable": [{"path": rule.path, "allow": rule.allow} for rule in workspace.readable],
+            "writable": [{"path": rule.path, "allow": rule.allow} for rule in workspace.writable],
             "temp_root": workspace.temp_root,
             "execution_backend": workspace.execution_backend,
             "network_policy": workspace.network_policy.value,
@@ -164,9 +160,7 @@ def decode_workspace(
         writable=writable,
         temp_root=(str(data["temp_root"]) if data.get("temp_root") is not None else None),
         execution_backend=(
-            str(data["execution_backend"])
-            if data.get("execution_backend") is not None
-            else None
+            str(data["execution_backend"]) if data.get("execution_backend") is not None else None
         ),
         network_policy=_enum(data.get("network_policy"), NetworkPolicy, network_default.value),
         mutation_mode=_enum(data.get("mutation_mode"), MutationMode, MutationMode.DIRECT.value),
@@ -213,6 +207,7 @@ def encode_criteria(criteria: tuple[Criterion, ...] | None) -> str:
 def decode_criteria(raw: Any) -> tuple[Criterion, ...]:
     result: list[Criterion] = []
     for index, item in enumerate(_items(raw, "acceptance_criteria")):
+        verification: VerificationSpec | None = None
         if isinstance(item, str):
             description = item.strip()
             if not description:
@@ -239,7 +234,6 @@ def decode_criteria(raw: Any) -> tuple[Criterion, ...]:
         if not isinstance(item, Mapping):
             raise TaskCodecError("acceptance criteria entries must be objects")
         verification_data = item.get("verification")
-        verification = None
         if verification_data:
             if not isinstance(verification_data, Mapping):
                 raise TaskCodecError("criterion verification must be an object")
@@ -336,9 +330,7 @@ def decode_model_policy(raw: Any) -> ModelPolicy:
         max_cost_usd=Decimal(str(cost)) if cost not in (None, "") else None,
         routing_preference=str(data.get("routing_preference", "balanced")),
         min_quality_tier=(
-            str(data["min_quality_tier"])
-            if data.get("min_quality_tier") is not None
-            else None
+            str(data["min_quality_tier"]) if data.get("min_quality_tier") is not None else None
         ),
         require_declared_quality=bool(data.get("require_declared_quality", False)),
     )
@@ -420,6 +412,8 @@ def decode_delivery(raw: Any) -> DeliverySpec | None:
 
 def encode_task_spec(task: TaskSpec) -> dict[str, Any]:
     """Return the canonical transport/database record for a ``TaskSpec``."""
+    workspace = encode_workspace(task.workspace)
+    delivery = encode_delivery(task.delivery)
     return {
         "id": task.id,
         "objective": task.objective,
@@ -427,14 +421,12 @@ def encode_task_spec(task: TaskSpec) -> dict[str, Any]:
         "parent_task_id": task.parent_task_id,
         "acceptance_criteria": json.loads(encode_criteria(task.acceptance_criteria)),
         "context_refs": json.loads(encode_context_refs(task.context_refs)),
-        "workspace": json.loads(encode_workspace(task.workspace))
-        if task.workspace is not None
-        else None,
+        "workspace": json.loads(workspace) if workspace is not None else None,
         "capability_policy": json.loads(encode_capability_policy(task.capability_policy)),
         "model_policy": json.loads(encode_model_policy(task.model_policy)),
         "resource_budget": json.loads(encode_budget(task.resource_budget)),
         "deadline": task.deadline.isoformat() if task.deadline else None,
-        "delivery": json.loads(encode_delivery(task.delivery)) if task.delivery else None,
+        "delivery": json.loads(delivery) if delivery is not None else None,
         "metadata": dict(task.metadata),
     }
 

@@ -349,12 +349,16 @@ class AthenaService:
         await tasks.record_recovery_marker(task_id, marker)
         row = await tasks.get(task_id)
         current = TaskStatus(row["status"]) if row else None
-        if current in {
-            TaskStatus.CREATED,
-            TaskStatus.QUEUED,
-            TaskStatus.RUNNING,
-            TaskStatus.INTERRUPTED,
-        } and self._task_manager is not None:
+        if (
+            current
+            in {
+                TaskStatus.CREATED,
+                TaskStatus.QUEUED,
+                TaskStatus.RUNNING,
+                TaskStatus.INTERRUPTED,
+            }
+            and self._task_manager is not None
+        ):
             await self._task_manager.transition(
                 task_id,
                 TaskStatus.RECOVERY_REQUIRED,
@@ -1506,13 +1510,9 @@ class AthenaService:
             except ValueError as exc:
                 raise ValueError("legacy mutation_mode conflicts with typed mutation_mode") from exc
             if legacy_value is not typed_mutation_mode:
-                raise ValueError(
-                    "typed mutation_mode conflicts with legacy metadata mutation_mode"
-                )
+                raise ValueError("typed mutation_mode conflicts with legacy metadata mutation_mode")
         raw_mutation_mode = (
-            typed_mutation_mode
-            if typed_mutation_mode is not None
-            else legacy_mutation_mode
+            typed_mutation_mode if typed_mutation_mode is not None else legacy_mutation_mode
         )
         # OFFLINE autonomy is a hard egress boundary (P0): the task's model
         # routing is narrowed to local-only models, not merely biased toward

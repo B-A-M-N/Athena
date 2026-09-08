@@ -145,7 +145,9 @@ class DelegationManager:
             child_workspace = _replace(
                 child_workspace,
                 delegate_mode="DETACHED" if detached else str(delegate_mode).upper(),
-                required_child=(False if detached else True if required_child is None else bool(required_child)),
+                required_child=(
+                    False if detached else True if required_child is None else bool(required_child)
+                ),
             )
         child_spec = TaskSpec(
             # No scope is pre-applied here: delegate/_scope_child performs the
@@ -157,9 +159,21 @@ class DelegationManager:
             parent_task_id=parent.id,
             context_refs=context_refs,
             workspace=child_workspace,
-            model_policy=(decode_model_policy(model_policy) if model_policy is not None else TaskSpec(id="", objective="").model_policy),
-            resource_budget=(decode_budget(resource_budget) if resource_budget is not None else TaskSpec(id="", objective="").resource_budget),
-            capability_policy=(decode_capability_policy(capability_policy) if capability_policy is not None else TaskSpec(id="", objective="").capability_policy),
+            model_policy=(
+                decode_model_policy(model_policy)
+                if model_policy is not None
+                else TaskSpec(id="", objective="").model_policy
+            ),
+            resource_budget=(
+                decode_budget(resource_budget)
+                if resource_budget is not None
+                else TaskSpec(id="", objective="").resource_budget
+            ),
+            capability_policy=(
+                decode_capability_policy(capability_policy)
+                if capability_policy is not None
+                else TaskSpec(id="", objective="").capability_policy
+            ),
             metadata=dict(metadata or {}),
         )
         created = await self.delegate(parent_task=parent, child_spec=child_spec)
@@ -483,9 +497,7 @@ def _scope_model_policy(parent: TaskSpec, child):
             if child_v.routing_preference != "balanced"
             else base.routing_preference
         ),
-        min_quality_tier=_stricter_quality_tier(
-            base.min_quality_tier, child_v.min_quality_tier
-        ),
+        min_quality_tier=_stricter_quality_tier(base.min_quality_tier, child_v.min_quality_tier),
         require_declared_quality=bool(
             base.require_declared_quality or child_v.require_declared_quality
         ),

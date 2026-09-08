@@ -40,9 +40,7 @@ class ContextDigestBuilder:
     ) -> ContextDigest:
         entries = (*required, *corpus)
         current = self._fields(task, entries, runtime_sessions, child_tasks)
-        current["compression_degraded"] = bool(
-            getattr(compression, "compression_degraded", False)
-        )
+        current["compression_degraded"] = bool(getattr(compression, "compression_degraded", False))
         if previous is not None:
             fields = {
                 name: _merge(previous.normalized_fields().get(name), current.get(name))

@@ -271,7 +271,9 @@ class TaskManager:
         rows = await self._store.list_by_session(session_id) or []
         return [_deserialize(r) for r in rows]
 
-    async def required_child_state(self, parent_task_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    async def required_child_state(
+        self, parent_task_id: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """Return (pending, failed) required direct children.
 
         Detached children have their own lifecycle and never hold the parent

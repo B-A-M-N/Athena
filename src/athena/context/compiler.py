@@ -1166,9 +1166,7 @@ class ContextCompiler:
                 "cannot form a bounded context."
             )
 
-        return kept, CompressionRecord(
-            tuple(markers), self._compressor.consume_degraded()
-        ), omitted
+        return kept, CompressionRecord(tuple(markers), self._compressor.consume_degraded()), omitted
 
     async def _persist_context_digest(
         self,

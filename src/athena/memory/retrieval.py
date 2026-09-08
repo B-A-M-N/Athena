@@ -129,8 +129,7 @@ class MemoryRetriever:
             weight_map = {str(k).lower(): float(v) for k, v in (weights or {}).items()}
             weighted_scores = [
                 (
-                    _weighted_retrieval_score(record)
-                    * weight_map.get(record.scope.value, 1.0),
+                    _weighted_retrieval_score(record) * weight_map.get(record.scope.value, 1.0),
                     record,
                 )
                 for record in records
@@ -297,9 +296,7 @@ def _fuse(
     """Deterministic reciprocal-rank fusion with explicit quality signals."""
     vector_scores = {record.id: float(score) for record, score in vector}
     vector_records = [record for record, _ in vector]
-    records: dict[str, MemoryRecord] = {
-        record.id: record for record in (*lexical, *vector_records)
-    }
+    records: dict[str, MemoryRecord] = {record.id: record for record in (*lexical, *vector_records)}
     scores: dict[str, float] = {record_id: 0.0 for record_id in records}
     for rank, record in enumerate(lexical, 1):
         scores[record.id] += 1.0 / (60.0 + rank)
@@ -322,9 +319,7 @@ def _fuse(
             record,
             metadata={
                 **dict(record.metadata or {}),
-                "_athena:retrieval_score": (
-                    vector_scores.get(record_id, scores[record_id])
-                ),
+                "_athena:retrieval_score": (vector_scores.get(record_id, scores[record_id])),
             },
         )
         for record_id, record in ranked

@@ -977,7 +977,10 @@ class ServiceLifecycle:
             or execution_outcome.get("backend_failures")
             or execution_outcome.get("sessions_remaining")
             or execution_outcome.get("unproven_process_kills")
-            or (self._svc._resource_finalizer and self._svc._resource_finalizer.health().get("failures"))
+            or (
+                self._svc._resource_finalizer
+                and self._svc._resource_finalizer.health().get("failures")
+            )
         )
         self._svc._shutdown_status = {
             "state": "clean" if shutdown_clean else "incomplete",
