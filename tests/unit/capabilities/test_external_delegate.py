@@ -11,6 +11,7 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     EffectClass,
 )
+from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import WorkspaceSpec
 
 
@@ -208,7 +209,9 @@ def test_delegate_task_cleanup_closes_transport_and_durable_session():
         return session, closed
 
     session, closed = asyncio.run(run())
-    assert closed == 1
+    assert isinstance(closed, TaskResourceCloseResult)
+    assert closed.confirmed is True
+    assert closed.closed_ids == (session.id,)
     assert transport.closed is True
     assert store.values[session.id].state == "closed"
 
@@ -225,6 +228,23 @@ def test_delegate_effect_ceiling_rejects_unknown_effect():
         assert "unknown effect" in str(exc)
     else:
         raise AssertionError("unknown delegate effect should be rejected")
+
+
+def test_delegate_preflight_checks_command_availability():
+    registry = DelegateRegistry()
+    registry.register(
+        DelegateSpec(
+            id="missing-specialist",
+            protocol="json_lines",
+            command=("athena-command-that-does-not-exist",),
+        )
+    )
+
+    result = registry.preflight("missing-specialist")
+
+    assert result["configured"] is True
+    assert result["executable_ready"] is False
+    assert result["available"] is False
 
 
 def test_host_configured_command_delegate_can_resume_protocol_session(tmp_path):

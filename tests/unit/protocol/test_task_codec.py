@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -54,6 +55,29 @@ def test_http_boundary_exposes_typed_authority_fields():
     assert request.acceptance_criteria == (_criterion(),)
     assert request.model_policy is not None
     assert request.model_policy.min_quality_tier == "premium"
+
+
+def test_http_boundary_exposes_full_capability_budget_and_deadline_fields():
+    request = build_agent_request(
+        {
+            "prompt": "bounded task",
+            "capability_policy": {
+                "allow": ["fs"],
+                "ask": ["git"],
+                "deny": ["network"],
+            },
+            "resource_budget": {"max_agent_iterations": 7, "max_wall_time": 30},
+            "deadline": "2030-01-01T00:00:00+00:00",
+        }
+    )
+    assert request.capability_policy is not None
+    assert request.capability_policy.allow == ("fs",)
+    assert request.capability_policy.ask == ("git",)
+    assert request.capability_policy.deny == ("network",)
+    assert request.resource_budget is not None
+    assert request.resource_budget.max_agent_iterations == 7
+    assert request.resource_budget.max_wall_time == timedelta(seconds=30)
+    assert request.deadline is not None
 
 
 @pytest.mark.asyncio

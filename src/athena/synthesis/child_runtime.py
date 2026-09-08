@@ -21,8 +21,9 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from athena.protocol.resources import TaskResourceCloseResult
 from athena.synthesis.runtime import GeneratedToolHost, PersistentGeneratedSession
 
 if TYPE_CHECKING:
@@ -240,30 +241,54 @@ class ChildRuntime:
                 shutil.rmtree(handle[1], ignore_errors=True)
         return result
 
-    async def close_persistent_sessions(self) -> None:
+    async def close_persistent_sessions(self) -> TaskResourceCloseResult:
         """Stop all generated persistent runtimes during service shutdown."""
         handles = tuple(self._e._persistent_sessions.items())
-        self._e._persistent_sessions.clear()
-        await self._e._close_persistent_handles(handles)
+        return await self._e._close_persistent_handles(handles)
 
-    async def close_persistent_sessions_for_task(self, task_id: str) -> None:
+    async def close_persistent_sessions_for_task(self, task_id: str) -> TaskResourceCloseResult:
         """Stop task-owned generated state when the task reaches a terminal state."""
         selected = tuple(
-            (key, self._e._persistent_sessions.pop(key))
+            (key, self._e._persistent_sessions[key])
             for key in tuple(self._e._persistent_sessions)
             if key[1] == task_id
         )
-        await self._e._close_persistent_handles(selected)
+        return await self._e._close_persistent_handles(selected)
 
-    async def _close_persistent_handles(self, handles) -> None:
-        for _key, (session, root, owned_root) in handles:
+    async def _close_persistent_handles(self, handles) -> TaskResourceCloseResult:
+        resource_ids = tuple("/".join(str(part) for part in key) for key, _ in handles)
+        closed_ids: list[str] = []
+        unproven: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        task_ids = {str(key[1]) for key, _ in handles}
+        task_id = next(iter(task_ids), "") if len(task_ids) == 1 else "service"
+        for key, (session, root, owned_root) in handles:
+            resource_id = "/".join(str(part) for part in key)
             try:
-                await session.close()
-            except (OSError, RuntimeError) as exc:
-                _logger.warning("persistent generated runtime close failed: %s", exc)
-            finally:
+                outcome = await session.close()
+                if not getattr(outcome, "proven_dead", False):
+                    unproven.append(
+                        {
+                            "session_id": resource_id,
+                            "survivors": list(getattr(outcome, "survivors", ()) or ()),
+                        }
+                    )
+                    continue
+                self._e._persistent_sessions.pop(key, None)
+                closed_ids.append(resource_id)
                 if owned_root:
                     shutil.rmtree(root, ignore_errors=True)
+            except Exception as exc:  # noqa: BLE001 - preserve each resource obligation
+                errors.append({"session_id": resource_id, "error": str(exc)})
+                _logger.warning("persistent generated runtime close failed: %s", exc)
+        return TaskResourceCloseResult(
+            task_id=task_id,
+            resource_type="generated_runtime",
+            resource_ids=resource_ids,
+            closed_ids=tuple(closed_ids),
+            unproven=tuple(unproven),
+            errors=tuple(errors),
+        )
 
     async def _run_generated_child(
         self,

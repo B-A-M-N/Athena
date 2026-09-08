@@ -13,6 +13,7 @@ error if Starlette is missing.
 from __future__ import annotations
 
 import enum
+import inspect
 import json
 import logging
 from collections.abc import Mapping
@@ -22,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 
 from athena.api.decoders import (
     DecodeError,
+    decode_budget,
+    decode_capability_policy,
     decode_criteria,
     decode_model_policy,
     decode_mutation_mode,
@@ -211,11 +214,30 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
 
     try:
         workspace = decode_workspace(body.get("workspace"))
+        capability_policy = (
+            None
+            if body.get("capability_policy") is None
+            else decode_capability_policy(body.get("capability_policy"))
+        )
+        resource_budget = decode_budget(body.get("resource_budget"))
         model_policy = decode_model_policy(body.get("model_policy"))
         mutation_mode = decode_mutation_mode(body.get("mutation_mode"))
         acceptance_criteria = decode_criteria(body.get("acceptance_criteria"))
     except DecodeError as exc:
         raise HTTPError(400, "validation_error", str(exc))
+
+    deadline = body.get("deadline")
+    if deadline is not None:
+        if not isinstance(deadline, str):
+            raise HTTPError(
+                400, "validation_error", "field 'deadline' must be an ISO string or null"
+            )
+        try:
+            deadline = datetime.fromisoformat(deadline)
+        except ValueError as exc:
+            raise HTTPError(
+                400, "validation_error", "field 'deadline' must be an ISO datetime"
+            ) from exc
 
     return AgentRequest(
         prompt=prompt,
@@ -224,6 +246,9 @@ def build_agent_request(body: Mapping[str, Any]) -> AgentRequest:
         autonomy=autonomy_value,
         workspace=workspace,
         model_policy=model_policy,
+        capability_policy=capability_policy,
+        resource_budget=resource_budget,
+        deadline=deadline,
         mutation_mode=mutation_mode,
         acceptance_criteria=acceptance_criteria,
         attachments=tuple(attachments),
@@ -514,6 +539,16 @@ def _health_handler(service: Any) -> Any:
                 database_error = str(exc)
         worker = getattr(service, "_worker", None)
         worker_health = worker.health() if worker is not None and hasattr(worker, "health") else {}
+        refresh_profile = getattr(service, "refresh_capability_profile", None)
+        if callable(refresh_profile):
+            try:
+                refreshed = refresh_profile()
+                if inspect.isawaitable(refreshed):
+                    await refreshed
+            except Exception:
+                # runtime_health below remains the diagnostic source; the
+                # readiness predicate will fail closed on the resulting state.
+                pass
         runtime_health = service.runtime_health() if hasattr(service, "runtime_health") else {}
         scheduler = getattr(service, "_scheduler", None)
         scheduler_health = runtime_health.get("scheduler") or (
@@ -524,10 +559,15 @@ def _health_handler(service: Any) -> Any:
         )
         scheduler_state = str(scheduler_health.get("health") or "")
         startup = service.startup_health() if hasattr(service, "startup_health") else None
+        capability_profile = runtime_health.get("capability_profile") or {}
+        resources = runtime_health.get("resources") or {}
+        execution_recovery = runtime_health.get("execution_recovery") or {}
+        execution_recovery_state = execution_recovery.get(
+            "state", getattr(service, "_recovery_status", "healthy")
+        )
         # Optional startup integrations may be degraded while the core
-        # service remains ready.  Their state is returned below for operators;
-        # only service/database/worker/scheduler/provider/recovery checks gate
-        # readiness.
+        # service remains ready. Required profile/resource failures are live
+        # contract failures and therefore gate new work and readiness.
         startup_ok = startup is None or startup.get("status") in {"ok", "degraded"}
         checks = {
             "service": started,
@@ -543,6 +583,9 @@ def _health_handler(service: Any) -> Any:
             "providers": _providers_ready(getattr(service, "_model_registry", None)),
             "worker_persistence": worker_health.get("status", "ok") == "ok",
             "recovery": getattr(service, "_recovery_status", "healthy") in {"healthy", "recovered"},
+            "capability_profile": capability_profile.get("status", "ok") == "ok",
+            "resource_teardown": resources.get("unresolved_count", 0) == 0,
+            "execution_recovery": execution_recovery_state in {"healthy", "recovered"},
         }
         if startup is not None:
             checks["startup"] = startup_ok

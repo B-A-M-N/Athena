@@ -26,6 +26,7 @@ LANE_STAGES: dict[str, str] = {
     # test evidence
     "pytest": "tests",
     "pytest-performance": "tests",
+    "functional-proof": "tests",
     "release-scenarios": "tests",
     # heavy integration: artifacts, native, E2E, sandboxes
     "native-fetch": "integration",
@@ -44,6 +45,15 @@ LANE_STAGES: dict[str, str] = {
 }
 
 VALID_STAGES = ("static", "tests", "bench", "integration")
+
+FUNCTIONAL_PROOF_NODEIDS = (
+    "tests/integration/test_end_to_end.py::test_full_loop_returns_complete_with_answer",
+    "tests/e2e/test_real_execution.py::test_persistent_python_session_keeps_state",
+    "tests/e2e/test_session_resume.py::test_resume_session_sees_prior_transcript",
+    "tests/integration/test_memory_recall.py::test_explicit_remember_request_is_retrievable_on_next_turn",
+    "tests/integration/test_scheduler_execution.py::test_scheduled_job_fires_and_runs_to_complete",
+    "tests/unit/capabilities/test_reality_coordinator.py::test_simple_patch_reaches_real_workspace_only_after_verification",
+)
 
 
 def lane_stage(name: str) -> str:
@@ -196,6 +206,10 @@ def release_commands(
                 "-n",
                 xdist_workers(),
             ],
+        ),
+        (
+            "functional-proof",
+            [*prefix, "python", "-m", "pytest", "-q", *FUNCTIONAL_PROOF_NODEIDS],
         ),
         # Wall-clock budget tests measure real latency; they run serially so
         # their measurement is not fighting other workers for CPU.

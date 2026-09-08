@@ -528,6 +528,16 @@ class ServiceLifecycle:
         )
         self._svc._delegation = delegation
 
+        from athena.service.resource_finalizer import TaskResourceFinalizer
+
+        # Install the resource barrier before capability observers are
+        # registered. Logical affordance observers may run afterward, but no
+        # process/session owner can be forgotten before this proof runs.
+        finalizer = TaskResourceFinalizer(event_sink=self._svc._forward_events(events))
+        finalizer.bind_service(self._svc)
+        self._svc._resource_finalizer = finalizer
+        task_manager.add_finalize_observer(finalizer.finalize)
+
         # 12. Register core capabilities (bind executors to current handles).
         await self._svc._register_core_capabilities(
             registry=registry,
@@ -537,13 +547,6 @@ class ServiceLifecycle:
             skills_store=skills_store,
             research_store=self._svc._research_store,
         )
-
-        from athena.service.resource_finalizer import TaskResourceFinalizer
-
-        finalizer = TaskResourceFinalizer(event_sink=self._svc._forward_events(events))
-        finalizer.bind_service(self._svc)
-        self._svc._resource_finalizer = finalizer
-        task_manager.add_finalize_observer(finalizer.finalize)
 
         # Rehydrate only validated project/user machinery. Task-local
         # capabilities are intentionally recreated by the owning task and

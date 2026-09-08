@@ -9,7 +9,13 @@ from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
 from athena.protocol.errors import ModelProviderUnconfigured
 from athena.protocol.models import PrivacyClass
-from athena.protocol.tasks import AgentRequest, ModelPolicy
+from athena.protocol.tasks import (
+    AgentRequest,
+    Criterion,
+    ModelPolicy,
+    VerificationSpec,
+    VerificationType,
+)
 from athena.service.service import AthenaService
 
 
@@ -82,6 +88,25 @@ async def test_model_judgment_preflights_unready_judge_role():
     request = AgentRequest(
         prompt="judge this",
         metadata={"acceptance_criteria": ["the result is correct"]},
+    )
+
+    with pytest.raises(ModelProviderUnconfigured) as error:
+        await service.require_agent_ready(request)
+    assert error.value.data["role"] == "judge"
+
+
+@pytest.mark.asyncio
+async def test_typed_acceptance_criteria_are_admitted_with_judge_role():
+    service, _ = _service_with_routes()
+    request = AgentRequest(
+        prompt="judge this",
+        acceptance_criteria=(
+            Criterion(
+                id="criterion-1",
+                description="the result is correct",
+                verification=VerificationSpec(type=VerificationType.MODEL_JUDGMENT),
+            ),
+        ),
     )
 
     with pytest.raises(ModelProviderUnconfigured) as error:

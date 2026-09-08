@@ -10,6 +10,7 @@ def test_core_release_lanes_exclude_optional_hermes_by_default():
 
     assert "hermes-live" not in names
     assert "e2e" in names
+    assert "functional-proof" in names
 
 
 def test_release_can_opt_into_hermes_live_evidence():

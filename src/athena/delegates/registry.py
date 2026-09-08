@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import os
+import shutil
 from typing import Any
 
 from athena.delegates.models import DelegateSpec
@@ -32,6 +34,50 @@ class DelegateRegistry:
 
     def connector_for(self, delegate_id: str):
         return self._connectors.get(delegate_id)
+
+    def preflight(self, delegate_id: str) -> dict[str, Any]:
+        """Check that a configured delegate can actually be launched.
+
+        Registration proves only that host configuration is syntactically
+        present. Admission needs a live, cheap check of the executable or
+        trusted connector so a required delegate cannot disappear behind a
+        successful startup configuration check.
+        """
+        spec = self.get(delegate_id)
+        connector = self.connector_for(delegate_id)
+        protocol = spec.protocol_value
+        protocol_supported = protocol in {"acp", "a2a", "openai", "json_lines"}
+        executable: str | None = None
+        if spec.command:
+            command = str(spec.command[0])
+            if os.path.isabs(command) or os.sep in command:
+                executable = command if os.access(command, os.X_OK) else None
+            else:
+                executable = shutil.which(command)
+        connector_ready = connector is not None and callable(connector)
+        executable_ready = executable is not None
+        available = connector_ready or executable_ready
+        return {
+            "id": spec.id,
+            "protocol": protocol,
+            "configured": True,
+            "connector_ready": connector_ready,
+            "executable": executable,
+            "executable_ready": executable_ready,
+            "protocol_supported": protocol_supported,
+            "available": available and protocol_supported,
+            "reason": (
+                None
+                if available and protocol_supported
+                else (
+                    "unsupported delegate protocol"
+                    if not protocol_supported
+                    else "delegate executable is unavailable"
+                    if spec.command
+                    else "delegate connector is unavailable"
+                )
+            ),
+        }
 
     def list(self) -> list[dict[str, Any]]:
         return [self._specs[key].to_record() for key in sorted(self._specs)]

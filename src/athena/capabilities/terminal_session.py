@@ -40,6 +40,7 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.events import EV, make_event
 from athena.protocol.ids import new_id
+from athena.protocol.resources import TaskResourceCloseResult
 
 try:
     import pexpect  # type: ignore[import-untyped]
@@ -570,16 +571,39 @@ class TerminalSessionCapability:
 
         return _result(request, ok=False, error=f"unknown operation: {op}")
 
-    async def close_task(self, task_id: str) -> None:
-        """Close and await all PTYs owned by one completed task."""
+    async def close_task(self, task_id: str) -> TaskResourceCloseResult:
+        """Close PTYs owned by one task and retain unproven ownership."""
         sessions = [s for s in self._sessions.values() if s.task_id == task_id]
+        resource_ids = tuple(session.id for session in sessions)
+        closed_ids: list[str] = []
+        unproven: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
         for session in sessions:
             try:
                 await run_blocking(session.child.terminate, True)
-            except (OSError, pexpect.exceptions.ExceptionPexpect) as exc:
-                _logger.debug("terminal session cleanup failed: %s", exc)
+                if session.alive():
+                    unproven.append(
+                        {"session_id": session.id, "pid": getattr(session.child, "pid", None)}
+                    )
+                    continue
+            except Exception as exc:  # noqa: BLE001 - preserve each resource obligation
+                errors.append({"session_id": session.id, "error": str(exc)})
+                _logger.warning("terminal session cleanup failed: %s", exc)
+                continue
             self._sessions.pop(session.id, None)
-            await self._emit_runtime(EV["RUNTIME_STATE_LOST"], session, reason="task_finalized")
+            closed_ids.append(session.id)
+            try:
+                await self._emit_runtime(EV["RUNTIME_STATE_LOST"], session, reason="task_finalized")
+            except Exception as exc:  # bookkeeping failure cannot re-open a closed PTY
+                _logger.warning("terminal session close event failed for %s: %s", session.id, exc)
+        return TaskResourceCloseResult(
+            task_id=str(task_id),
+            resource_type="terminal",
+            resource_ids=resource_ids,
+            closed_ids=tuple(closed_ids),
+            unproven=tuple(unproven),
+            errors=tuple(errors),
+        )
 
     def close_all(self):
         """Close every PTY, returning an awaitable for lifecycle events.

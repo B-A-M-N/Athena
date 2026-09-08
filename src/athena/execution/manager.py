@@ -55,7 +55,11 @@ class RuntimeCancellationResult:
 
     @property
     def confirmed(self) -> bool:
-        return not self.remaining_sessions and not self.pending_runtime_cancellations
+        return (
+            not self.remaining_sessions
+            and not self.pending_runtime_cancellations
+            and not self.unproven_process_kills
+        )
 
 
 class Sink:

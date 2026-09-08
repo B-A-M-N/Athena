@@ -41,6 +41,7 @@ from athena.protocol.capabilities import (
     ResourceClass,
 )
 from athena.network.target_policy import validate_target
+from athena.protocol.resources import TaskResourceCloseResult
 
 _playwright: Any = None
 try:  # optional dependency; the capability registers only when present
@@ -478,16 +479,34 @@ class BrowserCapability:
             except Exception:  # noqa: BLE001 - shutdown is best effort
                 pass
 
-    async def close_task(self, task_id: str) -> None:
-        """Close a task-scoped driver after its task reaches a final state."""
+    async def close_task(self, task_id: str) -> TaskResourceCloseResult:
+        """Close a task-scoped driver and retain it if closure is unproven."""
         if self._session_scope != "task":
-            return
+            return TaskResourceCloseResult(task_id=str(task_id), resource_type="browser")
         async with self._lock:
-            driver = self._drivers.pop(str(task_id), None)
-            if driver is not None:
-                self._driver_policies.pop(id(driver), None)
+            driver = self._drivers.get(str(task_id))
         if driver is not None:
-            await driver.close()
+            try:
+                await driver.close()
+            except Exception as exc:  # noqa: BLE001 - retain driver for retry
+                self._last_error = f"browser task cleanup failed: {type(exc).__name__}: {exc}"
+                return TaskResourceCloseResult(
+                    task_id=str(task_id),
+                    resource_type="browser",
+                    resource_ids=(str(task_id),),
+                    unproven=({"session_id": str(task_id), "error": str(exc)},),
+                    errors=({"session_id": str(task_id), "error": str(exc)},),
+                )
+            async with self._lock:
+                self._drivers.pop(str(task_id), None)
+                self._driver_policies.pop(id(driver), None)
+            return TaskResourceCloseResult(
+                task_id=str(task_id),
+                resource_type="browser",
+                resource_ids=(str(task_id),),
+                closed_ids=(str(task_id),),
+            )
+        return TaskResourceCloseResult(task_id=str(task_id), resource_type="browser")
 
     async def close_session(self, session_id: str) -> None:
         """Close a session-scoped driver when its owning session is closed."""

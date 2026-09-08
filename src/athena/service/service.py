@@ -105,7 +105,7 @@ if TYPE_CHECKING:
 
 from athena.protocol.events import Event
 from athena.protocol.ids import new_id
-from athena.protocol.errors import ModelProviderUnconfigured, ProviderError
+from athena.protocol.errors import ModelProviderUnconfigured, ProviderError, ServiceNotReady
 from athena.protocol.policy import ApprovalScope
 from athena.protocol.tasks import (
     AgentRequest,
@@ -413,6 +413,8 @@ class AthenaService:
                 "reason": "no embedding provider configured",
             }
         )
+        mcp = self.mcp_status()
+        capability_profile = self._live_capability_profile_status(mcp)
         return {
             "scheduler": scheduler.health() if scheduler is not None else {"health": "stopped"},
             "watch": watches.health() if watches is not None else {"health": "stopped"},
@@ -427,7 +429,13 @@ class AthenaService:
                     None if model_readiness.get("state") == "ready" else "no ready model provider"
                 ),
             },
-            "mcp": self.mcp_status(),
+            "execution_recovery": {
+                "state": self._recovery_status,
+                "summary": dict(self._recovery_summary),
+                "error": self._recovery_error,
+            },
+            "mcp": mcp,
+            "capability_profile": capability_profile,
             "optional_capabilities": {
                 name: dict(value)
                 for name, value in sorted(self._optional_capability_health.items())
@@ -439,6 +447,93 @@ class AthenaService:
             ),
             "shutdown": dict(self._shutdown_status),
         }
+
+    def _live_capability_profile_status(
+        self, mcp: Mapping[str, Mapping[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """Refresh cheap live profile state without performing async probes."""
+        configured = tuple(self.config.effective_required_capabilities)
+        if not configured:
+            status: dict[str, Any] = {
+                "profile": self.config.capability_profile,
+                "required": [],
+                "resolved": [],
+                "missing": [],
+                "status": "ok",
+                "blocking": False,
+            }
+            self._capability_profile_status = status
+            return dict(status)
+
+        mcp_status = dict(mcp or {})
+        previous_missing = {
+            str(item.get("id")): dict(item)
+            for item in self._capability_profile_status.get("missing", ())
+            if isinstance(item, Mapping)
+        }
+        resolved: list[str] = []
+        missing: list[dict[str, Any]] = []
+        aliases = {
+            "terminal": "terminal_session",
+            "external_delegate": "external_delegate",
+            "external-delegate": "external_delegate",
+        }
+        from athena.protocol.capabilities import Availability
+
+        for configured_id in configured:
+            requirement = str(configured_id).strip()
+            kind, separator, identifier = requirement.partition(":")
+            kind = kind.casefold() if separator else "capability"
+            identifier = identifier.strip() if separator else requirement
+            reason: str | None = None
+            if kind == "mcp":
+                state = mcp_status.get(identifier)
+                if state is None:
+                    reason = "MCP server is not configured"
+                elif state.get("state") != "connected":
+                    reason = str(state.get("last_error") or state.get("state") or "not connected")
+            elif kind == "capability":
+                if self._registry is None:
+                    reason = "capability registry is not initialized"
+                else:
+                    try:
+                        descriptor = self._registry.resolve(
+                            aliases.get(identifier.casefold(), identifier)
+                        )
+                        if descriptor.availability is not Availability.AVAILABLE:
+                            reason = f"capability is {descriptor.availability.value}"
+                    except Exception:
+                        reason = "capability is not registered"
+            elif kind == "delegate":
+                try:
+                    preflight = self._delegate_registry.preflight(identifier)
+                    if not preflight.get("available"):
+                        reason = str(preflight.get("reason") or "delegate is unavailable")
+                except KeyError:
+                    reason = "delegate is not configured"
+            elif kind in {"skill", "pack"}:
+                # Skill/pack checks require an async store read; preserve their
+                # last verified state here and refresh it at admission.
+                if requirement in previous_missing:
+                    reason = str(previous_missing[requirement].get("reason") or "not ready")
+                elif self._capability_profile_status.get("status") != "ok":
+                    reason = "capability profile has not been verified"
+            else:
+                reason = f"unknown capability requirement kind: {kind}"
+            if reason is None:
+                resolved.append(requirement)
+            else:
+                missing.append({"id": requirement, "reason": reason})
+        status = {
+            "profile": self.config.capability_profile,
+            "required": list(configured),
+            "resolved": resolved,
+            "missing": missing,
+            "status": "ok" if not missing else "failed",
+            "blocking": True,
+        }
+        self._capability_profile_status = status
+        return dict(status)
 
     async def _validate_required_capabilities(self) -> dict[str, Any]:
         """Resolve the configured deployment capability contract.
@@ -508,12 +603,9 @@ class AthenaService:
                         reason = str(health.get("reason") or health.get("status"))
             elif kind == "delegate":
                 try:
-                    spec = self._delegate_registry.get(identifier)
-                    if (
-                        not spec.command
-                        and self._delegate_registry.connector_for(identifier) is None
-                    ):
-                        reason = "delegate has no trusted connector"
+                    preflight = self._delegate_registry.preflight(identifier)
+                    if not preflight.get("available"):
+                        reason = str(preflight.get("reason") or "delegate is unavailable")
                 except KeyError:
                     reason = "delegate is not configured"
             elif kind == "capability":
@@ -1683,22 +1775,18 @@ class AthenaService:
         # spelling remains a compatibility input, but a request carrying both
         # forms must agree canonically instead of silently choosing one.
         raw_criteria = meta.pop("acceptance_criteria", None)
-        typed_criteria = tuple(request.acceptance_criteria or ())
         legacy_criteria = decode_criteria(raw_criteria) if raw_criteria is not None else ()
         if self_host:
             criteria = legacy_criteria
-        elif typed_criteria and legacy_criteria:
-            if encode_criteria(typed_criteria) != encode_criteria(legacy_criteria):
-                raise ValueError(
-                    "typed acceptance_criteria conflicts with legacy metadata acceptance_criteria"
-                )
-            criteria = typed_criteria
         else:
-            criteria = typed_criteria or legacy_criteria
+            criteria = self._normalize_agent_request_acceptance(request)
         # Normalize requested_capabilities into the task's capability policy
-        cap_policy = None
+        cap_policy = request.capability_policy
         if request.requested_capabilities:
-            cap_policy = CapabilityPolicy(allow=tuple(request.requested_capabilities))
+            requested = tuple(sorted(request.requested_capabilities))
+            if cap_policy is not None and set(requested) != set(cap_policy.allow):
+                raise ValueError("requested_capabilities conflicts with capability_policy.allow")
+            cap_policy = cap_policy or CapabilityPolicy(allow=requested)
         # Persist attachments as context refs so they survive beyond the request
         context_refs: list[ContextRef] = []
         for att in request.attachments or []:
@@ -1732,7 +1820,8 @@ class AthenaService:
             session_id=session_id,
             workspace=ws,
             model_policy=model_policy,
-            resource_budget=ResourceBudget(),
+            resource_budget=request.resource_budget or ResourceBudget(),
+            deadline=request.deadline,
             context_refs=tuple(context_refs),
             metadata=meta,
         )
@@ -1748,6 +1837,19 @@ class AthenaService:
             name = str(key)
             if name.startswith("_") or name in _RESERVED_REQUEST_METADATA:
                 raise ValueError(f"reserved Athena metadata: {name}")
+
+    @staticmethod
+    def _normalize_agent_request_acceptance(request: AgentRequest) -> tuple:
+        """Resolve typed and legacy acceptance criteria once at admission."""
+        typed = tuple(request.acceptance_criteria or ())
+        metadata = request.metadata if isinstance(request.metadata, Mapping) else {}
+        raw_legacy = metadata.get("acceptance_criteria")
+        legacy = decode_criteria(raw_legacy) if raw_legacy is not None else ()
+        if typed and legacy and encode_criteria(typed) != encode_criteria(legacy):
+            raise ValueError(
+                "typed acceptance_criteria conflicts with legacy metadata acceptance_criteria"
+            )
+        return typed or legacy
 
     def _workspace_reader(self):
         """Return a workspace instruction reader bound to the current workspace.
@@ -2725,24 +2827,6 @@ class AthenaService:
 
     async def _cleanup_task_affordances(self, task, result) -> None:
         task_id = getattr(task, "id", None)
-        if task_id and self._external_delegate_manager is not None:
-            try:
-                await self._external_delegate_manager.close_task(task_id)
-            except Exception as exc:
-                _logger.warning(
-                    "task external delegate cleanup failed for %s: %s",
-                    task_id,
-                    exc,
-                )
-        if task_id and self._synthesis is not None:
-            try:
-                await self._synthesis.close_persistent_sessions_for_task(task_id)
-            except Exception as exc:
-                _logger.warning(
-                    "task generated runtime cleanup failed for %s: %s",
-                    task_id,
-                    exc,
-                )
         if task_id and self._fabric is not None:
             self._fabric.unregister_task(task_id)
         if task_id:
@@ -3207,14 +3291,11 @@ class AthenaService:
         state: every caller must pass through this service-owned predicate.
         """
         await self._require_provider_ready()
+        await self.require_capability_profile_ready()
         if request is None:
             return
         base_policy = request.model_policy or _default_model_policy()
-        criteria = (
-            request.metadata.get("acceptance_criteria")
-            if isinstance(request.metadata, Mapping)
-            else None
-        )
+        criteria = self._normalize_agent_request_acceptance(request)
         await self._admit_model_roles(
             base_policy,
             self._required_model_roles(base_policy, request.metadata, criteria=criteria),
@@ -3223,6 +3304,7 @@ class AthenaService:
     async def require_task_ready(self, spec: TaskSpec) -> None:
         """Admit every model-backed Task before it enters durable state."""
         await self._require_provider_ready()
+        await self.require_capability_profile_ready()
         policy = spec.model_policy or _default_model_policy()
         await self._admit_model_roles(
             policy,
@@ -3268,6 +3350,22 @@ class AthenaService:
                     allowed_models=list(policy.allowed or ()),
                     role=role,
                 ) from exc
+
+    async def require_capability_profile_ready(self) -> None:
+        """Reject new work while a configured required surface is unhealthy."""
+        status = await self._validate_required_capabilities()
+        if status.get("status") == "ok":
+            return
+        raise ServiceNotReady(
+            "Required capability profile is not ready; new work is admitted only "
+            "after every required surface is healthy.",
+            profile=status.get("profile"),
+            missing=list(status.get("missing") or ()),
+        )
+
+    async def refresh_capability_profile(self) -> dict[str, Any]:
+        """Refresh async-backed capability health for operator/readiness APIs."""
+        return await self._validate_required_capabilities()
 
     @staticmethod
     def _required_model_roles(

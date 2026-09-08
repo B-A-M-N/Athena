@@ -29,6 +29,7 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.events import EV, make_event
 from athena.protocol.execution import ExecutionRequest
+from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import NetworkPolicy
 
 _debugpy: Any = None
@@ -574,32 +575,94 @@ class DebuggerCapability:
                 return _result(request, output=json.dumps(body, sort_keys=True), meta=body)
             if op == "detach":
                 await self._request(client, "disconnect", {"terminateDebuggee": True})
-                await self._close_session(session["session_id"], session)
+                close_result = await self._close_session(session["session_id"], session)
+                if not close_result.confirmed:
+                    return _result(
+                        request,
+                        ok=False,
+                        error="debugger session teardown was not confirmed",
+                        meta=close_result.to_dict(),
+                    )
                 return _result(request, output=f"detached {session['session_id']}")
             return _result(request, ok=False, error=f"unknown debugger operation: {op}")
         except (ConnectionError, OSError, RuntimeError, ValueError) as exc:
             return _result(request, ok=False, error=f"DAP {op} failed: {exc}")
 
-    async def _close_session(self, sid: str, session: dict[str, Any]) -> None:
+    async def _close_session(self, sid: str, session: dict[str, Any]) -> TaskResourceCloseResult:
+        errors: list[dict[str, Any]] = []
         client = session.get("client")
         if client is not None:
-            client.close()
+            try:
+                client.close()
+            except Exception as exc:  # noqa: BLE001 - retain ownership on uncertainty
+                errors.append({"session_id": sid, "resource": "dap", "error": str(exc)})
         execution_task = session.get("execution_task")
         if execution_task is not None and not execution_task.done():
             execution_task.cancel()
+            await asyncio.gather(execution_task, return_exceptions=True)
         if self._execution is not None:
             try:
                 await self._execution.interrupt(session["execution_id"])
+            except Exception as exc:  # noqa: BLE001 - preserve failed proof
+                errors.append({"session_id": sid, "resource": "execution", "error": str(exc)})
+            try:
                 await self._execution.destroy_session(session["runtime_session_id"])
-            except Exception as exc:
-                _logger.debug("debugger session cleanup failed: %s", exc)
+            except Exception as exc:  # noqa: BLE001 - preserve failed proof
+                errors.append(
+                    {
+                        "session_id": sid,
+                        "runtime_session_id": session.get("runtime_session_id"),
+                        "resource": "execution",
+                        "error": str(exc),
+                    }
+                )
+        if errors:
+            _logger.warning("debugger session cleanup failed: %s", errors)
+            return TaskResourceCloseResult(
+                task_id=str(session.get("task_id") or ""),
+                resource_type="debugger",
+                resource_ids=(str(sid),),
+                errors=tuple(errors),
+                unproven=tuple(errors),
+            )
         self._sessions.pop(sid, None)
+        return TaskResourceCloseResult(
+            task_id=str(session.get("task_id") or ""),
+            resource_type="debugger",
+            resource_ids=(str(sid),),
+            closed_ids=(str(sid),),
+        )
 
-    async def close_task(self, task_id: str) -> None:
-        """Await cleanup for debugger sessions owned by one task."""
+    async def close_task(self, task_id: str) -> TaskResourceCloseResult:
+        """Close debugger sessions and retain any unproven ownership."""
+        results: list[TaskResourceCloseResult] = []
         for sid, session in list(self._sessions.items()):
             if session.get("task_id") == task_id:
-                await self._close_session(sid, session)
+                try:
+                    results.append(await self._close_session(sid, session))
+                except Exception as exc:  # noqa: BLE001 - continue every owned session
+                    _logger.warning("debugger session cleanup failed: %s", exc)
+                    results.append(
+                        TaskResourceCloseResult(
+                            task_id=str(task_id),
+                            resource_type="debugger",
+                            resource_ids=(str(sid),),
+                            unproven=({"session_id": str(sid), "error": str(exc)},),
+                            errors=({"session_id": str(sid), "error": str(exc)},),
+                        )
+                    )
+        return TaskResourceCloseResult(
+            task_id=str(task_id),
+            resource_type="debugger",
+            resource_ids=tuple(
+                resource_id for result in results for resource_id in result.resource_ids
+            ),
+            closed_ids=tuple(
+                resource_id for result in results for resource_id in result.closed_ids
+            ),
+            unproven=tuple(item for result in results for item in result.unproven),
+            errors=tuple(item for result in results for item in result.errors),
+        )
 
     def close_all(self):
         """Close DAP clients synchronously and return an awaitable sweep."""

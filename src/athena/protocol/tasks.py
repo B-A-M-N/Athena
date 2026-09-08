@@ -395,6 +395,11 @@ class AgentRequest:
     autonomy: AutonomyLevel = AutonomyLevel.SUPERVISED
     attachments: tuple[ArtifactRef, ...] = ()
     requested_capabilities: frozenset[str] | None = None
+    # Optional full authority controls for interface callers. The legacy
+    # requested_capabilities field remains a shorthand for allow-only policy.
+    capability_policy: CapabilityPolicy | None = None
+    resource_budget: ResourceBudget | None = None
+    deadline: datetime | None = None
     # Authority-bearing: explicit mutation mode (defaults to workspace or SUPERVISED default).
     mutation_mode: MutationMode | None = None
     # Authority-bearing: explicit acceptance criteria for the task.

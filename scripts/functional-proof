@@ -5,13 +5,19 @@ set -euo pipefail
 # projection demo: it drives real Athena service, kernel, dispatcher, runtime,
 # persistence, memory, and reality-bound paths without a commercial model API.
 # The release host may pass additional pytest node IDs to narrow the proof.
-PYTHON_BIN="${ATHENA_PYTHON:-python3}"
-
-if (($#)); then
-    exec "${PYTHON_BIN}" -m pytest -q "$@"
+# Use the frozen project environment by default. ATHENA_PYTHON remains an
+# explicit escape hatch for hermetic callers that provide their own interpreter.
+if [[ -n "${ATHENA_PYTHON:-}" ]]; then
+    PYTHON_CMD=("${ATHENA_PYTHON}")
+else
+    PYTHON_CMD=(uv run --frozen --extra dev python)
 fi
 
-exec "${PYTHON_BIN}" -m pytest -q \
+if (($#)); then
+    exec "${PYTHON_CMD[@]}" -m pytest -q "$@"
+fi
+
+exec "${PYTHON_CMD[@]}" -m pytest -q \
     tests/integration/test_end_to_end.py::test_full_loop_returns_complete_with_answer \
     tests/e2e/test_real_execution.py::test_persistent_python_session_keeps_state \
     tests/e2e/test_session_resume.py::test_resume_session_sees_prior_transcript \

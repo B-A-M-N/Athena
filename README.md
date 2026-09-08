@@ -557,7 +557,13 @@ primitives but no model provider, network, database, or host mutation.
 For functional product evidence, use the separate deterministic proof workflow:
 
 ```bash
-bash scripts/functional-proof
+uv run --frozen --extra dev python -m pytest -q \
+  tests/integration/test_end_to_end.py::test_full_loop_returns_complete_with_answer \
+  tests/e2e/test_real_execution.py::test_persistent_python_session_keeps_state \
+  tests/e2e/test_session_resume.py::test_resume_session_sees_prior_transcript \
+  tests/integration/test_memory_recall.py::test_explicit_remember_request_is_retrievable_on_next_turn \
+  tests/integration/test_scheduler_execution.py::test_scheduled_job_fires_and_runs_to_complete \
+  tests/unit/capabilities/test_reality_coordinator.py::test_simple_patch_reaches_real_workspace_only_after_verification
 ```
 
 It exercises real service/kernel/dispatcher paths, a persistent Python runtime,
