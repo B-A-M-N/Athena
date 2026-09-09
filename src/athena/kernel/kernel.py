@@ -493,6 +493,8 @@ class AgentKernel:
         interpreter=None,
         reality_coordinator: Any = None,
         secret_manager=None,
+        workflow_store=None,
+        workflow_fabric=None,
     ) -> None:
         self._task_store = task_store
         self._events = events
@@ -536,6 +538,8 @@ class AgentKernel:
         # acceptance evidence to an active candidate branch and promote only
         # proven reality.
         self._reality_coordinator = reality_coordinator
+        self._workflow_store = workflow_store
+        self._workflow_fabric = workflow_fabric
         # Kernel-owned interpreter fusion hook (audit P0.2). The extension
         # itself carries no authority — it receives observations and returns
         # proposals; every subturn and every dispatch routes through the
@@ -599,6 +603,9 @@ class AgentKernel:
                 await begin_compute(task.id)
                 compute_started = True
             await self._bootstrap(task, state)
+            invocation = (task.metadata or {}).get("_pack_hook_invocation")
+            if invocation is not None:
+                return await self._run_pack_hook_workflow(task, state, invocation)
             return await self._loop(task, state)
         except BudgetStateUnavailable as exc:
             return await self._finalize(
@@ -613,6 +620,123 @@ class AgentKernel:
             self._runs.pop(task_id, None)
             self._resume_armed.discard(task_id)
             completion.set()
+
+    async def _run_pack_hook_workflow(
+        self,
+        task: TaskSpec,
+        state: RunState,
+        invocation: Mapping[str, Any],
+    ) -> TaskResult:
+        """Execute a pack hook's declared workflow without model mediation."""
+        workflow_id = str(invocation.get("workflow_id") or "")
+        pack_id = str(invocation.get("pack_id") or "")
+        if not workflow_id or not pack_id or self._workflow_store is None:
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.FAILED,
+                "pack hook workflow invocation is incomplete",
+            )
+        workspace = task.workspace
+        if workspace is None:
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.FAILED,
+                "pack hook workflow requires a workspace",
+            )
+        try:
+            workflow = await self._workflow_store.get(
+                workflow_id,
+                task_id=task.id,
+                project_id=workspace.id,
+                user_id=None,
+            )
+            if workflow is None:
+                raise ValueError(f"declared pack hook workflow not found: {workflow_id}")
+            provenance = dict(workflow.provenance or {})
+            if provenance.get("pack_id") != pack_id:
+                raise ValueError("pack hook workflow provenance does not match its pack")
+            if not workflow.enabled or workflow.lifecycle_state != "ACTIVE":
+                raise ValueError("declared pack hook workflow is not active")
+            if self._workflow_fabric is None or self._dispatch_factory is None:
+                raise RuntimeError("pack hook workflow execution is not wired")
+
+            from athena.capabilities.workflow import WorkflowCapability
+            from athena.workflows.executor import WorkflowExecutor
+
+            shim = self._dispatch_factory(task)
+            dispatcher = getattr(shim, "_dispatcher", None)
+            if dispatcher is None:
+                raise RuntimeError("pack hook workflow dispatcher is unavailable")
+            workflow_capability = WorkflowCapability(
+                self._workflow_store,
+                dispatcher,
+                self._workflow_fabric,
+                run_store=self._workflow_run_store,
+            )
+            graph = await workflow_capability._load_graph(  # noqa: SLF001
+                workflow,
+                task_id=task.id,
+                project_id=workspace.id,
+                user_id=None,
+            )
+
+            def resolver(identifier):
+                nested = graph.get(identifier)
+                if nested is not None:
+                    return nested
+                return self._workflow_fabric.executor_for(
+                    identifier,
+                    task_id=task.id,
+                    project_id=workspace.id,
+                    user_id=None,
+                ).descriptor
+
+            event_payload = invocation.get("event_payload")
+            inputs = {
+                "event": dict(event_payload) if isinstance(event_payload, Mapping) else {},
+                "event_id": str(invocation.get("event_id") or ""),
+                "hook_id": str(invocation.get("hook_id") or ""),
+                "pack_id": pack_id,
+            }
+            outcome = await WorkflowExecutor(
+                dispatcher,
+                resolver=resolver,
+                run_store=self._workflow_run_store,
+            ).run(
+                graph[workflow.id],
+                task_id=task.id,
+                workspace=workspace,
+                session_id=task.session_id,
+                inputs=inputs,
+                task_policy=task.capability_policy,
+                task_budget=task.resource_budget,
+            )
+            if outcome.suspended is not None:
+                await self._transition(task, TaskStatus.WAITING_APPROVAL)
+                return await self._paused_result(
+                    task,
+                    state,
+                    TaskStatus.WAITING_APPROVAL,
+                    "pack hook workflow is awaiting approval",
+                )
+            if outcome.status == "completed":
+                return await self._finalize(
+                    task,
+                    state,
+                    TaskStatus.COMPLETE,
+                    f"pack hook workflow {workflow.id} completed",
+                )
+            reason = "; ".join(outcome.failures) or f"workflow status: {outcome.status}"
+            return await self._finalize(task, state, TaskStatus.FAILED, reason)
+        except Exception as exc:  # workflow failures become truthful task results
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.FAILED,
+                f"pack hook workflow failed: {exc}",
+            )
 
     async def wait_for_completion(self, task_id: str, *, timeout: float | None = None) -> None:
         """Wait until the kernel has finished post-result cleanup for a run."""

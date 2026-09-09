@@ -547,6 +547,8 @@ class ServiceLifecycle:
             interpreter=self._svc._make_interpreter(),
             reality_coordinator=coordinator,
             secret_manager=self._svc._secrets,
+            workflow_store=self._svc._workflow_store,
+            workflow_fabric=self._svc._fabric,
         )
         self._svc._kernel = kernel
 
@@ -896,6 +898,7 @@ class ServiceLifecycle:
             try:
                 activated = await self._svc._pack_manager.rehydrate_enabled()
                 await self._svc._pack_manager.replay_hook_outbox()
+                await self._svc._pack_manager.start_hook_dispatcher()
                 failures = self._svc._pack_manager.rehydration_failures()
                 unavailable = {str(item["pack_id"]) for item in failures}
                 quarantined = await self._svc._quarantine_tasks_for_packs(
@@ -1065,6 +1068,8 @@ class ServiceLifecycle:
         }
 
         # MCP clients.
+        if self._svc._pack_manager is not None:
+            await self._svc._pack_manager.stop_hook_dispatcher()
         if self._svc._mcp_supervisor is not None:
             await self._svc._mcp_supervisor.stop()
             self._svc._mcp_supervisor = None

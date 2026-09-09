@@ -14,9 +14,10 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -31,11 +32,27 @@ from athena.protocol.capabilities import (
 )
 from athena.scheduler.scheduler import TriggerSpec, TriggerType
 from athena.scheduler.triggers import next_fire
+from athena.network import validate_target
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
 from athena.protocol.tasks import DeliverySpec
 
 _UNSET = object()
+
+
+@dataclass(frozen=True)
+class ScheduleControl:
+    """Current caller authority used to control a persisted schedule."""
+
+    origin: str = "user_direct"
+    task_id: str | None = None
+    session_id: str | None = None
+    principal_id: str | None = None
+    project_id: str | None = None
+    capability_policy: Any = None
+    resource_budget: Any = None
+    workspace: Any = None
+    narrow_to_caller: bool = False
 
 
 def _small_delta() -> timedelta:
@@ -62,18 +79,218 @@ def _trigger_from_metadata(job: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _owner_visible(job: Mapping[str, Any], owner: Mapping[str, str | None] | None) -> bool:
-    """Check task/session/project ownership, while preserving legacy jobs."""
+def _owner_visible(
+    job: Mapping[str, Any],
+    owner: Mapping[str, str | None] | None,
+    *,
+    control: ScheduleControl | None = None,
+) -> bool:
+    """Check visibility separately from mutation authority.
+
+    Legacy jobs without an owner remain available to operator surfaces but are
+    invisible to model-facing callers until explicitly adopted.
+    """
     metadata = job.get("metadata")
     stored = metadata.get("_owner") if isinstance(metadata, dict) else None
     if not isinstance(stored, dict) or not stored:
-        return True
+        return control is None or control.origin != "model"
     if owner is None:
         return True
+    if control is not None and control.origin == "model":
+        scoped = {key: value for key, value in dict(owner).items() if value}
+        return bool(scoped) and all(stored.get(key) == value for key, value in scoped.items())
     return any(
         value and stored.get(key) == value
         for key, value in dict(owner).items()
         if key in {"task_id", "session_id", "project_id", "principal_id"}
+    )
+
+
+def _authority_digest(authority: Mapping[str, Any]) -> str:
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(dict(authority), sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def _stored_control_grant(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    metadata = job.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    grant = metadata.get("_control_grant")
+    return grant if isinstance(grant, Mapping) else None
+
+
+def _policy_covers(stored: Mapping[str, Any], current: Any) -> bool:
+    if current is None:
+        return False
+    stored_effects = {str(value) for value in stored.get("effects") or ()}
+    current_effects = {
+        str(getattr(value, "value", value)) for value in getattr(current, "effects", ()) or ()
+    }
+    if stored_effects and current_effects and not stored_effects.issubset(current_effects):
+        return False
+    if stored_effects and not current_effects and bool(getattr(current, "deny", ())):
+        return False
+    stored_allow = set(str(value) for value in stored.get("allow") or ())
+    current_allow = set(str(value) for value in getattr(current, "allow", ()) or ())
+    if stored_allow and current_allow and not stored_allow.issubset(current_allow):
+        return False
+    stored_deny = set(str(value) for value in stored.get("deny") or ())
+    current_deny = set(str(value) for value in getattr(current, "deny", ()) or ())
+    if "*" in stored_deny and "*" not in current_deny:
+        return False
+    return True
+
+
+def _budget_covers(stored: Mapping[str, Any], current: Any) -> bool:
+    if current is None:
+        return False
+    for name, stored_value in stored.items():
+        if stored_value is None:
+            continue
+        current_value = getattr(current, name, None)
+        if current_value is None:
+            continue
+        try:
+            if float(current_value.total_seconds()) < float(stored_value):
+                return False
+        except AttributeError:
+            if float(current_value) < float(stored_value):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _current_authority(
+    control: ScheduleControl,
+    *,
+    owner: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _authority_snapshot(
+        workspace=control.workspace,
+        capability_policy=control.capability_policy,
+        model_policy=None,
+        resource_budget=control.resource_budget,
+        autonomy=None,
+        delivery=None,
+        owner=owner,
+    )
+
+
+def _authority_covers(
+    job: Mapping[str, Any],
+    owner: Mapping[str, str | None] | None,
+    control: ScheduleControl | None,
+) -> bool:
+    if control is None or control.origin in {"user_direct", "trusted_orchestration", "system"}:
+        return True
+    if control.origin != "model" or owner is None:
+        return False
+    grant = _stored_control_grant(job)
+    if grant is None:
+        return False
+    if grant.get("creator_task_id") and grant.get("creator_task_id") != control.task_id:
+        return False
+    if grant.get("creator_session_id") and grant.get("creator_session_id") != control.session_id:
+        return False
+    if grant.get("principal_id") and grant.get("principal_id") != control.principal_id:
+        return False
+    metadata = job.get("metadata")
+    stored_authority = (
+        metadata.get("_authority_snapshot")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    if not isinstance(stored_authority, Mapping):
+        return False
+    if grant.get("authority_digest") != stored_authority.get("authority_digest"):
+        return False
+    if not _policy_covers(stored_authority.get("capability_policy") or {}, control.capability_policy):
+        return False
+    if not _budget_covers(stored_authority.get("resource_budget") or {}, control.resource_budget):
+        return False
+    stored_workspace = stored_authority.get("workspace") or {}
+    current_workspace = _current_authority(control, owner=owner).get("workspace") or {}
+    stored_root = str(stored_workspace.get("root") or "")
+    current_root = str(current_workspace.get("root") or "")
+    return not stored_root or stored_root == current_root
+
+
+def _intersect_authority(
+    stored: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Narrow a schedule to the caller's current authority."""
+    result = dict(stored)
+    stored_policy = dict(stored.get("capability_policy") or {})
+    current_policy = dict(current.get("capability_policy") or {})
+    stored_effects = set(stored_policy.get("effects") or ())
+    current_effects = set(current_policy.get("effects") or ())
+    if current_effects:
+        stored_policy["effects"] = sorted(stored_effects & current_effects) if stored_effects else sorted(current_effects)
+    stored_policy["allow"] = sorted(
+        set(stored_policy.get("allow") or ()) & set(current_policy.get("allow") or ())
+    ) if current_policy.get("allow") else list(stored_policy.get("allow") or ())
+    stored_policy["ask"] = sorted(
+        set(stored_policy.get("ask") or ()) & set(current_policy.get("ask") or ())
+    ) if current_policy.get("ask") else list(stored_policy.get("ask") or ())
+    stored_policy["deny"] = sorted(
+        set(stored_policy.get("deny") or ()) | set(current_policy.get("deny") or ())
+    )
+    result["capability_policy"] = stored_policy
+    result["delivery_effects"] = sorted(
+        set(stored.get("delivery_effects") or ()) & set(current.get("capability_policy", {}).get("effects") or ())
+    ) if current.get("capability_policy", {}).get("effects") else list(stored.get("delivery_effects") or ())
+    result["effect_ceiling"] = list(result["delivery_effects"])
+    if current.get("workspace"):
+        result["workspace"] = dict(current["workspace"])
+    if current.get("resource_budget"):
+        result["resource_budget"] = dict(current["resource_budget"])
+    result["authority_digest"] = _authority_digest(result)
+    return result
+
+
+def _validate_delivery(delivery: DeliverySpec | None, workspace: Any) -> None:
+    if delivery is None:
+        return
+    channel = str(delivery.channel or "").strip().casefold()
+    if channel != "webhook":
+        return
+    destination = str(delivery.destination or "").strip()
+    parsed = urlsplit(destination)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("webhook delivery requires an http(s) destination")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("webhook destination may not contain credentials or fragments")
+    policy = getattr(workspace, "network_policy", None)
+    _target, error = validate_target(destination, getattr(policy, "value", policy))
+    if error:
+        raise PermissionError(error)
+
+
+def _job_delivery_workspace(job: Mapping[str, Any]) -> Any:
+    metadata = job.get("metadata")
+    authority = metadata.get("_authority_snapshot") if isinstance(metadata, Mapping) else None
+    workspace = authority.get("workspace") if isinstance(authority, Mapping) else None
+    if not isinstance(workspace, Mapping):
+        return None
+    return SimpleNamespace(network_policy=workspace.get("network_policy"))
+
+
+def _control_from_request(request: CapabilityRequest, context: Any) -> ScheduleControl:
+    return ScheduleControl(
+        origin=request.origin.value,
+        task_id=request.task_id,
+        session_id=request.session_id,
+        principal_id=getattr(context, "principal_id", None),
+        project_id=getattr(getattr(context, "workspace", None), "id", None),
+        capability_policy=getattr(context, "capability_policy", None),
+        resource_budget=getattr(context, "resource_budget", None),
+        workspace=getattr(context, "workspace", None),
+        narrow_to_caller=bool(request.arguments.get("narrow_authority")),
     )
 
 
@@ -266,6 +483,7 @@ class ScheduleAPI:
         reuse_session: bool = False,
         delivery: DeliverySpec | None = None,
         continuity: str = "fresh",
+        control: ScheduleControl | None = None,
     ) -> dict:
         if continuity not in {"fresh", "previous_result", "job_memory", "session"}:
             raise ValueError("continuity must be fresh, previous_result, job_memory, or session")
@@ -277,6 +495,7 @@ class ScheduleAPI:
         continuity_session_id = session_id if continuity == "session" else None
         if continuity == "session" and continuity_session_id is None:
             continuity_session_id = new_id("session")
+        _validate_delivery(delivery, workspace)
         job_id = new_id("job")
         trigger_spec = self._parse_trigger(trigger)
         owner_data = {key: value for key, value in dict(owner or {}).items() if value}
@@ -295,6 +514,15 @@ class ScheduleAPI:
             delivery=delivery,
             owner=owner_data,
         )
+        authority["authority_digest"] = _authority_digest(authority)
+        control_grant = {
+            "creator_task_id": owner_data.get("task_id"),
+            "creator_session_id": owner_data.get("session_id"),
+            "principal_id": owner_data.get("principal_id"),
+            "project_id": owner_data.get("project_id"),
+            "authority_digest": authority["authority_digest"],
+            "control_scope": "creator_authority_or_operator",
+        }
         # Occurrences default to FRESH sessions: recurring autonomous work
         # must not accumulate history inside the conversation that scheduled
         # it, inherit stale user instructions, or grow unboundedly expensive.
@@ -346,7 +574,11 @@ class ScheduleAPI:
             trigger_spec=self._scheduler_trigger_spec(trigger_spec),
             enabled=True,
             next_run=first_run.isoformat() if first_run else None,
-            metadata={"_owner": owner_data, "_authority_snapshot": authority},
+            metadata={
+                "_owner": owner_data,
+                "_authority_snapshot": authority,
+                "_control_grant": control_grant,
+            },
         )
         return {"job_id": job_id, "name": name, "enabled": True}
 
@@ -360,13 +592,29 @@ class ScheduleAPI:
         enabled: bool | None = None,
         continuity: str | None = None,
         delivery: DeliverySpec | None | object = _UNSET,
+        control: ScheduleControl | None = None,
+        authority_mode: str = "preserve",
     ) -> dict | None:
         """Update schedule-owned fields without widening its authority snapshot."""
         job = await self._scheduler._store.get_job_id(job_id)
-        if job is None or not _owner_visible(job, owner):
+        if job is None or not _owner_visible(job, owner, control=control):
             return None
+        covered = _authority_covers(job, owner, control)
+        narrowed = (
+            control is not None
+            and control.origin == "model"
+            and authority_mode == "narrow_to_caller"
+            and not covered
+        )
+        if not covered and not narrowed:
+            raise PermissionError("caller authority cannot control this schedule")
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
         template = dict(payload.get("template") or {})
+        template_metadata = dict(template.get("metadata") or {})
+        lineage = dict(template_metadata.get("_schedule_lineage") or {})
+        lineage["continuity"] = str(template.get("continuity") or "fresh")
+        template_metadata["_schedule_lineage"] = lineage
+        template["metadata"] = template_metadata
         if objective is not None:
             value = str(objective).strip()
             if not value or len(value) > 10_000:
@@ -378,6 +626,9 @@ class ScheduleAPI:
                     "continuity must be fresh, previous_result, job_memory, or session"
                 )
             template["continuity"] = continuity
+            lineage["continuity"] = continuity
+            template_metadata["_schedule_lineage"] = lineage
+            template["metadata"] = template_metadata
             if continuity == "session" and not template.get("continuity_session_id"):
                 template["continuity_session_id"] = new_id("session")
         if delivery is not _UNSET:
@@ -386,6 +637,10 @@ class ScheduleAPI:
             else:
                 if not isinstance(delivery, DeliverySpec):
                     raise TypeError("delivery must be a DeliverySpec or None")
+                _validate_delivery(
+                    delivery,
+                    getattr(control, "workspace", None) or _job_delivery_workspace(job),
+                )
                 template["delivery"] = {
                     "channel": delivery.channel,
                     "destination": delivery.destination,
@@ -405,6 +660,17 @@ class ScheduleAPI:
             next_run = next_value.isoformat() if next_value is not None else None
         metadata = dict(job.get("metadata") or {})
         metadata["_trigger_spec"] = dict(trigger_spec)
+        if narrowed:
+            existing_authority = metadata.get("_authority_snapshot")
+            if not isinstance(existing_authority, Mapping) or control is None:
+                raise PermissionError("schedule authority cannot be narrowed")
+            current = _current_authority(control, owner=owner or {})
+            metadata["_authority_snapshot"] = _intersect_authority(existing_authority, current)
+            metadata["_control_grant"] = {
+                **dict(metadata.get("_control_grant") or {}),
+                "authority_digest": metadata["_authority_snapshot"]["authority_digest"],
+                "control_scope": "narrowed_to_caller",
+            }
         if delivery is not _UNSET:
             authority = dict(metadata.get("_authority_snapshot") or {})
             if delivery is None:
@@ -440,7 +706,11 @@ class ScheduleAPI:
                 authority["delivery"] = record
                 authority["delivery_effects"] = effects
                 authority["effect_ceiling"] = list(effects)
+            authority["authority_digest"] = _authority_digest(authority)
             metadata["_authority_snapshot"] = authority
+            grant = dict(metadata.get("_control_grant") or {})
+            grant["authority_digest"] = authority["authority_digest"]
+            metadata["_control_grant"] = grant
         await self._scheduler._store.upsert_job(
             job_id,
             str(job.get("name") or template.get("objective") or job_id),
@@ -453,41 +723,89 @@ class ScheduleAPI:
         return await self.inspect(job_id, owner=owner)
 
     async def run(
-        self, job_id: str, *, owner: Mapping[str, str | None] | None = None
+        self,
+        job_id: str,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        control: ScheduleControl | None = None,
     ) -> str | None:
         job = await self._scheduler._store.get_job_id(job_id)
-        if job is None or not _owner_visible(job, owner):
+        if job is None or not _owner_visible(job, owner, control=control):
             return None
+        if not _authority_covers(job, owner, control):
+            raise PermissionError("caller authority cannot run this schedule")
         return await self._scheduler.run_now(job_id)
 
-    async def list_jobs(self, *, owner: Mapping[str, str | None] | None = None) -> list[dict]:
+    async def list_jobs(
+        self,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        control: ScheduleControl | None = None,
+    ) -> list[dict]:
         jobs = await self._scheduler._store.list_jobs(enabled_only=False)
-        return [self._public_job(job) for job in jobs if _owner_visible(job, owner)]
+        return [
+            self._public_job(job)
+            for job in jobs
+            if _owner_visible(job, owner, control=control)
+        ]
 
     async def inspect(
-        self, job_id: str, *, owner: Mapping[str, str | None] | None = None
+        self,
+        job_id: str,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        control: ScheduleControl | None = None,
     ) -> dict | None:
         job = await self._scheduler._store.get_job_id(job_id)
-        if job is None or not _owner_visible(job, owner):
+        if job is None or not _owner_visible(job, owner, control=control):
             return None
         return self._public_job(job)
 
-    async def enable(self, job_id: str, *, owner: Mapping[str, str | None] | None = None) -> bool:
-        return await self._set_enabled(job_id, True, owner=owner)
+    async def enable(
+        self,
+        job_id: str,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        control: ScheduleControl | None = None,
+    ) -> bool:
+        return await self._set_enabled(job_id, True, owner=owner, control=control)
 
-    async def disable(self, job_id: str, *, owner: Mapping[str, str | None] | None = None) -> bool:
-        return await self._set_enabled(job_id, False, owner=owner)
+    async def disable(
+        self,
+        job_id: str,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        control: ScheduleControl | None = None,
+    ) -> bool:
+        return await self._set_enabled(job_id, False, owner=owner, control=control)
 
-    async def delete(self, job_id: str, *, owner: Mapping[str, str | None] | None = None) -> bool:
+    async def delete(
+        self,
+        job_id: str,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        control: ScheduleControl | None = None,
+    ) -> bool:
         job = await self._scheduler._store.get_job_id(job_id)
-        if job is None or not _owner_visible(job, owner):
+        if job is None or not _owner_visible(job, owner, control=control):
             return False
+        if not _authority_covers(job, owner, control):
+            raise PermissionError("caller authority cannot delete this schedule")
         return await self._scheduler._store.delete_job(job_id)
 
-    async def _set_enabled(self, job_id: str, enabled: bool, *, owner) -> bool:
+    async def _set_enabled(
+        self,
+        job_id: str,
+        enabled: bool,
+        *,
+        owner,
+        control: ScheduleControl | None = None,
+    ) -> bool:
         job = await self._scheduler._store.get_job_id(job_id)
-        if job is None or not _owner_visible(job, owner):
+        if job is None or not _owner_visible(job, owner, control=control):
             return False
+        if not _authority_covers(job, owner, control):
+            raise PermissionError("caller authority cannot change this schedule")
         return await self._scheduler._store.set_enabled(job_id, enabled)
 
     @staticmethod
@@ -644,6 +962,13 @@ class ScheduleCapability:
                     "type": "string",
                     "enum": ["fresh", "previous_result", "job_memory", "session"],
                 },
+                "narrow_authority": {
+                    "type": "boolean",
+                    "description": (
+                        "For model updates only: intersect future execution authority "
+                        "with the caller's current authority."
+                    ),
+                },
             },
             "oneOf": [
                 {
@@ -696,6 +1021,7 @@ class ScheduleCapability:
             "project_id": getattr(getattr(context, "workspace", None), "id", None),
             "principal_id": getattr(context, "principal_id", None),
         }
+        control = _control_from_request(request, context)
         try:
             if op == "create":
                 requested_session = args.get("session_id")
@@ -755,6 +1081,7 @@ class ScheduleCapability:
                     autonomy=getattr(context, "autonomy", None),
                     delivery=_decode_delivery(args.get("delivery")),
                     continuity=str(args.get("continuity") or "fresh"),
+                    control=control,
                 )
                 job_id = (
                     result.get("id") or result.get("job_id") if isinstance(result, dict) else None
@@ -770,7 +1097,7 @@ class ScheduleCapability:
                     },
                 )
             elif op == "list":
-                jobs = await self._api.list_jobs(owner=owner)
+                jobs = await self._api.list_jobs(owner=owner, control=control)
                 return CapabilityResult(
                     call_id,
                     self.descriptor.id,
@@ -779,7 +1106,9 @@ class ScheduleCapability:
                     metadata={"operation": "list"},
                 )
             elif op == "inspect":
-                job = await self._api.inspect(args.get("job_id", ""), owner=owner)
+                job = await self._api.inspect(
+                    args.get("job_id", ""), owner=owner, control=control
+                )
                 if job is None:
                     return CapabilityResult(
                         call_id,
@@ -795,7 +1124,9 @@ class ScheduleCapability:
                     metadata={"operation": "inspect"},
                 )
             elif op == "enable":
-                ok = await self._api.enable(args.get("job_id", ""), owner=owner)
+                ok = await self._api.enable(
+                    args.get("job_id", ""), owner=owner, control=control
+                )
                 if not ok:
                     return CapabilityResult(
                         call_id,
@@ -811,7 +1142,9 @@ class ScheduleCapability:
                     metadata={"operation": "enable"},
                 )
             elif op == "disable":
-                ok = await self._api.disable(args.get("job_id", ""), owner=owner)
+                ok = await self._api.disable(
+                    args.get("job_id", ""), owner=owner, control=control
+                )
                 if not ok:
                     return CapabilityResult(
                         call_id,
@@ -827,7 +1160,9 @@ class ScheduleCapability:
                     metadata={"operation": "disable"},
                 )
             elif op == "delete":
-                ok = await self._api.delete(args.get("job_id", ""), owner=owner)
+                ok = await self._api.delete(
+                    args.get("job_id", ""), owner=owner, control=control
+                )
                 if not ok:
                     return CapabilityResult(
                         call_id,
@@ -853,6 +1188,10 @@ class ScheduleCapability:
                     delivery=(
                         _decode_delivery(args.get("delivery")) if "delivery" in args else _UNSET
                     ),
+                    control=control,
+                    authority_mode=(
+                        "narrow_to_caller" if bool(args.get("narrow_authority")) else "preserve"
+                    ),
                 )
                 if updated is None:
                     return CapabilityResult(
@@ -869,7 +1208,9 @@ class ScheduleCapability:
                     metadata={"operation": "update"},
                 )
             elif op == "run":
-                task_id = await self._api.run(args.get("job_id", ""), owner=owner)
+                task_id = await self._api.run(
+                    args.get("job_id", ""), owner=owner, control=control
+                )
                 if task_id is None:
                     return CapabilityResult(
                         call_id,

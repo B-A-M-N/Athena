@@ -129,6 +129,11 @@ class TaskTemplate:
             # snapshot is supplied.
             capability_policy = CapabilityPolicy(deny=("*",))
         metadata = dict(self.metadata)
+        lineage = dict(metadata.get("_schedule_lineage") or {})
+        lineage["continuity"] = self.continuity
+        if self.authority_snapshot.get("principal") and "principal_id" not in lineage:
+            lineage["principal_id"] = self.authority_snapshot["principal"].get("principal_id")
+        metadata["_schedule_lineage"] = lineage
         if occurrence_key is not None:
             metadata["_occurrence"] = occurrence_key
         metadata.setdefault(

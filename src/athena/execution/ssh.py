@@ -221,10 +221,10 @@ while True:
         err.append(traceback.format_exc())
     finally:
         sys.stdout, sys.stderr = old_out, old_err
-    for value in out:
-        sys.stdout.write(json.dumps({"type": "out", "data": value}) + "\n")
-    for value in err:
-        sys.stdout.write(json.dumps({"type": "err", "data": value}) + "\n")
+    if out:
+        sys.stdout.write(json.dumps({"type": "out", "data": "".join(out)}) + "\n")
+    if err:
+        sys.stdout.write(json.dumps({"type": "err", "data": "".join(err)}) + "\n")
     sys.stdout.write(json.dumps({"type": "done", "ok": ok}) + "\n")
     sys.stdout.flush()
 '''
@@ -260,6 +260,7 @@ with open(metadata_path, "w", encoding="utf-8") as handle:
 
 worker = None
 worker_identity = None
+session_env = {}
 worker_lock = threading.Lock()
 stop = threading.Event()
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -276,6 +277,7 @@ def ensure_worker(env=None):
     if worker is not None and worker.poll() is None:
         return worker
     merged = os.environ.copy()
+    merged.update({str(k): str(v) for k, v in session_env.items()})
     merged.update({str(k): str(v) for k, v in (env or {}).items()})
     worker = subprocess.Popen(
         [sys.executable, "-u", "-c", WORKER],
@@ -343,7 +345,10 @@ def handle(connection):
         operation = auth.get("op")
         if operation == "describe":
             described = dict(metadata)
+            described["start_identity"] = identity(controller_pid)
             described["worker_alive"] = bool(worker is not None and worker.poll() is None)
+            if worker is not None and worker.poll() is None:
+                described["worker_start_identity"] = identity(worker.pid)
             send(connection, {"kind": "response", **described})
             return
         if operation == "shutdown":
@@ -379,7 +384,10 @@ def handle(connection):
                 break
             request = json.loads(payload.decode())
             if request.get("op") == "configure":
-                ensure_worker(request.get("env") or {})
+                session_env.update(
+                    {str(key): str(value) for key, value in (request.get("env") or {}).items()}
+                )
+                ensure_worker()
                 continue
             current = ensure_worker()
             if current.stdin is None or current.stdout is None:
@@ -797,6 +805,43 @@ class SSHBackend(ExecutionBackend):
             f"{self._remote_arg(paths['socket_path'])} {self._remote_arg(paths['token_path'])}"
         )
 
+    def _remote_describe(
+        self,
+        *,
+        socket_path: str,
+        token_path: str,
+        key_path: str | None,
+    ) -> Mapping[str, Any]:
+        encoded = base64.b64encode(
+            (
+                "import json,socket,sys; "
+                "p,t=sys.argv[1:]; token=open(t).read().strip(); "
+                "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(p); "
+                "s.sendall((json.dumps({'token':token,'op':'describe'})+'\\n').encode()); "
+                "print(s.recv(65536).decode().strip()); s.close()"
+            ).encode()
+        ).decode("ascii")
+        launcher = f"import base64;exec(base64.b64decode({encoded!r}))"
+        command = (
+            f"python3 -u -c {shlex.quote(launcher)} "
+            f"{self._remote_arg(socket_path)} {self._remote_arg(token_path)}"
+        )
+        completed = self._run_remote_command(
+            command,
+            key_path=key_path,
+            check=False,
+            timeout=self.profile.connect_timeout,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("remote supervisor describe failed")
+        try:
+            value = json.loads((completed.stdout or "").strip().splitlines()[-1])
+        except (IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("remote supervisor describe response is invalid") from exc
+        if not isinstance(value, Mapping) or value.get("kind") != "response":
+            raise RuntimeError("remote supervisor describe response is not authoritative")
+        return value
+
     def _remote_interrupt(self, session: _SSHSession) -> bool:
         if not session.remote_socket or not session.remote_token_path:
             return False
@@ -1172,14 +1217,19 @@ class SSHBackend(ExecutionBackend):
             pid = str(remote.get("pid") or "")
             if not pid.isdigit():
                 raise RuntimeError("remote supervisor pid identity is invalid")
-            alive = await run_blocking(
-                self._run_remote_command,
-                f"kill -0 {pid}",
+            described = await run_blocking(
+                self._remote_describe,
+                socket_path=remote_socket,
+                token_path=remote_token_path,
                 key_path=key_path,
-                check=False,
             )
-            if alive.returncode != 0:
-                raise RuntimeError("remote supervisor process is no longer alive")
+            if str(described.get("session_id")) != session_id:
+                raise RuntimeError("remote supervisor live session identity mismatch")
+            if str(described.get("task_id")) != task_id:
+                raise RuntimeError("remote supervisor live task ownership mismatch")
+            live_start = str(described.get("start_identity") or "")
+            if not live_start or live_start != expected_start:
+                raise RuntimeError("remote supervisor live process identity mismatch")
             relay_paths = {"socket_path": remote_socket, "token_path": remote_token_path}
             command = [
                 *self._ssh_base(key_path),

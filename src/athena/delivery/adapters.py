@@ -27,7 +27,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from athena.protocol.capabilities import ExternalEffectPhase
 from athena.protocol.ids import new_id
-from athena.protocol.tasks import DeliverySpec, TaskResult
+from athena.protocol.tasks import DeliverySpec, NetworkPolicy, TaskResult
 from athena.state.external_effects import (
     CONFLICT,
     NEW,
@@ -68,6 +68,7 @@ class DeliveryAdapter(Protocol):
         *,
         task_id: str,
         session_id: str | None = None,
+        network_policy: NetworkPolicy | str | None = None,
     ) -> DeliveryOutcome: ...
 
 
@@ -101,6 +102,7 @@ class EventLogAdapter:
         *,
         task_id: str,
         session_id: str | None = None,
+        network_policy: NetworkPolicy | str | None = None,
     ) -> DeliveryOutcome:
         # The event append itself happens once, in DeliveryManager._record;
         # no second artifact for this channel.
@@ -159,6 +161,7 @@ class WebhookAdapter:
         *,
         task_id: str,
         session_id: str | None = None,
+        network_policy: NetworkPolicy | str | None = None,
     ) -> DeliveryOutcome:
         if not str(spec.destination or ""):
             return DeliveryOutcome(
@@ -258,7 +261,7 @@ class WebhookAdapter:
                 body=body,
                 timeout=10.0,
                 follow_redirects=False,
-                policy_name=None,
+                policy_name=getattr(network_policy, "value", network_policy),
             )
             if inspect.isawaitable(response):
                 response = await response

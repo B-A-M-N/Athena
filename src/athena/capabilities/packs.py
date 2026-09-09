@@ -21,6 +21,8 @@ def _pack_effects(arguments: Mapping[str, Any]) -> frozenset[EffectClass]:
     effects = {EffectClass.READ_LOCAL}
     if operation in {"install", "upgrade", "install_remote", "enable", "disable"}:
         effects.add(EffectClass.WRITE_LOCAL)
+    if operation in {"install", "upgrade", "install_remote", "enable", "disable", "uninstall"}:
+        effects.add(EffectClass.PRIVILEGED)
     if operation == "uninstall":
         effects.add(EffectClass.DELETE)
     if operation in {"fetch", "install_remote"}:
@@ -73,6 +75,7 @@ class PacksCapability:
                 EffectClass.WRITE_LOCAL,
                 EffectClass.DELETE,
                 EffectClass.NETWORK_READ,
+                EffectClass.PRIVILEGED,
             }
         ),
         effect_resolver=_pack_effects,
@@ -160,6 +163,10 @@ class PacksCapability:
                     )
                 value = (await self._manager.enable(pack_id)).to_record()
             elif operation == "disable":
+                if request.origin.value == "model":
+                    return _result(
+                        request, ok=False, error="pack deactivation requires operator promotion"
+                    )
                 value = (await self._manager.disable(pack_id)).to_record()
             elif operation == "uninstall":
                 if request.origin.value == "model":

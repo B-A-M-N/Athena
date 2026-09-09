@@ -148,6 +148,9 @@ class DeliveryManager:
                 result,
                 task_id=result.task_id,
                 session_id=task.session_id,
+                network_policy=getattr(
+                    getattr(task, "workspace", None), "network_policy", None
+                ),
             )
         except Exception as exc:  # adapter contract violation is still retryable
             _logger.warning(

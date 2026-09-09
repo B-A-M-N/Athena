@@ -57,6 +57,7 @@ _BROWSER_AVAILABILITY = (
 _MAX_SNAPSHOT_CHARS = 16_000
 _MAX_TEXT_CHARS = 8_000
 _MAX_URL_CHARS = 2048
+_MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -536,6 +537,11 @@ _BROWSER_DESCRIPTOR = CapabilityDescriptor(
             "key": {"type": "string", "maxLength": 128},
             "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000},
             "index": {"type": "integer", "minimum": 0, "maximum": 128},
+            "max_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": _MAX_DOWNLOAD_BYTES,
+            },
         },
         "required": ["operation"],
         "additionalProperties": False,
@@ -727,6 +733,9 @@ class BrowserCapability:
                 operation,
                 args,
                 policy_name=policy_name,
+                artifact_limit=getattr(
+                    getattr(context, "resource_budget", None), "max_artifact_bytes", None
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - driver failures are results
             self._last_error = f"{type(exc).__name__}: {exc}"
@@ -740,6 +749,7 @@ class BrowserCapability:
         args: dict[str, Any],
         *,
         policy_name: str = "allow",
+        artifact_limit: int | None = None,
     ) -> CapabilityResult:
         if operation == "navigate":
             url = str(args.get("url") or "").strip()
@@ -867,7 +877,13 @@ class BrowserCapability:
                 return _result(request, ok=False, error="download requires an artifact store")
             raw = await driver.download(selector)
             path = Path(str(raw.get("path") or ""))
-            data = await run_blocking(path.read_bytes)
+            requested_limit = int(args.get("max_bytes") or _MAX_DOWNLOAD_BYTES)
+            max_bytes = min(
+                _MAX_DOWNLOAD_BYTES,
+                requested_limit,
+                int(artifact_limit) if artifact_limit is not None else _MAX_DOWNLOAD_BYTES,
+            )
+            data = await run_blocking(_read_bounded_file, path, max_bytes)
             ref = await self._artifacts.save(
                 task_id=request.task_id,
                 content=data,
@@ -891,3 +907,21 @@ __all__ = [
     "ElementSnapshot",
     "PlaywrightBrowserDriver",
 ]
+
+
+def _read_bounded_file(path: Path, max_bytes: int) -> bytes:
+    """Read a browser download incrementally and fail before over-allocation."""
+    if max_bytes <= 0:
+        raise ValueError("browser download size limit must be positive")
+    values: list[bytes] = []
+    size = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(min(1024 * 1024, max_bytes - size + 1))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError(f"browser download exceeds max_bytes={max_bytes}")
+            values.append(chunk)
+    return b"".join(values)

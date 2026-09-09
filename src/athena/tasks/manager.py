@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -168,6 +169,16 @@ class TaskManager:
             result = self._admission(spec)
             if inspect.isawaitable(result):
                 await result
+        existing = await self._store.get(spec.id)
+        if existing is not None:
+            current = _deserialize(existing)
+            if (
+                current.objective != spec.objective
+                or current.session_id != spec.session_id
+                or current.parent_task_id != spec.parent_task_id
+            ):
+                raise ValueError(f"task id {spec.id!r} already identifies different work")
+            return current
         await self._ensure_session(spec)
         # AUTHORITY (Durability.AUTHORITY): the durable task row is the single
         # source of truth for the task's existence and state. It commits first
@@ -176,23 +187,36 @@ class TaskManager:
         # the authority commit (durability split, P1-27): a budget/cancellation
         # registration or event-emit failure cannot surface as a failed
         # ``create`` for a task that was actually admitted.
-        await self._store.insert_task(
-            spec.id,
-            spec.session_id,
-            spec.parent_task_id,
-            spec.objective,
-            autonomy=_autonomy(spec),
-            acceptance_criteria=spec.acceptance_criteria,
-            context_refs=spec.context_refs,
-            workspace=spec.workspace,
-            capability_policy=spec.capability_policy,
-            model_policy=spec.model_policy,
-            resource_budget=spec.resource_budget,
-            deadline=spec.deadline,
-            delivery=spec.delivery,
-            metadata=dict(spec.metadata),
-            status=TaskStatus.CREATED,
-        )
+        try:
+            await self._store.insert_task(
+                spec.id,
+                spec.session_id,
+                spec.parent_task_id,
+                spec.objective,
+                autonomy=_autonomy(spec),
+                acceptance_criteria=spec.acceptance_criteria,
+                context_refs=spec.context_refs,
+                workspace=spec.workspace,
+                capability_policy=spec.capability_policy,
+                model_policy=spec.model_policy,
+                resource_budget=spec.resource_budget,
+                deadline=spec.deadline,
+                delivery=spec.delivery,
+                metadata=dict(spec.metadata),
+                status=TaskStatus.CREATED,
+            )
+        except sqlite3.IntegrityError:
+            existing = await self._store.get(spec.id)
+            if existing is None:
+                raise
+            current = _deserialize(existing)
+            if (
+                current.objective != spec.objective
+                or current.session_id != spec.session_id
+                or current.parent_task_id != spec.parent_task_id
+            ):
+                raise ValueError(f"task id {spec.id!r} already identifies different work")
+            return current
 
         # ---- BOOKKEEPING (Durability.BOOKKEEPING), after the commit ------ #
         # Derived in-memory state (budget ledger, cancellation reset) and the

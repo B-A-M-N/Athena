@@ -50,6 +50,7 @@ def test_template_lineage_references_schedule_and_creator():
         "job_id": "job-1",
         "creator_task_id": "task-creator",
         "creator_session_id": "session-creator",
+        "continuity": "fresh",
     }
 
 

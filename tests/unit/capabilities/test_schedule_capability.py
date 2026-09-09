@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from athena.capabilities.schedule import ScheduleAPI
+from athena.capabilities.schedule import ScheduleAPI, ScheduleControl
 from athena.scheduler.scheduler import TriggerType
 from athena.state.database import Database
 from athena.state.schedules import ScheduleStore
+from athena.protocol.tasks import CapabilityPolicy, ResourceBudget, WorkspaceSpec
 
 
 class _Scheduler:
@@ -75,4 +76,67 @@ async def test_schedule_api_rejects_incomplete_trigger_contract(trigger, message
             trigger=trigger,
             owner={"task_id": "task-a"},
         )
+    await db.close()
+
+
+async def test_model_schedule_control_requires_creator_authority_or_explicit_narrowing():
+    db, api = await _api()
+    owner = {
+        "task_id": "task-a",
+        "session_id": "session-a",
+        "project_id": "repo-a",
+        "principal_id": "principal-a",
+    }
+    workspace = WorkspaceSpec(id="repo-a", root="/repo")
+    broad = CapabilityPolicy(effects=frozenset({"READ_LOCAL", "WRITE_LOCAL"}))
+    created = await api.create(
+        name="controlled",
+        objective="run",
+        trigger={"type": "interval", "interval_seconds": 60},
+        owner=owner,
+        workspace=workspace,
+        capability_policy=broad,
+        resource_budget=ResourceBudget(),
+    )
+    control = ScheduleControl(
+        origin="model",
+        task_id="task-a",
+        session_id="session-a",
+        principal_id="principal-a",
+        project_id="repo-a",
+        capability_policy=CapabilityPolicy(effects=frozenset({"READ_LOCAL"})),
+        resource_budget=ResourceBudget(),
+        workspace=workspace,
+    )
+    with pytest.raises(PermissionError):
+        await api.disable(created["job_id"], owner=owner, control=control)
+
+    narrowed = await api.update(
+        created["job_id"],
+        owner=owner,
+        objective="narrowed",
+        control=control,
+        authority_mode="narrow_to_caller",
+    )
+    assert narrowed is not None
+    assert narrowed["metadata"]["_authority_snapshot"]["capability_policy"]["effects"] == [
+        "READ_LOCAL"
+    ]
+    await db.close()
+
+
+async def test_model_cannot_see_ownerless_legacy_schedule():
+    db, api = await _api()
+    store = api._scheduler._store  # noqa: SLF001 - fixture boundary
+    await store.upsert_job(
+        "legacy-job",
+        "legacy",
+        payload={"template": {"objective": "legacy"}},
+        trigger_spec={"type": "event", "event_name": "legacy"},
+        enabled=True,
+        next_run=None,
+        metadata={},
+    )
+    control = ScheduleControl(origin="model", task_id="task-a", session_id="session-a")
+    assert await api.inspect("legacy-job", owner={"task_id": "task-a"}, control=control) is None
     await db.close()

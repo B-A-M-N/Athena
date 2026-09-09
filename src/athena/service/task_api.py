@@ -85,6 +85,18 @@ class TaskAPI:
         wait: bool,
         user_request: AgentRequest | None = None,
     ):
+        try:
+            existing = await task_manager.get(spec.id)
+        except KeyError:
+            existing = None
+        if existing is not None:
+            if (
+                existing.objective != spec.objective
+                or existing.session_id != spec.session_id
+                or existing.parent_task_id != spec.parent_task_id
+            ):
+                raise ValueError(f"task id {spec.id!r} already identifies different work")
+            return existing
         created = await task_manager.create(spec)
         # Every task gets a durable causal root before it can run. Transport
         # callers provide the original request; internal/scheduled callers
