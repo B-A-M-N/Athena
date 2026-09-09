@@ -579,6 +579,7 @@ class ResearchCapability:
         host_resolver=None,
         discovery_provider=None,
         discovery_providers: Sequence[ResearchDiscoveryProvider | Any] | None = None,
+        utility_inference: Callable[..., Any] | None = None,
     ) -> None:
         self._store = store
         self._artifacts = artifact_store
@@ -588,6 +589,7 @@ class ResearchCapability:
         if discovery_provider is not None and discovery_provider not in configured:
             configured = (*configured, discovery_provider)
         self._discovery_providers = configured
+        self._utility_inference = utility_inference
 
     async def invoke(self, request: CapabilityRequest, **kw) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -1456,18 +1458,60 @@ class ResearchCapability:
             rounds_run += 1
             round_queries = [query for query in queries if query not in attempted_queries]
             if not round_queries:
-                # Adapt from the durable gap state instead of replaying the
-                # initial query set. This keeps later rounds gap-driven.
+                # Adapt from durable gaps after the prior round's failed or
+                # contradictory evidence. Utility inference is advisory and
+                # bounded; deterministic gap questions remain the fallback.
                 gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
-                round_queries = _unique_strings(
-                    [
-                        str(gap.question)
-                        for gap in gaps
-                        if gap.status == "OPEN" and gap.required
-                    ]
-                )[:max_queries]
+                gap_context = [
+                    {
+                        "id": gap.id,
+                        "question": gap.question,
+                        "metadata": dict(gap.metadata),
+                    }
+                    for gap in gaps
+                    if gap.status == "OPEN" and gap.required
+                ][:50]
+                inferred: Any = None
+                if round_number + 1 < max_rounds and self._utility_inference is not None:
+                    try:
+                        prompt = json.dumps(
+                            {
+                                "remaining_gaps": gap_context,
+                                "attempted_queries": sorted(attempted_queries),
+                                "failed_queries": errors[-50:],
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                        inferred = self._utility_inference(
+                            system_prompt=(
+                                "Return only a JSON array of at most 10 better research queries. "
+                                "Do not claim evidence or answer the gaps."
+                            ),
+                            user_prompt=prompt,
+                            role="summarizer",
+                            task_id=request.task_id,
+                            metadata={"purpose": "research_query_utility_inference"},
+                        )
+                        if asyncio.iscoroutine(inferred):
+                            inferred = await asyncio.wait_for(inferred, timeout=10.0)
+                    except Exception as exc:  # advisory path; deterministic fallback remains
+                        errors.append({"utility_inference": str(exc)[:600]})
+                        inferred = None
+                parsed_queries: list[str] = []
+                if isinstance(inferred, str):
+                    try:
+                        decoded = json.loads(inferred)
+                        if isinstance(decoded, list):
+                            parsed_queries = _strings(decoded, limit=max_queries)
+                    except json.JSONDecodeError:
+                        parsed_queries = []
+                if not parsed_queries:
+                    parsed_queries = _unique_strings(
+                        [str(item.get("question") or "") for item in gap_context]
+                    )[:max_queries]
                 round_queries = [
-                    query for query in round_queries if query not in attempted_queries
+                    query for query in parsed_queries if query not in attempted_queries
                 ]
             for query in round_queries:
                 attempted_queries.add(query)
@@ -1512,9 +1556,7 @@ class ResearchCapability:
                     if isinstance(source, Mapping):
                         captures.append(dict(source))
                         fetched += 1
-                        bytes_fetched += int(
-                            (fetched_result.metadata or {}).get("bytes") or 0
-                        )
+                        bytes_fetched += int((fetched_result.metadata or {}).get("bytes") or 0)
         return (
             captures,
             errors,
@@ -1720,6 +1762,25 @@ class ResearchCapability:
             unverified_closed_gaps = ()
         research_completion = {
             "ready": ready,
+            "bundle_id": hashlib.sha256(
+                json.dumps(
+                    {"task_id": request.task_id, "objective": objective, "gap_ids": gap_ids},
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()[:32],
+            "requirement_ids": [
+                str((item.get("gap") or {}).get("metadata", {}).get("requirement_id"))
+                for item in plan.get("requirements", [])
+                if isinstance(item, Mapping)
+                and isinstance(item.get("gap"), Mapping)
+                and (item.get("gap") or {}).get("metadata", {}).get("requirement_id")
+            ],
+            "closed_gap_ids": [
+                str((item or {}).get("id"))
+                for item in (bundle.get("gaps") or [])
+                if isinstance(item, Mapping) and item.get("status") == "CLOSED"
+            ],
+            "evidence_ids": [str(item.get("id")) for item in evidence_records if item.get("id")],
             "required_open_gaps": list(required_open_gaps),
             "unverified_closed_gaps": list(unverified_closed_gaps),
             "bundle_ready": bool(bundle.get("ready")),

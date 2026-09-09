@@ -348,7 +348,11 @@ def release_commands(
         if stage not in VALID_STAGES:
             raise ValueError(f"unknown release stage: {stage!r}")
         commands = [item for item in commands if lane_stage(item[0]) == stage]
-    return tuple(commands)
+    # Establish source/config integrity before timing-sensitive benchmarks.
+    # The harness only parallelizes lanes within the static stage, so no
+    # benchmark shares CPU with these checks.
+    order = {"static": 0, "tests": 1, "bench": 2, "integration": 3}
+    return tuple(sorted(commands, key=lambda item: order.get(lane_stage(item[0]), 9)))
 
 
 __all__ = ["candidate_commands", "release_commands"]

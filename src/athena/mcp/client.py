@@ -134,6 +134,7 @@ class MCPClient:
         self._resource_cache: dict[str, object] = {}
         self._prompt_cache: dict[str, MCPPromptRef] = {}
         self._lock = _new_lock()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -227,6 +228,13 @@ class MCPClient:
 
     async def close(self) -> None:
         """Close the connection, tolerating server/process crashes."""
+        current = asyncio.current_task()
+        pending = [task for task in self._background_tasks if task is not current]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._background_tasks.difference_update(pending)
         stack, self._exit_stack = self._exit_stack, None
         self._session = None
         self._connected = False
@@ -417,7 +425,9 @@ class MCPClient:
             try:
                 outcome = callback(self.connection_id, exc)
                 if inspect.isawaitable(outcome):
-                    asyncio.ensure_future(outcome)
+                    task = asyncio.create_task(outcome, name=f"mcp-failure:{self.connection_id}")
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
             except Exception:
                 # A health callback is bookkeeping; never hide the transport
                 # failure that made the request unusable.

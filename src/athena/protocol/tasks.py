@@ -166,6 +166,9 @@ class Criterion:
     # canonical research workflow.  A successful capability invocation alone
     # is not enough: the workflow must report a ready bundle.
     evidence_required: bool = False
+    # Optional stable research requirement binding. A bundle receipt may only
+    # satisfy the criterion when it names this requirement (or its evidence).
+    evidence_requirement_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -247,20 +250,20 @@ class ResourceBudget:
         if other is None:
             return self
         return ResourceBudget(
-            max_agent_iterations=min(self.max_agent_iterations, other.max_agent_iterations),
+            max_agent_iterations=_min_opt(self.max_agent_iterations, other.max_agent_iterations),
             max_input_tokens=_min_opt(self.max_input_tokens, other.max_input_tokens),
             max_output_tokens=_min_opt(self.max_output_tokens, other.max_output_tokens),
             max_cost_usd=_min_opt(self.max_cost_usd, other.max_cost_usd),
             max_wall_time=_min_opt(self.max_wall_time, other.max_wall_time),
-            max_children=min(self.max_children, other.max_children),
-            max_child_depth=min(self.max_child_depth, other.max_child_depth),
-            max_parallel_model_calls=min(
+            max_children=_min_opt(self.max_children, other.max_children),
+            max_child_depth=_min_opt(self.max_child_depth, other.max_child_depth),
+            max_parallel_model_calls=_min_opt(
                 self.max_parallel_model_calls, other.max_parallel_model_calls
             ),
-            max_parallel_executions=min(
+            max_parallel_executions=_min_opt(
                 self.max_parallel_executions, other.max_parallel_executions
             ),
-            max_artifact_bytes=min(self.max_artifact_bytes, other.max_artifact_bytes),
+            max_artifact_bytes=_min_opt(self.max_artifact_bytes, other.max_artifact_bytes),
         )
 
 
@@ -313,6 +316,249 @@ class CapabilityPolicy:
     allow: tuple[str, ...] = ()
     ask: tuple[str, ...] = ()
     deny: tuple[str, ...] = ()
+
+
+def _policy_parts(value: CapabilityPolicy | Mapping[str, Any] | None) -> CapabilityPolicy:
+    if isinstance(value, CapabilityPolicy):
+        return value
+    if not isinstance(value, Mapping):
+        return CapabilityPolicy()
+    return CapabilityPolicy(
+        effects=frozenset(str(item) for item in value.get("effects") or ()),
+        allow=tuple(str(item) for item in value.get("allow") or ()),
+        ask=tuple(str(item) for item in value.get("ask") or ()),
+        deny=tuple(str(item) for item in value.get("deny") or ()),
+    )
+
+
+def _intersect_unrestricted_sets(left: set[str], right: set[str]) -> set[str]:
+    """Intersect sets where an empty set is the protocol's universal value."""
+    if not left:
+        return set(right)
+    if not right:
+        return set(left)
+    return left & right
+
+
+def intersect_capability_policies(
+    left: CapabilityPolicy | Mapping[str, Any] | None,
+    right: CapabilityPolicy | Mapping[str, Any] | None,
+) -> CapabilityPolicy:
+    """Return the authority intersection without widening empty universals.
+
+    ``allow``/``ask`` and ``effects`` use empty-as-universal semantics. ASK is
+    retained whenever either side requires approval for a surviving capability;
+    deny remains a hard union.
+    """
+    a = _policy_parts(left)
+    b = _policy_parts(right)
+    a_visible = set(a.allow) | set(a.ask)
+    b_visible = set(b.allow) | set(b.ask)
+    visible = _intersect_unrestricted_sets(a_visible, b_visible)
+    ask = (set(a.ask) | set(b.ask)) & visible
+    allow = visible - ask
+    effects = _intersect_unrestricted_sets(set(a.effects), set(b.effects))
+    deny = set(a.deny) | set(b.deny)
+    allow -= deny
+    ask -= deny
+    if "*" in deny:
+        allow.clear()
+        ask.clear()
+    return CapabilityPolicy(
+        effects=frozenset(effects),
+        allow=tuple(sorted(allow)),
+        ask=tuple(sorted(ask)),
+        deny=tuple(sorted(deny)),
+    )
+
+
+def capability_policy_covers(
+    upper: CapabilityPolicy | Mapping[str, Any] | None,
+    lower: CapabilityPolicy | Mapping[str, Any] | None,
+) -> bool:
+    """Return whether ``lower`` is contained by the ``upper`` ceiling."""
+    a = _policy_parts(upper)
+    b = _policy_parts(lower)
+    upper_visible = set(a.allow) | set(a.ask)
+    lower_visible = set(b.allow) | set(b.ask)
+    if upper_visible and (not lower_visible or not lower_visible.issubset(upper_visible)):
+        return False
+    if lower_visible & set(a.deny):
+        return False
+    if not upper_visible and not lower_visible:
+        if "*" in a.deny:
+            if "*" not in b.deny:
+                return False
+        elif not set(a.deny).issubset(set(b.deny)):
+            return False
+    upper_effects = set(a.effects)
+    lower_effects = set(b.effects)
+    if upper_effects and (not lower_effects or not lower_effects.issubset(upper_effects)):
+        return False
+    return True
+
+
+def intersect_resource_budgets(
+    left: ResourceBudget | Mapping[str, Any] | None,
+    right: ResourceBudget | Mapping[str, Any] | None,
+) -> ResourceBudget:
+    """Intersect two budgets; omitted limits remain unbounded, not zero."""
+    return _budget_from_value(left).merged_with(_budget_from_value(right))
+
+
+def _budget_from_value(value: ResourceBudget | Mapping[str, Any] | None) -> ResourceBudget:
+    if isinstance(value, ResourceBudget):
+        return value
+    if not isinstance(value, Mapping):
+        return ResourceBudget(
+            max_agent_iterations=None,
+            max_children=None,
+            max_child_depth=None,
+            max_parallel_model_calls=None,
+            max_parallel_executions=None,
+            max_artifact_bytes=None,
+        )
+    values: dict[str, Any] = {}
+    for name in (
+        "max_agent_iterations",
+        "max_input_tokens",
+        "max_output_tokens",
+        "max_cost_usd",
+        "max_wall_time",
+        "max_children",
+        "max_child_depth",
+        "max_parallel_model_calls",
+        "max_parallel_executions",
+        "max_artifact_bytes",
+    ):
+        if name not in value or value[name] is None:
+            continue
+        raw = value[name]
+        if name == "max_cost_usd":
+            raw = Decimal(str(raw))
+        elif name == "max_wall_time":
+            raw = timedelta(seconds=float(raw))
+        values[name] = raw
+    if not values:
+        return ResourceBudget(
+            max_agent_iterations=None,
+            max_children=None,
+            max_child_depth=None,
+            max_parallel_model_calls=None,
+            max_parallel_executions=None,
+            max_artifact_bytes=None,
+        )
+    return ResourceBudget(**values)
+
+
+def resource_budget_covers(
+    upper: ResourceBudget | Mapping[str, Any] | None,
+    lower: ResourceBudget | Mapping[str, Any] | None,
+) -> bool:
+    """Return whether every lower budget limit is within the upper limit."""
+    if upper is None:
+        return True
+    a = _budget_from_value(upper)
+    b = _budget_from_value(lower)
+    for name in (
+        "max_agent_iterations",
+        "max_input_tokens",
+        "max_output_tokens",
+        "max_cost_usd",
+        "max_wall_time",
+        "max_children",
+        "max_child_depth",
+        "max_parallel_model_calls",
+        "max_parallel_executions",
+        "max_artifact_bytes",
+    ):
+        high = getattr(a, name)
+        low = getattr(b, name)
+        if high is not None and (low is None or low > high):
+            return False
+    return True
+
+
+def _model_policy_value(value: ModelPolicy | Mapping[str, Any] | None) -> ModelPolicy:
+    if isinstance(value, ModelPolicy):
+        return value
+    if not isinstance(value, Mapping):
+        return ModelPolicy()
+    cost = value.get("max_cost_usd")
+    return ModelPolicy(
+        role=str(value.get("role", "primary")),
+        allowed=tuple(str(item) for item in value.get("allowed") or ()),
+        require_tools=bool(value.get("require_tools", False)),
+        privacy=str(value.get("privacy", "local-preferred")),
+        max_cost_usd=Decimal(str(cost)) if cost not in (None, "") else None,
+        routing_preference=str(value.get("routing_preference", "balanced")),
+        min_quality_tier=(
+            str(value["min_quality_tier"]) if value.get("min_quality_tier") is not None else None
+        ),
+        require_declared_quality=bool(value.get("require_declared_quality", False)),
+        max_model_attempts=int(value.get("max_model_attempts", 2)),
+    )
+
+
+def _privacy_rank(value: str) -> int:
+    return {"offline": 0, "local": 0, "local-preferred": 1, "local-pref": 1, "remote": 2}.get(
+        str(value or "local-preferred"), 0
+    )
+
+
+def _quality_rank(value: str | None) -> int:
+    return {"basic": 0, "standard": 1, "advanced": 2, "frontier": 3}.get(str(value), -1)
+
+
+def intersect_model_policies(
+    left: ModelPolicy | Mapping[str, Any] | None,
+    right: ModelPolicy | Mapping[str, Any] | None,
+) -> ModelPolicy:
+    a = _model_policy_value(left)
+    b = _model_policy_value(right)
+    allowed = tuple(_intersect_unrestricted_sets(set(a.allowed), set(b.allowed)))
+    if a.allowed and b.allowed and not allowed:
+        allowed = ("__no_model_intersection__",)
+    floors = [item for item in (a.min_quality_tier, b.min_quality_tier) if item]
+    floor = max(floors, key=_quality_rank) if floors else None
+    return ModelPolicy(
+        role=a.role if a.role == b.role else b.role if a.role == "primary" else a.role,
+        allowed=tuple(sorted(allowed)),
+        require_tools=a.require_tools or b.require_tools,
+        privacy=(a.privacy if _privacy_rank(a.privacy) <= _privacy_rank(b.privacy) else b.privacy),
+        max_cost_usd=_min_opt(a.max_cost_usd, b.max_cost_usd),
+        routing_preference=(
+            b.routing_preference if b.routing_preference != "balanced" else a.routing_preference
+        ),
+        min_quality_tier=floor,
+        require_declared_quality=a.require_declared_quality or b.require_declared_quality,
+        max_model_attempts=min(a.max_model_attempts, b.max_model_attempts),
+    )
+
+
+def model_policy_covers(
+    upper: ModelPolicy | Mapping[str, Any] | None,
+    lower: ModelPolicy | Mapping[str, Any] | None,
+) -> bool:
+    a = _model_policy_value(upper)
+    b = _model_policy_value(lower)
+    if a.allowed and (not b.allowed or not set(b.allowed).issubset(a.allowed)):
+        return False
+    if a.max_cost_usd is not None and (b.max_cost_usd is None or b.max_cost_usd > a.max_cost_usd):
+        return False
+    if _privacy_rank(b.privacy) > _privacy_rank(a.privacy):
+        return False
+    if a.min_quality_tier and _quality_rank(b.min_quality_tier) < _quality_rank(a.min_quality_tier):
+        return False
+    if a.require_tools and not b.require_tools:
+        return False
+    if a.require_declared_quality and not b.require_declared_quality:
+        return False
+    if b.max_model_attempts > a.max_model_attempts:
+        return False
+    if a.role != "primary" and b.role != a.role:
+        return False
+    return True
 
 
 def capability_id_permitted(capability_id: str, policy: CapabilityPolicy | None) -> bool:
@@ -421,6 +667,12 @@ class AgentRequest:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+class TrustedTaskMetadata(dict):
+    """In-process marker for framework-generated internal task metadata."""
+
+    _athena_trusted = True
+
+
 __all__ = [
     "TaskStatus",
     "TERMINAL_STATUSES",
@@ -439,8 +691,15 @@ __all__ = [
     "ModelPolicy",
     "CapabilityPolicy",
     "capability_id_permitted",
+    "intersect_capability_policies",
+    "capability_policy_covers",
+    "intersect_resource_budgets",
+    "resource_budget_covers",
+    "intersect_model_policies",
+    "model_policy_covers",
     "DeliverySpec",
     "TaskSpec",
+    "TrustedTaskMetadata",
     "UsageSummary",
     "MutationRef",
     "TaskResult",

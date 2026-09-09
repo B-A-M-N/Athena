@@ -433,6 +433,15 @@ def _cmd_setup(o: "Options", config: Any) -> int:
         or getattr(existing_provider, "credential_id", None)
         or f"{provider_name.upper().replace('-', '_')}_API_KEY"
     ).strip()
+    provider_kind = str(
+        o.setup_provider_kind
+        or getattr(existing_provider, "kind", None)
+        or (
+            provider_name
+            if provider_name in {"openai", "anthropic", "ollama", "lmstudio", "vllm", "llamacpp"}
+            else "openai-compat"
+        )
+    ).strip()
     workspace = str(o.setup_workspace or config.workspace_root or ask("Workspace", os.getcwd()))
     workspace = os.path.abspath(os.path.expanduser(workspace))
     if not provider_name or not model or not credential_id:
@@ -443,7 +452,7 @@ def _cmd_setup(o: "Options", config: Any) -> int:
     raw = load_toml_file(path)
     providers = [dict(item) for item in raw.get("providers", ()) if isinstance(item, dict)]
     provider_record = {
-        "kind": "openai-compat",
+        "kind": provider_kind,
         "name": provider_name,
         "model": model,
         "credential_id": credential_id,
@@ -666,6 +675,7 @@ class Options:
     referee_supervision: str | None = None
     _providers: tuple[Any, ...] = ()
     setup_provider: str | None = None
+    setup_provider_kind: str | None = None
     setup_model: str | None = None
     setup_credential_id: str | None = None
     setup_base_url: str | None = None
@@ -1681,6 +1691,12 @@ def _click_cli(click: Any):
 
     @cli.command("setup")
     @click.option("--provider", "setup_provider", default=None, help="Provider name.")
+    @click.option(
+        "--provider-kind",
+        "setup_provider_kind",
+        default=None,
+        help="Provider adapter preset (openai, anthropic, openai-compat, ollama, and more).",
+    )
     @click.option("--model", "setup_model", default=None, help="Default model.")
     @click.option("--credential-id", "setup_credential_id", default=None)
     @click.option("--base-url", "setup_base_url", default=None)
@@ -1696,6 +1712,7 @@ def _click_cli(click: Any):
     def setup(
         ctx,
         setup_provider,
+        setup_provider_kind,
         setup_model,
         setup_credential_id,
         setup_base_url,
@@ -1706,6 +1723,7 @@ def _click_cli(click: Any):
         """Configure an operator profile and optional voice routes."""
         o = base_options(ctx, "setup")
         o.setup_provider = setup_provider
+        o.setup_provider_kind = setup_provider_kind
         o.setup_model = setup_model
         o.setup_credential_id = setup_credential_id
         o.setup_base_url = setup_base_url
@@ -2136,9 +2154,12 @@ def _arg_parse(argv: list[str]) -> Options:
     sp = sub.add_parser("setup", help="Configure an operator profile and optional voice.")
     globals_(sp)
     sp.add_argument("--provider", dest="setup_provider", default=None)
+    sp.add_argument("--provider-kind", dest="setup_provider_kind", default=None)
     sp.add_argument("--credential-id", dest="setup_credential_id", default=None)
     sp.add_argument("--base-url", dest="setup_base_url", default=None)
-    sp.add_argument("--setup-workspace", dest="setup_workspace", default=None)
+    sp.add_argument(
+        "--setup-workspace", dest="setup_workspace", default=None, help=argparse.SUPPRESS
+    )
     sp.add_argument("--voice", dest="setup_voice", action="store_true", default=None)
     sp.add_argument("--no-voice", dest="setup_voice", action="store_false")
     sp.add_argument(
@@ -2214,10 +2235,13 @@ def _arg_parse(argv: list[str]) -> Options:
         referee_credential_id=getattr(ns, "referee_credential_id", "HERMES_REFEREE_API_KEY"),
         referee_supervision=getattr(ns, "referee_supervision", None),
         setup_provider=getattr(ns, "setup_provider", None),
-        setup_model=getattr(ns, "setup_model", None),
+        setup_provider_kind=getattr(ns, "setup_provider_kind", None),
+        setup_model=getattr(ns, "setup_model", None)
+        or (getattr(ns, "model", None) if command == "setup" else None),
         setup_credential_id=getattr(ns, "setup_credential_id", None),
         setup_base_url=getattr(ns, "setup_base_url", None),
-        setup_workspace=getattr(ns, "setup_workspace", None),
+        setup_workspace=getattr(ns, "setup_workspace", None)
+        or (getattr(ns, "workspace", None) if command == "setup" else None),
         setup_voice=getattr(ns, "setup_voice", None),
         setup_runtime_supervisor=getattr(ns, "setup_runtime_supervisor", None),
     )

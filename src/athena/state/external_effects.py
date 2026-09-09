@@ -170,7 +170,7 @@ class ExternalEffectStore:
             status = str(existing.get("status") or "")
             if status == "COMPLETED":
                 return ExternalPreparation(REPLAY_COMPLETED, existing)
-            if status in {"PREPARED", "DRY_RUN"}:
+            if status in {"PREPARED", "DRY_RUN", SAFE_TO_RETRY}:
                 return ExternalPreparation(SAFE_TO_RETRY, existing)
             if status in {"APPLYING", "RECOVERY_REQUIRED", "APPLY_FAILED"}:
                 return ExternalPreparation(RECOVERY_REQUIRED, existing)
@@ -209,7 +209,7 @@ class ExternalEffectStore:
                 raise ExternalEffectRecoveryRequired(
                     "external transaction outcome is unknown; recovery is required"
                 )
-            if status not in {"PREPARED", "DRY_RUN"}:
+            if status not in {"PREPARED", "DRY_RUN", SAFE_TO_RETRY}:
                 raise ExternalEffectRecoveryRequired(
                     f"external transaction is not applicable from {status or 'unknown'}"
                 )

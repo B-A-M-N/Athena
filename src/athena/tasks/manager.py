@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -770,6 +771,25 @@ class TaskManager:
         payload: dict[str, Any] = {"status": status.value}
         if reason:
             payload["reason"] = reason
+        causal = (task.metadata or {}).get("_causal")
+        if isinstance(causal, dict) and causal.get("kind") == "pack_hook":
+            # Only the durable TaskSpec metadata may establish hook lineage;
+            # event payload fields are never consulted as authority.
+            try:
+                causal_depth = max(0, int(causal.get("depth", 0)))
+            except (TypeError, ValueError):
+                causal_depth = 0
+            payload["_causal"] = {
+                "kind": "pack_hook",
+                "root_event_id": str(causal.get("root_event_id") or task.id),
+                "hook_id": str(causal.get("hook_id") or ""),
+                "depth": causal_depth,
+            }
+        causal_id = None
+        if isinstance(causal, dict) and causal.get("kind") == "pack_hook":
+            causal_id = "athena-pack-hook:" + json.dumps(
+                payload["_causal"], sort_keys=True, separators=(",", ":")
+            )
         mission_plan = (task.metadata or {}).get("_athena_mission_plan")
         if isinstance(mission_plan, dict) and mission_plan.get("phase"):
             # Self-host phase is durable mission state, not a renderer guess.
@@ -787,6 +807,7 @@ class TaskManager:
             payload,
             task_id=task.id,
             session_id=task.session_id,
+            causal_id=causal_id,
             id=(f"task-lifecycle:{task.id}:{status.value}" if status in FINAL_STATUSES else None),
         )
         # Child lifecycle events are emitted on the parent's stream as well

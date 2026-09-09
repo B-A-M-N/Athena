@@ -26,7 +26,8 @@ from athena.packs.models import PackManifest, PackState
 from athena.mcp.client import MCPClient
 from athena.network import pinned_sync_transport, validate_target
 from athena.protocol.ids import stable_id
-from athena.protocol.tasks import CapabilityPolicy
+from athena.protocol.messages import utcnow
+from athena.protocol.tasks import CapabilityPolicy, TrustedTaskMetadata
 
 try:
     tomllib = import_module("tomllib")
@@ -53,6 +54,21 @@ _EFFECTS = frozenset(
         "FINANCIAL",
     }
 )
+
+
+def _decode_pack_hook_causal(value: Any) -> Mapping[str, Any] | None:
+    """Decode only the durable task-manager causal envelope."""
+    raw = str(value or "")
+    prefix = "athena-pack-hook:"
+    if not raw.startswith(prefix):
+        return None
+    try:
+        decoded = json.loads(raw[len(prefix) :])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, Mapping) else None
+
+
 _PROVIDED_FILES = {
     "skills": (".md",),
     "workflows": (".json",),
@@ -90,6 +106,13 @@ class PackManager:
         self._hook_events_seen: set[str] = set()
         self._hook_outbox = None
         self._hook_retry_task: asyncio.Task | None = None
+        self._hook_health: dict[str, Any] = {
+            "state": "stopped",
+            "last_success_at": None,
+            "last_error_at": None,
+            "last_error": None,
+            "iterations": 0,
+        }
 
     def bind_integrations(
         self,
@@ -144,6 +167,9 @@ class PackManager:
         """Return pack failures from the most recent startup rehydration."""
         return [dict(item) for item in self._rehydration_failures]
 
+    def hook_dispatch_health(self) -> dict[str, Any]:
+        return dict(self._hook_health)
+
     async def replay_hook_outbox(self) -> int:
         """Replay hook deliveries that were durable before a process restart."""
         if self._hook_outbox is None:
@@ -158,6 +184,10 @@ class PackManager:
             callback = callbacks.get(str(row.get("hook_id") or ""))
             if callback is None:
                 continue
+            claimed = await self._hook_outbox.claim(str(row.get("id") or ""))
+            if claimed is None:
+                continue
+            row = claimed
             try:
                 payload = json.loads(str(row.get("payload") or "{}"))
                 event = SimpleNamespace(
@@ -166,10 +196,12 @@ class PackManager:
                     task_id=row.get("task_id"),
                     session_id=row.get("session_id"),
                     payload=payload if isinstance(payload, Mapping) else {},
+                    _hook_outbox_row=row,
                 )
                 await callback(event)
             except Exception as exc:  # recovery remains retryable
-                await self._hook_outbox.mark_failed(str(row.get("id") or ""), str(exc))
+                kwargs = {"claim_token": row.get("claim_token")} if row.get("claim_token") else {}
+                await self._hook_outbox.mark_failed(str(row.get("id") or ""), str(exc), **kwargs)
             else:
                 replayed += 1
         return replayed
@@ -180,14 +212,27 @@ class PackManager:
             return
 
         async def _loop() -> None:
-            try:
-                while True:
+            self._hook_health["state"] = "running"
+            while True:
+                try:
+                    self._hook_health["iterations"] = (
+                        int(self._hook_health.get("iterations", 0)) + 1
+                    )
                     await self.replay_hook_outbox()
+                    self._hook_health["last_success_at"] = utcnow().isoformat()
+                    self._hook_health["last_error"] = None
                     await asyncio.sleep(max(0.1, float(interval_s)))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _logger.warning("pack hook retry loop stopped: %s", exc)
+                except asyncio.CancelledError:
+                    self._hook_health["state"] = "stopped"
+                    raise
+                except Exception as exc:
+                    self._hook_health.update(
+                        state="degraded",
+                        last_error_at=utcnow().isoformat(),
+                        last_error=str(exc)[:2000],
+                    )
+                    _logger.warning("pack hook retry iteration failed: %s", exc)
+                    await asyncio.sleep(min(30.0, max(0.25, float(interval_s))))
 
         self._hook_retry_task = asyncio.create_task(_loop())
 
@@ -255,21 +300,17 @@ class PackManager:
         quarantine = Path(tempfile.mkdtemp(prefix=".pack-quarantine-", dir=str(self._root)))
         archive = quarantine / "source.archive"
         try:
-            content = _download_remote(
+            _download_remote(
                 str(source_url),
                 target=target,
                 max_bytes=max_bytes,
                 timeout=20.0,
                 user_agent="athena-pack-fetch/1",
+                destination=archive,
             )
-            digest = hashlib.sha256()
-            with archive.open("wb") as out:
-                digest.update(content)
-                out.write(content)
-            archive_hash = digest.hexdigest()
+            archive_hash = _file_sha256(archive)
             if expected and archive_hash != expected:
                 raise ValueError("remote pack archive hash does not match expected_sha256")
-            self._prune_content_cache()
             content_root = self._content_root / archive_hash
             if not content_root.exists():
                 extract_root = quarantine / "payload"
@@ -277,6 +318,10 @@ class PackManager:
                 _extract_archive_safely(archive, extract_root)
                 source_root = _find_pack_root(extract_root)
                 _validated_source_for_remote(source_root)
+                incoming_size = _tree_size(source_root)
+                if incoming_size > _REMOTE_CONTENT_CACHE_LIMIT:
+                    raise ValueError("remote pack exceeds the content cache limit")
+                self._prune_content_cache(reserve_bytes=incoming_size)
                 content_root.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source_root, content_root)
             else:
@@ -294,7 +339,7 @@ class PackManager:
         finally:
             shutil.rmtree(quarantine, ignore_errors=True)
 
-    def _prune_content_cache(self) -> None:
+    def _prune_content_cache(self, *, reserve_bytes: int = 0) -> None:
         """Bound remote approval material so abandoned fetches cannot grow forever."""
         if not self._content_root.exists():
             return
@@ -305,11 +350,7 @@ class PackManager:
                 continue
             try:
                 mtime = entry.stat().st_mtime
-                size = sum(
-                    item.stat().st_size
-                    for item in entry.rglob("*")
-                    if item.is_file()
-                )
+                size = sum(item.stat().st_size for item in entry.rglob("*") if item.is_file())
             except OSError:
                 continue
             if now - mtime > _REMOTE_CONTENT_CACHE_TTL:
@@ -317,8 +358,9 @@ class PackManager:
                 continue
             entries.append((mtime, size, entry))
         total = sum(size for _mtime, size, _entry in entries)
+        target = max(0, _REMOTE_CONTENT_CACHE_LIMIT - max(0, int(reserve_bytes)))
         for mtime, size, entry in sorted(entries):
-            if total <= _REMOTE_CONTENT_CACHE_LIMIT:
+            if total <= target:
                 break
             shutil.rmtree(entry, ignore_errors=True)
             total -= size
@@ -687,32 +729,38 @@ class PackManager:
                     event_payload = (
                         dict(raw_event_payload) if isinstance(raw_event_payload, Mapping) else {}
                     )
+                    causal = _decode_pack_hook_causal(getattr(event, "causal_id", None))
+                    if not isinstance(causal, Mapping):
+                        causal = {}
                     try:
-                        depth = int(event_payload.get("_pack_hook_depth", 0))
+                        depth = int(causal.get("depth", 0))
                     except (TypeError, ValueError):
                         depth = _recursion_limit + 1
+                    if causal and causal.get("kind") != "pack_hook":
+                        return
                     if depth > _recursion_limit:
                         return
-                    outbox_row = None
+                    outbox_row = getattr(event, "_hook_outbox_row", None)
                     if self._hook_outbox is not None:
-                        outbox_row = await self._hook_outbox.enqueue(
-                            pack_id=state.id,
-                            hook_id=_hook_id,
-                            event_id=event_id,
-                            event_type=_event_type,
-                            task_id=getattr(event, "task_id", None),
-                            session_id=getattr(event, "session_id", None),
-                            payload=event_payload,
-                            depth=depth,
-                        )
-                        if str(outbox_row.get("status") or "") == "DISPATCHED":
-                            return
-                        claim = getattr(self._hook_outbox, "claim", None)
-                        if claim is not None:
-                            claimed = await claim(str(outbox_row.get("id") or ""))
-                            if claimed is None:
+                        if outbox_row is None:
+                            outbox_row = await self._hook_outbox.enqueue(
+                                pack_id=state.id,
+                                hook_id=_hook_id,
+                                event_id=event_id,
+                                event_type=_event_type,
+                                task_id=getattr(event, "task_id", None),
+                                session_id=getattr(event, "session_id", None),
+                                payload=event_payload,
+                                depth=depth,
+                            )
+                            if str(outbox_row.get("status") or "") == "DISPATCHED":
                                 return
-                            outbox_row = claimed
+                            claim = getattr(self._hook_outbox, "claim", None)
+                            if claim is not None:
+                                claimed = await claim(str(outbox_row.get("id") or ""))
+                                if claimed is None:
+                                    return
+                                outbox_row = claimed
                     elif event_id in self._hook_events_seen:
                         return
                     else:
@@ -744,24 +792,32 @@ class PackManager:
                         ),
                         task_id=hook_task_id,
                         workspace=self._workspace,
-                        metadata={
-                            "_pack_hook": _hook_id,
-                            "_pack_event_id": event_id,
-                            "_pack_workflow": _workflow,
-                            "_pack_hook_depth": depth + 1,
-                            "_pack_hook_effect_ceiling": list(_effect_ceiling),
-                            "_pack_hook_authority": "manifest_requested_effects",
-                            "_pack_hook_invocation": {
-                                "workflow_id": _workflow,
-                                "event_id": event_id,
-                                "hook_id": _hook_id,
-                                "pack_id": state.id,
-                                "pack_version": state.manifest.version,
-                                "effect_ceiling": list(_effect_ceiling),
-                                "depth": depth + 1,
-                                "event_payload": invocation_payload,
-                            },
-                        },
+                        metadata=TrustedTaskMetadata(
+                            {
+                                "_pack_hook": _hook_id,
+                                "_pack_event_id": event_id,
+                                "_pack_workflow": _workflow,
+                                "_pack_hook_depth": depth + 1,
+                                "_causal": {
+                                    "kind": "pack_hook",
+                                    "root_event_id": str(causal.get("root_event_id") or event_id),
+                                    "hook_id": _hook_id,
+                                    "depth": depth + 1,
+                                },
+                                "_pack_hook_effect_ceiling": list(_effect_ceiling),
+                                "_pack_hook_authority": "manifest_requested_effects",
+                                "_pack_hook_invocation": {
+                                    "workflow_id": _workflow,
+                                    "event_id": event_id,
+                                    "hook_id": _hook_id,
+                                    "pack_id": state.id,
+                                    "pack_version": state.manifest.version,
+                                    "effect_ceiling": list(_effect_ceiling),
+                                    "depth": depth + 1,
+                                    "event_payload": invocation_payload,
+                                },
+                            }
+                        ),
                         capability_policy=CapabilityPolicy(
                             effects=frozenset(_effect_ceiling),
                             deny=("*",) if not _effect_ceiling else (),
@@ -775,14 +831,25 @@ class PackManager:
                             result_id = getattr(result, "id", None)
                             if result_id is None and isinstance(result, Mapping):
                                 result_id = result.get("id") or result.get("task_id")
+                            kwargs = (
+                                {"claim_token": outbox_row.get("claim_token")}
+                                if outbox_row.get("claim_token")
+                                else {}
+                            )
                             await self._hook_outbox.mark_dispatched(
                                 str(outbox_row.get("id") or ""),
                                 str(result_id) if result_id else None,
+                                **kwargs,
                             )
                     except Exception as exc:  # hook failures do not break event append
                         if self._hook_outbox is not None and outbox_row is not None:
+                            kwargs = (
+                                {"claim_token": outbox_row.get("claim_token")}
+                                if outbox_row.get("claim_token")
+                                else {}
+                            )
                             await self._hook_outbox.mark_failed(
-                                str(outbox_row.get("id") or ""), str(exc)
+                                str(outbox_row.get("id") or ""), str(exc), **kwargs
                             )
                         _logger.warning("pack hook %s could not enqueue: %s", _hook_id, exc)
 
@@ -978,6 +1045,13 @@ class PackManager:
                     raise ValueError(
                         f"pack workflow {workflow.id} is invalid: {'; '.join(validation.errors)}"
                     )
+                requested = set(state.manifest.requested_effects)
+                workflow_effects = set(validation.effects)
+                if not workflow_effects.issubset(requested):
+                    raise ValueError(
+                        f"pack workflow {workflow.id} exceeds requested effects: "
+                        + ", ".join(sorted(workflow_effects - requested))
+                    )
                 await self._workflow_store.save(workflow)
                 saved.append(workflow.id)
         except Exception:
@@ -1116,11 +1190,21 @@ class PackManager:
     def health(self, state: PackState) -> dict[str, Any]:
         path = Path(state.install_path)
         if not path.is_dir():
-            return {"pack_id": state.id, "status": "missing", "reason": "install path missing"}
+            return {
+                "pack_id": state.id,
+                "status": "missing",
+                "reason": "install path missing",
+                "hook_dispatch": self.hook_dispatch_health(),
+            }
         try:
             _source, manifest, integrity = self._validated_source(str(path))
         except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
-            return {"pack_id": state.id, "status": "invalid", "reason": str(exc)}
+            return {
+                "pack_id": state.id,
+                "status": "invalid",
+                "reason": str(exc),
+                "hook_dispatch": self.hook_dispatch_health(),
+            }
         status = (
             "healthy"
             if integrity == state.source_integrity and manifest == state.manifest
@@ -1133,6 +1217,7 @@ class PackManager:
             "enabled": state.enabled,
             "integrity": integrity,
             "expected_integrity": state.source_integrity,
+            "hook_dispatch": self.hook_dispatch_health(),
         }
 
     async def list(self) -> list[dict[str, Any]]:
@@ -1223,6 +1308,7 @@ def _download_remote(
     max_bytes: int,
     timeout: float,
     user_agent: str,
+    destination: Path | None = None,
 ) -> bytes:
     """Read one bounded, non-redirecting pack response.
 
@@ -1250,7 +1336,9 @@ def _download_remote(
                         raise ValueError(
                             f"remote pack fetch returned HTTP {response.status_code}; redirects are not followed"
                         )
-                    return _bounded_response(response.iter_bytes(), max_bytes)
+                    return _bounded_response(
+                        response.iter_bytes(), max_bytes, destination=destination
+                    )
         finally:
             transport.close()
 
@@ -1265,10 +1353,23 @@ def _download_remote(
             raise ValueError(
                 f"remote pack fetch returned HTTP {getattr(response, 'status', 0)}; redirects are not followed"
             )
-        return _bounded_response(iter(lambda: response.read(1024 * 1024), b""), max_bytes)
+        return _bounded_response(
+            iter(lambda: response.read(1024 * 1024), b""), max_bytes, destination=destination
+        )
 
 
-def _bounded_response(chunks, max_bytes: int) -> bytes:
+def _bounded_response(chunks, max_bytes: int, *, destination: Path | None = None) -> bytes:
+    if destination is not None:
+        size = 0
+        with destination.open("wb") as output:
+            for chunk in chunks:
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise ValueError("remote pack response exceeds size limit")
+                output.write(bytes(chunk))
+        return b""
     values: list[bytes] = []
     size = 0
     for chunk in chunks:
@@ -1279,6 +1380,18 @@ def _bounded_response(chunks, max_bytes: int) -> bytes:
             raise ValueError("remote pack response exceeds size limit")
         values.append(bytes(chunk))
     return b"".join(values)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tree_size(root: Path) -> int:
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 
 
 def _extract_archive_safely(

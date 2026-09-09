@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from datetime import timedelta
 from typing import Any, Mapping
 
@@ -98,12 +99,16 @@ class PackHookOutbox:
 
     async def claim(self, row_id: str) -> dict[str, Any] | None:
         now = utcnow().isoformat()
+        token = secrets.token_urlsafe(24)
+        lease_expires = (utcnow() + timedelta(seconds=60)).isoformat()
         cursor = await self._db.execute(
             "UPDATE pack_hook_outbox SET status = 'CLAIMED', attempts = attempts + 1, "
+            "claimed_at = ?, claim_token = ?, claim_expires_at = ?, "
             "updated_at = ?, error = NULL WHERE id = ? "
-            "AND status IN ('PENDING', 'FAILED', 'CLAIMED') "
-            "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
-            (now, str(row_id), now),
+            "AND ((status IN ('PENDING', 'FAILED') AND "
+            "(next_attempt_at IS NULL OR next_attempt_at <= ?)) OR "
+            "(status = 'CLAIMED' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?))",
+            (now, now, token, lease_expires, now, str(row_id), now, now),
         )
         if not cursor.rowcount:
             return None
@@ -112,15 +117,25 @@ class PackHookOutbox:
         )
         return dict(row or {})
 
-    async def mark_dispatched(self, row_id: str, task_id: str | None) -> None:
+    async def mark_dispatched(
+        self, row_id: str, task_id: str | None, *, claim_token: str | None = None
+    ) -> None:
         await self._db.execute(
             "UPDATE pack_hook_outbox SET status = 'DISPATCHED', dispatched_task_id = ?, "
-            "hook_task_id = COALESCE(hook_task_id, ?), next_attempt_at = NULL, updated_at = ? "
-            "WHERE id = ?",
-            (task_id, task_id, utcnow().isoformat(), str(row_id)),
+            "hook_task_id = COALESCE(hook_task_id, ?), next_attempt_at = NULL, "
+            "claim_token = NULL, claim_expires_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'CLAIMED' AND claim_token = ?",
+            (task_id, task_id, utcnow().isoformat(), str(row_id), claim_token),
         )
 
-    async def mark_failed(self, row_id: str, error: str, *, attempts: int | None = None) -> None:
+    async def mark_failed(
+        self,
+        row_id: str,
+        error: str,
+        *,
+        attempts: int | None = None,
+        claim_token: str | None = None,
+    ) -> None:
         row = await self._db.fetch_one(
             "SELECT attempts FROM pack_hook_outbox WHERE id = ?", (str(row_id),)
         )
@@ -129,14 +144,16 @@ class PackHookOutbox:
         retry_at = (utcnow() + timedelta(seconds=delay)).isoformat()
         await self._db.execute(
             "UPDATE pack_hook_outbox SET status = 'FAILED', error = ?, next_attempt_at = ?, "
-            "updated_at = ? WHERE id = ?",
-            (str(error)[:2000], retry_at, utcnow().isoformat(), str(row_id)),
+            "claim_token = NULL, claim_expires_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'CLAIMED' AND claim_token = ?",
+            (str(error)[:2000], retry_at, utcnow().isoformat(), str(row_id), claim_token),
         )
 
     async def mark_cancelled(self, row_id: str, reason: str) -> None:
         await self._db.execute(
             "UPDATE pack_hook_outbox SET status = 'CANCELLED', error = ?, "
-            "next_attempt_at = NULL, updated_at = ? WHERE id = ?",
+            "next_attempt_at = NULL, claim_token = NULL, claim_expires_at = NULL, "
+            "updated_at = ? WHERE id = ?",
             (str(reason)[:2000], utcnow().isoformat(), str(row_id)),
         )
 

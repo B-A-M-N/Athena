@@ -370,6 +370,9 @@ class AthenaConfig:
     browser_session_scope: str = "task"
     browser_timeout_ms: int = 12_000
     browser_viewport: tuple[int, int] | None = (1024, 768)
+    # Operator-owned browser profiles. Models may select only the opaque key;
+    # cookies/tokens and file paths never travel through task arguments.
+    browser_auth_profiles: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     browser_driver_factory: Any | None = None
     # Terminal UI: which mascot/buddy the surfaces show (a registered
     # character name, or "off" to hide the mascot column). ``mascots``
@@ -839,6 +842,10 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["browser_timeout_ms"] = config.browser_timeout_ms
     if config.browser_viewport != (1024, 768):
         d["browser_viewport"] = list(config.browser_viewport) if config.browser_viewport else None
+    if config.browser_auth_profiles:
+        d["browser_auth_profiles"] = {
+            str(name): dict(profile) for name, profile in config.browser_auth_profiles.items()
+        }
     if config.mascot is not None:
         d["mascot"] = config.mascot
     if config.mascots:
@@ -1000,6 +1007,11 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         browser_session_scope=str(data.get("browser_session_scope", "task")),
         browser_timeout_ms=int(data.get("browser_timeout_ms", 12_000)),
         browser_viewport=viewport if "browser_viewport" in data else (1024, 768),
+        browser_auth_profiles={
+            str(name): dict(profile)
+            for name, profile in (data.get("browser_auth_profiles") or {}).items()
+            if isinstance(profile, dict)
+        },
         mascot=data.get("mascot"),
         mascots={
             str(k): dict(v) for k, v in (data.get("mascots") or {}).items() if isinstance(v, dict)

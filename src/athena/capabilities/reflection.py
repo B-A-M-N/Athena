@@ -8,6 +8,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -1134,6 +1135,14 @@ class CapabilityReflection:
                 name: shutil.which(name) is not None
                 for name in ("uv", "pip", "npm", "pnpm", "cargo")
             },
+            "compilers": {
+                name: shutil.which(name) is not None
+                for name in ("cc", "gcc", "clang", "rustc", "go", "javac")
+            },
+            "runtimes": {
+                name: shutil.which(name) is not None
+                for name in ("python", "python3", "node", "deno", "bun")
+            },
             "shells": {
                 name: shutil.which(name) is not None for name in ("sh", "bash", "zsh", "pwsh")
             },
@@ -1143,6 +1152,16 @@ class CapabilityReflection:
             },
             "git": {
                 "workspace_repository": bool(workspace_root and (workspace_root / ".git").exists()),
+                "remotes": _git_remote_inventory(workspace_root),
+            },
+            "connectivity": {
+                "status": "unknown",
+                "reason": "connectivity is policy- and route-dependent; no network probe was requested",
+            },
+            "credential_references": {
+                "status": "opaque",
+                "source": "operator configuration",
+                "values": [],
             },
         }
         environment_record = (
@@ -1324,6 +1343,41 @@ def _host_resource_inventory(workspace_root: str | None) -> dict[str, Any]:
         except OSError:
             pass
     return resources
+
+
+def _git_remote_inventory(workspace_root: Path | None) -> list[dict[str, str]]:
+    """List remote identities without exposing embedded credentials."""
+    if workspace_root is None or not (workspace_root / ".git").exists():
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace_root), "remote", "-v"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    remotes: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for line in (result.stdout or "").splitlines()[:32]:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        name, raw_url, direction = fields[:3]
+        parsed = re.match(
+            r"^(?:(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*)://)?(?:(?:[^/@]+)@)?(?P<host>[^/:]+)(?::\d+)?(?P<path>/.*)?$",
+            raw_url,
+        )
+        safe_url = raw_url
+        if parsed and parsed.group("host"):
+            safe_url = f"{parsed.group('scheme') + '://' if parsed.group('scheme') else ''}{parsed.group('host')}{parsed.group('path') or ''}"
+        key = (name, safe_url)
+        if key not in seen:
+            remotes.append({"name": name[:128], "url": safe_url[:512], "direction": direction[:16]})
+            seen.add(key)
+    return remotes
 
 
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):

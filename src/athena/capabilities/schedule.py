@@ -35,7 +35,18 @@ from athena.scheduler.triggers import next_fire
 from athena.network import validate_target
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
-from athena.protocol.tasks import DeliverySpec
+from athena.protocol.tasks import (
+    CapabilityPolicy,
+    DeliverySpec,
+    ModelPolicy,
+    ResourceBudget,
+    capability_policy_covers,
+    intersect_capability_policies,
+    intersect_model_policies,
+    intersect_resource_budgets,
+    model_policy_covers,
+    resource_budget_covers,
+)
 
 _UNSET = object()
 
@@ -50,8 +61,11 @@ class ScheduleControl:
     principal_id: str | None = None
     project_id: str | None = None
     capability_policy: Any = None
+    model_policy: Any = None
     resource_budget: Any = None
     workspace: Any = None
+    autonomy: Any = None
+    grant_token: str | None = None
     narrow_to_caller: bool = False
 
 
@@ -123,45 +137,11 @@ def _stored_control_grant(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 
 def _policy_covers(stored: Mapping[str, Any], current: Any) -> bool:
-    if current is None:
-        return False
-    stored_effects = {str(value) for value in stored.get("effects") or ()}
-    current_effects = {
-        str(getattr(value, "value", value)) for value in getattr(current, "effects", ()) or ()
-    }
-    if stored_effects and current_effects and not stored_effects.issubset(current_effects):
-        return False
-    if stored_effects and not current_effects and bool(getattr(current, "deny", ())):
-        return False
-    stored_allow = set(str(value) for value in stored.get("allow") or ())
-    current_allow = set(str(value) for value in getattr(current, "allow", ()) or ())
-    if stored_allow and current_allow and not stored_allow.issubset(current_allow):
-        return False
-    stored_deny = set(str(value) for value in stored.get("deny") or ())
-    current_deny = set(str(value) for value in getattr(current, "deny", ()) or ())
-    if "*" in stored_deny and "*" not in current_deny:
-        return False
-    return True
+    return current is not None and capability_policy_covers(stored, current)
 
 
 def _budget_covers(stored: Mapping[str, Any], current: Any) -> bool:
-    if current is None:
-        return False
-    for name, stored_value in stored.items():
-        if stored_value is None:
-            continue
-        current_value = getattr(current, name, None)
-        if current_value is None:
-            continue
-        try:
-            if float(current_value.total_seconds()) < float(stored_value):
-                return False
-        except AttributeError:
-            if float(current_value) < float(stored_value):
-                return False
-        except (TypeError, ValueError):
-            return False
-    return True
+    return current is not None and resource_budget_covers(stored, current)
 
 
 def _current_authority(
@@ -172,9 +152,9 @@ def _current_authority(
     return _authority_snapshot(
         workspace=control.workspace,
         capability_policy=control.capability_policy,
-        model_policy=None,
+        model_policy=control.model_policy,
         resource_budget=control.resource_budget,
-        autonomy=None,
+        autonomy=control.autonomy,
         delivery=None,
         owner=owner,
     )
@@ -184,6 +164,8 @@ def _authority_covers(
     job: Mapping[str, Any],
     owner: Mapping[str, str | None] | None,
     control: ScheduleControl | None,
+    *,
+    operation: str = "control",
 ) -> bool:
     if control is None or control.origin in {"user_direct", "trusted_orchestration", "system"}:
         return True
@@ -192,31 +174,47 @@ def _authority_covers(
     grant = _stored_control_grant(job)
     if grant is None:
         return False
-    if grant.get("creator_task_id") and grant.get("creator_task_id") != control.task_id:
-        return False
-    if grant.get("creator_session_id") and grant.get("creator_session_id") != control.session_id:
-        return False
-    if grant.get("principal_id") and grant.get("principal_id") != control.principal_id:
-        return False
+    authorized_by_token = bool(control.grant_token and control.grant_token == grant.get("token"))
+    if authorized_by_token:
+        expires = grant.get("expires_at")
+        if grant.get("revoked") or (expires and str(expires) <= utcnow().isoformat()):
+            return False
+        if operation not in set(grant.get("operations") or ("control",)):
+            return False
+        for key in ("principal_id", "project_id"):
+            if grant.get(key) and grant.get(key) != getattr(control, key):
+                return False
+    else:
+        if grant.get("creator_task_id") and grant.get("creator_task_id") != control.task_id:
+            return False
+        if (
+            grant.get("creator_session_id")
+            and grant.get("creator_session_id") != control.session_id
+        ):
+            return False
+        if grant.get("principal_id") and grant.get("principal_id") != control.principal_id:
+            return False
     metadata = job.get("metadata")
     stored_authority = (
-        metadata.get("_authority_snapshot")
-        if isinstance(metadata, Mapping)
-        else None
+        metadata.get("_authority_snapshot") if isinstance(metadata, Mapping) else None
     )
     if not isinstance(stored_authority, Mapping):
         return False
     if grant.get("authority_digest") != stored_authority.get("authority_digest"):
         return False
-    if not _policy_covers(stored_authority.get("capability_policy") or {}, control.capability_policy):
+    if not _policy_covers(
+        control.capability_policy, stored_authority.get("capability_policy") or {}
+    ):
         return False
-    if not _budget_covers(stored_authority.get("resource_budget") or {}, control.resource_budget):
+    if not _budget_covers(control.resource_budget, stored_authority.get("resource_budget") or {}):
+        return False
+    if not model_policy_covers(control.model_policy, stored_authority.get("model_policy") or {}):
+        return False
+    if not _autonomy_covers(control.autonomy, stored_authority.get("autonomy")):
         return False
     stored_workspace = stored_authority.get("workspace") or {}
     current_workspace = _current_authority(control, owner=owner).get("workspace") or {}
-    stored_root = str(stored_workspace.get("root") or "")
-    current_root = str(current_workspace.get("root") or "")
-    return not stored_root or stored_root == current_root
+    return _workspace_covers(current_workspace, stored_workspace)
 
 
 def _intersect_authority(
@@ -225,31 +223,238 @@ def _intersect_authority(
 ) -> dict[str, Any]:
     """Narrow a schedule to the caller's current authority."""
     result = dict(stored)
-    stored_policy = dict(stored.get("capability_policy") or {})
-    current_policy = dict(current.get("capability_policy") or {})
-    stored_effects = set(stored_policy.get("effects") or ())
-    current_effects = set(current_policy.get("effects") or ())
-    if current_effects:
-        stored_policy["effects"] = sorted(stored_effects & current_effects) if stored_effects else sorted(current_effects)
-    stored_policy["allow"] = sorted(
-        set(stored_policy.get("allow") or ()) & set(current_policy.get("allow") or ())
-    ) if current_policy.get("allow") else list(stored_policy.get("allow") or ())
-    stored_policy["ask"] = sorted(
-        set(stored_policy.get("ask") or ()) & set(current_policy.get("ask") or ())
-    ) if current_policy.get("ask") else list(stored_policy.get("ask") or ())
-    stored_policy["deny"] = sorted(
-        set(stored_policy.get("deny") or ()) | set(current_policy.get("deny") or ())
+    policy = intersect_capability_policies(
+        stored.get("capability_policy"), current.get("capability_policy")
     )
-    result["capability_policy"] = stored_policy
+    result["capability_policy"] = _policy_record(policy)
+    current_effects = set(current.get("capability_policy", {}).get("effects") or ())
     result["delivery_effects"] = sorted(
-        set(stored.get("delivery_effects") or ()) & set(current.get("capability_policy", {}).get("effects") or ())
-    ) if current.get("capability_policy", {}).get("effects") else list(stored.get("delivery_effects") or ())
+        set(stored.get("delivery_effects") or ()) & current_effects
+        if current_effects
+        else set(stored.get("delivery_effects") or ())
+    )
     result["effect_ceiling"] = list(result["delivery_effects"])
     if current.get("workspace"):
-        result["workspace"] = dict(current["workspace"])
-    if current.get("resource_budget"):
-        result["resource_budget"] = dict(current["resource_budget"])
+        result["workspace"] = _intersect_workspace_records(
+            stored.get("workspace") or {}, current["workspace"]
+        )
+    result["resource_budget"] = _budget_record(
+        intersect_resource_budgets(
+            stored.get("resource_budget") or {}, current.get("resource_budget") or {}
+        )
+    )
+    result["model_policy"] = _model_policy_record(
+        intersect_model_policies(
+            stored.get("model_policy") or {}, current.get("model_policy") or {}
+        )
+    )
+    result["autonomy"] = _intersect_autonomy(stored.get("autonomy"), current.get("autonomy"))
     result["authority_digest"] = _authority_digest(result)
+    return result
+
+
+def _policy_record(policy: CapabilityPolicy) -> dict[str, Any]:
+    return {
+        "effects": sorted(policy.effects),
+        "allow": list(policy.allow),
+        "ask": list(policy.ask),
+        "deny": list(policy.deny),
+    }
+
+
+def _budget_record(budget: ResourceBudget) -> dict[str, Any]:
+    record: dict[str, Any] = {}
+    for name in (
+        "max_agent_iterations",
+        "max_input_tokens",
+        "max_output_tokens",
+        "max_cost_usd",
+        "max_wall_time",
+        "max_children",
+        "max_child_depth",
+        "max_parallel_model_calls",
+        "max_parallel_executions",
+        "max_artifact_bytes",
+    ):
+        value = getattr(budget, name, None)
+        if value is None:
+            continue
+        if name == "max_cost_usd":
+            value = str(value)
+        elif name == "max_wall_time":
+            value = value.total_seconds()
+        record[name] = value
+    return record
+
+
+def _model_policy_record(policy: ModelPolicy) -> dict[str, Any]:
+    return {
+        "role": policy.role,
+        "allowed": list(policy.allowed),
+        "require_tools": policy.require_tools,
+        "privacy": policy.privacy,
+        "max_cost_usd": str(policy.max_cost_usd) if policy.max_cost_usd is not None else None,
+        "routing_preference": policy.routing_preference,
+        "min_quality_tier": policy.min_quality_tier,
+        "require_declared_quality": policy.require_declared_quality,
+        "max_model_attempts": policy.max_model_attempts,
+    }
+
+
+def _autonomy_rank(value: Any) -> int:
+    return {"supervised": 0, "coding": 1, "autonomous": 2, "offline": 0}.get(
+        getattr(value, "value", value) or "supervised", 0
+    )
+
+
+def _autonomy_covers(upper: Any, lower: Any) -> bool:
+    return _autonomy_rank(lower) <= _autonomy_rank(upper)
+
+
+def _intersect_autonomy(left: Any, right: Any) -> str:
+    values = [getattr(item, "value", item) for item in (left, right) if item]
+    return min(values, key=_autonomy_rank) if values else "supervised"
+
+
+def _record_path(value: Any) -> str:
+    return os.path.realpath(os.path.abspath(os.path.expanduser(str(value))))
+
+
+def _path_within(path: str, root: str) -> bool:
+    try:
+        common = os.path.commonpath([_record_path(path), _record_path(root)])
+    except ValueError:
+        return False
+    return common == _record_path(root)
+
+
+def _workspace_rules_cover(upper: Any, lower: Any) -> bool:
+    upper_rules = [
+        item for item in upper or () if isinstance(item, Mapping) and item.get("allow", True)
+    ]
+    lower_rules = [
+        item for item in lower or () if isinstance(item, Mapping) and item.get("allow", True)
+    ]
+    upper_denies = [
+        item.get("path")
+        for item in upper or ()
+        if isinstance(item, Mapping) and not item.get("allow", True)
+    ]
+    if not upper_rules:
+        # No allow rules means an unrestricted base, narrowed only by explicit
+        # denies. A lower allow rule must not fall inside one of those denies.
+        return not any(
+            _path_within(str(child.get("path") or ""), str(deny))
+            for child in lower_rules
+            for deny in upper_denies
+            if deny
+        )
+    if not lower_rules:
+        return False
+    for child in lower_rules:
+        child_path = str(child.get("path") or "")
+        if not any(
+            _path_within(child_path, str(parent.get("path") or "")) for parent in upper_rules
+        ):
+            return False
+        if any(_path_within(child_path, str(deny)) for deny in upper_denies if deny):
+            return False
+    return True
+
+
+def _workspace_covers(upper: Mapping[str, Any], lower: Mapping[str, Any]) -> bool:
+    upper_root = str(upper.get("root") or "")
+    lower_root = str(lower.get("root") or "")
+    if upper_root and lower_root and _record_path(upper_root) != _record_path(lower_root):
+        return False
+    for field in ("execution_backend", "revision"):
+        if upper.get(field) and lower.get(field) != upper.get(field):
+            return False
+    network_rank = {"deny": 0, "restricted": 1, "allow": 2}
+    mutation_rank = {"read_only": 0, "speculative": 1, "direct": 2}
+    if network_rank.get(str(lower.get("network_policy") or "allow"), 2) > network_rank.get(
+        str(upper.get("network_policy") or "allow"), 2
+    ):
+        return False
+    if mutation_rank.get(str(lower.get("mutation_mode") or "direct"), 2) > mutation_rank.get(
+        str(upper.get("mutation_mode") or "direct"), 2
+    ):
+        return False
+    if (
+        upper.get("temp_root")
+        and lower.get("temp_root")
+        and not _path_within(str(lower["temp_root"]), str(upper["temp_root"]))
+    ):
+        return False
+    return _workspace_rules_cover(
+        upper.get("readable"), lower.get("readable")
+    ) and _workspace_rules_cover(upper.get("writable"), lower.get("writable"))
+
+
+def _intersect_workspace_rules(left: Any, right: Any) -> list[dict[str, Any]]:
+    a = [item for item in left or () if isinstance(item, Mapping)]
+    b = [item for item in right or () if isinstance(item, Mapping)]
+    if not a:
+        return [dict(item) for item in b]
+    if not b:
+        return [dict(item) for item in a]
+    out: list[dict[str, Any]] = []
+    for first in a:
+        if not first.get("allow", True):
+            out.append(dict(first))
+            continue
+        for second in b:
+            if not second.get("allow", True):
+                out.append(dict(second))
+                continue
+            left_path = _record_path(first.get("path"))
+            right_path = _record_path(second.get("path"))
+            if _path_within(left_path, right_path):
+                out.append({"path": left_path, "allow": True})
+            elif _path_within(right_path, left_path):
+                out.append({"path": right_path, "allow": True})
+    if not any(item.get("allow", True) for item in out):
+        root = str((b[0] if b else a[0]).get("path") or ".")
+        out.append({"path": root, "allow": False})
+    unique: dict[tuple[str, bool], dict[str, Any]] = {}
+    for item in out:
+        unique[(str(item.get("path")), bool(item.get("allow", True)))] = item
+    return list(unique.values())
+
+
+def _intersect_workspace_records(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> dict[str, Any]:
+    first = dict(left or {})
+    second = dict(right or {})
+    network = min(
+        (str(first.get("network_policy") or "allow"), str(second.get("network_policy") or "allow")),
+        key=lambda value: {"deny": 0, "restricted": 1, "allow": 2}.get(value, 0),
+    )
+    mutation = min(
+        (str(first.get("mutation_mode") or "direct"), str(second.get("mutation_mode") or "direct")),
+        key=lambda value: {"read_only": 0, "speculative": 1, "direct": 2}.get(value, 0),
+    )
+    result = dict(first)
+    result["readable"] = _intersect_workspace_rules(first.get("readable"), second.get("readable"))
+    result["writable"] = _intersect_workspace_rules(first.get("writable"), second.get("writable"))
+    result["network_policy"] = network
+    result["mutation_mode"] = mutation
+    first_temp = str(first.get("temp_root") or "")
+    second_temp = str(second.get("temp_root") or "")
+    if first_temp and second_temp:
+        if _path_within(second_temp, first_temp):
+            result["temp_root"] = second_temp
+        elif _path_within(first_temp, second_temp):
+            result["temp_root"] = first_temp
+        else:
+            result["temp_root"] = ""
+    elif second_temp:
+        result["temp_root"] = second_temp
+    if first.get("revision") and second.get("revision"):
+        result["revision"] = first["revision"] if first["revision"] == second["revision"] else None
+    elif second.get("revision"):
+        result["revision"] = second["revision"]
     return result
 
 
@@ -288,8 +493,10 @@ def _control_from_request(request: CapabilityRequest, context: Any) -> ScheduleC
         principal_id=getattr(context, "principal_id", None),
         project_id=getattr(getattr(context, "workspace", None), "id", None),
         capability_policy=getattr(context, "capability_policy", None),
+        model_policy=getattr(context, "model_policy", None),
         resource_budget=getattr(context, "resource_budget", None),
         workspace=getattr(context, "workspace", None),
+        autonomy=getattr(context, "autonomy", None),
         narrow_to_caller=bool(request.arguments.get("narrow_authority")),
     )
 
@@ -300,6 +507,8 @@ def _criterion_record(criterion: Any) -> dict[str, Any]:
         "id": str(getattr(criterion, "id", "")),
         "description": str(getattr(criterion, "description", "")),
         "required": bool(getattr(criterion, "required", True)),
+        "evidence_required": bool(getattr(criterion, "evidence_required", False)),
+        "evidence_requirement_id": getattr(criterion, "evidence_requirement_id", None),
         "verification": None
         if verification is None
         else {
@@ -404,39 +613,9 @@ def _authority_snapshot(
             "deny": list(getattr(cp, "deny", ()) or ()),
         },
         "model_policy": {
-            "role": getattr(mp, "role", "primary"),
-            "allowed": list(getattr(mp, "allowed", ()) or ()),
-            "require_tools": bool(getattr(mp, "require_tools", False)),
-            "privacy": getattr(mp, "privacy", "local-preferred"),
-            "max_cost_usd": (
-                str(getattr(mp, "max_cost_usd"))
-                if getattr(mp, "max_cost_usd", None) is not None
-                else None
-            ),
-            "routing_preference": getattr(mp, "routing_preference", "balanced"),
+            **_model_policy_record(mp if mp is not None else ModelPolicy()),
         },
-        "resource_budget": {
-            name: (
-                value.total_seconds()
-                if hasattr(value, "total_seconds")
-                else str(value)
-                if name == "max_cost_usd" and value is not None
-                else value
-            )
-            for name in (
-                "max_agent_iterations",
-                "max_input_tokens",
-                "max_output_tokens",
-                "max_cost_usd",
-                "max_wall_time",
-                "max_children",
-                "max_child_depth",
-                "max_parallel_model_calls",
-                "max_parallel_executions",
-                "max_artifact_bytes",
-            )
-            if (value := getattr(budget, name, None)) is not None
-        },
+        "resource_budget": _budget_record(budget) if budget is not None else {},
         "autonomy": getattr(autonomy, "value", autonomy) or "supervised",
         "delivery": delivery_record,
         "delivery_effects": delivery_effects,
@@ -516,10 +695,15 @@ class ScheduleAPI:
         )
         authority["authority_digest"] = _authority_digest(authority)
         control_grant = {
+            "token": new_id("schedule-token"),
+            "schedule_id": job_id,
             "creator_task_id": owner_data.get("task_id"),
             "creator_session_id": owner_data.get("session_id"),
             "principal_id": owner_data.get("principal_id"),
             "project_id": owner_data.get("project_id"),
+            "operations": ["update", "enable", "disable", "delete", "run", "control"],
+            "expires_at": None,
+            "revoked": False,
             "authority_digest": authority["authority_digest"],
             "control_scope": "creator_authority_or_operator",
         }
@@ -580,7 +764,60 @@ class ScheduleAPI:
                 "_control_grant": control_grant,
             },
         )
-        return {"job_id": job_id, "name": name, "enabled": True}
+        return {
+            "job_id": job_id,
+            "name": name,
+            "enabled": True,
+            "control_token": control_grant["token"],
+        }
+
+    async def grant_control(
+        self,
+        job_id: str,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        control: ScheduleControl | None = None,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+        operations: tuple[str, ...] = ("inspect", "update", "enable", "disable", "run"),
+        expires_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Issue a bounded bearer grant without changing schedule authority."""
+        job = await self._scheduler._store.get_job_id(job_id)
+        if job is None or not _owner_visible(job, owner, control=control):
+            return None
+        if control is not None and control.origin == "model":
+            raise PermissionError("only an operator or trusted orchestrator may grant control")
+        if not _authority_covers(job, owner, control, operation="control"):
+            raise PermissionError("caller authority cannot grant schedule control")
+        authority = (job.get("metadata") or {}).get("_authority_snapshot") or {}
+        grant = {
+            "token": new_id("schedule-token"),
+            "schedule_id": job_id,
+            "principal_id": principal_id,
+            "project_id": project_id,
+            "operations": sorted(set(str(item) for item in operations) | {"inspect"}),
+            "expires_at": expires_at,
+            "revoked": False,
+            "authority_digest": authority.get("authority_digest"),
+            "control_scope": "explicit_grant",
+        }
+        metadata = dict(job.get("metadata") or {})
+        metadata["_control_grant"] = grant
+        await self._scheduler._store.upsert_job(
+            job_id,
+            str(job.get("name") or job_id),
+            payload=job.get("payload") or {},
+            trigger_spec=_trigger_from_metadata(job),
+            enabled=bool(job.get("enabled", True)),
+            next_run=job.get("next_run"),
+            metadata=metadata,
+        )
+        return {
+            "job_id": job_id,
+            "control_token": grant["token"],
+            "operations": grant["operations"],
+        }
 
     async def update(
         self,
@@ -599,7 +836,7 @@ class ScheduleAPI:
         job = await self._scheduler._store.get_job_id(job_id)
         if job is None or not _owner_visible(job, owner, control=control):
             return None
-        covered = _authority_covers(job, owner, control)
+        covered = _authority_covers(job, owner, control, operation="update")
         narrowed = (
             control is not None
             and control.origin == "model"
@@ -732,7 +969,7 @@ class ScheduleAPI:
         job = await self._scheduler._store.get_job_id(job_id)
         if job is None or not _owner_visible(job, owner, control=control):
             return None
-        if not _authority_covers(job, owner, control):
+        if not _authority_covers(job, owner, control, operation="run"):
             raise PermissionError("caller authority cannot run this schedule")
         return await self._scheduler.run_now(job_id)
 
@@ -744,7 +981,7 @@ class ScheduleAPI:
     ) -> list[dict]:
         jobs = await self._scheduler._store.list_jobs(enabled_only=False)
         return [
-            self._public_job(job)
+            self._public_job(job, control=control)
             for job in jobs
             if _owner_visible(job, owner, control=control)
         ]
@@ -759,7 +996,7 @@ class ScheduleAPI:
         job = await self._scheduler._store.get_job_id(job_id)
         if job is None or not _owner_visible(job, owner, control=control):
             return None
-        return self._public_job(job)
+        return self._public_job(job, control=control)
 
     async def enable(
         self,
@@ -789,7 +1026,7 @@ class ScheduleAPI:
         job = await self._scheduler._store.get_job_id(job_id)
         if job is None or not _owner_visible(job, owner, control=control):
             return False
-        if not _authority_covers(job, owner, control):
+        if not _authority_covers(job, owner, control, operation="delete"):
             raise PermissionError("caller authority cannot delete this schedule")
         return await self._scheduler._store.delete_job(job_id)
 
@@ -804,16 +1041,18 @@ class ScheduleAPI:
         job = await self._scheduler._store.get_job_id(job_id)
         if job is None or not _owner_visible(job, owner, control=control):
             return False
-        if not _authority_covers(job, owner, control):
+        if not _authority_covers(job, owner, control, operation="enable" if enabled else "disable"):
             raise PermissionError("caller authority cannot change this schedule")
         return await self._scheduler._store.set_enabled(job_id, enabled)
 
     @staticmethod
-    def _public_job(job: Mapping[str, Any]) -> dict[str, Any]:
+    def _public_job(
+        job: Mapping[str, Any], *, control: ScheduleControl | None = None
+    ) -> dict[str, Any]:
         trigger = _trigger_from_metadata(job)
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
         template = payload.get("template") if isinstance(payload, dict) else {}
-        return {
+        public = {
             "id": job["id"],
             "name": job["name"],
             "enabled": bool(job.get("enabled", True)),
@@ -823,6 +1062,36 @@ class ScheduleAPI:
             "template": dict(template or {}),
             "metadata": dict(job.get("metadata") or {}),
         }
+        if control is None or control.origin != "model":
+            return public
+        authority = public["metadata"].get("_authority_snapshot") or {}
+        template_public = dict(public["template"])
+        delivery = template_public.get("delivery")
+        if not isinstance(delivery, Mapping):
+            delivery = authority.get("delivery")
+        if isinstance(delivery, Mapping):
+            destination = str(delivery.get("destination") or "")
+            parsed = urlsplit(destination)
+            template_public["delivery"] = {
+                "channel": delivery.get("channel"),
+                "destination_hostname": parsed.hostname,
+                "destination_hash": authority.get("delivery", {}).get("destination_hash")
+                if isinstance(authority.get("delivery"), Mapping)
+                else None,
+            }
+        public["template"] = {
+            key: template_public.get(key)
+            for key in ("objective", "continuity", "delivery")
+            if key in template_public
+        }
+        public["metadata"] = {
+            "schedule_id": public["id"],
+            "owner_project": (authority.get("principal") or {}).get("project_id"),
+            "control_grant_available": bool(
+                (public["metadata"].get("_control_grant") or {}).get("token")
+            ),
+        }
+        return public
 
     def _parse_trigger(self, trigger: dict) -> TriggerSpec:
         """Parse a trigger dict into a TriggerSpec."""
@@ -1106,9 +1375,7 @@ class ScheduleCapability:
                     metadata={"operation": "list"},
                 )
             elif op == "inspect":
-                job = await self._api.inspect(
-                    args.get("job_id", ""), owner=owner, control=control
-                )
+                job = await self._api.inspect(args.get("job_id", ""), owner=owner, control=control)
                 if job is None:
                     return CapabilityResult(
                         call_id,
@@ -1124,9 +1391,7 @@ class ScheduleCapability:
                     metadata={"operation": "inspect"},
                 )
             elif op == "enable":
-                ok = await self._api.enable(
-                    args.get("job_id", ""), owner=owner, control=control
-                )
+                ok = await self._api.enable(args.get("job_id", ""), owner=owner, control=control)
                 if not ok:
                     return CapabilityResult(
                         call_id,
@@ -1142,9 +1407,7 @@ class ScheduleCapability:
                     metadata={"operation": "enable"},
                 )
             elif op == "disable":
-                ok = await self._api.disable(
-                    args.get("job_id", ""), owner=owner, control=control
-                )
+                ok = await self._api.disable(args.get("job_id", ""), owner=owner, control=control)
                 if not ok:
                     return CapabilityResult(
                         call_id,
@@ -1160,9 +1423,7 @@ class ScheduleCapability:
                     metadata={"operation": "disable"},
                 )
             elif op == "delete":
-                ok = await self._api.delete(
-                    args.get("job_id", ""), owner=owner, control=control
-                )
+                ok = await self._api.delete(args.get("job_id", ""), owner=owner, control=control)
                 if not ok:
                     return CapabilityResult(
                         call_id,
@@ -1208,9 +1469,7 @@ class ScheduleCapability:
                     metadata={"operation": "update"},
                 )
             elif op == "run":
-                task_id = await self._api.run(
-                    args.get("job_id", ""), owner=owner, control=control
-                )
+                task_id = await self._api.run(args.get("job_id", ""), owner=owner, control=control)
                 if task_id is None:
                     return CapabilityResult(
                         call_id,

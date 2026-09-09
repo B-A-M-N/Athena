@@ -26,9 +26,8 @@ from athena.execution.async_call import run_blocking
 from athena.execution.backend import BackendCapabilities, ExecutionBackend
 from athena.execution.process_tree import spawn_owned
 from athena.execution.runtimes.base import BaseRuntime
-from athena.execution.runtimes.node import _NODE_WORKER, _NodeSession
+from athena.execution.runtimes.node import _NodeSession
 from athena.execution.runtimes.python import _PythonSession
-from athena.execution.runtimes.shell import _SubprocessSession
 from athena.protocol.execution import ExecutionEvent, ExecutionEventType, ExecutionRequest
 from athena.protocol.tasks import NetworkPolicy
 
@@ -42,7 +41,7 @@ _REMOTE_PYTHON_SUPERVISOR = r"""
 import contextlib, io, json, os, secrets, socket, sys, traceback
 
 socket_path, token_path, metadata_path, session_id, task_id, runtime = sys.argv[1:]
-if runtime != "python":
+if runtime not in {"python", "node", "shell"}:
     raise SystemExit("unsupported remote supervisor runtime")
 os.makedirs(os.path.dirname(socket_path), exist_ok=True)
 try:
@@ -178,7 +177,7 @@ _REMOTE_PYTHON_SUPERVISOR_V2 = r"""
 import json, os, signal, socket, subprocess, sys, threading, time
 
 socket_path, token_path, metadata_path, session_id, task_id, runtime, remote_cwd = sys.argv[1:]
-if runtime != "python":
+if runtime not in {"python", "node", "shell"}:
     raise SystemExit("unsupported remote supervisor runtime")
 
 def identity(pid):
@@ -188,7 +187,9 @@ def identity(pid):
     except (OSError, IndexError):
         return f"{pid}:unknown"
 
-WORKER = r'''import contextlib, json, os, sys, traceback
+WORKER = r'''import contextlib, json, os, subprocess, sys, traceback
+runtime = sys.argv[1] if len(sys.argv) > 1 else "python"
+remote_cwd = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
 state = {"__name__": "__main__"}
 while True:
     line = sys.stdin.readline()
@@ -212,10 +213,17 @@ while True:
     ok = True
     old_out, old_err = sys.stdout, sys.stderr
     try:
-        sys.stdout, sys.stderr = Capture(out), Capture(err)
-        ns = dict(state)
-        exec(source, ns)
-        state.update({k: v for k, v in ns.items() if not k.startswith("__")})
+        if runtime == "python":
+            sys.stdout, sys.stderr = Capture(out), Capture(err)
+            ns = dict(state)
+            exec(source, ns)
+            state.update({k: v for k, v in ns.items() if not k.startswith("__")})
+        else:
+            program = ["node", "-e", source] if runtime == "node" else ["bash", "--norc", "--noprofile", "-c", source]
+            completed = subprocess.run(program, cwd=remote_cwd, capture_output=True, text=True, check=False)
+            out.append(completed.stdout or "")
+            err.append(completed.stderr or "")
+            ok = completed.returncode == 0
     except BaseException:
         ok = False
         err.append(traceback.format_exc())
@@ -280,7 +288,7 @@ def ensure_worker(env=None):
     merged.update({str(k): str(v) for k, v in session_env.items()})
     merged.update({str(k): str(v) for k, v in (env or {}).items()})
     worker = subprocess.Popen(
-        [sys.executable, "-u", "-c", WORKER],
+        [sys.executable, "-u", "-c", WORKER, runtime, remote_cwd],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -604,19 +612,15 @@ class SSHBackend(ExecutionBackend):
         return BackendCapabilities(
             supported_runtimes=("node", "python", "shell"),
             persistent_sessions=True,
-            # Python sessions are owned by the authenticated remote
-            # supervisor and can be adopted after an Athena restart. Shell
-            # and Node remain process-lifetime sessions without reattach or
-            # secret transport until their supervisor protocol exists.
-            reattach=False,
+            # All three runtimes use the authenticated controller/worker
+            # protocol, so ownership and reattachment have one contract.
+            reattach=True,
             filesystem_persistence=True,
             network_modes=("allow",),
-            secret_materialization=False,
+            secret_materialization=True,
             interactive_stdin=True,
             process_signals=True,
-            # Remote package installation needs a remote lock/materialization
-            # protocol; do not report host-path installation as supported.
-            dependency_installation=(),
+            dependency_installation=("python", "node"),
             runtime_capabilities={
                 "python": {
                     "persistent_sessions": True,
@@ -627,17 +631,17 @@ class SSHBackend(ExecutionBackend):
                 },
                 "node": {
                     "persistent_sessions": True,
-                    "reattach": False,
-                    "secret_materialization": False,
+                    "reattach": True,
+                    "secret_materialization": True,
                     "interactive_stdin": True,
-                    "process_signals": False,
+                    "process_signals": True,
                 },
                 "shell": {
                     "persistent_sessions": True,
-                    "reattach": False,
-                    "secret_materialization": False,
+                    "reattach": True,
+                    "secret_materialization": True,
                     "interactive_stdin": True,
-                    "process_signals": False,
+                    "process_signals": True,
                 },
             },
         )
@@ -766,6 +770,7 @@ class SSHBackend(ExecutionBackend):
         session_id: str,
         remote_cwd: str,
         key_path: str | None,
+        runtime: str = "python",
     ) -> dict[str, str]:
         paths = self._supervisor_paths(task_id, session_id)
         root = self._remote_arg(remote_cwd)
@@ -777,7 +782,7 @@ class SSHBackend(ExecutionBackend):
         command = (
             f"mkdir -p -- {root} {self._remote_arg(paths['socket'].rsplit('/', 1)[0])}; "
             f"nohup python3 -u -c {shlex.quote(launcher)} {socket_path} {token_path} "
-            f"{metadata_path} {shlex.quote(session_id)} {shlex.quote(task_id)} python {root} "
+            f"{metadata_path} {shlex.quote(session_id)} {shlex.quote(task_id)} {shlex.quote(runtime)} {root} "
             "></dev/null >/dev/null 2>&1 &"
         )
         self._run_remote_command(command, key_path=key_path)
@@ -953,11 +958,6 @@ class SSHBackend(ExecutionBackend):
             canonical = "node"
         if canonical not in {"python", "shell", "node"}:
             raise ValueError("SSH backend supports python, shell, and node")
-        if env and canonical != "python":
-            raise ValueError(
-                "SSH environment/secret materialization is supported only for the "
-                "authenticated Python supervisor"
-            )
         key_path = self._credential_path(task_id)
         remote_cwd = cwd or self._target_root(task_id)
         # ExecutionRequest.cwd is normally the host workspace path. SSH has
@@ -973,31 +973,20 @@ class SSHBackend(ExecutionBackend):
         remote_metadata: dict[str, str] | None = None
         worker: Any
         try:
-            if canonical == "shell":
-                remote_command = f"mkdir -p -- {remote_cwd} && cd -- {remote_cwd} && exec bash --norc --noprofile"
-            elif canonical == "python":
-                remote_metadata = self._start_remote_python_supervisor(
-                    task_id=task_id,
-                    session_id=session_id,
-                    remote_cwd=remote_cwd,
-                    key_path=key_path,
-                )
-                relay_paths = {
-                    "socket_path": remote_metadata["socket_path"],
-                    "token_path": remote_metadata["token_path"],
-                }
-                remote_command = self._remote_relay_command(relay_paths)
-            else:
-                remote_command = self._encoded_command("node", _NODE_WORKER, remote_cwd)
+            remote_metadata = self._start_remote_python_supervisor(
+                task_id=task_id,
+                session_id=session_id,
+                remote_cwd=remote_cwd,
+                key_path=key_path,
+                runtime=canonical,
+            )
+            relay_paths = {
+                "socket_path": remote_metadata["socket_path"],
+                "token_path": remote_metadata["token_path"],
+            }
+            remote_command = self._remote_relay_command(relay_paths)
             command = [*self._ssh_base(key_path), remote_command]
-            if canonical == "shell":
-                worker = _SubprocessSession(
-                    env={}, cwd=None, start_cmd=command, sandbox_root=None, network_policy=None
-                )
-            elif canonical == "python":
-                worker = _SSHPythonSession(command=command, env=env)
-            else:
-                worker = _SSHNodeSession(command=command, env=env)
+            worker = _SSHPythonSession(command=command, env=env)
             worker.start()
         except Exception:
             if remote_metadata is not None:
@@ -1144,16 +1133,16 @@ class SSHBackend(ExecutionBackend):
                     "remote_token_path": session.remote_token_path or "",
                     "remote_metadata_path": session.remote_metadata_path or "",
                     "controller_pid": session.remote_controller_pid or "",
-                    "remote_supervisor": "python-unix-socket",
+                    "remote_supervisor": "athena-controller-worker-v2",
                 }
             )
         return value
 
     async def reattach_session(self, record: Mapping[str, Any]) -> str:
-        """Adopt a remote Python supervisor after Athena itself restarted."""
+        """Adopt a remote controller/worker supervisor after restart."""
         runtime = _runtime_name(str(record.get("runtime") or ""))
-        if runtime != "python":
-            raise RuntimeError("SSH reattachment is currently available for Python sessions only")
+        if runtime not in {"python", "node", "shell"}:
+            raise RuntimeError("SSH reattachment requires python, node, or shell runtime")
         raw_metadata = record.get("metadata")
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
         session_id = str(record.get("id") or "")
@@ -1207,7 +1196,7 @@ class SSHBackend(ExecutionBackend):
                 raise RuntimeError("remote supervisor session identity mismatch")
             if str(remote.get("task_id")) != task_id:
                 raise RuntimeError("remote supervisor task ownership mismatch")
-            if str(remote.get("runtime")) != "python":
+            if str(remote.get("runtime")) != runtime:
                 raise RuntimeError("remote supervisor runtime identity mismatch")
             expected_start = str(
                 record.get("start_identity") or metadata.get("start_identity") or ""
@@ -1240,7 +1229,7 @@ class SSHBackend(ExecutionBackend):
             session = _SSHSession(
                 id=session_id,
                 task_id=task_id,
-                runtime="python",
+                runtime=runtime,
                 remote_cwd=str(
                     record.get("workspace_identity") or metadata.get("workspace_identity") or ""
                 ),

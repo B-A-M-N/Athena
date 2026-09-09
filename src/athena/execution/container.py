@@ -391,7 +391,7 @@ class ContainerBackend(ExecutionBackend):
         # Dependency acquisition has a narrow, operator-defined writable
         # enclave. The source workspace remains read-only, while Python/npm
         # installs can persist their reproducibility records across sessions.
-        for relative in (".athena/dependencies", ".athena/node"):
+        for relative in (".athena/dependencies", ".athena/node", ".athena/environments"):
             writable = Path(root, relative)
             writable.mkdir(parents=True, exist_ok=True)
             command.extend(

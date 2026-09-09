@@ -116,8 +116,9 @@ The effective surface may contain:
 | Scratch program | Cheap task-local computation that is not automatically retained. |
 
 The registry is an ergonomic and governed inventory. It is not the boundary
-of Athena's agency: universal execution remains the escape hatch for building
-new deterministic machinery, subject to the same authority wall. It is not a
+of Athena's agency: governed multi-runtime/programmable execution remains the
+escape hatch for building new deterministic machinery, subject to the same
+authority wall. It is not a
 promise that every generated or remote runtime has identical host isolation.
 
 ### Reflection

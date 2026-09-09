@@ -85,7 +85,9 @@ _NETWORK_TOKENS = (
 )
 
 _MAX_MCP_SCHEMA_BYTES = 256 * 1024
-_MAX_MCP_SCHEMA_DEPTH = 24
+# Keep the MCP boundary aligned with the canonical registry validator. Local
+# recursive $refs are valid; only the concrete schema tree is depth-bounded.
+_MAX_MCP_SCHEMA_DEPTH = 32
 
 
 def sanitize_server_name(name: str) -> str:

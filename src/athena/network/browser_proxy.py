@@ -1,0 +1,137 @@
+"""Small Athena-owned browser proxy with per-request DNS pinning.
+
+Playwright's URL interception does not control the socket resolver.  This
+proxy validates every CONNECT/HTTP request, connects to the checked address,
+and tunnels TLS/WebSocket traffic without giving Chromium a second resolver.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from urllib.parse import urlsplit
+
+from athena.network.target_policy import validate_target
+
+
+class DNSPinnedBrowserProxy:
+    def __init__(self) -> None:
+        self._server: asyncio.AbstractServer | None = None
+        self._policy = "allow"
+
+    @property
+    def server_url(self) -> str:
+        if self._server is None or not self._server.sockets:
+            raise RuntimeError("browser proxy is not started")
+        port = self._server.sockets[0].getsockname()[1]
+        return f"http://127.0.0.1:{port}"
+
+    async def start(self) -> str:
+        if self._server is None:
+            self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        return self.server_url
+
+    async def set_policy(self, policy: str | object | None) -> None:
+        self._policy = str(getattr(policy, "value", policy) or "allow").casefold()
+
+    async def close(self) -> None:
+        if self._server is None:
+            return
+        self._server.close()
+        await self._server.wait_closed()
+        self._server = None
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            header_bytes = await reader.readuntil(b"\r\n\r\n")
+            if len(header_bytes) > 64 * 1024:
+                raise ValueError("browser proxy request headers are too large")
+            lines = header_bytes[:-4].decode("latin-1").split("\r\n")
+            method, target, version = lines[0].split(" ", 2)
+            headers = [line for line in lines[1:] if line and not line.lower().startswith("proxy-")]
+            if method.upper() == "CONNECT":
+                host, port = _split_host_port(target, default=443)
+                validated, error = validate_target(
+                    f"https://{_format_host(host)}:{port}", self._policy
+                )
+                if error or validated is None:
+                    raise PermissionError(error or "browser proxy target rejected")
+                upstream = await asyncio.open_connection(
+                    validated.addresses[0] if validated.addresses else host, port
+                )
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await writer.drain()
+                await _tunnel(reader, writer, *upstream)
+                return
+            parsed = urlsplit(target)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("browser proxy requires an absolute HTTP URL")
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            validated, error = validate_target(target, self._policy)
+            if error or validated is None:
+                raise PermissionError(error or "browser proxy target rejected")
+            upstream_reader, upstream_writer = await asyncio.open_connection(
+                validated.addresses[0] if validated.addresses else parsed.hostname, port
+            )
+            request_target = parsed.path or "/"
+            if parsed.query:
+                request_target += "?" + parsed.query
+            outgoing = f"{method} {request_target} {version}\r\n"
+            outgoing += "\r\n".join(headers) + "\r\n\r\n"
+            upstream_writer.write(outgoing.encode("latin-1"))
+            await upstream_writer.drain()
+            await _tunnel(reader, writer, upstream_reader, upstream_writer)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError, PermissionError, ValueError):
+            try:
+                writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+
+async def _tunnel(
+    client_reader: asyncio.StreamReader,
+    client_writer: asyncio.StreamWriter,
+    upstream_reader: asyncio.StreamReader,
+    upstream_writer: asyncio.StreamWriter,
+) -> None:
+    async def copy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while chunk := await reader.read(64 * 1024):
+                writer.write(chunk)
+                await writer.drain()
+        finally:
+            try:
+                writer.write_eof()
+            except (AttributeError, OSError, RuntimeError):
+                pass
+
+    await asyncio.gather(
+        copy(client_reader, upstream_writer),
+        copy(upstream_reader, client_writer),
+    )
+    upstream_writer.close()
+    await upstream_writer.wait_closed()
+
+
+def _split_host_port(value: str, *, default: int) -> tuple[str, int]:
+    raw = str(value).strip()
+    if raw.startswith("["):
+        host, _, port = raw[1:].partition("]")
+        return host, int(port[1:]) if port.startswith(":") else default
+    if raw.count(":") == 1:
+        host, port = raw.rsplit(":", 1)
+        return host, int(port)
+    return raw, default
+
+
+def _format_host(host: str) -> str:
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+__all__ = ["DNSPinnedBrowserProxy"]

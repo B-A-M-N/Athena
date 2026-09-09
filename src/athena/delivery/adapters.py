@@ -24,10 +24,12 @@ import inspect
 import json
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
+from urllib.parse import urlsplit
 
 from athena.protocol.capabilities import ExternalEffectPhase
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import DeliverySpec, NetworkPolicy, TaskResult
+from athena.network import validate_target
 from athena.state.external_effects import (
     CONFLICT,
     NEW,
@@ -50,6 +52,7 @@ class DeliveryOutcome:
     status: str  # DELIVERED | FAILED | RETRYABLE
     receipt: dict[str, Any] | None = None
     error: str | None = None
+    retry_after: float | None = None
 
     @property
     def retryable(self) -> bool:
@@ -175,6 +178,15 @@ class WebhookAdapter:
         request_digest = _delivery_digest(spec, result)
         idempotency_key = f"delivery:{result.task_id}:{request_digest[:24]}"
 
+        validation_error = _validate_webhook_request(destination, network_policy)
+        if validation_error:
+            return DeliveryOutcome(
+                ok=False,
+                status=FAILED,
+                error=f"rejected_before_apply: {validation_error}",
+                receipt={"delivery_status": "rejected_before_apply"},
+            )
+
         external_identity = _destination_identifier(destination)
         transaction_id = new_id("delivery-tx")
         try:
@@ -250,6 +262,17 @@ class WebhookAdapter:
             },
             default=str,
         )
+        # Re-check policy immediately before the durable apply fence. This
+        # closes the validation/authority TOCTOU window without ever starting
+        # an external apply for a request rejected by current policy.
+        validation_error = _validate_webhook_request(destination, network_policy)
+        if validation_error:
+            return DeliveryOutcome(
+                ok=False,
+                status=FAILED,
+                error=f"rejected_before_apply: {validation_error}",
+                receipt={"delivery_status": "rejected_before_apply"},
+            )
         try:
             response = runner(
                 url=destination,
@@ -303,6 +326,21 @@ class WebhookAdapter:
                 response={"http_status": status_code},
             )
             return DeliveryOutcome(ok=True, status=DELIVERED, receipt=receipt)
+        if 408 == status_code or status_code == 429:
+            retry_after = _retry_after_seconds(response.get("headers"))
+            receipt = await self._external_store.finish(
+                transaction_id,
+                status=SAFE_TO_RETRY,
+                response={"http_status": status_code, "retry_after": retry_after},
+                error=f"delivery endpoint returned {status_code}",
+            )
+            return DeliveryOutcome(
+                ok=False,
+                status=RETRYABLE,
+                error=f"endpoint returned {status_code}",
+                receipt=receipt,
+                retry_after=retry_after,
+            )
         if 400 <= status_code < 500:
             # The receiver rejected these bytes definitively; retrying the
             # same request cannot help.
@@ -327,6 +365,30 @@ class WebhookAdapter:
             error=f"endpoint returned {status_code}; remote outcome requires verification",
             receipt=receipt,
         )
+
+
+def _validate_webhook_request(
+    destination: str, network_policy: NetworkPolicy | str | None
+) -> str | None:
+    parsed = urlsplit(destination)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "webhook destination must be an http(s) URL"
+    if parsed.username or parsed.password or parsed.fragment:
+        return "webhook destination may not contain credentials or fragments"
+    _target, error = validate_target(destination, getattr(network_policy, "value", network_policy))
+    return error
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    if not isinstance(headers, Mapping):
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, min(300.0, float(raw)))
+    except (TypeError, ValueError):
+        return None
 
 
 __all__ = [

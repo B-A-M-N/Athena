@@ -347,6 +347,12 @@ def _criteria_from_records(value: Any) -> tuple[Criterion, ...]:
                 description=str(item.get("description") or ""),
                 verification=verification,
                 required=bool(item.get("required", True)),
+                evidence_required=bool(item.get("evidence_required", False)),
+                evidence_requirement_id=(
+                    str(item["evidence_requirement_id"])
+                    if item.get("evidence_requirement_id") is not None
+                    else None
+                ),
             )
         )
     return tuple(criteria)

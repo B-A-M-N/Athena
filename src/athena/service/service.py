@@ -2076,6 +2076,8 @@ class AthenaService:
 
     @staticmethod
     def _validate_request_metadata(metadata: Mapping[str, Any] | None) -> None:
+        if getattr(metadata, "_athena_trusted", False):
+            return
         for key in metadata or {}:
             name = str(key)
             if name.startswith("_") or name in _RESERVED_REQUEST_METADATA:
@@ -2831,6 +2833,7 @@ class AthenaService:
                     driver_factory=browser_factory,
                     session_scope=self.config.browser_session_scope,
                     artifact_store=self._artifacts,
+                    auth_profiles=self.config.browser_auth_profiles,
                 )
                 self._browser_health = self._browser.health()
                 self._optional_capability_health["browser"] = {
@@ -3383,6 +3386,9 @@ class AthenaService:
             self._mcp_prompts.remove_client(name)
         if self._mcp_supervisor is not None:
             self._mcp_supervisor.mark_failed(name)
+        # Required MCP profiles become admission-blocking immediately after a
+        # transport loss; the next task cannot race stale registered tools.
+        self._live_capability_profile_status(self.mcp_status())
 
     async def _connect_mcp_server(self, server: MCPConfig) -> dict[str, Any]:
         transport = "http" if server.url else "stdio"

@@ -13,7 +13,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
@@ -23,8 +23,14 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     EffectClass,
 )
-from athena.execution.dependencies import environment_fingerprint, record_hashes, verify_record_files
-from athena.execution.dependencies import resolve_dependency_environment
+from athena.execution.dependencies import (
+    dependency_environment_id,
+    dependency_environment_target,
+    environment_fingerprint,
+    record_hashes,
+    resolve_dependency_environment,
+    verify_record_files,
+)
 from athena.affordances.models import DependencyRequirement
 from athena.protocol.execution import ExecutionRequest
 from athena.protocol.messages import utcnow
@@ -42,7 +48,7 @@ class DependencyManager(Protocol):
 
     def package_spec(self, name: str, version: str) -> str: ...
 
-    def target(self, root: str) -> str: ...
+    def target(self, root: str, environment_id: str | None = None) -> str: ...
 
 
 class PythonDependencyManager:
@@ -55,8 +61,8 @@ class PythonDependencyManager:
         return f"{name}=={version}"
 
     @staticmethod
-    def target(root: str) -> str:
-        return str(Path(root) / ".athena" / "dependencies")
+    def target(root: str, environment_id: str | None = None) -> str:
+        return str(dependency_environment_target(root, environment_id, "python"))
 
 
 class NodeDependencyManager:
@@ -71,8 +77,8 @@ class NodeDependencyManager:
         return f"{name}@{version}" if version else name
 
     @staticmethod
-    def target(root: str) -> str:
-        return str(Path(root) / ".athena" / "node")
+    def target(root: str, environment_id: str | None = None) -> str:
+        return str(dependency_environment_target(root, environment_id, "node"))
 
 
 class DependencyCapability:
@@ -203,16 +209,14 @@ class DependencyCapability:
                 ),
             )
         root = context.workspace.root
-        target = dependency_manager.target(root)
+        version = str(args.get("version") or "")
+        lock = _read_lock(context)
+        environment_id = _requested_environment_id(lock, manager, name, version)
+        target = dependency_manager.target(root, environment_id)
         Path(target).mkdir(parents=True, exist_ok=True)
         command_target = target
         if backend == "container":
-            command_target = (
-                "/workspace/.athena/dependencies"
-                if manager == "python"
-                else "/workspace/.athena/node"
-            )
-        version = str(args.get("version") or "")
+            command_target = _container_target(root, target)
         package = dependency_manager.package_spec(name, version) if version else name
         # This command is deliberately assembled from validated fields.  It
         # still goes through ExecutionManager, whose sandbox/network profile
@@ -262,6 +266,7 @@ class DependencyCapability:
                         call_id=request.call_id,
                     )
                 )
+                lock_record["environment_id"] = environment_id
                 _write_lock(context, lock_record)
             except (OSError, TypeError, ValueError) as exc:
                 # The package may have been installed, but a successful
@@ -292,14 +297,20 @@ class DependencyCapability:
         if backend not in _HOST_INTERPRETER_BACKENDS:
             return None
         if manager == "node":
-            target = NodeDependencyManager.target(context.workspace.root)
+            target = NodeDependencyManager.target(
+                context.workspace.root,
+                _record_environment_id(record),
+            )
             source = (
                 "try { require.resolve(" + repr(name) + ", {paths: [" + repr(target) + "]}); "
                 "console.log('1'); } catch (_) { console.log('0'); }"
             )
             runtime = "node"
         else:
-            target = PythonDependencyManager.target(context.workspace.root)
+            target = PythonDependencyManager.target(
+                context.workspace.root,
+                _record_environment_id(record),
+            )
             source = (
                 "import importlib.util; "
                 f"print('1' if importlib.util.find_spec({name.replace('-', '_')!r}) else '0')"
@@ -373,22 +384,16 @@ class DependencyCapability:
                 error="lock entry lacks a resolved version or content hashes; replay refused",
             )
         root = str(context.workspace.root)
-        target = manager.target(root)
+        target = manager.target(root, _record_environment_id(record))
         Path(target).mkdir(parents=True, exist_ok=True)
         command_target = target
         if backend == "container":
-            command_target = (
-                "/workspace/.athena/dependencies"
-                if manager.name == "python"
-                else "/workspace/.athena/node"
-            )
+            command_target = _container_target(root, target)
         if manager.name == "python":
             executable = sys.executable if backend in _HOST_INTERPRETER_BACKENDS else "python3"
             locked_closure = record.get("closure")
             replay_packages = (
-                locked_closure
-                if isinstance(locked_closure, list) and locked_closure
-                else [record]
+                locked_closure if isinstance(locked_closure, list) and locked_closure else [record]
             )
             package_specs = " ".join(
                 shlex.quote(manager.package_spec(package_name, package_version))
@@ -407,10 +412,7 @@ class DependencyCapability:
                 f"{package_specs}"
             )
         else:
-            source = (
-                f"npm install --ignore-scripts --no-audit --no-fund --prefix {shlex.quote(command_target)} "
-                f"{shlex.quote(manager.package_spec(name, version))}"
-            )
+            source = f"npm ci --ignore-scripts --no-audit --no-fund --prefix {shlex.quote(command_target)}"
         result = await self._execution.execute(
             ExecutionRequest(
                 runtime="shell",
@@ -443,7 +445,10 @@ class DependencyCapability:
                 if expected_hashes and sorted(node_verified["record_hashes"]) != expected_hashes:
                     raise ValueError("npm package metadata hash mismatch")
                 expected_lock_hash = str(record.get("package_lock_sha256") or "")
-                if expected_lock_hash and node_verified.get("package_lock_sha256") != expected_lock_hash:
+                if (
+                    expected_lock_hash
+                    and node_verified.get("package_lock_sha256") != expected_lock_hash
+                ):
                     raise ValueError("npm package-lock.json hash mismatch")
             except (OSError, TypeError, ValueError) as exc:
                 return _result(
@@ -526,6 +531,44 @@ def _lock_record(lock: dict, name: str) -> dict[str, Any] | None:
         if str(key).replace("-", "_").casefold() == wanted and isinstance(value, dict):
             return value
     return None
+
+
+def _record_environment_id(record: Mapping[str, Any] | None) -> str | None:
+    value = str((record or {}).get("environment_id") or "")
+    return value or None
+
+
+def _requested_environment_id(
+    lock: Mapping[str, Any], manager: str, name: str, version: str
+) -> str:
+    """Address an acquisition before it mutates the lock.
+
+    The request is part of the address so the first install has a stable,
+    isolated destination; the resulting id is persisted in the lock record
+    and is used for every later replay.
+    """
+    existing = str(lock.get("environment_id") or "")
+    if existing and isinstance(lock.get("packages"), Mapping):
+        return existing
+    return dependency_environment_id(
+        {
+            "format": int(lock.get("format") or 1),
+            "manager": manager,
+            "name": name,
+            "version": version,
+            "packages": lock.get("packages") or {},
+        }
+    )
+
+
+def _container_target(root: str, target: str) -> str:
+    root_path = Path(root).resolve()
+    target_path = Path(target).resolve()
+    try:
+        relative = target_path.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError("dependency target escaped workspace") from exc
+    return "/workspace/" + relative.as_posix()
 
 
 def _record_installed_package(
@@ -702,6 +745,8 @@ def _write_lock(context, record: dict) -> None:
     lock = _read_lock(context)
     lock.setdefault("format", 1)
     lock.setdefault("packages", {})[str(record["name"])] = record
+    if record.get("environment_id"):
+        lock["environment_id"] = str(record["environment_id"])
     fd, tmp_name = tempfile.mkstemp(prefix="dependencies.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

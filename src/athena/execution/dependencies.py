@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import json
 import base64
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,12 +59,6 @@ def resolve_dependency_environment(
     turn its dependency declaration into an arbitrary host import path.
     """
     root = Path(workspace_root).resolve()
-    target = (root / ".athena" / "dependencies").resolve()
-    if root not in target.parents:
-        raise DependencyEnvironmentError("dependency target escaped workspace")
-    if not target.is_dir():
-        raise DependencyEnvironmentError(f"dependency environment is missing: {target}")
-
     lock_path = root / ".athena" / "dependencies.lock.json"
     try:
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -74,6 +69,15 @@ def resolve_dependency_environment(
     packages = lock.get("packages") if isinstance(lock, dict) else None
     if not isinstance(packages, dict):
         raise DependencyEnvironmentError("dependency lock has no package map")
+    environment_id = str(lock.get("environment_id") or "")
+    if not environment_id:
+        for value in packages.values():
+            if isinstance(value, Mapping) and value.get("environment_id"):
+                environment_id = str(value["environment_id"])
+                break
+    target = dependency_environment_target(root, environment_id or None, "python")
+    if not target.is_dir():
+        raise DependencyEnvironmentError(f"dependency environment is missing: {target}")
 
     verified: list[Mapping[str, Any]] = []
     verified_names: set[str] = set()
@@ -98,7 +102,9 @@ def resolve_dependency_environment(
         locked_packages = closure if isinstance(closure, list) else [record]
         for locked in locked_packages:
             if not isinstance(locked, Mapping):
-                raise DependencyEnvironmentError("dependency lock contains an invalid closure entry")
+                raise DependencyEnvironmentError(
+                    "dependency lock contains an invalid closure entry"
+                )
             package_name = str(locked.get("name") or "")
             normalized_name = _normalize(package_name)
             if not package_name or normalized_name in verified_names:
@@ -140,7 +146,9 @@ def resolve_dependency_environment(
                 {
                     "name": str(item.get("name") or ""),
                     "resolved_version": str(item.get("resolved_version") or ""),
-                    "record_hashes": sorted(str(value) for value in item.get("record_hashes") or ()),
+                    "record_hashes": sorted(
+                        str(value) for value in item.get("record_hashes") or ()
+                    ),
                 }
                 for item in locked_packages
                 if isinstance(item, Mapping)
@@ -249,9 +257,40 @@ def _normalize(value: str) -> str:
     return value.replace("-", "_").casefold()
 
 
+def dependency_environment_id(lock: Mapping[str, Any]) -> str:
+    """Return the stable content address for a dependency lock snapshot."""
+    payload = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def dependency_environment_target(
+    workspace_root: str | Path,
+    environment_id: str | None,
+    manager: str,
+) -> Path:
+    """Resolve an isolated environment path from its lock content address.
+
+    Legacy locks without an environment id remain readable for migration, but
+    every new install/replay path is addressed under ``.athena/environments``.
+    """
+    root = Path(workspace_root).resolve()
+    if environment_id:
+        if not re.fullmatch(r"[0-9a-f]{64}", str(environment_id)):
+            raise DependencyEnvironmentError("dependency environment id is not a SHA-256 digest")
+        target = root / ".athena" / "environments" / str(environment_id) / str(manager)
+    else:
+        target = root / ".athena" / "dependencies"
+    target = target.resolve()
+    if root not in target.parents:
+        raise DependencyEnvironmentError("dependency target escaped workspace")
+    return target
+
+
 __all__ = [
     "DependencyEnvironment",
     "DependencyEnvironmentError",
+    "dependency_environment_id",
+    "dependency_environment_target",
     "environment_fingerprint",
     "record_hashes",
     "resolve_dependency_environment",

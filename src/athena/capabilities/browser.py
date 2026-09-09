@@ -42,6 +42,7 @@ from athena.protocol.capabilities import (
     ResourceClass,
 )
 from athena.network.target_policy import validate_target
+from athena.network.browser_proxy import DNSPinnedBrowserProxy
 from athena.protocol.resources import TaskResourceCloseResult
 
 _playwright: Any = None
@@ -114,6 +115,8 @@ class BrowserDriver(Protocol):
 
     async def download(self, selector: str) -> dict[str, Any]: ...
 
+    async def upload(self, selector: str, path: str) -> dict[str, Any]: ...
+
     async def close(self) -> None: ...
 
 
@@ -126,7 +129,7 @@ class PlaywrightBrowserDriver:
     or remote drivers.
     """
 
-    def __init__(self, playwright, browser, context, page) -> None:
+    def __init__(self, playwright, browser, context, page, proxy=None) -> None:
         self._playwright = playwright
         self._browser = browser
         self._context = context
@@ -136,7 +139,10 @@ class PlaywrightBrowserDriver:
         # browser's socket DNS resolution.  Restricted work therefore stays
         # fail-closed unless a driver explicitly advertises an Athena-owned
         # DNS-pinned proxy/broker.
-        self.network_enforcement = "url_validation_only"
+        self._proxy = proxy
+        self.network_enforcement = (
+            "dns_pinned_proxy" if proxy is not None else "url_validation_only"
+        )
         self._console: list[dict[str, Any]] = []
         self._pages: list[Any] = [page]
         page.on(
@@ -259,6 +265,7 @@ class PlaywrightBrowserDriver:
         except ImportError as exc:
             raise RuntimeError("Playwright is not installed") from exc
         playwright = await async_playwright().start()
+        proxy = None
         try:
             browser_type = getattr(playwright, browser_name, None)
             if browser_type is None:
@@ -269,10 +276,13 @@ class PlaywrightBrowserDriver:
                 browser = await browser_type.connect_over_cdp(cdp_endpoint)
                 context = browser.contexts[0] if browser.contexts else await browser.new_context()
             else:
+                proxy = DNSPinnedBrowserProxy()
+                await proxy.start()
                 options: dict[str, Any] = {
                     "headless": headless,
                     "args": list(launch_args),
                     "timeout": max(1, int(timeout_ms)),
+                    "proxy": {"server": proxy.server_url},
                 }
                 if executable_path:
                     options["executable_path"] = executable_path
@@ -288,8 +298,10 @@ class PlaywrightBrowserDriver:
                 )
             page = await context.new_page()
             page.set_default_timeout(max(1, int(timeout_ms)))
-            return cls(playwright, browser, context, page)
+            return cls(playwright, browser, context, page, proxy=proxy)
         except BaseException:
+            if proxy is not None:
+                await proxy.close()
             await playwright.stop()
             raise
 
@@ -304,7 +316,12 @@ class PlaywrightBrowserDriver:
     async def set_network_policy(self, policy: str | object | None) -> None:
         """Validate every Playwright request, including redirects/subresources."""
         requested = str(getattr(policy, "value", policy) or "allow").casefold()
-        if requested == "restricted" and self.network_enforcement != "dns_pinned_proxy":
+        enforcement = getattr(self, "network_enforcement", None)
+        if (
+            requested == "restricted"
+            and enforcement is not None
+            and enforcement != "dns_pinned_proxy"
+        ):
             raise RuntimeError(
                 "restricted browser networking requires an Athena-controlled DNS-pinned proxy"
             )
@@ -312,6 +329,9 @@ class PlaywrightBrowserDriver:
         if rank.get(requested, 2) <= rank.get(self._network_policy, 0):
             return
         self._network_policy = requested
+        proxy = getattr(self, "_proxy", None)
+        if proxy is not None:
+            await proxy.set_policy(requested)
 
         async def _route(route) -> None:
             _target, error = validate_target(route.request.url, self._network_policy)
@@ -461,6 +481,19 @@ class PlaywrightBrowserDriver:
             "url": download.url,
         }
 
+    async def upload(self, selector: str, path: str) -> dict[str, Any]:
+        await self._page.locator(selector).set_input_files(path)
+        return {"selector": selector, "uploaded": True}
+
+    async def set_auth_profile(self, profile_id: str, profile: dict[str, Any]) -> dict[str, Any]:
+        """Apply only an operator-configured profile; the model supplies its id."""
+        cookies = profile.get("cookies")
+        if cookies:
+            if not isinstance(cookies, list) or len(cookies) > 512:
+                raise ValueError("browser auth profile cookies are invalid")
+            await self._context.add_cookies(cookies)
+        return {"profile_id": str(profile_id), "applied": bool(cookies)}
+
     async def close(self) -> None:
         try:
             await self._context.close()
@@ -468,6 +501,9 @@ class PlaywrightBrowserDriver:
             try:
                 await self._browser.close()
             finally:
+                proxy = getattr(self, "_proxy", None)
+                if proxy is not None:
+                    await proxy.close()
                 await self._playwright.stop()
 
 
@@ -540,6 +576,8 @@ _BROWSER_DESCRIPTOR = CapabilityDescriptor(
                     "close_tab",
                     "console",
                     "download",
+                    "upload",
+                    "auth_profile",
                 ]
             },
             "url": {"type": "string", "maxLength": _MAX_URL_CHARS},
@@ -553,6 +591,9 @@ _BROWSER_DESCRIPTOR = CapabilityDescriptor(
                 "minimum": 1,
                 "maximum": _MAX_DOWNLOAD_BYTES,
             },
+            "artifact_uri": {"type": "string", "maxLength": 512},
+            "path": {"type": "string", "maxLength": 2048},
+            "profile_id": {"type": "string", "maxLength": 128},
         },
         "required": ["operation"],
         "additionalProperties": False,
@@ -586,6 +627,8 @@ _BROWSER_DESCRIPTOR = CapabilityDescriptor(
         "close_tab": frozenset({EffectClass.COMPUTER_INPUT}),
         "console": frozenset({EffectClass.NETWORK_READ}),
         "download": frozenset({EffectClass.NETWORK_READ, EffectClass.WRITE_LOCAL}),
+        "upload": frozenset({EffectClass.WRITE_LOCAL, EffectClass.COMPUTER_INPUT}),
+        "auth_profile": frozenset({EffectClass.COMPUTER_INPUT}),
     },
     resources=frozenset({ResourceClass.NETWORK}),
     origin=CapabilityOrigin.NATIVE,
@@ -604,6 +647,7 @@ class BrowserCapability:
         *,
         session_scope: str = "task",
         artifact_store: Any = None,
+        auth_profiles: dict[str, Any] | None = None,
     ) -> None:
         # One driver belongs to one task (or session when no task id exists).
         # Keeping this state here, rather than in a provider/model turn,
@@ -611,6 +655,11 @@ class BrowserCapability:
         # calls while leaving governance on the dispatcher boundary.
         self._driver_factory = driver_factory
         self._artifacts = artifact_store
+        self._auth_profiles = {
+            str(name): dict(profile)
+            for name, profile in (auth_profiles or {}).items()
+            if isinstance(profile, dict)
+        }
         if session_scope not in {"task", "session"}:
             raise ValueError("session_scope must be task or session")
         self._session_scope = session_scope
@@ -725,10 +774,11 @@ class BrowserCapability:
         policy_name = str(getattr(network_policy, "value", network_policy) or "allow").casefold()
         try:
             driver = await self._driver_for(request)
-            if (
-                policy_name == "restricted"
-                and getattr(driver, "network_enforcement", None) != "dns_pinned_proxy"
-            ):
+            driver_enforcement = getattr(driver, "network_enforcement", None)
+            if policy_name == "restricted" and driver_enforcement not in {
+                None,
+                "dns_pinned_proxy",
+            }:
                 return _result(
                     request,
                     ok=False,
@@ -759,6 +809,7 @@ class BrowserCapability:
                 artifact_limit=getattr(
                     getattr(context, "resource_budget", None), "max_artifact_bytes", None
                 ),
+                workspace_root=getattr(getattr(context, "workspace", None), "root", None),
             )
         except Exception as exc:  # noqa: BLE001 - driver failures are results
             self._last_error = f"{type(exc).__name__}: {exc}"
@@ -773,6 +824,7 @@ class BrowserCapability:
         *,
         policy_name: str = "allow",
         artifact_limit: int | None = None,
+        workspace_root: str | None = None,
     ) -> CapabilityResult:
         if operation == "navigate":
             url = str(args.get("url") or "").strip()
@@ -930,6 +982,81 @@ class BrowserCapability:
                     default=str,
                 ),
             )
+
+        if operation == "auth_profile":
+            profile_id = str(args.get("profile_id") or "").strip()
+            if not profile_id:
+                return _result(request, ok=False, error="auth_profile requires profile_id")
+            if profile_id not in self._auth_profiles:
+                return _result(request, ok=False, error="unknown operator browser auth profile")
+            select = getattr(driver, "set_auth_profile", None)
+            if not callable(select):
+                return _result(
+                    request, ok=False, error="browser driver cannot select auth profiles"
+                )
+            outcome = select(profile_id, dict(self._auth_profiles[profile_id]))
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+            return _result(
+                request, output=json.dumps(outcome or {"profile_id": profile_id}, default=str)
+            )
+
+        if operation == "upload":
+            selector = str(args.get("selector") or "")
+            if not selector:
+                return _result(request, ok=False, error="upload requires selector")
+            if not workspace_root:
+                return _result(request, ok=False, error="upload requires an authorized workspace")
+            artifact_uri = str(args.get("artifact_uri") or "").strip()
+            raw_path = str(args.get("path") or "").strip()
+            source_path: Path | None = None
+            temporary = False
+            try:
+                if artifact_uri:
+                    if self._artifacts is None or not artifact_uri.startswith("artifact://"):
+                        return _result(
+                            request, ok=False, error="upload artifact_uri is not available"
+                        )
+                    data = await self._artifacts.load(artifact_uri)
+                    if len(data) > _MAX_DOWNLOAD_BYTES:
+                        return _result(
+                            request, ok=False, error="upload artifact exceeds size limit"
+                        )
+                    staging = Path(workspace_root).resolve() / ".athena" / "browser_uploads"
+                    staging.mkdir(parents=True, exist_ok=True)
+                    source_path = staging / f"{request.call_id}.upload"
+                    source_path.write_bytes(data)
+                    temporary = True
+                elif raw_path:
+                    root = Path(workspace_root).resolve()
+                    candidate = (
+                        Path(raw_path).resolve()
+                        if Path(raw_path).is_absolute()
+                        else (root / raw_path).resolve()
+                    )
+                    if candidate != root and root not in candidate.parents:
+                        return _result(
+                            request, ok=False, error="upload path must stay inside workspace"
+                        )
+                    if not candidate.is_file():
+                        return _result(request, ok=False, error="authorized upload file is missing")
+                    if candidate.stat().st_size > _MAX_DOWNLOAD_BYTES:
+                        return _result(request, ok=False, error="upload file exceeds size limit")
+                    source_path = candidate
+                else:
+                    return _result(
+                        request, ok=False, error="upload requires artifact_uri or workspace path"
+                    )
+                upload = getattr(driver, "upload", None)
+                if not callable(upload):
+                    return _result(request, ok=False, error="browser driver cannot upload files")
+                outcome = upload(selector, str(source_path))
+                if inspect.isawaitable(outcome):
+                    outcome = await outcome
+                return _result(request, output=json.dumps(outcome, default=str))
+            finally:
+                if temporary and source_path is not None:
+                    source_path.unlink(missing_ok=True)
 
         return _result(request, ok=False, error=f"unknown browser operation: {operation!r}")
 
