@@ -448,6 +448,39 @@ Dependency records must include manager, name, version constraint, purpose,
 owner/provenance, and the resulting environment fingerprint. Package managers
 and network access are policy-controlled effects.
 
+The lock container is versioned. New locks use `format: 2` and
+`fingerprint_version: 2`; the latter means the canonical package-closure
+fingerprint includes the recorded runtime identity. Format-1 locks remain
+readable with their original package-only fingerprint semantics. A verifier
+rejects unsupported future container or fingerprint versions rather than
+silently changing hash meaning.
+
+The stable shape is:
+
+```json
+{
+  "format": 2,
+  "fingerprint_version": 2,
+  "manager": "python",
+  "environment_id": "<sha256>",
+  "packages": {
+    "example": {
+      "name": "example",
+      "manager": "python",
+      "requested_version": ">=1",
+      "resolved_version": "1.2.3",
+      "closure": [],
+      "record_hashes": [],
+      "runtime_identity": "<identity>",
+      "environment_fingerprint": "<sha256>"
+    }
+  }
+}
+```
+
+Node records use the same versioned container and replace Python RECORD data
+with `package_lock_sha256` and `package_lock_identity`.
+
 ## 9. Validation tiers
 
 Validation must match the artifact's intended lifetime:
