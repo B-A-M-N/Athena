@@ -714,6 +714,7 @@ class ServiceLifecycle:
         self._svc._scheduler = scheduler
         events.subscribe(scheduler.notify_event, exclude_event_types=FAST_EVENT_TYPES)
         schedule_api = ScheduleAPI(scheduler, task_manager)
+        self._svc._schedule_api = schedule_api
         registry.register(ScheduleCapability(schedule_api))
         # Maintenance contracts are rehydrated before the core capability
         # bundle finishes registering. Create the live watcher owner first so

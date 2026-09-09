@@ -108,7 +108,7 @@ class PackHookOutbox:
             "AND ((status IN ('PENDING', 'FAILED') AND "
             "(next_attempt_at IS NULL OR next_attempt_at <= ?)) OR "
             "(status = 'CLAIMED' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?))",
-            (now, now, token, lease_expires, now, str(row_id), now, now),
+            (now, token, lease_expires, now, str(row_id), now, now),
         )
         if not cursor.rowcount:
             return None

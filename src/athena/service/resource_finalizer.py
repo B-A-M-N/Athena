@@ -215,9 +215,7 @@ class TaskResourceFinalizer:
     def bind_checkpoint_manager(self, manager: Any) -> None:
         self._checkpoint_manager = manager
 
-    async def _persist_parked_recovery_hint(
-        self, task_id: str, outcome: dict[str, Any]
-    ) -> None:
+    async def _persist_parked_recovery_hint(self, task_id: str, outcome: dict[str, Any]) -> None:
         """Make resource release part of the durable resume contract."""
         if not outcome.get("released"):
             return

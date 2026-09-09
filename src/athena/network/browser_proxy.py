@@ -14,9 +14,14 @@ from athena.network.target_policy import validate_target
 
 
 class DNSPinnedBrowserProxy:
+    MAX_CONCURRENT_TUNNELS = 32
+    IDLE_TIMEOUT_SECONDS = 60.0
+    MAX_TUNNEL_SECONDS = 300.0
+
     def __init__(self) -> None:
-        self._server: asyncio.AbstractServer | None = None
+        self._server: asyncio.Server | None = None
         self._policy = "allow"
+        self._active_tunnels: dict[int, tuple[asyncio.StreamWriter, asyncio.StreamWriter]] = {}
 
     @property
     def server_url(self) -> str:
@@ -31,7 +36,12 @@ class DNSPinnedBrowserProxy:
         return self.server_url
 
     async def set_policy(self, policy: str | object | None) -> None:
-        self._policy = str(getattr(policy, "value", policy) or "allow").casefold()
+        requested = str(getattr(policy, "value", policy) or "allow").casefold()
+        rank = {"allow": 0, "restricted": 1, "deny": 2}
+        previous = self._policy
+        self._policy = requested
+        if rank.get(requested, 2) > rank.get(previous, 0):
+            await self._close_active_tunnels()
 
     async def close(self) -> None:
         if self._server is None:
@@ -39,8 +49,11 @@ class DNSPinnedBrowserProxy:
         self._server.close()
         await self._server.wait_closed()
         self._server = None
+        await self._close_active_tunnels()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        tunnel_id = id(writer)
+        upstream_writer: asyncio.StreamWriter | None = None
         try:
             header_bytes = await reader.readuntil(b"\r\n\r\n")
             if len(header_bytes) > 64 * 1024:
@@ -58,6 +71,8 @@ class DNSPinnedBrowserProxy:
                 upstream = await asyncio.open_connection(
                     validated.addresses[0] if validated.addresses else host, port
                 )
+                upstream_writer = upstream[1]
+                self._register_tunnel(tunnel_id, writer, upstream_writer)
                 writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 await writer.drain()
                 await _tunnel(reader, writer, *upstream)
@@ -72,6 +87,7 @@ class DNSPinnedBrowserProxy:
             upstream_reader, upstream_writer = await asyncio.open_connection(
                 validated.addresses[0] if validated.addresses else parsed.hostname, port
             )
+            self._register_tunnel(tunnel_id, writer, upstream_writer)
             request_target = parsed.path or "/"
             if parsed.query:
                 request_target += "?" + parsed.query
@@ -87,11 +103,36 @@ class DNSPinnedBrowserProxy:
             except (ConnectionError, OSError):
                 pass
         finally:
+            self._active_tunnels.pop(tunnel_id, None)
+            if upstream_writer is not None:
+                upstream_writer.close()
             writer.close()
             try:
                 await writer.wait_closed()
             except (ConnectionError, OSError):
                 pass
+
+    def _register_tunnel(
+        self,
+        tunnel_id: int,
+        client_writer: asyncio.StreamWriter,
+        upstream_writer: asyncio.StreamWriter,
+    ) -> None:
+        if len(self._active_tunnels) >= self.MAX_CONCURRENT_TUNNELS:
+            upstream_writer.close()
+            raise PermissionError("browser proxy tunnel limit reached")
+        self._active_tunnels[tunnel_id] = (client_writer, upstream_writer)
+
+    async def _close_active_tunnels(self) -> None:
+        tunnels = list(self._active_tunnels.values())
+        self._active_tunnels.clear()
+        for client_writer, upstream_writer in tunnels:
+            client_writer.close()
+            upstream_writer.close()
+        await asyncio.gather(
+            *(writer.wait_closed() for tunnel in tunnels for writer in tunnel),
+            return_exceptions=True,
+        )
 
 
 async def _tunnel(
@@ -102,7 +143,15 @@ async def _tunnel(
 ) -> None:
     async def copy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            while chunk := await reader.read(64 * 1024):
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        reader.read(64 * 1024), DNSPinnedBrowserProxy.IDLE_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    return
+                if not chunk:
+                    return
                 writer.write(chunk)
                 await writer.drain()
         finally:
@@ -111,10 +160,21 @@ async def _tunnel(
             except (AttributeError, OSError, RuntimeError):
                 pass
 
-    await asyncio.gather(
-        copy(client_reader, upstream_writer),
-        copy(upstream_reader, client_writer),
-    )
+    tasks = {
+        asyncio.create_task(copy(client_reader, upstream_writer)),
+        asyncio.create_task(copy(upstream_reader, client_writer)),
+    }
+    try:
+        await asyncio.wait(
+            tasks,
+            timeout=DNSPinnedBrowserProxy.MAX_TUNNEL_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     upstream_writer.close()
     await upstream_writer.wait_closed()
 

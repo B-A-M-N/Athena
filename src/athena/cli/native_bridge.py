@@ -124,7 +124,7 @@ def native_projection_frame(
     has_viewport = width is not None and height is not None
     viewport_width = max(int(width), 1) if width is not None else 1
     viewport_height = max(int(height), 1) if height is not None else 1
-    scene_key = (int(state.event_count), viewport_width, viewport_height, character)
+    scene_key = (int(state.projection_revision), viewport_width, viewport_height, character)
     scene_cache = getattr(state, "_native_scene_cache", None)
     if isinstance(scene_cache, tuple) and scene_cache[:1] == (scene_key,):
         scene = scene_cache[1]
@@ -134,7 +134,7 @@ def native_projection_frame(
             Rect(0, 0, viewport_width, viewport_height),
             character=character,
         )
-        # The reducer's event_count is the canonical projection revision.
+        # The projection revision covers both reducer events and direct UI mutations.
         # Cache only the immutable scene object; frame dictionaries are still
         # rebuilt per call so callers cannot mutate cached output.
         state._native_scene_cache = (scene_key, scene)

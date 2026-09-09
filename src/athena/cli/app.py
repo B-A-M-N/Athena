@@ -1337,8 +1337,22 @@ async def _cmd_jobs(o: Options, service: Any) -> int:
             return 1
         print(f"job {value}: started task {task_id}")
         return 0
+    if action == "grant" and value and len(o.args) > 2:
+        result = await service.grant_job_control(value, o.args[2])
+        if result is None:
+            print(f"job not found or scheduler unavailable: {value}", file=sys.stderr)
+            return 1
+        print(f"job {value}: control granted to task {o.args[2]}")
+        return 0
+    if action == "revoke" and value:
+        if not await service.revoke_job_control(value):
+            print(f"job not found or grant absent: {value}", file=sys.stderr)
+            return 1
+        print(f"job {value}: control revoked")
+        return 0
     print(
-        "athena jobs: use list, show JOB_ID, enable JOB_ID, disable JOB_ID, or run-now JOB_ID",
+        "athena jobs: use list, show JOB_ID, enable JOB_ID, disable JOB_ID, "
+        "run-now JOB_ID, grant JOB_ID TASK_ID, or revoke JOB_ID",
         file=sys.stderr,
     )
     return 2

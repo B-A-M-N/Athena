@@ -336,9 +336,7 @@ async def _read_voice_audio(
     content_type = str(request.headers.get("content-type", "audio/wav"))
     media_type = content_type.split(";", 1)[0].strip().lower()
     wire_limit = (
-        (max_bytes * 4 + 2) // 3 + 16 * 1024
-        if media_type == "application/json"
-        else max_bytes
+        (max_bytes * 4 + 2) // 3 + 16 * 1024 if media_type == "application/json" else max_bytes
     )
     content_length = request.headers.get("content-length")
     if content_length:

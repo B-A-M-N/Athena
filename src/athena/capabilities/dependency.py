@@ -138,7 +138,10 @@ class DependencyCapability:
             return _result(request, ok=False, error=f"unsupported dependency manager: {manager}")
         backend = getattr(getattr(context, "workspace", None), "execution_backend", None) or "local"
         if operation in {"inspect", "resolve"}:
-            lock = _read_lock(context)
+            try:
+                lock = _read_lock(context)
+            except ValueError as exc:
+                return _result(request, ok=False, error=str(exc))
             record = _lock_record(lock, name) if lock else None
             host_installed = (
                 importlib.util.find_spec(name.replace("-", "_")) is not None
@@ -210,7 +213,10 @@ class DependencyCapability:
             )
         root = context.workspace.root
         version = str(args.get("version") or "")
-        lock = _read_lock(context)
+        try:
+            lock = _read_lock(context)
+        except ValueError as exc:
+            return _result(request, ok=False, error=str(exc))
         environment_id = _requested_environment_id(lock, manager, name, version)
         target = dependency_manager.target(root, environment_id)
         Path(target).mkdir(parents=True, exist_ok=True)
@@ -367,7 +373,10 @@ class DependencyCapability:
                     f"backend supports: {', '.join(supported_managers) or 'none'}"
                 ),
             )
-        lock = _read_lock(context)
+        try:
+            lock = _read_lock(context)
+        except ValueError as exc:
+            return _result(request, ok=False, error=str(exc))
         record = _lock_record(lock, name)
         if record is None:
             return _result(request, ok=False, error=f"dependency {name!r} is not in the lock")
@@ -519,7 +528,23 @@ def _read_lock(context) -> dict:
         data = json.loads(_lock_path(context).read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, TypeError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    try:
+        lock_format = int(data.get("format") or 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("dependency lock format is invalid") from exc
+    if lock_format not in {1, 2}:
+        raise ValueError(f"unsupported dependency lock format: {lock_format}")
+    fingerprint_version = data.get("fingerprint_version")
+    if fingerprint_version is not None:
+        try:
+            parsed_fingerprint_version = int(fingerprint_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("dependency fingerprint version is invalid") from exc
+        if parsed_fingerprint_version not in {1, 2}:
+            raise ValueError(f"unsupported dependency fingerprint version: {fingerprint_version}")
+    return data
 
 
 def _lock_record(lock: dict, name: str) -> dict[str, Any] | None:
@@ -552,7 +577,8 @@ def _requested_environment_id(
         return existing
     return dependency_environment_id(
         {
-            "format": int(lock.get("format") or 1),
+            "format": 2,
+            "fingerprint_version": 2,
             "manager": manager,
             "name": name,
             "version": version,
@@ -613,6 +639,7 @@ def _record_installed_package(
             "platform": platform.platform(),
         },
         "runtime_identity": runtime_identity,
+        "fingerprint_version": 2,
         "owner": {"task_id": task_id, "call_id": call_id},
         "recorded_at": utcnow().isoformat(),
     }
@@ -720,6 +747,7 @@ def _record_node_package(
             "integrity": identity.get("integrity"),
         },
         "runtime_identity": "node",
+        "fingerprint_version": 2,
         "owner": {"task_id": task_id, "call_id": call_id},
         "recorded_at": utcnow().isoformat(),
     }
@@ -743,8 +771,15 @@ def _write_lock(context, record: dict) -> None:
     path = _lock_path(context)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = _read_lock(context)
-    lock.setdefault("format", 1)
-    lock.setdefault("packages", {})[str(record["name"])] = record
+    packages = lock.setdefault("packages", {})
+    for existing in packages.values():
+        if isinstance(existing, dict) and "fingerprint_version" not in existing:
+            # Preserve legacy package fingerprints while upgrading the
+            # container schema for the newly recorded package.
+            existing["fingerprint_version"] = 1
+    lock["format"] = max(2, int(lock.get("format") or 1))
+    lock["fingerprint_version"] = 2
+    packages[str(record["name"])] = record
     if record.get("environment_id"):
         lock["environment_id"] = str(record["environment_id"])
     fd, tmp_name = tempfile.mkstemp(prefix="dependencies.", suffix=".tmp", dir=str(path.parent))

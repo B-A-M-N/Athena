@@ -72,6 +72,8 @@ async def test_dependency_install_writes_reproducibility_lock(tmp_path, monkeypa
     assert result.status is CapabilityResultStatus.OK
     lock = (tmp_path / ".athena" / "dependencies.lock.json").read_text()
     assert '"resolved_version": "1.2.3"' in lock
+    assert '"format": 2' in lock
+    assert '"fingerprint_version": 2' in lock
     assert '"task_id": "task-deps"' in lock
     assert '"pkg/__init__.py:sha256=abc"' in lock
 
@@ -90,6 +92,21 @@ async def test_dependency_inspect_reports_locked_version(tmp_path):
     assert result.status is CapabilityResultStatus.OK
     assert "1.2.3" in result.output
     assert result.metadata["lock"]["resolved_version"] == "1.2.3"
+
+
+@pytest.mark.asyncio
+async def test_dependency_rejects_unsupported_future_lock_format(tmp_path):
+    lock_dir = tmp_path / ".athena"
+    lock_dir.mkdir()
+    (lock_dir / "dependencies.lock.json").write_text(
+        '{"format": 99, "packages": {"demo": {"resolved_version": "1.2.3"}}}'
+    )
+    context = SimpleNamespace(workspace=WorkspaceSpec(id="repo", root=str(tmp_path)))
+
+    result = await DependencyCapability().invoke(_request("inspect", name="demo"), context=context)
+
+    assert result.status is CapabilityResultStatus.FAILED
+    assert "unsupported dependency lock format" in (result.error or "")
 
 
 @pytest.mark.asyncio

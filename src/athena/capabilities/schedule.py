@@ -33,6 +33,7 @@ from athena.protocol.capabilities import (
 from athena.scheduler.scheduler import TriggerSpec, TriggerType
 from athena.scheduler.triggers import next_fire
 from athena.network import validate_target
+from athena.policy.path_scope import intersect_path_rules, path_rules_cover
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
 from athena.protocol.tasks import (
@@ -40,6 +41,7 @@ from athena.protocol.tasks import (
     DeliverySpec,
     ModelPolicy,
     ResourceBudget,
+    ResourceBudgetCeiling,
     capability_policy_covers,
     intersect_capability_policies,
     intersect_model_policies,
@@ -111,6 +113,9 @@ def _owner_visible(
     if owner is None:
         return True
     if control is not None and control.origin == "model":
+        grant = _stored_control_grant(job)
+        if grant is not None and grant.get("grantee_task_id") == control.task_id:
+            return True
         scoped = {key: value for key, value in dict(owner).items() if value}
         return bool(scoped) and all(stored.get(key) == value for key, value in scoped.items())
     return any(
@@ -185,7 +190,10 @@ def _authority_covers(
             if grant.get(key) and grant.get(key) != getattr(control, key):
                 return False
     else:
-        if grant.get("creator_task_id") and grant.get("creator_task_id") != control.task_id:
+        if grant.get("grantee_task_id"):
+            if grant.get("grantee_task_id") != control.task_id:
+                return False
+        elif grant.get("creator_task_id") and grant.get("creator_task_id") != control.task_id:
             return False
         if (
             grant.get("creator_session_id")
@@ -262,7 +270,7 @@ def _policy_record(policy: CapabilityPolicy) -> dict[str, Any]:
     }
 
 
-def _budget_record(budget: ResourceBudget) -> dict[str, Any]:
+def _budget_record(budget: ResourceBudget | ResourceBudgetCeiling) -> dict[str, Any]:
     record: dict[str, Any] = {}
     for name in (
         "max_agent_iterations",
@@ -328,38 +336,19 @@ def _path_within(path: str, root: str) -> bool:
     return common == _record_path(root)
 
 
-def _workspace_rules_cover(upper: Any, lower: Any) -> bool:
-    upper_rules = [
-        item for item in upper or () if isinstance(item, Mapping) and item.get("allow", True)
-    ]
-    lower_rules = [
-        item for item in lower or () if isinstance(item, Mapping) and item.get("allow", True)
-    ]
-    upper_denies = [
-        item.get("path")
-        for item in upper or ()
-        if isinstance(item, Mapping) and not item.get("allow", True)
-    ]
-    if not upper_rules:
-        # No allow rules means an unrestricted base, narrowed only by explicit
-        # denies. A lower allow rule must not fall inside one of those denies.
-        return not any(
-            _path_within(str(child.get("path") or ""), str(deny))
-            for child in lower_rules
-            for deny in upper_denies
-            if deny
-        )
-    if not lower_rules:
-        return False
-    for child in lower_rules:
-        child_path = str(child.get("path") or "")
-        if not any(
-            _path_within(child_path, str(parent.get("path") or "")) for parent in upper_rules
-        ):
-            return False
-        if any(_path_within(child_path, str(deny)) for deny in upper_denies if deny):
-            return False
-    return True
+def _workspace_rules_cover(
+    upper: Any,
+    lower: Any,
+    *,
+    upper_root: str | None = None,
+    lower_root: str | None = None,
+) -> bool:
+    return path_rules_cover(
+        upper,
+        lower,
+        upper_base=upper_root,
+        lower_base=lower_root,
+    )
 
 
 def _workspace_covers(upper: Mapping[str, Any], lower: Mapping[str, Any]) -> bool:
@@ -387,39 +376,36 @@ def _workspace_covers(upper: Mapping[str, Any], lower: Mapping[str, Any]) -> boo
     ):
         return False
     return _workspace_rules_cover(
-        upper.get("readable"), lower.get("readable")
-    ) and _workspace_rules_cover(upper.get("writable"), lower.get("writable"))
+        upper.get("readable"),
+        lower.get("readable"),
+        upper_root=upper_root,
+        lower_root=lower_root,
+    ) and _workspace_rules_cover(
+        upper.get("writable"),
+        lower.get("writable"),
+        upper_root=upper_root,
+        lower_root=lower_root,
+    )
 
 
-def _intersect_workspace_rules(left: Any, right: Any) -> list[dict[str, Any]]:
-    a = [item for item in left or () if isinstance(item, Mapping)]
-    b = [item for item in right or () if isinstance(item, Mapping)]
-    if not a:
-        return [dict(item) for item in b]
-    if not b:
-        return [dict(item) for item in a]
-    out: list[dict[str, Any]] = []
-    for first in a:
-        if not first.get("allow", True):
-            out.append(dict(first))
-            continue
-        for second in b:
-            if not second.get("allow", True):
-                out.append(dict(second))
-                continue
-            left_path = _record_path(first.get("path"))
-            right_path = _record_path(second.get("path"))
-            if _path_within(left_path, right_path):
-                out.append({"path": left_path, "allow": True})
-            elif _path_within(right_path, left_path):
-                out.append({"path": right_path, "allow": True})
-    if not any(item.get("allow", True) for item in out):
-        root = str((b[0] if b else a[0]).get("path") or ".")
-        out.append({"path": root, "allow": False})
-    unique: dict[tuple[str, bool], dict[str, Any]] = {}
-    for item in out:
-        unique[(str(item.get("path")), bool(item.get("allow", True)))] = item
-    return list(unique.values())
+def _intersect_workspace_rules(
+    left: Any,
+    right: Any,
+    *,
+    left_root: str | None = None,
+    right_root: str | None = None,
+    result_root: str | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        {"path": rule.path, "allow": rule.allow}
+        for rule in intersect_path_rules(
+            left,
+            right,
+            left_base=left_root,
+            right_base=right_root,
+            result_base=result_root,
+        )
+    ]
 
 
 def _intersect_workspace_records(
@@ -436,8 +422,21 @@ def _intersect_workspace_records(
         key=lambda value: {"read_only": 0, "speculative": 1, "direct": 2}.get(value, 0),
     )
     result = dict(first)
-    result["readable"] = _intersect_workspace_rules(first.get("readable"), second.get("readable"))
-    result["writable"] = _intersect_workspace_rules(first.get("writable"), second.get("writable"))
+    result_root = str(first.get("root") or second.get("root") or "") or None
+    result["readable"] = _intersect_workspace_rules(
+        first.get("readable"),
+        second.get("readable"),
+        left_root=str(first.get("root") or "") or None,
+        right_root=str(second.get("root") or "") or None,
+        result_root=result_root,
+    )
+    result["writable"] = _intersect_workspace_rules(
+        first.get("writable"),
+        second.get("writable"),
+        left_root=str(first.get("root") or "") or None,
+        right_root=str(second.get("root") or "") or None,
+        result_root=result_root,
+    )
     result["network_policy"] = network
     result["mutation_mode"] = mutation
     first_temp = str(first.get("temp_root") or "")
@@ -768,7 +767,6 @@ class ScheduleAPI:
             "job_id": job_id,
             "name": name,
             "enabled": True,
-            "control_token": control_grant["token"],
         }
 
     async def grant_control(
@@ -779,6 +777,7 @@ class ScheduleAPI:
         control: ScheduleControl | None = None,
         principal_id: str | None = None,
         project_id: str | None = None,
+        task_id: str | None = None,
         operations: tuple[str, ...] = ("inspect", "update", "enable", "disable", "run"),
         expires_at: str | None = None,
     ) -> dict[str, Any] | None:
@@ -796,6 +795,7 @@ class ScheduleAPI:
             "schedule_id": job_id,
             "principal_id": principal_id,
             "project_id": project_id,
+            "grantee_task_id": task_id,
             "operations": sorted(set(str(item) for item in operations) | {"inspect"}),
             "expires_at": expires_at,
             "revoked": False,
@@ -815,9 +815,39 @@ class ScheduleAPI:
         )
         return {
             "job_id": job_id,
-            "control_token": grant["token"],
+            "task_id": task_id,
             "operations": grant["operations"],
         }
+
+    async def revoke_control(
+        self,
+        job_id: str,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        control: ScheduleControl | None = None,
+    ) -> bool:
+        """Revoke the current control grant from an operator surface."""
+        job = await self._scheduler._store.get_job_id(job_id)
+        if job is None or not _owner_visible(job, owner, control=control):
+            return False
+        if control is not None and control.origin == "model":
+            raise PermissionError("only an operator or trusted orchestrator may revoke control")
+        metadata = dict(job.get("metadata") or {})
+        grant = dict(metadata.get("_control_grant") or {})
+        if not grant:
+            return False
+        grant["revoked"] = True
+        metadata["_control_grant"] = grant
+        await self._scheduler._store.upsert_job(
+            job_id,
+            str(job.get("name") or job_id),
+            payload=job.get("payload") or {},
+            trigger_spec=_trigger_from_metadata(job),
+            enabled=bool(job.get("enabled", True)),
+            next_run=job.get("next_run"),
+            metadata=metadata,
+        )
+        return True
 
     async def update(
         self,

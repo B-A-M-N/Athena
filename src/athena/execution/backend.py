@@ -31,6 +31,7 @@ class RuntimeCapabilities:
     """Runtime-specific capability overrides for one backend."""
 
     persistent_sessions: bool = False
+    persistent_runtime_state: bool = False
     reattach: bool = False
     secret_materialization: bool = False
     interactive_stdin: bool = False

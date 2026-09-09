@@ -672,57 +672,15 @@ def _is_strict_descendant(child: Path, parent: Path) -> bool:
 
 
 def _restrict_paths(parent_rules, child_rules, parent_root: Path, child_root: Path):
-    """Return the canonical intersection of two prefix path policies.
+    from athena.policy.path_scope import intersect_path_rules
 
-    An empty rule tuple means the corresponding workspace root is implicitly
-    allowed.  The returned policy is always explicit, including a deny rule
-    at ``child_root`` when the intersection is empty.  This matters because
-    downstream scope checkers interpret an empty tuple as unrestricted.
-
-    ``Path.resolve(strict=False)`` canonicalizes existing symlink components;
-    every candidate is then checked against both roots and both allow sets.
-    Deny rules are retained when they overlap the surviving allow region, so
-    a parent deny cannot be erased by a child allow rule.
-    """
-    from athena.protocol.tasks import PathRule
-
-    parent = _canonical_rules(parent_rules, parent_root, parent_root)
-    child = _canonical_rules(child_rules, child_root, child_root)
-    if not parent:
-        parent = [(parent_root, True)]
-    if not child:
-        child = [(child_root, True)]
-
-    parent_allows = [path for path, allow in parent if allow and _is_within(path, parent_root)]
-    child_allows = [path for path, allow in child if allow and _is_within(path, child_root)]
-    candidates: list[Path] = []
-    for parent_allow in parent_allows:
-        for child_allow in child_allows:
-            overlap = _prefix_intersection(parent_allow, child_allow)
-            if overlap is None:
-                continue
-            if _is_within(overlap, parent_root) and _is_within(overlap, child_root):
-                candidates.append(overlap)
-
-    denies = [
-        path
-        for path, allow in (*parent, *child)
-        if not allow and (_is_within(path, parent_root) or _is_within(path, child_root))
-    ]
-    surviving: list[Path] = []
-    for candidate in _unique_paths(candidates):
-        # A deny ancestor/equal to the candidate removes that whole region.
-        if any(_is_within(candidate, deny) for deny in denies):
-            continue
-        surviving.append(candidate)
-
-    out: list[PathRule] = [PathRule(path=str(path), allow=True) for path in surviving]
-    for deny in _unique_paths(denies):
-        if any(_is_within(deny, candidate) for candidate in surviving):
-            out.append(PathRule(path=str(deny), allow=False))
-    if not out:
-        out.append(PathRule(path=str(child_root), allow=False))
-    return tuple(out)
+    return intersect_path_rules(
+        parent_rules,
+        child_rules,
+        left_base=parent_root,
+        right_base=child_root,
+        result_base=child_root,
+    )
 
 
 def _canonical_workspace_path(value: str | None, base: Path) -> Path | None:
@@ -730,37 +688,6 @@ def _canonical_workspace_path(value: str | None, base: Path) -> Path | None:
         return None
     raw = Path(value)
     return (raw if raw.is_absolute() else base / raw).resolve(strict=False)
-
-
-def _canonical_rules(rules, base: Path, root: Path) -> list[tuple[Path, bool]]:
-    result: list[tuple[Path, bool]] = []
-    for rule in rules or ():
-        if not getattr(rule, "path", None):
-            continue
-        path = _canonical_workspace_path(str(rule.path), base)
-        if path is None:
-            continue
-        result.append((path, bool(rule.allow)))
-    return result
-
-
-def _prefix_intersection(left: Path, right: Path) -> Path | None:
-    if _is_within(left, right):
-        return left
-    if _is_within(right, left):
-        return right
-    return None
-
-
-def _unique_paths(paths: list[Path]) -> list[Path]:
-    result: list[Path] = []
-    seen: set[str] = set()
-    for path in paths:
-        value = str(path)
-        if value not in seen:
-            seen.add(value)
-            result.append(path)
-    return result
 
 
 def _monotonic_backend(parent: str, child: str) -> str:

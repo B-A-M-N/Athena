@@ -267,6 +267,47 @@ class ResourceBudget:
         )
 
 
+@dataclass(frozen=True)
+class ResourceBudgetCeiling:
+    """Authority ceiling where an omitted dimension means unbounded.
+
+    ``ResourceBudget`` is the concrete execution budget with safe defaults.
+    Persisted authority algebra needs a separate type so an omitted ceiling
+    cannot be confused with those defaults.
+    """
+
+    max_agent_iterations: int | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_cost_usd: Decimal | None = None
+    max_wall_time: timedelta | None = None
+    max_children: int | None = None
+    max_child_depth: int | None = None
+    max_parallel_model_calls: int | None = None
+    max_parallel_executions: int | None = None
+    max_artifact_bytes: int | None = None
+
+    def merged_with(self, other: "ResourceBudgetCeiling | None") -> "ResourceBudgetCeiling":
+        if other is None:
+            return self
+        return ResourceBudgetCeiling(
+            max_agent_iterations=_min_opt(self.max_agent_iterations, other.max_agent_iterations),
+            max_input_tokens=_min_opt(self.max_input_tokens, other.max_input_tokens),
+            max_output_tokens=_min_opt(self.max_output_tokens, other.max_output_tokens),
+            max_cost_usd=_min_opt(self.max_cost_usd, other.max_cost_usd),
+            max_wall_time=_min_opt(self.max_wall_time, other.max_wall_time),
+            max_children=_min_opt(self.max_children, other.max_children),
+            max_child_depth=_min_opt(self.max_child_depth, other.max_child_depth),
+            max_parallel_model_calls=_min_opt(
+                self.max_parallel_model_calls, other.max_parallel_model_calls
+            ),
+            max_parallel_executions=_min_opt(
+                self.max_parallel_executions, other.max_parallel_executions
+            ),
+            max_artifact_bytes=_min_opt(self.max_artifact_bytes, other.max_artifact_bytes),
+        )
+
+
 def _min_opt(a, b):
     if a is None:
         return b
@@ -379,17 +420,27 @@ def capability_policy_covers(
     """Return whether ``lower`` is contained by the ``upper`` ceiling."""
     a = _policy_parts(upper)
     b = _policy_parts(lower)
-    upper_visible = set(a.allow) | set(a.ask)
-    lower_visible = set(b.allow) | set(b.ask)
-    if upper_visible and (not lower_visible or not lower_visible.issubset(upper_visible)):
+    upper_allow = set(a.allow)
+    upper_ask = set(a.ask)
+    lower_allow = set(b.allow)
+    lower_ask = set(b.ask)
+    upper_visible = upper_allow | upper_ask
+    lower_visible = lower_allow | lower_ask
+    # Empty allow/ask is the protocol's unrestricted value.  Once a policy
+    # names an allow/ask ceiling, preserve the distinction: ASK is weaker than
+    # ALLOW for a caller, but it cannot cover a stored autonomous ALLOW.
+    if upper_visible and not lower_visible:
         return False
-    if lower_visible & set(a.deny):
+    if upper_visible and not lower_allow.issubset(upper_allow):
         return False
-    if not upper_visible and not lower_visible:
-        if "*" in a.deny:
-            if "*" not in b.deny:
-                return False
-        elif not set(a.deny).issubset(set(b.deny)):
+    if upper_visible and not lower_ask.issubset(upper_visible):
+        return False
+    if lower_visible & set(a.deny) or "*" in a.deny and lower_visible:
+        return False
+    if not upper_visible and not lower_visible and "*" in a.deny and "*" not in b.deny:
+        return False
+    if not upper_visible and not lower_visible and "*" not in a.deny:
+        if not set(a.deny).issubset(set(b.deny)):
             return False
     upper_effects = set(a.effects)
     lower_effects = set(b.effects)
@@ -399,25 +450,33 @@ def capability_policy_covers(
 
 
 def intersect_resource_budgets(
-    left: ResourceBudget | Mapping[str, Any] | None,
-    right: ResourceBudget | Mapping[str, Any] | None,
-) -> ResourceBudget:
+    left: ResourceBudget | ResourceBudgetCeiling | Mapping[str, Any] | None,
+    right: ResourceBudget | ResourceBudgetCeiling | Mapping[str, Any] | None,
+) -> ResourceBudgetCeiling:
     """Intersect two budgets; omitted limits remain unbounded, not zero."""
-    return _budget_from_value(left).merged_with(_budget_from_value(right))
+    return _budget_ceiling_from_value(left).merged_with(_budget_ceiling_from_value(right))
 
 
-def _budget_from_value(value: ResourceBudget | Mapping[str, Any] | None) -> ResourceBudget:
-    if isinstance(value, ResourceBudget):
+def _budget_ceiling_from_value(
+    value: ResourceBudget | ResourceBudgetCeiling | Mapping[str, Any] | None,
+) -> ResourceBudgetCeiling:
+    if isinstance(value, ResourceBudgetCeiling):
         return value
-    if not isinstance(value, Mapping):
-        return ResourceBudget(
-            max_agent_iterations=None,
-            max_children=None,
-            max_child_depth=None,
-            max_parallel_model_calls=None,
-            max_parallel_executions=None,
-            max_artifact_bytes=None,
+    if isinstance(value, ResourceBudget):
+        return ResourceBudgetCeiling(
+            max_agent_iterations=value.max_agent_iterations,
+            max_input_tokens=value.max_input_tokens,
+            max_output_tokens=value.max_output_tokens,
+            max_cost_usd=value.max_cost_usd,
+            max_wall_time=value.max_wall_time,
+            max_children=value.max_children,
+            max_child_depth=value.max_child_depth,
+            max_parallel_model_calls=value.max_parallel_model_calls,
+            max_parallel_executions=value.max_parallel_executions,
+            max_artifact_bytes=value.max_artifact_bytes,
         )
+    if not isinstance(value, Mapping):
+        return ResourceBudgetCeiling()
     values: dict[str, Any] = {}
     for name in (
         "max_agent_iterations",
@@ -439,21 +498,19 @@ def _budget_from_value(value: ResourceBudget | Mapping[str, Any] | None) -> Reso
         elif name == "max_wall_time":
             raw = timedelta(seconds=float(raw))
         values[name] = raw
-    if not values:
-        return ResourceBudget(
-            max_agent_iterations=None,
-            max_children=None,
-            max_child_depth=None,
-            max_parallel_model_calls=None,
-            max_parallel_executions=None,
-            max_artifact_bytes=None,
-        )
-    return ResourceBudget(**values)
+    return ResourceBudgetCeiling(**values)
+
+
+def _budget_from_value(
+    value: ResourceBudget | ResourceBudgetCeiling | Mapping[str, Any] | None,
+) -> ResourceBudgetCeiling:
+    """Backward-compatible private alias for callers in older integrations."""
+    return _budget_ceiling_from_value(value)
 
 
 def resource_budget_covers(
-    upper: ResourceBudget | Mapping[str, Any] | None,
-    lower: ResourceBudget | Mapping[str, Any] | None,
+    upper: ResourceBudget | ResourceBudgetCeiling | Mapping[str, Any] | None,
+    lower: ResourceBudget | ResourceBudgetCeiling | Mapping[str, Any] | None,
 ) -> bool:
     """Return whether every lower budget limit is within the upper limit."""
     if upper is None:
@@ -688,6 +745,7 @@ __all__ = [
     "WorkspaceSpec",
     "MutationMode",
     "ResourceBudget",
+    "ResourceBudgetCeiling",
     "ModelPolicy",
     "CapabilityPolicy",
     "capability_id_permitted",

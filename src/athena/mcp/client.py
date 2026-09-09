@@ -425,7 +425,13 @@ class MCPClient:
             try:
                 outcome = callback(self.connection_id, exc)
                 if inspect.isawaitable(outcome):
-                    task = asyncio.create_task(outcome, name=f"mcp-failure:{self.connection_id}")
+
+                    async def _await_callback() -> None:
+                        await outcome
+
+                    task: asyncio.Task[Any] = asyncio.create_task(
+                        _await_callback(), name=f"mcp-failure:{self.connection_id}"
+                    )
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
             except Exception:

@@ -69,6 +69,12 @@ def resolve_dependency_environment(
     packages = lock.get("packages") if isinstance(lock, dict) else None
     if not isinstance(packages, dict):
         raise DependencyEnvironmentError("dependency lock has no package map")
+    try:
+        lock_format = int(lock.get("format") or 1)
+    except (TypeError, ValueError) as exc:
+        raise DependencyEnvironmentError("dependency lock format is invalid") from exc
+    if lock_format not in {1, 2}:
+        raise DependencyEnvironmentError(f"unsupported dependency lock format: {lock_format}")
     environment_id = str(lock.get("environment_id") or "")
     if not environment_id:
         for value in packages.values():
@@ -100,12 +106,12 @@ def resolve_dependency_environment(
             )
         closure = record.get("closure")
         locked_packages = closure if isinstance(closure, list) else [record]
-        for locked in locked_packages:
+        for index, locked in enumerate(locked_packages):
             if not isinstance(locked, Mapping):
                 raise DependencyEnvironmentError(
                     "dependency lock contains an invalid closure entry"
                 )
-            package_name = str(locked.get("name") or "")
+            package_name = str(locked.get("name") or (requirement.name if index == 0 else ""))
             normalized_name = _normalize(package_name)
             if not package_name or normalized_name in verified_names:
                 continue
@@ -142,35 +148,38 @@ def resolve_dependency_environment(
             verified.append(package)
         expected_package_fingerprint = record.get("environment_fingerprint")
         if expected_package_fingerprint:
+            fingerprint_version = _fingerprint_version(lock, record, lock_format)
             closure_packages = [
                 {
-                    "name": str(item.get("name") or ""),
+                    "name": str(item.get("name") or (requirement.name if index == 0 else "")),
                     "resolved_version": str(item.get("resolved_version") or ""),
                     "record_hashes": sorted(
                         str(value) for value in item.get("record_hashes") or ()
                     ),
                 }
-                for item in locked_packages
+                for index, item in enumerate(locked_packages)
                 if isinstance(item, Mapping)
             ]
             package_fingerprint = environment_fingerprint(
                 closure_packages,
-                runtime_identity=runtime_identity,
+                runtime_identity=runtime_identity if fingerprint_version >= 2 else None,
             )
             if expected_package_fingerprint != package_fingerprint:
                 raise DependencyEnvironmentError(
                     f"dependency {requirement.name!r} environment fingerprint mismatch"
                 )
 
-    fingerprint = environment_fingerprint(
-        verified,
-        runtime_identity=runtime_identity
-        if any(
-            record.get("runtime_identity")
+    fingerprint_version = max(
+        (
+            _fingerprint_version(lock, record, lock_format)
             for record in packages.values()
             if isinstance(record, Mapping)
-        )
-        else None,
+        ),
+        default=1,
+    )
+    fingerprint = environment_fingerprint(
+        verified,
+        runtime_identity=runtime_identity if fingerprint_version >= 2 else None,
     )
     if expected_fingerprint and fingerprint != expected_fingerprint:
         raise DependencyEnvironmentError(
@@ -227,6 +236,21 @@ def environment_fingerprint(
         payload = {"packages": payload, "runtime_identity": runtime_identity}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _fingerprint_version(
+    lock: Mapping[str, Any], record: Mapping[str, Any], lock_format: int
+) -> int:
+    raw = record.get("fingerprint_version", lock.get("fingerprint_version"))
+    if raw is None:
+        return 2 if lock_format >= 2 else 1
+    try:
+        version = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise DependencyEnvironmentError("dependency fingerprint version is invalid") from exc
+    if version not in {1, 2}:
+        raise DependencyEnvironmentError(f"unsupported dependency fingerprint version: {version}")
+    return version
 
 
 def _python_runtime_identity() -> str:

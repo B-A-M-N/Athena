@@ -27,7 +27,7 @@ import asyncio
 import inspect
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Mapping, Protocol
 from urllib.parse import urlsplit
 
 from athena.execution.async_call import run_blocking
@@ -118,6 +118,9 @@ class BrowserDriver(Protocol):
     async def upload(self, selector: str, path: str) -> dict[str, Any]: ...
 
     async def close(self) -> None: ...
+
+    @property
+    def effective_network_policy(self) -> str: ...
 
 
 class PlaywrightBrowserDriver:
@@ -341,6 +344,10 @@ class PlaywrightBrowserDriver:
             await route.continue_()
 
         await self._context.route("**/*", _route)
+
+    @property
+    def effective_network_policy(self) -> str:
+        return self._network_policy
 
     async def snapshot(self) -> list[ElementSnapshot]:
         locator = self._page.locator("a,button,input,textarea,select,[role]")
@@ -647,7 +654,7 @@ class BrowserCapability:
         *,
         session_scope: str = "task",
         artifact_store: Any = None,
-        auth_profiles: dict[str, Any] | None = None,
+        auth_profiles: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         # One driver belongs to one task (or session when no task id exists).
         # Keeping this state here, rather than in a provider/model turn,
@@ -799,13 +806,23 @@ class BrowserCapability:
                         ok=False,
                         error="browser driver cannot enforce workspace network policy",
                     )
-                self._driver_policies[id(driver)] = policy_name
+            effective_policy = str(
+                getattr(driver, "effective_network_policy", policy_name) or policy_name
+            ).casefold()
+            rank = {"allow": 0, "restricted": 1, "deny": 2}
+            if rank.get(effective_policy, 0) < rank.get(policy_name, 0):
+                return _result(
+                    request,
+                    ok=False,
+                    error="browser driver applied weaker network policy than requested",
+                )
+            self._driver_policies[id(driver)] = effective_policy
             return await self._dispatch(
                 request,
                 driver,
                 operation,
                 args,
-                policy_name=policy_name,
+                policy_name=effective_policy,
                 artifact_limit=getattr(
                     getattr(context, "resource_budget", None), "max_artifact_bytes", None
                 ),

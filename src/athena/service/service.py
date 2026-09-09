@@ -285,6 +285,7 @@ class AthenaService:
         self._skills: SkillStore | None = None
         self._skill_lifecycle: SkillLifecycle | None = None
         self._scheduler: Scheduler | None = None
+        self._schedule_api: Any = None
         self._artifacts: ArtifactStore | None = None
         self._mcp: MCPAdapter | None = None
         self._workflow_store: Any = None
@@ -1494,6 +1495,46 @@ class AthenaService:
         if self._scheduler is None:
             return None
         return await self._scheduler.run_now(job_id)
+
+    async def grant_job_control(
+        self,
+        job_id: str,
+        task_id: str,
+        *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+        operations: tuple[str, ...] = ("inspect", "update", "enable", "disable", "run"),
+        expires_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Grant a schedule lease to a task through the operator API.
+
+        The lease is bound to the task identity; no bearer token is returned
+        to model-visible context.
+        """
+        if self._schedule_api is None:
+            return None
+        from athena.capabilities.schedule import ScheduleControl
+
+        return await self._schedule_api.grant_control(
+            job_id,
+            control=ScheduleControl(origin="user_direct"),
+            principal_id=principal_id,
+            project_id=project_id,
+            task_id=task_id,
+            operations=operations,
+            expires_at=expires_at,
+        )
+
+    async def revoke_job_control(self, job_id: str) -> bool:
+        """Revoke a task-bound schedule lease through the operator API."""
+        if self._schedule_api is None:
+            return False
+        from athena.capabilities.schedule import ScheduleControl
+
+        return await self._schedule_api.revoke_control(
+            job_id,
+            control=ScheduleControl(origin="user_direct"),
+        )
 
     async def list_packs(self, query: str | None = None) -> list[dict[str, Any]]:
         """List installed declarative packs and their live health."""

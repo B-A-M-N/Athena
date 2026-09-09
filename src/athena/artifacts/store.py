@@ -132,9 +132,7 @@ class ArtifactStore:
             raise ValueError("max_bytes must be positive")
         staging = self._blobs / ".staging"
         staging.mkdir(parents=True, exist_ok=True)
-        staged_path, digest, size = await self._io(
-            _stage_file, Path(path), staging, int(max_bytes)
-        )
+        staged_path, digest, size = await self._io(_stage_file, Path(path), staging, int(max_bytes))
         reserved = False
         committed = False
         try:

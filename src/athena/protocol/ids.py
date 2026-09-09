@@ -58,9 +58,9 @@ def fake_id(kind: str, n: int = 1) -> str:
 
 def stable_id(kind: str, *parts: object) -> str:
     """Create a deterministic opaque identifier from stable identity parts."""
-    digest = hashlib.sha256(
-        "\x1f".join(str(part) for part in parts).encode("utf-8")
-    ).hexdigest()[:32]
+    digest = hashlib.sha256("\x1f".join(str(part) for part in parts).encode("utf-8")).hexdigest()[
+        :32
+    ]
     prefix = _PREFIXES.get(kind, kind)
     return f"{prefix}_{digest}"
 

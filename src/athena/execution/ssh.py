@@ -620,10 +620,13 @@ class SSHBackend(ExecutionBackend):
             secret_materialization=True,
             interactive_stdin=True,
             process_signals=True,
-            dependency_installation=("python", "node"),
+            # DependencyCapability persists and verifies lock targets through
+            # the service filesystem; SSH has no remote inventory RPC yet.
+            dependency_installation=(),
             runtime_capabilities={
                 "python": {
                     "persistent_sessions": True,
+                    "persistent_runtime_state": True,
                     "reattach": True,
                     "secret_materialization": True,
                     "interactive_stdin": True,
@@ -631,6 +634,7 @@ class SSHBackend(ExecutionBackend):
                 },
                 "node": {
                     "persistent_sessions": True,
+                    "persistent_runtime_state": False,
                     "reattach": True,
                     "secret_materialization": True,
                     "interactive_stdin": True,
@@ -638,6 +642,7 @@ class SSHBackend(ExecutionBackend):
                 },
                 "shell": {
                     "persistent_sessions": True,
+                    "persistent_runtime_state": False,
                     "reattach": True,
                     "secret_materialization": True,
                     "interactive_stdin": True,

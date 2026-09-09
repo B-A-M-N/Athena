@@ -188,6 +188,7 @@ class ProjectionState:
     self_host_phase: str = ""
     thinking: bool = False
     event_count: int = 0
+    projection_revision: int = 0
     diagnostics: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=80))
     instruments: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=48))
     verification_checks: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -207,6 +208,23 @@ class ProjectionState:
     _execution_order: deque[str] = field(default_factory=deque, repr=False)
     _approval_order: deque[str] = field(default_factory=deque, repr=False)
     _stream_partial_truncated: bool = field(default=False, repr=False)
+    _native_scene_cache: tuple[tuple[int, int, int, str], Any] | None = field(
+        default=None, repr=False
+    )
+
+    def mark_mutated(self) -> None:
+        """Advance the presentation revision for non-event UI mutations."""
+        self.projection_revision += 1
+
+    def set_status(self, status: str, message: str | None = None) -> None:
+        self.status = str(status)
+        if message is not None:
+            self.status_message = message
+        self.mark_mutated()
+
+    def set_status_message(self, message: str) -> None:
+        self.status_message = str(message)
+        self.mark_mutated()
 
     @property
     def pending_approval(self) -> dict[str, Any] | None:
@@ -230,11 +248,13 @@ class ProjectionState:
         if value is None:
             self.pending_approvals.clear()
             self._approval_order.clear()
+            self.mark_mutated()
             return
         approval_id = self._approval_id(value)
         if approval_id:
             self.pending_approvals[approval_id] = dict(value)
             self._touch(self._approval_order, approval_id)
+            self.mark_mutated()
 
     @staticmethod
     def _approval_id(payload: Mapping[str, Any]) -> str | None:
@@ -269,19 +289,24 @@ class ProjectionState:
         clean = sanitize_terminal_text(text).strip()
         if clean and (not self.recent or self.recent[-1] != (glyph, clean)):
             self.recent.append((glyph, clean))
+            self.mark_mutated()
 
     def add_maintenance(self, glyph: str, text: object) -> None:
         clean = sanitize_terminal_text(text).strip()
         if clean and (not self.maintenance or self.maintenance[-1] != (glyph, clean)):
             self.maintenance.append((glyph, clean))
+            self.mark_mutated()
 
     def add_chat(self, role: str, text: object) -> None:
         clean = sanitize_terminal_text(text).strip()
         if clean:
             self.chat.append({"role": role, "text": clean})
+            self.mark_mutated()
 
     def feed_stream(self, text: object, *, prefix: str = "") -> None:
         clean = sanitize_terminal_text(text)
+        if clean:
+            self.mark_mutated()
         # A chunk may end in the middle of a line. Prefix only the beginning
         # of that logical line so split stderr chunks do not become
         # ``[err] first[err] second`` in the shared stream.
@@ -301,6 +326,7 @@ class ProjectionState:
             self.stream.append(_cap_display(self.stream_partial))
             self.stream_partial = ""
             self._stream_partial_truncated = False
+            self.mark_mutated()
 
     def acknowledge_approval(
         self,
@@ -327,17 +353,14 @@ class ProjectionState:
             approval = dict(approval)
             approval["selected_scope"] = scope
         if granted:
-            self.status = "EXECUTING"
-            self.status_message = "Approval accepted; resuming."
+            self.set_status("EXECUTING", "Approval accepted; resuming.")
         else:
-            self.status = "WARNING"
-            self.status_message = "Approval denied."
+            self.set_status("WARNING", "Approval denied.")
 
     def ignore_approval_summary(self) -> None:
         """Discard a count-only approval summary after its request was handled."""
         if self.status == "APPROVAL" and not self.pending_approvals:
-            self.status = "EXECUTING"
-            self.status_message = "Approval accepted; resuming."
+            self.set_status("EXECUTING", "Approval accepted; resuming.")
 
     def _operation(
         self, payload: Mapping[str, Any], *, create: bool = True
@@ -593,6 +616,7 @@ class ProjectionState:
         payload = dict(payload or {})
         etype = str(event_type)
         self.event_count += 1
+        self.projection_revision += 1
         self.raw_events.append((etype, _bounded_event_payload(payload)))
         if task_id:
             payload.setdefault("_event_task_id", task_id)

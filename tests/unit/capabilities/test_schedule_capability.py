@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from athena.capabilities.schedule import ScheduleAPI, ScheduleControl
+from athena.capabilities.schedule import ScheduleAPI, ScheduleControl, _workspace_rules_cover
 from athena.scheduler.scheduler import TriggerType
 from athena.state.database import Database
 from athena.state.schedules import ScheduleStore
@@ -140,3 +140,64 @@ async def test_model_cannot_see_ownerless_legacy_schedule():
     control = ScheduleControl(origin="model", task_id="task-a", session_id="session-a")
     assert await api.inspect("legacy-job", owner={"task_id": "task-a"}, control=control) is None
     await db.close()
+
+
+async def test_operator_grant_binds_schedule_control_to_task_without_bearer_token():
+    db, api = await _api()
+    owner = {
+        "task_id": "task-a",
+        "session_id": "session-a",
+        "project_id": "repo-a",
+        "principal_id": "principal-a",
+    }
+    workspace = WorkspaceSpec(id="repo-a", root="/repo")
+    authority = CapabilityPolicy(effects=frozenset({"READ_LOCAL"}))
+    created = await api.create(
+        name="delegated",
+        objective="run",
+        trigger={"type": "interval", "interval_seconds": 60},
+        owner=owner,
+        workspace=workspace,
+        capability_policy=authority,
+        resource_budget=ResourceBudget(),
+    )
+    grant = await api.grant_control(
+        created["job_id"],
+        control=ScheduleControl(origin="user_direct"),
+        task_id="task-b",
+        principal_id="principal-a",
+        project_id="repo-a",
+    )
+    assert grant is not None
+    assert "control_token" not in grant
+
+    delegated = ScheduleControl(
+        origin="model",
+        task_id="task-b",
+        session_id="session-b",
+        principal_id="principal-a",
+        project_id="repo-a",
+        capability_policy=authority,
+        resource_budget=ResourceBudget(),
+        workspace=workspace,
+    )
+    assert await api.disable(created["job_id"], owner={"task_id": "task-b"}, control=delegated)
+    assert await api.revoke_control(
+        created["job_id"], control=ScheduleControl(origin="user_direct")
+    )
+    await db.close()
+
+
+def test_schedule_workspace_coverage_preserves_nested_denies():
+    upper = [
+        {"path": "/repo", "allow": True},
+        {"path": "/repo/secret", "allow": False},
+    ]
+    lower = [{"path": "/repo", "allow": True}]
+    assert not _workspace_rules_cover(upper, lower, upper_root="/repo", lower_root="/repo")
+
+    narrowed = [
+        {"path": "/repo", "allow": True},
+        {"path": "/repo/secret", "allow": False},
+    ]
+    assert _workspace_rules_cover(upper, narrowed, upper_root="/repo", lower_root="/repo")

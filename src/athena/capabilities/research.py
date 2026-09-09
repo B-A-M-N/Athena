@@ -1760,6 +1760,12 @@ class ResearchCapability:
         unverified_closed_gaps = bundle.get("unverified_closed_gaps")
         if not isinstance(unverified_closed_gaps, (list, tuple)):
             unverified_closed_gaps = ()
+        gaps_raw = bundle.get("gaps")
+        gaps: list[Mapping[str, Any]] = (
+            [item for item in gaps_raw if isinstance(item, Mapping)]
+            if isinstance(gaps_raw, list)
+            else []
+        )
         research_completion = {
             "ready": ready,
             "bundle_id": hashlib.sha256(
@@ -1776,9 +1782,7 @@ class ResearchCapability:
                 and (item.get("gap") or {}).get("metadata", {}).get("requirement_id")
             ],
             "closed_gap_ids": [
-                str((item or {}).get("id"))
-                for item in (bundle.get("gaps") or [])
-                if isinstance(item, Mapping) and item.get("status") == "CLOSED"
+                str((item or {}).get("id")) for item in gaps if item.get("status") == "CLOSED"
             ],
             "evidence_ids": [str(item.get("id")) for item in evidence_records if item.get("id")],
             "required_open_gaps": list(required_open_gaps),

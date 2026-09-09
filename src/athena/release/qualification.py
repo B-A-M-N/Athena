@@ -8,8 +8,10 @@ import re
 import time
 from typing import Any
 
+_RELEASE_PROCESS = re.compile(r"release-check|bench-(?:alacrity|indexing|rendering)")
 
-def benchmark_environment() -> dict[str, Any]:
+
+def benchmark_environment(*, proc_root: str | Path = "/proc") -> dict[str, Any]:
     """Capture the host facts that determine whether timing is meaningful."""
     cpus = max(1, int(os.cpu_count() or 1))
     load1 = 0.0
@@ -33,24 +35,8 @@ def benchmark_environment() -> dict[str, Any]:
                 break
     except (OSError, IndexError, ValueError):
         pass
-    release_instances = 0
-    try:
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                command = (
-                    (entry / "cmdline")
-                    .read_bytes()
-                    .replace(b"\x00", b" ")
-                    .decode("utf-8", "replace")
-                )
-            except OSError:
-                continue
-            if re.search(r"release-check|bench-(?:alacrity|indexing|rendering)", command):
-                release_instances += 1
-    except OSError:
-        pass
+    current_run_id = _valid_run_id(os.environ.get("ATHENA_RELEASE_RUN_ID"))
+    other_run_ids = _other_release_run_ids(Path(proc_root), current_run_id)
     return {
         "captured_at": time.time(),
         "cpus": cpus,
@@ -58,8 +44,50 @@ def benchmark_environment() -> dict[str, Any]:
         "load_per_cpu": round(load1 / cpus, 3),
         "steal_percent": round(steal, 3),
         "memory_available_mb": memory_available_mb,
-        "other_release_instances": max(0, release_instances - 1),
+        "release_run_id": current_run_id,
+        "other_release_instances": len(other_run_ids),
+        "other_release_run_ids": sorted(other_run_ids),
     }
+
+
+def _other_release_run_ids(proc_root: Path, current_run_id: str | None) -> set[str]:
+    """Find distinct active release runs, not individual child processes."""
+    run_ids: set[str] = set()
+    try:
+        entries = proc_root.iterdir()
+    except OSError:
+        return run_ids
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (
+                (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+            )
+        except OSError:
+            continue
+        if not _RELEASE_PROCESS.search(command):
+            continue
+        try:
+            environment = (entry / "environ").read_bytes().split(b"\x00")
+        except OSError:
+            # An unreadable process cannot be proven to be another run.
+            continue
+        values = {
+            item.partition(b"=")[2].decode("utf-8", "replace")
+            for item in environment
+            if item.startswith(b"ATHENA_RELEASE_RUN_ID=")
+        }
+        for run_id in values:
+            valid = _valid_run_id(run_id)
+            if valid and valid != current_run_id:
+                run_ids.add(valid)
+    return run_ids
+
+
+def _valid_run_id(value: str | None) -> str | None:
+    value = str(value or "").strip()
+    return value if value and all(char.isalnum() or char in {"-", "_"} for char in value) else None
 
 
 def qualify_benchmark_environment() -> dict[str, Any]:
