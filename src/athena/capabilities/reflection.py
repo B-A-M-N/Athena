@@ -1125,6 +1125,7 @@ class CapabilityReflection:
             "remediation": None if workspace_exists else "supply an existing workspace root",
         }
         host_inventory = {
+            "resources": _host_resource_inventory(workspace.root if workspace else None),
             "memory_available_bytes": _available_memory_bytes(),
             "container_engines": {
                 name: shutil.which(name) is not None for name in ("docker", "podman")
@@ -1272,6 +1273,57 @@ def _available_memory_bytes() -> int | None:
         return int(pages) * int(page_size)
     except (AttributeError, OSError, ValueError):
         return None
+
+
+def _host_resource_inventory(workspace_root: str | None) -> dict[str, Any]:
+    """Return a small, bounded host-resource passport for planning."""
+    resources: dict[str, Any] = {
+        "cpu_count": os.cpu_count(),
+        "load_average": None,
+        "process_count": None,
+        "workspace_disk": None,
+        "mounts": [],
+    }
+    try:
+        resources["load_average"] = [float(value) for value in os.getloadavg()]
+    except (AttributeError, OSError):
+        pass
+    proc = Path("/proc")
+    try:
+        if proc.is_dir():
+            process_count = 0
+            for entry in proc.iterdir():
+                if entry.name.isdigit():
+                    process_count += 1
+                if process_count >= 4096:
+                    break
+            resources["process_count"] = process_count
+            mounts = proc / "mounts"
+            if mounts.is_file():
+                records: list[dict[str, str]] = []
+                for line in mounts.read_text(encoding="utf-8", errors="replace").splitlines()[:64]:
+                    fields = line.split()
+                    if len(fields) >= 3:
+                        records.append(
+                            {
+                                "target": fields[1][:256],
+                                "filesystem": fields[2][:64],
+                            }
+                        )
+                resources["mounts"] = records
+    except OSError:
+        pass
+    if workspace_root:
+        try:
+            usage = shutil.disk_usage(workspace_root)
+            resources["workspace_disk"] = {
+                "total_bytes": int(usage.total),
+                "free_bytes": int(usage.free),
+                "used_bytes": int(usage.used),
+            }
+        except OSError:
+            pass
+    return resources
 
 
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):
