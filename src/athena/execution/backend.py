@@ -44,6 +44,7 @@ class BackendCapabilities:
 
     supported_runtimes: tuple[str, ...] = ()
     persistent_sessions: bool = False
+    persistent_runtime_state: bool = False
     reattach: bool = False
     filesystem_persistence: bool = False
     network_modes: tuple[str, ...] = ()

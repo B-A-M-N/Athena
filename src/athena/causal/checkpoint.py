@@ -52,6 +52,7 @@ class CheckpointManager:
         if metadata is not None:
             if not isinstance(metadata, dict):
                 raise TypeError("checkpoint metadata must be an object")
+            metadata = _normalize_checkpoint_metadata(metadata)
             metadata_payload = base64.b64encode(
                 json.dumps(metadata, sort_keys=True).encode("utf-8")
             ).decode("ascii")
@@ -65,6 +66,11 @@ class CheckpointManager:
         )
         self._register(manifest, owner=task_id)
         return manifest
+
+    @staticmethod
+    def classify_resources(metadata: dict | None) -> list[dict[str, object]]:
+        """Classify resources for resume without pretending to serialize them."""
+        return _resource_recovery((metadata or {}).get("resources"))
 
     async def inspect(self, checkpoint_id: str) -> dict:
         """Read an immutable checkpoint manifest, including semantic state."""
@@ -366,13 +372,21 @@ class CheckpointManager:
                 _remove_conflicting_path(cur)
                 removed += 1
 
+        workspace_fingerprint = _fingerprint(_tree_manifest(target))
+        resource_recovery = _resource_recovery((manifest.get("metadata") or {}).get("resources"))
         summary = {
             "checkpoint_id": checkpoint_id,
             "workspace_root": str(target),
             "restored_files": restored,
             "removed_files": removed,
-            "workspace_fingerprint": _fingerprint(_tree_manifest(target)),
+            "workspace_fingerprint": workspace_fingerprint,
+            "resource_recovery": resource_recovery,
         }
+        summary["resume_context"] = _resume_context(
+            manifest,
+            resource_recovery=resource_recovery,
+            workspace_fingerprint=workspace_fingerprint,
+        )
         _logger.info("restored checkpoint %s: %s", checkpoint_id, summary)
         return summary
 
@@ -480,6 +494,84 @@ def _write_private_json(path: Path, value: dict) -> None:
         path.chmod(0o600)
     except OSError:
         _logger.debug("could not restrict checkpoint manifest permissions: %s", path)
+
+
+def _normalize_checkpoint_metadata(metadata: dict) -> dict:
+    """Persist reconstructible identities, never live process objects."""
+    normalized = dict(metadata)
+    normalized.setdefault("checkpoint_kind", "reconstructible_workspace")
+    normalized.setdefault("resources", [])
+    normalized["resources"] = _resource_recovery(normalized.get("resources"))
+    return normalized
+
+
+def _resource_recovery(resources: object) -> list[dict[str, object]]:
+    if not isinstance(resources, list):
+        return []
+    result: list[dict[str, object]] = []
+    for raw in resources[:256]:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or raw.get("kind") or "resource")
+        if raw.get("reattachable") and raw.get("identity"):
+            state = "reattached"
+        elif raw.get("reconstructible") or raw.get("recipe") or raw.get("environment_id"):
+            state = "reconstructed"
+        else:
+            state = "lost"
+        item: dict[str, object] = {
+            "name": name,
+            "state": state,
+            "identity": str(raw.get("identity") or ""),
+            "recipe": str(raw.get("recipe") or ""),
+        }
+        # Persist identities and reconstruction receipts, not live handles or
+        # opaque credentials. These fields let a resume coordinator tell the
+        # task what was reattached, reconstructed, or lost before execution.
+        for key in (
+            "environment_id",
+            "workflow_checkpoint",
+            "cwd",
+            "environment_fingerprint",
+            "storage_state_ref",
+            "database_checkpoint_receipt",
+            "world_state_revision",
+        ):
+            value = raw.get(key)
+            if value not in (None, ""):
+                item[key] = value
+        result.append(item)
+    return result
+
+
+def _resume_context(
+    manifest: dict,
+    *,
+    resource_recovery: list[dict[str, object]],
+    workspace_fingerprint: str,
+) -> dict[str, object]:
+    metadata = manifest.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    context: dict[str, object] = {
+        "checkpoint_id": manifest.get("id"),
+        "task_id": manifest.get("task_id"),
+        "checkpoint_kind": metadata.get("checkpoint_kind", "workspace_files"),
+        "workspace_fingerprint": workspace_fingerprint,
+        "resources": resource_recovery,
+    }
+    for key in (
+        "dependency_environment_id",
+        "workflow_checkpoint",
+        "cwd",
+        "environment_fingerprint",
+        "browser_storage_state_ref",
+        "database_checkpoint_receipt",
+        "world_state_revision",
+    ):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            context[key] = value
+    return context
 
 
 async def _run_worker(operation: str, **kwargs) -> dict:

@@ -174,7 +174,7 @@ connection.close()
 # process and handles each authenticated socket connection in its own thread,
 # so a blocked worker cannot prevent describe/shutdown from being serviced.
 _REMOTE_PYTHON_SUPERVISOR_V2 = r"""
-import json, os, signal, socket, subprocess, sys, threading, time
+import base64, hashlib, json, os, re, signal, socket, subprocess, sys, threading, time
 
 socket_path, token_path, metadata_path, session_id, task_id, runtime, remote_cwd = sys.argv[1:]
 if runtime not in {"python", "node", "shell"}:
@@ -187,10 +187,157 @@ def identity(pid):
     except (OSError, IndexError):
         return f"{pid}:unknown"
 
-WORKER = r'''import contextlib, json, os, subprocess, sys, traceback
+WORKER = r'''import contextlib, json, os, pty, queue, secrets, signal, subprocess, sys, termios, threading, time, traceback
 runtime = sys.argv[1] if len(sys.argv) > 1 else "python"
 remote_cwd = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
 state = {"__name__": "__main__"}
+
+NODE_SOURCE = r"const vm=require('vm');const context=vm.createContext({});function send(o){process.stdout.write(JSON.stringify(o)+'\n');}context.console={log:(...a)=>send({type:'out',data:a.map(String).join(' ')}),error:(...a)=>send({type:'err',data:a.map(String).join(' ')}),warn:(...a)=>send({type:'err',data:a.map(String).join(' ')})};context.globalThis=context;context.process={env:Object.freeze({...process.env})};let buf=Buffer.alloc(0);function consume(){const nl=buf.indexOf(10);if(nl===-1)return false;const length=parseInt(buf.slice(0,nl).toString('utf8').trim(),10);if(isNaN(length)||buf.length<nl+1+length)return false;const payload=buf.slice(nl+1,nl+1+length).toString('utf8');buf=buf.slice(nl+1+length);let message;try{message=JSON.parse(payload);}catch(_){send({type:'err',data:'invalid node execution request'});send({type:'done',ok:false});return true;}let ok=true;try{new vm.Script(String(message.source||'')).runInContext(context,{timeout:10000});}catch(error){ok=false;send({type:'err',data:error&&error.stack?error.stack:String(error)});}send({type:'done',ok});return true;}process.stdin.on('data',(chunk)=>{buf=Buffer.concat([buf,chunk]);while(consume()){} });"
+
+node_process = None
+shell_process = None
+shell_master = None
+shell_output = queue.Queue()
+shell_threads = []
+
+def _read_shell(stream, kind):
+    try:
+        for line in iter(stream.readline, ''):
+            if not line:
+                break
+            shell_output.put((kind, line))
+    except (OSError, ValueError):
+        pass
+
+def _read_pty(fd):
+    try:
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            shell_output.put(chunk.decode("utf-8", "replace"))
+    except OSError:
+        pass
+
+def ensure_runtime():
+    global node_process, shell_process, shell_master, shell_threads
+    if runtime == "python":
+        return None
+    if runtime == "node":
+        if node_process is None or node_process.poll() is not None:
+            node_process = subprocess.Popen(
+                ["node", "-e", NODE_SOURCE], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=remote_cwd,
+                start_new_session=True, text=True, encoding="utf-8", errors="replace",
+                bufsize=0,
+            )
+        return node_process
+    if shell_process is None or shell_process.poll() is not None:
+        shell_master, slave = pty.openpty()
+        terminal = termios.tcgetattr(slave)
+        terminal[3] &= ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, terminal)
+        shell_env = os.environ.copy()
+        shell_env.update({"PS1": "", "PS2": "", "TERM": "dumb"})
+        shell_process = subprocess.Popen(
+            ["bash", "--norc", "--noprofile", "-i"], stdin=slave,
+            stdout=slave, stderr=slave, cwd=remote_cwd, env=shell_env,
+            start_new_session=True, close_fds=True,
+        )
+        os.close(slave)
+        shell_thread = threading.Thread(target=_read_pty, args=(shell_master,), daemon=True)
+        shell_threads = [shell_thread]
+        shell_thread.start()
+        time.sleep(0.05)
+        while True:
+            try:
+                shell_output.get_nowait()
+            except queue.Empty:
+                break
+    return shell_process
+
+def stop_runtime():
+    global node_process, shell_process, shell_master
+    process = node_process if runtime == "node" else shell_process
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    if runtime == "node":
+        node_process = None
+    else:
+        shell_process = None
+        if shell_master is not None:
+            try:
+                os.close(shell_master)
+            except OSError:
+                pass
+            shell_master = None
+
+def run_node(source):
+    process = ensure_runtime()
+    if process is None or process.stdin is None or process.stdout is None:
+        return [], ["node worker unavailable"], False
+    payload = json.dumps({"source": source}, separators=(",", ":"))
+    process.stdin.write(str(len(payload)) + "\n" + payload)
+    process.stdin.flush()
+    out, err, ok = [], [], True
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            return out, err + ["node worker exited"], False
+        frame = json.loads(line)
+        if frame.get("type") == "done":
+            ok = bool(frame.get("ok", True))
+            return out, err, ok
+        if frame.get("type") == "out": out.append(str(frame.get("data") or ""))
+        elif frame.get("type") == "err": err.append(str(frame.get("data") or ""))
+
+def run_shell(source):
+    process = ensure_runtime()
+    if process is None or shell_master is None:
+        return [], ["shell worker unavailable"], False
+    marker = "__ATHENA_REMOTE_SHELL_" + secrets.token_hex(16) + "__"
+    wrapped = (
+        "{\n" + source + "\n} ; athena_rc=$?\n"
+        + "printf '%s%s\n' '" + marker + "' \"$athena_rc\"\n"
+    )
+    os.write(shell_master, wrapped.encode("utf-8"))
+    out = []
+    pending = ""
+    deadline = time.monotonic() + 30.0
+    while True:
+        try:
+            chunk = shell_output.get(timeout=0.2)
+        except queue.Empty:
+            if process.poll() is not None:
+                return out, ["shell worker exited"], False
+            if time.monotonic() >= deadline:
+                return out, ["shell worker completion marker timed out"], False
+            continue
+        pending += chunk
+        marker_at = pending.find(marker)
+        if marker_at >= 0:
+            before = pending[:marker_at]
+            status_line = pending[marker_at + len(marker):].split("\n", 1)[0]
+            try:
+                return out + [before], [], int(status_line.strip()) == 0
+            except ValueError:
+                return out + [before], ["shell worker returned an invalid status"], False
+
 while True:
     line = sys.stdin.readline()
     if not line:
@@ -218,12 +365,10 @@ while True:
             ns = dict(state)
             exec(source, ns)
             state.update({k: v for k, v in ns.items() if not k.startswith("__")})
+        elif runtime == "node":
+            out, err, ok = run_node(source)
         else:
-            program = ["node", "-e", source] if runtime == "node" else ["bash", "--norc", "--noprofile", "-c", source]
-            completed = subprocess.run(program, cwd=remote_cwd, capture_output=True, text=True, check=False)
-            out.append(completed.stdout or "")
-            err.append(completed.stderr or "")
-            ok = completed.returncode == 0
+            out, err, ok = run_shell(source)
     except BaseException:
         ok = False
         err.append(traceback.format_exc())
@@ -235,6 +380,7 @@ while True:
         sys.stdout.write(json.dumps({"type": "err", "data": "".join(err)}) + "\n")
     sys.stdout.write(json.dumps({"type": "done", "ok": ok}) + "\n")
     sys.stdout.flush()
+stop_runtime()
 '''
 
 os.makedirs(os.path.dirname(socket_path), exist_ok=True)
@@ -279,6 +425,140 @@ server.settimeout(0.2)
 
 def send(connection, value):
     connection.sendall((json.dumps(value, separators=(",", ":")) + "\n").encode())
+
+def dependency_inventory(target, manager, requested_name):
+    target = os.path.realpath(target)
+    packages = []
+    if manager == "python":
+        for root, _, files in os.walk(target):
+            for filename in files:
+                if not filename.endswith(".dist-info/RECORD") and filename != "RECORD":
+                    continue
+                record_path = os.path.join(root, filename)
+                if not record_path.endswith(".dist-info/RECORD"):
+                    continue
+                dist_info = os.path.basename(os.path.dirname(record_path))
+                package_name = dist_info[:-10].rsplit("-", 1)[0]
+                package_version = dist_info[:-10].rsplit("-", 1)[-1]
+                entries = []
+                with open(record_path, encoding="utf-8") as handle:
+                    for line in handle:
+                        parts = line.rstrip("\n").split(",", 2)
+                        if len(parts) >= 2 and parts[1].startswith("sha256="):
+                            entries.append((parts[0], parts[1]))
+                entries.sort()
+                digest = hashlib.sha256()
+                for path, record_hash in entries:
+                    digest.update(path.encode())
+                    digest.update(b"\0")
+                    digest.update(record_hash.encode())
+                    digest.update(b"\n")
+                if package_name.casefold().replace("-", "_") == requested_name.casefold().replace("-", "_"):
+                    packages.append({
+                        "name": package_name,
+                        "resolved_version": package_version,
+                        "record_hashes": [
+                            path + ":" + record_hash for path, record_hash in entries[:10000]
+                        ],
+                        "record_entry_count": len(entries),
+                        "record_manifest_sha256": digest.hexdigest(),
+                    })
+    elif manager == "node":
+        def file_hash(path):
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        files = []
+        for root, _, names in os.walk(target):
+            for filename in names:
+                path = os.path.realpath(os.path.join(root, filename))
+                if path.startswith(target + os.sep):
+                    files.append((os.path.relpath(path, target), file_hash(path)))
+        files.sort()
+        digest = hashlib.sha256()
+        for path, file_digest in files:
+            digest.update(path.encode())
+            digest.update(b"\0")
+            digest.update(file_digest.encode())
+            digest.update(b"\n")
+        package_json = os.path.join(target, "node_modules", *requested_name.split("/"), "package.json")
+        package = {}
+        if os.path.isfile(package_json):
+            with open(package_json, encoding="utf-8") as handle:
+                package = json.load(handle)
+        package_lock = os.path.join(target, "package-lock.json")
+        packages.append({
+            "name": requested_name,
+            "resolved_version": str(package.get("version") or ""),
+            "record_entry_count": len(files),
+            "record_manifest_sha256": digest.hexdigest(),
+            "package_lock_sha256": file_hash(package_lock) if os.path.isfile(package_lock) else "",
+        })
+    canonical = {
+        "manager": manager,
+        "target": target,
+        "packages": packages,
+    }
+    canonical["environment_fingerprint"] = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return canonical
+
+def dependency_operation(request):
+    manager = str(request.get("manager") or "")
+    name = str(request.get("name") or "")
+    version = str(request.get("version") or "")
+    operation = str(request.get("operation") or "inventory")
+    environment_id = str(request.get("environment_id") or "")
+    if manager not in {"python", "node"}:
+        return {"ok": False, "error": "unsupported dependency manager"}
+    if not re.fullmatch(r"(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]{1,128}", name):
+        return {"ok": False, "error": "invalid dependency name"}
+    if environment_id and not re.fullmatch(r"[0-9a-f]{64}", environment_id):
+        return {"ok": False, "error": "invalid dependency environment id"}
+    if len(version) > 128 or any(char in version for char in "\x00\n\r"):
+        return {"ok": False, "error": "invalid dependency version"}
+    target = os.path.join(
+        remote_cwd, ".athena", "environments", environment_id or "legacy", manager
+    )
+    os.makedirs(target, mode=0o700, exist_ok=True)
+    if operation == "install":
+        package = name + ("==" + version if manager == "python" and version else "")
+        if manager == "node" and version:
+            package += "@" + version
+        command = (
+            [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+             "--no-input", "--target", target, package]
+            if manager == "python"
+            else ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund",
+                  "--prefix", target, package]
+        )
+        completed = subprocess.run(
+            command, cwd=remote_cwd, capture_output=True, text=True, check=False
+        )
+        if completed.returncode != 0:
+            return {
+                "ok": False,
+                "error": (completed.stderr or completed.stdout or "dependency install failed")[-4000:],
+                "exit_code": completed.returncode,
+                "target": target,
+            }
+    inventory = dependency_inventory(target, manager, name)
+    expected = request.get("expected")
+    if operation == "verify" and isinstance(expected, dict):
+        package = inventory.get("packages", [{}])
+        package = package[0] if isinstance(package, list) and package else {}
+        for key in ("environment_fingerprint", "record_entry_count", "record_manifest_sha256"):
+            actual = inventory.get(key, package.get(key) if isinstance(package, dict) else None)
+            if key in expected and expected.get(key) not in (None, "") and actual != expected.get(key):
+                return {"ok": False, "error": "remote dependency manifest mismatch", **inventory}
+    return {"ok": True, "operation": operation, **inventory}
 
 def ensure_worker(env=None):
     global worker, worker_identity
@@ -381,6 +661,9 @@ def handle(connection):
                     "worker_pid": current.pid if current is not None else None,
                 },
             )
+            return
+        if operation == "dependency":
+            send(connection, {"kind": "response", **dependency_operation(auth)})
             return
         while True:
             length_line = stream.readline()
@@ -588,9 +871,9 @@ class _SSHSession:
 class SSHBackend(ExecutionBackend):
     """Run persistent Python, shell, and Node workers over a fixed SSH profile."""
 
-    # Python sessions are owned by the authenticated remote supervisor and
-    # can be adopted after Athena restarts. Direct shell/Node sessions remain
-    # process-lifetime resources until their supervisor protocol is available.
+    # All runtime sessions are owned by the authenticated remote supervisor and
+    # can be adopted after Athena restarts. The supervisor keeps a single
+    # runtime worker alive for the life of the session.
     supports_reattach = True
 
     def __init__(
@@ -620,9 +903,9 @@ class SSHBackend(ExecutionBackend):
             secret_materialization=True,
             interactive_stdin=True,
             process_signals=True,
-            # DependencyCapability persists and verifies lock targets through
-            # the service filesystem; SSH has no remote inventory RPC yet.
-            dependency_installation=(),
+            # DependencyCapability routes these managers through the
+            # authenticated remote supervisor inventory/install RPC.
+            dependency_installation=("python", "node"),
             runtime_capabilities={
                 "python": {
                     "persistent_sessions": True,
@@ -634,7 +917,7 @@ class SSHBackend(ExecutionBackend):
                 },
                 "node": {
                     "persistent_sessions": True,
-                    "persistent_runtime_state": False,
+                    "persistent_runtime_state": True,
                     "reattach": True,
                     "secret_materialization": True,
                     "interactive_stdin": True,
@@ -642,7 +925,7 @@ class SSHBackend(ExecutionBackend):
                 },
                 "shell": {
                     "persistent_sessions": True,
-                    "persistent_runtime_state": False,
+                    "persistent_runtime_state": True,
                     "reattach": True,
                     "secret_materialization": True,
                     "interactive_stdin": True,
@@ -851,6 +1134,117 @@ class SSHBackend(ExecutionBackend):
         if not isinstance(value, Mapping) or value.get("kind") != "response":
             raise RuntimeError("remote supervisor describe response is not authoritative")
         return value
+
+    def _remote_dependency(
+        self,
+        *,
+        socket_path: str,
+        token_path: str,
+        key_path: str | None,
+        request: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Call the authenticated remote dependency RPC with JSON only."""
+        encoded_request = base64.b64encode(
+            json.dumps(dict(request), separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        client = (
+            "import base64,json,socket,sys; "
+            "p,t,b=sys.argv[1:]; token=open(t,encoding='utf-8').read().strip(); "
+            "payload=json.loads(base64.b64decode(b)); payload.update({'token':token,'op':'dependency'}); "
+            "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(p); "
+            "s.sendall((json.dumps(payload,separators=(',',':'))+'\\n').encode()); "
+            "print(s.makefile('rb').readline().decode().strip()); s.close()"
+        )
+        encoded = base64.b64encode(client.encode("utf-8")).decode("ascii")
+        launcher = f"import base64;exec(base64.b64decode({encoded!r}))"
+        command = (
+            f"python3 -u -c {shlex.quote(launcher)} "
+            f"{self._remote_arg(socket_path)} {self._remote_arg(token_path)} "
+            f"{shlex.quote(encoded_request)}"
+        )
+        completed = self._run_remote_command(
+            command,
+            key_path=key_path,
+            check=False,
+            timeout=max(self.profile.connect_timeout, 30.0),
+        )
+        try:
+            response = json.loads((completed.stdout or "").strip().splitlines()[-1])
+        except (IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "remote dependency RPC response is invalid: "
+                + (completed.stderr or completed.stdout or "")[-500:]
+            ) from exc
+        if not isinstance(response, Mapping) or response.get("kind") != "response":
+            raise RuntimeError("remote dependency RPC response is not authoritative")
+        return response
+
+    async def dependency_operation(
+        self,
+        *,
+        task_id: str,
+        manager: str,
+        name: str,
+        version: str = "",
+        operation: str = "inventory",
+        environment_id: str = "",
+        expected: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Install or verify a remote dependency through the supervisor RPC."""
+        if operation not in {"install", "inventory", "verify"}:
+            raise ValueError("unsupported SSH dependency operation")
+        key_path = await run_blocking(self._credential_path, task_id)
+        session_id = f"ssh_dependency_{task_id}_{secrets.token_hex(8)}"
+        remote_cwd = self._target_root(task_id)
+        metadata: Mapping[str, str] | None = None
+        control = _SSHSession(
+            id=session_id,
+            task_id=task_id,
+            runtime="python",
+            remote_cwd=remote_cwd,
+            worker=None,
+            host=self.profile.host,
+            start_identity=session_id,
+            key_path=key_path,
+        )
+        try:
+            metadata = await run_blocking(
+                self._start_remote_python_supervisor,
+                task_id=task_id,
+                session_id=session_id,
+                remote_cwd=remote_cwd,
+                key_path=key_path,
+                runtime="python",
+            )
+            control.remote_socket = metadata["socket_path"]
+            control.remote_token_path = metadata["token_path"]
+            control.remote_metadata_path = metadata.get("metadata_path")
+            control.remote_controller_pid = metadata.get("pid")
+            return await run_blocking(
+                self._remote_dependency,
+                socket_path=metadata["socket_path"],
+                token_path=metadata["token_path"],
+                key_path=key_path,
+                request={
+                    "operation": operation,
+                    "manager": manager,
+                    "name": name,
+                    "version": version,
+                    "environment_id": environment_id,
+                    "expected": dict(expected or {}),
+                },
+            )
+        finally:
+            if metadata is not None:
+                try:
+                    await run_blocking(self._remote_shutdown, control)
+                except Exception:  # noqa: BLE001 - preserve the primary RPC result
+                    pass
+            if self.profile.identity_file is None and key_path:
+                try:
+                    os.unlink(key_path)
+                except FileNotFoundError:
+                    pass
 
     def _remote_interrupt(self, session: _SSHSession) -> bool:
         if not session.remote_socket or not session.remote_token_path:

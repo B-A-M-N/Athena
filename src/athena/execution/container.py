@@ -191,6 +191,7 @@ class ContainerBackend(ExecutionBackend):
         return BackendCapabilities(
             supported_runtimes=("node", "python", "shell"),
             persistent_sessions=True,
+            persistent_runtime_state=True,
             reattach=True,
             filesystem_persistence=True,
             network_modes=("allow", "deny", "restricted"),

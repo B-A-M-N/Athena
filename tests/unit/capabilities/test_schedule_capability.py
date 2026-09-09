@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
-from athena.capabilities.schedule import ScheduleAPI, ScheduleControl, _workspace_rules_cover
+from athena.capabilities.schedule import (
+    ScheduleAPI,
+    ScheduleControl,
+    _grant_allows,
+    _workspace_rules_cover,
+)
 from athena.scheduler.scheduler import TriggerType
 from athena.state.database import Database
 from athena.state.schedules import ScheduleStore
@@ -185,6 +193,180 @@ async def test_operator_grant_binds_schedule_control_to_task_without_bearer_toke
     assert await api.revoke_control(
         created["job_id"], control=ScheduleControl(origin="user_direct")
     )
+    await db.close()
+
+
+async def test_task_bound_grant_enforces_operation_scope_and_revoke_preserves_creator(monkeypatch):
+    db, api = await _api()
+    owner = {
+        "task_id": "task-a",
+        "session_id": "session-a",
+        "project_id": "repo-a",
+        "principal_id": "principal-a",
+    }
+    workspace = WorkspaceSpec(id="repo-a", root="/repo")
+    authority = CapabilityPolicy(effects=frozenset({"READ_LOCAL", "WRITE_LOCAL"}))
+    created = await api.create(
+        name="delegated",
+        objective="run",
+        trigger={"type": "interval", "interval_seconds": 60},
+        owner=owner,
+        workspace=workspace,
+        capability_policy=authority,
+        resource_budget=ResourceBudget(),
+    )
+    job_id = created["job_id"]
+    await api.grant_control(
+        job_id,
+        control=ScheduleControl(origin="user_direct"),
+        task_id="task-b",
+        principal_id="principal-a",
+        project_id="repo-a",
+        operations=("inspect",),
+    )
+    delegated = ScheduleControl(
+        origin="model",
+        task_id="task-b",
+        session_id="session-b",
+        principal_id="principal-a",
+        project_id="repo-a",
+        capability_policy=authority,
+        resource_budget=ResourceBudget(),
+        workspace=workspace,
+    )
+
+    assert await api.inspect(job_id, owner={"task_id": "task-b"}, control=delegated)
+    assert await api.inspect(job_id, control=delegated)
+    unauthorized = replace(delegated, task_id="task-c")
+    assert await api.inspect(job_id, control=unauthorized) is None
+    for operation in ("enable", "disable", "delete", "run"):
+        with pytest.raises(PermissionError):
+            await getattr(api, operation)(job_id, owner={"task_id": "task-b"}, control=delegated)
+    with pytest.raises(PermissionError):
+        await api.update(job_id, owner={"task_id": "task-b"}, control=delegated, objective="nope")
+
+    assert await api.revoke_control(job_id, control=ScheduleControl(origin="user_direct"))
+    assert await api.inspect(job_id, owner={"task_id": "task-b"}, control=delegated) is None
+    assert await api.run(job_id, owner={"task_id": "task-b"}, control=delegated) is None
+    assert await api.enable(job_id, owner={"task_id": "task-b"}, control=delegated) is False
+    assert await api.disable(job_id, owner={"task_id": "task-b"}, control=delegated) is False
+
+    creator = ScheduleControl(
+        origin="model",
+        task_id="task-a",
+        session_id="session-a",
+        principal_id="principal-a",
+        project_id="repo-a",
+        capability_policy=authority,
+        resource_budget=ResourceBudget(),
+        workspace=workspace,
+    )
+    assert await api.disable(job_id, owner=owner, control=creator)
+
+    run_job = (
+        await api.create(
+            name="run-only",
+            objective="run",
+            trigger={"type": "interval", "interval_seconds": 60},
+            owner=owner,
+            workspace=workspace,
+            capability_policy=authority,
+            resource_budget=ResourceBudget(),
+        )
+    )["job_id"]
+    await api.grant_control(
+        run_job,
+        control=ScheduleControl(origin="user_direct"),
+        task_id="task-c",
+        operations=("run",),
+    )
+    run_control = replace(delegated, task_id="task-c")
+
+    async def fake_run_now(_job_id):
+        return "occurrence-run-only"
+
+    monkeypatch.setattr(api._scheduler, "run_now", fake_run_now, raising=False)
+    assert (
+        await api.run(run_job, owner={"task_id": "task-c"}, control=run_control)
+        == "occurrence-run-only"
+    )
+    with pytest.raises(PermissionError):
+        await api.update(
+            run_job,
+            owner={"task_id": "task-c"},
+            control=run_control,
+            objective="must remain denied",
+        )
+    await db.close()
+
+
+async def test_grant_expiry_is_timezone_aware_and_malformed_expiry_is_atomic():
+    db, api = await _api()
+    owner = {"task_id": "task-a", "session_id": "session-a"}
+    created = await api.create(
+        name="expiry",
+        objective="run",
+        trigger={"type": "interval", "interval_seconds": 60},
+        owner=owner,
+    )
+    job_id = created["job_id"]
+    before = await api.inspect(job_id, owner=owner)
+    assert before is not None
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await api.grant_control(
+            job_id,
+            control=ScheduleControl(origin="user_direct"),
+            task_id="task-b",
+            expires_at="2026-09-09T11:00:00",
+        )
+    after = await api.inspect(job_id, owner=owner)
+    assert after is not None
+    assert after["metadata"].get("_delegated_control_grants") is None
+
+    await api.grant_control(
+        job_id,
+        control=ScheduleControl(origin="user_direct"),
+        task_id="task-offset",
+        operations=("inspect",),
+        expires_at="2026-09-09T11:00:00+02:00",
+    )
+    raw_job = await api._scheduler._store.get_job_id(job_id)
+    assert raw_job["metadata"]["_delegated_control_grants"][-1]["expires_at"] == (
+        "2026-09-09T09:00:00+00:00"
+    )
+
+    grant = {
+        "operations": ["inspect"],
+        "expires_at": "2026-09-09T11:00:00+02:00",
+        "revoked": False,
+    }
+    before_offset = datetime(2026, 9, 9, 8, 30, tzinfo=timezone.utc)
+    after_offset = datetime(2026, 9, 9, 9, 30, tzinfo=timezone.utc)
+    assert _grant_allows(grant, operation="inspect", now=before_offset)
+    assert not _grant_allows(grant, operation="inspect", now=after_offset)
+
+    expired_job = (
+        await api.create(
+            name="expired",
+            objective="run",
+            trigger={"type": "interval", "interval_seconds": 60},
+            owner=owner,
+        )
+    )["job_id"]
+    await api.grant_control(
+        expired_job,
+        control=ScheduleControl(origin="user_direct"),
+        task_id="task-expired",
+        operations=("run",),
+        expires_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+    )
+    expired_control = ScheduleControl(
+        origin="model",
+        task_id="task-expired",
+        session_id="session-expired",
+    )
+    assert await api.inspect(expired_job, control=expired_control) is None
+    assert await api.run(expired_job, control=expired_control) is None
     await db.close()
 
 

@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "packages": {
+    "demo": {
+      "manager": "python",
+      "name": "demo",
+      "record_hashes": ["demo.py:sha256=abc"],
+      "resolved_version": "1.0.0"
+    }
+  }
+}

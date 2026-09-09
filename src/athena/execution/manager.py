@@ -195,6 +195,10 @@ class ExecutionManager:
             }
         raise ValueError(f"unknown execution backend: {name!r}")
 
+    def backend(self, name: str) -> ExecutionBackend | None:
+        """Return the selected backend for structured backend RPCs."""
+        return self._selected_backend(name)
+
     def available_runtimes(self) -> list[str]:
         return sorted(self._runtimes.keys())
 

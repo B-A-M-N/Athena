@@ -86,6 +86,14 @@ def _parse_datetime(value: Any, field: str) -> datetime:
     raise ValueError(f"{field} must be an ISO-8601 datetime")
 
 
+def _parse_control_grant_expiry(value: Any) -> datetime:
+    """Parse a grant expiry without losing timezone semantics."""
+    expiry = _parse_datetime(value, "expires_at")
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        raise ValueError("expires_at must be a timezone-aware ISO-8601 datetime")
+    return expiry.astimezone(timezone.utc)
+
+
 def _trigger_from_metadata(job: Mapping[str, Any]) -> dict[str, Any]:
     metadata = job.get("metadata")
     if isinstance(metadata, dict):
@@ -110,14 +118,31 @@ def _owner_visible(
     stored = metadata.get("_owner") if isinstance(metadata, dict) else None
     if not isinstance(stored, dict) or not stored:
         return control is None or control.origin != "model"
+    if control is not None and control.origin == "model":
+        grants = _stored_control_grants(job)
+        if owner is None:
+            return any(
+                _grant_allows(grant, operation="inspect", now=utcnow())
+                and _grant_matches_control(grant, control)
+                for grant in grants
+            )
+        for grant in grants:
+            if (
+                grant.get("grantee_task_id") == control.task_id
+                and _grant_allows(grant, operation="inspect", now=utcnow())
+                and _grant_matches_control(grant, control)
+            ):
+                return True
+        scoped = {key: value for key, value in dict(owner).items() if value}
+        if not bool(scoped) or not all(stored.get(key) == value for key, value in scoped.items()):
+            return False
+        return any(
+            _grant_allows(grant, operation="inspect", now=utcnow())
+            and _grant_matches_control(grant, control)
+            for grant in grants
+        )
     if owner is None:
         return True
-    if control is not None and control.origin == "model":
-        grant = _stored_control_grant(job)
-        if grant is not None and grant.get("grantee_task_id") == control.task_id:
-            return True
-        scoped = {key: value for key, value in dict(owner).items() if value}
-        return bool(scoped) and all(stored.get(key) == value for key, value in scoped.items())
     return any(
         value and stored.get(key) == value
         for key, value in dict(owner).items()
@@ -133,12 +158,57 @@ def _authority_digest(authority: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
-def _stored_control_grant(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
+def _stored_control_grants(job: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     metadata = job.get("metadata")
     if not isinstance(metadata, Mapping):
-        return None
-    grant = metadata.get("_control_grant")
-    return grant if isinstance(grant, Mapping) else None
+        return ()
+    grants: list[Mapping[str, Any]] = []
+    creator = metadata.get("_control_grant")
+    if isinstance(creator, Mapping) and creator.get("control_scope") != "explicit_grant":
+        grants.append(creator)
+    delegated = metadata.get("_delegated_control_grants")
+    if isinstance(delegated, (list, tuple)):
+        grants.extend(item for item in delegated if isinstance(item, Mapping))
+    # Jobs written by the pre-delegation implementation stored the delegated
+    # grant in the creator slot. Keep those jobs readable while new grants use
+    # the separate delegated collection.
+    if not grants and isinstance(creator, Mapping):
+        grants.append(creator)
+    return tuple(grants)
+
+
+def _grant_allows(grant: Mapping[str, Any], *, operation: str, now: datetime) -> bool:
+    if bool(grant.get("revoked")):
+        return False
+    operations = {str(value) for value in grant.get("operations") or ()}
+    if operation not in operations:
+        return False
+    raw_expiry = grant.get("expires_at")
+    if raw_expiry is not None:
+        try:
+            expiry = _parse_control_grant_expiry(raw_expiry)
+        except ValueError:
+            return False
+        if expiry <= now.astimezone(timezone.utc):
+            return False
+    return True
+
+
+def _grant_matches_control(grant: Mapping[str, Any], control: ScheduleControl) -> bool:
+    authorized_by_token = bool(control.grant_token and control.grant_token == grant.get("token"))
+    if not authorized_by_token:
+        expected_task = grant.get("grantee_task_id") or grant.get("creator_task_id")
+        if expected_task and expected_task != control.task_id:
+            return False
+        if (
+            grant.get("creator_session_id")
+            and grant.get("creator_session_id") != control.session_id
+        ):
+            return False
+    for key in ("principal_id", "project_id"):
+        if grant.get(key) and grant.get(key) != getattr(control, key):
+            return False
+    return True
 
 
 def _policy_covers(stored: Mapping[str, Any], current: Any) -> bool:
@@ -176,32 +246,19 @@ def _authority_covers(
         return True
     if control.origin != "model" or owner is None:
         return False
-    grant = _stored_control_grant(job)
+    now = utcnow()
+    grants = _stored_control_grants(job)
+    grant = next(
+        (
+            candidate
+            for candidate in grants
+            if _grant_allows(candidate, operation=operation, now=now)
+            and _grant_matches_control(candidate, control)
+        ),
+        None,
+    )
     if grant is None:
         return False
-    authorized_by_token = bool(control.grant_token and control.grant_token == grant.get("token"))
-    if authorized_by_token:
-        expires = grant.get("expires_at")
-        if grant.get("revoked") or (expires and str(expires) <= utcnow().isoformat()):
-            return False
-        if operation not in set(grant.get("operations") or ("control",)):
-            return False
-        for key in ("principal_id", "project_id"):
-            if grant.get(key) and grant.get(key) != getattr(control, key):
-                return False
-    else:
-        if grant.get("grantee_task_id"):
-            if grant.get("grantee_task_id") != control.task_id:
-                return False
-        elif grant.get("creator_task_id") and grant.get("creator_task_id") != control.task_id:
-            return False
-        if (
-            grant.get("creator_session_id")
-            and grant.get("creator_session_id") != control.session_id
-        ):
-            return False
-        if grant.get("principal_id") and grant.get("principal_id") != control.principal_id:
-            return False
     metadata = job.get("metadata")
     stored_authority = (
         metadata.get("_authority_snapshot") if isinstance(metadata, Mapping) else None
@@ -701,7 +758,15 @@ class ScheduleAPI:
             "creator_session_id": owner_data.get("session_id"),
             "principal_id": owner_data.get("principal_id"),
             "project_id": owner_data.get("project_id"),
-            "operations": ["update", "enable", "disable", "delete", "run", "control"],
+            "operations": [
+                "inspect",
+                "update",
+                "enable",
+                "disable",
+                "delete",
+                "run",
+                "control",
+            ],
             "expires_at": None,
             "revoked": False,
             "authority_digest": authority["authority_digest"],
@@ -782,7 +847,13 @@ class ScheduleAPI:
         operations: tuple[str, ...] = ("inspect", "update", "enable", "disable", "run"),
         expires_at: str | None = None,
     ) -> dict[str, Any] | None:
-        """Issue a bounded bearer grant without changing schedule authority."""
+        """Issue a bounded task grant without changing schedule authority."""
+        normalized_operations = sorted(
+            {str(item).strip() for item in operations if str(item).strip()} | {"inspect"}
+        )
+        normalized_expiry = (
+            _parse_control_grant_expiry(expires_at).isoformat() if expires_at is not None else None
+        )
         job = await self._scheduler._store.get_job_id(job_id)
         if job is None or not _owner_visible(job, owner, control=control):
             return None
@@ -797,14 +868,23 @@ class ScheduleAPI:
             "principal_id": principal_id,
             "project_id": project_id,
             "grantee_task_id": task_id,
-            "operations": sorted(set(str(item) for item in operations) | {"inspect"}),
-            "expires_at": expires_at,
+            "operations": normalized_operations,
+            "expires_at": normalized_expiry,
             "revoked": False,
             "authority_digest": authority.get("authority_digest"),
             "control_scope": "explicit_grant",
         }
         metadata = dict(job.get("metadata") or {})
-        metadata["_control_grant"] = grant
+        delegated = [
+            dict(item)
+            for item in metadata.get("_delegated_control_grants", ())
+            if isinstance(item, Mapping)
+        ]
+        legacy = metadata.get("_control_grant")
+        if isinstance(legacy, Mapping) and legacy.get("control_scope") == "explicit_grant":
+            delegated.append(dict(legacy))
+        delegated.append(grant)
+        metadata["_delegated_control_grants"] = delegated
         await self._scheduler._store.upsert_job(
             job_id,
             str(job.get("name") or job_id),
@@ -834,11 +914,24 @@ class ScheduleAPI:
         if control is not None and control.origin == "model":
             raise PermissionError("only an operator or trusted orchestrator may revoke control")
         metadata = dict(job.get("metadata") or {})
-        grant = dict(metadata.get("_control_grant") or {})
-        if not grant:
+        delegated = [
+            dict(item)
+            for item in metadata.get("_delegated_control_grants", ())
+            if isinstance(item, Mapping)
+        ]
+        legacy = metadata.get("_control_grant")
+        if isinstance(legacy, Mapping) and legacy.get("control_scope") == "explicit_grant":
+            delegated.append(dict(legacy))
+        if not delegated:
             return False
-        grant["revoked"] = True
-        metadata["_control_grant"] = grant
+        changed = False
+        for grant in delegated:
+            if not grant.get("revoked"):
+                grant["revoked"] = True
+                changed = True
+        if not changed:
+            return False
+        metadata["_delegated_control_grants"] = delegated
         await self._scheduler._store.upsert_job(
             job_id,
             str(job.get("name") or job_id),
@@ -934,11 +1027,17 @@ class ScheduleAPI:
                 raise PermissionError("schedule authority cannot be narrowed")
             current = _current_authority(control, owner=owner or {})
             metadata["_authority_snapshot"] = _intersect_authority(existing_authority, current)
+            digest = metadata["_authority_snapshot"]["authority_digest"]
             metadata["_control_grant"] = {
                 **dict(metadata.get("_control_grant") or {}),
-                "authority_digest": metadata["_authority_snapshot"]["authority_digest"],
+                "authority_digest": digest,
                 "control_scope": "narrowed_to_caller",
             }
+            metadata["_delegated_control_grants"] = [
+                {**dict(grant), "authority_digest": digest}
+                for grant in metadata.get("_delegated_control_grants", ())
+                if isinstance(grant, Mapping)
+            ]
         if delivery is not _UNSET:
             authority = dict(metadata.get("_authority_snapshot") or {})
             if delivery is None:
@@ -976,9 +1075,15 @@ class ScheduleAPI:
                 authority["effect_ceiling"] = list(effects)
             authority["authority_digest"] = _authority_digest(authority)
             metadata["_authority_snapshot"] = authority
+            digest = authority["authority_digest"]
             grant = dict(metadata.get("_control_grant") or {})
-            grant["authority_digest"] = authority["authority_digest"]
+            grant["authority_digest"] = digest
             metadata["_control_grant"] = grant
+            metadata["_delegated_control_grants"] = [
+                {**dict(item), "authority_digest": digest}
+                for item in metadata.get("_delegated_control_grants", ())
+                if isinstance(item, Mapping)
+            ]
         await self._scheduler._store.upsert_job(
             job_id,
             str(job.get("name") or template.get("objective") or job_id),
@@ -1118,8 +1223,9 @@ class ScheduleAPI:
         public["metadata"] = {
             "schedule_id": public["id"],
             "owner_project": (authority.get("principal") or {}).get("project_id"),
-            "control_grant_available": bool(
-                (public["metadata"].get("_control_grant") or {}).get("token")
+            "control_grant_available": any(
+                _grant_allows(grant, operation="inspect", now=utcnow())
+                for grant in _stored_control_grants(job)
             ),
         }
         return public

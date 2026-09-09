@@ -27,6 +27,7 @@ from athena.execution.environment import (
     ToolchainBinding,
     VerificationEnvironment,
 )
+from athena.execution.conformance import ConformanceReceipt, run_backend_conformance
 
 __all__ = [
     "ExecutionManager",
@@ -48,4 +49,6 @@ __all__ = [
     "ProjectEnvironmentFingerprint",
     "ToolchainBinding",
     "VerificationEnvironment",
+    "ConformanceReceipt",
+    "run_backend_conformance",
 ]

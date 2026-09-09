@@ -35,6 +35,9 @@ context.console = {
   warn: (...a) => send({ type: 'err', data: a.map(String).join(' ') }),
 };
 context.globalThis = context;
+// Expose only a frozen environment snapshot; the child process/controller is
+// not part of the generated runtime namespace.
+context.process = { env: Object.freeze({ ...process.env }) };
 let buf = Buffer.alloc(0);
 
 function send(obj) {

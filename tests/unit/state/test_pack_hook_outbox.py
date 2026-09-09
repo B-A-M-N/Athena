@@ -42,7 +42,7 @@ async def test_pack_hook_outbox_claim_and_token_ownership() -> None:
         assert claimed["attempts"] == 1
 
         assert await outbox.claim(pending["id"]) is None
-        await outbox.mark_dispatched(
+        assert await outbox.mark_dispatched(
             pending["id"], "task-created", claim_token=claimed["claim_token"]
         )
         row = await db.fetch_one("SELECT * FROM pack_hook_outbox WHERE id = ?", (pending["id"],))
@@ -68,14 +68,17 @@ async def test_pack_hook_outbox_expired_lease_reclaims_and_rejects_stale_token()
         assert reclaimed["claim_token"] != claimed["claim_token"]
         assert reclaimed["attempts"] == 2
 
-        await outbox.mark_dispatched(
+        assert not await outbox.mark_dispatched(
             pending["id"], "stale-task", claim_token=claimed["claim_token"]
+        )
+        assert not await outbox.mark_failed(
+            pending["id"], "stale failure", claim_token=claimed["claim_token"]
         )
         still_claimed = await db.fetch_one(
             "SELECT status FROM pack_hook_outbox WHERE id = ?", (pending["id"],)
         )
         assert still_claimed["status"] == "CLAIMED"
-        await outbox.mark_failed(
+        assert await outbox.mark_failed(
             pending["id"], "worker crashed", claim_token=reclaimed["claim_token"]
         )
         failed = await db.fetch_one(

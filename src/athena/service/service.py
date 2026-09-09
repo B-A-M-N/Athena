@@ -462,6 +462,47 @@ class AthenaService:
             "shutdown": dict(self._shutdown_status),
         }
 
+    def operational_matrix(self) -> dict[str, Any]:
+        """Return the concrete backend/runtime readiness matrix for operators."""
+        execution = getattr(self, "_execution", None)
+        backend_rows = execution.backend_status() if execution is not None else []
+        cells: list[dict[str, Any]] = []
+        for backend in backend_rows:
+            capabilities = backend.get("capabilities") if isinstance(backend, dict) else None
+            if not isinstance(capabilities, dict):
+                continue
+            runtime_caps = capabilities.get("runtime_capabilities") or {}
+            for runtime in capabilities.get("supported_runtimes") or ():
+                cell = runtime_caps.get(runtime) if isinstance(runtime_caps, dict) else {}
+                if not isinstance(cell, dict):
+                    cell = {}
+                cells.append(
+                    {
+                        "backend": backend.get("id"),
+                        "runtime": runtime,
+                        "available": bool(backend.get("available")),
+                        "persistent_session": bool(
+                            cell.get("persistent_sessions", capabilities.get("persistent_sessions"))
+                        ),
+                        "persistent_runtime_state": bool(
+                            cell.get(
+                                "persistent_runtime_state",
+                                capabilities.get("persistent_runtime_state"),
+                            )
+                        ),
+                        "reattach": bool(cell.get("reattach", capabilities.get("reattach"))),
+                        "dependency_installation": list(
+                            capabilities.get("dependency_installation") or ()
+                        ),
+                        "network_modes": list(capabilities.get("network_modes") or ()),
+                    }
+                )
+        return {
+            "execution": cells,
+            "mcp": self.mcp_status(),
+            "memory": self.runtime_health().get("memory_embeddings", {}),
+        }
+
     async def retry_resource_cleanup(self, task_id: str) -> dict[str, Any]:
         """Run the operator-visible retry path for durable resource obligations."""
         finalizer = self._resource_finalizer

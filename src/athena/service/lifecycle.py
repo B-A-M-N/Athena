@@ -894,6 +894,7 @@ class ServiceLifecycle:
                 event_store=events,
                 hook_outbox=self._svc._pack_hook_outbox,
                 task_intake=self._svc.submit,
+                task_lookup=task_manager.get,
                 workspace=workspace,
             )
             try:

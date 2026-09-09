@@ -4,6 +4,7 @@ import socket
 import subprocess
 import sys
 import time
+import shutil
 
 import pytest
 
@@ -12,6 +13,42 @@ from athena.execution.ssh import (
     SSHProfile,
     _REMOTE_PYTHON_SUPERVISOR_V2,
 )
+
+
+def _start_remote_fixture(tmp_path, runtime):
+    socket_path = tmp_path / f"{runtime}.sock"
+    token_path = tmp_path / f"{runtime}.token"
+    metadata_path = tmp_path / f"{runtime}.json"
+    source = base64.b64encode(_REMOTE_PYTHON_SUPERVISOR_V2.encode()).decode()
+    launcher = "import base64;exec(base64.b64decode(" + repr(source) + "))"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            launcher,
+            str(socket_path),
+            str(token_path),
+            str(metadata_path),
+            f"session-{runtime}",
+            f"task-{runtime}",
+            runtime,
+            str(tmp_path),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    for _ in range(100):
+        if socket_path.exists() and token_path.exists() and metadata_path.exists():
+            break
+        time.sleep(0.01)
+    if process.poll() is not None:
+        error = process.stderr.read()
+        if "Operation not permitted" in error:
+            pytest.skip("sandbox does not permit local Unix socket binds")
+        raise AssertionError(error)
+    return process, socket_path, token_path
 
 
 def test_ssh_profile_requires_strict_operator_identity(tmp_path):
@@ -83,6 +120,7 @@ def test_remote_python_supervisor_owns_worker_and_authenticates_env(tmp_path):
         token = token_path.read_text(encoding="utf-8").strip()
 
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(35)
         connection.connect(str(socket_path))
         connection.sendall((json.dumps({"token": token}) + "\n").encode())
         configure = json.dumps(
@@ -129,3 +167,88 @@ def test_remote_python_supervisor_owns_worker_and_authenticates_env(tmp_path):
             known_hosts=str(tmp_path / "known_hosts"),
             remote_root="~/athena;rm -rf /",
         )
+
+
+@pytest.mark.parametrize("runtime", ["shell", "node"])
+def test_remote_supervisor_preserves_runtime_state(runtime, tmp_path):
+    if runtime == "node" and shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    process, socket_path, token_path = _start_remote_fixture(tmp_path, runtime)
+    connection = None
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(35)
+        connection.connect(str(socket_path))
+        connection.sendall((json.dumps({"token": token}) + "\n").encode())
+
+        sources = (
+            (
+                "export ATHENA_REMOTE_STATE=kept; mkdir -p nested; cd nested; "
+                "helper(){ printf '%s' \"$1\"; }"
+                if runtime == "shell"
+                else "globalThis.ATHENA_REMOTE_STATE = 41; globalThis.helper = (x) => x + 1;"
+            ),
+            (
+                'printf \'%s:%s:%s\' "$ATHENA_REMOTE_STATE" "$(pwd | sed \'s#.*/##\')" "$(helper ok)"'
+                if runtime == "shell"
+                else "console.log(ATHENA_REMOTE_STATE + ':' + helper(ATHENA_REMOTE_STATE));"
+            ),
+        )
+        frames = []
+        stream = connection.makefile("rb")
+        for source_code in sources:
+            payload = json.dumps({"source": source_code}).encode()
+            connection.sendall(f"{len(payload)}\n".encode() + payload)
+            while True:
+                line = stream.readline()
+                assert line
+                frame = json.loads(line.decode())
+                frames.append(frame)
+                if frame.get("type") == "done":
+                    break
+        output = "".join(
+            str(frame.get("data") or "") for frame in frames if frame.get("type") == "out"
+        )
+        assert ("kept:nested:ok" if runtime == "shell" else "41:42") in output
+
+        shutdown = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        shutdown.connect(str(socket_path))
+        shutdown.sendall((json.dumps({"token": token, "op": "shutdown"}) + "\n").encode())
+        receipt = json.loads(shutdown.makefile("rb").readline().decode())
+        shutdown.close()
+        assert receipt["confirmed"] is True
+        assert process.wait(timeout=3) == 0
+    finally:
+        if connection is not None:
+            connection.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+
+
+def test_remote_supervisor_dependency_inventory_rpc(tmp_path):
+    process, socket_path, token_path = _start_remote_fixture(tmp_path, "python")
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.connect(str(socket_path))
+        request = {
+            "token": token,
+            "op": "dependency",
+            "operation": "inventory",
+            "manager": "python",
+            "name": "demo",
+            "environment_id": "a" * 64,
+        }
+        connection.sendall((json.dumps(request) + "\n").encode())
+        response = json.loads(connection.makefile("rb").readline().decode())
+        connection.close()
+        assert response["kind"] == "response"
+        assert response["ok"] is True
+        assert response["target"].endswith("/.athena/environments/" + "a" * 64 + "/python")
+        assert response["packages"] == []
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)

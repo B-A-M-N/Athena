@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field as dataclass_field
 from typing import Any
 
+from athena.artifacts.extractors import ArtifactExtractionService
 from athena.protocol.artifacts import parse_artifact_uri
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
@@ -172,6 +173,37 @@ class ArtifactCapability:
                     "required": ["operation", "artifact_uri"],
                     "additionalProperties": False,
                 },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"enum": ["describe", "metadata", "media_info"]},
+                        "artifact_uri": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["operation", "artifact_uri"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"const": "extract_text"},
+                        "artifact_uri": {"type": "string", "minLength": 1},
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 25_000_000},
+                        "max_chars": {"type": "integer", "minimum": 1, "maximum": 1_000_000},
+                    },
+                    "required": ["operation", "artifact_uri"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"const": "pages"},
+                        "artifact_uri": {"type": "string", "minLength": 1},
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 25_000_000},
+                        "max_pages": {"type": "integer", "minimum": 1, "maximum": 200},
+                    },
+                    "required": ["operation", "artifact_uri"],
+                    "additionalProperties": False,
+                },
             ],
         },
         effects=frozenset({EffectClass.READ_LOCAL}),
@@ -188,6 +220,7 @@ class ArtifactCapability:
         self._store = store
         self._max_read_bytes = max(1, min(max_read_bytes, 65_536))
         self._extractors = extractor_registry or MimeExtractorRegistry()
+        self._derivations = ArtifactExtractionService(store)
 
     async def invoke(self, request: CapabilityRequest, **kw) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -217,6 +250,40 @@ class ArtifactCapability:
                 return await self._search(request, args, uri)
             if operation == "extract":
                 return await self._extract(request, args, uri, owned)
+            if operation in {"describe", "metadata", "media_info"}:
+                value = (
+                    await self._derivations.media_info(owned)
+                    if operation == "media_info"
+                    else (await self._derivations.describe(owned)).to_record()
+                )
+                return _result(request, output=_json(value), metadata=value)
+            if operation == "extract_text":
+                derived = await self._derivations.extract_text(
+                    owned,
+                    task_id=request.task_id,
+                    max_bytes=int(args.get("max_bytes") or 10_000_000),
+                    max_chars=int(args.get("max_chars") or 200_000),
+                )
+                return _result(
+                    request,
+                    output=_json({"source": _ref_record(owned), "derived": _ref_record(derived)}),
+                )
+            if operation == "pages":
+                pages = await self._derivations.pages(
+                    owned,
+                    task_id=request.task_id,
+                    max_bytes=int(args.get("max_bytes") or 25_000_000),
+                    max_pages=int(args.get("max_pages") or 200),
+                )
+                return _result(
+                    request,
+                    output=_json(
+                        {
+                            "source": _ref_record(owned),
+                            "pages": [_ref_record(page) for page in pages],
+                        }
+                    ),
+                )
             return _result(request, ok=False, error=f"unknown operation: {operation}")
         except (OSError, ValueError) as exc:
             return _result(request, ok=False, error=str(exc))

@@ -28,6 +28,7 @@ from athena.protocol.errors import CapabilityUnavailable
 from athena.protocol.tasks import MutationMode
 from athena.synthesis.runtime import GeneratedToolHost
 from athena.workspace_manifest import copy_workspace_tree
+from athena.synthesis.verifier import GeneratedCapabilityVerifier
 
 if TYPE_CHECKING:
     from athena.protocol.tasks import WorkspaceSpec
@@ -562,6 +563,10 @@ class Validator:
             "live_failure_cases": historical_failures,
             "regression_cases": historical_failures,
         }
+        independent_review = GeneratedCapabilityVerifier.review(cap)
+        cap.validation["independent_verification"] = independent_review
+        if not independent_review["passed"]:
+            cap.validation["all_passed"] = False
         cap.lifecycle_state = "VALIDATED" if cap.validation["all_passed"] else "REJECTED"
         if cap.id_generated and cap.validation["all_passed"]:
             # Assign the public id only after source normalization, dependency

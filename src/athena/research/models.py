@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 
 def _now() -> str:
@@ -34,6 +35,24 @@ def schema_hash(value: Mapping[str, Any]) -> str:
     """Hash a JSON-shaped record for provenance and replay boundaries."""
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def source_family_metadata(
+    canonical_uri: str, metadata: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Derive bounded source-family identity without claiming independence."""
+    values = dict(metadata or {})
+    domain = (urlsplit(canonical_uri).hostname or "").casefold()
+    publisher = str(values.get("publisher") or domain)
+    family = str(values.get("source_family") or publisher or domain or "unknown")
+    return {
+        "publisher": publisher,
+        "canonical_domain": domain,
+        "source_family": family,
+        "upstream_source": str(values.get("upstream_source") or ""),
+        "primary_secondary": str(values.get("primary_secondary") or "secondary"),
+        "independence_group": str(values.get("independence_group") or family),
+    }
 
 
 @dataclass(frozen=True)
@@ -70,6 +89,8 @@ class SourceRecord:
     ) -> SourceRecord:
         # A changed content hash creates a new source version.  Uncaptured
         # sources still deduplicate by canonical URI until a snapshot exists.
+        merged_metadata = source_family_metadata(canonical_uri, metadata)
+        merged_metadata.update(dict(metadata or {}))
         return cls(
             id=_stable_id("src", canonical_uri, content_hash or "uncaptured"),
             canonical_uri=canonical_uri,
@@ -81,7 +102,7 @@ class SourceRecord:
             published_at=published_at,
             task_id=task_id,
             project_id=project_id,
-            metadata=dict(metadata or {}),
+            metadata=merged_metadata,
         )
 
     def to_record(self) -> dict[str, Any]:

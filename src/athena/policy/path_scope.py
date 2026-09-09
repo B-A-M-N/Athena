@@ -75,7 +75,7 @@ def path_rules_cover(
     lower_allows, lower_denies = _effective_parts(lower_rules, lower_base_path)
 
     # A restricted upper scope cannot cover an unrestricted lower scope.
-    if upper_rules and not upper_allows:
+    if upper_rules and not upper_allows and lower_allows:
         return False
     for lower_allow in lower_allows:
         if upper_rules and not any(
@@ -142,20 +142,27 @@ def intersect_path_rules(
         if any(_within(deny, allowed) for allowed in surviving)
     )
     if not output:
-        fallback = result_base_path or right_base_path or left_base_path
-        if fallback is not None:
-            output.append(PathRule(path=str(fallback), allow=False))
+        fallback = scope_path or result_base_path or right_base_path or left_base_path or Path("/")
+        # A root deny is the canonical fail-closed representation of an empty
+        # intersection.  A deny-only child path would otherwise mean
+        # unrestricted authority outside that child.
+        output.append(PathRule(path=str(fallback), allow=False))
     return tuple(output)
 
 
 def _effective_parts(rules: list[PathRule], base: Path | None) -> tuple[list[Path], list[Path]]:
-    allows = [Path(rule.path) for rule in rules if rule.allow]
     denies = [Path(rule.path) for rule in rules if not rule.allow]
-    if not allows:
+    explicit_allows = [Path(rule.path) for rule in rules if rule.allow]
+    if not explicit_allows:
+        if any(deny == Path("/") or (base is not None and deny == base) for deny in denies):
+            return [], denies
         # No positive rule means the base is unrestricted, even when explicit
         # denies are present.  With serialized absolute rules and no workspace
         # root, the protocol's safe universal reference is the filesystem root.
-        allows = [base or Path("/")]
+        return [base or Path("/")], denies
+    allows = [
+        allow for allow in explicit_allows if not any(_within(allow, deny) for deny in denies)
+    ]
     return allows, denies
 
 

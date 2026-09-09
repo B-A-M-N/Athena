@@ -436,6 +436,7 @@ class ResearchCapability:
                         "verify",
                         "plan",
                         "assess",
+                        "critique",
                         "bundle",
                         "run",
                     ],
@@ -541,6 +542,7 @@ class ResearchCapability:
                 "required": {"type": "boolean"},
                 "evidence_ids": {"type": "array", "items": {"type": "string"}},
                 "claim_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}},
+                "min_independent_groups": {"type": "integer", "minimum": 1, "maximum": 10},
                 "query": {"type": "string", "maxLength": 2000},
                 "status": {"type": "string", "enum": ["OPEN", "CLOSED"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
@@ -624,6 +626,8 @@ class ResearchCapability:
                 return await self._plan(request, args, context)
             if operation == "assess":
                 return await self._assess(request, args, context)
+            if operation == "critique":
+                return await self._critique(request, args, context)
             if operation == "bundle":
                 return await self._bundle(request, args, context)
             if operation == "run":
@@ -1076,10 +1080,17 @@ class ResearchCapability:
             if not isinstance(receipt, Mapping):
                 return _result(request, ok=False, error="receipt must be an object")
             metadata["receipt"] = dict(receipt)
+        excerpt = str(args.get("excerpt") or "")
+        # The model may propose the excerpt, but the immutable source snapshot
+        # remains the authority.  Persist enough provenance to make that
+        # later verification auditable without trusting the proposal itself.
+        metadata.setdefault("source_content_hash", source.content_hash)
+        metadata.setdefault("excerpt_hash", hashlib.sha256(excerpt.encode("utf-8")).hexdigest())
+        metadata.setdefault("normalization_version", "1")
         evidence = EvidenceObject.for_content(
             source_id=source_id,
             extracted_claim=str(args.get("claim") or ""),
-            exact_supporting_excerpt=str(args.get("excerpt") or ""),
+            exact_supporting_excerpt=excerpt,
             locator=args.get("locator") or {},
             evidence_type=str(args.get("evidence_type") or "quote"),
             # Authority is derived from the source, not model input.
@@ -1365,6 +1376,69 @@ class ResearchCapability:
                     "ready": not required_open,
                     "required_open_gaps": required_open,
                     "gaps": assessed,
+                }
+            ),
+        )
+
+    async def _critique(self, request, args, context) -> CapabilityResult:
+        """Run bounded, deterministic evidence-quality critique questions."""
+        if not request.task_id:
+            return _result(request, ok=False, error="critique requires a task")
+        workspace_id = getattr(getattr(context, "workspace", None), "id", None)
+        evidence = await self._store.list_evidence(
+            task_id=request.task_id,
+            project_id=workspace_id,
+            claim_id=None,
+            limit=200,
+        )
+        wanted_claims = {str(value) for value in args.get("claim_ids") or ()}
+        if wanted_claims:
+            evidence = [item for item in evidence if item.claim_id in wanted_claims]
+        groups: dict[str, list[str]] = {}
+        source_records: dict[str, Any] = {}
+        for item in evidence:
+            source = await self._store.get_source(item.source_id)
+            if source is None or not await _evidence_visible(
+                item, request, context, self._store.get_source
+            ):
+                continue
+            source_records[source.id] = source
+            metadata = dict(source.metadata)
+            group = str(
+                metadata.get("independence_group")
+                or metadata.get("source_family")
+                or metadata.get("canonical_domain")
+                or source.canonical_uri
+            )
+            groups.setdefault(group, []).append(item.id)
+        # Report the evidence objects that make a contradiction claim.  The
+        # related IDs are useful edges, but returning only those targets would
+        # misidentify which source asserted the conflict.
+        contradictions = sorted(item.id for item in evidence if item.contradicts)
+        min_groups = max(1, min(int(args.get("min_independent_groups") or 2), 10))
+        independent_groups = sorted(groups)
+        primary_sources = [
+            source.id
+            for source in source_records.values()
+            if str(source.metadata.get("primary_secondary") or "").casefold() == "primary"
+            or source.authority_class in {"primary", "official"}
+        ]
+        return _result(
+            request,
+            output=_json(
+                {
+                    "evidence_count": len(evidence),
+                    "independent_evidence_groups": independent_groups,
+                    "independent_group_count": len(independent_groups),
+                    "meets_independence_threshold": len(independent_groups) >= min_groups,
+                    "single_group_warning": len(independent_groups) <= 1 and bool(evidence),
+                    "contradiction_evidence_ids": contradictions,
+                    "primary_source_candidates": sorted(primary_sources),
+                    "questions": [
+                        "What evidence would falsify this claim?",
+                        "Which contradiction materially changes the answer?",
+                        "Can a primary source replace this secondary source?",
+                    ],
                 }
             ),
         )
@@ -1826,7 +1900,16 @@ class ResearchCapability:
             "status": "verified" if found else "invalid",
             "content_hash": content_hash,
             "hash_matches": hash_matches,
+            "excerpt_hash": hashlib.sha256(
+                evidence.exact_supporting_excerpt.encode("utf-8")
+            ).hexdigest(),
         }
+        recorded_excerpt_hash = evidence.metadata.get("excerpt_hash")
+        if recorded_excerpt_hash and recorded_excerpt_hash != result["excerpt_hash"]:
+            result["status"] = "invalid"
+            result["excerpt_hash_matches"] = False
+        else:
+            result["excerpt_hash_matches"] = True
         if not found:
             return result
 

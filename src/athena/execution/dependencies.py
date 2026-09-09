@@ -20,6 +20,12 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import unquote
 
 from athena.affordances.models import DependencyRequirement
+from athena.execution.dependency_lock import (
+    calculate_environment_fingerprint,
+    parse_dependency_lock,
+    record_manifest as calculate_record_manifest,
+    sha256_file,
+)
 
 
 class DependencyEnvironmentError(ValueError):
@@ -61,7 +67,7 @@ def resolve_dependency_environment(
     root = Path(workspace_root).resolve()
     lock_path = root / ".athena" / "dependencies.lock.json"
     try:
-        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock = parse_dependency_lock(lock_path.read_bytes())
     except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
         raise DependencyEnvironmentError(
             f"dependency lock is missing or invalid: {lock_path}"
@@ -127,7 +133,7 @@ def resolve_dependency_environment(
                     f"dependency {package_name!r} changed from locked version "
                     f"{locked_version} to {installed_version}"
                 )
-            hashes = record_hashes(distribution)
+            hashes, record_entry_count, record_manifest_sha256 = record_manifest(distribution)
             verify_record_files(distribution)
             expected_runtime = locked.get("runtime_identity") or record.get("runtime_identity")
             if expected_runtime and expected_runtime != runtime_identity:
@@ -139,11 +145,27 @@ def resolve_dependency_environment(
                 raise DependencyEnvironmentError(
                     f"dependency {package_name!r} RECORD hash mismatch"
                 )
-            package = {
+            expected_count = locked.get("record_entry_count")
+            if expected_count is not None and int(expected_count) != record_entry_count:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} RECORD entry count mismatch"
+                )
+            expected_manifest = str(locked.get("record_manifest_sha256") or "")
+            if expected_manifest and expected_manifest != record_manifest_sha256:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} RECORD manifest mismatch"
+                )
+            package: dict[str, Any] = {
                 "name": package_name,
                 "resolved_version": installed_version,
                 "record_hashes": hashes,
             }
+            if (
+                locked.get("record_manifest_sha256")
+                and locked.get("record_entry_count") is not None
+            ):
+                package["record_entry_count"] = record_entry_count
+                package["record_manifest_sha256"] = record_manifest_sha256
             verified_names.add(normalized_name)
             verified.append(package)
         expected_package_fingerprint = record.get("environment_fingerprint")
@@ -155,6 +177,15 @@ def resolve_dependency_environment(
                     "resolved_version": str(item.get("resolved_version") or ""),
                     "record_hashes": sorted(
                         str(value) for value in item.get("record_hashes") or ()
+                    ),
+                    **(
+                        {
+                            "record_entry_count": int(item["record_entry_count"]),
+                            "record_manifest_sha256": str(item["record_manifest_sha256"]),
+                        }
+                        if item.get("record_manifest_sha256")
+                        and item.get("record_entry_count") is not None
+                        else {}
                     ),
                 }
                 for index, item in enumerate(locked_packages)
@@ -194,15 +225,12 @@ def resolve_dependency_environment(
 
 def record_hashes(distribution: Any) -> list[str]:
     """Return the canonical hashed entries from a distribution RECORD file."""
-    record_text = distribution.read_text("RECORD")
-    hashes: list[str] = []
-    if record_text:
-        for line in record_text.splitlines():
-            parts = line.split(",", 2)
-            if len(parts) >= 2 and parts[1].startswith("sha256="):
-                hashes.append(f"{parts[0]}:{parts[1]}")
-    hashes.sort()
-    return hashes[:10_000]
+    return record_manifest(distribution)[0]
+
+
+def record_manifest(distribution: Any) -> tuple[list[str], int, str]:
+    """Return a bounded preview plus a digest of every hashed RECORD entry."""
+    return calculate_record_manifest(distribution.read_text("RECORD"))
 
 
 def verify_record_files(distribution: Any) -> None:
@@ -220,7 +248,7 @@ def verify_record_files(distribution: Any) -> None:
         if not candidate.is_file():
             raise DependencyEnvironmentError(f"dependency RECORD entry is missing: {path}")
         actual = (
-            base64.urlsafe_b64encode(hashlib.sha256(candidate.read_bytes()).digest())
+            base64.urlsafe_b64encode(bytes.fromhex(sha256_file(candidate)))
             .rstrip(b"=")
             .decode("ascii")
         )
@@ -231,11 +259,7 @@ def verify_record_files(distribution: Any) -> None:
 def environment_fingerprint(
     packages: Sequence[Mapping[str, Any]], *, runtime_identity: str | None = None
 ) -> str:
-    payload: Any = list(packages)
-    if runtime_identity:
-        payload = {"packages": payload, "runtime_identity": runtime_identity}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return calculate_environment_fingerprint(packages, runtime_identity=runtime_identity)
 
 
 def _fingerprint_version(
@@ -317,6 +341,7 @@ __all__ = [
     "dependency_environment_target",
     "environment_fingerprint",
     "record_hashes",
+    "record_manifest",
     "resolve_dependency_environment",
     "verify_record_files",
 ]

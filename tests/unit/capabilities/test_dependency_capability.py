@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from athena.capabilities.dependency import DependencyCapability
+from athena.execution.dependencies import record_manifest
 from athena.protocol.capabilities import CapabilityRequest, CapabilityResultStatus
 from athena.protocol.execution import ExecutionExitStatus, ExecutionResult
 from athena.protocol.tasks import WorkspaceSpec
@@ -38,6 +39,20 @@ class _Distribution:
         return "pkg/__init__.py,sha256=abc,12\npkg-1.2.3.dist-info/METADATA,,"
 
 
+class _LargeRecord:
+    def __init__(self, extra: str = ""):
+        self.extra = extra
+
+    def read_text(self, name):
+        assert name == "RECORD"
+        entries = [f"file-{index:05d},sha256=hash-{index},1" for index in range(10_000)]
+        entries.extend(
+            f"zzzz-{index},sha256=tail-{index}{self.extra if index == 4 else ''},1"
+            for index in range(5)
+        )
+        return "\n".join(entries)
+
+
 def _request(operation, **arguments):
     return CapabilityRequest(
         capability_id="dependency",
@@ -45,6 +60,17 @@ def _request(operation, **arguments):
         call_id=f"dependency-{operation}",
         arguments={"operation": operation, **arguments},
     )
+
+
+def test_record_manifest_commits_to_all_entries_with_bounded_preview():
+    preview, count, digest = record_manifest(_LargeRecord())
+    changed_preview, changed_count, changed_digest = record_manifest(_LargeRecord("-changed"))
+
+    assert len(preview) == 10_000
+    assert len(changed_preview) == 10_000
+    assert count == changed_count == 10_005
+    assert digest != changed_digest
+    assert preview == changed_preview
 
 
 @pytest.mark.asyncio

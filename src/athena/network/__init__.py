@@ -6,6 +6,7 @@ from athena.network.transport import (
     resolve_addresses,
 )
 from athena.network.target_policy import ValidatedTarget, validate_target
+from athena.network.browser_proxy import BrowserProxyConfig
 
 __all__ = [
     "ValidatedTarget",
@@ -13,4 +14,5 @@ __all__ = [
     "pinned_sync_transport",
     "resolve_addresses",
     "validate_target",
+    "BrowserProxyConfig",
 ]

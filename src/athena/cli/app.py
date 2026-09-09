@@ -590,7 +590,9 @@ def _doctor_startup(o: "Options", config: Any) -> int:
     async def probe() -> dict[str, Any]:
         try:
             await service.start()
-            return service.startup_health()
+            health = service.startup_health()
+            health["operational_matrix"] = service.operational_matrix()
+            return health
         finally:
             await service.stop()
 
@@ -603,6 +605,28 @@ def _doctor_startup(o: "Options", config: Any) -> int:
     for name, check in (health.get("checks") or {}).items():
         status = check.get("status", "unknown") if isinstance(check, dict) else "unknown"
         print(f"  {name}: {status}")
+    matrix = health.get("operational_matrix") or {}
+    for cell in matrix.get("execution") or ():
+        print(
+            "  execution/{backend}/{runtime}: available={available} persistent={persistent} "
+            "state={state} reattach={reattach} deps={deps}".format(
+                backend=cell.get("backend"),
+                runtime=cell.get("runtime"),
+                available="yes" if cell.get("available") else "no",
+                persistent="yes" if cell.get("persistent_session") else "no",
+                state="yes" if cell.get("persistent_runtime_state") else "no",
+                reattach="yes" if cell.get("reattach") else "no",
+                deps=",".join(cell.get("dependency_installation") or ()) or "none",
+            )
+        )
+    mcp = matrix.get("mcp") or {}
+    if isinstance(mcp, dict):
+        for name, status in sorted(mcp.items()):
+            state = status.get("state", "unknown") if isinstance(status, dict) else "unknown"
+            print(f"  mcp/{name}: {state}")
+    memory = matrix.get("memory") or {}
+    if isinstance(memory, dict):
+        print(f"  semantic-memory: {memory.get('state', 'unknown')}")
     return 0 if health.get("status") == "ok" else 1
 
 

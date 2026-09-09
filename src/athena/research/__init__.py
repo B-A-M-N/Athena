@@ -10,6 +10,7 @@ from athena.research.models import (
     EvidenceObject,
     ResearchGap,
     SourceRecord,
+    source_family_metadata,
 )
 from athena.research.policy import SourcePolicy, SourcePolicyError
 from athena.research.store import ResearchStore
@@ -21,4 +22,5 @@ __all__ = [
     "SourcePolicy",
     "SourcePolicyError",
     "SourceRecord",
+    "source_family_metadata",
 ]

@@ -17,6 +17,11 @@ from athena.protocol.artifacts import ArtifactRef
 from athena.protocol.messages import utcnow
 
 
+_NO_CAPABILITY_INTERSECTION = "__athena_no_capability_intersection__"
+_NO_EFFECT_INTERSECTION = "__athena_no_effect_intersection__"
+_NO_MODEL_INTERSECTION = "__athena_no_model_intersection__"
+
+
 class TaskStatus(str, enum.Enum):
     CREATED = "CREATED"
     QUEUED = "QUEUED"
@@ -372,6 +377,25 @@ def _policy_parts(value: CapabilityPolicy | Mapping[str, Any] | None) -> Capabil
     )
 
 
+def _effective_capability_policy(
+    value: CapabilityPolicy | Mapping[str, Any] | None,
+) -> CapabilityPolicy:
+    """Normalize deny precedence before authority algebra compares policies."""
+    policy = _policy_parts(value)
+    denied = set(policy.deny)
+    allow = set(policy.allow) - denied
+    ask = set(policy.ask) - denied
+    if "*" in denied:
+        allow.clear()
+        ask.clear()
+    return CapabilityPolicy(
+        effects=policy.effects,
+        allow=tuple(sorted(allow)),
+        ask=tuple(sorted(ask)),
+        deny=tuple(sorted(denied)),
+    )
+
+
 def _intersect_unrestricted_sets(left: set[str], right: set[str]) -> set[str]:
     """Intersect sets where an empty set is the protocol's universal value."""
     if not left:
@@ -391,20 +415,24 @@ def intersect_capability_policies(
     retained whenever either side requires approval for a surviving capability;
     deny remains a hard union.
     """
-    a = _policy_parts(left)
-    b = _policy_parts(right)
+    a = _effective_capability_policy(left)
+    b = _effective_capability_policy(right)
     a_visible = set(a.allow) | set(a.ask)
     b_visible = set(b.allow) | set(b.ask)
     visible = _intersect_unrestricted_sets(a_visible, b_visible)
     ask = (set(a.ask) | set(b.ask)) & visible
     allow = visible - ask
-    effects = _intersect_unrestricted_sets(set(a.effects), set(b.effects))
     deny = set(a.deny) | set(b.deny)
     allow -= deny
     ask -= deny
     if "*" in deny:
         allow.clear()
         ask.clear()
+    if not allow and not ask and (a_visible or b_visible):
+        allow.add(_NO_CAPABILITY_INTERSECTION)
+    effects = _intersect_unrestricted_sets(set(a.effects), set(b.effects))
+    if a.effects and b.effects and not effects:
+        effects.add(_NO_EFFECT_INTERSECTION)
     return CapabilityPolicy(
         effects=frozenset(effects),
         allow=tuple(sorted(allow)),
@@ -418,24 +446,32 @@ def capability_policy_covers(
     lower: CapabilityPolicy | Mapping[str, Any] | None,
 ) -> bool:
     """Return whether ``lower`` is contained by the ``upper`` ceiling."""
-    a = _policy_parts(upper)
-    b = _policy_parts(lower)
+    a = _effective_capability_policy(upper)
+    b = _effective_capability_policy(lower)
     upper_allow = set(a.allow)
     upper_ask = set(a.ask)
     lower_allow = set(b.allow)
     lower_ask = set(b.ask)
+    lower_is_empty = (
+        _NO_CAPABILITY_INTERSECTION in lower_allow or _NO_CAPABILITY_INTERSECTION in lower_ask
+    )
+    lower_allow.discard(_NO_CAPABILITY_INTERSECTION)
+    lower_ask.discard(_NO_CAPABILITY_INTERSECTION)
     upper_visible = upper_allow | upper_ask
     lower_visible = lower_allow | lower_ask
     # Empty allow/ask is the protocol's unrestricted value.  Once a policy
     # names an allow/ask ceiling, preserve the distinction: ASK is weaker than
     # ALLOW for a caller, but it cannot cover a stored autonomous ALLOW.
-    if upper_visible and not lower_visible:
+    lower_is_empty = lower_is_empty or "*" in b.deny
+    if upper_visible and not lower_visible and not lower_is_empty:
         return False
     if upper_visible and not lower_allow.issubset(upper_allow):
         return False
     if upper_visible and not lower_ask.issubset(upper_visible):
         return False
     if lower_visible & set(a.deny) or "*" in a.deny and lower_visible:
+        return False
+    if "*" in a.deny and "*" not in b.deny:
         return False
     if not upper_visible and not lower_visible and "*" in a.deny and "*" not in b.deny:
         return False
@@ -444,7 +480,16 @@ def capability_policy_covers(
             return False
     upper_effects = set(a.effects)
     lower_effects = set(b.effects)
-    if upper_effects and (not lower_effects or not lower_effects.issubset(upper_effects)):
+    lower_effects_empty = _NO_EFFECT_INTERSECTION in lower_effects
+    if lower_effects_empty:
+        lower_effects = set()
+    if _NO_EFFECT_INTERSECTION in upper_effects:
+        return lower_effects_empty
+    if (
+        upper_effects
+        and not lower_effects_empty
+        and (not lower_effects or not lower_effects.issubset(upper_effects))
+    ):
         return False
     return True
 
@@ -575,7 +620,7 @@ def intersect_model_policies(
     b = _model_policy_value(right)
     allowed = tuple(_intersect_unrestricted_sets(set(a.allowed), set(b.allowed)))
     if a.allowed and b.allowed and not allowed:
-        allowed = ("__no_model_intersection__",)
+        allowed = (_NO_MODEL_INTERSECTION,)
     floors = [item for item in (a.min_quality_tier, b.min_quality_tier) if item]
     floor = max(floors, key=_quality_rank) if floors else None
     return ModelPolicy(
@@ -599,7 +644,11 @@ def model_policy_covers(
 ) -> bool:
     a = _model_policy_value(upper)
     b = _model_policy_value(lower)
-    if a.allowed and (not b.allowed or not set(b.allowed).issubset(a.allowed)):
+    if (
+        b.allowed not in {(_NO_MODEL_INTERSECTION,), ("__no_model_intersection__",)}
+        and a.allowed
+        and (not b.allowed or not set(b.allowed).issubset(a.allowed))
+    ):
         return False
     if a.max_cost_usd is not None and (b.max_cost_usd is None or b.max_cost_usd > a.max_cost_usd):
         return False

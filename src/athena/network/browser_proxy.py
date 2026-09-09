@@ -8,9 +8,27 @@ and tunnels TLS/WebSocket traffic without giving Chromium a second resolver.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from athena.network.target_policy import validate_target
+
+
+@dataclass(frozen=True)
+class BrowserProxyConfig:
+    """Operator-owned proxy limits; model input never reaches this object."""
+
+    max_concurrent_tunnels: int = 32
+    idle_timeout_seconds: float = 60.0
+    max_tunnel_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        if not 1 <= int(self.max_concurrent_tunnels) <= 1024:
+            raise ValueError("max_concurrent_tunnels must be between 1 and 1024")
+        if not 0.1 <= float(self.idle_timeout_seconds) <= 3600.0:
+            raise ValueError("idle_timeout_seconds must be between 0.1 and 3600")
+        if not 0.1 <= float(self.max_tunnel_seconds) <= 86_400.0:
+            raise ValueError("max_tunnel_seconds must be between 0.1 and 86400")
 
 
 class DNSPinnedBrowserProxy:
@@ -18,10 +36,19 @@ class DNSPinnedBrowserProxy:
     IDLE_TIMEOUT_SECONDS = 60.0
     MAX_TUNNEL_SECONDS = 300.0
 
-    def __init__(self) -> None:
+    def __init__(self, config: BrowserProxyConfig | None = None) -> None:
         self._server: asyncio.Server | None = None
         self._policy = "allow"
         self._active_tunnels: dict[int, tuple[asyncio.StreamWriter, asyncio.StreamWriter]] = {}
+        self._config = config
+
+    @property
+    def config(self) -> BrowserProxyConfig:
+        return self._config or BrowserProxyConfig(
+            max_concurrent_tunnels=self.MAX_CONCURRENT_TUNNELS,
+            idle_timeout_seconds=self.IDLE_TIMEOUT_SECONDS,
+            max_tunnel_seconds=self.MAX_TUNNEL_SECONDS,
+        )
 
     @property
     def server_url(self) -> str:
@@ -75,7 +102,13 @@ class DNSPinnedBrowserProxy:
                 self._register_tunnel(tunnel_id, writer, upstream_writer)
                 writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 await writer.drain()
-                await _tunnel(reader, writer, *upstream)
+                await _tunnel(
+                    reader,
+                    writer,
+                    *upstream,
+                    idle_timeout_seconds=self.config.idle_timeout_seconds,
+                    max_tunnel_seconds=self.config.max_tunnel_seconds,
+                )
                 return
             parsed = urlsplit(target)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -95,8 +128,22 @@ class DNSPinnedBrowserProxy:
             outgoing += "\r\n".join(headers) + "\r\n\r\n"
             upstream_writer.write(outgoing.encode("latin-1"))
             await upstream_writer.drain()
-            await _tunnel(reader, writer, upstream_reader, upstream_writer)
-        except (asyncio.IncompleteReadError, ConnectionError, OSError, PermissionError, ValueError):
+            await _tunnel(
+                reader,
+                writer,
+                upstream_reader,
+                upstream_writer,
+                idle_timeout_seconds=self.config.idle_timeout_seconds,
+                max_tunnel_seconds=self.config.max_tunnel_seconds,
+            )
+        except (
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            ConnectionError,
+            OSError,
+            PermissionError,
+            ValueError,
+        ):
             try:
                 writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
                 await writer.drain()
@@ -118,7 +165,7 @@ class DNSPinnedBrowserProxy:
         client_writer: asyncio.StreamWriter,
         upstream_writer: asyncio.StreamWriter,
     ) -> None:
-        if len(self._active_tunnels) >= self.MAX_CONCURRENT_TUNNELS:
+        if len(self._active_tunnels) >= self.config.max_concurrent_tunnels:
             upstream_writer.close()
             raise PermissionError("browser proxy tunnel limit reached")
         self._active_tunnels[tunnel_id] = (client_writer, upstream_writer)
@@ -140,14 +187,26 @@ async def _tunnel(
     client_writer: asyncio.StreamWriter,
     upstream_reader: asyncio.StreamReader,
     upstream_writer: asyncio.StreamWriter,
+    *,
+    idle_timeout_seconds: float | None = None,
+    max_tunnel_seconds: float | None = None,
 ) -> None:
+    idle_timeout = (
+        DNSPinnedBrowserProxy.IDLE_TIMEOUT_SECONDS
+        if idle_timeout_seconds is None
+        else idle_timeout_seconds
+    )
+    max_lifetime = (
+        DNSPinnedBrowserProxy.MAX_TUNNEL_SECONDS
+        if max_tunnel_seconds is None
+        else max_tunnel_seconds
+    )
+
     async def copy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             while True:
                 try:
-                    chunk = await asyncio.wait_for(
-                        reader.read(64 * 1024), DNSPinnedBrowserProxy.IDLE_TIMEOUT_SECONDS
-                    )
+                    chunk = await asyncio.wait_for(reader.read(64 * 1024), idle_timeout)
                 except asyncio.TimeoutError:
                     return
                 if not chunk:
@@ -167,7 +226,7 @@ async def _tunnel(
     try:
         await asyncio.wait(
             tasks,
-            timeout=DNSPinnedBrowserProxy.MAX_TUNNEL_SECONDS,
+            timeout=max_lifetime,
             return_when=asyncio.FIRST_COMPLETED,
         )
     finally:
@@ -194,4 +253,4 @@ def _format_host(host: str) -> str:
     return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
-__all__ = ["DNSPinnedBrowserProxy"]
+__all__ = ["BrowserProxyConfig", "DNSPinnedBrowserProxy"]

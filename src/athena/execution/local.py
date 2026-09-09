@@ -28,6 +28,7 @@ class LocalBackend(ExecutionBackend):
         return BackendCapabilities(
             supported_runtimes=tuple(self.manager.available_runtimes()),
             persistent_sessions=True,
+            persistent_runtime_state=True,
             reattach=False,
             filesystem_persistence=True,
             network_modes=("allow", "deny", "restricted"),

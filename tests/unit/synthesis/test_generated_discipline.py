@@ -12,9 +12,15 @@ from __future__ import annotations
 import json
 
 import pytest
+from hypothesis import given, strategies as st
 
 from athena.capabilities.registry import _compile_validator, validate_schema as _validate_schema
-from athena.synthesis.engine import _GENERATED_EFFECTIVE_AUTHORITY, SyntheticCapability
+from athena.synthesis.engine import (
+    _GENERATED_EFFECTIVE_AUTHORITY,
+    _service_negative_cases,
+    SyntheticCapability,
+)
+from athena.synthesis.verifier import GeneratedCapabilityVerifier
 
 
 # ---------------------------------------------------------------- #
@@ -60,6 +66,33 @@ class TestAdversarialSchemas:
         for hostile in ([], "str", 3, None):
             assert _validate_schema(schema, hostile) != [], hostile
 
+    @given(
+        properties=st.dictionaries(
+            st.sampled_from(["text", "count", "enabled"]),
+            st.sampled_from(
+                [
+                    {"type": "string"},
+                    {"type": "integer"},
+                    {"type": "boolean"},
+                    {"type": "array"},
+                ]
+            ),
+            max_size=3,
+        ),
+        additional=st.booleans(),
+    )
+    def test_service_negative_corpus_is_schema_invalid(self, properties, additional):
+        """Generated malformed fixtures never become valid input by accident."""
+        schema = {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": additional,
+        }
+        cases = _service_negative_cases(schema)
+        assert cases
+        for case in cases:
+            assert _validate_schema(schema, case["input"]), case
+
 
 # ---------------------------------------------------------------- #
 # Effect authority: the sandbox contract, not the declaration, is the
@@ -82,6 +115,17 @@ class TestEffectAuthority:
         for hostile in ("DELETE", "SECRET_READ", "FINANCIAL", "EXTERNAL_PUBLISH"):
             cap = _cap(effects=frozenset({hostile}))
             assert set(cap.effective_effects) <= set(_GENERATED_EFFECTIVE_AUTHORITY)
+
+    def test_generated_verifier_rejects_malformed_negative_receipts(self):
+        cap = _cap(effects=frozenset({"READ_LOCAL"}))
+        cap.validation = {
+            "all_passed": True,
+            "details": [{"passed": True}],
+            "negative_cases": ["not-a-receipt"],
+        }
+        review = GeneratedCapabilityVerifier.review(cap)
+        assert review["passed"] is False
+        assert review["promotion_authority"] is False
 
 
 def _cap(effects) -> SyntheticCapability:

@@ -135,6 +135,35 @@ async def test_checkpoint_inspects_immutable_metadata(tmp_path: Path):
     assert inspected["metadata"]["state"]["event_boundary"]["last_sequence"] == 4
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_classifies_reconstructible_resources(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "state.txt").write_text("state", encoding="utf-8")
+    manager = CheckpointManager(str(tmp_path / "checkpoints"))
+    captured = await manager.capture(
+        task_id="task-resources",
+        workspace_root=str(workspace),
+        label="resume",
+        metadata={
+            "resources": [
+                {"name": "python", "reattachable": True, "identity": "session-1"},
+                {"name": "dependencies", "environment_id": "env-1"},
+                {"name": "browser", "recipe": "restore-storage"},
+                {"name": "lost-process"},
+            ]
+        },
+    )
+    inspected = await manager.inspect(captured["id"])
+    states = {item["name"]: item["state"] for item in inspected["metadata"]["resources"]}
+    assert states == {
+        "python": "reattached",
+        "dependencies": "reconstructed",
+        "browser": "reconstructed",
+        "lost-process": "lost",
+    }
+
+
 async def test_restore_unknown_checkpoint(tmp_path: Path):
     mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
     with pytest.raises(KeyError):
