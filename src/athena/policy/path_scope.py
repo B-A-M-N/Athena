@@ -98,22 +98,40 @@ def intersect_path_rules(
     left_base: str | Path | None = None,
     right_base: str | Path | None = None,
     result_base: str | Path | None = None,
+    scope: str | Path | None = None,
 ) -> tuple[PathRule, ...]:
-    """Return the explicit prefix-policy intersection of two rule sets."""
+    """Return the explicit prefix-policy intersection of two rule sets.
+
+    ``scope`` bounds the result to a workspace root.  It is separate from
+    ``result_base`` because a base resolves relative rules, while a scope is
+    an authority boundary that must also trim absolute rules outside it.
+    """
     left_base_path = Path(left_base).resolve(strict=False) if left_base else None
     right_base_path = Path(right_base).resolve(strict=False) if right_base else None
     result_base_path = Path(result_base).resolve(strict=False) if result_base else None
+    scope_path = Path(scope).resolve(strict=False) if scope else None
     left_rules = list(canonicalize_path_rules(left, base=left_base_path))
     right_rules = list(canonicalize_path_rules(right, base=right_base_path))
     left_allows, left_denies = _effective_parts(left_rules, left_base_path)
     right_allows, right_denies = _effective_parts(right_rules, right_base_path)
     candidates = [
-        overlap
+        scoped
         for first in left_allows
         for second in right_allows
         if (overlap := _prefix_intersection(first, second)) is not None
+        and (
+            scoped := (
+                _prefix_intersection(overlap, scope_path) if scope_path is not None else overlap
+            )
+        )
+        is not None
     ]
-    denies = left_denies + right_denies
+    denies = [
+        scoped
+        for deny in (*left_denies, *right_denies)
+        if (scoped := (_prefix_intersection(deny, scope_path) if scope_path is not None else deny))
+        is not None
+    ]
     surviving = [
         path for path in _unique(candidates) if not any(_within(path, deny) for deny in denies)
     ]

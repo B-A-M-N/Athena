@@ -680,6 +680,7 @@ def _restrict_paths(parent_rules, child_rules, parent_root: Path, child_root: Pa
         left_base=parent_root,
         right_base=child_root,
         result_base=child_root,
+        scope=child_root,
     )
 
 

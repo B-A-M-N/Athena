@@ -404,6 +404,7 @@ def _intersect_workspace_rules(
             left_base=left_root,
             right_base=right_root,
             result_base=result_root,
+            scope=result_root,
         )
     ]
 
