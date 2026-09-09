@@ -95,6 +95,11 @@ class ExecutionManager:
         self._event_sink = event_sink
         self._durability_mandatory = durability_mandatory
         self._recovery_sink = recovery_sink
+        self._local_backend: ExecutionBackend | None = None
+
+    def set_local_backend(self, backend: ExecutionBackend | None) -> None:
+        """Select an operator-owned local backend such as the runtime host."""
+        self._local_backend = backend
 
     def set_recovery_sink(self, sink) -> None:
         """Bind the task-state recovery authority after construction."""
@@ -129,6 +134,16 @@ class ExecutionManager:
     def backend_status(self) -> list[dict[str, Any]]:
         """Return availability for registered non-local backends."""
         result = [{"id": "local", "available": True, "healthy": True}]
+        if self._local_backend is not None:
+            result[0]["implementation"] = type(self._local_backend).__name__
+            try:
+                value = self._local_backend.capabilities()
+                result[0]["capabilities"] = {
+                    key: list(item) if isinstance(item, tuple) else item
+                    for key, item in vars(value).items()
+                }
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                result[0]["capabilities_error"] = str(exc)
         for name, backend in sorted(self._backends.items()):
             available = True
             probe = getattr(backend, "available", None)
@@ -145,6 +160,16 @@ class ExecutionManager:
                     "implementation": type(backend).__name__,
                 }
             )
+            capabilities = getattr(backend, "capabilities", None)
+            if callable(capabilities):
+                try:
+                    value = capabilities()
+                    result[-1]["capabilities"] = {
+                        key: list(item) if isinstance(item, tuple) else item
+                        for key, item in vars(value).items()
+                    }
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    result[-1]["capabilities_error"] = str(exc)
             identity = getattr(backend, "environment_identity", None)
             if available and callable(identity):
                 try:
@@ -152,6 +177,23 @@ class ExecutionManager:
                 except (OSError, RuntimeError, TypeError, ValueError) as exc:
                     result[-1]["environment_identity_error"] = str(exc)
         return result
+
+    def backend_capabilities(self, name: str = "local") -> Any:
+        """Return the declared capability contract for one execution target."""
+        selected = self._selected_backend(name)
+        if selected is not None:
+            return selected.capabilities()
+        if name in {"local", "sandboxed-local"}:
+            runtimes = tuple(self.available_runtimes())
+            return {
+                "supported_runtimes": runtimes,
+                "dependency_installation": tuple(
+                    manager
+                    for manager, runtime in (("python", "python"), ("node", "node"))
+                    if runtime in runtimes
+                ),
+            }
+        raise ValueError(f"unknown execution backend: {name!r}")
 
     def available_runtimes(self) -> list[str]:
         return sorted(self._runtimes.keys())
@@ -241,7 +283,7 @@ class ExecutionManager:
                 await self._persist_session_start(
                     sid,
                     task_id,
-                    backend=backend,
+                    backend=getattr(selected_backend, "name", backend),
                     runtime=runtime,
                     cwd=cwd,
                     metadata={
@@ -305,6 +347,9 @@ class ExecutionManager:
         """
         backend_name = str(record.get("backend") or "")
         backend = self._backends.get(backend_name)
+        if backend is None and self._local_backend is not None:
+            if backend_name == getattr(self._local_backend, "name", None):
+                backend = self._local_backend
         if backend is None or not bool(getattr(backend, "supports_reattach", False)):
             return False
         reattach = getattr(backend, "reattach_session", None)
@@ -818,7 +863,10 @@ class ExecutionManager:
                     {"runtime": type(runtime).__name__, "error": str(exc)}
                 )
                 _logger.warning("runtime %s close_all failed: %s", type(runtime).__name__, exc)
-        for backend in list(self._backends.values()):
+        backends = list(self._backends.values())
+        if self._local_backend is not None:
+            backends.append(self._local_backend)
+        for backend in backends:
             shutdown = getattr(backend, "shutdown", None)
             if shutdown is None:
                 continue
@@ -910,6 +958,8 @@ class ExecutionManager:
         return False
 
     def _selected_backend(self, name: str) -> ExecutionBackend | None:
+        if name == "local" and self._local_backend is not None:
+            return self._local_backend
         if name in {"local", "sandboxed-local", "shadow", "sandbox", "verification"}:
             return None
         backend = self._backends.get(name)

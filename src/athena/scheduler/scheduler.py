@@ -45,7 +45,11 @@ _logger = logging.getLogger("athena.scheduler")
 @dataclass(frozen=True)
 class TaskTemplate:
     objective: str
+    # ``session_id`` remains a legacy input for hand-authored templates. A
+    # schedule-owned continuity session is persisted separately so changing
+    # the mode to ``fresh`` never accidentally reuses it.
     session_id: str | None = None
+    continuity_session_id: str | None = None
     parent_task_id: str | None = None
     workspace_id: str | None = None
     workspace_root: str | None = None
@@ -56,6 +60,8 @@ class TaskTemplate:
     max_agent_iterations: int | None = None
     deadline: datetime | None = None
     delivery_channel: str | None = None
+    delivery: DeliverySpec | None = None
+    continuity: str = "fresh"
     acceptance_criteria: tuple[Criterion, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
     capability_policy: CapabilityPolicy | None = None
@@ -130,11 +136,21 @@ class TaskTemplate:
         )
         if self.authority_snapshot:
             metadata["_authority_snapshot"] = dict(self.authority_snapshot)
-        # A template without a persistent session minted one fresh session per
-        # occurrence (the default). TaskManager._ensure_session creates the
-        # row; the lineage in metadata ties the occurrence back to its
-        # schedule and the conversation that scheduled it.
-        session_id = self.session_id or new_id("session")
+        # Fresh/previous-result/job-memory occurrences always mint a new
+        # execution session. Only the explicit ``session`` continuity mode may
+        # use the schedule-owned stable session. The fallback to session_id is
+        # for old persisted templates and is never used for fresh mode.
+        session_id = (
+            self.continuity_session_id or self.session_id or new_id("session")
+            if self.continuity == "session"
+            else new_id("session")
+        )
+        scheduled_delivery = (
+            _delivery_from_record(self.authority_snapshot.get("delivery"))
+            if "delivery" in self.authority_snapshot
+            else self.delivery
+            or (None if not self.delivery_channel else DeliverySpec(channel=self.delivery_channel))
+        )
         return TaskSpec(
             id=new_id("task"),
             objective=self.objective,
@@ -146,9 +162,7 @@ class TaskTemplate:
             model_policy=model_policy,
             resource_budget=budget,
             deadline=self.deadline,
-            delivery=(
-                None if not self.delivery_channel else DeliverySpec(channel=self.delivery_channel)
-            ),
+            delivery=scheduled_delivery,
             metadata=metadata,
         )
 
@@ -235,6 +249,7 @@ def _template_from_job(job: dict) -> TaskTemplate:
     return TaskTemplate(
         objective=active.get("objective") or job.get("name") or "",
         session_id=active.get("session_id"),
+        continuity_session_id=active.get("continuity_session_id"),
         parent_task_id=active.get("parent_task_id"),
         workspace_id=active.get("workspace_id"),
         workspace_root=active.get("workspace_root"),
@@ -245,6 +260,8 @@ def _template_from_job(job: dict) -> TaskTemplate:
         max_agent_iterations=active.get("max_agent_iterations"),
         deadline=deadline,
         delivery_channel=active.get("delivery_channel"),
+        delivery=_delivery_from_record(active.get("delivery")),
+        continuity=str(active.get("continuity") or "fresh"),
         acceptance_criteria=_criteria_from_records(active.get("acceptance_criteria")),
         metadata=dict(active.get("metadata") or {}),
         authority_snapshot=authority,
@@ -260,6 +277,15 @@ def _path_rules(raw: Any) -> tuple:
         PathRule(path=str(item.get("path") or ""), allow=bool(item.get("allow", True)))
         for item in raw
         if isinstance(item, Mapping) and item.get("path")
+    )
+
+
+def _delivery_from_record(raw: Any) -> DeliverySpec | None:
+    if not isinstance(raw, Mapping) or not raw.get("channel"):
+        return None
+    return DeliverySpec(
+        channel=str(raw["channel"]),
+        destination=(str(raw["destination"]) if raw.get("destination") is not None else None),
     )
 
 
@@ -454,6 +480,21 @@ class Scheduler:
                 "type": getattr(event, "type", None),
                 "payload": dict(getattr(event, "payload", {}) or {}),
             }
+        if template.continuity in {"previous_result", "job_memory"}:
+            prior = await self._store.previous_completed_run(job["id"], claim.scheduled_for)
+            if prior and prior.get("task_id"):
+                result = await self._tm.get_result(str(prior["task_id"]))
+                if result is not None:
+                    metadata["_schedule_previous_result"] = {
+                        "task_id": str(result.task_id),
+                        "status": result.status.value,
+                        "summary": str(result.summary or "")[:12_000],
+                        "unresolved": list(result.unresolved)[:64],
+                    }
+                    if template.continuity == "job_memory":
+                        metadata["_schedule_job_memory"] = dict(
+                            metadata["_schedule_previous_result"]
+                        )
         template = replace(template, metadata=metadata)
         spec = template.build_task_spec(job["id"], occurrence_key=occurrence_key)
         created = None

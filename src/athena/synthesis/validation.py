@@ -312,7 +312,7 @@ class Validator:
         child = _mod()._child_code(repr(cap.code))
         hosts: list[GeneratedToolHost] = []
 
-        async def _run_case(case: dict):
+        async def _run_case(case: dict, *, retry_transient_timeout: bool = True):
             execution_root = base_workspace_root
             host: GeneratedToolHost | None = None
             if validation_parent:
@@ -373,6 +373,22 @@ class Validator:
                 python_paths=dependency_paths,
                 host=host,
             )
+            # Bubblewrap/process startup can occasionally consume the entire
+            # validation budget under host contention before a trivial child
+            # reaches user code. Retry that infrastructure-shaped timeout once
+            # in a fresh isolated workspace; a genuinely non-terminating
+            # generated case still times out on the second attempt and is
+            # rejected normally. Expected-failure fixtures do not pay this
+            # extra retry because their timeout is part of the asserted proof.
+            if (
+                retry_transient_timeout
+                and output[2] == 124
+                and output[1].strip() == "synthetic execution timed out"
+            ):
+                # Re-enter the case builder so the retry receives a fresh
+                # workspace clone and a fresh generated host, rather than
+                # inheriting any partial state from the timed-out child.
+                return await _run_case(case, retry_transient_timeout=False)
             return (*output, execution_root, before, host)
 
         for i, case in enumerate(cases or []):
@@ -394,7 +410,14 @@ class Validator:
                     if case.get("expect_invalid_input"):
                         passed += 1
                     continue
-                out, err, rc, case_root, before, case_host = await _run_case(case)
+                expected_failure = bool(
+                    case.get("expect_failure")
+                    or case.get("expect_error_contains") is not None
+                    or case.get("expected_error") is not None
+                )
+                out, err, rc, case_root, before, case_host = await _run_case(
+                    case, retry_transient_timeout=not expected_failure
+                )
                 ok = rc == 0
                 marker = "__RESULT__"
                 value = None
@@ -418,11 +441,6 @@ class Validator:
                 expected_output = case.get("expect_output", _mod()._MISSING)
                 if expected_output is not _mod()._MISSING:
                     ok = ok and value == expected_output
-                expected_failure = bool(
-                    case.get("expect_failure")
-                    or case.get("expect_error_contains") is not None
-                    or case.get("expected_error") is not None
-                )
                 if expected_failure:
                     ok = rc != 0
                     expected_error = case.get("expect_error_contains")

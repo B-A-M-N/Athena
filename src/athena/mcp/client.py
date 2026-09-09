@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import asyncio
+import inspect
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -104,8 +105,10 @@ class MCPClient:
         args: list[str] | None = None,
         url: str | None = None,
         env: Mapping[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
         cwd: str | None = None,
         connect_timeout: float = 10.0,
+        on_transport_failure: Any = None,
     ) -> None:
         if (command is not None) == (url is not None):
             raise MCPError(
@@ -117,8 +120,10 @@ class MCPClient:
         self.args = list(args or [])
         self.url = url
         self.env = dict(env or {})
+        self.headers = dict(headers or {})
         self.cwd = cwd
         self.connect_timeout = connect_timeout
+        self._on_transport_failure = on_transport_failure
         self._session: Any = None
         self._exit_stack: Any = None
         self._connected = False
@@ -127,6 +132,7 @@ class MCPClient:
         self._last_successful_connection: str | None = None
         self._tool_count = 0
         self._resource_cache: dict[str, object] = {}
+        self._prompt_cache: dict[str, MCPPromptRef] = {}
         self._lock = _new_lock()
 
     # ------------------------------------------------------------------ #
@@ -177,7 +183,11 @@ class MCPClient:
                     streamablehttp_client = importlib.import_module(
                         "mcp.client.streamable_http"
                     ).streamablehttp_client
-                    http_ctx = streamablehttp_client(self.url, timeout=float(self.connect_timeout))
+                    http_ctx = streamablehttp_client(
+                        self.url,
+                        timeout=float(self.connect_timeout),
+                        headers=self.headers or None,
+                    )
                     read, write, _ = await self._bounded(stack.enter_async_context(http_ctx))
                 else:
                     stdio_client = importlib.import_module("mcp.client.stdio").stdio_client
@@ -306,7 +316,7 @@ class MCPClient:
         except Exception as exc:
             self._mark_transport_failure(exc)
             raise MCPError(f"MCP list_prompts failed on {self.connection_id!r}: {exc}") from exc
-        return [
+        refs = [
             MCPPromptRef(
                 name=p.name,
                 description=getattr(p, "description", "") or "",
@@ -315,6 +325,8 @@ class MCPClient:
             )
             for p in result.prompts
         ]
+        self._prompt_cache = {ref.name: ref for ref in refs}
+        return refs
 
     async def get_prompt(
         self,
@@ -397,6 +409,19 @@ class MCPClient:
         """
         self._connected = False
         self._last_error = f"{type(exc).__name__}: {exc}"
+        self._tool_count = 0
+        self._resource_cache.clear()
+        self._prompt_cache.clear()
+        callback = self._on_transport_failure
+        if callback is not None:
+            try:
+                outcome = callback(self.connection_id, exc)
+                if inspect.isawaitable(outcome):
+                    asyncio.ensure_future(outcome)
+            except Exception:
+                # A health callback is bookkeeping; never hide the transport
+                # failure that made the request unusable.
+                pass
 
 
 def _normalize_annotations(annotations: Any) -> dict[str, Any]:

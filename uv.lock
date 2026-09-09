@@ -130,9 +130,6 @@ cli = [
 computer = [
     { name = "pyautogui" },
 ]
-container = [
-    { name = "docker" },
-]
 debug = [
     { name = "debugpy" },
 ]
@@ -167,7 +164,6 @@ requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "click", marker = "extra == 'dev'", specifier = ">=8.1" },
     { name = "debugpy", marker = "extra == 'debug'", specifier = ">=1.8" },
-    { name = "docker", marker = "extra == 'container'", specifier = ">=7.0" },
     { name = "fastembed", marker = "extra == 'semantic'", specifier = ">=0.8,<0.9" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
@@ -193,7 +189,7 @@ requires-dist = [
     { name = "wcwidth", specifier = ">=0.2" },
     { name = "wcwidth", marker = "extra == 'cli'", specifier = ">=0.2" },
 ]
-provides-extras = ["mcp", "semantic", "anthropic", "container", "debug", "cli", "glass", "computer", "browser", "dev"]
+provides-extras = ["mcp", "semantic", "anthropic", "debug", "cli", "glass", "computer", "browser", "dev"]
 
 [[package]]
 name = "attrs"
@@ -448,20 +444,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/0f/d5/c66da9b79e5bdb124974bfe172b4daf3c984ebd9c2a06e2b8a4dc7331c72/defusedxml-0.7.1.tar.gz", hash = "sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69", size = 75520, upload-time = "2021-03-08T10:59:26.269Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl", hash = "sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61", size = 25604, upload-time = "2021-03-08T10:59:24.45Z" },
-]
-
-[[package]]
-name = "docker"
-version = "7.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pywin32", marker = "sys_platform == 'win32'" },
-    { name = "requests" },
-    { name = "urllib3" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/88/7f/731ff914b0255d3d065f45fd4e626d4b8c95dbcbaada049f337a6ac16410/docker-7.2.0.tar.gz", hash = "sha256:cebb93773d334f778e023a7ee352a8d6e13ab1bd3b863a4d4a59dec897df43ac", size = 118731, upload-time = "2026-07-09T14:53:46.39Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/75/23/529140fe1aab80fc6992f93a706deec709140a6397439139a054e1515c45/docker-7.2.0-py3-none-any.whl", hash = "sha256:a3f45fdeb9165e2d25d9a1d02ddf3bc70fb572cf5ebbf9b58558c22caf29b71f", size = 148775, upload-time = "2026-07-09T14:53:45.224Z" },
 ]
 
 [[package]]

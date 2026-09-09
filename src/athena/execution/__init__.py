@@ -13,7 +13,9 @@ from athena.execution.backend import (
     register_backend,
 )
 from athena.execution.container import ContainerBackend
+from athena.execution.ssh import SSHBackend, SSHProfile
 from athena.execution.local import LocalBackend
+from athena.execution.runtime_host import LocalRuntimeSupervisor, SupervisedLocalBackend
 from athena.execution.manager import ExecutionManager, Sink
 from athena.execution.diagnostics import (
     Diagnostic,
@@ -34,7 +36,11 @@ __all__ = [
     "register_backend",
     "get_backend",
     "LocalBackend",
+    "LocalRuntimeSupervisor",
+    "SupervisedLocalBackend",
     "ContainerBackend",
+    "SSHBackend",
+    "SSHProfile",
     "process_tree",
     "Diagnostic",
     "normalize_diagnostics",

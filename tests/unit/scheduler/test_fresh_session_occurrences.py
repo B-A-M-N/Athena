@@ -53,14 +53,29 @@ def test_template_lineage_references_schedule_and_creator():
     }
 
 
-def test_explicit_persistent_session_is_honored():
-    template = _template(session_id="session-persistent")
+def test_explicit_session_continuity_is_honored():
+    template = _template(
+        session_id="session-persistent",
+        continuity_session_id="session-persistent",
+        continuity="session",
+    )
 
     first = template.build_task_spec("job-1", occurrence_key="job-1|t1")
     second = template.build_task_spec("job-1", occurrence_key="job-1|t2")
 
     assert first.session_id == "session-persistent"
     assert second.session_id == "session-persistent"
+
+
+def test_fresh_continuity_does_not_reuse_legacy_session_id():
+    template = _template(session_id="session-creator", continuity="fresh")
+
+    first = template.build_task_spec("job-1", occurrence_key="job-1|t1")
+    second = template.build_task_spec("job-1", occurrence_key="job-1|t2")
+
+    assert first.session_id != "session-creator"
+    assert second.session_id != "session-creator"
+    assert first.session_id != second.session_id
 
 
 @pytest.mark.asyncio
@@ -169,8 +184,11 @@ async def test_schedule_capability_persistent_session_opt_in():
     assert result.status.name == "OK", result.error
     job = store.jobs[json.loads(result.output)["job_id"]]
     template = job["payload"]["template"]
-    # Explicit opt-in: every occurrence shares the requesting session.
-    assert template["session_id"] == "session-creator"
+    # Explicit opt-in: every occurrence shares a schedule-owned continuity
+    # session, kept separate from the generic session field.
+    assert template["session_id"] is None
+    assert template["continuity_session_id"] == "session-creator"
+    assert template["continuity"] == "session"
 
 
 def test_occurrence_metadata_marks_occurrence_key():

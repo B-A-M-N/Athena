@@ -98,7 +98,8 @@ __all__ = ["AgentKernel"]
 
 _logger = logging.getLogger("athena.kernel")
 
-_FALLBACK_ATTEMPTS = 2
+# Hard process-wide safety ceiling; task/role policy may narrow this further.
+_FALLBACK_ATTEMPTS = 8
 
 
 def _bookkeeping_failure(what: str, task: TaskSpec | str | None, exc: BaseException) -> None:
@@ -486,6 +487,7 @@ class AgentKernel:
         continuation_store=None,
         workflow_run_store=None,
         input_request_store=None,
+        steering_store=None,
         parked_slot_wait_s: float = 300.0,
         router: "ModelRouter",
         interpreter=None,
@@ -518,6 +520,7 @@ class AgentKernel:
         # call parks the SAME task in WAITING_INPUT with the question durable;
         # the operator's answer resumes the identical task.
         self._input_request_store = input_request_store
+        self._steering_store = steering_store
         # Worker slot release (P1-17): how long a parked wait (WAITING_INPUT,
         # WAITING_APPROVAL) may hold its worker coroutine. Past this, the run
         # returns with the task left in its paused status and the worker slot
@@ -525,6 +528,8 @@ class AgentKernel:
         # survives, and the resumer (provide_input / approve / startup
         # recovery) relaunches the task on a fresh worker.
         self._parked_slot_wait_s = max(float(parked_slot_wait_s), 0.0)
+        self._parked_resource_releaser = None
+        self._parked_resource_resumption_handler = None
         # Secret manager for runtime secrets supplied via request_input.
         self._secret_manager = secret_manager
         # Reality completion authority: intercepts terminal decisions to bind
@@ -659,6 +664,9 @@ class AgentKernel:
                 _bookkeeping_failure("provider stream interrupt", task_id, exc)
 
     async def notify_approval_resolved(self, task_id: str, decision: str) -> bool:
+        cancel_release = getattr(self, "_cancel_parked_resource_release", None)
+        if callable(cancel_release):
+            await cancel_release(task_id)
         self._resume_decision[task_id] = decision
         event = self._resume.setdefault(task_id, asyncio.Event())
         async with self._resume_locks.setdefault(task_id, asyncio.Lock()):
@@ -678,6 +686,9 @@ class AgentKernel:
         # The answer has already been committed by InputRequestStore.  Keep
         # plaintext out of process-local side channels; the durable row is the
         # authority and the event only reduces resume latency.
+        cancel_release = getattr(self, "_cancel_parked_resource_release", None)
+        if callable(cancel_release):
+            await cancel_release(task_id)
         event = self._resume.setdefault(task_id, asyncio.Event())
         async with self._resume_locks.setdefault(task_id, asyncio.Lock()):
             armed = task_id in self._resume_armed
@@ -719,6 +730,36 @@ class AgentKernel:
 
     def _park_wait(self, task, state):
         return ContinuationCoordinator(self)._park_wait(task, state)
+
+    def set_parked_resource_releaser(self, releaser) -> None:
+        """Bind the service-owned parked-resource retention authority."""
+        self._parked_resource_releaser = releaser
+
+    def set_parked_resource_resumption_handler(self, handler) -> None:
+        """Bind cancellation of a delayed parked-resource release."""
+        self._parked_resource_resumption_handler = handler
+
+    async def _cancel_parked_resource_release(self, task_id: str) -> None:
+        handler = self._parked_resource_resumption_handler
+        if not callable(handler):
+            return
+        try:
+            result = handler(task_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # parked cleanup is evidence, not a resume blocker
+            _logger.warning("parked resource release cancellation failed for %s: %s", task_id, exc)
+
+    async def _release_parked_resources(self, task) -> None:
+        releaser = self._parked_resource_releaser
+        if not callable(releaser):
+            return
+        try:
+            outcome = releaser(task.id)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception as exc:  # parked cleanup is evidence, not a crash path
+            _logger.warning("parked resource release failed for %s: %s", task.id, exc)
 
     async def _paused_result(self, task, state, status: TaskStatus, reason: str) -> TaskResult:
         return await RunFinalizer(self)._paused_result(task, state, status, reason)
@@ -789,6 +830,8 @@ class AgentKernel:
                 if approval_result is not None:
                     return approval_result
                 continue
+
+            await self._apply_pending_steering(task)
 
             try:
                 compiled = await self._compile(task)
@@ -912,6 +955,71 @@ class AgentKernel:
                 task,
             )
         return compiled
+
+    async def _apply_pending_steering(self, task: TaskSpec) -> None:
+        """Materialize queued steering as durable user content at a safe boundary."""
+        store = self._steering_store
+        if store is None or not task.session_id:
+            return
+        for item in await store.list_pending(task.id):
+            message_id = f"msg_steer_{item['id']}"
+            source = str(item.get("source") or "").strip().lower()
+            if not source:
+                source = "parent_task" if item.get("source_task_id") else "operator"
+            if source == "parent_task":
+                source_type = SourceType.TASK
+                trust = TrustClass.AGENT_CURATED
+                prefix = "[Parent-task steering for the current task; consider it at this reasoning boundary]\n"
+            elif source == "system":
+                source_type = SourceType.SYSTEM
+                trust = TrustClass.AUTHORITY
+                prefix = "[System steering for the current task]\n"
+            else:
+                source_type = SourceType.USER
+                trust = TrustClass.USER_CONTENT
+                prefix = "[Operator steering for the current task; consider it at this reasoning boundary]\n"
+            message = Message(
+                id=message_id,
+                role=Role.USER,
+                blocks=(
+                    TextBlock(
+                        text=(prefix + str(item["text"])),
+                        provenance=Provenance(
+                            source_type=source_type,
+                            source_id=str(item["id"]),
+                            trust=trust,
+                            scope=f"task:{task.id}",
+                            created_at=utcnow(),
+                        ),
+                    ),
+                ),
+                created_at=utcnow(),
+                provenance=Provenance(
+                    source_type=source_type,
+                    source_id=str(item["id"]),
+                    trust=trust,
+                    scope=f"task:{task.id}",
+                    created_at=utcnow(),
+                ),
+                metadata={
+                    "session_id": task.session_id,
+                    "task_id": task.id,
+                    "steering_id": item["id"],
+                    "source_task_id": item.get("source_task_id"),
+                    "source": source,
+                },
+            )
+            await self._messages.append_user_turn(task.session_id, message)
+            await store.mark_consumed(item["id"])
+            await self._emit(
+                "TaskSteered",
+                {
+                    "steering_id": item["id"],
+                    "principal_id": item["principal_id"],
+                    "source_task_id": item.get("source_task_id"),
+                },
+                task,
+            )
 
     async def _select_model(
         self,

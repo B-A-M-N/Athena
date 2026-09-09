@@ -62,6 +62,9 @@ from athena.kernel.kernel import AgentKernel
 from athena.kernel.dispatch import CapabilityDispatchShim
 from athena.mcp.adapter import MCPAdapter
 from athena.mcp.client import MCPClient
+from athena.mcp.prompts import MCPPromptProvider
+from athena.mcp.resources import MCPResourceProvider
+from athena.mcp.supervisor import MCPConnectionSupervisor
 from athena.memory.store import MemoryStore
 from athena.models.providers.anthropic import AnthropicProvider
 from athena.models.providers.fake import FakeModelProvider
@@ -99,6 +102,7 @@ from athena.tasks.cancellation import CancellationManager
 from athena.tasks.delegation import DelegationManager
 from athena.tasks.manager import TaskManager
 from athena.tasks.worker import TaskWorker
+from athena.voice import VoiceManager
 
 if TYPE_CHECKING:
     from athena.state.input_requests import InputRequestStore
@@ -234,6 +238,7 @@ class AthenaService:
         self._context_block_store: ContextBlockStore | None = None
         self._pack_store: PackStore | None = None
         self._pack_manager: Any = None
+        self._pack_hook_outbox: Any = None
         self._delegate_session_store: DelegateSessionStore | None = None
         self._delegate_registry = DelegateRegistry()
         self._external_delegate_manager: Any = None
@@ -261,6 +266,7 @@ class AthenaService:
         self._acceptance_verifier: Any = None
         self._compiler: ContextCompiler | None = None
         self._model_registry: ProviderRegistry | None = None
+        self._voice: VoiceManager | None = None
         self._kernel: AgentKernel | None = None
         self._task_manager: TaskManager | None = None
         self._worker: TaskWorker | None = None
@@ -270,6 +276,7 @@ class AthenaService:
         self._shutdown_hooks: list[tuple[str, Any]] = []
         self._resource_finalizer: Any = None
         self._resource_obligation_store: Any = None
+        self._pending_finalization_store: Any = None
         self._shutdown_status: dict[str, Any] = {"state": "not_started"}
         self._budgets: BudgetTracker | None = None
         self._cancellations: CancellationManager | None = None
@@ -288,10 +295,12 @@ class AthenaService:
         # Set by ServiceLifecycle during startup (P1-10 extraction); declared
         # here so the facade's type surface stays complete.
         self._store_input_requests: InputRequestStore | None = None
+        self._steering_store: Any = None
         self._external_effect_store: ExternalEffectStore | None = None
         self._knowledge: Any = None
         self._provider_usage_store: Any = None
         self._runtime_state_root: Path | None = None
+        self._runtime_host_supervisor: Any = None
         self._router: ModelRouter | None = None
         # Self-host orchestration mechanism (P1-10): constructed against
         # the facade; every authority seam still resolves through self.
@@ -299,8 +308,11 @@ class AthenaService:
         self._candidates = CandidateService(self)
 
         self._mcp_clients: list[MCPClient] = []
+        self._mcp_resources: MCPResourceProvider | None = None
+        self._mcp_prompts: MCPPromptProvider | None = None
         self._mcp_connection_status: dict[str, dict[str, Any]] = {}
         self._mcp_reconnect_failures: dict[str, int] = {}
+        self._mcp_supervisor: MCPConnectionSupervisor | None = None
 
     # ------------------------------------------------------------------ #
     # Factories for tests / smoke
@@ -456,7 +468,9 @@ class AthenaService:
         if finalizer is None or manager is None:
             raise ServiceNotReady("resource finalization is not initialized")
         task = await manager.get(str(task_id))
-        result = await manager.get_result(str(task_id))
+        pending_store = self._pending_finalization_store
+        pending = await pending_store.get(str(task_id)) if pending_store is not None else None
+        result = pending.result if pending is not None else await manager.get_result(str(task_id))
         if result is None:
             from athena.protocol.tasks import TaskResult
 
@@ -467,6 +481,17 @@ class AthenaService:
             )
         await finalizer.retry(task, result)
         health = finalizer.health()
+        task_unresolved = finalizer.unresolved_for_task(str(task_id))
+        if pending is not None and not task_unresolved and not health.get("durability_error"):
+            recovered = await manager.commit_pending_finalization(str(task_id))
+            if recovered is not None:
+                health = {
+                    **health,
+                    "pending_finalization": {
+                        "status": "committed",
+                        "result_status": recovered.status.value,
+                    },
+                }
         check = self._startup_health.get("checks", {}).get("resource_obligations")
         if isinstance(check, dict):
             check.update(
@@ -681,8 +706,70 @@ class AthenaService:
                 },
             )
         for client in self._mcp_clients:
-            status[client.connection_id] = client.health()
+            live = client.health()
+            configured_server = configured.get(client.connection_id)
+            live.update(
+                {
+                    "configured": configured_server is not None,
+                    "required": bool(configured_server.required)
+                    if configured_server is not None
+                    else False,
+                    "transport": (
+                        "http"
+                        if configured_server is not None and configured_server.url
+                        else "stdio"
+                    ),
+                }
+            )
+            status[client.connection_id] = live
         return {name: dict(status[name]) for name in sorted(status)}
+
+    def mcp_resources(self) -> list[dict[str, Any]]:
+        """List discovered MCP resources without treating them as tools."""
+        provider = self._mcp_resources
+        if provider is None:
+            return []
+        return [
+            {
+                "uri": ref.uri,
+                "name": ref.name,
+                "description": ref.description,
+                "server": ref.server,
+            }
+            for ref in provider.available()
+        ]
+
+    async def read_mcp_resource(self, uri: str, *, connection_id: str | None = None) -> list[Any]:
+        if self._mcp_resources is None:
+            raise ServiceNotReady("MCP resources are not initialized")
+        return await self._mcp_resources.read_resource_blocks(uri, connection_id=connection_id)
+
+    async def mcp_prompts(self) -> list[dict[str, Any]]:
+        """Discover MCP prompts as lower-authority context templates."""
+        if self._mcp_prompts is None:
+            return []
+        return [
+            {
+                "name": ref.name,
+                "description": ref.description,
+                "arguments": list(ref.arguments),
+                "server": ref.server,
+            }
+            for ref in await self._mcp_prompts.available()
+        ]
+
+    async def render_mcp_prompt(
+        self,
+        name: str,
+        arguments: Mapping[str, str] | None = None,
+        *,
+        connection_id: str | None = None,
+    ) -> list[Any]:
+        if self._mcp_prompts is None:
+            raise ServiceNotReady("MCP prompts are not initialized")
+        return await self._mcp_prompts.render_prompt_blocks(
+            name, dict(arguments or {}), connection_id=connection_id
+        )
 
     @property
     def _hermes_supervision_mode(self) -> HermesSupervisionMode:
@@ -797,6 +884,77 @@ class AthenaService:
     # ------------------------------------------------------------------ #
     async def submit(self, request: AgentRequest, *, wait: bool = True) -> TaskSpec:
         return await TaskAPI(self).submit(request, wait=wait)
+
+    def voice_health(self) -> dict[str, Any]:
+        """Return bounded voice readiness without exposing credentials."""
+        if self._voice is None:
+            return {"enabled": False, "state": "not_started"}
+        return self._voice.health()
+
+    async def transcribe_voice(
+        self,
+        data: bytes,
+        *,
+        mime_type: str,
+        filename: str = "voice-input",
+        language: str | None = None,
+        task_id: str | None = None,
+    ):
+        """Transcribe audio through the configured voice route."""
+        if self._voice is None:
+            from athena.protocol.errors import VoiceUnavailable
+
+            raise VoiceUnavailable("voice subsystem is not started")
+        return await self._voice.transcribe(
+            data,
+            mime_type=mime_type,
+            filename=filename,
+            language=language,
+            task_id=task_id,
+        )
+
+    async def synthesize_voice(
+        self,
+        text: str,
+        *,
+        task_id: str | None = None,
+        voice: str | None = None,
+        response_format: str | None = None,
+    ):
+        """Synthesize bounded spoken output into a task-owned artifact."""
+        if self._voice is None:
+            from athena.protocol.errors import VoiceUnavailable
+
+            raise VoiceUnavailable("voice subsystem is not started")
+        return await self._voice.synthesize(
+            text,
+            task_id=task_id,
+            voice=voice,
+            response_format=response_format,
+        )
+
+    async def synthesize_task_result(
+        self,
+        task_id: str,
+        *,
+        voice: str | None = None,
+        response_format: str | None = None,
+    ):
+        """Speak the durable task summary once the task has finalized."""
+        from athena.protocol.errors import VoiceResultNotReady
+
+        result = await self.get_result(task_id)
+        if result is None:
+            raise VoiceResultNotReady(f"result not ready for task {task_id!r}")
+        summary = str(getattr(result, "summary", "") or "").strip()
+        if not summary:
+            raise VoiceResultNotReady(f"task {task_id!r} has no speakable summary")
+        return await self.synthesize_voice(
+            summary,
+            task_id=task_id,
+            voice=voice,
+            response_format=response_format,
+        )
 
     async def submit_spec(
         self,
@@ -1409,6 +1567,61 @@ class AthenaService:
 
     async def interrupt(self, task_id: str, reason: str = "externally interrupted") -> TaskStatus:
         return await OperatorInteractionService(self).interrupt(task_id, reason)
+
+    async def steer_task(
+        self,
+        task_id: str,
+        text: str,
+        *,
+        principal_id: str | None = None,
+        source_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Queue operator/parent steering for the next safe model boundary."""
+        if self._steering_store is None or self._task_manager is None:
+            raise ServiceNotReady("task steering is not initialized")
+        task = await self._task_manager.get(str(task_id))
+        if source_task_id is not None:
+            source_id = str(source_task_id)
+            try:
+                source = await self._task_manager.get(source_id)
+            except KeyError as exc:
+                raise ValueError(f"source task {source_id!r} does not exist") from exc
+            # A parent may steer any descendant, but unrelated tasks must not
+            # be able to inject authority-bearing content into one another.
+            cursor = task
+            related = False
+            visited: set[str] = set()
+            while cursor.parent_task_id and cursor.parent_task_id not in visited:
+                visited.add(cursor.id)
+                if cursor.parent_task_id == source.id:
+                    related = True
+                    break
+                try:
+                    cursor = await self._task_manager.get(cursor.parent_task_id)
+                except KeyError:
+                    break
+            if not related:
+                raise ValueError(
+                    f"source task {source_id!r} is not an ancestor of task {task_id!r}"
+                )
+        status = await self.get_task_status(str(task_id))
+        if status not in {
+            TaskStatus.QUEUED.value,
+            TaskStatus.RUNNING.value,
+            TaskStatus.INTERRUPTED.value,
+        }:
+            raise ValueError(f"task {task_id!r} is not steerable in status {status}")
+        record = await self._steering_store.enqueue(
+            str(task_id),
+            text,
+            principal_id=str(principal_id or self.config.cache_namespace),
+            source_task_id=source_task_id,
+            source="operator",
+        )
+        worker = self._worker
+        if worker is not None:
+            worker.notify()
+        return record
 
     async def pending_input(self, task_id: str) -> dict | None:
         return await OperatorInteractionService(self).pending_input(task_id)
@@ -2155,6 +2368,7 @@ class AthenaService:
                     else None
                 ),
                 require_declared_quality=bool(spec.get("require_declared_quality", False)),
+                max_model_attempts=int(spec.get("max_model_attempts", 2)),
             )
         return out
 
@@ -2301,7 +2515,12 @@ class AthenaService:
         from athena.capabilities.dependency import DependencyCapability
         from athena.capabilities.reflection import CapabilityReflection
         from athena.capabilities.truth import TruthCapability
-        from athena.capabilities.research import HttpDiscoveryProvider, ResearchCapability
+        from athena.capabilities.research import (
+            BraveSearchProvider,
+            HttpDiscoveryProvider,
+            ResearchCapability,
+            TavilySearchProvider,
+        )
         from athena.capabilities.scratch import ScratchCapability
         from athena.capabilities.observer import ObserverCapability
         from athena.capabilities.capsule import ProcedureCapsuleCapability
@@ -2403,7 +2622,7 @@ class AthenaService:
                 if self.config.research_discovery_endpoint
                 else ()
             )
-            discovery_providers = tuple(
+            discovery_providers: list[Any] = list(
                 HttpDiscoveryProvider(
                     endpoint,
                     source_policy=research_policy,
@@ -2411,12 +2630,54 @@ class AthenaService:
                 )
                 for endpoint in discovery_endpoints
             )
+
+            # Resolve API credentials lazily at search time. This keeps raw
+            # keys out of config, capability descriptors, and model context,
+            # while allowing the configured SecretManager source (env,
+            # keyring, 1Password, Bitwarden, or operator resolver) to rotate.
+            def research_credential(name: str):
+                def resolve() -> str | None:
+                    try:
+                        return (
+                            self._secrets.resolve(
+                                name,
+                                owner_task="system",
+                                backend="research",
+                            )
+                            if self._secrets is not None
+                            else None
+                        )
+                    except SecretError:
+                        return None
+
+                return resolve
+
+            if self.config.research_brave_api_key_credential:
+                discovery_providers.append(
+                    BraveSearchProvider(
+                        source_policy=research_policy,
+                        api_key_resolver=research_credential(
+                            self.config.research_brave_api_key_credential
+                        ),
+                        timeout=self.config.research_discovery_timeout,
+                    )
+                )
+            if self.config.research_tavily_api_key_credential:
+                discovery_providers.append(
+                    TavilySearchProvider(
+                        source_policy=research_policy,
+                        api_key_resolver=research_credential(
+                            self.config.research_tavily_api_key_credential
+                        ),
+                        timeout=self.config.research_discovery_timeout,
+                    )
+                )
             registry.register(
                 ResearchCapability(
                     research_store,
                     artifact_store=self._artifacts,
                     source_policy=research_policy,
-                    discovery_providers=discovery_providers,
+                    discovery_providers=tuple(discovery_providers),
                 )
             )
         if self._workflow_store is not None and self._fabric is not None:
@@ -2569,6 +2830,7 @@ class AthenaService:
                 self._browser = BrowserCapability(
                     driver_factory=browser_factory,
                     session_scope=self.config.browser_session_scope,
+                    artifact_store=self._artifacts,
                 )
                 self._browser_health = self._browser.health()
                 self._optional_capability_health["browser"] = {
@@ -2668,6 +2930,8 @@ class AthenaService:
             else None
         )
         self._checkpoints = CheckpointManager(root=checkpoint_root or "/tmp/athena-checkpoints")
+        if self._resource_finalizer is not None:
+            self._resource_finalizer.bind_checkpoint_manager(self._checkpoints)
         self._reality_gate.bind_checkpoint_manager(self._checkpoints)
         registry.register(
             WorkspaceCapability(
@@ -2975,8 +3239,8 @@ class AthenaService:
         pcs = tuple(self.config.providers)
         if not pcs:
             return
-        provider: Any = None
         for pc in pcs:
+            provider: Any
             if pc.kind == "fake":
                 provider = FakeModelProvider(
                     tool_calling=True,
@@ -2984,6 +3248,8 @@ class AthenaService:
                     provider=pc.name,
                     scripts=list(pc.extra.get("scripts") or []),
                     vision=bool(pc.extra.get("vision", False)),
+                    audio_input=bool(pc.extra.get("audio_input", False)),
+                    audio_output=bool(pc.extra.get("audio_output", False)),
                     cost=pc.extra.get("cost"),
                     latency_class=pc.latency_class or pc.extra.get("latency_class"),
                 )
@@ -2995,42 +3261,40 @@ class AthenaService:
                     _model_profile_from_config(pc.model, pc.extra.get("model_profile")),
                 )
                 continue
+            credential_ids = tuple(
+                dict.fromkeys(
+                    str(value)
+                    for value in (
+                        pc.credential_ids or ((pc.credential_id,) if pc.credential_id else ())
+                    )
+                    if value
+                )
+            )
+            if len(credential_ids) > 1:
+                from athena.models.credentials import ProviderCredentialPool
+
+                factories: list[tuple[str, Any]] = []
+                for credential_id in credential_ids:
+                    factories.append(
+                        (
+                            credential_id,
+                            lambda credential_id=credential_id, provider_config=pc: (
+                                self._build_provider(provider_config, credential_id)
+                            ),
+                        )
+                    )
+                provider = ProviderCredentialPool(
+                    pc.name,
+                    factories,
+                )
+            else:
+                provider = self._build_provider(pc, credential_ids[0] if credential_ids else None)
             profile = resolve_profile(
                 pc.kind,
                 base_url=pc.base_url,
                 model_id=pc.model,
                 cache_mode=pc.cache_mode,
             )
-            if profile.protocol in {"openai", "openai-compat"}:
-                if not profile.base_url:
-                    raise ValueError(f"provider {pc.name!r} needs an explicit base_url")
-                provider = OpenAICompatProvider(
-                    base_url=profile.base_url,
-                    api_key=self._resolve_api_key(pc),
-                    model=profile.model_id or pc.model,
-                    provider=pc.name,
-                    headers=pc.extra.get("headers"),
-                    timeout=float(pc.extra.get("timeout", 60.0)),
-                    http2=bool(pc.extra.get("http2", False)),
-                    authentication=pc.authentication,
-                    cost=pc.extra.get("cost"),
-                    latency_class=pc.latency_class or pc.extra.get("latency_class"),
-                    vision=bool(pc.extra.get("vision", False)),
-                )
-            elif profile.protocol == "anthropic":
-                provider = AnthropicProvider(
-                    api_key=self._resolve_api_key(pc) or None,
-                    base_url=profile.base_url,
-                    model=profile.model_id or pc.model,
-                    provider=pc.name,
-                    headers=pc.extra.get("headers"),
-                    timeout=float(pc.extra.get("timeout", 60.0)),
-                    use_sdk=bool(pc.extra.get("use_sdk", True)),
-                    cost=pc.extra.get("cost"),
-                    latency_class=pc.latency_class or pc.extra.get("latency_class"),
-                )
-            else:
-                raise ValueError(f"unsupported provider protocol: {profile.protocol!r}")
             registry.register(pc.name, provider)
             registry.set_profile(pc.name, profile)
             registry.set_model_profile(
@@ -3042,15 +3306,83 @@ class AthenaService:
                 ),
             )
 
+    def _build_provider(self, pc: ProviderConfig, credential_id: str | None = None) -> Any:
+        """Construct one provider adapter for one credential slot."""
+        profile = resolve_profile(
+            pc.kind,
+            base_url=pc.base_url,
+            model_id=pc.model,
+            cache_mode=pc.cache_mode,
+        )
+        if profile.protocol in {"openai", "openai-compat"}:
+            if not profile.base_url:
+                raise ValueError(f"provider {pc.name!r} needs an explicit base_url")
+            return OpenAICompatProvider(
+                base_url=profile.base_url,
+                api_key=self._resolve_api_key(pc, credential_id=credential_id),
+                model=profile.model_id or pc.model,
+                provider=pc.name,
+                headers=pc.extra.get("headers"),
+                timeout=float(pc.extra.get("timeout", 60.0)),
+                http2=bool(pc.extra.get("http2", False)),
+                authentication=pc.authentication,
+                cost=pc.extra.get("cost"),
+                latency_class=pc.latency_class or pc.extra.get("latency_class"),
+                vision=bool(pc.extra.get("vision", False)),
+                audio_input=bool(pc.extra.get("audio_input", False)),
+                audio_output=bool(pc.extra.get("audio_output", False)),
+            )
+        if profile.protocol == "anthropic":
+            return AnthropicProvider(
+                api_key=self._resolve_api_key(pc, credential_id=credential_id) or None,
+                base_url=profile.base_url,
+                model=profile.model_id or pc.model,
+                provider=pc.name,
+                headers=pc.extra.get("headers"),
+                timeout=float(pc.extra.get("timeout", 60.0)),
+                use_sdk=bool(pc.extra.get("use_sdk", True)),
+                cost=pc.extra.get("cost"),
+                latency_class=pc.latency_class or pc.extra.get("latency_class"),
+            )
+        raise ValueError(f"unsupported provider protocol: {profile.protocol!r}")
+
     async def _connect_mcp(self) -> None:
         for server in self.config.mcp_servers:
             await self._connect_mcp_server(server)
-            status = self._mcp_connection_status.get(server.name, {})
-            if server.required and status.get("state") != "connected":
-                raise RuntimeError(
-                    f"required MCP server {server.name!r} is not ready: "
-                    f"{status.get('last_error') or status.get('state') or 'unknown'}"
-                )
+
+    async def start_mcp_supervisor(self) -> None:
+        if not self.config.mcp_servers:
+            return
+        self._mcp_supervisor = MCPConnectionSupervisor(
+            (server.name for server in self.config.mcp_servers),
+            self.mcp_reconnect,
+        )
+        for name, status in self._mcp_connection_status.items():
+            if status.get("state") == "connected":
+                self._mcp_supervisor.mark_connected(name)
+        await self._mcp_supervisor.start()
+
+    async def _handle_mcp_transport_failure(self, connection_id: str, error: BaseException) -> None:
+        """Invalidate a live MCP surface before reconnect is attempted."""
+        name = str(connection_id)
+        current = dict(self._mcp_connection_status.get(name) or {})
+        current.update(
+            {
+                "id": name,
+                "state": "failed",
+                "tool_count": 0,
+                "last_error": f"{type(error).__name__}: {error}",
+            }
+        )
+        self._mcp_connection_status[name] = current
+        if self._mcp is not None:
+            self._mcp.unregister_connection(name)
+        if self._mcp_resources is not None:
+            self._mcp_resources.remove_client(name)
+        if self._mcp_prompts is not None:
+            self._mcp_prompts.remove_client(name)
+        if self._mcp_supervisor is not None:
+            self._mcp_supervisor.mark_failed(name)
 
     async def _connect_mcp_server(self, server: MCPConfig) -> dict[str, Any]:
         transport = "http" if server.url else "stdio"
@@ -3070,18 +3402,70 @@ class AthenaService:
             if server.secret_env and self._secrets is not None:
                 for env_name, credential_id in server.secret_env.items():
                     env[env_name] = self._secrets.resolve(credential_id)
+            headers = dict(server.headers)
+            if server.secret_headers and self._secrets is not None:
+                for header_name, credential_id in server.secret_headers.items():
+                    headers[header_name] = self._secrets.resolve(credential_id)
+            if server.credential_id:
+                if self._secrets is None:
+                    raise SecretError(
+                        f"MCP server {server.name!r} requires SecretManager credential"
+                    )
+                credential = self._secrets.resolve(server.credential_id)
+                scheme = str(server.auth_scheme or "bearer").strip().lower()
+                if scheme == "bearer":
+                    headers.setdefault("Authorization", f"Bearer {credential}")
+                elif scheme == "basic":
+                    headers.setdefault("Authorization", f"Basic {credential}")
+                else:
+                    raise ValueError(
+                        f"MCP server {server.name!r} auth_scheme must be bearer or basic"
+                    )
             client = MCPClient(
                 server.name,
                 command=server.command,
                 args=list(server.args),
                 url=server.url,
                 env=env,
+                headers=headers,
                 connect_timeout=server.connect_timeout,
+                on_transport_failure=self._handle_mcp_transport_failure,
             )
             await client.connect()
             self._mcp_clients.append(client)
+            if self._mcp_resources is not None:
+                self._mcp_resources.add_client(
+                    server.name,
+                    client,
+                    allowed=server.allowed_resources,
+                    denied=server.denied_resources,
+                )
+            if self._mcp_prompts is not None:
+                self._mcp_prompts.add_client(
+                    server.name,
+                    client,
+                    allowed=server.allowed_prompts,
+                    denied=server.denied_prompts,
+                )
             if self._mcp is not None:
-                descriptors = await self._mcp.collect_and_register(client, server_alias=server.name)
+                tools = await client.list_tools()
+                allowed = set(server.allowed_tools)
+                denied = set(server.denied_tools)
+                if allowed:
+                    tools = [tool for tool in tools if tool.name in allowed]
+                if denied:
+                    tools = [tool for tool in tools if tool.name not in denied]
+                descriptors = self._mcp.register_all(
+                    tools,
+                    connection_id=client.connection_id,
+                    client=client,
+                    server_alias=server.name,
+                )
+                for discover in (client.list_resources, client.list_prompts):
+                    try:
+                        await discover()
+                    except Exception as exc:
+                        _logger.info("MCP discovery failed for %s: %s", server.name, exc)
             else:
                 descriptors = []
             self._mcp_connection_status[server.name] = {
@@ -3097,6 +3481,10 @@ class AthenaService:
                     self._mcp_clients.remove(client)
                 if self._mcp is not None:
                     self._mcp.unregister_connection(server.name)
+                if self._mcp_resources is not None:
+                    self._mcp_resources.remove_client(server.name)
+                if self._mcp_prompts is not None:
+                    self._mcp_prompts.remove_client(server.name)
                 try:
                     await client.close()
                 except Exception as close_exc:  # noqa: BLE001 - preserve original failure
@@ -3122,26 +3510,31 @@ class AthenaService:
                 continue
             if self._mcp is not None:
                 self._mcp.unregister_connection(name)
+            if self._mcp_resources is not None:
+                self._mcp_resources.remove_client(name)
+            if self._mcp_prompts is not None:
+                self._mcp_prompts.remove_client(name)
             await client.close()
             self._mcp_clients.remove(client)
         return await self._connect_mcp_server(server)
 
-    def _resolve_api_key(self, pc: ProviderConfig) -> str:
+    def _resolve_api_key(self, pc: ProviderConfig, *, credential_id: str | None = None) -> str:
         """Return the key for a provider, preferring a leased credential.
 
         A ``credential_id`` is treated as the NAME of a secret and resolved
         through the SecretManager at the authorized boundary; the raw
         ``api_key`` field remains a backward-compatible fallback.
         """
-        if pc.credential_id and self._secrets is not None:
+        selected_credential = credential_id or pc.credential_id
+        if selected_credential and self._secrets is not None:
             try:
-                return self._secrets.resolve(pc.credential_id)
+                return self._secrets.resolve(selected_credential)
             except SecretError as exc:
                 # Provider registration is diagnostic and must not turn a
                 # missing credential into a half-started service. The adapter
                 # remains registered and reports ``auth_missing`` readiness;
                 # admission then fails closed through require_agent_ready().
-                _logger.warning("provider credential %s unavailable: %s", pc.credential_id, exc)
+                _logger.warning("provider credential %s unavailable: %s", selected_credential, exc)
                 return ""
         if pc.api_key is not None:
             return pc.api_key

@@ -78,6 +78,33 @@ class TaskOwnershipLost(TaskError):
 
 class ProviderError(AthenaError):
     code = "provider_error"
+
+
+class VoiceError(AthenaError):
+    """Base error for the governed voice transport."""
+
+    code = "voice_error"
+
+
+class VoiceUnavailable(VoiceError):
+    """Voice is disabled or has no configured capable provider."""
+
+    code = "voice_unavailable"
+    http_status = 503
+
+
+class VoiceInputError(VoiceError):
+    """The supplied audio or voice request is invalid."""
+
+    code = "voice_input_invalid"
+    http_status = 400
+
+
+class VoiceResultNotReady(VoiceError):
+    """A requested spoken task result does not exist yet."""
+
+    code = "voice_result_not_ready"
+    http_status = 409
     retryable = False
 
 
@@ -88,6 +115,12 @@ class ProviderAuthenticationError(ProviderError):
 class ProviderRateLimitError(ProviderError):
     code = "provider_rate_limit"
     retryable = True
+
+    def __init__(self, message: str, *, retry_after: float | None = None, **data: Any) -> None:
+        self.retry_after = max(0.0, float(retry_after)) if retry_after is not None else None
+        if self.retry_after is not None:
+            data.setdefault("retry_after_seconds", self.retry_after)
+        super().__init__(message, **data)
 
 
 class ProviderTimeout(ProviderError):

@@ -11,6 +11,8 @@ wants a whole response.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import ipaddress
 import logging
 import math
@@ -230,6 +232,8 @@ class OpenAICompatProvider:
         cost: CostInfo | Mapping[str, object] | None = None,
         latency_class: str | None = None,
         vision: bool = False,
+        audio_input: bool = False,
+        audio_output: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -252,6 +256,8 @@ class OpenAICompatProvider:
         self._cost = cost
         self._latency_class = latency_class
         self._vision = bool(vision)
+        self._audio_input = bool(audio_input)
+        self._audio_output = bool(audio_output)
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             http2=http2,
@@ -269,6 +275,8 @@ class OpenAICompatProvider:
                 streaming=True,
                 tool_calling=True,
                 vision=self._vision,
+                audio_input=self._audio_input,
+                audio_output=self._audio_output,
                 privacy_class=self._privacy_class,
                 cost=self._cost,
                 latency_class=self._latency_class,
@@ -330,6 +338,70 @@ class OpenAICompatProvider:
             self._active_streams.pop(request_id, None)
         else:
             _logger.info("cancel requested for request %s (no active stream)", request_id)
+
+    async def transcribe_audio(
+        self,
+        data: bytes,
+        *,
+        filename: str,
+        mime_type: str,
+        model: str,
+        language: str | None = None,
+    ) -> str | dict[str, Any]:
+        """Call the OpenAI-compatible speech-to-text endpoint.
+
+        This is deliberately a provider capability rather than a second
+        model-provider registry. VoiceManager selects the already configured
+        provider and keeps credentials inside this adapter.
+        """
+        form: dict[str, str] = {"model": model}
+        if language:
+            form["language"] = language
+        try:
+            response = await self._client.post(
+                self.base_url + "/audio/transcriptions",
+                files={"file": (filename, data, mime_type)},
+                data=form,
+            )
+            if response.status_code >= 400:
+                raise await self._map_err(response)
+            return await self._read_json(response)
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeout(f"{self.provider} transcription timed out", cause=exc) from exc
+        except httpx.RequestError as exc:
+            raise ProviderUnavailable(
+                f"{self.provider} transcription endpoint unreachable: {exc}", cause=exc
+            ) from exc
+
+    async def synthesize_audio(
+        self,
+        text: str,
+        *,
+        model: str,
+        voice: str,
+        response_format: str,
+    ) -> bytes:
+        """Call the OpenAI-compatible text-to-speech endpoint."""
+        payload = {
+            "model": model,
+            "input": text,
+            "voice": voice,
+            "response_format": response_format,
+        }
+        try:
+            response = await self._client.post(
+                self.base_url + "/audio/speech",
+                json=payload,
+            )
+            if response.status_code >= 400:
+                raise await self._map_err(response)
+            return response.content
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeout(f"{self.provider} speech synthesis timed out", cause=exc) from exc
+        except httpx.RequestError as exc:
+            raise ProviderUnavailable(
+                f"{self.provider} speech endpoint unreachable: {exc}", cause=exc
+            ) from exc
 
     # -- translation (provider-specific shape lives only here) -----------------
     def _build_request(self, request: ModelRequest) -> dict[str, Any]:
@@ -677,7 +749,10 @@ class OpenAICompatProvider:
         if code in (401, 403):
             return ProviderAuthenticationError(message)
         if code == 429:
-            return ProviderRateLimitError(message)
+            return ProviderRateLimitError(
+                message,
+                retry_after=_retry_after_seconds(resp.headers.get("Retry-After")),
+            )
         if code == 400 and ("context" in body.lower() or "max tokens" in body.lower()):
             return ContextOverflow(message)
         if code == 404:
@@ -694,6 +769,21 @@ def _optional_float(value: object) -> float | None:
         return float(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _retry_after_seconds(value: object) -> float | None:
+    try:
+        return max(0.0, float(str(value))) if value is not None else None
+    except (TypeError, ValueError):
+        if value is None:
+            return None
+        try:
+            parsed = parsedate_to_datetime(str(value))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 __all__ = ["OpenAICompatProvider", "parse_tool_arguments", "serialize_tool_result"]

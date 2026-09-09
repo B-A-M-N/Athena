@@ -310,6 +310,8 @@ class TaskStore:
         unresolved: Any,
         usage: Any,
         allow_recovery_completion: bool = False,
+        recovery_finalization: bool = False,
+        commit_pending: bool = False,
     ) -> None:
         """Atomically transition a task to a terminal status and persist its
         result in a single transaction (BUILDSPEC §86): a crash cannot leave a
@@ -321,12 +323,21 @@ class TaskStore:
                 raise KeyError(f"Task not found: {task_id}")
             current = TaskStatus(row["status"])
             allowed = current.legal_transitions()
+            if recovery_finalization and not (
+                current is TaskStatus.RECOVERY_REQUIRED
+                and status in FINAL_STATUSES
+                and result_status is status
+            ):
+                raise ValueError(
+                    "recovery finalization requires RECOVERY_REQUIRED -> exact final result"
+                )
             if (
                 not (
                     allow_recovery_completion
                     and current in {TaskStatus.INTERRUPTED, TaskStatus.RECOVERY_REQUIRED}
                     and status is TaskStatus.COMPLETE
                 )
+                and not recovery_finalization
                 and status not in allowed
             ):
                 raise ValueError(
@@ -358,6 +369,15 @@ class TaskStore:
                     task_id,
                 ),
             )
+            # The pending write-ahead record and the task/result commit share
+            # this transaction. A crash after the task row is visible but
+            # before observers run therefore leaves a durable replay point.
+            if commit_pending:
+                await self._db.execute_raw(
+                    "UPDATE pending_task_finalizations SET phase = 'COMMITTED', "
+                    "updated_at = ? WHERE task_id = ?",
+                    (now, task_id),
+                )
 
     async def claim_next(self, target_statuses: tuple[TaskStatus, ...]) -> dict | None:
         """Atomically claim one schedulable task.

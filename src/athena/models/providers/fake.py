@@ -36,6 +36,8 @@ class _InfoKwargs(TypedDict, total=False):
     max_output_tokens: int | None
     reasoning: bool
     structured_output: bool
+    audio_input: bool
+    audio_output: bool
     privacy_class: PrivacyClass
     streaming: bool
     cost: CostInfo | None
@@ -57,6 +59,8 @@ class FakeModelProvider:
         max_output_tokens: int | None = None,
         reasoning: bool = False,
         structured_output: bool = False,
+        audio_input: bool = False,
+        audio_output: bool = False,
         privacy_class: PrivacyClass = PrivacyClass.UNKNOWN,
         streaming: bool = True,
         cost: CostInfo | Mapping[str, object] | None = None,
@@ -86,6 +90,8 @@ class FakeModelProvider:
             "max_output_tokens": max_output_tokens,
             "reasoning": reasoning,
             "structured_output": structured_output,
+            "audio_input": audio_input,
+            "audio_output": audio_output,
             "privacy_class": privacy_class,
             "streaming": streaming,
             "cost": cost,

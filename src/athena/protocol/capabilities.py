@@ -256,6 +256,9 @@ class CapabilityDescriptor:
     cache_key_resolver: Callable[[Mapping[str, Any], WorkspaceSpec], str | None] | None = None
     external_effects: Mapping[str, ExternalEffectContract] | None = None
     resources: frozenset[ResourceClass] | None = None
+    # Original provider schema, when a remote integration exposes a richer
+    # contract than Athena's execution validator currently understands.
+    source_schema: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         """Attach the native operation contract at descriptor creation.
@@ -462,6 +465,9 @@ class CapabilityRequest:
     call_id: str = ""
     origin: CapabilityRequestOrigin = CapabilityRequestOrigin.MODEL
     candidate: Any = None
+    # Host-owned task lineage. This is not model authority; it is copied from
+    # the durable TaskSpec so capabilities can bind job/session continuity.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

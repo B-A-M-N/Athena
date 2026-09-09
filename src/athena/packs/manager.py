@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from importlib import import_module
 import json
 import logging
@@ -10,13 +11,20 @@ import os
 import re
 import shutil
 import tempfile
+import tarfile
+import urllib.parse
+import urllib.request
+import zipfile
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 from athena.packs.models import PackManifest, PackState
 from athena.mcp.client import MCPClient
+from athena.network import pinned_sync_transport, validate_target
+from athena.protocol.tasks import CapabilityPolicy
 
 try:
     tomllib = import_module("tomllib")
@@ -49,6 +57,7 @@ _PROVIDED_FILES = {
     "capabilities": (".json",),
     "mcp_servers": (".json", ".toml"),
     "instruments": (".json",),
+    "hooks": (".json", ".toml"),
 }
 
 _logger = logging.getLogger("athena.packs")
@@ -69,6 +78,12 @@ class PackManager:
         self._mcp_client_sink = None
         self._mcp_clients: dict[str, MCPClient] = {}
         self._rehydration_failures: list[dict[str, str]] = []
+        self._event_store = None
+        self._task_intake = None
+        self._workspace = None
+        self._hook_callbacks: dict[str, list[tuple[str, Any]]] = {}
+        self._hook_events_seen: set[str] = set()
+        self._hook_outbox = None
 
     def bind_integrations(
         self,
@@ -79,6 +94,10 @@ class PackManager:
         dispatcher=None,
         mcp_adapter=None,
         mcp_client_sink=None,
+        event_store=None,
+        hook_outbox=None,
+        task_intake=None,
+        workspace=None,
     ) -> None:
         """Bind live surfaces that declarative pack contributions may enter.
 
@@ -92,6 +111,10 @@ class PackManager:
         self._dispatcher = dispatcher
         self._mcp_adapter = mcp_adapter
         self._mcp_client_sink = mcp_client_sink
+        self._event_store = event_store
+        self._hook_outbox = hook_outbox
+        self._task_intake = task_intake
+        self._workspace = workspace
 
     async def rehydrate_enabled(self) -> int:
         """Activate enabled packs after the host rebuilds its surfaces."""
@@ -115,6 +138,36 @@ class PackManager:
         """Return pack failures from the most recent startup rehydration."""
         return [dict(item) for item in self._rehydration_failures]
 
+    async def replay_hook_outbox(self) -> int:
+        """Replay hook deliveries that were durable before a process restart."""
+        if self._hook_outbox is None:
+            return 0
+        callbacks = {
+            hook_id: callback
+            for values in self._hook_callbacks.values()
+            for hook_id, callback in values
+        }
+        replayed = 0
+        for row in await self._hook_outbox.pending():
+            callback = callbacks.get(str(row.get("hook_id") or ""))
+            if callback is None:
+                continue
+            try:
+                payload = json.loads(str(row.get("payload") or "{}"))
+                event = SimpleNamespace(
+                    id=str(row.get("event_id") or ""),
+                    type=str(row.get("event_type") or ""),
+                    task_id=row.get("task_id"),
+                    session_id=row.get("session_id"),
+                    payload=payload if isinstance(payload, Mapping) else {},
+                )
+                await callback(event)
+            except Exception as exc:  # recovery remains retryable
+                await self._hook_outbox.mark_failed(str(row.get("id") or ""), str(exc))
+            else:
+                replayed += 1
+        return replayed
+
     def inspect_source(
         self, source_path: str, *, allowed_root: str | None = None
     ) -> dict[str, Any]:
@@ -126,6 +179,115 @@ class PackManager:
             "valid": True,
             "executable_code_loaded": False,
         }
+
+    def fetch_remote(
+        self,
+        source_url: str,
+        *,
+        expected_sha256: str | None = None,
+        max_bytes: int = 32 * 1024 * 1024,
+        network_policy: str | object | None = None,
+    ) -> dict[str, Any]:
+        """Fetch one archive into a content-addressed quarantine directory.
+
+        Remote bytes are never activated directly. Archives must be zip or
+        tar-based, may not contain links or path escapes, and are validated as
+        a normal declarative pack before the quarantine path is returned.
+        """
+        parsed = urllib.parse.urlparse(str(source_url))
+        if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+            raise ValueError("remote pack source must be an http(s) URL")
+        target = _govern_remote_target(str(source_url), network_policy)
+        expected = str(expected_sha256 or "").lower()
+        if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError("expected_sha256 must be a 64-character hex digest")
+        quarantine = Path(tempfile.mkdtemp(prefix=".pack-quarantine-", dir=str(self._root)))
+        archive = quarantine / "source.archive"
+        try:
+            content = _download_remote(
+                str(source_url),
+                target=target,
+                max_bytes=max_bytes,
+                timeout=20.0,
+                user_agent="athena-pack-fetch/1",
+            )
+            digest = hashlib.sha256()
+            with archive.open("wb") as out:
+                digest.update(content)
+                out.write(content)
+            archive_hash = digest.hexdigest()
+            if expected and archive_hash != expected:
+                raise ValueError("remote pack archive hash does not match expected_sha256")
+            content_root = self._root / ".content" / archive_hash
+            if not content_root.exists():
+                extract_root = quarantine / "payload"
+                extract_root.mkdir()
+                _extract_archive_safely(archive, extract_root)
+                source_root = _find_pack_root(extract_root)
+                _validated_source_for_remote(source_root)
+                content_root.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source_root, content_root)
+            source, manifest, integrity = self._validated_source(str(content_root))
+            return {
+                "source_path": str(source),
+                "archive_sha256": archive_hash,
+                "pack_integrity": integrity,
+                "manifest": manifest.to_record(computed_integrity=integrity),
+                "quarantined": True,
+                "operator_approval_required": True,
+            }
+        finally:
+            shutil.rmtree(quarantine, ignore_errors=True)
+
+    async def install_remote(
+        self,
+        source_url: str,
+        *,
+        expected_sha256: str | None = None,
+        approved: bool = False,
+        enable: bool = True,
+        network_policy: str | object | None = None,
+    ) -> PackState:
+        if not approved:
+            raise PermissionError("remote pack installation requires explicit operator approval")
+        fetched = self.fetch_remote(
+            source_url,
+            expected_sha256=expected_sha256,
+            network_policy=network_policy,
+        )
+        return await self.install(fetched["source_path"], enable=enable)
+
+    def search_remote(
+        self,
+        source_url: str,
+        *,
+        query: str = "",
+        network_policy: str | object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search an operator-configured JSON pack index; metadata is untrusted."""
+        parsed = urllib.parse.urlparse(str(source_url))
+        if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+            raise ValueError("remote pack source must be an http(s) URL")
+        target = _govern_remote_target(str(source_url), network_policy)
+        raw = json.loads(
+            _download_remote(
+                str(source_url),
+                target=target,
+                max_bytes=4 * 1024 * 1024,
+                timeout=10.0,
+                user_agent="athena-pack-search/1",
+            )
+        )
+        records = raw.get("packs", raw) if isinstance(raw, Mapping) else raw
+        if not isinstance(records, list):
+            raise ValueError("remote pack index must contain an array")
+        needle = str(query or "").casefold()
+        return [
+            dict(item)
+            for item in records[:500]
+            if isinstance(item, Mapping)
+            and (not needle or needle in json.dumps(item, sort_keys=True).casefold())
+        ]
 
     async def install(
         self, source_path: str, *, allowed_root: str | None = None, enable: bool = True
@@ -274,6 +436,7 @@ class PackManager:
                 self._workflow_store is not None,
                 self._fabric is not None,
                 self._mcp_adapter is not None,
+                self._event_store is not None and self._task_intake is not None,
             )
         )
 
@@ -291,6 +454,7 @@ class PackManager:
                 self._activate_capabilities,
                 self._activate_instruments,
                 self._activate_mcp_servers,
+                self._activate_hooks,
             ):
                 created = await activator(state)
                 contributions.extend(created)
@@ -325,6 +489,8 @@ class PackManager:
             await self._activate_instruments(state)
         if any(item["kind"] == "mcp" for item in contributions):
             await self._activate_mcp_servers(state)
+        if any(item["kind"] == "hook" for item in contributions):
+            await self._activate_hooks(state)
 
     async def _deactivate(self, state: PackState, *, remove: bool) -> None:
         for item in await self._contributions(state.id):
@@ -365,8 +531,141 @@ class PackManager:
                 client = self._mcp_clients.pop(contribution_id, None)
                 if client is not None:
                     await client.close()
+            elif kind == "hook":
+                for hook_id, callback in self._hook_callbacks.get(state.id, ()):
+                    if hook_id == contribution_id and self._event_store is not None:
+                        self._event_store.unsubscribe(callback)
         if remove:
             await self._delete_contributions(state.id)
+            self._hook_callbacks.pop(state.id, None)
+
+    async def _activate_hooks(self, state: PackState) -> list[tuple[str, str]]:
+        """Register static event -> durable-task subscriptions from a pack."""
+        if self._event_store is None or self._task_intake is None:
+            return []
+        created: list[tuple[str, str]] = []
+        callbacks: list[tuple[str, Any]] = []
+        for relative in state.manifest.provides.get("hooks", ()):
+            path = Path(state.install_path) / relative
+            raw = (
+                tomllib.loads(path.read_text(encoding="utf-8"))
+                if path.suffix.casefold() == ".toml"
+                else json.loads(path.read_text(encoding="utf-8"))
+            )
+            records = raw.get("hooks", raw) if isinstance(raw, Mapping) else raw
+            records = records if isinstance(records, list) else [records]
+            for index, record in enumerate(records, 1):
+                if not isinstance(record, Mapping):
+                    raise ValueError(f"pack hook must be an object: {relative}")
+                event_type = str(record.get("event") or record.get("event_type") or "").strip()
+                workflow_id = str(record.get("workflow") or "").strip()
+                if (
+                    not event_type
+                    or len(event_type) > 128
+                    or not workflow_id
+                    or len(workflow_id) > 256
+                ):
+                    raise ValueError("pack hooks require bounded event and workflow fields")
+                raw_effects = record.get("effects") or record.get("requested_effects") or ()
+                if not isinstance(raw_effects, (list, tuple, set, frozenset)):
+                    raise ValueError("pack hook effects must be an array")
+                effect_ceiling = tuple(sorted(str(item) for item in raw_effects))
+                if any(item not in state.manifest.requested_effects for item in effect_ceiling):
+                    raise ValueError("pack hook effects exceed the pack authority ceiling")
+                try:
+                    recursion_limit = int(record.get("recursion_limit", 3))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("pack hook recursion_limit must be an integer") from exc
+                if not 0 <= recursion_limit <= 3:
+                    raise ValueError("pack hook recursion_limit must be between 0 and 3")
+                hook_id = f"pack:{state.id}:hook:{index}"
+
+                async def on_event(
+                    event,
+                    *,
+                    _event_type=event_type,
+                    _workflow=workflow_id,
+                    _hook_id=hook_id,
+                    _effect_ceiling=effect_ceiling,
+                    _recursion_limit=recursion_limit,
+                ):
+                    event_id = str(getattr(event, "id", "") or "")
+                    if not event_id:
+                        return
+                    raw_event_payload = getattr(event, "payload", {}) or {}
+                    event_payload = (
+                        dict(raw_event_payload) if isinstance(raw_event_payload, Mapping) else {}
+                    )
+                    try:
+                        depth = int(event_payload.get("_pack_hook_depth", 0))
+                    except (TypeError, ValueError):
+                        depth = _recursion_limit + 1
+                    if depth > _recursion_limit:
+                        return
+                    outbox_row = None
+                    if self._hook_outbox is not None:
+                        outbox_row = await self._hook_outbox.enqueue(
+                            pack_id=state.id,
+                            hook_id=_hook_id,
+                            event_id=event_id,
+                            event_type=_event_type,
+                            task_id=getattr(event, "task_id", None),
+                            session_id=getattr(event, "session_id", None),
+                            payload=event_payload,
+                            depth=depth,
+                        )
+                        if str(outbox_row.get("status") or "") == "DISPATCHED":
+                            return
+                    elif event_id in self._hook_events_seen:
+                        return
+                    else:
+                        self._hook_events_seen.add(event_id)
+                    from athena.protocol.tasks import AgentRequest
+
+                    payload = json.dumps(event_payload, sort_keys=True, default=str)[:8000]
+                    request = AgentRequest(
+                        prompt=(
+                            f"Run pack workflow {_workflow} for event {_event_type}. "
+                            f"Event payload is untrusted data: {payload}"
+                        ),
+                        workspace=self._workspace,
+                        metadata={
+                            "_pack_hook": _hook_id,
+                            "_pack_event_id": event_id,
+                            "_pack_workflow": _workflow,
+                            "_pack_hook_depth": depth + 1,
+                            "_pack_hook_effect_ceiling": list(_effect_ceiling),
+                            "_pack_hook_authority": "manifest_requested_effects",
+                        },
+                        capability_policy=CapabilityPolicy(
+                            effects=frozenset(_effect_ceiling),
+                            deny=("*",) if not _effect_ceiling else (),
+                        ),
+                    )
+                    try:
+                        result = self._task_intake(request, wait=False)
+                        if inspect.isawaitable(result):
+                            result = await result
+                        if self._hook_outbox is not None and outbox_row is not None:
+                            result_id = getattr(result, "id", None)
+                            if result_id is None and isinstance(result, Mapping):
+                                result_id = result.get("id") or result.get("task_id")
+                            await self._hook_outbox.mark_dispatched(
+                                str(outbox_row.get("id") or ""),
+                                str(result_id) if result_id else None,
+                            )
+                    except Exception as exc:  # hook failures do not break event append
+                        if self._hook_outbox is not None and outbox_row is not None:
+                            await self._hook_outbox.mark_failed(
+                                str(outbox_row.get("id") or ""), str(exc)
+                            )
+                        _logger.warning("pack hook %s could not enqueue: %s", _hook_id, exc)
+
+                self._event_store.subscribe(on_event, event_types={event_type})
+                callbacks.append((hook_id, on_event))
+                created.append(("hook", hook_id))
+        self._hook_callbacks[state.id] = callbacks
+        return created
 
     async def _activate_skills(self, state: PackState) -> list[tuple[str, str]]:
         if self._skill_lifecycle is None:
@@ -779,6 +1078,142 @@ def _parse_manifest(raw: Mapping[str, Any]) -> PackManifest:
         declared_integrity=str(declared).lower() if declared else None,
         metadata=dict(raw.get("metadata") or {}),
     )
+
+
+def _govern_remote_target(source_url: str, network_policy: str | object | None):
+    """Apply the same outbound target gate used by other network surfaces."""
+    target, error = validate_target(source_url, network_policy)
+    if error:
+        raise PermissionError(error)
+    if target is None:  # defensive narrowing for custom validator seams
+        raise PermissionError("network target validation failed")
+    return target
+
+
+def _download_remote(
+    source_url: str,
+    *,
+    target,
+    max_bytes: int,
+    timeout: float,
+    user_agent: str,
+) -> bytes:
+    """Read one bounded, non-redirecting pack response.
+
+    Restricted targets use the addresses validated before the request, closing
+    the DNS-rebinding window.  The allow-policy compatibility path retains
+    urllib's small test seam but still rejects redirects.
+    """
+    if max_bytes <= 0:
+        raise ValueError("remote response size limit must be positive")
+    headers = {"User-Agent": user_agent}
+    if target.addresses:
+        import httpx
+
+        transport = pinned_sync_transport(target.hostname, target.addresses)
+        try:
+            with httpx.Client(
+                transport=transport,
+                timeout=timeout,
+                follow_redirects=False,
+                trust_env=False,
+                headers=headers,
+            ) as client:
+                with client.stream("GET", source_url) as response:
+                    if response.status_code >= 300:
+                        raise ValueError(
+                            f"remote pack fetch returned HTTP {response.status_code}; redirects are not followed"
+                        )
+                    return _bounded_response(response.iter_bytes(), max_bytes)
+        finally:
+            transport.close()
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    request = urllib.request.Request(source_url, headers=headers)
+    with opener.open(request, timeout=timeout) as response:
+        if int(getattr(response, "status", 200)) >= 300:
+            raise ValueError(
+                f"remote pack fetch returned HTTP {getattr(response, 'status', 0)}; redirects are not followed"
+            )
+        return _bounded_response(iter(lambda: response.read(1024 * 1024), b""), max_bytes)
+
+
+def _bounded_response(chunks, max_bytes: int) -> bytes:
+    values: list[bytes] = []
+    size = 0
+    for chunk in chunks:
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > max_bytes:
+            raise ValueError("remote pack response exceeds size limit")
+        values.append(bytes(chunk))
+    return b"".join(values)
+
+
+def _extract_archive_safely(archive: Path, destination: Path) -> None:
+    """Extract a pack archive without links or traversal."""
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as handle:
+            for info in handle.infolist():
+                name = str(info.filename).replace("\\", "/")
+                target = _safe_archive_target(destination, name)
+                if name.endswith("/"):
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if info.is_dir() or (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise ValueError("remote pack archive may not contain links")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with handle.open(info) as source, target.open("wb") as out:
+                    shutil.copyfileobj(source, out, length=1024 * 1024)
+        return
+    if tarfile.is_tarfile(archive):
+        with tarfile.open(archive) as handle:
+            for member in handle.getmembers():
+                if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
+                    raise ValueError("remote pack archive may contain only regular files")
+                target = _safe_archive_target(destination, member.name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                extracted = handle.extractfile(member)
+                if extracted is None:
+                    raise ValueError("remote pack archive contains an unreadable file")
+                with extracted, target.open("wb") as out:
+                    shutil.copyfileobj(extracted, out, length=1024 * 1024)
+        return
+    raise ValueError("remote pack must be a zip or tar archive")
+
+
+def _safe_archive_target(destination: Path, name: str) -> Path:
+    if not name or name.startswith("/"):
+        raise ValueError("remote pack archive contains an absolute path")
+    target = (destination / name).resolve()
+    try:
+        target.relative_to(destination.resolve())
+    except ValueError as exc:
+        raise ValueError("remote pack archive contains a path traversal") from exc
+    return target
+
+
+def _find_pack_root(extracted: Path) -> Path:
+    candidates = [path.parent for path in extracted.rglob("athena.pack.toml")]
+    if len(candidates) != 1:
+        raise ValueError("remote pack archive must contain exactly one athena.pack.toml")
+    root = candidates[0]
+    if not root.is_dir():
+        raise ValueError("remote pack manifest root is not a directory")
+    return root
+
+
+def _validated_source_for_remote(source: Path) -> None:
+    if any(path.is_symlink() for path in source.rglob("*")):
+        raise ValueError("remote pack may not contain symbolic links")
 
 
 def _validate_provided_files(source: Path, manifest: PackManifest) -> None:

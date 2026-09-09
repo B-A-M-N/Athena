@@ -66,6 +66,7 @@ class DelegationManager:
         budgets: Any = None,
         sessions: Any = None,
         cancellations: Any = None,
+        steering_store: Any = None,
         execution_manager: Any = None,
         principal_id: str | None = None,
         default_max_depth: int = _DEFAULT_MAX_DEPTH,
@@ -82,6 +83,7 @@ class DelegationManager:
             if cancellations is not None
             else getattr(task_manager, "_cancellations", None)
         )
+        self._steering_store = steering_store
         self._execution = (
             execution_manager
             if execution_manager is not None
@@ -278,6 +280,32 @@ class DelegationManager:
         if status not in TERMINAL_STATUSES:
             await self._tasks.transition(child_task_id, TaskStatus.CANCELLED)
         return TaskStatus.CANCELLED
+
+    async def steer(
+        self,
+        parent_task_id: str,
+        child_task_id: str,
+        text: str,
+        *,
+        principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Queue guidance for a live descendant at a kernel-safe boundary."""
+        if self._steering_store is None:
+            raise DelegationError("task steering is not configured")
+        if not await self.is_descendant(parent_task_id, child_task_id):
+            raise DelegationError(
+                f"child task {child_task_id!r} is not a descendant of {parent_task_id!r}"
+            )
+        status = await self.status_of(child_task_id)
+        if status in TERMINAL_STATUSES:
+            raise DelegationError(f"child task is no longer steerable (status={status.value})")
+        return await self._steering_store.enqueue(
+            child_task_id,
+            text,
+            principal_id=str(principal_id or self._principal_id or "delegation"),
+            source_task_id=parent_task_id,
+            source="parent_task",
+        )
 
     async def collect_results(self, child_task_id: str) -> TaskResult:
         result = await self._tasks.get_result(child_task_id)
@@ -501,6 +529,7 @@ def _scope_model_policy(parent: TaskSpec, child):
         require_declared_quality=bool(
             base.require_declared_quality or child_v.require_declared_quality
         ),
+        max_model_attempts=min(base.max_model_attempts, child_v.max_model_attempts),
     )
 
 
@@ -518,6 +547,7 @@ def _as_model_policy(value):
         routing_preference=getattr(value, "routing_preference", "balanced"),
         min_quality_tier=getattr(value, "min_quality_tier", None),
         require_declared_quality=bool(getattr(value, "require_declared_quality", False)),
+        max_model_attempts=int(getattr(value, "max_model_attempts", 2)),
     )
 
 

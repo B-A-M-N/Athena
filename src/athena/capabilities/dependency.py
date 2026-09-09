@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import importlib.metadata
+import hashlib
 import json
 import os
 import platform
@@ -58,6 +59,22 @@ class PythonDependencyManager:
         return str(Path(root) / ".athena" / "dependencies")
 
 
+class NodeDependencyManager:
+    """Structured npm acquisition into a workspace-local prefix."""
+
+    name = "node"
+
+    @staticmethod
+    def package_spec(name: str, version: str) -> str:
+        if not re.fullmatch(r"(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+", name):
+            raise ValueError("invalid npm package name")
+        return f"{name}@{version}" if version else name
+
+    @staticmethod
+    def target(root: str) -> str:
+        return str(Path(root) / ".athena" / "node")
+
+
 class DependencyCapability:
     descriptor = CapabilityDescriptor(
         id="dependency",
@@ -76,7 +93,7 @@ class DependencyCapability:
                     "enum": ["inspect", "resolve", "install", "replay"],
                 },
                 "name": {"type": "string", "minLength": 1, "maxLength": 128},
-                "manager": {"type": "string", "enum": ["python"]},
+                "manager": {"type": "string", "enum": ["python", "node"]},
                 "version": {"type": "string", "maxLength": 64},
             },
             "additionalProperties": False,
@@ -95,14 +112,20 @@ class DependencyCapability:
 
     def __init__(self, execution_manager=None) -> None:
         self._execution = execution_manager
-        self._managers: dict[str, DependencyManager] = {"python": PythonDependencyManager()}
+        self._managers: dict[str, DependencyManager] = {
+            "python": PythonDependencyManager(),
+            "node": NodeDependencyManager(),
+        }
 
     async def invoke(self, request: CapabilityRequest, *, context=None, **kw):
         args = dict(request.arguments or {})
         operation = str(args.get("operation") or "")
         name = str(args.get("name") or "").strip()
         manager = str(args.get("manager") or "python")
-        if not _NAME.fullmatch(name):
+        valid_name = _NAME.fullmatch(name) or (
+            manager == "node" and re.fullmatch(r"(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+", name)
+        )
+        if not valid_name:
             return _result(request, ok=False, error="invalid dependency name")
         dependency_manager = self._managers.get(manager)
         if dependency_manager is None:
@@ -111,9 +134,13 @@ class DependencyCapability:
         if operation in {"inspect", "resolve"}:
             lock = _read_lock(context)
             record = _lock_record(lock, name) if lock else None
-            host_installed = importlib.util.find_spec(name.replace("-", "_")) is not None
+            host_installed = (
+                importlib.util.find_spec(name.replace("-", "_")) is not None
+                if manager == "python"
+                else False
+            )
             task_runtime_available = await self._runtime_probe(
-                request, context=context, name=name, record=record
+                request, context=context, name=name, record=record, manager=manager
             )
             metadata = {
                 "name": name,
@@ -155,26 +182,52 @@ class DependencyCapability:
             return _result(
                 request, ok=False, error="dependency install requires execution workspace"
             )
-        if backend not in _HOST_INTERPRETER_BACKENDS:
+        capabilities_fn = getattr(self._execution, "backend_capabilities", None)
+        capabilities = (
+            capabilities_fn(backend)
+            if callable(capabilities_fn)
+            else {"dependency_installation": ("python",) if backend == "local" else ()}
+        )
+        supported_managers = (
+            tuple(getattr(capabilities, "dependency_installation", ()))
+            if not isinstance(capabilities, dict)
+            else tuple(capabilities.get("dependency_installation", ()))
+        )
+        if manager not in supported_managers:
             return _result(
                 request,
                 ok=False,
                 error=(
                     f"dependency {operation} is unsupported for execution backend {backend!r}; "
-                    "use local, shadow, or sandbox with a known host Python interpreter"
+                    f"backend supports: {', '.join(supported_managers) or 'none'}"
                 ),
             )
         root = context.workspace.root
         target = dependency_manager.target(root)
+        Path(target).mkdir(parents=True, exist_ok=True)
+        command_target = target
+        if backend == "container":
+            command_target = (
+                "/workspace/.athena/dependencies"
+                if manager == "python"
+                else "/workspace/.athena/node"
+            )
         version = str(args.get("version") or "")
         package = dependency_manager.package_spec(name, version) if version else name
         # This command is deliberately assembled from validated fields.  It
         # still goes through ExecutionManager, whose sandbox/network profile
         # and task cancellation own the actual process.
-        source = (
-            f"{shlex.quote(sys.executable)} -m pip install --disable-pip-version-check --no-input "
-            f"--target {shlex.quote(target)} {shlex.quote(package)}"
-        )
+        if manager == "python":
+            executable = sys.executable if backend in _HOST_INTERPRETER_BACKENDS else "python3"
+            source = (
+                f"{shlex.quote(executable)} -m pip install --disable-pip-version-check --no-input "
+                f"--target {shlex.quote(command_target)} {shlex.quote(package)}"
+            )
+        else:
+            source = (
+                f"npm install --ignore-scripts --no-audit --no-fund --prefix {shlex.quote(command_target)} "
+                f"{shlex.quote(package)}"
+            )
         result = await self._execution.execute(
             ExecutionRequest(
                 runtime="shell",
@@ -192,12 +245,22 @@ class DependencyCapability:
         lock_error = None
         if ok:
             try:
-                lock_record = _record_installed_package(
-                    target,
-                    name=name,
-                    requested_version=version,
-                    task_id=request.task_id or "dependency",
-                    call_id=request.call_id,
+                lock_record = (
+                    _record_installed_package(
+                        target,
+                        name=name,
+                        requested_version=version,
+                        task_id=request.task_id or "dependency",
+                        call_id=request.call_id,
+                    )
+                    if manager == "python"
+                    else _record_node_package(
+                        target,
+                        name=name,
+                        requested_version=version,
+                        task_id=request.task_id or "dependency",
+                        call_id=request.call_id,
+                    )
                 )
                 _write_lock(context, lock_record)
             except (OSError, TypeError, ValueError) as exc:
@@ -219,21 +282,32 @@ class DependencyCapability:
             },
         )
 
-    async def _runtime_probe(self, request, *, context, name: str, record: dict | None):
+    async def _runtime_probe(
+        self, request, *, context, name: str, record: dict | None, manager: str
+    ):
         """Probe the actual task Python, rather than reporting host imports."""
         if self._execution is None or context is None:
             return None
         backend = getattr(context.workspace, "execution_backend", None) or "local"
         if backend not in _HOST_INTERPRETER_BACKENDS:
             return None
-        target = PythonDependencyManager.target(context.workspace.root)
-        source = (
-            "import importlib.util; "
-            f"print('1' if importlib.util.find_spec({name.replace('-', '_')!r}) else '0')"
-        )
+        if manager == "node":
+            target = NodeDependencyManager.target(context.workspace.root)
+            source = (
+                "try { require.resolve(" + repr(name) + ", {paths: [" + repr(target) + "]}); "
+                "console.log('1'); } catch (_) { console.log('0'); }"
+            )
+            runtime = "node"
+        else:
+            target = PythonDependencyManager.target(context.workspace.root)
+            source = (
+                "import importlib.util; "
+                f"print('1' if importlib.util.find_spec({name.replace('-', '_')!r}) else '0')"
+            )
+            runtime = "python"
         result = await self._execution.execute(
             ExecutionRequest(
-                runtime="python",
+                runtime=runtime,
                 source=source,
                 task_id=request.task_id or "dependency-inspect",
                 workspace_id=context.workspace.id,
@@ -241,7 +315,7 @@ class DependencyCapability:
                 cwd=context.workspace.root,
                 network_policy=context.workspace.network_policy,
                 workspace_root=context.workspace.root,
-                env={"PYTHONPATH": target} if os.path.isdir(target) else {},
+                env={"PYTHONPATH": target} if manager == "python" and os.path.isdir(target) else {},
             )
         )
         if result.exit_code != 0:
@@ -262,13 +336,24 @@ class DependencyCapability:
                 request, ok=False, error="dependency replay requires execution workspace"
             )
         backend = getattr(context.workspace, "execution_backend", None) or "local"
-        if backend not in _HOST_INTERPRETER_BACKENDS:
+        capabilities_fn = getattr(self._execution, "backend_capabilities", None)
+        capabilities = (
+            capabilities_fn(backend)
+            if callable(capabilities_fn)
+            else {"dependency_installation": ("python",) if backend == "local" else ()}
+        )
+        supported_managers = (
+            tuple(getattr(capabilities, "dependency_installation", ()))
+            if not isinstance(capabilities, dict)
+            else tuple(capabilities.get("dependency_installation", ()))
+        )
+        if manager.name not in supported_managers:
             return _result(
                 request,
                 ok=False,
                 error=(
                     f"dependency replay is unsupported for execution backend {backend!r}; "
-                    "use local, shadow, or sandbox with a known host Python interpreter"
+                    f"backend supports: {', '.join(supported_managers) or 'none'}"
                 ),
             )
         lock = _read_lock(context)
@@ -289,11 +374,26 @@ class DependencyCapability:
             )
         root = str(context.workspace.root)
         target = manager.target(root)
-        source = (
-            f"{shlex.quote(sys.executable)} -m pip install --disable-pip-version-check --no-input --no-deps "
-            f"--upgrade --target {shlex.quote(target)} "
-            f"{shlex.quote(manager.package_spec(name, version))}"
-        )
+        Path(target).mkdir(parents=True, exist_ok=True)
+        command_target = target
+        if backend == "container":
+            command_target = (
+                "/workspace/.athena/dependencies"
+                if manager.name == "python"
+                else "/workspace/.athena/node"
+            )
+        if manager.name == "python":
+            executable = sys.executable if backend in _HOST_INTERPRETER_BACKENDS else "python3"
+            source = (
+                f"{shlex.quote(executable)} -m pip install --disable-pip-version-check --no-input --no-deps "
+                f"--upgrade --target {shlex.quote(command_target)} "
+                f"{shlex.quote(manager.package_spec(name, version))}"
+            )
+        else:
+            source = (
+                f"npm install --ignore-scripts --no-audit --no-fund --prefix {shlex.quote(command_target)} "
+                f"{shlex.quote(manager.package_spec(name, version))}"
+            )
         result = await self._execution.execute(
             ExecutionRequest(
                 runtime="shell",
@@ -314,8 +414,38 @@ class DependencyCapability:
                 error=result.stderr or "dependency replay failed",
                 metadata={"exit_code": result.exit_code, "target": target},
             )
+        if manager.name == "node":
+            try:
+                node_verified = _record_node_package(
+                    target,
+                    name=name,
+                    requested_version=version,
+                    task_id=request.task_id or "dependency",
+                    call_id=request.call_id,
+                )
+                if expected_hashes and sorted(node_verified["record_hashes"]) != expected_hashes:
+                    raise ValueError("npm package metadata hash mismatch")
+            except (OSError, TypeError, ValueError) as exc:
+                return _result(
+                    request,
+                    ok=False,
+                    output=result.stdout,
+                    error=f"dependency replay verification failed: {exc}",
+                    metadata={"exit_code": result.exit_code, "target": target},
+                )
+            return _result(
+                request,
+                output=result.stdout,
+                metadata={
+                    "exit_code": result.exit_code,
+                    "target": target,
+                    "manager": manager.name,
+                    "lock": dict(record),
+                    "environment": {"target": target, "manager": manager.name},
+                },
+            )
         try:
-            verified = resolve_dependency_environment(
+            environment = resolve_dependency_environment(
                 root,
                 (
                     DependencyRequirement(
@@ -342,7 +472,7 @@ class DependencyCapability:
                 "target": target,
                 "manager": manager.name,
                 "lock": dict(record),
-                "environment": verified.to_metadata(),
+                "environment": environment.to_metadata(),
                 "provenance": {
                     "task_id": request.task_id,
                     "call_id": request.call_id,
@@ -432,6 +562,37 @@ def _record_installed_package(
         runtime_identity=runtime_identity,
     )
     return record
+
+
+def _record_node_package(
+    target: str,
+    *,
+    name: str,
+    requested_version: str,
+    task_id: str,
+    call_id: str,
+) -> dict:
+    package_json = Path(target) / "node_modules" / Path(name) / "package.json"
+    try:
+        raw = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"could not find installed npm package metadata for {name}") from exc
+    resolved_version = str(raw.get("version") or "")
+    if not resolved_version:
+        raise ValueError(f"npm package {name!r} has no resolved version")
+    package_hash = hashlib.sha256(package_json.read_bytes()).hexdigest()
+    return {
+        "name": name,
+        "manager": "node",
+        "requested_version": requested_version or None,
+        "resolved_version": resolved_version,
+        "source": "npm-registry",
+        "target": target,
+        "record_hashes": [f"package.json:sha256={package_hash}"],
+        "runtime_identity": "node",
+        "owner": {"task_id": task_id, "call_id": call_id},
+        "recorded_at": utcnow().isoformat(),
+    }
 
 
 def _runtime_identity() -> str:

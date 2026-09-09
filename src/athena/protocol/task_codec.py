@@ -312,6 +312,7 @@ def encode_model_policy(policy: ModelPolicy | None) -> str:
             "routing_preference": policy.routing_preference,
             "min_quality_tier": policy.min_quality_tier,
             "require_declared_quality": policy.require_declared_quality,
+            "max_model_attempts": policy.max_model_attempts,
         },
         sort_keys=True,
     )
@@ -333,6 +334,7 @@ def decode_model_policy(raw: Any) -> ModelPolicy:
             str(data["min_quality_tier"]) if data.get("min_quality_tier") is not None else None
         ),
         require_declared_quality=bool(data.get("require_declared_quality", False)),
+        max_model_attempts=int(data.get("max_model_attempts", 2)),
     )
 
 

@@ -915,6 +915,11 @@ class CapabilityReflection:
             "workspace_root": str(workspace_root) if workspace_root else None,
             "workspace_exists": bool(workspace_root and workspace_root.is_dir()),
             "workspace_writable": bool(workspace_root and os.access(workspace_root, os.W_OK)),
+            "free_bytes": (
+                shutil.disk_usage(workspace_root).free
+                if workspace_root and workspace_root.exists()
+                else None
+            ),
             "sandbox_backend": "bubblewrap" if sandbox_available else None,
             "sandbox_status": sandbox_status,
             "sandbox_remediation": None
@@ -1072,6 +1077,8 @@ class CapabilityReflection:
             "release": platform.release(),
             "machine": platform.machine(),
             "python": sys.version.split()[0],
+            "processor": platform.processor() or None,
+            "cpu_count": os.cpu_count(),
             "status": "available",
             "availability": "available",
             "reason": None,
@@ -1095,6 +1102,26 @@ class CapabilityReflection:
             "availability": "available" if workspace_exists else "unavailable",
             "reason": None if workspace_exists else "no workspace context supplied",
             "remediation": None if workspace_exists else "supply an existing workspace root",
+        }
+        host_inventory = {
+            "memory_available_bytes": _available_memory_bytes(),
+            "container_engines": {
+                name: shutil.which(name) is not None for name in ("docker", "podman")
+            },
+            "package_managers": {
+                name: shutil.which(name) is not None
+                for name in ("uv", "pip", "npm", "pnpm", "cargo")
+            },
+            "shells": {
+                name: shutil.which(name) is not None for name in ("sh", "bash", "zsh", "pwsh")
+            },
+            "gpu": {
+                "nvidia_smi": shutil.which("nvidia-smi") is not None,
+                "cuda_visible_devices_configured": bool(os.environ.get("CUDA_VISIBLE_DEVICES")),
+            },
+            "git": {
+                "workspace_repository": bool(workspace_root and (workspace_root / ".git").exists()),
+            },
         }
         environment_record = (
             {
@@ -1134,6 +1161,7 @@ class CapabilityReflection:
             "status": passport_status,
             "capabilities": capabilities,
             "platform": platform_record,
+            "host_inventory": host_inventory,
             "runtimes": runtime_records,
             "backends": backend_records,
             "toolchains": toolchains,
@@ -1205,6 +1233,24 @@ class CapabilityReflection:
             "scope": skill.scope,
             "version": skill.version,
         }
+
+
+def _available_memory_bytes() -> int | None:
+    """Return bounded host memory evidence without invoking a subprocess."""
+    try:
+        meminfo = Path("/proc/meminfo")
+        if meminfo.is_file():
+            for line in meminfo.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return int(pages) * int(page_size)
+    except (AttributeError, OSError, ValueError):
+        return None
 
 
 def _result(request, *, ok: bool = True, output: str = "", error: str | None = None):

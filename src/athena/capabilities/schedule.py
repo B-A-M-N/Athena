@@ -12,10 +12,12 @@ Operations:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from athena.protocol.capabilities import (
@@ -31,6 +33,9 @@ from athena.scheduler.scheduler import TriggerSpec, TriggerType
 from athena.scheduler.triggers import next_fire
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
+from athena.protocol.tasks import DeliverySpec
+
+_UNSET = object()
 
 
 def _small_delta() -> timedelta:
@@ -101,6 +106,7 @@ def _authority_snapshot(
     model_policy: Any,
     resource_budget: Any,
     autonomy: Any,
+    delivery: DeliverySpec | None,
     owner: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Serialize the service-owned ceiling captured at schedule creation."""
@@ -144,6 +150,31 @@ def _authority_snapshot(
         cp = _SafePolicy()
     mp = model_policy
     budget = resource_budget
+    delivery_record = None
+    delivery_effects: list[str] = []
+    if delivery is not None:
+        destination = str(delivery.destination or "")
+        parts = urlsplit(destination)
+        canonical = urlunsplit(
+            (
+                parts.scheme.lower(),
+                parts.netloc.lower(),
+                parts.path or "/",
+                parts.query,
+                "",
+            )
+        )
+        delivery_record = {
+            "channel": delivery.channel,
+            "destination": destination,
+            "destination_hash": hashlib.sha256(canonical.encode()).hexdigest(),
+            "credential_identity": None,
+        }
+        if str(delivery.channel or "").strip().lower() == "webhook":
+            delivery_effects = [
+                EffectClass.NETWORK_WRITE.value,
+                EffectClass.EXTERNAL_MESSAGE.value,
+            ]
     return {
         "principal": dict(owner),
         "workspace": workspace_record,
@@ -190,7 +221,23 @@ def _authority_snapshot(
             if (value := getattr(budget, name, None)) is not None
         },
         "autonomy": getattr(autonomy, "value", autonomy) or "supervised",
+        "delivery": delivery_record,
+        "delivery_effects": delivery_effects,
+        "effect_ceiling": list(delivery_effects),
     }
+
+
+def _schedule_effects(arguments: Mapping[str, Any]) -> frozenset[EffectClass]:
+    """Resolve schedule effects, including the future delivery grant."""
+    operation = str(arguments.get("operation") or "").lower()
+    effects = {EffectClass.READ_LOCAL}
+    if operation in {"create", "update", "enable", "disable", "delete", "run"}:
+        effects.add(EffectClass.WRITE_LOCAL)
+    delivery = arguments.get("delivery")
+    if operation in {"create", "update"} and isinstance(delivery, Mapping):
+        if str(delivery.get("channel") or "").strip().lower() == "webhook":
+            effects.update({EffectClass.NETWORK_WRITE, EffectClass.EXTERNAL_MESSAGE})
+    return frozenset(effects)
 
 
 class ScheduleAPI:
@@ -217,7 +264,19 @@ class ScheduleAPI:
         resource_budget=None,
         autonomy=None,
         reuse_session: bool = False,
+        delivery: DeliverySpec | None = None,
+        continuity: str = "fresh",
     ) -> dict:
+        if continuity not in {"fresh", "previous_result", "job_memory", "session"}:
+            raise ValueError("continuity must be fresh, previous_result, job_memory, or session")
+        # ``reuse_session`` is the legacy spelling of explicit session
+        # continuity. Persist a schedule-owned identity rather than the
+        # creator's generic session field.
+        if reuse_session and continuity == "fresh":
+            continuity = "session"
+        continuity_session_id = session_id if continuity == "session" else None
+        if continuity == "session" and continuity_session_id is None:
+            continuity_session_id = new_id("session")
         job_id = new_id("job")
         trigger_spec = self._parse_trigger(trigger)
         owner_data = {key: value for key, value in dict(owner or {}).items() if value}
@@ -233,6 +292,7 @@ class ScheduleAPI:
             model_policy=model_policy,
             resource_budget=resource_budget,
             autonomy=autonomy,
+            delivery=delivery,
             owner=owner_data,
         )
         # Occurrences default to FRESH sessions: recurring autonomous work
@@ -246,6 +306,7 @@ class ScheduleAPI:
             "_schedule_lineage",
             {
                 "job_id": job_id,
+                "continuity": continuity,
                 "creator_task_id": owner_data.get("task_id"),
                 "creator_session_id": owner_data.get("session_id"),
             },
@@ -256,7 +317,8 @@ class ScheduleAPI:
             payload={
                 "template": {
                     "objective": objective,
-                    "session_id": session_id if reuse_session else None,
+                    "session_id": None,
+                    "continuity_session_id": continuity_session_id,
                     "workspace_id": owner_data.get("project_id"),
                     "workspace_root": workspace_root,
                     "network_policy": getattr(
@@ -272,6 +334,12 @@ class ScheduleAPI:
                     "acceptance_criteria": [
                         _criterion_record(criterion) for criterion in acceptance_criteria
                     ],
+                    "delivery": (
+                        {"channel": delivery.channel, "destination": delivery.destination}
+                        if delivery is not None
+                        else None
+                    ),
+                    "continuity": continuity,
                     "metadata": template_metadata,
                 }
             },
@@ -281,6 +349,116 @@ class ScheduleAPI:
             metadata={"_owner": owner_data, "_authority_snapshot": authority},
         )
         return {"job_id": job_id, "name": name, "enabled": True}
+
+    async def update(
+        self,
+        job_id: str,
+        *,
+        owner: Mapping[str, str | None] | None = None,
+        objective: str | None = None,
+        trigger: dict | None = None,
+        enabled: bool | None = None,
+        continuity: str | None = None,
+        delivery: DeliverySpec | None | object = _UNSET,
+    ) -> dict | None:
+        """Update schedule-owned fields without widening its authority snapshot."""
+        job = await self._scheduler._store.get_job_id(job_id)
+        if job is None or not _owner_visible(job, owner):
+            return None
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        template = dict(payload.get("template") or {})
+        if objective is not None:
+            value = str(objective).strip()
+            if not value or len(value) > 10_000:
+                raise ValueError("objective must contain 1-10000 characters")
+            template["objective"] = value
+        if continuity is not None:
+            if continuity not in {"fresh", "previous_result", "job_memory", "session"}:
+                raise ValueError(
+                    "continuity must be fresh, previous_result, job_memory, or session"
+                )
+            template["continuity"] = continuity
+            if continuity == "session" and not template.get("continuity_session_id"):
+                template["continuity_session_id"] = new_id("session")
+        if delivery is not _UNSET:
+            if delivery is None:
+                template["delivery"] = None
+            else:
+                if not isinstance(delivery, DeliverySpec):
+                    raise TypeError("delivery must be a DeliverySpec or None")
+                template["delivery"] = {
+                    "channel": delivery.channel,
+                    "destination": delivery.destination,
+                }
+        trigger_spec = _trigger_from_metadata(job)
+        next_run = job.get("next_run")
+        if trigger is not None:
+            parsed = self._parse_trigger(trigger)
+            if parsed.type is TriggerType.INTERVAL and parsed.at is None:
+                parsed = replace(parsed, at=utcnow())
+            trigger_spec = self._scheduler_trigger_spec(parsed)
+            next_value = (
+                None
+                if parsed.type is TriggerType.EVENT
+                else next_fire(parsed, utcnow() - _small_delta())
+            )
+            next_run = next_value.isoformat() if next_value is not None else None
+        metadata = dict(job.get("metadata") or {})
+        metadata["_trigger_spec"] = dict(trigger_spec)
+        if delivery is not _UNSET:
+            authority = dict(metadata.get("_authority_snapshot") or {})
+            if delivery is None:
+                authority["delivery"] = None
+                authority["delivery_effects"] = []
+                authority["effect_ceiling"] = []
+            else:
+                if not isinstance(delivery, DeliverySpec):
+                    raise TypeError("delivery must be a DeliverySpec or None")
+                new_delivery = delivery
+                destination = str(new_delivery.destination or "")
+                parts = urlsplit(destination)
+                canonical = urlunsplit(
+                    (
+                        parts.scheme.lower(),
+                        parts.netloc.lower(),
+                        parts.path or "/",
+                        parts.query,
+                        "",
+                    )
+                )
+                record = {
+                    "channel": new_delivery.channel,
+                    "destination": destination,
+                    "destination_hash": hashlib.sha256(canonical.encode()).hexdigest(),
+                    "credential_identity": None,
+                }
+                effects = (
+                    [EffectClass.NETWORK_WRITE.value, EffectClass.EXTERNAL_MESSAGE.value]
+                    if str(new_delivery.channel or "").strip().lower() == "webhook"
+                    else []
+                )
+                authority["delivery"] = record
+                authority["delivery_effects"] = effects
+                authority["effect_ceiling"] = list(effects)
+            metadata["_authority_snapshot"] = authority
+        await self._scheduler._store.upsert_job(
+            job_id,
+            str(job.get("name") or template.get("objective") or job_id),
+            payload={"template": template},
+            trigger_spec=trigger_spec,
+            enabled=bool(job.get("enabled", True)) if enabled is None else bool(enabled),
+            next_run=next_run,
+            metadata=metadata,
+        )
+        return await self.inspect(job_id, owner=owner)
+
+    async def run(
+        self, job_id: str, *, owner: Mapping[str, str | None] | None = None
+    ) -> str | None:
+        job = await self._scheduler._store.get_job_id(job_id)
+        if job is None or not _owner_visible(job, owner):
+            return None
+        return await self._scheduler.run_now(job_id)
 
     async def list_jobs(self, *, owner: Mapping[str, str | None] | None = None) -> list[dict]:
         jobs = await self._scheduler._store.list_jobs(enabled_only=False)
@@ -416,7 +594,7 @@ class ScheduleAPI:
 
 
 class ScheduleCapability:
-    """Expose scheduling as a capability (operations: create/list/inspect/enable/disable/delete)."""
+    """Expose scheduling as a bounded task-lifecycle capability."""
 
     descriptor = CapabilityDescriptor(
         id="schedule",
@@ -428,7 +606,16 @@ class ScheduleCapability:
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["create", "list", "inspect", "enable", "disable", "delete"],
+                    "enum": [
+                        "create",
+                        "list",
+                        "inspect",
+                        "enable",
+                        "disable",
+                        "delete",
+                        "update",
+                        "run",
+                    ],
                 },
                 "job_id": {"type": "string", "minLength": 1, "maxLength": 128},
                 "name": {"type": "string", "minLength": 1, "maxLength": 256},
@@ -444,6 +631,19 @@ class ScheduleCapability:
                     ),
                 },
                 "trigger": {"type": "object", "maxProperties": 16},
+                "delivery": {
+                    "type": "object",
+                    "properties": {
+                        "channel": {"type": "string", "maxLength": 64},
+                        "destination": {"type": "string", "maxLength": 4096},
+                    },
+                    "additionalProperties": False,
+                },
+                "enabled": {"type": "boolean"},
+                "continuity": {
+                    "type": "string",
+                    "enum": ["fresh", "previous_result", "job_memory", "session"],
+                },
             },
             "oneOf": [
                 {
@@ -452,14 +652,31 @@ class ScheduleCapability:
                 },
                 {
                     "properties": {
-                        "operation": {"enum": ["inspect", "enable", "disable", "delete"]}
+                        "operation": {
+                            "enum": [
+                                "inspect",
+                                "enable",
+                                "disable",
+                                "delete",
+                                "update",
+                                "run",
+                            ]
+                        }
                     },
                     "required": ["job_id"],
                 },
                 {"properties": {"operation": {"const": "list"}}},
             ],
         },
-        effects=frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        effects=frozenset(
+            {
+                EffectClass.READ_LOCAL,
+                EffectClass.WRITE_LOCAL,
+                EffectClass.NETWORK_WRITE,
+                EffectClass.EXTERNAL_MESSAGE,
+            }
+        ),
+        effect_resolver=_schedule_effects,
         resources=frozenset({ResourceClass.SCHEDULE}),
         origin=CapabilityOrigin.NATIVE,
     )
@@ -516,6 +733,8 @@ class ScheduleCapability:
                             CapabilityResultStatus.FAILED,
                             error="scheduled workspace must remain within current workspace",
                         )
+                session_continuity = str(args.get("continuity") or "fresh") == "session"
+                persistent_session = bool(args.get("persistent_session")) or session_continuity
                 result = await self._api.create(
                     name=args.get("name", "scheduled task"),
                     objective=args.get("objective", ""),
@@ -525,10 +744,8 @@ class ScheduleCapability:
                     # session. The requesting task/session are carried as
                     # lineage in the template metadata, never as the
                     # execution session.
-                    session_id=(
-                        request.session_id if bool(args.get("persistent_session")) else None
-                    ),
-                    reuse_session=bool(args.get("persistent_session")),
+                    session_id=request.session_id if persistent_session else None,
+                    reuse_session=persistent_session,
                     workspace_root=workspace_root,
                     workspace=workspace,
                     owner=owner,
@@ -536,6 +753,8 @@ class ScheduleCapability:
                     model_policy=getattr(context, "model_policy", None),
                     resource_budget=getattr(context, "resource_budget", None),
                     autonomy=getattr(context, "autonomy", None),
+                    delivery=_decode_delivery(args.get("delivery")),
+                    continuity=str(args.get("continuity") or "fresh"),
                 )
                 job_id = (
                     result.get("id") or result.get("job_id") if isinstance(result, dict) else None
@@ -623,6 +842,48 @@ class ScheduleCapability:
                     output=json.dumps({"deleted": ok}),
                     metadata={"operation": "delete"},
                 )
+            elif op == "update":
+                updated = await self._api.update(
+                    args.get("job_id", ""),
+                    owner=owner,
+                    objective=args.get("objective"),
+                    trigger=args.get("trigger"),
+                    enabled=args.get("enabled"),
+                    continuity=args.get("continuity"),
+                    delivery=(
+                        _decode_delivery(args.get("delivery")) if "delivery" in args else _UNSET
+                    ),
+                )
+                if updated is None:
+                    return CapabilityResult(
+                        call_id,
+                        self.descriptor.id,
+                        CapabilityResultStatus.FAILED,
+                        error="job not found or not owned",
+                    )
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.OK,
+                    output=json.dumps(updated),
+                    metadata={"operation": "update"},
+                )
+            elif op == "run":
+                task_id = await self._api.run(args.get("job_id", ""), owner=owner)
+                if task_id is None:
+                    return CapabilityResult(
+                        call_id,
+                        self.descriptor.id,
+                        CapabilityResultStatus.FAILED,
+                        error="job not found, not owned, or disabled",
+                    )
+                return CapabilityResult(
+                    call_id,
+                    self.descriptor.id,
+                    CapabilityResultStatus.OK,
+                    output=json.dumps({"task_id": task_id}),
+                    metadata={"operation": "run"},
+                )
             return CapabilityResult(
                 call_id,
                 self.descriptor.id,
@@ -636,3 +897,12 @@ class ScheduleCapability:
                 CapabilityResultStatus.FAILED,
                 error=f"schedule.{op} failed: {exc}",
             )
+
+
+def _decode_delivery(raw: Any) -> DeliverySpec | None:
+    if not isinstance(raw, Mapping) or not raw.get("channel"):
+        return None
+    return DeliverySpec(
+        channel=str(raw["channel"]),
+        destination=(str(raw["destination"]) if raw.get("destination") is not None else None),
+    )

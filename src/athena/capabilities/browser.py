@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import urlsplit
 
+from athena.execution.async_call import run_blocking
 from athena.protocol.capabilities import (
     Availability,
     CapabilityDescriptor,
@@ -88,6 +89,30 @@ class BrowserDriver(Protocol):
 
     async def text(self) -> str: ...
 
+    async def back(self) -> dict[str, Any]: ...
+
+    async def forward(self) -> dict[str, Any]: ...
+
+    async def reload(self) -> dict[str, Any]: ...
+
+    async def wait_for(self, selector: str, timeout_ms: int = 12_000) -> dict[str, Any]: ...
+
+    async def press(self, selector: str, key: str) -> dict[str, Any]: ...
+
+    async def select(self, selector: str, value: str) -> dict[str, Any]: ...
+
+    async def tabs(self) -> list[dict[str, Any]]: ...
+
+    async def new_tab(self, url: str | None = None) -> dict[str, Any]: ...
+
+    async def switch_tab(self, index: int) -> dict[str, Any]: ...
+
+    async def close_tab(self) -> dict[str, Any]: ...
+
+    async def console(self) -> list[dict[str, Any]]: ...
+
+    async def download(self, selector: str) -> dict[str, Any]: ...
+
     async def close(self) -> None: ...
 
 
@@ -106,6 +131,12 @@ class PlaywrightBrowserDriver:
         self._context = context
         self._page = page
         self._network_policy = "allow"
+        self._console: list[dict[str, Any]] = []
+        self._pages: list[Any] = [page]
+        page.on(
+            "console",
+            lambda message: self._console.append({"type": message.type, "text": message.text}),
+        )
 
     @classmethod
     async def preflight(
@@ -343,6 +374,83 @@ class PlaywrightBrowserDriver:
     async def text(self) -> str:
         return await self._page.locator("body").inner_text()
 
+    async def _page_state(self) -> dict[str, Any]:
+        return {"url": self._page.url, "title": await self._page.title()}
+
+    async def back(self) -> dict[str, Any]:
+        await self._page.go_back(wait_until="domcontentloaded")
+        return await self._page_state()
+
+    async def forward(self) -> dict[str, Any]:
+        await self._page.go_forward(wait_until="domcontentloaded")
+        return await self._page_state()
+
+    async def reload(self) -> dict[str, Any]:
+        await self._page.reload(wait_until="domcontentloaded")
+        return await self._page_state()
+
+    async def wait_for(self, selector: str, timeout_ms: int = 12_000) -> dict[str, Any]:
+        await self._page.locator(selector).wait_for(timeout=max(1, int(timeout_ms)))
+        return {"selector": selector, "ready": True}
+
+    async def press(self, selector: str, key: str) -> dict[str, Any]:
+        await self._page.locator(selector).press(key)
+        return {"selector": selector, "key": key, "pressed": True}
+
+    async def select(self, selector: str, value: str) -> dict[str, Any]:
+        selected = await self._page.locator(selector).select_option(value)
+        return {"selector": selector, "value": value, "selected": selected}
+
+    async def tabs(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "index": index,
+                "url": page.url,
+                "title": await page.title(),
+                "active": page is self._page,
+            }
+            for index, page in enumerate(self._pages)
+        ]
+
+    async def new_tab(self, url: str | None = None) -> dict[str, Any]:
+        page = await self._context.new_page()
+        self._pages.append(page)
+        self._page = page
+        if url:
+            await page.goto(url, wait_until="domcontentloaded")
+        return {"index": len(self._pages) - 1, **await self._page_state()}
+
+    async def switch_tab(self, index: int) -> dict[str, Any]:
+        if index < 0 or index >= len(self._pages):
+            raise ValueError("tab index is out of range")
+        self._page = self._pages[index]
+        return {"index": index, **await self._page_state()}
+
+    async def close_tab(self) -> dict[str, Any]:
+        if len(self._pages) <= 1:
+            raise ValueError("cannot close the last browser tab")
+        index = self._pages.index(self._page)
+        await self._page.close()
+        self._pages.pop(index)
+        self._page = self._pages[max(0, index - 1)]
+        return {"closed": index, "active": self._pages.index(self._page)}
+
+    async def console(self) -> list[dict[str, Any]]:
+        return list(self._console[-256:])
+
+    async def download(self, selector: str) -> dict[str, Any]:
+        async with self._page.expect_download() as pending:
+            await self._page.locator(selector).click()
+        download = await pending.value
+        path = await download.path()
+        if path is None:
+            raise RuntimeError("browser download has no readable path")
+        return {
+            "path": str(path),
+            "filename": download.suggested_filename,
+            "url": download.url,
+        }
+
     async def close(self) -> None:
         try:
             await self._context.close()
@@ -400,16 +508,45 @@ _BROWSER_DESCRIPTOR = CapabilityDescriptor(
     input_schema={
         "type": "object",
         "properties": {
-            "operation": {"enum": ["navigate", "snapshot", "query", "fill", "click", "text"]},
+            "operation": {
+                "enum": [
+                    "navigate",
+                    "snapshot",
+                    "query",
+                    "fill",
+                    "click",
+                    "text",
+                    "back",
+                    "forward",
+                    "reload",
+                    "wait_for",
+                    "press",
+                    "select",
+                    "tabs",
+                    "new_tab",
+                    "switch_tab",
+                    "close_tab",
+                    "console",
+                    "download",
+                ]
+            },
             "url": {"type": "string", "maxLength": _MAX_URL_CHARS},
             "selector": {"type": "string", "maxLength": 512},
             "value": {"type": "string", "maxLength": 4096},
+            "key": {"type": "string", "maxLength": 128},
+            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000},
+            "index": {"type": "integer", "minimum": 0, "maximum": 128},
         },
         "required": ["operation"],
         "additionalProperties": False,
     },
     effects=frozenset(
-        {EffectClass.NETWORK_READ, EffectClass.NETWORK_WRITE, EffectClass.COMPUTER_INPUT}
+        {
+            EffectClass.NETWORK_READ,
+            EffectClass.NETWORK_WRITE,
+            EffectClass.COMPUTER_INPUT,
+            EffectClass.WRITE_LOCAL,
+        }
     ),
     operation_effects={
         "navigate": frozenset({EffectClass.NETWORK_READ, EffectClass.NETWORK_WRITE}),
@@ -420,6 +557,18 @@ _BROWSER_DESCRIPTOR = CapabilityDescriptor(
         # A click can submit a form or trigger a remote mutation; keep that
         # possibility inside the NETWORK_WRITE approval boundary.
         "click": frozenset({EffectClass.COMPUTER_INPUT, EffectClass.NETWORK_WRITE}),
+        "back": frozenset({EffectClass.NETWORK_READ}),
+        "forward": frozenset({EffectClass.NETWORK_READ}),
+        "reload": frozenset({EffectClass.NETWORK_READ}),
+        "wait_for": frozenset({EffectClass.NETWORK_READ}),
+        "press": frozenset({EffectClass.COMPUTER_INPUT}),
+        "select": frozenset({EffectClass.COMPUTER_INPUT}),
+        "tabs": frozenset({EffectClass.NETWORK_READ}),
+        "new_tab": frozenset({EffectClass.NETWORK_READ}),
+        "switch_tab": frozenset({EffectClass.COMPUTER_INPUT}),
+        "close_tab": frozenset({EffectClass.COMPUTER_INPUT}),
+        "console": frozenset({EffectClass.NETWORK_READ}),
+        "download": frozenset({EffectClass.NETWORK_READ, EffectClass.WRITE_LOCAL}),
     },
     resources=frozenset({ResourceClass.NETWORK}),
     origin=CapabilityOrigin.NATIVE,
@@ -437,12 +586,14 @@ class BrowserCapability:
         driver_factory: Callable[[], BrowserDriver | Awaitable[BrowserDriver]] | None = None,
         *,
         session_scope: str = "task",
+        artifact_store: Any = None,
     ) -> None:
         # One driver belongs to one task (or session when no task id exists).
         # Keeping this state here, rather than in a provider/model turn,
         # preserves cookies, navigation, and page state across capability
         # calls while leaving governance on the dispatcher boundary.
         self._driver_factory = driver_factory
+        self._artifacts = artifact_store
         if session_scope not in {"task", "session"}:
             raise ValueError("session_scope must be task or session")
         self._session_scope = session_scope
@@ -645,6 +796,90 @@ class BrowserCapability:
                 request,
                 output=text,
                 meta={"truncated": len(text) >= _MAX_TEXT_CHARS},
+            )
+
+        if operation in {"back", "forward", "reload"}:
+            method = getattr(driver, operation, None)
+            if not callable(method):
+                return _result(request, ok=False, error=f"browser driver lacks {operation}")
+            return _result(request, output=json.dumps(await method(), default=str))
+
+        if operation == "wait_for":
+            selector = str(args.get("selector") or "")
+            if not selector:
+                return _result(request, ok=False, error="wait_for requires selector")
+            return _result(
+                request,
+                output=json.dumps(
+                    await driver.wait_for(selector, int(args.get("timeout_ms") or 12_000)),
+                    default=str,
+                ),
+            )
+
+        if operation == "press":
+            selector = str(args.get("selector") or "")
+            key = str(args.get("key") or "")
+            if not selector or not key:
+                return _result(request, ok=False, error="press requires selector and key")
+            return _result(
+                request, output=json.dumps(await driver.press(selector, key), default=str)
+            )
+
+        if operation == "select":
+            selector = str(args.get("selector") or "")
+            value = str(args.get("value") or "")
+            if not selector or not value:
+                return _result(request, ok=False, error="select requires selector and value")
+            return _result(
+                request, output=json.dumps(await driver.select(selector, value), default=str)
+            )
+
+        if operation == "tabs":
+            return _result(request, output=json.dumps(await driver.tabs(), default=str))
+
+        if operation == "new_tab":
+            new_tab_url: str | None = str(args.get("url") or "").strip() or None
+            if new_tab_url:
+                _target, error = validate_target(new_tab_url, policy_name)
+                if error:
+                    return _result(request, ok=False, error=error)
+            return _result(
+                request, output=json.dumps(await driver.new_tab(new_tab_url), default=str)
+            )
+
+        if operation == "switch_tab":
+            return _result(
+                request,
+                output=json.dumps(await driver.switch_tab(int(args.get("index", 0))), default=str),
+            )
+
+        if operation == "close_tab":
+            return _result(request, output=json.dumps(await driver.close_tab(), default=str))
+
+        if operation == "console":
+            return _result(request, output=json.dumps(await driver.console(), default=str))
+
+        if operation == "download":
+            selector = str(args.get("selector") or "")
+            if not selector:
+                return _result(request, ok=False, error="download requires selector")
+            if self._artifacts is None:
+                return _result(request, ok=False, error="download requires an artifact store")
+            raw = await driver.download(selector)
+            path = Path(str(raw.get("path") or ""))
+            data = await run_blocking(path.read_bytes)
+            ref = await self._artifacts.save(
+                task_id=request.task_id,
+                content=data,
+                mime_type="application/octet-stream",
+                metadata={"filename": raw.get("filename"), "source_url": raw.get("url")},
+            )
+            return _result(
+                request,
+                output=json.dumps(
+                    {"artifact": ref.to_dict(), **{k: v for k, v in raw.items() if k != "path"}},
+                    default=str,
+                ),
             )
 
         return _result(request, ok=False, error=f"unknown browser operation: {operation!r}")

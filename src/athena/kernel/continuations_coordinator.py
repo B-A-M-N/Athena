@@ -704,6 +704,9 @@ class ContinuationCoordinator:
                 self._disarm_resume_wait(task.id)
                 return "resumed"
             self._disarm_resume_wait(task.id)
+            release = getattr(self._k, "_release_parked_resources", None)
+            if callable(release):
+                await release(task)
             return "slot_released"
 
     def _arm_resume_wait(self, task_id: str) -> None:

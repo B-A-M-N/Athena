@@ -11,6 +11,8 @@ external content; they can never override configured or authority instruction.
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
+
 from athena.protocol.messages import (
     ContentBlock,
     Provenance,
@@ -49,10 +51,24 @@ class MCPResourceProvider:
 
     def __init__(self, clients: dict[str, MCPClient] | None = None) -> None:
         self._clients: dict[str, MCPClient] = dict(clients or {})
+        self._policies: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
 
-    def add_client(self, connection_id: str, client: MCPClient) -> None:
+    def add_client(
+        self,
+        connection_id: str,
+        client: MCPClient,
+        *,
+        allowed: tuple[str, ...] = (),
+        denied: tuple[str, ...] = (),
+    ) -> None:
         """Register a client whose resource cache the provider can use."""
         self._clients[connection_id] = client
+        self._policies[connection_id] = (tuple(allowed), tuple(denied))
+
+    def remove_client(self, connection_id: str) -> None:
+        """Remove a dead connection and its cached resource inventory."""
+        self._clients.pop(str(connection_id), None)
+        self._policies.pop(str(connection_id), None)
 
     def available(self) -> list[MCPResourceRef]:
         """Return the union of discovered resource refs across clients."""
@@ -60,6 +76,8 @@ class MCPResourceProvider:
         seen: set[str] = set()
         for client in self._clients.values():
             for ref in self._cached(client):
+                if not self._visible(client.connection_id, ref.uri, ref.name):
+                    continue
                 if ref.uri not in seen:
                     seen.add(ref.uri)
                     out.append(ref)
@@ -73,6 +91,8 @@ class MCPResourceProvider:
     ) -> list[ContentBlock]:
         """Read a resource and return UNTRUSTED MCP content blocks."""
         client = self._pick(connection_id, uri)
+        if not self._visible(client.connection_id, uri, ""):
+            raise LookupError(f"MCP resource {uri!r} is not exposed by policy")
         result = await client.read_resource(uri)
         provenance = mcp_provenance(client.connection_id, source_id=uri)
         return [
@@ -87,11 +107,13 @@ class MCPResourceProvider:
             client = self._clients.get(connection_id)
             if client is None:
                 raise LookupError(f"unknown MCP connection: {connection_id}")
+            if not self._visible(connection_id, uri, ""):
+                raise LookupError(f"MCP resource {uri!r} is not exposed by policy")
             return client
         if len(self._clients) == 1:
             return next(iter(self._clients.values()))
         for client in self._clients.values():
-            if uri in client._resource_cache:
+            if uri in client._resource_cache and self._visible(client.connection_id, uri, ""):
                 return client
         raise LookupError(
             "cannot resolve MCP resource; specify connection_id or list resources first"
@@ -101,6 +123,15 @@ class MCPResourceProvider:
     def _cached(client: MCPClient) -> list[MCPResourceRef]:
         cache = getattr(client, "_resource_cache", None) or {}
         return [r for r in cache.values() if isinstance(r, MCPResourceRef)]
+
+    def _visible(self, connection_id: str, uri: str, name: str) -> bool:
+        allowed, denied = self._policies.get(connection_id, ((), ()))
+        values = (str(uri), str(name))
+        if any(fnmatchcase(value, pattern) for value in values for pattern in denied):
+            return False
+        return not allowed or any(
+            fnmatchcase(value, pattern) for value in values for pattern in allowed
+        )
 
 
 __all__ = ["MCPResourceProvider", "mcp_provenance"]

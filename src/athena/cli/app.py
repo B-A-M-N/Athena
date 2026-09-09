@@ -282,6 +282,7 @@ def _config_set(o: "Options") -> int:
             ("browser_enabled",),
             ("browser_headless",),
             ("research_allow_private_network",),
+            ("local_runtime_supervisor",),
             ("animations",),
             ("reduced_motion",),
         }
@@ -392,6 +393,114 @@ def _cmd_config(o: "Options", config: Any) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _cmd_setup(o: "Options", config: Any) -> int:
+    """Create a usable operator profile without starting an agent loop."""
+    from getpass import getpass
+
+    from athena.policy.credentials import write_user_secret
+    from athena.service.config import (
+        config_from_dict,
+        global_config_path,
+        load_toml_file,
+        write_toml_atomic_private,
+    )
+
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+
+    def ask(label: str, default: str = "") -> str:
+        if not interactive:
+            return default
+        suffix = f" [{default}]" if default else ""
+        value = input(f"{label}{suffix}: ").strip()
+        return value or default
+
+    existing_provider = next(iter(getattr(config, "providers", ()) or ()), None)
+    provider_name = str(
+        o.setup_provider
+        or getattr(existing_provider, "name", None)
+        or ask("Model provider name", "openai")
+    ).strip()
+    model = str(
+        o.setup_model
+        or getattr(o, "model", None)
+        or getattr(existing_provider, "model", None)
+        or ask("Model", "gpt-4o-mini")
+    ).strip()
+    credential_id = str(
+        o.setup_credential_id
+        or getattr(existing_provider, "credential_id", None)
+        or f"{provider_name.upper().replace('-', '_')}_API_KEY"
+    ).strip()
+    workspace = str(o.setup_workspace or config.workspace_root or ask("Workspace", os.getcwd()))
+    workspace = os.path.abspath(os.path.expanduser(workspace))
+    if not provider_name or not model or not credential_id:
+        print("athena setup: provider, model, and credential id are required", file=sys.stderr)
+        return 2
+
+    path = Path(o.config_path).expanduser() if o.config_path else global_config_path()
+    raw = load_toml_file(path)
+    providers = [dict(item) for item in raw.get("providers", ()) if isinstance(item, dict)]
+    provider_record = {
+        "kind": "openai-compat",
+        "name": provider_name,
+        "model": model,
+        "credential_id": credential_id,
+    }
+    if o.setup_base_url:
+        provider_record["base_url"] = str(o.setup_base_url)
+    replaced = False
+    for index, item in enumerate(providers):
+        if str(item.get("name") or "") == provider_name:
+            providers[index] = {**item, **provider_record}
+            replaced = True
+            break
+    if not replaced:
+        providers.append(provider_record)
+    raw["providers"] = providers
+    raw["workspace_root"] = workspace
+
+    voice_enabled = o.setup_voice
+    if voice_enabled is None and interactive:
+        voice_enabled = ask("Enable voice transcription and synthesis?", "yes").casefold() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+    if voice_enabled:
+        voice = dict(raw.get("voice") or {})
+        voice.update(
+            {
+                "enabled": True,
+                "transcription_provider": provider_name,
+                "synthesis_provider": provider_name,
+            }
+        )
+        raw["voice"] = voice
+
+    runtime_supervisor = getattr(o, "setup_runtime_supervisor", None)
+    if runtime_supervisor is not None:
+        raw["local_runtime_supervisor"] = bool(runtime_supervisor)
+
+    if interactive:
+        secret = getpass(f"Credential value for {credential_id} (empty to keep existing): ").strip()
+        if secret:
+            write_user_secret(credential_id, secret)
+    try:
+        config_from_dict(raw)
+        write_toml_atomic_private(path, raw)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(f"athena setup: could not save configuration: {exc}", file=sys.stderr)
+        return 1
+    print(f"configured {provider_name}/{model}")
+    print(f"workspace: {workspace}")
+    print(f"credential: {credential_id} (stored outside config)")
+    print(f"voice: {'enabled' if voice_enabled else 'not enabled'}")
+    print("next: athena doctor startup")
+    return 0
 
 
 def _cmd_referee(o: "Options") -> int:
@@ -556,6 +665,13 @@ class Options:
     referee_credential_id: str = "HERMES_REFEREE_API_KEY"
     referee_supervision: str | None = None
     _providers: tuple[Any, ...] = ()
+    setup_provider: str | None = None
+    setup_model: str | None = None
+    setup_credential_id: str | None = None
+    setup_base_url: str | None = None
+    setup_workspace: str | None = None
+    setup_voice: bool | None = None
+    setup_runtime_supervisor: bool | None = None
 
 
 def dispatch(o: Options) -> int:
@@ -577,6 +693,8 @@ def dispatch(o: Options) -> int:
         o.reduced_motion = bool(getattr(config, "reduced_motion", False))
     if o.command == "config":
         return _cmd_config(o, config)
+    if o.command == "setup":
+        return _cmd_setup(o, config)
     if o.command == "serve":
         from athena.api.app import create_app
         from athena.api.sse import run as run_server
@@ -1561,6 +1679,41 @@ def _click_cli(click: Any):
     def config(ctx):
         """Inspect or update operator configuration."""
 
+    @cli.command("setup")
+    @click.option("--provider", "setup_provider", default=None, help="Provider name.")
+    @click.option("--model", "setup_model", default=None, help="Default model.")
+    @click.option("--credential-id", "setup_credential_id", default=None)
+    @click.option("--base-url", "setup_base_url", default=None)
+    @click.option("--workspace", "setup_workspace", default=None)
+    @click.option("--voice/--no-voice", "setup_voice", default=None)
+    @click.option(
+        "--runtime-supervisor/--no-runtime-supervisor",
+        "setup_runtime_supervisor",
+        default=None,
+        help="Use the durable local runtime supervisor for reattachment.",
+    )
+    @click.pass_context
+    def setup(
+        ctx,
+        setup_provider,
+        setup_model,
+        setup_credential_id,
+        setup_base_url,
+        setup_workspace,
+        setup_voice,
+        setup_runtime_supervisor,
+    ):
+        """Configure an operator profile and optional voice routes."""
+        o = base_options(ctx, "setup")
+        o.setup_provider = setup_provider
+        o.setup_model = setup_model
+        o.setup_credential_id = setup_credential_id
+        o.setup_base_url = setup_base_url
+        o.setup_workspace = setup_workspace
+        o.setup_voice = setup_voice
+        o.setup_runtime_supervisor = setup_runtime_supervisor
+        sys.exit(dispatch(o))
+
     @config.command("show")
     @click.pass_context
     def config_show(ctx):
@@ -1980,6 +2133,23 @@ def _arg_parse(argv: list[str]) -> Options:
         choices=["startup", "display", "native"],
         default="startup",
     )
+    sp = sub.add_parser("setup", help="Configure an operator profile and optional voice.")
+    globals_(sp)
+    sp.add_argument("--provider", dest="setup_provider", default=None)
+    sp.add_argument("--credential-id", dest="setup_credential_id", default=None)
+    sp.add_argument("--base-url", dest="setup_base_url", default=None)
+    sp.add_argument("--setup-workspace", dest="setup_workspace", default=None)
+    sp.add_argument("--voice", dest="setup_voice", action="store_true", default=None)
+    sp.add_argument("--no-voice", dest="setup_voice", action="store_false")
+    sp.add_argument(
+        "--runtime-supervisor",
+        dest="setup_runtime_supervisor",
+        action="store_true",
+        default=None,
+    )
+    sp.add_argument(
+        "--no-runtime-supervisor", dest="setup_runtime_supervisor", action="store_false"
+    )
     sp = sub.add_parser("config", help="Inspect or update operator configuration.")
     globals_(sp)
     config_sub = sp.add_subparsers(dest="config_action")
@@ -2043,6 +2213,13 @@ def _arg_parse(argv: list[str]) -> Options:
         referee_port=getattr(ns, "referee_port", 8643),
         referee_credential_id=getattr(ns, "referee_credential_id", "HERMES_REFEREE_API_KEY"),
         referee_supervision=getattr(ns, "referee_supervision", None),
+        setup_provider=getattr(ns, "setup_provider", None),
+        setup_model=getattr(ns, "setup_model", None),
+        setup_credential_id=getattr(ns, "setup_credential_id", None),
+        setup_base_url=getattr(ns, "setup_base_url", None),
+        setup_workspace=getattr(ns, "setup_workspace", None),
+        setup_voice=getattr(ns, "setup_voice", None),
+        setup_runtime_supervisor=getattr(ns, "setup_runtime_supervisor", None),
     )
     if command == "doctor":
         o.args = [ns.target]

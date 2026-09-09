@@ -22,6 +22,7 @@ class MemoryKind(str, enum.Enum):
 
 
 class MemoryScope(str, enum.Enum):
+    JOB = "job"
     SESSION = "session"
     TASK = "task"
     PROJECT = "project"

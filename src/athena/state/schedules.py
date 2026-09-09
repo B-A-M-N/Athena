@@ -289,6 +289,15 @@ class ScheduleStore:
         )
         return _decode_run(row) if row else None
 
+    async def previous_completed_run(self, job_id: str, before: str) -> dict | None:
+        row = await self._db.fetch_one(
+            "SELECT * FROM job_runs WHERE job_id = ? AND scheduled_for < ? "
+            "AND status = 'FIRED' AND task_id IS NOT NULL "
+            "ORDER BY started_at DESC LIMIT 1",
+            (job_id, before),
+        )
+        return _decode_run(row) if row else None
+
     async def count_runs(self, job_id: str) -> int:
         row = await self._db.fetch_one(
             "SELECT COUNT(*) AS count FROM job_runs WHERE job_id = ?",

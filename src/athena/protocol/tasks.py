@@ -292,6 +292,15 @@ class ModelPolicy:
     # Safety-sensitive deployments may require a provider to declare its tier;
     # undeclared metadata is otherwise treated conservatively as advisory.
     require_declared_quality: bool = False
+    # Bounded provider failover. The router may use fewer attempts when fewer
+    # distinct eligible routes exist; it must never retry indefinitely.
+    max_model_attempts: int = 2
+
+    def __post_init__(self) -> None:
+        attempts = int(self.max_model_attempts)
+        if attempts < 1 or attempts > 8:
+            raise ValueError("max_model_attempts must be between 1 and 8")
+        object.__setattr__(self, "max_model_attempts", attempts)
 
 
 @dataclass(frozen=True)

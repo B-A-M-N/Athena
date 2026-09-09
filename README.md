@@ -1,7 +1,7 @@
 # Athena
 
 A compact, local-first autonomous agent runtime with durable knowledge,
-structured delegation, universal execution, a programmable execution
+structured delegation, governed multi-runtime execution, a programmable execution
 environment, and a **single authoritative reasoning loop**.
 
 Athena brings capability discovery, evidence, execution, policy, and learning
@@ -98,7 +98,7 @@ athena chat
 # hosted raster OI on a Kitty-compatible graphics transport
 athena --display glass chat
 
-# universal terminal fallback
+# governed terminal fallback
 athena --display ansi chat
 
 # native Athena terminal (Alacritty core + Athena compositor)
@@ -581,7 +581,9 @@ deterministic `research:plan`, `research:assess`, `research:bundle`, and
 `research:run` operations are live. `research:run` composes an explicit
 objective, requirements, selected source captures, exact evidence excerpts,
 contradiction checks, and a final readiness bundle without creating a separate
-research brain. Open-ended autonomous research planning remains in development.
+research brain. With `autonomous=true`, it also performs a bounded
+discover→policy-check→immutable-fetch acquisition loop; open-ended query
+planning and model-generated extraction remain intentionally bounded.
 
 ## Current limitations
 
@@ -699,6 +701,41 @@ allowed = ["anthropic/claude-opus-4"]     # main reasoning loop
 Built-in roles: `primary` (task reasoning), `summarizer` (context compression),
 `judge` (model-judged acceptance criteria). A caller's explicit allowlist
 always wins over role defaults.
+
+### Voice input and output
+
+Voice is an opt-in transport around the normal durable task path. Configure
+named OpenAI-compatible providers for transcription and speech synthesis; the
+provider credentials stay in the ordinary provider/SecretManager boundary:
+
+```toml
+[[providers]]
+kind = "openai"
+name = "openai"
+model = "gpt-4o-mini"
+credential_id = "OPENAI_API_KEY"
+
+[voice]
+enabled = true
+transcription_provider = "openai"
+transcription_model = "gpt-4o-mini-transcribe"
+synthesis_provider = "openai"
+synthesis_model = "gpt-4o-mini-tts"
+voice = "alloy"
+response_format = "mp3"
+```
+
+The HTTP API accepts raw audio or JSON with `audio_base64`:
+
+- `POST /v1/voice/transcribe` returns the transcript and immutable input artifact.
+- `POST /v1/voice/turn` transcribes audio and submits an ordinary Athena task,
+  retaining the audio artifact as provenance.
+- `POST /v1/voice/synthesize` returns spoken audio.
+- `POST /v1/tasks/{task_id}/voice` speaks a finalized task summary.
+
+Audio sizes and synthesized text are bounded by `[voice]` configuration. A
+voice turn is transcribed once, so ordinary text-capable reasoning models can
+handle it without silently receiving a second ungoverned audio payload.
 
 ### Required capability profiles
 

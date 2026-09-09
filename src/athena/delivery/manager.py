@@ -201,6 +201,9 @@ class DeliveryManager:
                 receipt,
                 task_id=result.task_id,
                 session_id=task.session_id,
+                id=(
+                    f"delivery:{result.task_id}:{receipt.get('delivery_channel')}:{receipt.get('delivery_status')}"
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - bookkeeping must not propagate
             _logger.warning(

@@ -11,6 +11,7 @@ from athena.service.config import (
     AthenaConfig,
     HermesRefereeConfig,
     ProviderConfig,
+    VoiceConfig,
     config_from_dict,
     config_to_dict,
     project_config_paths,
@@ -105,6 +106,28 @@ def test_roundtrip_providers_mcp_model_roles():
         "mcp:tools",
         "computer",
     )
+
+
+def test_roundtrip_voice_config():
+    config = AthenaConfig(
+        voice=VoiceConfig(
+            enabled=True,
+            transcription_provider="openai",
+            transcription_model="gpt-4o-mini-transcribe",
+            synthesis_provider="openai",
+            synthesis_model="gpt-4o-mini-tts",
+            voice="marin",
+            response_format="wav",
+            max_input_bytes=8_000_000,
+            max_output_bytes=9_000_000,
+            max_text_chars=4_000,
+        )
+    )
+
+    restored = config_from_dict(config_to_dict(config))
+
+    assert restored.voice == config.voice
+    assert config_to_dict(config)["voice"]["enabled"] is True
 
 
 def test_roundtrip_hermes_referee_config():

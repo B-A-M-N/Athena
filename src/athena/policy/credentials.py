@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -92,6 +94,94 @@ class FileSource(SecretSource):
                 return fh.read().strip()
         except OSError:
             return None
+
+
+class KeyringSource(SecretSource):
+    """Optional OS keyring backend; unavailable keyring fails closed."""
+
+    name = "keyring"
+
+    def __init__(self, service: str = "athena") -> None:
+        self._service = str(service)
+
+    def resolve(self, name: str) -> str | None:
+        try:
+            import keyring
+
+            value = keyring.get_password(self._service, str(name))
+        except Exception:
+            return None
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+class _CommandSecretSource(SecretSource):
+    """Base for optional owner-authenticated CLI secret stores.
+
+    Commands receive a fixed argument vector and never a shell string. Their
+    output is consumed in memory only; stderr is discarded so a credential
+    value or CLI diagnostic cannot leak into Athena logs.
+    """
+
+    timeout_seconds = 5.0
+
+    def _run(self, argv: list[str]) -> str | None:
+        if shutil.which(argv[0]) is None:
+            return None
+        try:
+            completed = subprocess.run(  # architecture-lint: allow subprocess-outside-approved-backends reason=owner-authenticated secret-store CLI
+                argv,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        value = completed.stdout.strip()
+        return value or None
+
+
+class OnePasswordSource(_CommandSecretSource):
+    """Resolve an item field through the operator's ``op`` CLI session."""
+
+    name = "1password"
+
+    def __init__(self, vault: str | None = None, field: str = "credential") -> None:
+        self.vault = str(vault).strip() if vault else None
+        self.field = str(field).strip() or "credential"
+
+    def resolve(self, name: str) -> str | None:
+        reference = str(name).strip()
+        if not reference.startswith("op://"):
+            if not self.vault:
+                return None
+            reference = f"op://{self.vault}/{reference}/{self.field}"
+        return self._run(["op", "read", reference])
+
+
+class BitwardenSource(_CommandSecretSource):
+    """Resolve a login password through the operator's ``bw`` CLI session."""
+
+    name = "bitwarden"
+
+    def resolve(self, name: str) -> str | None:
+        return self._run(["bw", "get", "password", str(name)])
+
+
+class ResolverSecretSource(SecretSource):
+    """Adapter for operator-installed vault/1Password/Bitwarden resolvers."""
+
+    def __init__(self, name: str, resolver: Callable[[str], str | None]) -> None:
+        self.name = str(name)
+        self._resolver = resolver
+
+    def resolve(self, name: str) -> str | None:
+        try:
+            value = self._resolver(str(name))
+        except Exception:
+            return None
+        return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def user_secret_dir() -> Path:
@@ -230,6 +320,7 @@ class SecretManager:
             EnvSource(),
             FileSource(str(user_secret_dir()), require_private=True),
             FileSource("/etc/athena/secrets", require_private=True),
+            KeyringSource(),
         ]
         self._sources: list[SecretSource] = (
             list(sources) if sources is not None else default_sources
@@ -438,6 +529,10 @@ __all__ = [
     "SecretSource",
     "EnvSource",
     "FileSource",
+    "KeyringSource",
+    "OnePasswordSource",
+    "BitwardenSource",
+    "ResolverSecretSource",
     "CredentialLease",
     "SecretDelegation",
     "SecretError",

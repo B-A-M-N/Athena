@@ -1,10 +1,14 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
 from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import TaskStatus
-from athena.service.resource_finalizer import TaskResourceFinalizer
+from athena.service.resource_finalizer import (
+    TaskResourceFinalizer,
+    TaskResourceRetentionPolicy,
+)
 from athena.state.database import Database
 from athena.state.resource_obligations import ResourceObligationStore
 
@@ -134,6 +138,30 @@ async def test_finalizer_continues_after_one_resource_exception_without_success_
 
 
 @pytest.mark.asyncio
+async def test_quiesce_proof_is_reused_by_post_commit_observer():
+    terminal = _Resource("terminal")
+    finalizer = TaskResourceFinalizer()
+    finalizer.bind_service(
+        SimpleNamespace(
+            _terminals=terminal,
+            _debugger=None,
+            _browser=None,
+            _external_delegate_manager=None,
+            _synthesis=None,
+            _execution=None,
+        )
+    )
+    task = SimpleNamespace(id="task-once")
+    result = SimpleNamespace(status=TaskStatus.COMPLETE)
+
+    outcome = await finalizer.quiesce(task, result)
+    assert outcome["confirmed"] is True
+    await finalizer.finalize(task, result)
+    await finalizer.finalize(task, result)
+    assert terminal.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_resource_obligation_survives_restart_and_reconciles():
     db = Database(":memory:")
     await db._ensure_ready()
@@ -172,3 +200,35 @@ async def test_resource_obligation_survives_restart_and_reconciles():
     assert second.health()["unresolved_count"] == 0
     assert await obligations.list_open() == []
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_parked_retain_policy_releases_after_ttl():
+    events = []
+
+    async def sink(event):
+        events.append(event.payload)
+
+    terminal = _Resource("terminal")
+    finalizer = TaskResourceFinalizer(
+        event_sink=sink,
+        retention_policy=TaskResourceRetentionPolicy(mode="retain", retain_seconds=0.01),
+    )
+    finalizer.bind_service(
+        SimpleNamespace(
+            _terminals=terminal,
+            _debugger=None,
+            _browser=None,
+            _external_delegate_manager=None,
+            _synthesis=None,
+            _execution=None,
+        )
+    )
+
+    outcome = await finalizer.release_parked("task-ttl")
+    assert outcome["retained"] is True
+    assert terminal.calls == 0
+    await asyncio.sleep(0.03)
+    assert terminal.calls == 1
+    assert events[-1]["mode"] == "retain_expired"
+    await finalizer.shutdown()

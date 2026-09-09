@@ -177,7 +177,9 @@ class InferenceBroker:
         attempted: set[tuple[str, str]] = set()
         selection_for_attempt = selection
         compiled_for_attempt = compiled
-        for attempt in range(self._fallback_attempts):
+        effective_policy = self._k._router.effective_policy(task.model_policy)
+        max_attempts = min(self._fallback_attempts, effective_policy.max_model_attempts)
+        for attempt in range(max_attempts):
             if state.cancel.is_set():
                 raise RequestCancelled("task cancelled")
             pair = (
@@ -435,7 +437,7 @@ class InferenceBroker:
                         _bookkeeping_failure("provider usage failure record", task, record_exc)
                 if not _is_retryable(exc):
                     raise
-                if attempt >= self._fallback_attempts - 1:
+                if attempt >= max_attempts - 1:
                     break
                 # Exclude the failed (provider, model) pair only; sibling
                 # models on the same provider remain candidates.

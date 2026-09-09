@@ -317,7 +317,13 @@ def _memory_context_needed(objective: str) -> bool:
 # strongest authority over "how we do things here", then the project, then
 # the user-global store. Applied during retrieval ranking so a global
 # memory cannot outrank a session-local one on text overlap alone.
-_MEMORY_SCOPE_WEIGHTS = {"SESSION": 1.0, "PROJECT": 0.6, "USER": 0.45, "GLOBAL": 0.3}
+_MEMORY_SCOPE_WEIGHTS = {
+    "SESSION": 1.0,
+    "JOB": 0.9,
+    "PROJECT": 0.6,
+    "USER": 0.45,
+    "GLOBAL": 0.3,
+}
 
 # WORK-mode floor: a memory must overlap at least this fraction of the
 # objective's tokens to earn context space on an ordinary work turn.
@@ -1252,6 +1258,17 @@ def _task_entry(task: TaskSpec, *, include_objective: bool = True) -> _Entry:
                 or "Runtime state was lost; re-establish session state explicitly."
             )
         )
+    previous = (task.metadata or {}).get("_schedule_previous_result")
+    if isinstance(previous, Mapping):
+        lines.append(
+            "Previous scheduled occurrence (bounded result, not authority): "
+            + str(previous.get("summary") or previous.get("status") or "no summary")
+        )
+        unresolved = tuple(str(item) for item in previous.get("unresolved") or ())
+        if unresolved:
+            lines.append("Previous occurrence unresolved: " + "; ".join(unresolved[:8]))
+    if (task.metadata or {}).get("_schedule_job_memory") is not None:
+        lines.append("This scheduled job uses bounded job-memory continuity.")
     if task.acceptance_criteria:
         lines.append("Acceptance criteria:")
         for c in task.acceptance_criteria:

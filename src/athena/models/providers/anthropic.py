@@ -11,6 +11,8 @@ in/out remain canonical provider-neutral ModelRequest/ModelEvent types.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
 import math
 from collections.abc import AsyncIterator, Mapping
@@ -723,7 +725,10 @@ class AnthropicProvider:
         if code in (401, 403):
             return ProviderAuthenticationError(message)
         if code == 429:
-            return ProviderRateLimitError(message)
+            return ProviderRateLimitError(
+                message,
+                retry_after=_retry_after_seconds(resp.headers.get("Retry-After")),
+            )
         if code == 400 and ("context" in body.lower() or "token" in body.lower()):
             return ContextOverflow(message)
         if code == 404:
@@ -740,6 +745,21 @@ def _optional_float(value: object) -> float | None:
         return float(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _retry_after_seconds(value: object) -> float | None:
+    try:
+        return max(0.0, float(str(value))) if value is not None else None
+    except (TypeError, ValueError):
+        if value is None:
+            return None
+        try:
+            parsed = parsedate_to_datetime(str(value))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 __all__ = ["AnthropicProvider"]

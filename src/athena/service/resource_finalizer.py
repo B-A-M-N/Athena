@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import inspect
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from athena.protocol.events import EV, make_event
@@ -12,6 +14,22 @@ from athena.protocol.resources import TaskResourceCloseResult
 from athena.protocol.tasks import FINAL_STATUSES, TaskStatus
 
 _logger = logging.getLogger("athena.service.resources")
+
+
+@dataclass(frozen=True)
+class TaskResourceRetentionPolicy:
+    """What happens to task-owned resources after a parked slot expires."""
+
+    mode: str = "release"
+    retain_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"retain", "checkpoint_and_release", "release"}:
+            raise ValueError(
+                "resource retention mode must be retain, checkpoint_and_release, or release"
+            )
+        if self.retain_seconds < 0:
+            raise ValueError("resource retention retain_seconds must be non-negative")
 
 
 class TaskResourceFinalizer:
@@ -22,13 +40,30 @@ class TaskResourceFinalizer:
     a capability cannot quietly invent a second task cleanup path.
     """
 
-    def __init__(self, *, event_sink=None, history_limit: int = 256) -> None:
+    def __init__(
+        self,
+        *,
+        event_sink=None,
+        history_limit: int = 256,
+        retention_policy: TaskResourceRetentionPolicy | None = None,
+    ) -> None:
         self._event_sink = event_sink
         self._obligation_store = None
         self._outcomes: deque[dict[str, Any]] = deque(maxlen=history_limit)
         self._inflight: set[str] = set()
         self._unresolved: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._durability_error: str | None = None
+        self._retention_policy = retention_policy or TaskResourceRetentionPolicy()
+        self._parked_release_tasks: dict[str, asyncio.Task] = {}
+        self._checkpoint_manager: Any = None
+        # ``quiesce`` is the pre-publication half of finalization.  A
+        # successful quiesce is already a close proof; the post-commit
+        # observer must publish that proof, not close every resource a second
+        # time.  Keep a process-local guard as well for duplicate observer
+        # delivery.  Restart recovery still re-proves ownership through the
+        # durable obligation store.
+        self._quiesced: dict[str, dict[str, Any]] = {}
+        self._finalized: set[str] = set()
 
     async def _emit(self, event_type: str, task_id: str, payload: dict[str, Any]) -> None:
         if self._event_sink is None:
@@ -43,11 +78,15 @@ class TaskResourceFinalizer:
         if status not in FINAL_STATUSES and status is not TaskStatus.RECOVERY_REQUIRED:
             return
         task_id = str(task.id)
+        if task_id in self._finalized:
+            return
         if task_id in self._inflight:
             return
         self._inflight.add(task_id)
         try:
-            outcome = await self._close_resources(task_id, status)
+            outcome = self._quiesced.get(task_id)
+            if outcome is None or not outcome.get("confirmed"):
+                outcome = await self._close_resources(task_id, status)
             self._outcomes.append(outcome)
             event_type = (
                 EV["TASK_RESOURCES_FINALIZED"]
@@ -55,6 +94,9 @@ class TaskResourceFinalizer:
                 else EV["TASK_RESOURCE_TEARDOWN_FAILED"]
             )
             await self._emit(event_type, task_id, outcome)
+            if outcome["confirmed"]:
+                self._finalized.add(task_id)
+                self._quiesced.pop(task_id, None)
         finally:
             self._inflight.discard(task_id)
 
@@ -72,15 +114,134 @@ class TaskResourceFinalizer:
         status = getattr(result, "status", None)
         if status not in FINAL_STATUSES and status is not TaskStatus.RECOVERY_REQUIRED:
             return {"confirmed": True, "unresolved": []}
-        outcome = await self._close_resources(str(task.id), status)
+        task_id = str(task.id)
+        existing = self._quiesced.get(task_id)
+        outcome = existing if existing is not None and existing.get("confirmed") else None
+        if outcome is None:
+            outcome = await self._close_resources(task_id, status)
+            self._quiesced[task_id] = outcome
         return {
             "confirmed": bool(outcome["confirmed"]),
             "unresolved": list(outcome["unresolved"]),
             "failures": list(outcome["failures"]),
         }
 
+    async def release_parked(self, task_id: str) -> dict[str, Any]:
+        """Apply the explicit parked-resource policy after slot release."""
+        task_id = str(task_id)
+        checkpoint: dict[str, Any] | None = None
+        if self._retention_policy.mode == "checkpoint_and_release":
+            checkpoint = await self._checkpoint_parked_task(task_id)
+            if checkpoint is None:
+                outcome = {
+                    "task_id": task_id,
+                    "mode": "checkpoint_and_release",
+                    "released": False,
+                    "retained": True,
+                    "confirmed": False,
+                    "error": "workspace checkpoint could not be established",
+                }
+                await self._emit("TaskResourceCheckpointFailed", task_id, outcome)
+                return outcome
+        if self._retention_policy.mode == "retain" and self._retention_policy.retain_seconds > 0:
+            current = self._parked_release_tasks.get(task_id)
+            if current is None or current.done():
+                self._parked_release_tasks[task_id] = asyncio.create_task(
+                    self._release_after_retention(task_id),
+                    name=f"athena-parked-release-{task_id}",
+                )
+            outcome = {
+                "task_id": task_id,
+                "mode": "retain",
+                "released": False,
+                "retained": True,
+                "retain_seconds": self._retention_policy.retain_seconds,
+                "confirmed": True,
+            }
+        else:
+            outcome = await self._close_resources(task_id, TaskStatus.WAITING_INPUT)
+            outcome["mode"] = self._retention_policy.mode
+            outcome["released"] = bool(outcome.get("closed"))
+        if checkpoint is not None:
+            outcome["checkpoint"] = checkpoint
+            outcome["resume_consequence"] = (
+                "task-owned runtimes were released; resume must reconstruct them from the checkpoint"
+            )
+        await self._emit("TaskResourceReleasedWhileParked", task_id, outcome)
+        return outcome
+
+    async def cancel_parked_release(self, task_id: str) -> None:
+        """Cancel a delayed release when a parked task resumes in time."""
+        task_id = str(task_id)
+        pending = self._parked_release_tasks.pop(task_id, None)
+        if pending is None or pending.done():
+            return
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+    async def shutdown(self) -> None:
+        """Stop delayed retention jobs before service-owned resources close."""
+        pending = list(self._parked_release_tasks.values())
+        self._parked_release_tasks.clear()
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _release_after_retention(self, task_id: str) -> None:
+        try:
+            await asyncio.sleep(self._retention_policy.retain_seconds)
+            outcome = await self._close_resources(task_id, TaskStatus.WAITING_INPUT)
+            outcome.update(
+                {
+                    "mode": "retain_expired",
+                    "released": bool(outcome.get("closed")),
+                    "retained": False,
+                }
+            )
+            await self._emit("TaskResourceReleasedWhileParked", task_id, outcome)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._parked_release_tasks.pop(task_id, None)
+
     def bind_service(self, service: Any) -> None:
         self._service = service
+        self._checkpoint_manager = getattr(service, "_checkpoints", None)
+
+    def bind_checkpoint_manager(self, manager: Any) -> None:
+        self._checkpoint_manager = manager
+
+    async def _checkpoint_parked_task(self, task_id: str) -> dict[str, Any] | None:
+        manager = self._checkpoint_manager
+        service = getattr(self, "_service", None)
+        task_manager = getattr(service, "_task_manager", None)
+        if manager is None or task_manager is None:
+            return None
+        try:
+            task = await task_manager.get(task_id)
+            workspace = getattr(task, "workspace", None)
+            root = getattr(workspace, "root", None)
+            if not root:
+                return None
+            manifest = await manager.capture(
+                task_id=task_id,
+                workspace_root=str(root),
+                label="parked-resource-release",
+                metadata={
+                    "reason": "parked resource retention policy",
+                    "task_status": TaskStatus.WAITING_INPUT.value,
+                },
+            )
+            return {
+                "id": str(manifest.get("id") or ""),
+                "workspace_root": str(root),
+                "file_count": int(manifest.get("file_count") or 0),
+            }
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+            _logger.warning("parked checkpoint failed for %s: %s", task_id, exc)
+            return None
 
     def bind_obligation_store(self, store: Any) -> None:
         self._obligation_store = store
@@ -150,6 +311,10 @@ class TaskResourceFinalizer:
             "unresolved": unresolved,
             "durability_error": self._durability_error,
         }
+
+    def unresolved_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        """Return unresolved ownership proofs for one task."""
+        return self._unresolved_for_task(str(task_id))
 
     async def _close_resources(self, task_id: str, status: Any) -> dict[str, Any]:
         outcome: dict[str, Any] = {
@@ -401,4 +566,4 @@ def _ownership_identity(evidence: dict[str, Any]) -> dict[str, Any]:
     return identity
 
 
-__all__ = ["TaskResourceFinalizer"]
+__all__ = ["TaskResourceFinalizer", "TaskResourceRetentionPolicy"]

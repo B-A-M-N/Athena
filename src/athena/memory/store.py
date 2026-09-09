@@ -678,7 +678,12 @@ class MemoryStore:
     def _scope_id(record: MemoryRecord) -> str | None:
         if "scope_id" in record.metadata:
             return str(record.metadata["scope_id"])
-        if record.scope in (MemoryScope.TASK, MemoryScope.SESSION, MemoryScope.USER):
+        if record.scope in (
+            MemoryScope.TASK,
+            MemoryScope.SESSION,
+            MemoryScope.JOB,
+            MemoryScope.USER,
+        ):
             return record.source.source_id if record.source else None
         return None
 

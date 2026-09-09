@@ -232,6 +232,56 @@ async def test_discover_queries_all_providers_and_deduplicates_canonical_uris():
 
 
 @pytest.mark.asyncio
+async def test_autonomous_acquisition_is_bounded_and_fetches_candidates():
+    store = _MemoryResearchStore()
+    provider = _DiscoveryProvider(
+        "provider-a",
+        [{"uri": "https://example.test/guide", "title": "Guide", "source_type": "web"}],
+    )
+    capability = ResearchCapability(
+        store,
+        source_policy=SourcePolicy(allowed_domains=("example.test",)),
+        discovery_providers=(provider,),
+    )
+
+    async def fake_fetch(request, args, context):
+        del context
+        return capability_result(
+            request,
+            {"source": {"id": "source-1", "canonical_uri": args["uri"]}},
+        )
+
+    capability._fetch = fake_fetch
+    captures, errors, summary = await capability._autonomous_acquire(  # noqa: SLF001
+        CapabilityRequest(
+            capability_id="research",
+            task_id="task-auto",
+            call_id="auto-1",
+            arguments={},
+        ),
+        SimpleNamespace(workspace=SimpleNamespace(id="project")),
+        [{"question": "guide", "queries": ["guide"]}],
+        {"max_research_rounds": 3, "max_sources": 1, "max_queries": 1},
+    )
+
+    assert len(captures) == 1
+    assert errors == []
+    assert summary["rounds"] == 1
+    assert summary["fetched"] == 1
+
+
+def capability_result(request, payload):
+    from athena.protocol.capabilities import CapabilityResult
+
+    return CapabilityResult(
+        request.call_id,
+        request.capability_id,
+        CapabilityResultStatus.OK,
+        output=json.dumps(payload),
+    )
+
+
+@pytest.mark.asyncio
 async def test_capability_records_and_verifies_evidence():
     store = _MemoryResearchStore()
     artifacts = _MemoryArtifacts()

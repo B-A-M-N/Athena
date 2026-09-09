@@ -440,3 +440,86 @@ def test_pack_instrument_is_a_governed_callable_surface(tmp_path):
         pass
     else:
         raise AssertionError("disabled pack instrument remains registered")
+
+
+def test_pack_hook_is_durable_idempotent_and_effect_capped(tmp_path):
+    source = tmp_path / "hook-pack"
+    (source / "hooks").mkdir(parents=True)
+    (source / "hooks" / "events.json").write_text(
+        json.dumps(
+            {
+                "hooks": [
+                    {
+                        "event": "TaskCompleted",
+                        "workflow": "review",
+                        "effects": ["READ_LOCAL"],
+                        "recursion_limit": 1,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "athena.pack.toml").write_text(
+        "id = 'hook-pack'\nversion = '1.0.0'\npublisher = 'test'\n"
+        "[provides]\nhooks = ['hooks/events.json']\n"
+        "[authority]\nrequested_effects = ['READ_LOCAL']\n",
+        encoding="utf-8",
+    )
+
+    class _Events:
+        def __init__(self):
+            self.callbacks = []
+
+        def subscribe(self, callback, **_kwargs):
+            self.callbacks.append(callback)
+
+        def unsubscribe(self, callback):
+            self.callbacks.remove(callback)
+
+    class _Outbox:
+        def __init__(self):
+            self.rows = {}
+
+        async def enqueue(self, **kwargs):
+            key = (kwargs["hook_id"], kwargs["event_id"])
+            row = self.rows.setdefault(key, {"id": "outbox-1", "status": "PENDING"})
+            return dict(row)
+
+        async def mark_dispatched(self, row_id, task_id):
+            assert row_id == "outbox-1"
+            self.rows[("pack:hook-pack:hook:1", "event-1")]["status"] = "DISPATCHED"
+            self.rows[("pack:hook-pack:hook:1", "event-1")]["task_id"] = task_id
+
+        async def mark_failed(self, *_args):
+            raise AssertionError("hook should not fail")
+
+        async def pending(self):
+            return []
+
+    events = _Events()
+    outbox = _Outbox()
+    requests = []
+
+    async def intake(request, *, wait):
+        assert wait is False
+        requests.append(request)
+        return SimpleNamespace(id="hook-task")
+
+    manager = PackManager(_PackStore(), install_root=str(tmp_path / "installed"))
+    manager.bind_integrations(event_store=events, hook_outbox=outbox, task_intake=intake)
+    asyncio.run(manager.install(str(source), allowed_root=str(tmp_path)))
+    assert len(events.callbacks) == 1
+
+    event = SimpleNamespace(
+        id="event-1",
+        type="TaskCompleted",
+        task_id="task-1",
+        session_id="session-1",
+        payload={"status": "COMPLETE"},
+    )
+    asyncio.run(events.callbacks[0](event))
+    asyncio.run(events.callbacks[0](event))
+    assert len(requests) == 1
+    assert requests[0].metadata["_pack_hook_effect_ceiling"] == ["READ_LOCAL"]
+    assert requests[0].capability_policy.effects == frozenset({"READ_LOCAL"})

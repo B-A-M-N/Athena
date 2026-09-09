@@ -11,11 +11,48 @@ instances. All process execution still flows through ExecutionManager (INV-005).
 from __future__ import annotations
 
 import abc
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Mapping
 
 from athena.protocol.execution import ExecutionEvent, ExecutionRequest
 
-__all__ = ["ExecutionBackend", "BackendRegistry", "register_backend", "get_backend"]
+__all__ = [
+    "BackendCapabilities",
+    "RuntimeCapabilities",
+    "ExecutionBackend",
+    "BackendRegistry",
+    "register_backend",
+    "get_backend",
+]
+
+
+@dataclass(frozen=True)
+class RuntimeCapabilities:
+    """Runtime-specific capability overrides for one backend."""
+
+    persistent_sessions: bool = False
+    reattach: bool = False
+    secret_materialization: bool = False
+    interactive_stdin: bool = False
+    process_signals: bool = False
+
+
+@dataclass(frozen=True)
+class BackendCapabilities:
+    """Operational contract exposed by an execution backend."""
+
+    supported_runtimes: tuple[str, ...] = ()
+    persistent_sessions: bool = False
+    reattach: bool = False
+    filesystem_persistence: bool = False
+    network_modes: tuple[str, ...] = ()
+    secret_materialization: bool = False
+    interactive_stdin: bool = False
+    process_signals: bool = False
+    dependency_installation: tuple[str, ...] = ()
+    runtime_capabilities: Mapping[str, RuntimeCapabilities | Mapping[str, object]] = field(
+        default_factory=dict
+    )
 
 
 class ExecutionBackend(abc.ABC):
@@ -23,6 +60,10 @@ class ExecutionBackend(abc.ABC):
     # Backends opt in only when they can prove ownership and environment
     # identity after the Athena process itself has restarted.
     supports_reattach: bool = False
+
+    def capabilities(self) -> BackendCapabilities:
+        """Return the backend's truthful runtime/persistence contract."""
+        return BackendCapabilities(reattach=self.supports_reattach)
 
     @abc.abstractmethod
     async def create_session(
