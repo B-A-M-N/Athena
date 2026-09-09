@@ -27,6 +27,7 @@ crt="$tmp_dir/crt.png"
 focus_lost="$tmp_dir/focus-lost.png"
 focus_return="$tmp_dir/focus-return.png"
 clipboard_capture="$tmp_dir/clipboard.txt"
+clipboard_input="$tmp_dir/clipboard-input.txt"
 
 layout_json="$($native_bin --dump-layout)"
 window_strategy="$(LAYOUT_JSON="$layout_json" python3 -c '
@@ -152,7 +153,8 @@ window_geometry() {
 # Clipboard is a real X11 selection round-trip, not only a key-event smoke
 # test. The native editor must deliver the selected text to its PTY child.
 clipboard_text='real desktop clipboard — Athena'
-printf '%s' "$clipboard_text" | xclip -selection clipboard -in &
+printf '%s' "$clipboard_text" > "$clipboard_input"
+xclip -selection clipboard -in < "$clipboard_input" >/dev/null 2>&1 &
 clipboard_pid=$!
 xdotool key --window "$window" ctrl+shift+v
 sleep 0.25
