@@ -188,6 +188,7 @@ def encode_criteria(criteria: tuple[Criterion, ...] | None) -> str:
                 "id": criterion.id,
                 "description": criterion.description,
                 "required": criterion.required,
+                "evidence_required": criterion.evidence_required,
                 "verification": (
                     {
                         "type": verification.type.value,
@@ -228,6 +229,7 @@ def decode_criteria(raw: Any) -> tuple[Criterion, ...]:
                     description=description,
                     verification=verification,
                     required=True,
+                    evidence_required=False,
                 )
             )
             continue
@@ -254,6 +256,7 @@ def decode_criteria(raw: Any) -> tuple[Criterion, ...]:
                 description=str(item.get("description") or ""),
                 verification=verification,
                 required=bool(item.get("required", True)),
+                evidence_required=bool(item.get("evidence_required", False)),
             )
         )
     return tuple(result)

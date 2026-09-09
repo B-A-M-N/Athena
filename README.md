@@ -582,8 +582,10 @@ deterministic `research:plan`, `research:assess`, `research:bundle`, and
 objective, requirements, selected source captures, exact evidence excerpts,
 contradiction checks, and a final readiness bundle without creating a separate
 research brain. With `autonomous=true`, it also performs a bounded
-discover→policy-check→immutable-fetch acquisition loop; open-ended query
-planning and model-generated extraction remain intentionally bounded.
+discover→policy-check→immutable-fetch acquisition loop. Later rounds are
+gap-driven and byte-bounded; evidence-required tasks remain partial until a
+typed ready-bundle receipt exists. Model-generated extraction remains
+intentionally bounded.
 
 ## Current limitations
 

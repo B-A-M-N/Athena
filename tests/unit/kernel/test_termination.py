@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from athena.kernel.termination import TerminationDecision, TerminationEvaluator
+from athena.kernel.termination import TerminationDecision, TerminationEvaluator, WorkEvidence
 from athena.protocol.models import ModelResponse, UsageInfo
 from athena.protocol.messages import CapabilityCallBlock, TextBlock
 from athena.protocol.tasks import Criterion, MutationMode, TaskSpec, TaskStatus, WorkspaceSpec
@@ -75,6 +75,45 @@ async def test_truth_outranks_success_unverified_criteria(evaluator):
     assert decision.terminal is True
     assert decision.status.value == "PARTIAL"
     assert "c1" in decision.unresolved
+
+
+async def test_required_research_evidence_needs_a_ready_bundle_receipt():
+    class _PassingVerifier:
+        async def verify(self, task, criteria):
+            return [True for _ in criteria]
+
+    task = TaskSpec(
+        id="research-proof",
+        objective="research the release",
+        acceptance_criteria=(
+            Criterion(
+                id="research-bundle",
+                description="research bundle is ready",
+                evidence_required=True,
+            ),
+        ),
+    )
+    evaluator = TerminationEvaluator(acceptance_verifier=_PassingVerifier())
+    decision = await evaluator.evaluate(
+        task,
+        _response([TextBlock(type="text", text="done")]),
+        iterations=1,
+        work_evidence=(
+            WorkEvidence(kind="observation", capability_id="research", research_ready=False),
+        ),
+    )
+    assert decision.status is TaskStatus.PARTIAL
+    assert decision.unresolved == ("research-bundle",)
+
+    ready = await evaluator.evaluate(
+        task,
+        _response([TextBlock(type="text", text="done")]),
+        iterations=1,
+        work_evidence=(
+            WorkEvidence(kind="observation", capability_id="research", research_ready=True),
+        ),
+    )
+    assert ready.status is TaskStatus.COMPLETE
 
 
 async def test_reality_coordinator_owns_speculative_candidate_proof():

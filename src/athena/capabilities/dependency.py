@@ -23,7 +23,7 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     EffectClass,
 )
-from athena.execution.dependencies import environment_fingerprint, record_hashes
+from athena.execution.dependencies import environment_fingerprint, record_hashes, verify_record_files
 from athena.execution.dependencies import resolve_dependency_environment
 from athena.affordances.models import DependencyRequirement
 from athena.protocol.execution import ExecutionRequest
@@ -384,10 +384,27 @@ class DependencyCapability:
             )
         if manager.name == "python":
             executable = sys.executable if backend in _HOST_INTERPRETER_BACKENDS else "python3"
+            locked_closure = record.get("closure")
+            replay_packages = (
+                locked_closure
+                if isinstance(locked_closure, list) and locked_closure
+                else [record]
+            )
+            package_specs = " ".join(
+                shlex.quote(manager.package_spec(package_name, package_version))
+                for item in replay_packages
+                for package_name, package_version in [
+                    (
+                        str(item.get("name") or (name if item is record else "")),
+                        str(item.get("resolved_version") or ""),
+                    )
+                ]
+                if package_name and package_version
+            )
             source = (
                 f"{shlex.quote(executable)} -m pip install --disable-pip-version-check --no-input --no-deps "
                 f"--upgrade --target {shlex.quote(command_target)} "
-                f"{shlex.quote(manager.package_spec(name, version))}"
+                f"{package_specs}"
             )
         else:
             source = (
@@ -425,6 +442,9 @@ class DependencyCapability:
                 )
                 if expected_hashes and sorted(node_verified["record_hashes"]) != expected_hashes:
                     raise ValueError("npm package metadata hash mismatch")
+                expected_lock_hash = str(record.get("package_lock_sha256") or "")
+                if expected_lock_hash and node_verified.get("package_lock_sha256") != expected_lock_hash:
+                    raise ValueError("npm package-lock.json hash mismatch")
             except (OSError, TypeError, ValueError) as exc:
                 return _result(
                     request,
@@ -532,6 +552,7 @@ def _record_installed_package(
     if not resolved_version:
         raise ValueError(f"could not resolve installed version for {name}")
     hashes = record_hashes(distribution)
+    closure = _python_dependency_closure(target, distribution)
     runtime_identity = _runtime_identity()
     record = {
         "name": name,
@@ -541,6 +562,7 @@ def _record_installed_package(
         "source": "python-index",
         "target": target,
         "record_hashes": hashes,
+        "closure": closure,
         "environment": {
             "python": platform.python_version(),
             "implementation": platform.python_implementation(),
@@ -552,16 +574,63 @@ def _record_installed_package(
         "recorded_at": utcnow().isoformat(),
     }
     record["environment_fingerprint"] = environment_fingerprint(
-        (
+        [
             {
-                "name": name,
-                "resolved_version": resolved_version,
-                "record_hashes": hashes,
-            },
-        ),
+                "name": item["name"],
+                "resolved_version": item["resolved_version"],
+                "record_hashes": item["record_hashes"],
+            }
+            for item in closure
+        ],
         runtime_identity=runtime_identity,
     )
     return record
+
+
+def _python_dependency_closure(target: str, root_distribution: Any) -> list[dict[str, Any]]:
+    """Capture the installed transitive closure, not just the requested root."""
+    distributions = {
+        str(item.metadata.get("Name") or "").replace("-", "_").casefold(): item
+        for item in importlib.metadata.distributions(path=[target])
+        if item.metadata.get("Name")
+    }
+    queue = [root_distribution]
+    visited: set[str] = set()
+    closure: list[dict[str, Any]] = []
+    while queue:
+        distribution = queue.pop(0)
+        name = str(distribution.metadata.get("Name") or "").strip()
+        normalized = name.replace("-", "_").casefold()
+        if not name or normalized in visited:
+            continue
+        visited.add(normalized)
+        if callable(getattr(distribution, "locate_file", None)):
+            verify_record_files(distribution)
+        closure.append(
+            {
+                "name": name,
+                "resolved_version": str(distribution.version or ""),
+                "record_hashes": record_hashes(distribution),
+                "runtime_identity": _runtime_identity(),
+            }
+        )
+        for raw_requirement in getattr(distribution, "requires", None) or ():
+            dependency_name = _requirement_name(raw_requirement)
+            dependency = distributions.get(dependency_name.replace("-", "_").casefold())
+            if dependency is not None:
+                queue.append(dependency)
+    if not closure:
+        raise ValueError("installed dependency closure is empty")
+    return sorted(closure, key=lambda item: str(item["name"]).casefold())
+
+
+def _requirement_name(raw_requirement: str) -> str:
+    try:
+        from packaging.requirements import Requirement
+
+        return Requirement(str(raw_requirement)).name
+    except (ImportError, TypeError, ValueError):
+        return re.split(r"[ <>=!~;\[]", str(raw_requirement), maxsplit=1)[0].strip()
 
 
 def _record_node_package(
@@ -580,7 +649,18 @@ def _record_node_package(
     resolved_version = str(raw.get("version") or "")
     if not resolved_version:
         raise ValueError(f"npm package {name!r} has no resolved version")
-    package_hash = hashlib.sha256(package_json.read_bytes()).hexdigest()
+    package_hash = _sha256_file(package_json)
+    lock_path = Path(target) / "package-lock.json"
+    if not lock_path.is_file():
+        raise ValueError("npm package-lock.json is missing; reproducible replay is refused")
+    lock_hash = _sha256_file(lock_path)
+    lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock_packages = lock_data.get("packages") if isinstance(lock_data, dict) else None
+    if not isinstance(lock_packages, dict):
+        raise ValueError("npm package-lock.json has no package map")
+    identity = lock_packages.get(f"node_modules/{name}") or {}
+    if not isinstance(identity, dict) or str(identity.get("version") or "") != resolved_version:
+        raise ValueError("npm package identity does not match package-lock.json")
     return {
         "name": name,
         "manager": "node",
@@ -589,10 +669,25 @@ def _record_node_package(
         "source": "npm-registry",
         "target": target,
         "record_hashes": [f"package.json:sha256={package_hash}"],
+        "package_lock_sha256": lock_hash,
+        "package_lock_identity": {
+            "name": name,
+            "version": resolved_version,
+            "resolved": identity.get("resolved"),
+            "integrity": identity.get("integrity"),
+        },
         "runtime_identity": "node",
         "owner": {"task_id": task_id, "call_id": call_id},
         "recorded_at": utcnow().isoformat(),
     }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _runtime_identity() -> str:

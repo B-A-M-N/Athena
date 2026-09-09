@@ -162,6 +162,10 @@ class Criterion:
     description: str
     verification: VerificationSpec | None = None
     required: bool = True
+    # A criterion with this flag requires a typed evidence receipt from the
+    # canonical research workflow.  A successful capability invocation alone
+    # is not enough: the workflow must report a ready bundle.
+    evidence_required: bool = False
 
 
 @dataclass(frozen=True)

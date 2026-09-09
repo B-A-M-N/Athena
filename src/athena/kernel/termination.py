@@ -53,6 +53,7 @@ class WorkEvidence:
     mutation_ref: str | None = None
     artifact_ref: str | None = None
     external_receipt: str | None = None
+    research_ready: bool = False
 
 
 _CONTROL_CAPABILITIES = frozenset(
@@ -154,6 +155,10 @@ def result_qualifies_as_work_evidence(
     )
     receipt = metadata.get("external_receipt") or metadata.get("receipt_id")
     external_receipt = str(receipt) if receipt else None
+    research_completion = metadata.get("research_completion")
+    research_ready = bool(
+        isinstance(research_completion, dict) and research_completion.get("ready") is True
+    )
 
     capability_leaf = capability_id.rsplit(".", 1)[-1]
     # Canonical receipt path: the dispatcher has already resolved the exact
@@ -201,6 +206,7 @@ def result_qualifies_as_work_evidence(
         mutation_ref=mutation_ref,
         artifact_ref=artifact_ref,
         external_receipt=external_receipt,
+        research_ready=research_ready,
     )
     if required_kind is not None and required_kind not in {
         kind,
@@ -379,6 +385,13 @@ class TerminationEvaluator:
         #     that prove Athena performed the requested action.
         required_criteria = [c for c in task.acceptance_criteria if c.required]
         unresolved = await self._unresolved_criteria(task)
+        evidence_unresolved = tuple(
+            criterion.id
+            for criterion in required_criteria
+            if criterion.evidence_required
+            and not any(item.research_ready for item in work_evidence)
+        )
+        unresolved = tuple(dict.fromkeys((*unresolved, *evidence_unresolved)))
         if unresolved:
             return TerminationDecision(
                 terminal=True,

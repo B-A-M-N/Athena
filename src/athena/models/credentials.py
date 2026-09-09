@@ -84,7 +84,6 @@ class ProviderCredentialPool:
             slots.append(
                 {
                     "slot": f"slot-{index + 1}",
-                    "credential": slot.label,
                     "state": slot.state,
                     "failures": slot.failures,
                     "retry_at": slot.retry_at.isoformat() if slot.retry_at else None,
@@ -241,16 +240,19 @@ class ProviderCredentialPool:
         slot.last_error = None
         slot.last_success = datetime.now(timezone.utc)
 
-    def reset_authentication(self, label: str | None = None) -> int:
+    async def reset_authentication(self, label: str | None = None) -> int:
         """Operator action to release permanent auth-failure quarantine."""
-        changed = 0
-        for slot in self._slots:
-            if slot.state == "auth_failed" and (label is None or slot.label == str(label)):
-                slot.state = "healthy"
-                slot.retry_at = None
-                slot.last_error = None
-                changed += 1
-        return changed
+        async with self._availability:
+            changed = 0
+            for slot in self._slots:
+                if slot.state == "auth_failed" and (label is None or slot.label == str(label)):
+                    slot.state = "healthy"
+                    slot.retry_at = None
+                    slot.last_error = None
+                    changed += 1
+            if changed:
+                self._availability.notify_all()
+            return changed
 
     def _with_provider(self, info: Any) -> Any:
         try:

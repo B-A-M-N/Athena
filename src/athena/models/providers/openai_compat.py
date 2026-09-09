@@ -258,6 +258,14 @@ class OpenAICompatProvider:
         self._vision = bool(vision)
         self._audio_input = bool(audio_input)
         self._audio_output = bool(audio_output)
+        self.voice_capabilities = frozenset(
+            capability
+            for capability, enabled in (
+                ("transcription", self._audio_input),
+                ("synthesis", self._audio_output),
+            )
+            if enabled
+        )
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             http2=http2,
@@ -283,7 +291,7 @@ class OpenAICompatProvider:
             )
         ]
 
-    def readiness(self) -> dict[str, str | bool]:
+    def readiness(self) -> dict[str, Any]:
         host = (urlsplit(self.base_url).hostname or "").lower()
         local = _is_local_host(host)
         authentication = self._authentication
@@ -304,6 +312,7 @@ class OpenAICompatProvider:
             "kind": "openai-compatible",
             "local": local,
             "authentication": authentication,
+            "voice_capabilities": sorted(self.voice_capabilities),
         }
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:

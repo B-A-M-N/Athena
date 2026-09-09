@@ -550,6 +550,11 @@ class ResearchCapability:
                 "max_queries": {"type": "integer", "minimum": 1, "maximum": 20},
                 "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30},
                 "max_bytes": {"type": "integer", "minimum": 1, "maximum": 10_000_000},
+                "max_research_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50_000_000,
+                },
                 "metadata": {"type": "object", "additionalProperties": True},
             },
             "additionalProperties": False,
@@ -1429,6 +1434,7 @@ class ResearchCapability:
         max_rounds = max(1, min(int(args.get("max_research_rounds") or 1), 3))
         max_sources = max(1, min(int(args.get("max_sources") or 5), 20))
         max_queries = max(1, min(int(args.get("max_queries") or 10), 20))
+        max_bytes = max(1, min(int(args.get("max_research_bytes") or 20_000_000), 50_000_000))
         queries = _strings(args.get("queries"), limit=max_queries)
         for requirement in requirements:
             queries.extend(_strings(requirement.get("queries"), limit=5))
@@ -1441,12 +1447,30 @@ class ResearchCapability:
         seen_uris: set[str] = set()
         discovered = 0
         fetched = 0
+        bytes_fetched = 0
         rounds_run = 0
+        attempted_queries: set[str] = set()
         for round_number in range(max_rounds):
-            if fetched >= max_sources:
+            if fetched >= max_sources or bytes_fetched >= max_bytes:
                 break
             rounds_run += 1
-            for query in queries:
+            round_queries = [query for query in queries if query not in attempted_queries]
+            if not round_queries:
+                # Adapt from the durable gap state instead of replaying the
+                # initial query set. This keeps later rounds gap-driven.
+                gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
+                round_queries = _unique_strings(
+                    [
+                        str(gap.question)
+                        for gap in gaps
+                        if gap.status == "OPEN" and gap.required
+                    ]
+                )[:max_queries]
+                round_queries = [
+                    query for query in round_queries if query not in attempted_queries
+                ]
+            for query in round_queries:
+                attempted_queries.add(query)
                 discovered_result = await self._discover(
                     request,
                     {"query": query, "limit": min(20, max_sources)},
@@ -1461,7 +1485,11 @@ class ResearchCapability:
                     continue
                 discovered += len(candidates)
                 for candidate in candidates:
-                    if fetched >= max_sources or not isinstance(candidate, Mapping):
+                    if (
+                        fetched >= max_sources
+                        or bytes_fetched >= max_bytes
+                        or not isinstance(candidate, Mapping)
+                    ):
                         break
                     uri = str(candidate.get("uri") or "")
                     if not uri or uri in seen_uris or not uri.startswith(("http://", "https://")):
@@ -1473,6 +1501,7 @@ class ResearchCapability:
                             "uri": uri,
                             "title": candidate.get("title"),
                             "source_type": candidate.get("source_type") or "web",
+                            "max_bytes": min(10_000_000, max_bytes - bytes_fetched),
                         },
                         context,
                     )
@@ -1483,11 +1512,9 @@ class ResearchCapability:
                     if isinstance(source, Mapping):
                         captures.append(dict(source))
                         fetched += 1
-            if round_number + 1 < max_rounds and fetched == 0:
-                # A repeated round is only useful when a provider exposes
-                # changing results; do not amplify network work on a static
-                # or unavailable discovery source.
-                break
+                        bytes_fetched += int(
+                            (fetched_result.metadata or {}).get("bytes") or 0
+                        )
         return (
             captures,
             errors,
@@ -1497,6 +1524,9 @@ class ResearchCapability:
                 "discovered": discovered,
                 "fetched": fetched,
                 "max_sources": max_sources,
+                "bytes_fetched": bytes_fetched,
+                "max_research_bytes": max_bytes,
+                "attempted_queries": sorted(attempted_queries),
             },
         )
 
@@ -1682,6 +1712,18 @@ class ResearchCapability:
         ready = bool(bundle.get("ready")) and not (
             capture_errors or search_errors or evidence_errors
         )
+        required_open_gaps = bundle.get("required_open_gaps")
+        if not isinstance(required_open_gaps, (list, tuple)):
+            required_open_gaps = ()
+        unverified_closed_gaps = bundle.get("unverified_closed_gaps")
+        if not isinstance(unverified_closed_gaps, (list, tuple)):
+            unverified_closed_gaps = ()
+        research_completion = {
+            "ready": ready,
+            "required_open_gaps": list(required_open_gaps),
+            "unverified_closed_gaps": list(unverified_closed_gaps),
+            "bundle_ready": bool(bundle.get("ready")),
+        }
         return _result(
             request,
             output=_json(
@@ -1701,6 +1743,7 @@ class ResearchCapability:
                     "ready": ready,
                 }
             ),
+            metadata={"research_completion": research_completion},
         )
 
     async def _verify_evidence(

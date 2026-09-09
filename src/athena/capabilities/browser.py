@@ -132,6 +132,11 @@ class PlaywrightBrowserDriver:
         self._context = context
         self._page = page
         self._network_policy = "allow"
+        # Playwright request interception validates URLs but cannot pin the
+        # browser's socket DNS resolution.  Restricted work therefore stays
+        # fail-closed unless a driver explicitly advertises an Athena-owned
+        # DNS-pinned proxy/broker.
+        self.network_enforcement = "url_validation_only"
         self._console: list[dict[str, Any]] = []
         self._pages: list[Any] = [page]
         page.on(
@@ -299,6 +304,10 @@ class PlaywrightBrowserDriver:
     async def set_network_policy(self, policy: str | object | None) -> None:
         """Validate every Playwright request, including redirects/subresources."""
         requested = str(getattr(policy, "value", policy) or "allow").casefold()
+        if requested == "restricted" and self.network_enforcement != "dns_pinned_proxy":
+            raise RuntimeError(
+                "restricted browser networking requires an Athena-controlled DNS-pinned proxy"
+            )
         rank = {"allow": 0, "restricted": 1, "deny": 2}
         if rank.get(requested, 2) <= rank.get(self._network_policy, 0):
             return
@@ -504,7 +513,9 @@ _BROWSER_DESCRIPTOR = CapabilityDescriptor(
         "element, fill fields, click selectors, read page text. Navigation "
         "is a NETWORK effect (workspace network policy applies); fill and "
         "click are COMPUTER_INPUT governed (ask-by-default). For pages "
-        "with no usable structure, fall back to the computer capability."
+        "with no usable structure, fall back to the computer capability. "
+        "Restricted networking requires a driver backed by an Athena-controlled "
+        "DNS-pinned proxy; URL interception alone is not sufficient."
     ),
     input_schema={
         "type": "object",
@@ -714,6 +725,18 @@ class BrowserCapability:
         policy_name = str(getattr(network_policy, "value", network_policy) or "allow").casefold()
         try:
             driver = await self._driver_for(request)
+            if (
+                policy_name == "restricted"
+                and getattr(driver, "network_enforcement", None) != "dns_pinned_proxy"
+            ):
+                return _result(
+                    request,
+                    ok=False,
+                    error=(
+                        "restricted browser networking is unavailable: the driver must use "
+                        "an Athena-controlled DNS-pinned proxy"
+                    ),
+                )
             if self._driver_policies.get(id(driver)) != policy_name:
                 configure = getattr(driver, "set_network_policy", None)
                 if callable(configure):
@@ -883,13 +906,23 @@ class BrowserCapability:
                 requested_limit,
                 int(artifact_limit) if artifact_limit is not None else _MAX_DOWNLOAD_BYTES,
             )
-            data = await run_blocking(_read_bounded_file, path, max_bytes)
-            ref = await self._artifacts.save(
-                task_id=request.task_id,
-                content=data,
-                mime_type="application/octet-stream",
-                metadata={"filename": raw.get("filename"), "source_url": raw.get("url")},
-            )
+            save_file = getattr(self._artifacts, "save_file", None)
+            if callable(save_file):
+                ref = await save_file(
+                    task_id=request.task_id,
+                    path=path,
+                    max_bytes=max_bytes,
+                    mime_type="application/octet-stream",
+                    metadata={"filename": raw.get("filename"), "source_url": raw.get("url")},
+                )
+            else:
+                data = await run_blocking(_read_bounded_file, path, max_bytes)
+                ref = await self._artifacts.save(
+                    task_id=request.task_id,
+                    content=data,
+                    mime_type="application/octet-stream",
+                    metadata={"filename": raw.get("filename"), "source_url": raw.get("url")},
+                )
             return _result(
                 request,
                 output=json.dumps(

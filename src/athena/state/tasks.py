@@ -227,6 +227,9 @@ class TaskStore:
         backend: str | None = None,
         runtime: str | None = None,
         cwd: str | None = None,
+        released_resources: dict[str, Any] | None = None,
+        checkpoint_id: str | None = None,
+        resume_consequence: str | None = None,
     ) -> None:
         """Persist a fail-closed hint for the next context compilation.
 
@@ -251,6 +254,9 @@ class TaskStore:
             "recovery_route": "execute",
             "replay_command": False,
             "recovery_action": "reestablish_runtime",
+            "released_resources": dict(released_resources or {}),
+            "checkpoint_id": str(checkpoint_id) if checkpoint_id else None,
+            "resume_consequence": resume_consequence,
             "message": (
                 "Runtime state was lost across restart. Do not assume prior "
                 "process variables or session state exist; invoke execute with a fresh "

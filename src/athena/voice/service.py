@@ -242,6 +242,15 @@ class VoiceManager:
             return {"provider": provider_name, "ready": False, "reason": "not_registered"}
         if not callable(getattr(provider, method_name, None)):
             return {"provider": provider_name, "ready": False, "reason": "unsupported"}
+        capability = "transcription" if method_name == "transcribe_audio" else "synthesis"
+        declared = getattr(provider, "voice_capabilities", None)
+        if declared is not None and capability not in declared:
+            return {
+                "provider": provider_name,
+                "ready": False,
+                "reason": "capability_not_declared",
+                "capability": capability,
+            }
         return {"provider": provider_name, "ready": True}
 
     def _validate_audio(self, data: bytes, mime_type: str) -> None:

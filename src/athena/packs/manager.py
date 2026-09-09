@@ -61,6 +61,8 @@ _PROVIDED_FILES = {
     "instruments": (".json",),
     "hooks": (".json", ".toml"),
 }
+_REMOTE_CONTENT_CACHE_LIMIT = 512 * 1024 * 1024
+_REMOTE_CONTENT_CACHE_TTL = 7 * 24 * 60 * 60
 
 _logger = logging.getLogger("athena.packs")
 
@@ -72,6 +74,7 @@ class PackManager:
         self._store = store
         self._root = Path(install_root).resolve()
         self._root.mkdir(parents=True, exist_ok=True)
+        self._content_root = self._root / ".content"
         self._skill_lifecycle = None
         self._workflow_store = None
         self._fabric = None
@@ -266,7 +269,8 @@ class PackManager:
             archive_hash = digest.hexdigest()
             if expected and archive_hash != expected:
                 raise ValueError("remote pack archive hash does not match expected_sha256")
-            content_root = self._root / ".content" / archive_hash
+            self._prune_content_cache()
+            content_root = self._content_root / archive_hash
             if not content_root.exists():
                 extract_root = quarantine / "payload"
                 extract_root.mkdir()
@@ -275,6 +279,9 @@ class PackManager:
                 _validated_source_for_remote(source_root)
                 content_root.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source_root, content_root)
+            else:
+                # A cache hit is live use; refresh its TTL before returning it.
+                os.utime(content_root, None)
             source, manifest, integrity = self._validated_source(str(content_root))
             return {
                 "source_path": str(source),
@@ -286,6 +293,35 @@ class PackManager:
             }
         finally:
             shutil.rmtree(quarantine, ignore_errors=True)
+
+    def _prune_content_cache(self) -> None:
+        """Bound remote approval material so abandoned fetches cannot grow forever."""
+        if not self._content_root.exists():
+            return
+        now = datetime.now(timezone.utc).timestamp()
+        entries: list[tuple[float, int, Path]] = []
+        for entry in self._content_root.iterdir():
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+                size = sum(
+                    item.stat().st_size
+                    for item in entry.rglob("*")
+                    if item.is_file()
+                )
+            except OSError:
+                continue
+            if now - mtime > _REMOTE_CONTENT_CACHE_TTL:
+                shutil.rmtree(entry, ignore_errors=True)
+                continue
+            entries.append((mtime, size, entry))
+        total = sum(size for _mtime, size, _entry in entries)
+        for mtime, size, entry in sorted(entries):
+            if total <= _REMOTE_CONTENT_CACHE_LIMIT:
+                break
+            shutil.rmtree(entry, ignore_errors=True)
+            total -= size
 
     async def install_remote(
         self,
@@ -1370,7 +1406,9 @@ def _directory_integrity(root: Path) -> str:
         relative = path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
         digest.update(b"\0")
     return digest.hexdigest()
 

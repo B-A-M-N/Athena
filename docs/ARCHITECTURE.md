@@ -117,7 +117,8 @@ The effective surface may contain:
 
 The registry is an ergonomic and governed inventory. It is not the boundary
 of Athena's agency: universal execution remains the escape hatch for building
-new deterministic machinery, subject to the same authority wall.
+new deterministic machinery, subject to the same authority wall. It is not a
+promise that every generated or remote runtime has identical host isolation.
 
 ### Reflection
 
@@ -350,7 +351,11 @@ records, excerpt verification, and deterministic `research:plan`,
 `research:run` composes an explicit objective, requirements, selected captures,
 exact evidence excerpts, contradiction checks, and a final readiness bundle.
 These operations only close gaps backed by verified captured evidence.
-Open-ended autonomous acquisition/critique remains future work.
+Autonomous acquisition is bounded by rounds, source count, query count, and a
+research-byte budget. Later rounds derive queries from still-open required
+gaps rather than replaying the initial query set. A task that marks research
+evidence as required remains partial until a typed ready-bundle receipt exists;
+capability invocation alone never proves completion.
 
 Archivist's in-memory planner/critic loop is intentionally not imported. A
 future `research.deep` or `research.verify_claim` workflow may extend the
@@ -537,7 +542,7 @@ complete.
 | GeneratedCapability | **Live for 0.1 support scope**; model-visible task-scoped creation, hashes, dependency locks, proof evolution, candidate retention, project/user rehydration, and explicit promotion/deprecation exist. Native-window and platform-specific sandbox parity remain incomplete. |
 | Declarative nested workflows | **Live for 0.1 support scope**; models, SQLite storage, validation, nested execution, approval/failure handling, replay, and strategy-to-workflow release evidence are covered. Broader workflow authoring ergonomics remain. |
 | Reflection | **Partial**; scoped/ranked capability reflection, workflow/skill search and description, runtime/dependency/permission/device inventories, and availability passports are live; broader resource discovery and fuller dependency-manager coverage are incomplete. |
-| Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, optional local FastEmbed semantic/hybrid retrieval, and deterministic plan/assess/bundle/run operations are live; autonomous acquisition/critique and full completion verification remain incomplete. |
+| Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, optional local FastEmbed semantic/hybrid retrieval, deterministic plan/assess/bundle/run operations, byte-bounded adaptive acquisition, and typed evidence-required completion receipts are live; richer critique and extraction remain incomplete. |
 | Dependency acquisition | **Partial**; a governed Python route records resolved versions, source metadata, file hashes, exact runtime identity, and environment fingerprints, and rejects lock replay on mismatch; manager breadth and full policy coverage remain. |
 | Tiered validation | **Partial**; task admission now records parse/interface/security/format/lint checks, candidate/project/user tiers can require Ruff/Mypy, and exact JSON Schema is compiled; generated-test planning, independent evidence, and optional Semgrep remain incomplete. |
 | Promotion and retention | **Live for 0.1 support scope**; `/candidates`, `/candidate`, `/promote`, and `/deprecate` provide explicit project/user review and lifecycle control with durable proof, history, quality scoring, and garbage collection. Richer review/supersession UX remains. |

@@ -335,16 +335,16 @@ async def _read_voice_audio(
     max_bytes = int(getattr(voice_config, "max_input_bytes", 25 * 1024 * 1024))
     content_type = str(request.headers.get("content-type", "audio/wav"))
     media_type = content_type.split(";", 1)[0].strip().lower()
+    wire_limit = (
+        (max_bytes * 4 + 2) // 3 + 16 * 1024
+        if media_type == "application/json"
+        else max_bytes
+    )
     content_length = request.headers.get("content-length")
     if content_length:
         try:
             # JSON/base64 adds roughly one third over the decoded audio. The
             # post-decode check below remains authoritative.
-            wire_limit = (
-                (max_bytes * 4 + 2) // 3 + 16 * 1024
-                if media_type == "application/json"
-                else max_bytes
-            )
             if int(content_length) > wire_limit:
                 from athena.protocol.errors import VoiceInputError
 
@@ -353,7 +353,13 @@ async def _read_voice_audio(
             pass
     metadata: Mapping[str, Any] = {}
     if media_type == "application/json":
-        body = await request.json()
+        raw_body = await _read_request_bytes(request, wire_limit)
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            from athena.protocol.errors import VoiceInputError
+
+            raise VoiceInputError("voice JSON body is invalid", cause=exc) from exc
         if not isinstance(body, Mapping):
             from athena.protocol.errors import VoiceInputError
 
@@ -373,7 +379,7 @@ async def _read_voice_audio(
         filename = str(body.get("filename") or "voice-input")
         metadata = body
     else:
-        data = await request.body()
+        data = await _read_request_bytes(request, max_bytes)
         mime_type = media_type or "audio/wav"
         filename = str(request.headers.get("x-filename") or "voice-input")
     if len(data) > max_bytes:
@@ -381,6 +387,31 @@ async def _read_voice_audio(
 
         raise VoiceInputError("voice input exceeds the configured size limit")
     return data, mime_type, filename, metadata
+
+
+async def _read_request_bytes(request: Any, limit: int) -> bytes:
+    """Read a request body incrementally with a hard wire-size ceiling."""
+    if limit <= 0:
+        raise ValueError("request body limit must be positive")
+    stream = getattr(request, "stream", None)
+    if callable(stream):
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in stream():
+            data = bytes(chunk)
+            size += len(data)
+            if size > limit:
+                from athena.protocol.errors import VoiceInputError
+
+                raise VoiceInputError("voice input exceeds the configured size limit")
+            chunks.append(data)
+        return b"".join(chunks)
+    body = await request.body()
+    if len(body) > limit:
+        from athena.protocol.errors import VoiceInputError
+
+        raise VoiceInputError("voice input exceeds the configured size limit")
+    return body
 
 
 async def _voice_audio_response(service: Any, synthesis: Any) -> Any:

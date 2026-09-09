@@ -696,13 +696,34 @@ class CapabilityReflection:
             )
             preconditions.append("workspace network policy must allow this operation")
         elif needs_network:
+            browser_restricted_unavailable = (
+                capability_id == "browser" and network_policy == "restricted"
+            )
             checks.append(
                 {
                     "kind": "network",
-                    "status": "restricted" if network_policy == "restricted" else "available",
+                    "status": (
+                        "unavailable"
+                        if browser_restricted_unavailable
+                        else ("restricted" if network_policy == "restricted" else "available")
+                    ),
                     "policy": network_policy or "unknown",
+                    **(
+                        {
+                            "detail": (
+                                "browser restricted networking requires an Athena-controlled "
+                                "DNS-pinned proxy"
+                            )
+                        }
+                        if browser_restricted_unavailable
+                        else {}
+                    ),
                 }
             )
+            if browser_restricted_unavailable:
+                preconditions.append(
+                    "browser driver must advertise Athena-controlled DNS-pinned proxy enforcement"
+                )
 
         task_policy = getattr(context, "capability_policy", None)
         policy_status = "allowed"

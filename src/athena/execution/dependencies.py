@@ -76,6 +76,8 @@ def resolve_dependency_environment(
         raise DependencyEnvironmentError("dependency lock has no package map")
 
     verified: list[Mapping[str, Any]] = []
+    verified_names: set[str] = set()
+    runtime_identity = _python_runtime_identity()
     for requirement in requirements:
         if requirement.manager != "python":
             raise DependencyEnvironmentError(
@@ -92,46 +94,66 @@ def resolve_dependency_environment(
                 f"dependency {requirement.name!r} version mismatch: "
                 f"required {requirement.version}, locked {resolved_version}"
             )
-        distribution = _find_distribution(target, requirement.name)
-        if distribution is None:
-            raise DependencyEnvironmentError(
-                f"locked dependency {requirement.name!r} is not installed"
-            )
-        installed_version = str(distribution.version or "")
-        if installed_version != resolved_version:
-            raise DependencyEnvironmentError(
-                f"dependency {requirement.name!r} changed from locked version "
-                f"{resolved_version} to {installed_version}"
-            )
-        hashes = record_hashes(distribution)
-        verify_record_files(distribution)
-        expected_runtime = record.get("runtime_identity")
-        runtime_identity = _python_runtime_identity()
-        if expected_runtime and expected_runtime != runtime_identity:
-            raise DependencyEnvironmentError(
-                f"dependency {requirement.name!r} runtime identity changed"
-            )
-        expected_hashes = sorted(str(item) for item in record.get("record_hashes") or ())
-        if expected_hashes and hashes != expected_hashes:
-            raise DependencyEnvironmentError(
-                f"dependency {requirement.name!r} RECORD hash mismatch"
-            )
-        package = {
-            "name": requirement.name,
-            "resolved_version": installed_version,
-            "record_hashes": hashes,
-        }
-        package_fingerprint = environment_fingerprint(
-            (package,), runtime_identity=runtime_identity if expected_runtime else None
-        )
+        closure = record.get("closure")
+        locked_packages = closure if isinstance(closure, list) else [record]
+        for locked in locked_packages:
+            if not isinstance(locked, Mapping):
+                raise DependencyEnvironmentError("dependency lock contains an invalid closure entry")
+            package_name = str(locked.get("name") or "")
+            normalized_name = _normalize(package_name)
+            if not package_name or normalized_name in verified_names:
+                continue
+            distribution = _find_distribution(target, package_name)
+            if distribution is None:
+                raise DependencyEnvironmentError(
+                    f"locked dependency {package_name!r} is not installed"
+                )
+            installed_version = str(distribution.version or "")
+            locked_version = str(locked.get("resolved_version") or "")
+            if installed_version != locked_version:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} changed from locked version "
+                    f"{locked_version} to {installed_version}"
+                )
+            hashes = record_hashes(distribution)
+            verify_record_files(distribution)
+            expected_runtime = locked.get("runtime_identity") or record.get("runtime_identity")
+            if expected_runtime and expected_runtime != runtime_identity:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} runtime identity changed"
+                )
+            expected_hashes = sorted(str(item) for item in locked.get("record_hashes") or ())
+            if expected_hashes and hashes != expected_hashes:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} RECORD hash mismatch"
+                )
+            package = {
+                "name": package_name,
+                "resolved_version": installed_version,
+                "record_hashes": hashes,
+            }
+            verified_names.add(normalized_name)
+            verified.append(package)
         expected_package_fingerprint = record.get("environment_fingerprint")
-        if expected_package_fingerprint and expected_package_fingerprint != package_fingerprint:
-            raise DependencyEnvironmentError(
-                f"dependency {requirement.name!r} environment fingerprint mismatch"
+        if expected_package_fingerprint:
+            closure_packages = [
+                {
+                    "name": str(item.get("name") or ""),
+                    "resolved_version": str(item.get("resolved_version") or ""),
+                    "record_hashes": sorted(str(value) for value in item.get("record_hashes") or ()),
+                }
+                for item in locked_packages
+                if isinstance(item, Mapping)
+            ]
+            package_fingerprint = environment_fingerprint(
+                closure_packages,
+                runtime_identity=runtime_identity,
             )
-        verified.append(package)
+            if expected_package_fingerprint != package_fingerprint:
+                raise DependencyEnvironmentError(
+                    f"dependency {requirement.name!r} environment fingerprint mismatch"
+                )
 
-    runtime_identity = _python_runtime_identity()
     fingerprint = environment_fingerprint(
         verified,
         runtime_identity=runtime_identity

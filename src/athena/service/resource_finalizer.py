@@ -167,6 +167,7 @@ class TaskResourceFinalizer:
             outcome["resume_consequence"] = (
                 "task-owned runtimes were released; resume must reconstruct them from the checkpoint"
             )
+        await self._persist_parked_recovery_hint(task_id, outcome)
         await self._emit("TaskResourceReleasedWhileParked", task_id, outcome)
         return outcome
 
@@ -200,6 +201,7 @@ class TaskResourceFinalizer:
                     "retained": False,
                 }
             )
+            await self._persist_parked_recovery_hint(task_id, outcome)
             await self._emit("TaskResourceReleasedWhileParked", task_id, outcome)
         except asyncio.CancelledError:
             raise
@@ -212,6 +214,42 @@ class TaskResourceFinalizer:
 
     def bind_checkpoint_manager(self, manager: Any) -> None:
         self._checkpoint_manager = manager
+
+    async def _persist_parked_recovery_hint(
+        self, task_id: str, outcome: dict[str, Any]
+    ) -> None:
+        """Make resource release part of the durable resume contract."""
+        if not outcome.get("released"):
+            return
+        service = getattr(self, "_service", None)
+        task_store = getattr(service, "_store_tasks", None)
+        persist = getattr(task_store, "persist_runtime_recovery_hint", None)
+        if not callable(persist):
+            return
+        released: dict[str, Any] = {}
+        for name, evidence in (outcome.get("resources") or {}).items():
+            if not isinstance(evidence, dict) or not evidence.get("confirmed"):
+                continue
+            released[str(name)] = {
+                "resource_ids": list(evidence.get("resource_ids") or ()),
+                "closed_ids": list(evidence.get("closed_ids") or ()),
+            }
+        checkpoint = outcome.get("checkpoint")
+        checkpoint_id = checkpoint.get("id") if isinstance(checkpoint, dict) else None
+        consequence = outcome.get("resume_consequence")
+        try:
+            await persist(
+                task_id,
+                runtime_session_id=f"parked-release:{task_id}",
+                backend="task-resource-finalizer",
+                runtime="released",
+                released_resources=released,
+                checkpoint_id=checkpoint_id,
+                resume_consequence=consequence,
+            )
+        except Exception as exc:  # release already happened; retain evidence in event
+            self._durability_error = str(exc)
+            _logger.error("parked recovery hint for %s could not be persisted: %s", task_id, exc)
 
     async def _checkpoint_parked_task(self, task_id: str) -> dict[str, Any] | None:
         manager = self._checkpoint_manager
