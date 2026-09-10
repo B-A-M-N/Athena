@@ -25,7 +25,10 @@ class PackStore:
                 state.id,
                 state.manifest.version,
                 json.dumps(
-                    state.manifest.to_record(computed_integrity=state.source_integrity),
+                    {
+                        **state.manifest.to_record(computed_integrity=state.source_integrity),
+                        "provenance": dict(state.provenance),
+                    },
                     sort_keys=True,
                 ),
                 state.install_path,
@@ -54,6 +57,7 @@ class PackStore:
             installed_at=state.installed_at,
             source_integrity=state.source_integrity,
             health=state.health,
+            provenance=state.provenance,
         )
         await self.save(updated)
         return updated
@@ -118,6 +122,7 @@ def _from_row(row: Mapping[str, Any]) -> PackState:
         installed_at=str(row.get("installed_at") or ""),
         source_integrity=str(row.get("source_integrity") or ""),
         health="unknown",
+        provenance=dict(manifest_data.get("provenance") or {}),
     )
 
 

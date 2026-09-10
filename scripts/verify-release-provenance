@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+input="${1:-}"
+signature="${2:-}"
+[[ -f "$input" && -s "$signature" ]] || { printf '%s\n' 'verify-release-provenance: usage: verify-release-provenance PROVENANCE.json SIGNATURE' >&2; exit 2; }
+command -v cosign >/dev/null 2>&1 || { printf '%s\n' 'verify-release-provenance: FAIL — cosign is required' >&2; exit 1; }
+if [[ -n "${COSIGN_PUBLIC_KEY:-}" ]]; then
+  cosign verify-blob --key "$COSIGN_PUBLIC_KEY" --signature "$signature" "$input"
+else
+  [[ -n "${COSIGN_CERTIFICATE_IDENTITY:-}" && -n "${COSIGN_CERTIFICATE_OIDC_ISSUER:-}" ]] || {
+    printf '%s\n' 'verify-release-provenance: FAIL — keyless verification requires certificate identity and OIDC issuer' >&2
+    exit 1
+  }
+  cosign verify-blob \
+    --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+    --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+    --signature "$signature" "$input"
+fi
+printf '%s\n' 'verify-release-provenance: PASS'

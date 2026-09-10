@@ -47,7 +47,9 @@ class BackendCapabilities:
     persistent_runtime_state: bool = False
     reattach: bool = False
     filesystem_persistence: bool = False
+    filesystem_containment: bool = False
     network_modes: tuple[str, ...] = ()
+    network_containment: bool = False
     secret_materialization: bool = False
     interactive_stdin: bool = False
     process_signals: bool = False

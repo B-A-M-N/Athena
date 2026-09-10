@@ -13,6 +13,40 @@ _VERIFY = runpy.run_path(str(_REPO / "scripts" / "verify-release-evidence"))
 
 def _write_supporting_evidence(evidence: Path, sha: str, run_id: str) -> None:
     record = {"commit_sha": sha, "release_run_id": run_id, "exit_code": 0}
+    (evidence / "backend-passport.json").write_text(
+        json.dumps(
+            {
+                "kind": "athena_backend_passport",
+                "schema_version": 1,
+                "backend": "local-supervised",
+                "release_sha": sha,
+                "release_run_id": run_id,
+                "status": "PASS",
+                "cells": [
+                    {
+                        "backend": "local-supervised",
+                        "runtime": "python",
+                        "passed": True,
+                        "unverified_claims": [],
+                    }
+                ],
+            }
+        )
+    )
+    (evidence / "support-matrix.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "generated_by": "scripts/generate-support-matrix",
+                "release_binding": {"source_sha": sha, "release_run_id": run_id},
+                "generated_from": {
+                    "release_sha": sha,
+                    "release_run_id": run_id,
+                    "behavioral_evidence": {"backend_passport": {"status": "PASS"}},
+                },
+            }
+        )
+    )
     (evidence / "optional-integrations.json").write_text(
         json.dumps(
             {
@@ -70,6 +104,33 @@ def _attach_sbom(evidence: Path, manifest: dict, sha: str) -> None:
     }
 
 
+def _attach_provenance(evidence: Path, sha: str, run_id: str) -> None:
+    manifest_path = evidence / "release-manifest.json"
+    artifacts = []
+    for artifact in sorted((evidence / "distributions").iterdir()):
+        if artifact.is_file():
+            artifacts.append(
+                {
+                    "path": f"distributions/{artifact.name}",
+                    "sha256": _VERIFY["sha256"](artifact),
+                    "size": artifact.stat().st_size,
+                }
+            )
+    (evidence / "release-provenance.json").write_text(
+        json.dumps(
+            {
+                "kind": "athena_release_provenance",
+                "schema_version": 1,
+                "source_sha": sha,
+                "release_run_id": run_id,
+                "manifest_sha256": _VERIFY["sha256"](manifest_path),
+                "artifacts": artifacts,
+            }
+        )
+    )
+    (evidence / "release-provenance.sig").write_bytes(b"fixture-signature")
+
+
 def test_verify_release_evidence_accepts_frozen_manifest(tmp_path: Path) -> None:
     sha = "a" * 40
     run_id = "run-1"
@@ -111,6 +172,7 @@ def test_verify_release_evidence_accepts_frozen_manifest(tmp_path: Path) -> None
         )
     )
     _write_supporting_evidence(evidence, sha, run_id)
+    _attach_provenance(evidence, sha, run_id)
 
     assert (
         _VERIFY["main"](
@@ -209,6 +271,7 @@ def test_verify_release_evidence_rejects_unexpected_distribution(tmp_path: Path)
         )
     )
     _write_supporting_evidence(evidence, sha, run_id)
+    _attach_provenance(evidence, sha, run_id)
     assert _VERIFY["main"](["--evidence-dir", str(evidence), "--sha", sha, "--tag", "v0.1.0"])
 
 
@@ -252,6 +315,7 @@ def test_verify_release_evidence_selects_commit_run_transaction(tmp_path: Path) 
         )
     )
     _write_supporting_evidence(evidence, sha, run_id)
+    _attach_provenance(evidence, sha, run_id)
 
     assert (
         _VERIFY["main"](

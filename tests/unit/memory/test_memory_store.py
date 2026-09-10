@@ -157,6 +157,80 @@ async def test_recall_and_search_filter_by_tags_and_scope(store):
     assert {r.id for r in via_search} == {"mem_sem_1"}
 
 
+async def test_normal_retrieval_excludes_inactive_conflicted_and_superseded_records(store):
+    now = utcnow()
+    records = [
+        MemoryRecord(
+            id="mem-current-policy",
+            kind=MemoryKind.SEMANTIC,
+            scope=MemoryScope.PROJECT,
+            content="current release policy uses signed receipts",
+            metadata={"scope_id": "retrieval-current"},
+        ),
+        MemoryRecord(
+            id="mem-expired-policy",
+            kind=MemoryKind.SEMANTIC,
+            scope=MemoryScope.PROJECT,
+            content="expired release policy uses unsigned receipts",
+            valid_until=now - timedelta(minutes=1),
+            metadata={"scope_id": "retrieval-expired"},
+        ),
+        MemoryRecord(
+            id="mem-future-policy",
+            kind=MemoryKind.SEMANTIC,
+            scope=MemoryScope.PROJECT,
+            content="future release policy uses experimental receipts",
+            valid_from=now + timedelta(minutes=1),
+            metadata={"scope_id": "retrieval-future"},
+        ),
+        MemoryRecord(
+            id="mem-conflicted-policy",
+            kind=MemoryKind.SEMANTIC,
+            scope=MemoryScope.PROJECT,
+            content="conflicted release policy uses unsigned receipts",
+            contradicted_by=("mem-current-policy",),
+            metadata={"scope_id": "retrieval-conflicted"},
+        ),
+        MemoryRecord(
+            id="mem-old-policy",
+            kind=MemoryKind.SEMANTIC,
+            scope=MemoryScope.PROJECT,
+            content="superseded release policy uses unsigned receipts",
+            metadata={"scope_id": "retrieval-old"},
+        ),
+        MemoryRecord(
+            id="mem-new-policy",
+            kind=MemoryKind.SEMANTIC,
+            scope=MemoryScope.PROJECT,
+            content="successor release policy uses signed receipts",
+            supersedes=("mem-old-policy",),
+            metadata={"scope_id": "retrieval-new"},
+        ),
+    ]
+    for record in records:
+        await store.save(record)
+
+    current = await store.search("release policy receipts", scope=MemoryScope.PROJECT, limit=20)
+    assert {record.id for record in current} == {"mem-current-policy", "mem-new-policy"}
+
+    history = await store.search(
+        "release policy receipts",
+        scope=MemoryScope.PROJECT,
+        mode=RetrievalMode.HISTORY,
+        limit=20,
+    )
+    assert {record.id for record in history} == {record.id for record in records}
+
+    explicit = await store.search(
+        "release policy receipts",
+        scope=MemoryScope.PROJECT,
+        limit=20,
+        include_inactive=True,
+        include_conflicts=True,
+    )
+    assert {record.id for record in explicit} == {record.id for record in records}
+
+
 class _EmbeddingProvider:
     model = "test-embedding"
     version = "v1"
@@ -342,6 +416,7 @@ async def test_promoted_candidate_preserves_canonical_metadata_and_scope_retriev
             "concise release notes",
             scope=MemoryScope.USER,
             scope_id="principal-1",
+            include_conflicts=True,
         )
     ] == [pending.id]
 

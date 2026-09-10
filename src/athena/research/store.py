@@ -212,7 +212,7 @@ class ResearchStore:
                 source.artifact_uri,
                 source.task_id,
                 source.project_id,
-                json.dumps(dict(source.metadata), sort_keys=True),
+                json.dumps(source.to_record()["metadata"], sort_keys=True),
             ),
         )
         self._generation += 1
@@ -299,7 +299,7 @@ class ResearchStore:
                 evidence.confidence,
                 evidence.task_id,
                 evidence.created_at,
-                json.dumps(dict(evidence.metadata), sort_keys=True),
+                json.dumps(evidence.to_record()["metadata"], sort_keys=True),
             ),
         )
         for related_id in evidence.corroborates:

@@ -3,6 +3,38 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+desktop_receipt="${ATHENA_NATIVE_DESKTOP_RECEIPT:-native-desktop-acceptance.json}"
+
+write_desktop_receipt() {
+  local header_strategy="$1"
+  ATHENA_DESKTOP_RECEIPT="$desktop_receipt" \
+    ATHENA_DESKTOP_STRATEGY="$window_strategy" \
+    ATHENA_DESKTOP_HEADER_STRATEGY="$header_strategy" \
+    ATHENA_DESKTOP_WM="${wm_name:-unknown}" \
+    ATHENA_DESKTOP_SUPPORTING_WM="${wm_supporting_window:-unknown}" \
+    ATHENA_DESKTOP_RELEASE_SHA="${ATHENA_RELEASE_SHA:-}" \
+    ATHENA_DESKTOP_RELEASE_RUN_ID="${ATHENA_RELEASE_RUN_ID:-}" \
+    python3 -c '
+import json, os
+record = {
+    "kind": "athena_native_desktop_receipt",
+    "status": "PASS",
+    "display": os.environ.get("DISPLAY"),
+    "session_type": os.environ.get("XDG_SESSION_TYPE", "unknown"),
+    "window_strategy": os.environ.get("ATHENA_DESKTOP_STRATEGY"),
+    "header_strategy": os.environ.get("ATHENA_DESKTOP_HEADER_STRATEGY"),
+    "wm": os.environ.get("ATHENA_DESKTOP_WM", "unknown"),
+    "supporting_wm_check": os.environ.get("ATHENA_DESKTOP_SUPPORTING_WM", "unknown"),
+}
+if os.environ.get("ATHENA_DESKTOP_RELEASE_SHA"):
+    record["source_sha"] = os.environ["ATHENA_DESKTOP_RELEASE_SHA"]
+if os.environ.get("ATHENA_DESKTOP_RELEASE_RUN_ID"):
+    record["release_run_id"] = os.environ["ATHENA_DESKTOP_RELEASE_RUN_ID"]
+with open(os.environ["ATHENA_DESKTOP_RECEIPT"], "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+'
+}
 
 [[ -n "${DISPLAY:-}" ]] || {
   printf '%s\n' 'native-desktop-acceptance: FAIL — DISPLAY is required for real desktop acceptance' >&2
@@ -14,6 +46,10 @@ for command in xdotool import identify compare python3 xclip xmessage xprop rg; 
     exit 1
   }
 done
+python3 -c 'import Xlib' >/dev/null 2>&1 || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — python3-xlib is required for EWMH state normalization' >&2
+  exit 1
+}
 
 cargo build --release --manifest-path native/Cargo.toml --locked --offline >/dev/null
 native_bin="$repo_root/native/target/release/athena-terminal"
@@ -49,23 +85,6 @@ fi
 printf 'native-desktop-acceptance: INFO — strategy=%s DISPLAY=%s XDG_SESSION_TYPE=%s WM=%s %s\n' \
   "$window_strategy" "$DISPLAY" "${XDG_SESSION_TYPE:-unknown}" \
   "${wm_supporting_window:-unknown}" "${wm_name:-unknown}" >&2
-read -r brightness_x brightness_y focus_x focus_y crt_x crt_y header_x header_y prompt_x prompt_y < <(
-  LAYOUT_JSON="$layout_json" python3 -c '
-import json, os
-layout = json.loads(os.environ["LAYOUT_JSON"])
-rail = layout["rail"]
-def center(name):
-    rect = rail[name]
-    return round(rect["x"] + rect["width"] / 2), round(rect["y"] + rect["height"] / 2)
-header = layout["header"]
-print(*center("brightness"), *center("focus"), *center("power"),
-      round(header["x"] + header["width"] / 2),
-      round(header["y"] + header["height"] / 2),
-      round(layout["prompt"]["x"] + layout["prompt"]["width"] / 2),
-      round(layout["prompt"]["y"] + layout["prompt"]["height"] / 2))
-'
-)
-
 ATHENA_NATIVE_LAYOUT_DUMP="$resize_dump" \
   "$native_bin" --no-animations --command \
   "IFS= read -r line; printf '%s' \"\$line\" > $(printf '%q' "$clipboard_capture"); sleep 30" \
@@ -123,6 +142,36 @@ focus_window() {
   return 1
 }
 
+clear_maximize_state() {
+  ATHENA_WINDOW_ID="$1" python3 -c '
+import os
+from Xlib import X, display, protocol
+
+display_conn = display.Display()
+root = display_conn.screen().root
+window = display_conn.create_resource_object("window", int(os.environ["ATHENA_WINDOW_ID"]))
+state = display_conn.intern_atom("_NET_WM_STATE")
+vertical = display_conn.intern_atom("_NET_WM_STATE_MAXIMIZED_VERT")
+horizontal = display_conn.intern_atom("_NET_WM_STATE_MAXIMIZED_HORZ")
+message = protocol.event.ClientMessage(
+    window=window,
+    client_type=state,
+    data=(32, [0, vertical, horizontal, 1, 0]),
+)
+root.send_event(message, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
+display_conn.sync()
+'
+}
+
+window_geometry() {
+  local geometry
+  geometry="$(xdotool getwindowgeometry --shell "$window")"
+  window_x="$(awk -F= '$1 == "X" {print $2}' <<< "$geometry")"
+  window_y="$(awk -F= '$1 == "Y" {print $2}' <<< "$geometry")"
+  window_width="$(awk -F= '$1 == "WIDTH" {print $2}' <<< "$geometry")"
+  window_height="$(awk -F= '$1 == "HEIGHT" {print $2}' <<< "$geometry")"
+}
+
 window=""
 for _ in $(seq 1 100); do
   window="$(find_window_for_pid || true)"
@@ -133,23 +182,32 @@ done
   printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window did not appear' >&2
   exit 1
 }
-focus_window "$window" || {
-  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window could not be focused' >&2
-  exit 1
-}
+clear_maximize_state "$window"
 sleep 0.3
+sleep 0.3
+window_geometry
+# The WM may choose a different live size than the deterministic 1280x800
+# layout probe. Hit-test coordinates must be derived from the actual surface.
+layout_json="$($native_bin --dump-layout --dump-layout-size "${window_width}x${window_height}")"
+read -r brightness_x brightness_y focus_x focus_y crt_x crt_y header_x header_y prompt_x prompt_y < <(
+  LAYOUT_JSON="$layout_json" python3 -c '
+import json, os
+layout = json.loads(os.environ["LAYOUT_JSON"])
+rail = layout["rail"]
+def center(name):
+    rect = rail[name]
+    return round(rect["x"] + rect["width"] / 2), round(rect["y"] + rect["height"] / 2)
+header = layout["header"]
+print(*center("brightness"), *center("focus"), *center("power"),
+      round(header["x"] + header["width"] / 2),
+      round(header["y"] + header["height"] / 2),
+      round(layout["prompt"]["x"] + layout["prompt"]["width"] / 2),
+      round(layout["prompt"]["y"] + layout["prompt"]["height"] / 2))
+'
+)
 import -window "$window" "$before"
 xdotool mousemove --window "$window" "$prompt_x" "$prompt_y"
 xdotool click --window "$window" 1
-
-window_geometry() {
-  local geometry
-  geometry="$(xdotool getwindowgeometry --shell "$window")"
-  window_x="$(awk -F= '$1 == "X" {print $2}' <<< "$geometry")"
-  window_y="$(awk -F= '$1 == "Y" {print $2}' <<< "$geometry")"
-  window_width="$(awk -F= '$1 == "WIDTH" {print $2}' <<< "$geometry")"
-  window_height="$(awk -F= '$1 == "HEIGHT" {print $2}' <<< "$geometry")"
-}
 
 # Clipboard is a real X11 selection round-trip, not only a key-event smoke
 # test. The native editor must deliver the selected text to its PTY child.
@@ -178,6 +236,8 @@ done
 window_geometry
 original_x="$window_x"
 original_y="$window_y"
+original_width="$window_width"
+original_height="$window_height"
 header_drag_verified=0
 if [[ "$window_strategy" == "ewmh" ]]; then
   printf '%s\n' 'native-desktop-acceptance: INFO — WM advertises EWMH; exercising adaptive confirmation/fallback' >&2
@@ -194,7 +254,8 @@ xdotool mousemove_relative -- 48 32
 xdotool mouseup --window "$window" 1
 sleep 0.2
 window_geometry
-if [[ "$window_x" == "$original_x" && "$window_y" == "$original_y" ]]; then
+if [[ "$window_x" == "$original_x" && "$window_y" == "$original_y" \
+  && "$window_width" == "$original_width" && "$window_height" == "$original_height" ]]; then
   printf '%s\n' 'native-desktop-acceptance: FAIL — adaptive header move did not change geometry' >&2
   exit 1
 else
@@ -203,6 +264,33 @@ else
 fi
 xdotool windowmove --sync "$window" "$original_x" "$original_y"
 sleep 0.1
+
+# Header EWMH moves may snap the surface to the desktop bounds. Restore a
+# manageable client geometry before testing controls and edge resizes, then
+# refresh every hit-test coordinate against that live geometry.
+clear_maximize_state "$window"
+sleep 0.3
+window_geometry
+layout_json="$($native_bin --dump-layout --dump-layout-size "${window_width}x${window_height}")"
+read -r brightness_x brightness_y focus_x focus_y crt_x crt_y header_x header_y prompt_x prompt_y < <(
+  LAYOUT_JSON="$layout_json" python3 -c '
+import json, os
+layout = json.loads(os.environ["LAYOUT_JSON"])
+rail = layout["rail"]
+def center(name):
+    rect = rail[name]
+    return round(rect["x"] + rect["width"] / 2), round(rect["y"] + rect["height"] / 2)
+header = layout["header"]
+print(*center("brightness"), *center("focus"), *center("power"),
+      round(header["x"] + header["width"] / 2),
+      round(header["y"] + header["height"] / 2),
+      round(layout["prompt"]["x"] + layout["prompt"]["width"] / 2),
+      round(layout["prompt"]["y"] + layout["prompt"]["height"] / 2))
+'
+)
+capture_width="$window_width"
+capture_height="$window_height"
+import -window "$window" "$before"
 
 # A managed borderless window must remain movable even when the host desktop
 # does not accept synthetic _NET_WM_MOVERESIZE gestures (some remote X11 WMs
@@ -238,7 +326,7 @@ sleep 0.15
 import -window "$window" "$crt"
 
 for capture in "$brightness" "$focus" "$crt"; do
-  [[ "$(identify -format '%wx%h' "$capture")" == '1280x800' ]] || {
+  [[ "$(identify -format '%wx%h' "$capture")" == "${capture_width}x${capture_height}" ]] || {
     printf 'native-desktop-acceptance: FAIL — unexpected capture dimensions for %s\n' "$capture" >&2
     exit 1
   }
@@ -304,20 +392,30 @@ focus_return_rmse="$(compare -metric RMSE "$focus_lost" "$focus_return" null: 2>
 # sign is asserted rather than an exact pixel delta because WMs may apply
 # resize increments or minimum-size hints.
 for resize_case in \
-  'top-left 2 2 - -' \
-  'top 640 2 0 -' \
-  'top-right 1278 2 1 -' \
-  'right 1278 400 1 0' \
-  'bottom-right 1278 798 1 1' \
-  'bottom 640 798 0 1' \
-  'bottom-left 2 798 - 1' \
-  'left 2 400 - 0'; do
-  read -r resize_name resize_x resize_y width_sign height_sign <<< "$resize_case"
-  xdotool windowsize --sync "$window" 1280 800
+  'top-left - -' \
+  'top 0 -' \
+  'top-right 1 -' \
+  'right 1 0' \
+  'bottom-right 1 1' \
+  'bottom 0 1' \
+  'bottom-left - 1' \
+  'left - 0'; do
+  read -r resize_name width_sign height_sign <<< "$resize_case"
+  xdotool windowsize --sync "$window" "$capture_width" "$capture_height"
   sleep 0.1
   window_geometry
   resize_before_width="$window_width"
   resize_before_height="$window_height"
+  case "$resize_name" in
+    top-left) resize_x=2; resize_y=2 ;;
+    top) resize_x=$((window_width / 2)); resize_y=2 ;;
+    top-right) resize_x=$((window_width - 2)); resize_y=2 ;;
+    right) resize_x=$((window_width - 2)); resize_y=$((window_height / 2)) ;;
+    bottom-right) resize_x=$((window_width - 2)); resize_y=$((window_height - 2)) ;;
+    bottom) resize_x=$((window_width / 2)); resize_y=$((window_height - 2)) ;;
+    bottom-left) resize_x=2; resize_y=$((window_height - 2)) ;;
+    left) resize_x=2; resize_y=$((window_height / 2)) ;;
+  esac
   xdotool mousemove --window "$window" "$resize_x" "$resize_y"
   xdotool mousedown --window "$window" 1
   sleep 0.1
@@ -345,7 +443,7 @@ done
 # Unmap/remap exercises the supported managed-window lifecycle without losing
 # the native process or the PTY child. EWMH minimize is WM policy, so it is
 # deliberately not treated as an Athena product invariant.
-xdotool windowsize --sync "$window" 1280 800
+xdotool windowsize --sync "$window" "$capture_width" "$capture_height"
 xdotool windowunmap "$window"
 sleep 0.25
 if xdotool search --onlyvisible --name 'ATHENA' 2>/dev/null | rg -q "$window"; then
@@ -364,7 +462,7 @@ xdotool search --onlyvisible --name 'ATHENA' 2>/dev/null | rg -q "$window" || {
 }
 
 # Exercise live ConfigureNotify handling at several real window sizes.
-for size in 1280x800 1170x659 1920x1080; do
+for size in "${capture_width}x${capture_height}" 1170x659 1920x1080; do
   IFS=x read -r resize_width resize_height <<< "$size"
   xdotool windowsize --sync "$window" "$resize_width" "$resize_height"
   sleep 0.2
@@ -377,8 +475,10 @@ for _ in $(seq 1 100); do
 if ! kill -0 "$native_pid" 2>/dev/null; then
     wait "$native_pid"
     if [[ "$header_drag_verified" == "1" ]]; then
+      write_desktop_receipt "ewmh-confirmed-or-client-fallback"
       printf '%s\n' 'native-desktop-acceptance: PASS — live X11 controls, clipboard, focus, header moveresize, eight-way resize, unmap/remap, CRT, and close'
     else
+      write_desktop_receipt "client-managed-fallback"
       printf '%s\n' 'native-desktop-acceptance: PASS — live X11 controls, clipboard, focus, generic window move, unmap/remap, CRT, and close (desktop fallback; not release evidence)'
     fi
     exit 0

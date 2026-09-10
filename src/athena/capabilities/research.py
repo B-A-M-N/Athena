@@ -29,7 +29,13 @@ from athena.protocol.capabilities import (
     EffectClass,
     ResourceClass,
 )
-from athena.research.models import EvidenceBundle, EvidenceObject, ResearchGap, SourceRecord
+from athena.research.models import (
+    EvidenceBundle,
+    EvidenceObject,
+    ResearchGap,
+    SourceRecord,
+    classify_evidence_quality,
+)
 from athena.research.discovery import (
     BraveSearchProvider,
     HttpDiscoveryProvider,
@@ -43,6 +49,7 @@ from athena.research.policy import (
     canonicalize_uri,
     classify_source,
 )
+from athena.research.verification import verify_evidence
 
 _SOURCE_TYPES = ("web", "paper", "documentation", "dataset", "code", "local")
 _EVIDENCE_TYPES = ("quote", "measurement", "observation", "derivation", "execution")
@@ -124,6 +131,7 @@ class ResearchCapability:
                 "extraction_model": {"type": "string", "maxLength": 256},
                 "receipt": {"type": "object", "additionalProperties": True},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "confidence_calibration": {"type": "object", "additionalProperties": True},
                 "corroborates": {"type": "array", "items": {"type": "string"}},
                 "contradicts": {"type": "array", "items": {"type": "string"}},
                 "objective": {"type": "string", "minLength": 1, "maxLength": 20_000},
@@ -196,6 +204,10 @@ class ResearchCapability:
                             "extraction_model": {"type": "string", "maxLength": 256},
                             "receipt": {"type": "object", "additionalProperties": True},
                             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            "confidence_calibration": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
                             "corroborates": {"type": "array", "items": {"type": "string"}},
                             "contradicts": {"type": "array", "items": {"type": "string"}},
                             "metadata": {"type": "object", "additionalProperties": True},
@@ -767,6 +779,10 @@ class ResearchCapability:
             claim_id=args.get("claim_id"),
             corroborates=tuple(args.get("corroborates") or ()),
             contradicts=tuple(args.get("contradicts") or ()),
+            source_revision=source.revision,
+            source_content_hash=source.content_hash,
+            acquired_at=source.retrieved_at,
+            confidence_calibration=args.get("confidence_calibration") or {},
             metadata=metadata,
         )
         await self._store.save_evidence(evidence)
@@ -980,13 +996,12 @@ class ResearchCapability:
             checks: list[dict[str, Any]] = []
             for item in candidates:
                 source = await self._store.get_source(item.source_id)
-                if source is not None:
-                    checks.append(
-                        {
-                            "evidence_id": item.id,
-                            **await self._verify_evidence(item, source),
-                        }
-                    )
+                checks.append(
+                    {
+                        "evidence_id": item.id,
+                        **await self._verify_evidence(item, source),
+                    }
+                )
             candidate_ids = {item.id for item in candidates}
             conflicts = [
                 item.id
@@ -1002,13 +1017,18 @@ class ResearchCapability:
                 )
             ]
             verified = [
-                check["evidence_id"] for check in checks if check.get("status") == "verified"
+                check["evidence_id"]
+                for check in checks
+                if check.get("status") == "verified" and check.get("quality") == "supported"
             ]
             can_close = (
                 bool(candidates)
                 and bool(verified)
                 and not conflicts
-                and all(check.get("status") == "verified" for check in checks)
+                and all(
+                    check.get("status") == "verified" and check.get("quality") == "supported"
+                    for check in checks
+                )
             )
             updated = gap
             if gap.status == "OPEN" and can_close:
@@ -1061,12 +1081,15 @@ class ResearchCapability:
             evidence = [item for item in evidence if item.claim_id in wanted_claims]
         groups: dict[str, list[str]] = {}
         source_records: dict[str, Any] = {}
+        quality_counts: dict[str, int] = {}
         for item in evidence:
             source = await self._store.get_source(item.source_id)
             if source is None or not await _evidence_visible(
                 item, request, context, self._store.get_source
             ):
                 continue
+            quality = classify_evidence_quality(item, source)
+            quality_counts[quality] = quality_counts.get(quality, 0) + 1
             source_records[source.id] = source
             metadata = dict(source.metadata)
             group = str(
@@ -1099,6 +1122,29 @@ class ResearchCapability:
                     "single_group_warning": len(independent_groups) <= 1 and bool(evidence),
                     "contradiction_evidence_ids": contradictions,
                     "primary_source_candidates": sorted(primary_sources),
+                    "quality_counts": quality_counts,
+                    "quality_questions": [
+                        question
+                        for quality, question in (
+                            (
+                                "no_evidence",
+                                "Which claims still lack a captured source artifact?",
+                            ),
+                            (
+                                "weak",
+                                "Which low-confidence evidence needs calibration or corroboration?",
+                            ),
+                            (
+                                "stale",
+                                "Which evidence must be refreshed against the current source revision?",
+                            ),
+                            (
+                                "contradicted",
+                                "Which contradicted evidence must be resolved before synthesis?",
+                            ),
+                        )
+                        if quality_counts.get(quality, 0)
+                    ],
                     "questions": [
                         "What evidence would falsify this claim?",
                         "Which contradiction materially changes the answer?",
@@ -1127,6 +1173,11 @@ class ResearchCapability:
         gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
         required_open = [gap.id for gap in gaps if gap.required and gap.status != "CLOSED"]
         unverified_closed: list[str] = []
+        quality_counts: dict[str, int] = {}
+        for item in evidence:
+            source = await self._store.get_source(item.source_id)
+            quality = classify_evidence_quality(item, source)
+            quality_counts[quality] = quality_counts.get(quality, 0) + 1
         for gap in gaps:
             if gap.status != "CLOSED" or not gap.required:
                 continue
@@ -1136,10 +1187,14 @@ class ResearchCapability:
             for evidence_id in gap.evidence_ids:
                 item = await self._store.get_evidence(evidence_id)
                 source = await self._store.get_source(item.source_id) if item else None
+                verification = (
+                    await self._verify_evidence(item, source)
+                    if item is not None
+                    else {"status": "unverified", "quality": "no_evidence"}
+                )
                 if (
-                    item is None
-                    or source is None
-                    or (await self._verify_evidence(item, source))["status"] != "verified"
+                    verification.get("status") != "verified"
+                    or verification.get("quality") != "supported"
                 ):
                     unverified_closed.append(gap.id)
                     break
@@ -1167,6 +1222,7 @@ class ResearchCapability:
             unverified_closed_gaps=unverified_closed,
             independence_groups=groups,
             contradiction_evidence_ids=contradictions,
+            evidence_quality_counts=quality_counts,
         )
         return _result(request, output=_json(bundle.to_record()))
 
@@ -1566,89 +1622,9 @@ class ResearchCapability:
     async def _verify_evidence(
         self,
         evidence: EvidenceObject,
-        source: SourceRecord,
+        source: SourceRecord | None,
     ) -> dict[str, Any]:
-        if not source.artifact_uri or self._artifacts is None:
-            return {"status": "unverified", "reason": "source snapshot not captured"}
-        content = await self._artifacts.load(source.artifact_uri)
-        content_hash = hashlib.sha256(content).hexdigest()
-        hash_matches = not source.content_hash or content_hash == source.content_hash
-        found = hash_matches and evidence.exact_supporting_excerpt.encode("utf-8") in content
-        result: dict[str, Any] = {
-            "status": "verified" if found else "invalid",
-            "content_hash": content_hash,
-            "hash_matches": hash_matches,
-            "excerpt_hash": hashlib.sha256(
-                evidence.exact_supporting_excerpt.encode("utf-8")
-            ).hexdigest(),
-        }
-        recorded_excerpt_hash = evidence.metadata.get("excerpt_hash")
-        if recorded_excerpt_hash and recorded_excerpt_hash != result["excerpt_hash"]:
-            result["status"] = "invalid"
-            result["excerpt_hash_matches"] = False
-        else:
-            result["excerpt_hash_matches"] = True
-        if not found:
-            return result
-
-        # Structured evidence is still evidence only when its receipt is
-        # internally coherent.  The source hash/excerpt check above proves
-        # the captured bytes; these checks prove that a measurement or
-        # execution claim has the fields needed for replay/review.
-        if evidence.evidence_type in {
-            "execution",
-            "measurement",
-            "observation",
-            "derivation",
-        }:
-            receipt = evidence.metadata.get("receipt")
-            structured = _verify_receipt(evidence.evidence_type, receipt)
-            result["receipt"] = structured
-            if structured["status"] != "verified":
-                result["status"] = "invalid"
-        return result
-
-
-def _verify_receipt(evidence_type: str, receipt: Any) -> dict[str, Any]:
-    """Validate the minimum replay boundary for structured evidence."""
-    if not isinstance(receipt, Mapping):
-        return {"status": "unverified", "reason": "structured receipt is missing"}
-    required: dict[str, tuple[str, ...]] = {
-        "execution": ("capability_id", "input_hash", "environment_fingerprint"),
-        "measurement": ("value", "unit", "observed_at", "environment_fingerprint"),
-        "observation": ("observation", "observed_at", "environment_fingerprint"),
-        "derivation": ("inputs", "derivation", "environment_fingerprint"),
-    }
-    missing = [
-        field
-        for field in required.get(evidence_type, ())
-        if field not in receipt or receipt[field] in (None, "", [])
-    ]
-    if missing:
-        return {"status": "invalid", "missing": missing}
-    if evidence_type == "execution":
-        exit_code = receipt.get("exit_code")
-        ok = receipt.get("ok")
-        status = str(receipt.get("status") or "").casefold()
-        if (
-            exit_code not in (None, 0)
-            or ok is False
-            or status
-            in {
-                "failed",
-                "error",
-                "cancelled",
-            }
-        ):
-            return {
-                "status": "invalid",
-                "reason": "execution receipt does not show a successful exit",
-            }
-    return {
-        "status": "verified",
-        "evidence_type": evidence_type,
-        "fields": sorted(str(key) for key in receipt),
-    }
+        return await verify_evidence(evidence, source, self._artifacts)
 
 
 def _json(value: Any) -> str:

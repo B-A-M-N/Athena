@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Signing is an explicit release operation. This command never emits a
+# placeholder signature: a release host must provide cosign and a keyless
+# identity or a configured key.
+input="${1:-}"
+output="${2:-}"
+[[ -n "$input" && -f "$input" ]] || { printf '%s\n' 'sign-release-provenance: usage: sign-release-provenance PROVENANCE.json SIGNATURE' >&2; exit 2; }
+[[ -n "$output" ]] || { printf '%s\n' 'sign-release-provenance: output signature is required' >&2; exit 2; }
+command -v cosign >/dev/null 2>&1 || { printf '%s\n' 'sign-release-provenance: FAIL — cosign is required; no unsigned fallback' >&2; exit 1; }
+
+if [[ -n "${COSIGN_KEY:-}" ]]; then
+  cosign sign-blob --yes --key "$COSIGN_KEY" --output-signature "$output" "$input"
+else
+  cosign sign-blob --yes --output-signature "$output" "$input"
+fi
+[[ -s "$output" ]] || { printf '%s\n' 'sign-release-provenance: FAIL — cosign produced no signature' >&2; exit 1; }
+printf 'sign-release-provenance: PASS — %s\n' "$output"

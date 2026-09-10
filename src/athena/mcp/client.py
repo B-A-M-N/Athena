@@ -20,6 +20,14 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from athena.network import validate_endpoint
+from athena.network.endpoint_security import headers_are_credentialed
+from athena.mcp.sdk_compat import (
+    make_session,
+    make_stdio_context,
+    make_stdio_parameters,
+    require_supported_sdk,
+    streamable_http_context,
+)
 from athena.protocol.errors import MCPError
 
 
@@ -52,10 +60,7 @@ def _require_str(value: Any) -> str:
 
 def _headers_are_credentialed(headers: Mapping[str, str] | None) -> bool:
     """Recognize credential-bearing headers without logging their values."""
-    return any(
-        str(name).casefold() in {"authorization", "proxy-authorization", "x-api-key", "api-key"}
-        for name in (headers or {})
-    )
+    return headers_are_credentialed(headers)
 
 
 def _new_lock() -> Any:
@@ -197,7 +202,7 @@ class MCPClient:
         """Establish the transport and an MCP session (idempotent)."""
         if self.connected:
             return self
-        mcp = _require_sdk()
+        sdk = require_supported_sdk()
         from contextlib import AsyncExitStack  # noqa: PLC0415
 
         stack = AsyncExitStack()
@@ -216,43 +221,31 @@ class MCPClient:
                         # retain the new error if this cleanup also fails.
                         pass
                 if self.url is not None:
-                    streamablehttp_client = importlib.import_module(
-                        "mcp.client.streamable_http"
-                    ).streamablehttp_client
-                    http_kwargs: dict[str, Any] = {
-                        "timeout": float(self.connect_timeout),
-                        "headers": self.headers or None,
-                    }
-                    # Newer MCP SDKs expose the underlying httpx factory;
-                    # use it to make the proxy decision explicit and keep
-                    # environment proxy variables out of the default path.
-                    if self._endpoint is not None:
-                        parameters = inspect.signature(streamablehttp_client).parameters
-                        if "httpx_client_factory" in parameters:
-                            import httpx  # noqa: PLC0415
-
-                            http_kwargs["httpx_client_factory"] = lambda: httpx.AsyncClient(
-                                trust_env=self._endpoint.trust_env
-                            )
-                        elif self._endpoint.trust_env:
-                            raise MCPError(
-                                "configured MCP SDK cannot honor the explicit proxy policy"
-                            )
-                    http_ctx = streamablehttp_client(self.url, **http_kwargs)
-                    read, write, _ = await self._bounded(stack.enter_async_context(http_ctx))
+                    if self._endpoint is None:
+                        raise MCPError("MCP HTTP endpoint policy was not initialized")
+                    http_ctx = streamable_http_context(
+                        sdk,
+                        self.url,
+                        headers=self.headers,
+                        timeout=self.connect_timeout,
+                        trust_env=self._endpoint.trust_env,
+                    )
+                    transport_streams = await self._bounded(stack.enter_async_context(http_ctx))
+                    # MCP 2.x yields (read, write); retain tolerance for
+                    # transitional fixtures that append a third metadata item.
+                    read, write = tuple(transport_streams)[:2]
                 else:
-                    stdio_client = importlib.import_module("mcp.client.stdio").stdio_client
-                    StdioServerParameters = importlib.import_module("mcp").StdioServerParameters
-                    server_params = StdioServerParameters(
+                    server_params = make_stdio_parameters(
+                        sdk,
                         command=_require_str(self.command),
                         args=self.args,
                         env=self.env if self.env else None,
                         cwd=self.cwd,
                     )
-                    stdio_ctx = stdio_client(server_params)
+                    stdio_ctx = make_stdio_context(sdk, server_params)
                     read, write = await self._bounded(stack.enter_async_context(stdio_ctx))
                 session = await self._bounded(
-                    stack.enter_async_context(mcp.ClientSession(read, write))
+                    stack.enter_async_context(make_session(sdk, read, write))
                 )
                 await self._bounded(session.initialize())
                 self._session = session
@@ -262,7 +255,7 @@ class MCPClient:
                 self._connected_at = datetime.now(timezone.utc).isoformat()
                 self._last_successful_connection = self._connected_at
                 return self
-        except Exception as exc:  # noqa: BLE001 - redact and normalize transport failures
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalize transport failures
             try:
                 await self._bounded(stack.aclose())
             except Exception:  # noqa: BLE001 - close is best effort after transport failure
@@ -329,7 +322,7 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.list_tools())
-        except Exception as exc:  # noqa: BLE001 - normalize remote discovery failure
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalize remote discovery failure
             self._mark_transport_failure(exc)
             raise MCPError(f"MCP list_tools failed on {self.connection_id!r}") from exc
         tools = list(getattr(result, "tools", None) or ())
@@ -366,7 +359,7 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.list_resources())
-        except Exception as exc:  # noqa: BLE001 - normalize remote discovery failure
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalize remote discovery failure
             self._mark_transport_failure(exc)
             raise MCPError(f"MCP list_resources failed on {self.connection_id!r}") from exc
         resources = list(getattr(result, "resources", None) or ())
@@ -401,7 +394,7 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.list_prompts())
-        except Exception as exc:  # noqa: BLE001 - normalize remote discovery failure
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalize remote discovery failure
             self._mark_transport_failure(exc)
             raise MCPError(f"MCP list_prompts failed on {self.connection_id!r}") from exc
         prompts = list(getattr(result, "prompts", None) or ())
@@ -449,7 +442,7 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.get_prompt(name, dict(arguments or {})))
-        except Exception as exc:  # noqa: BLE001 - normalize remote prompt failure
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalize remote prompt failure
             self._mark_transport_failure(exc)
             raise MCPError(f"mcp get_prompt {name!r} failed on {self.connection_id!r}") from exc
         messages = list(getattr(result, "messages", None) or ())
@@ -476,7 +469,7 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.call_tool(name, dict(arguments or {})))
-        except Exception as exc:  # noqa: BLE001 - normalize remote tool failure
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalize remote tool failure
             self._mark_transport_failure(exc)
             raise MCPError(f"mcp call_tool {name!r} failed on {self.connection_id!r}") from exc
         return MCPToolResult(
@@ -491,7 +484,7 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.read_resource(uri))
-        except Exception as exc:  # noqa: BLE001 - normalize remote resource failure
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalize remote resource failure
             self._mark_transport_failure(exc)
             raise MCPError(f"mcp read_resource {uri!r} failed on {self.connection_id!r}") from exc
         blocks = list(getattr(result, "contents", None) or ())

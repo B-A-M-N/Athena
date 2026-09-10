@@ -1,27 +1,106 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# One release mechanism, one pinned policy. cargo-audit and an unpinned local
+# cargo-deny are deliberately not interchangeable.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 manifest="native/Cargo.toml"
 lockfile="native/Cargo.lock"
 denyfile="native/deny.toml"
+version_file="native/cargo-deny.version"
+receipt_dir="${ATHENA_SUPPLY_CHAIN_EVIDENCE_DIR:-$repo_root/release-evidence}"
+receipt="$receipt_dir/rust-supply-chain.json"
+max_age_days="${ATHENA_RUSTSEC_MAX_AGE_DAYS:-7}"
 
-[[ -f "$lockfile" ]] || {
-  printf '%s\n' 'rust-supply-chain-audit: FAIL — native/Cargo.lock is missing' >&2
+for path in "$lockfile" "$denyfile" "$version_file"; do
+  [[ -f "$path" ]] || {
+    printf 'rust-supply-chain-audit: FAIL — missing %s\n' "$path" >&2
+    exit 1
+  }
+done
+
+expected_version="$(tr -d '[:space:]' < "$version_file")"
+[[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  printf '%s\n' 'rust-supply-chain-audit: FAIL — invalid pinned cargo-deny version' >&2
   exit 1
 }
-[[ -f "$denyfile" ]] || {
-  printf '%s\n' 'rust-supply-chain-audit: FAIL — native/deny.toml is missing' >&2
-  exit 1
-}
+
 cargo metadata --manifest-path "$manifest" --locked --offline --format-version 1 >/dev/null
 
-if command -v cargo-audit >/dev/null 2>&1; then
-  cargo audit --file "$lockfile"
-elif command -v cargo-deny >/dev/null 2>&1; then
-  cargo deny check advisories sources licenses --config "$denyfile" --manifest-path "$manifest"
-else
-  printf '%s\n' 'rust-supply-chain-audit: FAIL — install cargo-audit or cargo-deny for release qualification' >&2
+cargo_deny_bin="${ATHENA_CARGO_DENY_BIN:-cargo-deny}"
+command -v "$cargo_deny_bin" >/dev/null 2>&1 || {
+  printf 'rust-supply-chain-audit: FAIL — install cargo-deny %s (cargo install --locked --version %s cargo-deny)\n' \
+    "$expected_version" "$expected_version" >&2
   exit 2
+}
+actual_version="$("$cargo_deny_bin" --version | awk 'NR==1 {print $2}')"
+[[ "$actual_version" == "$expected_version" ]] || {
+  printf 'rust-supply-chain-audit: FAIL — cargo-deny %s required, found %s\n' \
+    "$expected_version" "${actual_version:-unknown}" >&2
+  exit 1
+}
+deny=("$cargo_deny_bin")
+mechanism="pinned-host-binary"
+
+(
+  cd "$(dirname "$manifest")"
+  "${deny[@]}" \
+    --config "$(basename "$denyfile")" \
+    --manifest-path "$(basename "$manifest")" \
+    check advisories bans licenses sources
+)
+
+if [[ -n "${ATHENA_RUSTSEC_DB_DIR:-}" ]]; then
+  advisory_db="$ATHENA_RUSTSEC_DB_DIR"
+else
+  cargo_home="${CARGO_HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)/.cargo}"
+  advisory_db="$cargo_home/advisory-dbs"
 fi
+now="$(date +%s)"
+latest_db_mtime="$(find "$advisory_db" -type f -printf '%T@\n' 2>/dev/null | sort -nr | head -n 1 || true)"
+[[ -n "$latest_db_mtime" ]] || {
+  printf 'rust-supply-chain-audit: FAIL — RustSec advisory database is missing (%s)\n' "$advisory_db" >&2
+  exit 1
+}
+latest_db_epoch="${latest_db_mtime%%.*}"
+age_seconds=$((now - latest_db_epoch))
+max_age_seconds=$((max_age_days * 86400))
+(( age_seconds >= 0 && age_seconds <= max_age_seconds )) || {
+  printf 'rust-supply-chain-audit: FAIL — advisory database is %ss old; max is %ss\n' \
+    "$age_seconds" "$max_age_seconds" >&2
+  exit 1
+}
+
+mkdir -p "$receipt_dir"
+python3 - "$receipt" "$expected_version" "$mechanism" "$denyfile" "$lockfile" \
+  "$age_seconds" "$max_age_days" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+from datetime import datetime, timezone
+
+out, version, mechanism, denyfile, lockfile, age, max_age = sys.argv[1:]
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+record = {
+    "status": "PASS",
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "cargo_deny_version": version,
+    "mechanism": mechanism,
+    "deny_sha256": digest(denyfile),
+    "cargo_lock_sha256": digest(lockfile),
+    "advisory_db_age_seconds": int(age),
+    "advisory_db_max_age_days": int(max_age),
+    "checks": ["advisories", "bans", "licenses", "sources", "locked-metadata"],
+}
+pathlib.Path(out).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+printf 'rust-supply-chain-audit: PASS — cargo-deny %s (%s)\n' "$expected_version" "$mechanism"

@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Create canonical release provenance over the manifest and distributions."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        manifest_bytes = args.manifest.read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except (OSError, ValueError) as exc:
+        print(f"create-release-provenance: FAIL — invalid manifest: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(manifest, dict):
+        print("create-release-provenance: FAIL — manifest must be an object", file=sys.stderr)
+        return 1
+    source_sha = str(manifest.get("source_sha") or "")
+    release_run_id = str(manifest.get("release_run_id") or "")
+    if manifest.get("source_status") != "frozen-clean" or not source_sha or not release_run_id:
+        print(
+            "create-release-provenance: FAIL — manifest must bind a frozen source and run",
+            file=sys.stderr,
+        )
+        return 1
+    if not args.artifacts.is_dir():
+        print(
+            "create-release-provenance: FAIL — distributions directory is missing", file=sys.stderr
+        )
+        return 1
+
+    artifacts = []
+    for path in sorted(item for item in args.artifacts.rglob("*") if item.is_file()):
+        relative = path.relative_to(args.artifacts).as_posix()
+        artifacts.append(
+            {
+                "path": f"distributions/{relative}",
+                "sha256": sha256(path),
+                "size": path.stat().st_size,
+            }
+        )
+    if not artifacts:
+        print("create-release-provenance: FAIL — no release artifacts found", file=sys.stderr)
+        return 1
+    record = {
+        "kind": "athena_release_provenance",
+        "schema_version": 1,
+        "source_sha": source_sha,
+        "release_run_id": release_run_id,
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "artifacts": artifacts,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"create-release-provenance: PASS — {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

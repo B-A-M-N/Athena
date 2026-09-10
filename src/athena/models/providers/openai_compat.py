@@ -57,6 +57,7 @@ from athena.protocol.models import (
     UsageInfo,
 )
 from athena.network import validate_endpoint
+from athena.network.endpoint_security import headers_are_credentialed, merge_provider_headers
 
 _logger = logging.getLogger("athena.provider.openai_compat")
 
@@ -220,7 +221,8 @@ class OpenAICompatProvider:
         self.model = model
         self.provider = provider
         self._privacy_class = privacy_class
-        self._api_key_configured = bool(api_key)
+        configured_headers = dict(headers or {})
+        self._api_key_configured = bool(api_key) or headers_are_credentialed(configured_headers)
         if authentication is not None:
             authentication = authentication.strip().casefold()
             if authentication not in {"none", "bearer", "required"}:
@@ -228,7 +230,7 @@ class OpenAICompatProvider:
         self._authentication = authentication
         endpoint = validate_endpoint(
             self.base_url,
-            credentialed=bool(api_key) or authentication in {"bearer", "required"},
+            credentialed=(self._api_key_configured or authentication in {"bearer", "required"}),
             allow_insecure_remote=allow_insecure_remote,
             trust_env=trust_env,
         )
@@ -259,8 +261,11 @@ class OpenAICompatProvider:
             timeout=httpx.Timeout(timeout),
             http2=http2,
             trust_env=self._trust_env,
-            headers=({"Authorization": f"Bearer {api_key}"} if api_key else {})
-            | dict(headers or {}),
+            headers=merge_provider_headers(
+                {"Authorization": f"Bearer {api_key}"} if api_key else {},
+                configured_headers,
+                protected=("Authorization",),
+            ),
         )
         # P2-67: per-instance stream tracking — multiple configured
         # OpenAI-compatible routes must not share cancellation bookkeeping.

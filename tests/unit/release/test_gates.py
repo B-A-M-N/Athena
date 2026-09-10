@@ -11,6 +11,8 @@ def test_core_release_lanes_exclude_optional_hermes_by_default():
     assert "hermes-live" not in names
     assert "e2e" in names
     assert "functional-proof" in names
+    assert "backend-passport" in names
+    assert "clean-install-upgrade-rollback" in names
 
 
 def test_release_can_opt_into_hermes_live_evidence():
@@ -39,3 +41,17 @@ def test_skip_e2e_never_claims_optional_hermes_certification():
     }
 
     assert "hermes-live" not in names
+
+
+def test_release_can_opt_into_real_beta_endurance():
+    names = {
+        name
+        for name, _command in release_commands(
+            "uv",
+            skip_e2e=False,
+            bootstrap=False,
+            include_endurance=True,
+        )
+    }
+
+    assert "endurance" in names

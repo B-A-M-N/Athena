@@ -36,6 +36,13 @@ class LocalBackend(ExecutionBackend):
             interactive_stdin=True,
             process_signals=True,
             dependency_installation=("python", "node"),
+            runtime_capabilities={
+                runtime: {
+                    "filesystem_containment": True,
+                    "network_containment": True,
+                }
+                for runtime in ("python", "shell")
+            },
         )
 
     def __init__(self, manager: ExecutionManager | None = None) -> None:

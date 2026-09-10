@@ -29,6 +29,7 @@ from athena.protocol.tasks import MutationMode
 from athena.synthesis.runtime import GeneratedToolHost
 from athena.workspace_manifest import copy_workspace_tree
 from athena.synthesis.verifier import GeneratedCapabilityVerifier
+from athena.synthesis.proof_corpus import corpus_digest, derive_proof_cases
 
 if TYPE_CHECKING:
     from athena.protocol.tasks import WorkspaceSpec
@@ -562,6 +563,12 @@ class Validator:
             "negative_cases": negative_details,
             "live_failure_cases": historical_failures,
             "regression_cases": historical_failures,
+        }
+        derived_cases = derive_proof_cases(cap.input_schema, cap.effective_effects)
+        cap.validation["derived_proof_corpus"] = {
+            "source": "schema_and_effects",
+            "digest": corpus_digest(derived_cases),
+            "cases": [case.to_record() for case in derived_cases],
         }
         independent_review = GeneratedCapabilityVerifier.review(cap)
         cap.validation["independent_verification"] = independent_review

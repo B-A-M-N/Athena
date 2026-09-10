@@ -18,6 +18,8 @@ import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Literal
 
 from athena.protocol.ids import new_id
 from athena.workspace_manifest import copy_ignore, copy_workspace_tree, tree_paths
@@ -28,6 +30,102 @@ _IGNORE_PATTERNS = copy_ignore
 
 class CheckpointConflict(RuntimeError):
     """The target workspace changed since the caller's expected revision."""
+
+
+RecoveryState = Literal["reattached", "reconstructed", "lost", "stale", "conflict"]
+_RECOVERY_STATES = frozenset({"reattached", "reconstructed", "lost", "stale", "conflict"})
+
+
+@dataclass(frozen=True)
+class ComputationalCheckpointManifest:
+    """Explicit contract for what a checkpoint can and cannot recover.
+
+    Athena checkpoints are causal workspace snapshots, not VM snapshots. The
+    manifest makes that boundary machine-readable so a resume path can rebuild
+    runtime sessions and external resources instead of implying live process
+    continuity from copied files.
+    """
+
+    task_id: str | None = None
+    continuation_id: str | None = None
+    workspace_fingerprint: str | None = None
+    dependency_environment_id: str | None = None
+    runtime_session_receipts: tuple[dict[str, object], ...] = ()
+    scheduler_checkpoint: dict[str, object] | None = None
+    workflow_checkpoint: dict[str, object] | None = None
+    browser_storage_state_ref: str | None = None
+    database_checkpoint_receipt: object | None = None
+    world_state_revision: str | None = None
+    kind: str = "workspace_snapshot"
+    execution_state: str = "not_serialized"
+    runtime_state: str = "reconstructible_only"
+    external_resources: tuple[dict[str, object], ...] = ()
+    non_restorable_obligations: tuple[str, ...] = ()
+    recovery_contract: tuple[str, ...] = (
+        "verify_workspace_fingerprint",
+        "recreate_runtime_sessions",
+        "reacquire_external_resources",
+        "mark_unrecoverable_resources_lost",
+    )
+
+    @classmethod
+    def from_metadata(
+        cls,
+        metadata: dict | None,
+        *,
+        task_id: str | None = None,
+        workspace_fingerprint: str | None = None,
+    ) -> "ComputationalCheckpointManifest":
+        payload = metadata or {}
+        resources = _resource_recovery(payload.get("resources"))
+        sessions = payload.get("runtime_session_receipts")
+        session_receipts = (
+            tuple(dict(item) for item in sessions[:256] if isinstance(item, dict))
+            if isinstance(sessions, list)
+            else ()
+        )
+        scheduler = payload.get("scheduler_checkpoint")
+        workflow = payload.get("workflow_checkpoint")
+        obligations = payload.get("non_restorable_obligations")
+        return cls(
+            task_id=task_id or _optional_string(payload.get("task_id")),
+            continuation_id=_optional_string(payload.get("continuation_id")),
+            workspace_fingerprint=workspace_fingerprint,
+            dependency_environment_id=_optional_string(payload.get("dependency_environment_id")),
+            runtime_session_receipts=session_receipts,
+            scheduler_checkpoint=dict(scheduler) if isinstance(scheduler, dict) else None,
+            workflow_checkpoint=dict(workflow) if isinstance(workflow, dict) else None,
+            browser_storage_state_ref=_optional_string(payload.get("browser_storage_state_ref")),
+            database_checkpoint_receipt=payload.get("database_checkpoint_receipt"),
+            world_state_revision=_optional_string(payload.get("world_state_revision")),
+            external_resources=tuple(resources),
+            non_restorable_obligations=tuple(
+                str(item) for item in obligations[:256] if item not in (None, "")
+            )
+            if isinstance(obligations, list)
+            else (),
+        )
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "continuation_id": self.continuation_id,
+            "workspace_fingerprint": self.workspace_fingerprint,
+            "dependency_environment_id": self.dependency_environment_id,
+            "runtime_session_receipts": [dict(item) for item in self.runtime_session_receipts],
+            "scheduler_checkpoint": self.scheduler_checkpoint,
+            "workflow_checkpoint": self.workflow_checkpoint,
+            "browser_storage_state_ref": self.browser_storage_state_ref,
+            "database_checkpoint_receipt": self.database_checkpoint_receipt,
+            "world_state_revision": self.world_state_revision,
+            "kind": self.kind,
+            "execution_state": self.execution_state,
+            "runtime_state": self.runtime_state,
+            "external_resources": [dict(item) for item in self.external_resources],
+            "recovery_outcomes": [dict(item) for item in self.external_resources],
+            "non_restorable_obligations": list(self.non_restorable_obligations),
+            "recovery_contract": list(self.recovery_contract),
+        }
 
 
 class CheckpointManager:
@@ -63,6 +161,15 @@ class CheckpointManager:
             workspace_root=workspace_root,
             label=label,
             metadata_base64=metadata_payload,
+        )
+        manifest["computational_checkpoint"] = ComputationalCheckpointManifest.from_metadata(
+            metadata,
+            task_id=task_id,
+            workspace_fingerprint=str(manifest.get("workspace_fingerprint") or ""),
+        ).to_record()
+        _write_private_json(
+            self._root / f"{manifest['id']}.manifest.json",
+            manifest,
         )
         self._register(manifest, owner=task_id)
         return manifest
@@ -374,6 +481,13 @@ class CheckpointManager:
 
         workspace_fingerprint = _fingerprint(_tree_manifest(target))
         resource_recovery = _resource_recovery((manifest.get("metadata") or {}).get("resources"))
+        computational_checkpoint = manifest.get("computational_checkpoint")
+        if not isinstance(computational_checkpoint, dict):
+            computational_checkpoint = ComputationalCheckpointManifest.from_metadata(
+                manifest.get("metadata"),
+                task_id=str(manifest.get("task_id") or "") or None,
+                workspace_fingerprint=str(manifest.get("workspace_fingerprint") or "") or None,
+            ).to_record()
         summary = {
             "checkpoint_id": checkpoint_id,
             "workspace_root": str(target),
@@ -381,6 +495,8 @@ class CheckpointManager:
             "removed_files": removed,
             "workspace_fingerprint": workspace_fingerprint,
             "resource_recovery": resource_recovery,
+            "recovery_outcomes": resource_recovery,
+            "computational_checkpoint": computational_checkpoint,
         }
         summary["resume_context"] = _resume_context(
             manifest,
@@ -513,7 +629,16 @@ def _resource_recovery(resources: object) -> list[dict[str, object]]:
         if not isinstance(raw, dict):
             continue
         name = str(raw.get("name") or raw.get("kind") or "resource")
-        if raw.get("reattachable") and raw.get("identity"):
+        requested_state = str(raw.get("state") or raw.get("recovery_state") or "").casefold()
+        if requested_state not in _RECOVERY_STATES:
+            requested_state = ""
+        if raw.get("conflict"):
+            state: RecoveryState = "conflict"
+        elif raw.get("stale"):
+            state = "stale"
+        elif requested_state:
+            state = requested_state  # type: ignore[assignment]
+        elif raw.get("reattachable") and raw.get("identity"):
             state = "reattached"
         elif raw.get("reconstructible") or raw.get("recipe") or raw.get("environment_id"):
             state = "reconstructed"
@@ -536,12 +661,19 @@ def _resource_recovery(resources: object) -> list[dict[str, object]]:
             "storage_state_ref",
             "database_checkpoint_receipt",
             "world_state_revision",
+            "receipt",
+            "reason",
+            "last_seen_revision",
         ):
             value = raw.get(key)
             if value not in (None, ""):
                 item[key] = value
         result.append(item)
     return result
+
+
+def _optional_string(value: object) -> str | None:
+    return str(value) if value not in (None, "") else None
 
 
 def _resume_context(
@@ -631,4 +763,4 @@ async def _run_worker(operation: str, **kwargs) -> dict:
     return payload
 
 
-__all__ = ["CheckpointConflict", "CheckpointManager"]
+__all__ = ["CheckpointConflict", "CheckpointManager", "ComputationalCheckpointManifest"]

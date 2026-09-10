@@ -71,3 +71,5 @@ def test_instrument_view_is_emitted_by_dispatcher_and_projected():
     assert state.instruments[0]["kind"] == "graph"
     frame = native_projection_frame(state, width=60, height=20)
     assert frame["instruments"][0]["title"] == "Dependency graph"
+    assert frame["instruments"][-1]["kind"] == "semantic_runtime_facts"
+    assert frame["instruments"][-1]["authority"] == "python_projection"

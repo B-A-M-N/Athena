@@ -160,7 +160,7 @@ semantic = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
-    { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.39" },
+    { name = "anthropic", marker = "extra == 'anthropic'", specifier = "==1.0.0" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
     { name = "click", specifier = ">=8.1" },
     { name = "click", marker = "extra == 'dev'", specifier = ">=8.1" },
@@ -169,7 +169,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.100" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = "==2.1.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
     { name = "pexpect", specifier = ">=4.9" },
     { name = "pillow", marker = "extra == 'glass'", specifier = ">=10.0" },

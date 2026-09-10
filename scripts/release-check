@@ -269,6 +269,11 @@ def main(argv: list[str] | None = None) -> int:
         help="include optional operator-owned Hermes live evidence",
     )
     parser.add_argument(
+        "--include-endurance",
+        action="store_true",
+        help="include the real 30-minute beta endurance lane",
+    )
+    parser.add_argument(
         "--bootstrap",
         action="store_true",
         help="fetch locked Rust dependencies before the offline native checks",
@@ -283,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--timeout must be positive")
     if args.skip_e2e and args.include_hermes_live:
         parser.error("--include-hermes-live requires the full gate (omit --skip-e2e)")
+    if args.stage is None and not args.skip_e2e and not args.evidence_dir:
+        parser.error("--evidence-dir is required for a full signed release qualification")
 
     explicit_sha = args.sha is not None
     requested_sha = args.sha or "HEAD"
@@ -330,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
                     "skip_e2e": bool(args.skip_e2e),
                     "stage": args.stage,
                     "include_hermes_live": bool(args.include_hermes_live),
+                    "include_endurance": bool(args.include_endurance),
                     "optional_integrations": {
                         "hermes_referee": {
                             "required_for_core_release": False,
@@ -370,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
             skip_e2e=args.skip_e2e,
             bootstrap=args.bootstrap,
             include_hermes_live=args.include_hermes_live,
+            include_endurance=args.include_endurance,
             stage=args.stage,
         )
         static_lanes = [
@@ -423,6 +432,52 @@ def main(argv: list[str] | None = None) -> int:
                         checkout / "release-artifacts" / "distributions",
                         artifact_evidence,
                     )
+            if name == "backend-passport" and int(record.get("exit_code") or 0) == 0:
+                passport_path = checkout / "backend-passport.json"
+                if not passport_path.is_file():
+                    raise RuntimeError(
+                        "backend passport lane did not produce backend-passport.json"
+                    )
+                try:
+                    passport = json.loads(passport_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise RuntimeError(f"backend passport is not valid JSON: {exc}") from exc
+                if (
+                    passport.get("kind") != "athena_backend_passport"
+                    or passport.get("release_sha") != resolved
+                    or passport.get("release_run_id") != run_id
+                    or passport.get("status") != "PASS"
+                ):
+                    raise RuntimeError(
+                        "backend passport is not a PASS bound to the frozen SHA and release run"
+                    )
+                if evidence_dir is not None:
+                    _write_text(
+                        evidence_stage / "backend-passport.json",
+                        json.dumps(passport, indent=2, sort_keys=True) + "\n",
+                    )
+            if name == "endurance" and int(record.get("exit_code") or 0) == 0:
+                receipt_path = checkout / "endurance-receipt.json"
+                if not receipt_path.is_file():
+                    raise RuntimeError("endurance lane did not produce endurance-receipt.json")
+                if evidence_dir is not None:
+                    shutil.copy2(receipt_path, evidence_stage / "endurance-receipt.json")
+            if name == "support-matrix-release" and int(record.get("exit_code") or 0) == 0:
+                matrix_path = checkout / "release-support-matrix.json"
+                if not matrix_path.is_file():
+                    raise RuntimeError(
+                        "support-matrix release lane did not produce release-support-matrix.json"
+                    )
+                if evidence_dir is not None:
+                    shutil.copy2(matrix_path, evidence_stage / "support-matrix.json")
+            if name == "native-desktop-acceptance" and int(record.get("exit_code") or 0) == 0:
+                desktop_receipt = checkout / "native-desktop-acceptance.json"
+                if not desktop_receipt.is_file():
+                    raise RuntimeError(
+                        "desktop acceptance lane did not produce native-desktop-acceptance.json"
+                    )
+                if evidence_dir is not None:
+                    shutil.copy2(desktop_receipt, evidence_stage / desktop_receipt.name)
             if evidence_dir is not None:
                 _write_text(
                     evidence_stage
@@ -471,6 +526,8 @@ def main(argv: list[str] | None = None) -> int:
                 "dependency-audit",
                 "rust-supply-chain",
                 "static-critical",
+                "support-matrix",
+                "architecture-lint",
                 "uv-lock-check",
             }
             _write_json(
@@ -522,6 +579,45 @@ def main(argv: list[str] | None = None) -> int:
                     evidence_stage / "e2e.txt",
                     "SKIPPED: installed-artifact acceptance was explicitly omitted\n",
                 )
+            if args.stage is None and not args.skip_e2e:
+                provenance_commands = (
+                    (
+                        "release-provenance",
+                        [
+                            args.uv,
+                            "run",
+                            "--frozen",
+                            "--extra",
+                            "dev",
+                            "python",
+                            "scripts/create-release-provenance",
+                            "--manifest",
+                            str(evidence_stage / "release-manifest.json"),
+                            "--artifacts",
+                            str(evidence_stage / "distributions"),
+                            "--output",
+                            str(evidence_stage / "release-provenance.json"),
+                        ],
+                    ),
+                    (
+                        "release-provenance-signature",
+                        [
+                            "scripts/sign-release-provenance",
+                            str(evidence_stage / "release-provenance.json"),
+                            str(evidence_stage / "release-provenance.sig"),
+                        ],
+                    ),
+                )
+                for name, command in provenance_commands:
+                    record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
+                    record["name"] = name
+                    record["commit_sha"] = resolved
+                    record["release_run_id"] = run_id
+                    lanes.append(record)
+                    if int(record.get("exit_code") or 0) != 0:
+                        raise RuntimeError(
+                            f"command failed with exit {record['exit_code']}: {' '.join(command)}"
+                        )
         if args.stage is not None:
             final_status = f"STAGE_{args.stage.upper()}_PASS"
             print(

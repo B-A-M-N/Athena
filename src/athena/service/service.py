@@ -87,6 +87,7 @@ from athena.state.tool_repairs import ToolRepairStore
 from athena.state.context_blocks import ContextBlockStore
 from athena.state.self_host import SelfHostMissionStore
 from athena.packs.store import PackStore
+from athena.service.operational_matrix import build_operational_matrix
 from athena.self_host.gates import SelfHostGateBundle
 from athena.state.delegate_sessions import DelegateSessionStore
 from athena.project.index.store import ProjectIndexStore
@@ -471,48 +472,7 @@ class AthenaService:
 
     def operational_matrix(self) -> dict[str, Any]:
         """Return the concrete backend/runtime readiness matrix for operators."""
-        execution = getattr(self, "_execution", None)
-        backend_rows = execution.backend_status() if execution is not None else []
-        cells: list[dict[str, Any]] = []
-        for backend in backend_rows:
-            capabilities = backend.get("capabilities") if isinstance(backend, dict) else None
-            if not isinstance(capabilities, dict):
-                continue
-            runtime_caps = capabilities.get("runtime_capabilities") or {}
-            for runtime in capabilities.get("supported_runtimes") or ():
-                cell = runtime_caps.get(runtime) if isinstance(runtime_caps, dict) else {}
-                if not isinstance(cell, dict):
-                    cell = {}
-                cells.append(
-                    {
-                        "backend": backend.get("id"),
-                        "runtime": runtime,
-                        "available": bool(backend.get("available")),
-                        "persistent_session": bool(
-                            cell.get("persistent_sessions", capabilities.get("persistent_sessions"))
-                        ),
-                        "persistent_runtime_state": bool(
-                            cell.get(
-                                "persistent_runtime_state",
-                                capabilities.get("persistent_runtime_state"),
-                            )
-                        ),
-                        "reattach": bool(cell.get("reattach", capabilities.get("reattach"))),
-                        "dependency_installation": list(
-                            capabilities.get("dependency_installation") or ()
-                        ),
-                        "network_modes": list(capabilities.get("network_modes") or ()),
-                        # Reflection is a claim surface, not a behavioral
-                        # receipt. The explicit conformance lane must run
-                        # before this cell can be presented as proven.
-                        "behavioral_proof": "not_run",
-                    }
-                )
-        return {
-            "execution": cells,
-            "mcp": self.mcp_status(),
-            "memory": self.runtime_health().get("memory_embeddings", {}),
-        }
+        return build_operational_matrix(self)
 
     async def retry_resource_cleanup(self, task_id: str) -> dict[str, Any]:
         """Run the operator-visible retry path for durable resource obligations."""

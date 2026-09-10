@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export UV_CACHE_DIR="${ATHENA_UV_CACHE_DIR:-/tmp/athena-uv-cache}"
+
+# Qualify the exact distributions produced by build-release-artifacts.  This
+# lane deliberately runs outside the checkout's import path and exercises a
+# fresh database, a reopen/upgrade boundary, and a failed migration rollback.
+artifacts="${1:-}"
+if [[ "${artifacts}" == "--artifacts" ]]; then
+  artifacts="${2:-}"
+fi
+[[ -n "${artifacts}" && -d "${artifacts}" ]] || {
+  printf '%s\n' 'clean-install-upgrade-rollback: usage: --artifacts DISTRIBUTIONS_DIR' >&2
+  exit 2
+}
+
+uv run --frozen --extra dev python - "${artifacts}" <<'PY'
+from __future__ import annotations
+
+import asyncio
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import venv
+
+
+artifacts = Path(sys.argv[1]).resolve()
+python_wheels = sorted(artifacts.glob("athena_agent-*.whl"))
+native_wheels = sorted(artifacts.glob("athena_agent_native-*.whl"))
+if not python_wheels or not native_wheels:
+    raise SystemExit("clean-install-upgrade-rollback: both Python and native wheels are required")
+
+
+with tempfile.TemporaryDirectory(prefix="athena-release-venv-") as raw_venv:
+    venv_dir = Path(raw_venv)
+    venv.EnvBuilder(with_pip=True, clear=True).create(venv_dir)
+    installed_python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(
+        [
+            str(installed_python),
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--force-reinstall",
+            str(python_wheels[-1]),
+            str(native_wheels[-1]),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env["PYTHONNOUSERSITE"] = "1"
+    subprocess.run(
+        [str(installed_python), "-c", "import athena, athena_native"],
+        check=True,
+        env=env,
+    )
+    subprocess.run(
+        [str(installed_python), "-c", "import asyncio; from athena.state.database import Database; asyncio.run(Database(':memory:')._ensure_ready())"],
+        check=True,
+        env=env,
+    )
+    probe = venv_dir / "database_probe.py"
+    probe.write_text(
+        '''import asyncio\nimport tempfile\nfrom pathlib import Path\nfrom athena.state.database import Database\nfrom athena.state.sessions import SessionRepository\n\nasync def main():\n    with tempfile.TemporaryDirectory(prefix="athena-installed-release-") as raw_root:\n        root = Path(raw_root)\n        database_path = root / "fresh.sqlite"\n        first = Database(str(database_path))\n        await first._ensure_ready()\n        await SessionRepository(first).create("installed-session")\n        await first.execute("INSERT INTO tasks(id, status, autonomy, objective, created_at, updated_at) VALUES ('installed-task', 'QUEUED', 'supervised', 'installed', '2026-01-01', '2026-01-01')")\n        assert await first.fetch_one("SELECT id FROM sessions WHERE id = ?", ("installed-session",))\n        await first.close()\n        reopened = Database(str(database_path))\n        await reopened._ensure_ready()\n        assert await reopened.fetch_one("SELECT id FROM tasks WHERE id = ?", ("installed-task",))\n        migration_count = await reopened.fetch_one("SELECT COUNT(*) AS count FROM schema_migrations")\n        assert migration_count and int(migration_count["count"]) >= 48\n        await reopened.close()\n        failed_path = root / "failed-upgrade.sqlite"\n        def fail_latest(version, body):\n            return body + "\\nSELECT athena_release_migration_failure();\\n" if version == "048" else body\n        failing = Database(str(failed_path), migration_fault_injector=fail_latest)\n        try:\n            try:\n                await failing._ensure_ready()\n            except Exception:\n                pass\n            else:\n                raise AssertionError("faulted migration unexpectedly committed")\n        finally:\n            await failing.close()\n        recovered = Database(str(failed_path))\n        await recovered._ensure_ready()\n        columns = await recovered.fetch_all("PRAGMA table_info(model_response_receipts)")\n        assert any(str(row["name"]) == "attempt_id" for row in columns)\n        await recovered.close()\n\nasyncio.run(main())\n''',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [str(installed_python), str(probe)],
+        check=True,
+        env=env,
+        text=True,
+    )
+
+print("clean-install-upgrade-rollback: PASS")
+PY

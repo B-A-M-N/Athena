@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import queue
 import sqlite3
@@ -36,6 +37,11 @@ def _load_migration_files(migrations_dir: str) -> tuple[tuple[str, str, str], ..
             sql = handle.read()
         entries.append((filename, sql, hashlib.sha256(sql.encode("utf-8")).hexdigest()))
     return tuple(entries)
+
+
+def _load_json_file(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 class _AsyncSQLiteConnection:
@@ -334,11 +340,12 @@ class Database:
 
     async def _ensure_ready_unlocked(self) -> None:
         if self._conn is None:
-            self._conn = _AsyncSQLiteConnection(
+            connection = _AsyncSQLiteConnection(
                 self._path,
                 on_close=self._mark_closed,
                 poll_fallback=self._sqlite_poll_fallback,
             )
+            self._conn = connection
             try:
                 await self._conn.start()
                 if self._path != ":memory:":
@@ -351,12 +358,25 @@ class Database:
                         )
                 await self._conn.execute("PRAGMA foreign_keys=ON")
                 await self._conn.execute("PRAGMA busy_timeout=5000")
-            except DatabaseRecoveryRequired:
+            except BaseException as exc:
+                self._startup_diagnostics = {
+                    "status": "recovery_required",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                try:
+                    await connection.close()
+                except BaseException:
+                    pass
+                self._conn = None
+                self._migrated = False
+                self._txn_owner = None
+                if isinstance(exc, DatabaseRecoveryRequired):
+                    raise
+                if isinstance(exc, sqlite3.DatabaseError):
+                    raise DatabaseRecoveryRequired(
+                        f"SQLite database cannot be opened safely: {type(exc).__name__}: {exc}"
+                    ) from exc
                 raise
-            except sqlite3.DatabaseError as exc:
-                raise DatabaseRecoveryRequired(
-                    f"SQLite database cannot be opened safely: {type(exc).__name__}: {exc}"
-                ) from exc
         if not self._migrated:
             await self._run_migrations()
             # In-memory databases cannot retain an interrupted WAL or a
@@ -422,8 +442,23 @@ class Database:
                 )
 
         # Backfill hashes for databases created before the hash column existed.
-        # The current packaged files are the only possible source of truth for
-        # those historical rows; future edits are then detected strictly.
+        # Historical SQL is immutable: the checked-in digest manifest must
+        # agree with the packaged bytes before legacy rows are upgraded.
+        manifest_path = os.path.join(migrations_dir, "migration-digests.json")
+        try:
+            baseline = await run_blocking(_load_json_file, manifest_path)
+            if not isinstance(baseline, dict):
+                raise ValueError("migration digest manifest must be an object")
+            for filename, _sql, digest in packaged:
+                expected = baseline.get(filename)
+                if expected is not None and str(expected) != digest:
+                    raise RuntimeError(
+                        f"historical migration digest mismatch for {filename}: "
+                        f"manifest {expected}, packaged {digest}"
+                    )
+        except FileNotFoundError:
+            raise RuntimeError("migration digest manifest is missing") from None
+
         missing_hashes = [
             (migration_sql[str(row["version"])][1], str(row["version"]))
             for row in rows

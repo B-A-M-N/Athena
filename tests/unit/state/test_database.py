@@ -97,6 +97,56 @@ async def test_migration_failure_rolls_back_all_statements_and_retries_cleanly(
     await recovered.close()
 
 
+async def test_legacy_two_column_migration_ledger_is_upgraded(tmp_path):
+    path = tmp_path / "legacy.sqlite"
+    source_dir = Path(database_module.__file__).resolve().parent / "migrations"
+    initial_sql = (source_dir / "001_initial.sql").read_text(encoding="utf-8")
+    connection = sqlite3.connect(path)
+    connection.executescript(initial_sql)
+    connection.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        ("001", "2026-01-01T00:00:00+00:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(str(path))
+    await database._ensure_ready()
+    row = await database.fetch_one("SELECT sql_sha256 FROM schema_migrations WHERE version = '001'")
+    assert row is not None
+    assert row["sql_sha256"] == hashlib.sha256(initial_sql.encode("utf-8")).hexdigest()
+    assert await database.fetch_one(
+        "SELECT name FROM sqlite_master WHERE name = 'model_response_receipts'"
+    )
+    await database.close()
+
+
+async def test_database_startup_failure_cleans_state_and_can_retry(tmp_path, monkeypatch):
+    path = tmp_path / "retry.sqlite"
+    original_start = database_module._AsyncSQLiteConnection.start
+    calls = 0
+
+    async def fail_once(connection):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("simulated startup failure")
+        await original_start(connection)
+
+    monkeypatch.setattr(database_module._AsyncSQLiteConnection, "start", fail_once)
+    database = Database(str(path))
+    with pytest.raises(DatabaseRecoveryRequired, match="cannot be opened safely"):
+        await database._ensure_ready()
+    assert database._conn is None
+    assert database._migrated is False
+    assert database._startup_diagnostics["status"] == "recovery_required"
+
+    await database._ensure_ready()
+    assert database._conn is not None
+    assert database._migrated is True
+    await database.close()
+
+
 async def test_migration_fault_hook_rolls_back_ddl_and_ledger(tmp_path):
     path = tmp_path / "fault-hook.sqlite"
 

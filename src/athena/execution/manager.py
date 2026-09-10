@@ -96,10 +96,25 @@ class ExecutionManager:
         self._durability_mandatory = durability_mandatory
         self._recovery_sink = recovery_sink
         self._local_backend: ExecutionBackend | None = None
+        self._backend_passports: dict[str, dict[str, Any]] = {}
+        # A cancellation may race the final backend event.  This marker keeps
+        # a late session identity from being re-adopted after its process tree
+        # was closed, which would otherwise leave a dead session in the
+        # manager's live-resource accounting.
+        self._cancel_requested_tasks: set[str] = set()
 
     def set_local_backend(self, backend: ExecutionBackend | None) -> None:
         """Select an operator-owned local backend such as the runtime host."""
         self._local_backend = backend
+
+    def set_backend_passport(self, backend: str, passport: Mapping[str, Any]) -> None:
+        """Bind a release-bound behavioral passport to a backend inventory row."""
+        record = dict(passport)
+        if record.get("kind") != "athena_backend_passport":
+            raise ValueError("backend passport has an unsupported kind")
+        if str(record.get("backend") or "") != str(backend):
+            raise ValueError("backend passport identity does not match backend")
+        self._backend_passports[str(backend)] = record
 
     def set_recovery_sink(self, sink) -> None:
         """Bind the task-state recovery authority after construction."""
@@ -136,6 +151,9 @@ class ExecutionManager:
         result = [{"id": "local", "available": True, "healthy": True}]
         if self._local_backend is not None:
             result[0]["implementation"] = type(self._local_backend).__name__
+            passport = self._backend_passports.get(getattr(self._local_backend, "name", "local"))
+            if passport is not None:
+                result[0]["passport"] = dict(passport)
             try:
                 value = self._local_backend.capabilities()
                 result[0]["capabilities"] = {
@@ -160,6 +178,9 @@ class ExecutionManager:
                     "implementation": type(backend).__name__,
                 }
             )
+            passport = self._backend_passports.get(name)
+            if passport is not None:
+                result[-1]["passport"] = dict(passport)
             capabilities = getattr(backend, "capabilities", None)
             if callable(capabilities):
                 try:
@@ -264,6 +285,7 @@ class ExecutionManager:
         workspace_root: str | None = None,
         network_policy: str | None = None,
     ) -> str:
+        self._cancel_requested_tasks.discard(task_id)
         selected_backend = self._selected_backend(backend)
         if selected_backend is not None:
             sid = await selected_backend.create_session(
@@ -497,15 +519,16 @@ class ExecutionManager:
                     # live-stream decoration.
                     execution_metadata.update(dict(meta))
                 if meta.get("runtime_session_id"):
-                    await self._adopt_runtime_session(
-                        rt,
-                        meta["runtime_session_id"],
-                        request.task_id,
-                        backend=request.backend,
-                        runtime=request.runtime,
-                        cwd=request.cwd,
-                        metadata=meta,
-                    )
+                    if request.task_id not in self._cancel_requested_tasks:
+                        await self._adopt_runtime_session(
+                            rt,
+                            meta["runtime_session_id"],
+                            request.task_id,
+                            backend=request.backend,
+                            runtime=request.runtime,
+                            cwd=request.cwd,
+                            metadata=meta,
+                        )
                     self._exec_runtimes[execution_id] = (rt, meta["runtime_session_id"])
                     if not persisted:
                         persisted = True
@@ -532,7 +555,7 @@ class ExecutionManager:
                     exit_code = event.exit_code
                 yield event
             adopted = self._exec_runtimes.get(execution_id)
-            if adopted:
+            if adopted and request.task_id not in self._cancel_requested_tasks:
                 rt, sid = adopted
                 if sid:
                     await self._adopt_runtime_session(
@@ -547,6 +570,10 @@ class ExecutionManager:
         finally:
             self._executions.pop(execution_id, None)
             self._exec_runtimes.pop(execution_id, None)
+            if not any(
+                owner == request.task_id for owner in self._executions.values()
+            ) and not self._task_sessions.get(request.task_id):
+                self._cancel_requested_tasks.discard(request.task_id)
             track_exit = exit_status is not None
             final_status = track_exit and exit_status or ExecutionExitStatus.FAILED
             await self._persist_execution_finish(
@@ -702,6 +729,7 @@ class ExecutionManager:
         Runtime failures are returned to the task cancellation authority. A
         caller must not convert a failed close into a durable CANCELLED state.
         """
+        self._cancel_requested_tasks.add(task_id)
         rooms = list(self._task_sessions.get(task_id, []))
         # Enumerate sessions across ALL executions of this task, including
         # ones the runtimes adopted implicitly during execute() (BHV-061/062).
@@ -812,6 +840,8 @@ class ExecutionManager:
                     entry["session_id"],
                     entry["pid"],
                 )
+        if not any(owner == task_id for owner in self._executions.values()):
+            self._cancel_requested_tasks.discard(task_id)
         return RuntimeCancellationResult(
             task_id=task_id,
             closed_sessions=tuple(closed_sessions),

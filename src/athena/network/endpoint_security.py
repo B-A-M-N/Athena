@@ -12,10 +12,60 @@ from __future__ import annotations
 import ipaddress
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+from collections.abc import Mapping, Iterable
 
 
 class EndpointSecurityError(ValueError):
     """The configured endpoint violates Athena's outbound transport policy."""
+
+
+# These names are intentionally conservative.  A provider may declare
+# additional secret-derived headers, but arbitrary headers must not silently
+# make a remote HTTP endpoint look anonymous.
+DEFAULT_SECRET_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+    }
+)
+
+
+def headers_are_credentialed(
+    headers: Mapping[str, object] | None,
+    *,
+    secret_headers: Iterable[str] = (),
+) -> bool:
+    """Return whether configured headers carry an authentication secret.
+
+    Header names are compared case-insensitively and values are never
+    inspected or included in diagnostics.  Providers can extend the set for
+    vendor-specific secret-derived headers without duplicating this policy.
+    """
+    names = DEFAULT_SECRET_HEADER_NAMES | {str(name).casefold() for name in secret_headers}
+    return any(str(name).casefold() in names for name in (headers or {}))
+
+
+def merge_provider_headers(
+    canonical: Mapping[str, str],
+    configured: Mapping[str, str] | None,
+    *,
+    protected: Iterable[str] = (),
+    allow_protected_override: bool = False,
+) -> dict[str, str]:
+    """Merge headers without allowing silent auth-header replacement."""
+    protected_names = {str(name).casefold() for name in protected}
+    result = dict(canonical)
+    for name, value in (configured or {}).items():
+        if not allow_protected_override and str(name).casefold() in protected_names:
+            if any(existing.casefold() == str(name).casefold() for existing in canonical):
+                raise EndpointSecurityError(
+                    f"configured header {name!r} would override a provider-managed header"
+                )
+        result[name] = value
+    return result
 
 
 @dataclass(frozen=True)
@@ -114,8 +164,11 @@ def _split_endpoint(url: str):
 
 
 __all__ = [
+    "DEFAULT_SECRET_HEADER_NAMES",
     "EndpointIdentity",
     "EndpointSecurityError",
     "classify_endpoint",
+    "headers_are_credentialed",
+    "merge_provider_headers",
     "validate_endpoint",
 ]

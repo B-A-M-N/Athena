@@ -301,6 +301,29 @@ async def test_reflection_environment_passport_is_exhaustive_and_actionable(tmp_
     assert passport["delegates"][0]["status"] == "available"
     assert passport["filesystem"]["workspace_exists"] is True
     for group in (
+        "container_engines",
+        "package_managers",
+        "compilers",
+        "runtimes",
+        "shells",
+        "databases",
+        "services",
+    ):
+        assert passport["host_inventory"][group]
+        assert all(
+            {"status", "value", "source", "fresh_at", "remediation"} <= set(item)
+            for item in passport["host_inventory"][group].values()
+        )
+    assert {"status", "value", "source", "fresh_at", "remediation"} <= set(
+        passport["host_inventory"]["ports"]
+    )
+    assert {"status", "value", "source", "fresh_at", "remediation"} <= set(
+        passport["host_inventory"]["graphics"]
+    )
+    assert {"status", "value", "source", "fresh_at", "remediation"} <= set(
+        passport["host_inventory"]["permissions"]
+    )
+    for group in (
         "platform",
         "workspace",
         "network",

@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "product": "athena-agent",
+  "release_channel": "beta",
+  "generated_by": "scripts/support-matrix-check",
+  "generated_from": {
+    "contracts": [
+      "pyproject.toml",
+      "src/athena/mcp/sdk_compat.py",
+      "src/athena/models/compat/anthropic_sdk.py",
+      "src/athena/execution/conformance.py",
+      "src/athena/execution/manager.py",
+      "scripts/backend-passport",
+      "scripts/generate-support-matrix",
+      "scripts/endurance-runner",
+      "src/athena/release/gates.py",
+      "scripts/create-release-provenance",
+      "scripts/sign-release-provenance",
+      "scripts/verify-release-provenance"
+    ],
+    "proof_policy": "advertised claims require an executable evidence reference"
+  },
+  "surfaces": {
+    "python": {
+      "supported": ["3.12", "3.13"],
+      "verification": "release-check:python-version",
+      "proof": {"status": "implemented", "evidence": ["release-check:python-version"]}
+    },
+    "mcp": {
+      "supported": ["2.x"],
+      "verification": "mcp-streamable-http-and-stdio-e2e",
+      "proof": {"status": "implemented", "evidence": ["tests/e2e/test_mcp_streamable_http.py", "tests/e2e/test_mcp_transport.py"]}
+    },
+    "anthropic_sdk": {
+      "supported": ["1.x"],
+      "verification": "anthropic-sdk-compatibility-tests",
+      "proof": {"status": "implemented", "evidence": ["tests/unit/models/test_sdk_compat.py"]}
+    },
+    "native": {
+      "supported": ["linux-x86_64", "linux-aarch64", "macos-arm64"],
+      "verification": "native-check-and-native-test",
+      "proof": {"status": "implemented", "evidence": ["native/Cargo.toml", "native/src"]}
+    },
+    "remote_packs": {
+      "supported": ["https-with-operator-pinned-sha256"],
+      "verification": "pack-provenance-tests",
+      "proof": {"status": "implemented", "evidence": ["tests/unit/capabilities/test_packs.py", "src/athena/packs/provenance.py"]}
+    },
+    "rollback": {
+      "supported": ["durable-pack-upgrade", "frozen-artifact-reinstall"],
+      "verification": "release-black-box-and-upgrade-tests",
+      "proof": {"status": "implemented", "evidence": ["tests/e2e/test_release_black_box.py", "tests/unit/capabilities/test_packs.py", "tests/unit/capabilities/test_reality_integrity.py"]}
+    },
+    "execution_backend_passport": {
+      "supported": ["local-supervised:python", "local-supervised:shell", "local-supervised:node"],
+      "verification": "release-check:backend-passport",
+      "proof": {"status": "beta", "evidence": ["scripts/backend-passport", "src/athena/execution/conformance.py", "src/athena/execution/manager.py"]}
+    },
+    "endurance": {
+      "supported": ["beta-30-minute", "nightly-6-hour"],
+      "verification": "release-check:optional-endurance",
+      "proof": {"status": "beta", "evidence": ["scripts/endurance-runner", "tests/crash/test_soak_matrix.py"]}
+    }
+  },
+  "unsupported_claims": [
+    "MCP SDK 1.x",
+    "credentialed non-loopback HTTP",
+    "unsigned release provenance",
+    "unverified model-originated pack installation"
+  ]
+}

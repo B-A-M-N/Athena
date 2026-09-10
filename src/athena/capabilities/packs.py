@@ -111,6 +111,9 @@ class PacksCapability:
                 value = self._manager.fetch_remote(
                     source_url,
                     expected_sha256=args.get("expected_sha256"),
+                    expected_sha256_source=(
+                        "model" if request.origin.value == "model" else "operator"
+                    ),
                     network_policy=_workspace_network_policy(context),
                 )
                 return _result(request, output=json.dumps(value, default=str))
@@ -124,6 +127,9 @@ class PacksCapability:
                 state = await self._manager.install_remote(
                     str(args.get("source_url") or ""),
                     expected_sha256=args.get("expected_sha256"),
+                    expected_sha256_source=(
+                        "model" if request.origin.value == "model" else "operator"
+                    ),
                     approved=bool(args.get("approved")),
                     network_policy=_workspace_network_policy(context),
                 )

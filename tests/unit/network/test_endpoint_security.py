@@ -3,6 +3,8 @@ import pytest
 from athena.network.endpoint_security import (
     EndpointSecurityError,
     classify_endpoint,
+    headers_are_credentialed,
+    merge_provider_headers,
     validate_endpoint,
 )
 
@@ -51,3 +53,18 @@ def test_proxy_environment_is_disabled_by_default():
         validate_endpoint("https://api.example.test", credentialed=True, trust_env=True).trust_env
         is True
     )
+
+
+def test_secret_header_detection_is_case_insensitive_and_value_opaque():
+    assert headers_are_credentialed({"Authorization": "Bearer secret"})
+    assert headers_are_credentialed({"X-API-KEY": "secret"})
+    assert not headers_are_credentialed({"X-Tenant": "tenant-a"})
+
+
+def test_provider_managed_auth_headers_cannot_be_overridden():
+    with pytest.raises(EndpointSecurityError, match="override"):
+        merge_provider_headers(
+            {"Authorization": "Bearer managed"},
+            {"authorization": "Bearer configured"},
+            protected=("authorization",),
+        )

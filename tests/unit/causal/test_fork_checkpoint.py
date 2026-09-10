@@ -208,6 +208,61 @@ async def test_checkpoint_classifies_reconstructible_resources(tmp_path: Path):
     }
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_manifest_carries_recovery_contract_and_typed_outcomes(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "state.txt").write_text("state", encoding="utf-8")
+    manager = CheckpointManager(str(tmp_path / "checkpoints"))
+    captured = await manager.capture(
+        task_id="task-manifest",
+        workspace_root=str(workspace),
+        label="full-manifest",
+        metadata={
+            "continuation_id": "continuation-7",
+            "dependency_environment_id": "env-7",
+            "runtime_session_receipts": [{"session_id": "runtime-1", "state": "closed"}],
+            "scheduler_checkpoint": {"next_trigger": "2026-09-09T12:00:00Z"},
+            "workflow_checkpoint": {"workflow_id": "wf-1", "step": "verify"},
+            "browser_storage_state_ref": "secret://browser-state-7",
+            "database_checkpoint_receipt": {"wal_frame": 42},
+            "world_state_revision": "world-19",
+            "non_restorable_obligations": ["live-child-process"],
+            "resources": [
+                {"name": "reattach", "state": "reattached", "identity": "r-1"},
+                {"name": "rebuild", "state": "reconstructed", "recipe": "rebuild"},
+                {"name": "stale", "stale": True, "identity": "stale-1"},
+                {"name": "conflict", "conflict": True, "identity": "conflict-1"},
+                {"name": "lost"},
+            ],
+        },
+    )
+
+    contract = captured["computational_checkpoint"]
+    assert contract["task_id"] == "task-manifest"
+    assert contract["continuation_id"] == "continuation-7"
+    assert contract["workspace_fingerprint"] == captured["workspace_fingerprint"]
+    assert contract["dependency_environment_id"] == "env-7"
+    assert contract["runtime_session_receipts"] == [{"session_id": "runtime-1", "state": "closed"}]
+    assert contract["scheduler_checkpoint"] == {"next_trigger": "2026-09-09T12:00:00Z"}
+    assert contract["workflow_checkpoint"] == {"workflow_id": "wf-1", "step": "verify"}
+    assert contract["browser_storage_state_ref"] == "secret://browser-state-7"
+    assert contract["database_checkpoint_receipt"] == {"wal_frame": 42}
+    assert contract["world_state_revision"] == "world-19"
+    assert contract["non_restorable_obligations"] == ["live-child-process"]
+    assert {item["state"] for item in contract["recovery_outcomes"]} == {
+        "reattached",
+        "reconstructed",
+        "stale",
+        "conflict",
+        "lost",
+    }
+
+    restored = await manager.restore(captured["id"], str(workspace))
+    assert restored["recovery_outcomes"] == contract["recovery_outcomes"]
+    assert restored["computational_checkpoint"] == contract
+
+
 async def test_restore_unknown_checkpoint(tmp_path: Path):
     mgr = CheckpointManager(root=str(tmp_path / "ckpts"))
     with pytest.raises(KeyError):

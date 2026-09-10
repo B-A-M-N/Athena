@@ -45,6 +45,13 @@ class EvaluationOutcome:
     safety_events: tuple[str, ...] = ()
     model_calls: int = 0
     tool_calls: int = 0
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    capability_calls: int = 0
+    synthesis_attempts: int = 0
+    delegation_count: int = 0
+    approvals: int = 0
+    operator_interventions: int = 0
     latency_ms: float = 0.0
     cost_usd: Decimal | None = None
     recovered: bool = False
@@ -55,7 +62,18 @@ class EvaluationOutcome:
             raise ValueError("evaluation outcome requires case_id")
         if self.status not in {"complete", "partial", "failed", "blocked"}:
             raise ValueError(f"unsupported evaluation status: {self.status}")
-        for name, value in (("model_calls", self.model_calls), ("tool_calls", self.tool_calls)):
+        for name in (
+            "model_calls",
+            "tool_calls",
+            "prompt_tokens",
+            "output_tokens",
+            "capability_calls",
+            "synthesis_attempts",
+            "delegation_count",
+            "approvals",
+            "operator_interventions",
+        ):
+            value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.latency_ms < 0:
@@ -75,6 +93,13 @@ class EvaluationOutcome:
             "safety_events": list(self.safety_events),
             "model_calls": self.model_calls,
             "tool_calls": self.tool_calls,
+            "prompt_tokens": self.prompt_tokens,
+            "output_tokens": self.output_tokens,
+            "capability_calls": self.capability_calls,
+            "synthesis_attempts": self.synthesis_attempts,
+            "delegation_count": self.delegation_count,
+            "approvals": self.approvals,
+            "operator_interventions": self.operator_interventions,
             "latency_ms": round(self.latency_ms, 3),
             "cost_usd": str(self.cost_usd) if self.cost_usd is not None else None,
             "recovered": self.recovered,
@@ -105,6 +130,13 @@ def outcome_from_record(case: EvaluationCase, value: Mapping[str, Any]) -> Evalu
         safety_events=tuple(str(item) for item in value.get("safety_events") or ()),
         model_calls=int(value.get("model_calls") or 0),
         tool_calls=int(value.get("tool_calls") or 0),
+        prompt_tokens=int(value.get("prompt_tokens") or 0),
+        output_tokens=int(value.get("output_tokens") or 0),
+        capability_calls=int(value.get("capability_calls") or 0),
+        synthesis_attempts=int(value.get("synthesis_attempts") or 0),
+        delegation_count=int(value.get("delegation_count") or 0),
+        approvals=int(value.get("approvals") or 0),
+        operator_interventions=int(value.get("operator_interventions") or 0),
         latency_ms=float(value.get("latency_ms") or 0.0),
         cost_usd=_decimal(value.get("cost_usd")),
         recovered=bool(value.get("recovered")),
@@ -182,7 +214,83 @@ class NeutralEvaluationHarness:
                 outcome = replace(outcome, latency_ms=elapsed_ms)
                 outcomes[name] = outcome
             reports.append(compare_outcomes(case, outcomes))
-        return {"cases": reports, "case_count": len(reports), "systems": sorted(adapters)}
+        return {
+            "cases": reports,
+            "by_case": {str(report["case"]): report for report in reports},
+            "case_count": len(reports),
+            "systems": sorted(adapters),
+        }
+
+    @staticmethod
+    def efficiency_regressions(
+        baseline: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        *,
+        max_latency_ratio: float = 1.25,
+        max_cost_ratio: float = 1.25,
+        max_model_call_delta: int = 1,
+        max_tool_call_delta: int = 2,
+        max_prompt_token_delta: int = 512,
+        max_output_token_delta: int = 512,
+        max_capability_call_delta: int = 2,
+        max_synthesis_attempt_delta: int = 1,
+        max_delegation_delta: int = 1,
+        max_approval_delta: int = 1,
+        max_operator_intervention_delta: int = 1,
+    ) -> list[str]:
+        """Compare declared efficiency dimensions without judging quality."""
+        failures: list[str] = []
+        candidate_cases = candidate.get("cases") or [
+            {"case": case_id, "systems": value.get("systems", {})}
+            for case_id, value in (candidate.get("by_case") or {}).items()
+            if isinstance(value, Mapping)
+        ]
+        for case in candidate_cases:
+            case_id = str(case.get("case") or "")
+            old = (baseline.get("by_case") or {}).get(case_id, {})
+            new = (candidate.get("by_case") or {}).get(case_id, {})
+            for system, current in (new.get("systems") or {}).items():
+                previous = (old.get("systems") or {}).get(system)
+                if not isinstance(previous, Mapping) or not isinstance(current, Mapping):
+                    continue
+                if float(current.get("latency_ms") or 0) > max_latency_ratio * max(
+                    1.0, float(previous.get("latency_ms") or 0)
+                ):
+                    failures.append(f"{case_id}/{system}: latency regression")
+                if (
+                    int(current.get("model_calls") or 0) - int(previous.get("model_calls") or 0)
+                    > max_model_call_delta
+                ):
+                    failures.append(f"{case_id}/{system}: model-call regression")
+                if (
+                    int(current.get("tool_calls") or 0) - int(previous.get("tool_calls") or 0)
+                    > max_tool_call_delta
+                ):
+                    failures.append(f"{case_id}/{system}: tool-call regression")
+                dimensions = (
+                    ("prompt_tokens", max_prompt_token_delta, "prompt-token"),
+                    ("output_tokens", max_output_token_delta, "output-token"),
+                    ("capability_calls", max_capability_call_delta, "capability-call"),
+                    ("synthesis_attempts", max_synthesis_attempt_delta, "synthesis-attempt"),
+                    ("delegation_count", max_delegation_delta, "delegation"),
+                    ("approvals", max_approval_delta, "approval"),
+                    (
+                        "operator_interventions",
+                        max_operator_intervention_delta,
+                        "operator-intervention",
+                    ),
+                )
+                for dimension, maximum_delta, label in dimensions:
+                    if (
+                        int(current.get(dimension) or 0) - int(previous.get(dimension) or 0)
+                        > maximum_delta
+                    ):
+                        failures.append(f"{case_id}/{system}: {label} regression")
+                old_cost = _decimal(previous.get("cost_usd")) or Decimal("0")
+                new_cost = _decimal(current.get("cost_usd")) or Decimal("0")
+                if new_cost > old_cost * Decimal(str(max_cost_ratio)) and old_cost > 0:
+                    failures.append(f"{case_id}/{system}: cost regression")
+        return failures
 
 
 def dumps_report(report: Mapping[str, Any]) -> str:

@@ -25,9 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0"]
+mcp = ["mcp==2.1.1"]
 semantic = ["fastembed>=0.8,<0.9"]
-anthropic = ["anthropic>=0.39"]
+anthropic = ["anthropic==1.0.0"]
 debug = ["debugpy>=1.8"]
 cli = ["wcwidth>=0.2"]
 glass = ["Pillow>=10.0"]
@@ -55,7 +55,11 @@ athena = "athena.cli.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-athena = ["state/migrations/*.sql", "bundled_skills/**/SKILL.md"]
+athena = [
+    "state/migrations/*.sql",
+    "state/migrations/migration-digests.json",
+    "bundled_skills/**/SKILL.md",
+]
 
 [tool.ruff]
 target-version = "py312"

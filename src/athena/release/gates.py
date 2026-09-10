@@ -25,11 +25,16 @@ LANE_STAGES: dict[str, str] = {
     "static-critical": "static",
     "compileall": "static",
     "architecture-lint": "static",
+    "support-matrix": "static",
     # test evidence
     "pytest": "tests",
     "pytest-performance": "tests",
     "functional-proof": "tests",
     "release-scenarios": "tests",
+    "backend-passport": "integration",
+    "support-matrix-release": "integration",
+    "clean-install-upgrade-rollback": "integration",
+    "endurance": "integration",
     # heavy integration: artifacts, native, E2E, sandboxes
     "native-fetch": "integration",
     "native-check": "integration",
@@ -88,6 +93,7 @@ def candidate_commands() -> tuple[str, ...]:
         "uv run --frozen --no-sync python --version",
         "uv lock --check --offline",
         "uv run --frozen --no-sync python scripts/architecture-lint",
+        "uv run --frozen --no-sync python scripts/support-matrix-check",
         "uv run --frozen --no-sync python scripts/scenarios --exclude-family VHS --output /tmp/athena-self-scenarios.json",
         "cargo check --manifest-path native/Cargo.toml --locked --offline",
         "cargo test --manifest-path native/Cargo.toml --locked --offline",
@@ -98,6 +104,7 @@ def candidate_commands() -> tuple[str, ...]:
         "uv run --frozen --no-sync python scripts/bench-alacrity --events 5000 --min-producer-events-per-second 10000",
         "uv run --frozen --no-sync python scripts/bench-indexing --samples 3 --max-full-seconds 5 --hard-max-full-seconds 8 --max-cold-start-seconds 8 --max-incremental-seconds 0.5 --hard-max-incremental-seconds 1",
         "uv run --frozen --no-sync python scripts/bench-rendering --max-scene-p95-ms 2 --max-native-projection-p95-ms 5 --max-idle-redraws-per-second 0.1 --max-idle-cpu-percent 2 --max-active-fps 25 --max-cache-bytes 16777216 --require-native",
+        "scripts/endurance-runner --profile beta --output endurance-receipt.json",
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q",
         "uv run --frozen --no-sync --extra dev python scripts/dependency-audit",
         "scripts/rust-supply-chain-audit",
@@ -117,6 +124,7 @@ def release_commands(
     skip_e2e: bool,
     bootstrap: bool,
     include_hermes_live: bool = False,
+    include_endurance: bool = False,
     stage: str | None = None,
 ) -> tuple[tuple[str, list[str]], ...]:
     """Return core lanes, with live Hermes evidence opt-in.
@@ -237,7 +245,29 @@ def release_commands(
                 "release-scenarios.json",
             ],
         ),
+        (
+            "backend-passport",
+            [
+                "scripts/backend-passport",
+                "--output",
+                "backend-passport.json",
+                "--require-all-claims",
+            ],
+        ),
+        (
+            "support-matrix-release",
+            [
+                *prefix,
+                "python",
+                "scripts/generate-support-matrix",
+                "--passport",
+                "backend-passport.json",
+                "--output",
+                "release-support-matrix.json",
+            ],
+        ),
         ("architecture-lint", [*prefix, "python", "scripts/architecture-lint"]),
+        ("support-matrix", [*prefix, "python", "scripts/support-matrix-check"]),
     ]
     if bootstrap:
         commands.append(
@@ -274,9 +304,30 @@ def release_commands(
                 "release-artifacts",
                 ["scripts/build-release-artifacts", "--output-dir", "release-artifacts"],
             ),
+            (
+                "clean-install-upgrade-rollback",
+                [
+                    "scripts/clean-install-upgrade-rollback",
+                    "--artifacts",
+                    "release-artifacts/distributions",
+                ],
+            ),
             ("native-smoke", ["scripts/native-smoke"]),
         ]
     )
+    if include_endurance:
+        commands.append(
+            (
+                "endurance",
+                [
+                    "scripts/endurance-runner",
+                    "--profile",
+                    "beta",
+                    "--output",
+                    "endurance-receipt.json",
+                ],
+            )
+        )
     if not skip_e2e:
         commands.append(
             (

@@ -315,7 +315,26 @@ def native_projection_frame(
         "code_view": serialized_code,
         "diagnostics": [dict(item) for item in scene.diagnostics],
         "attention_items": attention_items,
-        "instruments": [dict(item) for item in scene.instruments],
+        "instruments": [
+            *[dict(item) for item in scene.instruments],
+            {
+                "kind": "semantic_runtime_facts",
+                "title": "Semantic runtime facts",
+                "strategy": sanitize_terminal_text(scene.mode.value),
+                "authority": "python_projection",
+                "evidence": {
+                    "verification_status": sanitize_terminal_text(state.verification_status),
+                    "runtime_recovery": _json_safe(state.runtime_recovery),
+                    "model_request_status": sanitize_terminal_text(scene.model_request_status),
+                },
+                "checkpoint": _json_safe(state.runtime_recovery.get("checkpoint"))
+                if isinstance(state.runtime_recovery, Mapping)
+                else None,
+                "backend_passport": _json_safe(state.runtime_recovery.get("backend_passport"))
+                if isinstance(state.runtime_recovery, Mapping)
+                else None,
+            },
+        ],
         "verification": {
             "status": sanitize_terminal_text(state.verification_status),
             "checks": [dict(item) for item in scene.verification_checks],

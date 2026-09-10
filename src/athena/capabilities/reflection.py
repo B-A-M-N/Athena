@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1128,28 +1129,29 @@ class CapabilityReflection:
         host_inventory = {
             "resources": _host_resource_inventory(workspace.root if workspace else None),
             "memory_available_bytes": _available_memory_bytes(),
-            "container_engines": {
-                name: shutil.which(name) is not None for name in ("docker", "podman")
-            },
-            "package_managers": {
-                name: shutil.which(name) is not None
-                for name in ("uv", "pip", "npm", "pnpm", "cargo")
-            },
-            "compilers": {
-                name: shutil.which(name) is not None
-                for name in ("cc", "gcc", "clang", "rustc", "go", "javac")
-            },
-            "runtimes": {
-                name: shutil.which(name) is not None
-                for name in ("python", "python3", "node", "deno", "bun")
-            },
-            "shells": {
-                name: shutil.which(name) is not None for name in ("sh", "bash", "zsh", "pwsh")
-            },
-            "gpu": {
-                "nvidia_smi": shutil.which("nvidia-smi") is not None,
-                "cuda_visible_devices_configured": bool(os.environ.get("CUDA_VISIBLE_DEVICES")),
-            },
+            "container_engines": _command_inventory(
+                ("docker", "podman"), source="PATH:container-engine"
+            ),
+            "package_managers": _command_inventory(
+                ("uv", "pip", "npm", "pnpm", "cargo"), source="PATH:package-manager"
+            ),
+            "compilers": _command_inventory(
+                ("cc", "gcc", "clang", "rustc", "go", "javac"), source="PATH:compiler"
+            ),
+            "runtimes": _command_inventory(
+                ("python", "python3", "node", "deno", "bun"), source="PATH:runtime"
+            ),
+            "shells": _command_inventory(("sh", "bash", "zsh", "pwsh"), source="PATH:shell"),
+            "databases": _command_inventory(
+                ("sqlite3", "psql", "mysql", "redis-cli"), source="PATH:database-client"
+            ),
+            "services": _command_inventory(
+                ("systemctl", "docker", "podman"), source="PATH:service-manager"
+            ),
+            "ports": _port_inventory(),
+            "graphics": _graphics_inventory(),
+            "permissions": _permission_inventory(workspace_root),
+            "gpu": _command_inventory(("nvidia-smi", "rocminfo"), source="PATH:gpu-probe"),
             "git": {
                 "workspace_repository": bool(workspace_root and (workspace_root / ".git").exists()),
                 "remotes": _git_remote_inventory(workspace_root),
@@ -1292,6 +1294,88 @@ def _available_memory_bytes() -> int | None:
         return int(pages) * int(page_size)
     except (AttributeError, OSError, ValueError):
         return None
+
+
+def _fresh_at() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _inventory_record(
+    value: Any,
+    *,
+    source: str,
+    available: bool | None = None,
+    remediation: str | None = None,
+) -> dict[str, Any]:
+    if available is None:
+        available = bool(value)
+    return {
+        "status": "available" if available else "unavailable",
+        "value": value,
+        "source": source,
+        "fresh_at": _fresh_at(),
+        "remediation": remediation if not available else None,
+    }
+
+
+def _command_inventory(names: tuple[str, ...], *, source: str) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for name in names:
+        executable = shutil.which(name)
+        records[name] = _inventory_record(
+            {"executable": executable},
+            source=source,
+            available=executable is not None,
+            remediation=f"install or configure {name}" if executable is None else None,
+        )
+    return records
+
+
+def _port_inventory() -> dict[str, Any]:
+    source = "/proc/net/tcp"
+    listening = 0
+    try:
+        path = Path(source)
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[1:4097]
+        listening = sum(1 for line in lines if len(line.split()) > 3 and line.split()[3] == "0A")
+        return _inventory_record({"listening_tcp": listening}, source=source, available=True)
+    except OSError:
+        return _inventory_record(
+            {"listening_tcp": listening},
+            source=source,
+            available=False,
+            remediation="expose a bounded host port inventory source",
+        )
+
+
+def _graphics_inventory() -> dict[str, Any]:
+    displays = {
+        "DISPLAY": os.environ.get("DISPLAY"),
+        "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY"),
+    }
+    return _inventory_record(
+        {"display_environment": displays, "xrandr": shutil.which("xrandr")},
+        source="environment-and-PATH:graphics",
+        available=bool(displays["DISPLAY"] or displays["WAYLAND_DISPLAY"]),
+        remediation="attach a display server or configure a graphics adapter",
+    )
+
+
+def _permission_inventory(workspace_root: Path | None) -> dict[str, Any]:
+    writable = bool(workspace_root and os.access(workspace_root, os.W_OK))
+    value = {
+        "uid": getattr(os, "getuid", lambda: None)(),
+        "gid": getattr(os, "getgid", lambda: None)(),
+        "workspace_writable": writable,
+    }
+    return _inventory_record(
+        value,
+        source="os.access-and-identity",
+        available=workspace_root is None or writable,
+        remediation="supply a writable workspace or grant the task's declared permission"
+        if workspace_root is not None and not writable
+        else None,
+    )
 
 
 def _host_resource_inventory(workspace_root: str | None) -> dict[str, Any]:

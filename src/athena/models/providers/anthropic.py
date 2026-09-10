@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import logging
 import math
-import inspect
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from typing import Any
@@ -59,6 +58,7 @@ from athena.protocol.models import (
     UsageInfo,
 )
 from athena.network import validate_endpoint
+from athena.network.endpoint_security import headers_are_credentialed, merge_provider_headers
 
 _PATH = "/v1/messages"
 _CACHEABLE_MODES = frozenset({"session-key", "explicit-cache-api"})
@@ -235,35 +235,38 @@ class AnthropicProvider:
         self._cost = cost
         self._latency_class = latency_class
         self._api_key = api_key
-        self._api_key_configured = bool(api_key)
+        self._headers = dict(headers or {})
+        self._api_key_configured = bool(api_key) or headers_are_credentialed(self._headers)
         endpoint = validate_endpoint(
             self.base_url,
-            credentialed=bool(api_key),
+            credentialed=self._api_key_configured,
             allow_insecure_remote=allow_insecure_remote,
             trust_env=trust_env,
         )
         self._endpoint_classification = endpoint.classification
         self._trust_env = endpoint.trust_env
         self._timeout = timeout
-        self._headers = dict(headers or {})
         self._anthropic = _load_anthropic() if use_sdk else None
         self._client: httpx.AsyncClient | None = None
         self._active_streams: dict[str, httpx.Response] = {}
 
     def _http_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            if not self._api_key:
+            if not self._api_key and not self._api_key_configured:
                 raise ProviderAuthenticationError(
-                    f"{self.provider} requires an api_key (no anthropic SDK available)"
+                    f"{self.provider} requires an api_key or credential-bearing header"
                 )
+            canonical_headers = {"anthropic-version": "2023-06-01"}
+            if self._api_key:
+                canonical_headers["x-api-key"] = self._api_key
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self._timeout),
                 trust_env=self._trust_env,
-                headers={
-                    "x-api-key": self._api_key,
-                    "anthropic-version": "2023-06-01",
-                    **self._headers,
-                },
+                headers=merge_provider_headers(
+                    canonical_headers,
+                    self._headers,
+                    protected=("x-api-key", "anthropic-version"),
+                ),
             )
         return self._client
 
@@ -305,20 +308,27 @@ class AnthropicProvider:
 
     async def _complete_sdk(self, request: ModelRequest) -> ModelEvent:
         assert self._anthropic is not None  # guarded by `complete` before dispatch
-        sdk_kwargs: dict[str, Any] = {}
-        http_client: httpx.AsyncClient | None = None
-        if "http_client" in inspect.signature(self._anthropic.AsyncAnthropic).parameters:
-            http_client = httpx.AsyncClient(trust_env=self._trust_env)
-            sdk_kwargs["http_client"] = http_client
-        elif not self._trust_env:
-            raise ProviderUnavailable(
-                f"{self.provider} SDK cannot honor Athena's explicit proxy policy"
+        from athena.models.compat.anthropic_sdk import build_async_client
+
+        try:
+            # The SDK owns canonical authentication/version headers. Reject a
+            # custom case-variant override here so REST and SDK transport
+            # cannot silently disagree about which secret/header wins.
+            merge_provider_headers(
+                {"x-api-key": "managed", "anthropic-version": "managed"},
+                self._headers,
+                protected=("x-api-key", "anthropic-version"),
             )
-        client = self._anthropic.AsyncAnthropic(
-            api_key=self._api_key,
-            base_url=self.base_url,
-            **sdk_kwargs,
-        )
+            client = build_async_client(
+                self._anthropic,
+                api_key=self._api_key,
+                base_url=self.base_url,
+                headers=self._headers,
+                timeout=self._timeout,
+                trust_env=self._trust_env,
+            )
+        except ValueError as exc:
+            raise ProviderUnavailable(str(exc)) from exc
         kwargs = self._build_kwargs(request, stream=False)
         try:
             response = await client.messages.create(**kwargs)

@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Bind the checked-in support contract to the executed release evidence."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--matrix", type=Path, default=Path("docs/support-matrix.json"))
+    parser.add_argument("--passport", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=Path("release-support-matrix.json"))
+    parser.add_argument("--source-sha", default=os.environ.get("ATHENA_RELEASE_SHA"))
+    parser.add_argument("--release-run-id", default=os.environ.get("ATHENA_RELEASE_RUN_ID"))
+    args = parser.parse_args(argv)
+    if not args.source_sha or not args.release_run_id:
+        parser.error(
+            "--source-sha/--release-run-id or ATHENA_RELEASE_SHA/ATHENA_RELEASE_RUN_ID required"
+        )
+    try:
+        matrix = json.loads(args.matrix.read_text(encoding="utf-8"))
+        passport = json.loads(args.passport.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"generate-support-matrix: FAIL — {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(matrix, dict) or not isinstance(passport, dict):
+        print("generate-support-matrix: FAIL — inputs must be JSON objects", file=sys.stderr)
+        return 1
+    cells = passport.get("cells")
+    if (
+        passport.get("kind") != "athena_backend_passport"
+        or passport.get("release_sha") != args.source_sha
+        or passport.get("release_run_id") != args.release_run_id
+        or passport.get("status") != "PASS"
+        or not isinstance(cells, list)
+        or not cells
+        or any(not isinstance(cell, dict) or cell.get("passed") is not True for cell in cells)
+    ):
+        print(
+            "generate-support-matrix: FAIL — backend passport is not a bound PASS", file=sys.stderr
+        )
+        return 1
+    result = dict(matrix)
+    result["generated_by"] = "scripts/generate-support-matrix"
+    generated_from = dict(result.get("generated_from") or {})
+    generated_from["release_sha"] = args.source_sha
+    generated_from["release_run_id"] = args.release_run_id
+    generated_from["behavioral_evidence"] = {
+        "backend_passport": {
+            "path": "backend-passport.json",
+            "status": passport["status"],
+            "backend": passport.get("backend"),
+            "cell_count": len(cells),
+        }
+    }
+    result["generated_from"] = generated_from
+    result["release_binding"] = {
+        "source_sha": args.source_sha,
+        "release_run_id": args.release_run_id,
+    }
+    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"generate-support-matrix: PASS — {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

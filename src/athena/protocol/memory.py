@@ -43,6 +43,7 @@ class RetrievalMode(str, enum.Enum):
     SEMANTIC = "semantic"
     HYBRID = "hybrid"
     RECENCY = "recency"
+    HISTORY = "history"
 
 
 @dataclass(frozen=True)

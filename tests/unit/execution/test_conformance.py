@@ -1,6 +1,6 @@
 import pytest
 
-from athena.execution.conformance import run_backend_conformance
+from athena.execution.conformance import run_backend_conformance, run_backend_passport
 from athena.execution.manager import ExecutionManager
 from athena.execution.runtimes import NodeRuntime, PythonRuntime, ShellRuntime
 from athena.protocol.execution import ExecutionExitStatus, ExecutionResult
@@ -50,6 +50,25 @@ async def test_conformance_executes_every_advertised_persistent_cell():
     assert all(receipt.passed for receipt in receipts), receipts
     assert all("persistent_runtime_state" in receipt.checks for receipt in receipts)
     assert all("reattach" in receipt.unverified_claims for receipt in receipts)
+
+
+async def test_backend_passport_keeps_unverified_claims_non_passing():
+    passport = await run_backend_passport(
+        _ConformanceManager(),
+        backend="fixture",
+        release_sha="release-sha",
+        environment={"fixture": True},
+    )
+    assert passport.status == "FAIL"
+    assert set(passport.unverified_claims) == {
+        f"{runtime}:{claim}"
+        for runtime in ("node", "python", "shell")
+        for claim in ("reattach", "process_signals")
+    }
+    record = passport.to_record()
+    assert record["kind"] == "athena_backend_passport"
+    assert record["release_sha"] == "release-sha"
+    assert record["status"] == "FAIL"
 
 
 @pytest.mark.asyncio

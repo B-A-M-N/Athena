@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 
 from athena.packs.models import PackManifest, PackState
+from athena.packs.provenance import index_provenance, remote_archive_receipts
 from athena.mcp.client import MCPClient
 from athena.network import (
     classify_endpoint,
@@ -310,14 +311,14 @@ class PackManager:
         source_url: str,
         *,
         expected_sha256: str | None = None,
+        expected_sha256_source: str = "operator",
         max_bytes: int = 32 * 1024 * 1024,
         network_policy: str | object | None = None,
     ) -> dict[str, Any]:
         """Fetch one archive into a content-addressed quarantine directory.
 
-        Remote bytes are never activated directly. Archives must be zip or
-        tar-based, may not contain links or path escapes, and are validated as
-        a normal declarative pack before the quarantine path is returned.
+        Remote bytes are never activated directly. Archives must be zip/tar,
+        contain no links or path escapes, and pass declarative validation.
         """
         parsed = urllib.parse.urlparse(str(source_url))
         if parsed.scheme not in {"https", "http"} or not parsed.netloc:
@@ -368,6 +369,9 @@ class PackManager:
                 # A cache hit is live use; refresh its TTL before returning it.
                 os.utime(content_root, None)
             source, manifest, integrity = self._validated_source(str(content_root))
+            provenance, authenticity = remote_archive_receipts(
+                str(source_url), endpoint, archive_hash, expected or None, expected_sha256_source
+            )  # noqa: E501
             return {
                 "source_path": str(source),
                 "archive_sha256": archive_hash,
@@ -375,13 +379,8 @@ class PackManager:
                 "manifest": manifest.to_record(computed_integrity=integrity),
                 "quarantined": True,
                 "operator_approval_required": True,
-                "authenticity": {
-                    "transport": endpoint.scheme,
-                    "endpoint_classification": endpoint.classification,
-                    "archive_sha256": archive_hash,
-                    "operator_expected_sha256": expected or None,
-                    "operator_approved": False,
-                },
+                "provenance": provenance,
+                "authenticity": authenticity,
             }
         finally:
             shutil.rmtree(quarantine, ignore_errors=True)
@@ -417,6 +416,7 @@ class PackManager:
         source_url: str,
         *,
         expected_sha256: str | None = None,
+        expected_sha256_source: str = "operator",
         approved: bool = False,
         enable: bool = True,
         network_policy: str | object | None = None,
@@ -426,9 +426,11 @@ class PackManager:
         fetched = self.fetch_remote(
             source_url,
             expected_sha256=expected_sha256,
+            expected_sha256_source=expected_sha256_source,
             network_policy=network_policy,
         )
-        return await self.install(fetched["source_path"], enable=enable)
+        provenance = dict(fetched["provenance"]) | dict(fetched["authenticity"])
+        return await self.install(fetched["source_path"], enable=enable, provenance=provenance)
 
     def search_remote(
         self,
@@ -441,6 +443,13 @@ class PackManager:
         parsed = urllib.parse.urlparse(str(source_url))
         if parsed.scheme not in {"https", "http"} or not parsed.netloc:
             raise ValueError("remote pack source must be an http(s) URL")
+        endpoint = validate_endpoint(
+            str(source_url),
+            credentialed=False,
+            allow_insecure_remote=classify_endpoint(str(source_url)) == "loopback",
+        )
+        if endpoint.scheme != "https" and not endpoint.loopback:
+            raise ValueError("non-loopback remote pack indexes require HTTPS")
         target = _govern_remote_target(str(source_url), network_policy)
         raw = json.loads(
             _download_remote(
@@ -456,14 +465,22 @@ class PackManager:
             raise ValueError("remote pack index must contain an array")
         needle = str(query or "").casefold()
         return [
-            dict(item)
+            {
+                **dict(item),
+                "provenance": index_provenance(str(source_url), endpoint),
+            }
             for item in records[:500]
             if isinstance(item, Mapping)
             and (not needle or needle in json.dumps(item, sort_keys=True).casefold())
         ]
 
     async def install(
-        self, source_path: str, *, allowed_root: str | None = None, enable: bool = True
+        self,
+        source_path: str,
+        *,
+        allowed_root: str | None = None,
+        enable: bool = True,
+        provenance: Mapping[str, Any] | None = None,
     ) -> PackState:
         source, manifest, integrity = self._validated_source(source_path, allowed_root=allowed_root)
         target = self._root / manifest.id / manifest.version
@@ -488,6 +505,7 @@ class PackManager:
             installed_at=datetime.now(timezone.utc).isoformat(),
             source_integrity=integrity,
             health="healthy",
+            provenance=dict(provenance or {"kind": "local_pack_source"}),
         )
         await self._store.save(state)
         if enable and self._integrations_bound:

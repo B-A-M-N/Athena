@@ -1469,6 +1469,7 @@ class AgentKernel:
         *,
         estimator: ModelTokenEstimator | None = None,
         request_fingerprint: str | None = None,
+        attempt_id: str | None = None,
     ) -> ModelResponse:
         return await InferenceBroker(self)._consume(
             task,
@@ -1477,6 +1478,7 @@ class AgentKernel:
             request,
             estimator=estimator,
             request_fingerprint=request_fingerprint,
+            attempt_id=attempt_id,
         )
 
     async def _relay_delta(self, task: TaskSpec, delta: ModelDelta) -> None:
@@ -1773,7 +1775,18 @@ class AgentKernel:
         """Persist an assistant response through the durable replay boundary."""
         append_idempotent = getattr(self._messages, "append_idempotent", None)
         if append_idempotent is not None:
-            return bool(await append_idempotent(message))
+            result = bool(await append_idempotent(message))
+            receipt = (message.metadata or {}).get("inference_receipt") or {}
+            provider_metadata = receipt.get("provider_metadata") or {}
+            attempt_id = provider_metadata.get("inference_attempt_id")
+            hook = getattr(self, "_inference_fault_injector", None)
+            if result and hook is not None:
+                value = hook("assistant-message-append")
+                if inspect.isawaitable(value):
+                    await value
+            if attempt_id and self._model_response_store is not None:
+                await self._model_response_store.mark_assistant_appended(str(attempt_id))
+            return result
         # Narrow compatibility path for test doubles and legacy adapters.
         await self._messages.append(message)
         return True

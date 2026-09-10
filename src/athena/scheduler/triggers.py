@@ -117,7 +117,10 @@ def _next_cron(trigger: TriggerSpec, after: datetime) -> datetime | None:
     # minutes in the configured timezone (DST-safe), then convert the matched
     # minute to UTC for comparison and storage.
     local_after = base.astimezone(tz)
-    current = local_after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    # Start at the current local minute.  On a fall-back transition the
+    # second occurrence of that minute may still be strictly after ``after``;
+    # advancing unconditionally would silently drop it.
+    current = local_after.replace(second=0, microsecond=0)
     for _ in range(24 * 60 * 366 * 5):  # scan ~5 years of minutes
         if _cron_matches(current, minute, hour, dom, month, dow):
             # A fall-back minute has two real instants. Choose the first one
@@ -159,8 +162,13 @@ def _local_utc_candidates(naive: datetime, tz) -> tuple[datetime, ...]:
     candidates: set[datetime] = set()
     for fold in (0, 1):
         aware = naive.replace(tzinfo=tz, fold=fold)
-        if aware.astimezone(tz).replace(tzinfo=None) == naive:
-            candidates.add(aware.astimezone(timezone.utc))
+        # A direct aware -> same-zone conversion preserves a nonexistent wall
+        # time instead of normalizing it.  Round-trip through UTC so spring
+        # gaps are rejected and fall-back folds retain both real instants.
+        utc = aware.astimezone(timezone.utc)
+        round_tripped = utc.astimezone(tz).replace(tzinfo=None)
+        if round_tripped == naive:
+            candidates.add(utc)
     return tuple(sorted(candidates))
 
 

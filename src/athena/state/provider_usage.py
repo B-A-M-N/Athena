@@ -30,15 +30,16 @@ class ProviderUsageStore:
         output_tokens: int = 0,
         cost_usd: str | None = None,
         metadata: dict | None = None,
+        usage_id: str | None = None,
     ) -> str:
         """Record a model attempt (successful or failed)."""
-        uid = new_id("usage")
+        uid = usage_id or new_id("usage")
         now = utcnow().isoformat()
         await self._db.execute(
             "INSERT INTO provider_usage("
             "id, provider, model, task_id, session_id, input_tokens, "
             "output_tokens, cost_usd, started_at, metadata"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
             (
                 uid,
                 provider,
@@ -62,21 +63,22 @@ class ProviderUsageStore:
         output_tokens: int,
         cost_usd: str | None = None,
         metadata: dict | None = None,
-    ) -> None:
-        """Update a recorded attempt with final token/cost counts."""
+    ) -> bool:
+        """Complete one attempt without rewriting an already completed row."""
         now = utcnow().isoformat()
         if metadata is None:
-            await self._db.execute(
+            cursor = await self._db.execute(
                 "UPDATE provider_usage SET input_tokens = ?, output_tokens = ?, "
-                "cost_usd = ?, ended_at = ? WHERE id = ?",
+                "cost_usd = ?, ended_at = ? WHERE id = ? AND ended_at IS NULL",
                 (input_tokens, output_tokens, cost_usd, now, usage_id),
             )
-            return
-        await self._db.execute(
+            return cursor.rowcount == 1
+        cursor = await self._db.execute(
             "UPDATE provider_usage SET input_tokens = ?, output_tokens = ?, "
-            "cost_usd = ?, ended_at = ?, metadata = ? WHERE id = ?",
+            "cost_usd = ?, ended_at = ?, metadata = ? WHERE id = ? AND ended_at IS NULL",
             (input_tokens, output_tokens, cost_usd, now, json.dumps(dict(metadata)), usage_id),
         )
+        return cursor.rowcount == 1
 
     async def list_for_task(self, task_id: str) -> list[dict]:
         rows = await self._db.fetch_all(

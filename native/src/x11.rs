@@ -37,6 +37,9 @@ use clipboard::Clipboard;
 use input_method::{InputMethod, lookup_key, terminal_key_bytes};
 use render::chassis::{PresentationControl, PresentationSettings};
 use render::text::{FontRole, TextRenderer};
+#[path = "window_management.rs"]
+mod window_management;
+use window_management::{PendingEwmhGesture, WindowDrag};
 
 type Display = c_void;
 type Window = c_ulong;
@@ -622,6 +625,17 @@ unsafe extern "C" {
         time: c_ulong,
     ) -> c_int;
     fn XUngrabPointer(display: *mut Display, time: c_ulong) -> c_int;
+    fn XQueryPointer(
+        display: *mut Display,
+        window: Window,
+        root_return: *mut Window,
+        child_return: *mut Window,
+        root_x_return: *mut c_int,
+        root_y_return: *mut c_int,
+        win_x_return: *mut c_int,
+        win_y_return: *mut c_int,
+        mask_return: *mut CUint,
+    ) -> c_int;
     fn XCreateFontCursor(display: *mut Display, shape: CUint) -> Cursor;
     fn XDefineCursor(display: *mut Display, window: Window, cursor: Cursor) -> c_int;
     fn XUndefineCursor(display: *mut Display, window: Window) -> c_int;
@@ -1210,123 +1224,6 @@ fn window_management_diagnostics(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WindowDrag {
-    kind: WindowDragKind,
-    start_root_x: i32,
-    start_root_y: i32,
-    start_window_x: i32,
-    start_window_y: i32,
-    start_width: i32,
-    start_height: i32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingEwmhGesture {
-    drag: WindowDrag,
-    configure_events_at_start: u64,
-    deadline: Instant,
-}
-
-impl PendingEwmhGesture {
-    fn new(drag: WindowDrag, configure_events: u64) -> Self {
-        Self {
-            drag,
-            configure_events_at_start: configure_events,
-            deadline: Instant::now() + EWMH_GESTURE_GRACE,
-        }
-    }
-
-    fn geometry_changed(self, x: i32, y: i32, width: i32, height: i32) -> bool {
-        x != self.drag.start_window_x
-            || y != self.drag.start_window_y
-            || width != self.drag.start_width
-            || height != self.drag.start_height
-    }
-}
-
-impl WindowDrag {
-    fn new(
-        display: *mut Display,
-        window: Window,
-        button: &XButtonEvent,
-        width: i32,
-        height: i32,
-        kind: WindowDragKind,
-    ) -> Self {
-        let (start_window_x, start_window_y) = window_root_position(display, window);
-        Self {
-            kind,
-            start_root_x: button.x_root,
-            start_root_y: button.y_root,
-            start_window_x,
-            start_window_y,
-            start_width: width,
-            start_height: height,
-        }
-    }
-
-    fn geometry(self, root_x: i32, root_y: i32) -> (i32, i32, i32, i32) {
-        let dx = root_x.saturating_sub(self.start_root_x);
-        let dy = root_y.saturating_sub(self.start_root_y);
-        match self.kind {
-            WindowDragKind::Move => (
-                self.start_window_x.saturating_add(dx),
-                self.start_window_y.saturating_add(dy),
-                self.start_width,
-                self.start_height,
-            ),
-            WindowDragKind::Resize(zone) => {
-                let left = matches!(
-                    zone,
-                    ResizeZone::TopLeft | ResizeZone::BottomLeft | ResizeZone::Left
-                );
-                let right = matches!(
-                    zone,
-                    ResizeZone::TopRight | ResizeZone::Right | ResizeZone::BottomRight
-                );
-                let top = matches!(
-                    zone,
-                    ResizeZone::TopLeft | ResizeZone::Top | ResizeZone::TopRight
-                );
-                let bottom = matches!(
-                    zone,
-                    ResizeZone::BottomLeft | ResizeZone::Bottom | ResizeZone::BottomRight
-                );
-                let width = if left {
-                    self.start_width.saturating_sub(dx)
-                } else if right {
-                    self.start_width.saturating_add(dx)
-                } else {
-                    self.start_width
-                }
-                .max(900);
-                let height = if top {
-                    self.start_height.saturating_sub(dy)
-                } else if bottom {
-                    self.start_height.saturating_add(dy)
-                } else {
-                    self.start_height
-                }
-                .max(620);
-                let x = if left {
-                    self.start_window_x
-                        .saturating_add(self.start_width.saturating_sub(width))
-                } else {
-                    self.start_window_x
-                };
-                let y = if top {
-                    self.start_window_y
-                        .saturating_add(self.start_height.saturating_sub(height))
-                } else {
-                    self.start_window_y
-                };
-                (x, y, width, height)
-            }
-        }
-    }
-}
-
 fn window_root_position(display: *mut Display, window: Window) -> (i32, i32) {
     let root = unsafe { XRootWindow(display, XDefaultScreen(display)) };
     let mut x = 0;
@@ -1337,6 +1234,40 @@ fn window_root_position(display: *mut Display, window: Window) -> (i32, i32) {
     if translated == 0 { (0, 0) } else { (x, y) }
 }
 
+fn window_parent_position(display: *mut Display, window: Window) -> (i32, i32) {
+    let mut attributes = unsafe { std::mem::zeroed::<XWindowAttributes>() };
+    if unsafe { XGetWindowAttributes(display, window, &mut attributes) } != 0 {
+        (attributes.x, attributes.y)
+    } else {
+        window_root_position(display, window)
+    }
+}
+
+fn pointer_root_position(display: *mut Display) -> Option<(i32, i32)> {
+    let root = unsafe { XRootWindow(display, XDefaultScreen(display)) };
+    let mut root_return = 0;
+    let mut child_return = 0;
+    let mut root_x = 0;
+    let mut root_y = 0;
+    let mut window_x = 0;
+    let mut window_y = 0;
+    let mut mask = 0;
+    let status = unsafe {
+        XQueryPointer(
+            display,
+            root,
+            &mut root_return,
+            &mut child_return,
+            &mut root_x,
+            &mut root_y,
+            &mut window_x,
+            &mut window_y,
+            &mut mask,
+        )
+    };
+    (status != 0).then_some((root_x, root_y))
+}
+
 fn apply_window_drag(
     display: *mut Display,
     window: Window,
@@ -1344,7 +1275,13 @@ fn apply_window_drag(
     root_x: i32,
     root_y: i32,
 ) {
-    let (x, y, width, height) = drag.geometry(root_x, root_y);
+    let (root_target_x, root_target_y, width, height) = drag.geometry(root_x, root_y);
+    let x = drag
+        .start_parent_x
+        .saturating_add(root_target_x.saturating_sub(drag.start_window_x));
+    let y = drag
+        .start_parent_y
+        .saturating_add(root_target_y.saturating_sub(drag.start_window_y));
     unsafe {
         match drag.kind {
             WindowDragKind::Move => {
@@ -1827,6 +1764,7 @@ fn run_window(
     let mut child_exited = false;
     let mut window_drag: Option<WindowDrag> = None;
     let mut pending_ewmh_gesture: Option<PendingEwmhGesture> = None;
+    let mut client_fallback_until: Option<Instant> = None;
     let mut dirty = true;
     let mut terminal_dirty = false;
     let mut oi_motion_dirty = false;
@@ -2219,6 +2157,8 @@ fn run_window(
                             window_move_telemetry
                                 .activate_fallback("ewmh_no_configure_before_grace");
                             window_drag = Some(pending.drag);
+                            client_fallback_until =
+                                Some(Instant::now() + Duration::from_millis(500));
                             grab_window_pointer(display, window);
                         }
                     }
@@ -2280,6 +2220,7 @@ fn run_window(
                         }
                         let had_client_drag = window_drag.is_some();
                         window_drag = None;
+                        client_fallback_until = None;
                         if had_client_drag {
                             unsafe { XUngrabPointer(display, CURRENT_TIME) };
                         }
@@ -2407,6 +2348,38 @@ fn run_window(
                     }
                 }
                 _ => {}
+            }
+        }
+        // An EWMH moveresize request can hand the pointer grab to the WM, so
+        // Athena may receive neither motion nor release events while the
+        // grace period expires. Keep the fallback timer independent of the
+        // event stream and seed the client-managed drag from the live pointer
+        // position when it takes over.
+        if let Some(pending) = pending_ewmh_gesture {
+            if Instant::now() >= pending.deadline {
+                pending_ewmh_gesture = None;
+                window_move_telemetry.activate_fallback("ewmh_no_configure_before_grace");
+                window_drag = Some(pending.drag);
+                client_fallback_until = Some(Instant::now() + Duration::from_millis(500));
+                grab_window_pointer(display, window);
+                if let Some((root_x, root_y)) = pointer_root_position(display) {
+                    apply_window_drag(display, window, pending.drag, root_x, root_y);
+                }
+            }
+        }
+        if let Some(until) = client_fallback_until {
+            if Instant::now() < until {
+                if let (Some(drag), Some((root_x, root_y))) =
+                    (window_drag, pointer_root_position(display))
+                {
+                    apply_window_drag(display, window, drag, root_x, root_y);
+                }
+            } else {
+                client_fallback_until = None;
+                if window_drag.is_some() {
+                    window_drag = None;
+                    unsafe { XUngrabPointer(display, CURRENT_TIME) };
+                }
             }
         }
         if focus_pending
@@ -3020,12 +2993,13 @@ mod tests {
     use super::render::chassis::{PresentationControl, PresentationSettings};
     use super::render::oi::AttentionAction;
     use super::{
-        FrameGeometry, PresentationClock, Projection, ResizeZone, VisualMode, WindowMoveStrategy,
-        WindowMoveTelemetry, is_wm_delete_message, moveresize_message_data, resize_zone,
-        write_attention_action,
+        FrameGeometry, PendingEwmhGesture, PresentationClock, Projection, ResizeZone, VisualMode,
+        WindowDrag, WindowDragKind, WindowMoveStrategy, WindowMoveTelemetry, is_wm_delete_message,
+        moveresize_message_data, resize_zone, write_attention_action,
     };
     use crate::ProjectionView;
     use alacritty_terminal::term::TermMode;
+    use std::time::Instant;
 
     #[test]
     fn frame_geometry_keeps_apertures_equal() {
@@ -3261,6 +3235,37 @@ mod tests {
         assert_eq!(fallback.active_strategy, "client_managed");
         assert!(!fallback.ewmh_confirmed);
         assert_eq!(fallback.fallback_reason, Some("no_configure"));
+    }
+
+    #[test]
+    fn delayed_ewmh_configure_after_fallback_cannot_reactivate_protocol() {
+        let drag = WindowDrag {
+            kind: WindowDragKind::Move,
+            start_root_x: 10,
+            start_root_y: 10,
+            start_window_x: 100,
+            start_window_y: 100,
+            start_parent_x: 100,
+            start_parent_y: 100,
+            start_width: 800,
+            start_height: 600,
+        };
+        let pending = PendingEwmhGesture {
+            drag,
+            configure_events_at_start: 4,
+            deadline: Instant::now(),
+        };
+        assert!(pending.geometry_changed(130, 140, 800, 600));
+        let mut telemetry = WindowMoveTelemetry::for_strategy(WindowMoveStrategy::Ewmh);
+        telemetry.begin_ewmh();
+        telemetry.activate_fallback("ewmh_no_configure_before_grace");
+        telemetry.confirm_ewmh();
+        assert_eq!(telemetry.active_strategy, "client_managed");
+        assert!(!telemetry.ewmh_confirmed);
+        assert_eq!(
+            telemetry.fallback_reason,
+            Some("ewmh_no_configure_before_grace")
+        );
     }
 
     #[test]

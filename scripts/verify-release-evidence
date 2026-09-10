@@ -113,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
         evidence / "static-checks.json",
         evidence / "pytest-summary.json",
         evidence / "release-scenarios.json",
+        evidence / "backend-passport.json",
+        evidence / "support-matrix.json",
         evidence / "release-sbom.spdx.json",
     )
     for path in required_json:
@@ -131,6 +133,10 @@ def main(argv: list[str] | None = None) -> int:
         static_checks = json.loads((evidence / "static-checks.json").read_text(encoding="utf-8"))
         pytest_summary = json.loads((evidence / "pytest-summary.json").read_text(encoding="utf-8"))
         scenarios = json.loads((evidence / "release-scenarios.json").read_text(encoding="utf-8"))
+        backend_passport = json.loads(
+            (evidence / "backend-passport.json").read_text(encoding="utf-8")
+        )
+        support_matrix = json.loads((evidence / "support-matrix.json").read_text(encoding="utf-8"))
         sbom = json.loads((evidence / "release-sbom.spdx.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return fail(f"invalid evidence JSON: {exc}")
@@ -151,10 +157,91 @@ def main(argv: list[str] | None = None) -> int:
 
     if result.get("status") != "PASS" or result.get("releasable") is not True:
         return fail("protected release result is not a releasable PASS")
+    provenance_path = evidence / "release-provenance.json"
+    signature_path = evidence / "release-provenance.sig"
+    if (
+        not provenance_path.is_file()
+        or not signature_path.is_file()
+        or not signature_path.stat().st_size
+    ):
+        return fail("releasable evidence has no signed release provenance payload")
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return fail(f"invalid release provenance: {exc}")
+    if not isinstance(provenance, dict):
+        return fail("release provenance is not an object")
+    if provenance.get("kind") != "athena_release_provenance":
+        return fail("release provenance kind is invalid")
+    if provenance.get("source_sha") != args.sha:
+        return fail("release provenance source does not match certified SHA")
+    if provenance.get("release_run_id") != release_run_id:
+        return fail("release provenance run does not match certified run")
+    if provenance.get("manifest_sha256") != sha256(manifest_path):
+        return fail("release provenance manifest hash does not match evidence")
+    provenance_artifacts = provenance.get("artifacts")
+    if not isinstance(provenance_artifacts, list) or not provenance_artifacts:
+        return fail("release provenance has no artifact hashes")
+    for item in provenance_artifacts:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            return fail("release provenance artifact record is malformed")
+        artifact = evidence / item["path"]
+        if not artifact.is_file() or sha256(artifact) != item.get("sha256"):
+            return fail(f"release provenance artifact hash mismatch: {item.get('path')}")
+    actual_provenance_paths = {
+        f"distributions/{path.relative_to(artifact_dir).as_posix()}"
+        for path in artifact_dir.rglob("*")
+        if path.is_file()
+    }
+    if {str(item.get("path")) for item in provenance_artifacts} != actual_provenance_paths:
+        return fail("release provenance does not cover exactly the certified distributions")
     if result.get("commit_sha") != args.sha:
         return fail("result commit does not match certified SHA")
     if result.get("release_run_id") != release_run_id:
         return fail("result release run does not match certified run")
+    passport_error = _check_identity(
+        backend_passport,
+        label="backend passport",
+        commit_sha=args.sha,
+        release_run_id=release_run_id,
+        source_key="release_sha",
+    )
+    if passport_error:
+        return fail(passport_error)
+    if (
+        backend_passport.get("kind") != "athena_backend_passport"
+        or backend_passport.get("status") != "PASS"
+        or not isinstance(backend_passport.get("cells"), list)
+        or not backend_passport["cells"]
+    ):
+        return fail("backend passport is not a complete PASS")
+    for index, cell in enumerate(backend_passport["cells"]):
+        if not isinstance(cell, dict) or cell.get("passed") is not True:
+            return fail(f"backend passport cell [{index}] did not pass")
+        if cell.get("unverified_claims"):
+            return fail(f"backend passport cell [{index}] has unverified claims")
+    if not isinstance(support_matrix, dict):
+        return fail("generated support matrix is not an object")
+    matrix_binding = support_matrix.get("release_binding")
+    generated_from = support_matrix.get("generated_from")
+    behavioral_evidence = (
+        generated_from.get("behavioral_evidence") if isinstance(generated_from, dict) else None
+    )
+    passport_evidence = (
+        behavioral_evidence.get("backend_passport")
+        if isinstance(behavioral_evidence, dict)
+        else None
+    )
+    if (
+        support_matrix.get("generated_by") != "scripts/generate-support-matrix"
+        or matrix_binding != {"source_sha": args.sha, "release_run_id": release_run_id}
+        or not isinstance(generated_from, dict)
+        or generated_from.get("release_sha") != args.sha
+        or generated_from.get("release_run_id") != release_run_id
+        or not isinstance(passport_evidence, dict)
+        or passport_evidence.get("status") != "PASS"
+    ):
+        return fail("generated support matrix is not bound to the certified backend passport")
     if manifest.get("source_sha") != args.sha:
         return fail("manifest source does not match certified SHA")
     if manifest.get("release_run_id") != release_run_id:
@@ -163,6 +250,23 @@ def main(argv: list[str] | None = None) -> int:
         return fail("identity commit does not match certified SHA")
     if identity.get("skip_e2e") is not False:
         return fail("certified evidence skipped installed-artifact acceptance")
+    if identity.get("include_endurance") is True:
+        endurance_path = evidence / "endurance-receipt.json"
+        if not endurance_path.is_file():
+            return fail("endurance was requested but its receipt is missing")
+        try:
+            endurance = json.loads(endurance_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return fail(f"invalid endurance receipt: {exc}")
+        if (
+            not isinstance(endurance, dict)
+            or endurance.get("kind") != "athena_endurance_receipt"
+            or endurance.get("status") != "PASS"
+            or endurance.get("source_sha") != args.sha
+            or endurance.get("release_run_id") != release_run_id
+            or float(endurance.get("duration_hours") or 0) < 0.5
+        ):
+            return fail("endurance receipt is not a bound 30-minute PASS")
     if manifest.get("source_status") != "frozen-clean":
         return fail("artifact manifest does not identify a frozen clean source")
     sbom_record = manifest.get("sbom")
@@ -234,6 +338,30 @@ def main(argv: list[str] | None = None) -> int:
         return fail(error)
     if not static_checks.get("lanes"):
         return fail("static checks have no lane records")
+    desktop_lane = next(
+        (
+            lane
+            for lane in result.get("lanes", [])
+            if lane.get("name") == "native-desktop-acceptance"
+        ),
+        None,
+    )
+    if isinstance(desktop_lane, dict) and int(desktop_lane.get("exit_code") or 0) == 0:
+        desktop_path = evidence / "native-desktop-acceptance.json"
+        if not desktop_path.is_file():
+            return fail("desktop acceptance PASS has no native desktop receipt")
+        try:
+            desktop = json.loads(desktop_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return fail(f"invalid native desktop receipt: {exc}")
+        if (
+            not isinstance(desktop, dict)
+            or desktop.get("kind") != "athena_native_desktop_receipt"
+            or desktop.get("status") != "PASS"
+            or desktop.get("source_sha") != args.sha
+            or desktop.get("release_run_id") != release_run_id
+        ):
+            return fail("native desktop receipt is not bound to the certified release")
     error = _check_identity(
         pytest_summary.get("lane"),
         label="pytest lane",

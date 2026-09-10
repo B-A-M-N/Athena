@@ -1,7 +1,6 @@
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version TEXT PRIMARY KEY,
-    applied_at TEXT NOT NULL,
-    sql_sha256 TEXT NOT NULL
+    applied_at TEXT NOT NULL
 );
 
 CREATE TABLE sessions (

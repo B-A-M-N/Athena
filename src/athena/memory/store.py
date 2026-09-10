@@ -452,6 +452,8 @@ class MemoryStore:
         *,
         tags: Sequence[str] | None = None,
         limit: int = 5000,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> int:
         """Backfill missing/stale vectors when semantic retrieval is requested.
 
@@ -463,7 +465,13 @@ class MemoryStore:
         provider = self._embedding_provider
         if provider is None or not callable(getattr(provider, "embed", None)):
             return 0
-        scope_where, params = await self._scope_where(scope, scope_id, tags)
+        scope_where, params = await self._scope_where(
+            scope,
+            scope_id,
+            tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         where = f"WHERE {scope_where}" if scope_where else ""
         rows = await self._db.fetch_all(
             "SELECT m.*, e.content_hash AS embedding_content_hash, "
@@ -494,8 +502,17 @@ class MemoryStore:
         scope_id: str | None,
         limit: int,
         tags: Sequence[str] | None = None,
+        *,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[tuple[MemoryRecord, float]]:
-        scope_w, params = await self._scope_where(scope, scope_id, tags)
+        scope_w, params = await self._scope_where(
+            scope,
+            scope_id,
+            tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         where = f"WHERE {scope_w}" if scope_w else ""
         rows = await self._db.fetch_all(
             "SELECT m.*, e.vector AS embedding_vector FROM memories m "
@@ -521,10 +538,23 @@ class MemoryStore:
         scopes: Sequence[tuple[MemoryScope, str | None]],
         limit: int,
         tags: Sequence[str] | None = None,
+        *,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[tuple[MemoryRecord, float]]:
         rows: list[tuple[MemoryRecord, float]] = []
         for scope, scope_id in scopes:
-            rows.extend(await self.retrieve_by_embedding(vector, scope, scope_id, limit, tags))
+            rows.extend(
+                await self.retrieve_by_embedding(
+                    vector,
+                    scope,
+                    scope_id,
+                    limit,
+                    tags,
+                    include_inactive=include_inactive,
+                    include_conflicts=include_conflicts,
+                )
+            )
         by_id: dict[str, tuple[MemoryRecord, float]] = {}
         for record, score in rows:
             if record.id not in by_id or score > by_id[record.id][1]:
@@ -698,6 +728,8 @@ class MemoryStore:
         scope_id: str | None = None,
         mode: RetrievalMode | str = RetrievalMode.RELEVANCE,
         limit: int = 10,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         from athena.memory.retrieval import MemoryRetriever
 
@@ -708,6 +740,8 @@ class MemoryStore:
             mode=mode,
             limit=limit,
             tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
         )
 
     async def search(
@@ -719,6 +753,8 @@ class MemoryStore:
         scope_id: str | None = None,
         mode: RetrievalMode | str = RetrievalMode.RELEVANCE,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         from athena.memory.retrieval import MemoryRetriever
 
@@ -729,6 +765,8 @@ class MemoryStore:
             mode=mode,
             limit=limit,
             tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
         )
 
     async def search_scopes(
@@ -739,6 +777,8 @@ class MemoryStore:
         limit: int = 10,
         mode: RetrievalMode | str = RetrievalMode.RELEVANCE,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         """Search several authority scopes with one retrieval operation."""
         from athena.memory.retrieval import MemoryRetriever
@@ -749,6 +789,8 @@ class MemoryStore:
             mode=mode,
             limit=limit,
             tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
         )
 
     async def retrieve_scopes_weighted(
@@ -760,6 +802,8 @@ class MemoryStore:
         mode: RetrievalMode | str = RetrievalMode.RELEVANCE,
         tags: Sequence[str] | None = None,
         weights: Mapping[str, float] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         """Scope-weighted retrieval (P1-12): authority order participates in
         the ranking, so a session-local memory outranks a user-global one on
@@ -775,6 +819,8 @@ class MemoryStore:
             limit=limit,
             tags=tags,
             weights=weights,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
         )
 
     # ---- retrieval SQL (owned by the store; the retriever only re-ranks) ----
@@ -784,13 +830,42 @@ class MemoryStore:
         scope: MemoryScope | None,
         scope_id: str | None,
         tags: Sequence[str] | None = None,
+        *,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> tuple[str, list[Any]]:
         conds: list[str] = []
         params: list[Any] = []
-        # Pending agent-derived candidates are review material, not ordinary
-        # context. Explicit USER_CONTENT records use pending_promotion=false
-        # and remain immediately retrievable.
-        conds.append("COALESCE(json_extract(m.metadata, '$.pending_promotion'), 0) != 1")
+        if not include_inactive:
+            # Pending agent-derived candidates are review material, not
+            # ordinary context. Explicit USER_CONTENT records use
+            # pending_promotion=false and remain immediately retrievable.
+            conds.append("COALESCE(json_extract(m.metadata, '$.pending_promotion'), 0) != 1")
+            # Temporal validity is retrieval policy, not merely display
+            # metadata. SQLite's datetime() comparison keeps the policy in
+            # UTC even when records contain explicit offsets.
+            conds.append(
+                "(json_extract(m.metadata, '$._athena:valid_from') IS NULL "
+                "OR datetime(json_extract(m.metadata, '$._athena:valid_from')) <= datetime('now'))"
+            )
+            conds.append(
+                "(json_extract(m.metadata, '$._athena:valid_until') IS NULL "
+                "OR datetime(json_extract(m.metadata, '$._athena:valid_until')) >= datetime('now'))"
+            )
+            # A superseded record is historical evidence, not current
+            # context. The relation is stored on the successor so this also
+            # works when the old record predates the current schema.
+            conds.append(
+                "NOT EXISTS (SELECT 1 FROM memories successor, "
+                "json_each(COALESCE(json_extract(successor.metadata, "
+                "'$._athena:supersedes'), '[]')) supersession "
+                "WHERE supersession.value = m.id)"
+            )
+        if not include_conflicts:
+            conds.append(
+                "COALESCE(json_array_length(json_extract(m.metadata, "
+                "'$._athena:contradicted_by')), 0) = 0"
+            )
         if scope is not None:
             conds.append("m.scope = ?")
             params.append(scope.value)
@@ -813,8 +888,17 @@ class MemoryStore:
         scope_id: str | None,
         limit: int,
         tags: Sequence[str] | None = None,
+        *,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
-        scope_w, params = await self._scope_where(scope, scope_id, tags)
+        scope_w, params = await self._scope_where(
+            scope,
+            scope_id,
+            tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         where = f"WHERE {scope_w}" if scope_w else ""
         sql = f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ?"
         params.append(limit)
@@ -827,11 +911,20 @@ class MemoryStore:
         scope_id: str | None,
         limit: int,
         tags: Sequence[str] | None = None,
+        *,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         match = self.sanitize_match(query)
         if not match:
             return []
-        scope_w, params = await self._scope_where(scope, scope_id, tags)
+        scope_w, params = await self._scope_where(
+            scope,
+            scope_id,
+            tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         where_parts = ["memories_fts MATCH ?"]
         if scope_w:
             where_parts.append(scope_w)
@@ -851,30 +944,31 @@ class MemoryStore:
         scopes: Sequence[tuple[MemoryScope, str | None]],
         limit: int,
         tags: Sequence[str] | None = None,
+        *,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         match = self.sanitize_match(query)
         if not match or not scopes:
             return []
         groups: list[str] = []
-        params: list[Any] = [match]
+        group_params: list[Any] = []
         for scope, scope_id in scopes:
             parts = ["m.scope = ?"]
-            params.append(scope.value)
+            group_params.append(scope.value)
             if scope_id:
                 parts.append("json_extract(m.metadata, '$._athena:scope_id') = ?")
-                params.append(scope_id)
+                group_params.append(scope_id)
             groups.append("(" + " AND ".join(parts) + ")")
-        tag_parts: list[str] = []
-        for tag in tags or ():
-            if tag:
-                tag_parts.append("json_extract(m.metadata, '$._athena:tags') LIKE ?")
-                params.append(f'%"{tag}"%')
-        where = [
-            "memories_fts MATCH ?",
-            "COALESCE(json_extract(m.metadata, '$.pending_promotion'), 0) != 1",
-            "(" + " OR ".join(groups) + ")",
-        ]
-        where.extend(tag_parts)
+        state_where, state_params = await self._scope_where(
+            None,
+            None,
+            tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
+        where = ["memories_fts MATCH ?", state_where, "(" + " OR ".join(groups) + ")"]
+        params: list[Any] = [match, *state_params, *group_params]
         params.append(limit)
         return await self._fetch_records(
             "SELECT m.* FROM memories_fts "

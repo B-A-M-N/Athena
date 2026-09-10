@@ -199,6 +199,13 @@ class ContainerBackend(ExecutionBackend):
             interactive_stdin=True,
             process_signals=True,
             dependency_installation=("python", "node"),
+            runtime_capabilities={
+                runtime: {
+                    "filesystem_containment": True,
+                    "network_containment": True,
+                }
+                for runtime in ("python", "shell")
+            },
         )
 
     def available(self) -> bool:

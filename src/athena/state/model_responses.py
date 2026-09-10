@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from decimal import Decimal
 from typing import Any, Mapping
 
 from athena.protocol.models import ModelResponse, UsageInfo
 from athena.protocol.messages import utcnow
+from athena.protocol.ids import new_id
 from athena.state.database import Database
 from athena.state.sessions import _deserialize_block, _serialize_block
 
@@ -33,6 +35,7 @@ class ModelResponseStore:
         request_id: str,
         provider: str,
         model: str,
+        reservation_amount: Decimal | str | None = None,
     ) -> dict[str, Any]:
         """Create or recover one task-scoped provider request identity."""
         existing = await self._db.fetch_one(
@@ -40,10 +43,12 @@ class ModelResponseStore:
             (task_id, request_fingerprint),
         )
         if existing is None:
+            attempt_id = new_id("inference")
             await self._db.execute(
                 "INSERT OR IGNORE INTO model_response_receipts("
-                "task_id, request_fingerprint, request_id, provider, model, status, created_at"
-                ") VALUES (?, ?, ?, ?, ?, 'PENDING', ?)",
+                "task_id, request_fingerprint, request_id, provider, model, status, created_at, "
+                "attempt_id, reservation_amount"
+                ") VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)",
                 (
                     task_id,
                     request_fingerprint,
@@ -51,6 +56,8 @@ class ModelResponseStore:
                     provider,
                     model,
                     utcnow().isoformat(),
+                    attempt_id,
+                    str(reservation_amount) if reservation_amount is not None else None,
                 ),
             )
             existing = await self._db.fetch_one(
@@ -67,11 +74,56 @@ class ModelResponseStore:
             raise ValueError("model response receipt identity changed for the same request")
         status = str(existing.get("status") or "PENDING")
         if status == "FAILED":
+            attempt_id = new_id("inference")
             await self._db.execute(
                 "UPDATE model_response_receipts SET request_id = ?, status = 'PENDING', "
-                "response = NULL, completed_at = NULL WHERE task_id = ? "
+                "response = NULL, completed_at = NULL, attempt_id = ?, "
+                "reservation_amount = ?, reservation_applied_at = NULL, "
+                "actual_input_tokens = NULL, actual_output_tokens = NULL, actual_cost = NULL, "
+                "provider_usage_id = NULL, response_committed_at = NULL, "
+                "accounting_applied_at = NULL, assistant_appended_at = NULL WHERE task_id = ? "
                 "AND request_fingerprint = ?",
-                (request_id, task_id, request_fingerprint),
+                (
+                    request_id,
+                    attempt_id,
+                    str(reservation_amount) if reservation_amount is not None else None,
+                    task_id,
+                    request_fingerprint,
+                ),
+            )
+            existing = await self._db.fetch_one(
+                "SELECT * FROM model_response_receipts "
+                "WHERE task_id = ? AND request_fingerprint = ?",
+                (task_id, request_fingerprint),
+            )
+        elif not existing.get("attempt_id"):
+            # Pre-accounting receipts already represented a completed provider
+            # turn. Mark their legacy identity as accounted so replay cannot
+            # charge them a second time.
+            await self._db.execute(
+                "UPDATE model_response_receipts SET attempt_id = ?, "
+                "accounting_applied_at = COALESCE(accounting_applied_at, completed_at) "
+                "WHERE task_id = ? AND request_fingerprint = ?",
+                (new_id("legacy-inference"), task_id, request_fingerprint),
+            )
+            existing = await self._db.fetch_one(
+                "SELECT * FROM model_response_receipts "
+                "WHERE task_id = ? AND request_fingerprint = ?",
+                (task_id, request_fingerprint),
+            )
+        elif (
+            str(existing.get("status") or "PENDING") == "PENDING"
+            and existing.get("reservation_amount") in (None, "")
+            and reservation_amount is not None
+        ):
+            # A receipt created by an older binary may predate the reservation
+            # column. Backfill the same durable amount before any provider
+            # call so recovery can release/reconcile the exact attempt.
+            await self._db.execute(
+                "UPDATE model_response_receipts SET reservation_amount = ? "
+                "WHERE task_id = ? AND request_fingerprint = ? AND status = 'PENDING' "
+                "AND reservation_amount IS NULL",
+                (str(reservation_amount), task_id, request_fingerprint),
             )
             existing = await self._db.fetch_one(
                 "SELECT * FROM model_response_receipts "
@@ -80,24 +132,113 @@ class ModelResponseStore:
             )
         return dict(existing or {})
 
+    async def mark_reservation_applied(self, *, task_id: str, request_fingerprint: str) -> bool:
+        cursor = await self._db.execute(
+            "UPDATE model_response_receipts SET reservation_applied_at = ? "
+            "WHERE task_id = ? AND request_fingerprint = ? AND reservation_applied_at IS NULL",
+            (utcnow().isoformat(), task_id, request_fingerprint),
+        )
+        return cursor.rowcount == 1
+
+    async def set_provider_usage_id(
+        self, *, task_id: str, request_fingerprint: str, provider_usage_id: str
+    ) -> None:
+        await self._db.execute(
+            "UPDATE model_response_receipts SET provider_usage_id = ? "
+            "WHERE task_id = ? AND request_fingerprint = ?",
+            (provider_usage_id, task_id, request_fingerprint),
+        )
+
+    async def set_actual_usage(
+        self,
+        *,
+        task_id: str,
+        request_fingerprint: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: Decimal | str | None,
+    ) -> None:
+        """Checkpoint provider usage derived after the response is assembled.
+
+        The response receipt is committed before budget reconciliation so a
+        crash cannot cause a second provider call.  Token estimators and
+        pricing, however, are selected by the broker after that commit.  Keep
+        those final values on the same durable receipt, while preserving a
+        previously recorded cost when a later replay cannot determine one.
+        """
+        await self._db.execute(
+            "UPDATE model_response_receipts SET actual_input_tokens = ?, "
+            "actual_output_tokens = ?, actual_cost = COALESCE(?, actual_cost) "
+            "WHERE task_id = ? AND request_fingerprint = ? AND status = 'COMPLETED'",
+            (
+                max(0, int(input_tokens)),
+                max(0, int(output_tokens)),
+                str(cost_usd) if cost_usd is not None else None,
+                task_id,
+                request_fingerprint,
+            ),
+        )
+
     async def complete(
         self,
         *,
         task_id: str,
         request_fingerprint: str,
         response: ModelResponse,
+        provider_usage_id: str | None = None,
     ) -> bool:
         """Persist a response exactly once and acknowledge the transition."""
         payload = json.dumps(_encode_response(response), sort_keys=True, default=str)
+        committed_at = utcnow().isoformat()
         cursor = await self._db.execute(
             "UPDATE model_response_receipts SET status = 'COMPLETED', response = ?, "
-            "completed_at = ? WHERE task_id = ? AND request_fingerprint = ? "
-            "AND status IN ('PENDING', 'COMPLETED')",
-            (payload, utcnow().isoformat(), task_id, request_fingerprint),
+            "completed_at = ?, response_committed_at = ?, "
+            "actual_input_tokens = ?, actual_output_tokens = ?, actual_cost = ?, "
+            "provider_usage_id = COALESCE(?, provider_usage_id) "
+            "WHERE task_id = ? AND request_fingerprint = ? "
+            "AND status = 'PENDING'",
+            (
+                payload,
+                committed_at,
+                committed_at,
+                int(getattr(response.usage, "input_tokens", 0) or 0),
+                int(getattr(response.usage, "output_tokens", 0) or 0),
+                str(response.usage.cost_usd)
+                if getattr(response.usage, "cost_usd", None) is not None
+                else None,
+                provider_usage_id,
+                task_id,
+                request_fingerprint,
+            ),
         )
-        if cursor.rowcount == 0:
-            raise ValueError("model response receipt was not prepared")
-        return True
+        if cursor.rowcount == 1:
+            return True
+        existing = await self._db.fetch_one(
+            "SELECT status FROM model_response_receipts "
+            "WHERE task_id = ? AND request_fingerprint = ?",
+            (task_id, request_fingerprint),
+        )
+        if existing is not None and str(existing.get("status") or "") == "COMPLETED":
+            # A replay observed the already durable first response.  Do not
+            # replace its payload, timestamps, or accounting inputs.
+            return False
+        raise ValueError("model response receipt was not prepared")
+
+    async def mark_accounting_applied(self, *, task_id: str, request_fingerprint: str) -> bool:
+        cursor = await self._db.execute(
+            "UPDATE model_response_receipts SET accounting_applied_at = ? "
+            "WHERE task_id = ? AND request_fingerprint = ? AND accounting_applied_at IS NULL",
+            (utcnow().isoformat(), task_id, request_fingerprint),
+        )
+        return cursor.rowcount == 1
+
+    async def mark_assistant_appended(self, attempt_id: str) -> bool:
+        cursor = await self._db.execute(
+            "UPDATE model_response_receipts SET assistant_appended_at = ? "
+            "WHERE attempt_id = ? AND assistant_appended_at IS NULL",
+            (utcnow().isoformat(), attempt_id),
+        )
+        return cursor.rowcount == 1
 
     async def fail(self, *, task_id: str, request_fingerprint: str) -> bool:
         cursor = await self._db.execute(

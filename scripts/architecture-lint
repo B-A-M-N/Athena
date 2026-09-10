@@ -68,6 +68,9 @@ Exit codes: 0 clean, 1 violations found, 2 usage/scan error.
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -75,18 +78,34 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = "src/athena"
+BROAD_EXCEPTION_ROOTS = frozenset(
+    {"state", "kernel", "execution", "scheduler", "reality", "approval", "policy"}
+)
+BROAD_EXCEPTION_POLICY = "docs/broad-exception-policy.json"
 
 # These are deliberately checked-in debt ceilings, not a claim that the
 # modules are healthy.  The first follow-up refactor must lower these values;
 # until then a one-line increase is a visible architecture failure.
 LEGACY_SIZE_BUDGETS: dict[str, int] = {
-    "service/service.py": 4_100,
-    "kernel/kernel.py": 2_000,
+    "service/service.py": 3_617,
+    "kernel/kernel.py": 1_996,
     "cli/app.py": 2_356,
-    "capabilities/research.py": 2_111,
-    "packs/manager.py": 1_800,
+    "capabilities/research.py": 1_789,
+    "packs/manager.py": 1_795,
 }
 DEFAULT_MODULE_SIZE_BUDGET = 2_000
+
+# Native orchestration/rendering modules have the same ratcheted ceiling.
+# These are deliberately exact current baselines; a future decomposition must
+# lower a value, never increase it. Feature work must first extract a helper
+# rather than silently expanding an authority module.
+RUST_SIZE_BUDGETS: dict[str, int] = {
+    "main.rs": 1_658,
+    "x11.rs": 3_319,
+    "render/oi.rs": 2_890,
+    "render/chassis.rs": 1_169,
+}
+DEFAULT_RUST_MODULE_SIZE_BUDGET = 2_000
 
 # ---------------------------------------------------------------------------
 # Data tables — new rules are one-line additions here.
@@ -213,6 +232,65 @@ def _annotated_allow(rule: Rule, line: str) -> bool:
     )
 
 
+def _broad_exception_hits(root: Path, path: Path, rel: str, text: str) -> list[Hit]:
+    """Require a reviewable rationale or a hash-pinned legacy rationale.
+
+    The hash pin makes the legacy catalog fail closed when a file changes: a
+    new broad catch must carry an inline ``broad-exception:`` rationale before
+    the architecture lane can pass.
+    """
+    if rel.split("/", 1)[0] not in BROAD_EXCEPTION_ROOTS:
+        return []
+    try:
+        policy = json.loads((root / BROAD_EXCEPTION_POLICY).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        policy = {}
+    files = policy.get("files") if isinstance(policy, dict) else {}
+    entry = files.get(f"{SRC}/{rel}") if isinstance(files, dict) else None
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    legacy_ok = isinstance(entry, dict) and entry.get("sha256") == digest
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as exc:
+        return [
+            Hit("broad-exception-rationale", f"{SRC}/{rel}", exc.lineno or 1, str(exc), "violation")
+        ]
+    hits: list[Hit] = []
+    lines = text.splitlines()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        broad = node.type is None or (
+            isinstance(node.type, ast.Name) and node.type.id in {"Exception", "BaseException"}
+        )
+        if not broad:
+            continue
+        line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+        if re.search(r"broad-exception:|rationale:|noqa:\s*BLE001", line, re.IGNORECASE):
+            continue
+        if legacy_ok:
+            hits.append(
+                Hit(
+                    "broad-exception-rationale",
+                    f"{SRC}/{rel}",
+                    node.lineno,
+                    "hash-pinned legacy catch: " + str(entry.get("rationale")),
+                    "info",
+                )
+            )
+        else:
+            hits.append(
+                Hit(
+                    "broad-exception-rationale",
+                    f"{SRC}/{rel}",
+                    node.lineno,
+                    "broad catch requires inline rationale or updated hash-pinned policy entry",
+                    "violation",
+                )
+            )
+    return hits
+
+
 def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
     hits: list[Hit] = []
     src_dir = root / SRC
@@ -243,6 +321,7 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
         if not active:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
+        hits.extend(_broad_exception_hits(Path(root), path, rel, text))
         for lineno, line in enumerate(text.splitlines(), start=1):
             stripped = line.lstrip()
             if stripped.startswith("#"):
@@ -257,6 +336,27 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
                         continue
                 severity = "info" if sev == "info" or _annotated_allow(rule, line) else sev
                 hits.append(Hit(rule.id, f"{SRC}/{rel}", lineno, line.strip(), severity))
+
+    native_dir = root / "native" / "src"
+    if native_dir.is_dir():
+        for path in sorted(native_dir.rglob("*.rs")):
+            rel = str(path.relative_to(native_dir))
+            try:
+                line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError as exc:
+                print(f"architecture-lint: cannot read {path}: {exc}", file=sys.stderr)
+                continue
+            budget = RUST_SIZE_BUDGETS.get(rel, DEFAULT_RUST_MODULE_SIZE_BUDGET)
+            if line_count > budget:
+                hits.append(
+                    Hit(
+                        "rust-module-size-budget",
+                        f"native/src/{rel}",
+                        line_count,
+                        f"module has {line_count} lines; budget is {budget}",
+                        "violation",
+                    )
+                )
     return hits
 
 
