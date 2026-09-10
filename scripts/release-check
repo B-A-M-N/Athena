@@ -34,6 +34,10 @@ import uuid
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# The beta endurance profile is itself wall-clock bounded at 30 minutes. Give
+# its final pytest teardown and receipt flush a finite margin without making
+# every other release lane wait longer after a hang.
+ENDURANCE_TIMEOUT_SECONDS = 2100.0
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from athena.release.gates import lane_stage, release_commands  # noqa: E402
@@ -395,7 +399,12 @@ def main(argv: list[str] | None = None) -> int:
             if name in static_by_name:
                 record = static_by_name[name]
             else:
-                record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
+                command_timeout = (
+                    max(args.timeout, ENDURANCE_TIMEOUT_SECONDS)
+                    if name == "endurance"
+                    else args.timeout
+                )
+                record = _run(command, cwd=checkout, env=env, timeout=command_timeout)
             record["name"] = name
             record["commit_sha"] = resolved
             record["release_run_id"] = run_id
