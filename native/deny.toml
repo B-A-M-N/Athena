@@ -1,0 +1,32 @@
+# Release supply-chain policy for the native companion.
+# Cargo.lock is still the source of exact resolution; cargo-deny enforces
+# advisories, provenance, and licenses against that locked graph.
+
+[advisories]
+version = 2
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+]
+unlicensed = "deny"
+copyleft = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/alacritty/alacritty.git"]

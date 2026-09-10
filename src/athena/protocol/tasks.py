@@ -377,10 +377,15 @@ def _policy_parts(value: CapabilityPolicy | Mapping[str, Any] | None) -> Capabil
     )
 
 
-def _effective_capability_policy(
+def effective_capability_policy(
     value: CapabilityPolicy | Mapping[str, Any] | None,
 ) -> CapabilityPolicy:
-    """Normalize deny precedence before authority algebra compares policies."""
+    """Return the canonical effective policy used by every authority check.
+
+    Deny is applied once at the boundary so policy evaluation, delegation,
+    scheduling, reflection, and intersection cannot each invent subtly
+    different ALLOW/ASK semantics.
+    """
     policy = _policy_parts(value)
     denied = set(policy.deny)
     allow = set(policy.allow) - denied
@@ -394,6 +399,10 @@ def _effective_capability_policy(
         ask=tuple(sorted(ask)),
         deny=tuple(sorted(denied)),
     )
+
+
+# Private compatibility name for older internal callers.
+_effective_capability_policy = effective_capability_policy
 
 
 def _intersect_unrestricted_sets(left: set[str], right: set[str]) -> set[str]:
@@ -462,7 +471,13 @@ def capability_policy_covers(
     # Empty allow/ask is the protocol's unrestricted value.  Once a policy
     # names an allow/ask ceiling, preserve the distinction: ASK is weaker than
     # ALLOW for a caller, but it cannot cover a stored autonomous ALLOW.
-    lower_is_empty = lower_is_empty or "*" in b.deny
+    # A policy whose every positive rule is cancelled by deny represents the
+    # empty authority set. It is narrower than any non-denying ceiling; the
+    # absence of visible rules alone must not be confused with the protocol's
+    # unrestricted empty policy.
+    lower_is_empty = (
+        lower_is_empty or "*" in b.deny or (not lower_visible and bool(b.allow or b.ask or b.deny))
+    )
     if upper_visible and not lower_visible and not lower_is_empty:
         return False
     if upper_visible and not lower_allow.issubset(upper_allow):
@@ -679,6 +694,7 @@ def capability_id_permitted(capability_id: str, policy: CapabilityPolicy | None)
     masked by the presence of an ``allow`` list. ``deny`` is a hard exclude
     that wins over both.
     """
+    policy = effective_capability_policy(policy)
     if policy is None:
         return True
     if capability_id in policy.deny or "*" in policy.deny:

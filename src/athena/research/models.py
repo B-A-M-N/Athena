@@ -18,7 +18,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 
@@ -316,4 +316,72 @@ class ResearchGap:
         )
 
 
-__all__ = ["EvidenceObject", "ResearchGap", "SourceRecord", "schema_hash"]
+@dataclass(frozen=True)
+class EvidenceBundle:
+    """Bounded, deterministic packet presented to synthesis or a reviewer."""
+
+    id: str
+    task_id: str
+    ready: bool
+    sources: tuple[Mapping[str, Any], ...] = ()
+    evidence: tuple[Mapping[str, Any], ...] = ()
+    gaps: tuple[Mapping[str, Any], ...] = ()
+    required_open_gaps: tuple[str, ...] = ()
+    unverified_closed_gaps: tuple[str, ...] = ()
+    independence_groups: tuple[str, ...] = ()
+    contradiction_evidence_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def create(
+        cls,
+        task_id: str,
+        *,
+        ready: bool,
+        sources: Sequence[Mapping[str, Any]] = (),
+        evidence: Sequence[Mapping[str, Any]] = (),
+        gaps: Sequence[Mapping[str, Any]] = (),
+        required_open_gaps: Sequence[str] = (),
+        unverified_closed_gaps: Sequence[str] = (),
+        independence_groups: Sequence[str] = (),
+        contradiction_evidence_ids: Sequence[str] = (),
+    ) -> "EvidenceBundle":
+        normalized_sources = tuple(dict(item) for item in sources)
+        normalized_evidence = tuple(dict(item) for item in evidence)
+        normalized_gaps = tuple(dict(item) for item in gaps)
+        identity = (
+            task_id,
+            [item.get("id") for item in normalized_sources],
+            [item.get("id") for item in normalized_evidence],
+            [item.get("id") for item in normalized_gaps],
+            list(required_open_gaps),
+            list(unverified_closed_gaps),
+        )
+        return cls(
+            id=_stable_id("bundle", json.dumps(identity, sort_keys=True, default=str)),
+            task_id=task_id,
+            ready=bool(ready),
+            sources=normalized_sources,
+            evidence=normalized_evidence,
+            gaps=normalized_gaps,
+            required_open_gaps=tuple(str(item) for item in required_open_gaps),
+            unverified_closed_gaps=tuple(str(item) for item in unverified_closed_gaps),
+            independence_groups=tuple(str(item) for item in independence_groups),
+            contradiction_evidence_ids=tuple(str(item) for item in contradiction_evidence_ids),
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "bundle_id": self.id,
+            "task_id": self.task_id,
+            "ready": self.ready,
+            "required_open_gaps": list(self.required_open_gaps),
+            "unverified_closed_gaps": list(self.unverified_closed_gaps),
+            "sources": [dict(item) for item in self.sources],
+            "evidence": [dict(item) for item in self.evidence],
+            "gaps": [dict(item) for item in self.gaps],
+            "independence_groups": list(self.independence_groups),
+            "contradiction_evidence_ids": list(self.contradiction_evidence_ids),
+        }
+
+
+__all__ = ["EvidenceBundle", "EvidenceObject", "ResearchGap", "SourceRecord", "schema_hash"]

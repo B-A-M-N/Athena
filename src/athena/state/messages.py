@@ -61,6 +61,45 @@ class MessageStore:
             ),
         )
 
+    async def append_idempotent(self, message: Message) -> bool:
+        """Append one durable message, returning whether this call inserted it.
+
+        This is the persistence boundary for replayed model responses.  A
+        retry after a process restart must not depend on an in-memory set or
+        manufacture a second transcript row.  A reused message identity in a
+        different session is a hard collision rather than a silent no-op.
+        """
+        session_id = message.metadata.get("session_id") if message.metadata else None
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("append_idempotent requires a session_id in message metadata")
+        existing = await self._db.fetch_one(
+            "SELECT session_id FROM messages WHERE id = ?",
+            (message.id,),
+        )
+        if existing is not None:
+            if str(existing.get("session_id") or "") != session_id:
+                raise ValueError(f"message id already belongs to another session: {message.id}")
+            return False
+        blocks_json = json.dumps([_serialize_block(b) for b in message.blocks])
+        prov_json = json.dumps(_serialize_provenance(message.provenance))
+        meta_json = json.dumps(dict(message.metadata))
+        text_content = _extract_text(message.blocks)
+        cursor = await self._db.execute(
+            "INSERT OR IGNORE INTO messages(id, session_id, role, blocks, text_content, "
+            "created_at, provenance, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                message.id,
+                session_id,
+                message.role.value,
+                blocks_json,
+                text_content,
+                message.created_at.isoformat(),
+                prov_json,
+                meta_json,
+            ),
+        )
+        return cursor.rowcount == 1
+
     async def append_user_turn(self, session_id: str, message: Message) -> bool:
         """Append a canonical user turn unless its task association exists."""
         # The service assigns the stable ``msg_user_<task-id>`` identity.

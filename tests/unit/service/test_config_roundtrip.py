@@ -160,6 +160,9 @@ def test_roundtrip_serializable_browser_config():
         browser_session_scope="session",
         browser_timeout_ms=12_000,
         browser_viewport=(1024, 768),
+        browser_proxy_max_connections=48,
+        browser_proxy_idle_timeout_seconds=45.0,
+        browser_proxy_max_connection_seconds=240.0,
     )
 
     restored = config_from_dict(config_to_dict(config))
@@ -171,6 +174,9 @@ def test_roundtrip_serializable_browser_config():
     assert restored.browser_executable_path == "/opt/firefox/firefox"
     assert restored.browser_channel == "nightly"
     assert restored.browser_session_scope == "session"
+    assert restored.browser_proxy_max_connections == 48
+    assert restored.browser_proxy_idle_timeout_seconds == 45.0
+    assert restored.browser_proxy_max_connection_seconds == 240.0
 
 
 def test_roundtrip_runtime_recovery_and_worker_timing_config():

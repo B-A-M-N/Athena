@@ -42,7 +42,7 @@ from athena.protocol.capabilities import (
     ResourceClass,
 )
 from athena.network.target_policy import validate_target
-from athena.network.browser_proxy import DNSPinnedBrowserProxy
+from athena.network.browser_proxy import BrowserProxyConfig, DNSPinnedBrowserProxy
 from athena.protocol.resources import TaskResourceCloseResult
 
 _playwright: Any = None
@@ -262,6 +262,7 @@ class PlaywrightBrowserDriver:
         cdp_endpoint: str | None = None,
         timeout_ms: int = 12_000,
         viewport: tuple[int, int] | None = (1024, 768),
+        proxy_config: BrowserProxyConfig | None = None,
     ) -> "PlaywrightBrowserDriver":
         try:
             async_playwright = importlib.import_module("playwright.async_api").async_playwright
@@ -279,7 +280,7 @@ class PlaywrightBrowserDriver:
                 browser = await browser_type.connect_over_cdp(cdp_endpoint)
                 context = browser.contexts[0] if browser.contexts else await browser.new_context()
             else:
-                proxy = DNSPinnedBrowserProxy()
+                proxy = DNSPinnedBrowserProxy(config=proxy_config)
                 await proxy.start()
                 options: dict[str, Any] = {
                     "headless": headless,

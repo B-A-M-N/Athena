@@ -10,6 +10,12 @@ without a concrete textual match; allow-listed matches are printed as INFO.
 
 Rules (audit-mandated)
 ----------------------
+module-size-budget
+    Existing orchestration modules retain explicit debt ceilings while all
+    new Python modules are capped at 2,000 lines.  This is containment until
+    the legacy modules are split; it prevents another god object from growing
+    unnoticed.
+
 router-construction
     ``ModelRouter(`` may be constructed only in src/athena/service/service.py
     (the single sanctioned construction site).  Everywhere else is a second
@@ -66,25 +72,37 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = "src/athena"
+
+# These are deliberately checked-in debt ceilings, not a claim that the
+# modules are healthy.  The first follow-up refactor must lower these values;
+# until then a one-line increase is a visible architecture failure.
+LEGACY_SIZE_BUDGETS: dict[str, int] = {
+    "service/service.py": 4_100,
+    "kernel/kernel.py": 2_000,
+    "cli/app.py": 2_356,
+    "capabilities/research.py": 2_111,
+    "packs/manager.py": 1_800,
+}
+DEFAULT_MODULE_SIZE_BUDGET = 2_000
 
 # ---------------------------------------------------------------------------
 # Data tables — new rules are one-line additions here.
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Rule:
     id: str
     description: str
-    pattern: re.Pattern          # matched against each physical line
-    include: tuple[str, ...]     # path prefixes (relative to src/athena/) scanned
-    exclude: tuple[str, ...]     # path prefixes exempt from VIOLATION reporting
-    allow: tuple[str, ...]       # retained for rules with narrow path exceptions
+    pattern: re.Pattern  # matched against each physical line
+    include: tuple[str, ...]  # path prefixes (relative to src/athena/) scanned
+    exclude: tuple[str, ...]  # path prefixes exempt from VIOLATION reporting
+    allow: tuple[str, ...]  # retained for rules with narrow path exceptions
     receiver_filter: str | None = None  # optional regex the text before the
-                                        # match must also match (noise gating)
+    # match must also match (noise gating)
 
 
 def _r(pattern: str) -> re.Pattern:
@@ -95,7 +113,7 @@ RULES: tuple[Rule, ...] = (
     Rule(
         id="router-construction",
         description="ModelRouter constructed outside the sanctioned site "
-                    "(src/athena/service/service.py)",
+        "(src/athena/service/service.py)",
         pattern=_r(r"\bModelRouter\s*\("),
         include=("",),
         exclude=("service/service.py", "models/", "protocol/models.py"),
@@ -104,22 +122,25 @@ RULES: tuple[Rule, ...] = (
     Rule(
         id="provider-invocation-outside-authority",
         description="direct .complete(/.stream( on a provider object outside "
-                    "src/athena/models/ and src/athena/kernel/",
+        "src/athena/models/ and src/athena/kernel/",
         pattern=_r(r"\.(?:complete|stream)\s*\("),
         include=("",),
         exclude=("models/", "kernel/"),
         allow=(),
         receiver_filter=_r(
             r"(?i)\b(?:self\.)?_?[A-Za-z_]*provider_?[A-Za-z_]*\s*\.\s*"
-            r"(?:complete|stream)\s*\("),
+            r"(?:complete|stream)\s*\("
+        ),
     ),
     Rule(
         id="subprocess-outside-approved-backends",
         description="subprocess/os.system creation outside src/athena/execution/, "
-                    "capabilities/, affordances/ (plus file allow-list)",
-        pattern=_r(r"\b(?:subprocess\.(?:run|Popen|call|check_call|check_output)"
-                   r"\s*\(|asyncio\.create_subprocess_(?:exec|shell)\s*\("
-                   r"|os\.system\s*\()"),
+        "capabilities/, affordances/ (plus file allow-list)",
+        pattern=_r(
+            r"\b(?:subprocess\.(?:run|Popen|call|check_call|check_output)"
+            r"\s*\(|asyncio\.create_subprocess_(?:exec|shell)\s*\("
+            r"|os\.system\s*\()"
+        ),
         include=("",),
         exclude=("execution/", "capabilities/", "affordances/"),
         allow=(),
@@ -135,17 +156,18 @@ RULES: tuple[Rule, ...] = (
     Rule(
         id="scheduler-watcher-inference",
         description="athena.models import or provider call inside scheduler/ "
-                    "or capabilities/watch.py",
-        pattern=_r(r"\b(?:from\s+athena\.models|import\s+athena\.models|"
-                   r"provider\s*\.\s*(?:complete|stream)\s*\()"),
+        "or capabilities/watch.py",
+        pattern=_r(
+            r"\b(?:from\s+athena\.models|import\s+athena\.models|"
+            r"provider\s*\.\s*(?:complete|stream)\s*\()"
+        ),
         include=("scheduler/", "capabilities/watch.py"),
         exclude=(),
         allow=(),
     ),
     Rule(
         id="kernel-router-construction",
-        description="kernel constructs its own ModelRouter instead of "
-                    "receiving an injected one",
+        description="kernel constructs its own ModelRouter instead of receiving an injected one",
         pattern=_r(r"self\._router\s*=[^=].*\bModelRouter\s*\("),
         include=("kernel/",),
         exclude=(),
@@ -156,6 +178,7 @@ RULES: tuple[Rule, ...] = (
 # ---------------------------------------------------------------------------
 # Checker
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Hit:
@@ -196,22 +219,30 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
     if not src_dir.is_dir():
         raise SystemExit(f"architecture-lint: {src_dir} not found")
 
-    files = sorted(
-        p for p in src_dir.rglob("*.py")
-        if not (skip_tests and "/tests/" in str(p))
-    )
+    files = sorted(p for p in src_dir.rglob("*.py") if not (skip_tests and "/tests/" in str(p)))
     for path in files:
         rel = str(path.relative_to(src_dir))
+        try:
+            line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError as exc:
+            print(f"architecture-lint: cannot read {path}: {exc}", file=sys.stderr)
+            continue
+        budget = LEGACY_SIZE_BUDGETS.get(rel, DEFAULT_MODULE_SIZE_BUDGET)
+        if line_count > budget:
+            hits.append(
+                Hit(
+                    "module-size-budget",
+                    f"{SRC}/{rel}",
+                    line_count,
+                    f"module has {line_count} lines; budget is {budget}",
+                    "violation",
+                )
+            )
         active = [(rule, _classify(rule, rel)) for rule in RULES]
         active = [(r, sev) for r, sev in active if sev]
         if not active:
             continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            print(f"architecture-lint: cannot read {path}: {exc}",
-                  file=sys.stderr)
-            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
         for lineno, line in enumerate(text.splitlines(), start=1):
             stripped = line.lstrip()
             if stripped.startswith("#"):
@@ -221,25 +252,26 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
                 if not m:
                     continue
                 if rule.receiver_filter is not None:
-                    window = line[max(0, m.start() - 60):m.end() + 1]
+                    window = line[max(0, m.start() - 60) : m.end() + 1]
                     if not rule.receiver_filter.search(window):
                         continue
                 severity = "info" if sev == "info" or _annotated_allow(rule, line) else sev
-                hits.append(Hit(rule.id, f"{SRC}/{rel}", lineno,
-                                line.strip(), severity))
+                hits.append(Hit(rule.id, f"{SRC}/{rel}", lineno, line.strip(), severity))
     return hits
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="scripts/architecture-lint",
-        description="Scan src/athena for audit-prohibited structural patterns.")
-    parser.add_argument("--root", default=str(REPO_ROOT),
-                        help="repository root (default: auto-detected)")
-    parser.add_argument("--quiet", "-q", action="store_true",
-                        help="suppress INFO (allow-listed) lines")
-    parser.add_argument("--list-rules", action="store_true",
-                        help="print the rule table and exit")
+        description="Scan src/athena for audit-prohibited structural patterns.",
+    )
+    parser.add_argument(
+        "--root", default=str(REPO_ROOT), help="repository root (default: auto-detected)"
+    )
+    parser.add_argument(
+        "--quiet", "-q", action="store_true", help="suppress INFO (allow-listed) lines"
+    )
+    parser.add_argument("--list-rules", action="store_true", help="print the rule table and exit")
     args = parser.parse_args(argv)
 
     if args.list_rules:
@@ -265,10 +297,10 @@ def main(argv: list[str] | None = None) -> int:
             rule_viol = [h for h in violations if h.rule == rule.id]
             rule_info = [h for h in infos if h.rule == rule.id]
             if rule_viol or rule_info:
-                print(f"    {rule.id}: {len(rule_viol)} violation(s), "
-                      f"{len(rule_info)} allow-listed")
-        print(f"architecture-lint: {len(violations)} violation(s), "
-              f"{len(infos)} allow-listed INFO")
+                print(
+                    f"    {rule.id}: {len(rule_viol)} violation(s), {len(rule_info)} allow-listed"
+                )
+        print(f"architecture-lint: {len(violations)} violation(s), {len(infos)} allow-listed INFO")
     else:
         print(f"architecture-lint: {len(violations)} violation(s)")
 

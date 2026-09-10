@@ -33,7 +33,8 @@ layout_json="$($native_bin --dump-layout)"
 window_strategy="$(LAYOUT_JSON="$layout_json" python3 -c '
 import json, os
 layout = json.loads(os.environ["LAYOUT_JSON"])
-print(layout.get("window_management", {}).get("strategy", "unavailable"))
+window_management = layout.get("window_management", {})
+print(window_management.get("selected_strategy", window_management.get("strategy", "unavailable")))
 ')"
 [[ "$window_strategy" != "unavailable" ]] || {
   printf '%s\n' 'native-desktop-acceptance: FAIL — native layout did not report a window-management strategy' >&2
@@ -171,31 +172,34 @@ done
   exit 1
 }
 
-# The borderless fascia uses the strategy selected from the WM's
-# _NET_SUPPORTED property. EWMH and client-managed fallback are exclusive.
+# The borderless fascia attempts EWMH when advertised, but always keeps the
+# deterministic client-managed drag armed as an adaptive fallback. A WM that
+# advertises and ignores EWMH must therefore still pass this gesture.
 window_geometry
 original_x="$window_x"
 original_y="$window_y"
 header_drag_verified=0
 if [[ "$window_strategy" == "ewmh" ]]; then
-  xdotool mousemove --window "$window" "$header_x" "$header_y"
-  xdotool mousedown --window "$window" 1
-  xdotool mousemove_relative -- 48 32
-  xdotool mouseup --window "$window" 1
-  sleep 0.2
-  window_geometry
-  if [[ "$window_x" == "$original_x" && "$window_y" == "$original_y" ]]; then
-    if [[ "${ATHENA_RELEASE_GATE:-0}" == "1" ]]; then
-      printf '%s\n' 'native-desktop-acceptance: FAIL — release gate requires Athena EWMH moveresize; host WM ignored it' >&2
-      exit 1
-    fi
-    printf '%s\n' 'native-desktop-acceptance: INFO — host WM ignored synthetic EWMH moveresize; testing managed move directly' >&2
-  else
-    header_drag_verified=1
-    printf '%s\n' 'native-desktop-acceptance: PASS — header fascia EWMH moveresize' >&2
-  fi
+  printf '%s\n' 'native-desktop-acceptance: INFO — WM advertises EWMH; exercising adaptive confirmation/fallback' >&2
 else
-  printf '%s\n' 'native-desktop-acceptance: INFO — WM lacks _NET_WM_MOVERESIZE; testing client-managed fallback' >&2
+  printf '%s\n' 'native-desktop-acceptance: INFO — WM lacks _NET_WM_MOVERESIZE; using client-managed fallback' >&2
+fi
+# Exercise the actual application gesture in both modes. When EWMH is
+# advertised, the native client attempts it and falls back after the bounded
+# confirmation window; when it is absent, the same gesture starts the client
+# mover directly. Either adaptive strategy must move the managed surface.
+xdotool mousemove --window "$window" "$header_x" "$header_y"
+xdotool mousedown --window "$window" 1
+xdotool mousemove_relative -- 48 32
+xdotool mouseup --window "$window" 1
+sleep 0.2
+window_geometry
+if [[ "$window_x" == "$original_x" && "$window_y" == "$original_y" ]]; then
+  printf '%s\n' 'native-desktop-acceptance: FAIL — adaptive header move did not change geometry' >&2
+  exit 1
+else
+  header_drag_verified=1
+  printf '%s\n' 'native-desktop-acceptance: PASS — header fascia EWMH/adaptive client moveresize' >&2
 fi
 xdotool windowmove --sync "$window" "$original_x" "$original_y"
 sleep 0.1

@@ -303,6 +303,7 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "verify": frozenset({EffectClass.READ_LOCAL}),
         "plan": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "assess": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        "critique": frozenset({EffectClass.READ_LOCAL}),
         "bundle": frozenset({EffectClass.READ_LOCAL}),
         # The bounded workflow may capture allowlisted sources, persist
         # evidence/gaps, and verify a task-scoped packet in one dispatch.
@@ -449,6 +450,6 @@ def resolve_operation_effects(
         return ()
     try:
         effects = descriptor.resolve_effects(arguments)
-    except ValueError as exc:
+    except Exception as exc:  # noqa: BLE001 - effect resolution is a fail-closed boundary
         raise CapabilityEffectError(f"capability {descriptor.id}: {exc}") from None
     return tuple(sorted(effects or (), key=lambda e: e.value))

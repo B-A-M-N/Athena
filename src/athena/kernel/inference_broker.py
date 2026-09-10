@@ -13,6 +13,8 @@ reconciled.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from dataclasses import replace
@@ -101,6 +103,39 @@ if TYPE_CHECKING:
 __all__ = ["InferenceBroker"]
 
 _logger = logging.getLogger("athena.kernel")
+
+
+def _request_fingerprint(
+    task: TaskSpec,
+    request: ModelRequest,
+    *,
+    inference_kind: str | None,
+    attempt: int,
+) -> str:
+    """Hash the exact logical provider prompt, excluding random request IDs."""
+    from athena.state.sessions import _serialize_block
+
+    payload = {
+        "task_id": task.id,
+        "kind": inference_kind or "primary",
+        "attempt": attempt,
+        "provider": request.provider,
+        "model": request.model,
+        "system": request.system,
+        "max_tokens": request.max_tokens,
+        "stop": list(request.stop),
+        "messages": [
+            {
+                "role": message.role.value,
+                "blocks": [_serialize_block(block) for block in message.blocks],
+                "metadata": dict(message.metadata or {}),
+            }
+            for message in request.messages
+        ],
+        "capabilities": [vars(capability) for capability in request.capabilities],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class InferenceBroker:
@@ -276,6 +311,53 @@ class InferenceBroker:
                     f"bounded model call cost {worst_cost} exceeds "
                     f"ceiling {effective_policy.max_cost_usd} USD"
                 )
+            request_fingerprint = _request_fingerprint(
+                task,
+                request,
+                inference_kind=inference_kind,
+                attempt=attempt,
+            )
+            response_store = getattr(self._k, "_model_response_store", None)
+            if response_store is not None:
+                receipt = await response_store.prepare(
+                    task_id=task.id,
+                    request_fingerprint=request_fingerprint,
+                    request_id=request.request_id,
+                    provider=selection_for_attempt.provider,
+                    model=selection_for_attempt.model,
+                )
+                stored_request_id = str(receipt.get("request_id") or "")
+                if stored_request_id and stored_request_id != request.request_id:
+                    request = replace(request, request_id=stored_request_id)
+                cached_response = response_store.response_from_row(receipt)
+                if cached_response is not None:
+                    state.request_id = cached_response.request_id
+                    state.provider = cached_response.provider
+                    state.model_calls += 1
+                    state.input_tokens += _input_tokens_of(
+                        cached_response, request, estimator=token_estimator
+                    )
+                    state.output_tokens += _output_tokens_of(cached_response)
+                    cached_cost = _actual_model_cost(
+                        selection_for_attempt.info,
+                        cached_response,
+                        request,
+                        estimator=token_estimator,
+                    )
+                    if cached_cost is None:
+                        state.cost_known = False
+                    state.cost += cached_cost or Decimal("0")
+                    await self._k._emit(
+                        "ModelResponseReplayed",
+                        {
+                            "provider": cached_response.provider,
+                            "model": cached_response.model,
+                            "request_id": cached_response.request_id,
+                            "attempt_index": attempt,
+                        },
+                        task,
+                    )
+                    return cached_response
             reservation = False
             if self._k._budgets is not None and worst_cost is not None:
                 await self._k._budgets.reserve_model_cost(task.id, worst_cost)
@@ -322,11 +404,21 @@ class InferenceBroker:
                 if self._k._budgets is not None:
                     async with self._k._budgets.model_call_lease(task.id):
                         response = await self._k._consume(
-                            task, state, provider, request, estimator=token_estimator
+                            task,
+                            state,
+                            provider,
+                            request,
+                            estimator=token_estimator,
+                            request_fingerprint=request_fingerprint,
                         )
                 else:
                     response = await self._k._consume(
-                        task, state, provider, request, estimator=token_estimator
+                        task,
+                        state,
+                        provider,
+                        request,
+                        estimator=token_estimator,
+                        request_fingerprint=request_fingerprint,
                     )
                 response_completed_payload: dict[str, Any] = {
                     "provider": selection_for_attempt.provider,
@@ -405,6 +497,14 @@ class InferenceBroker:
                         _bookkeeping_failure("provider usage completion record", task, exc)
                 return response
             except ProviderError as exc:
+                if response_store is not None:
+                    try:
+                        await response_store.fail(
+                            task_id=task.id,
+                            request_fingerprint=request_fingerprint,
+                        )
+                    except Exception as receipt_exc:
+                        _bookkeeping_failure("model response failure receipt", task, receipt_exc)
                 if self._k._budgets is not None and reservation and worst_cost is not None:
                     await self._k._budgets.release_model_cost(task.id, worst_cost)
                 last_err = exc
@@ -946,6 +1046,7 @@ class InferenceBroker:
         request: ModelRequest,
         *,
         estimator: ModelTokenEstimator | None = None,
+        request_fingerprint: str | None = None,
     ) -> ModelResponse:
         accumulator = ModelResponseAccumulator(request)
 
@@ -1032,6 +1133,13 @@ class InferenceBroker:
             provider_metadata={**usage_metadata, "normalized": normalized.to_dict()},
         )
         final = replace(final, usage=usage, metadata=response_metadata)
+        response_store = getattr(self._k, "_model_response_store", None)
+        if response_store is not None and request_fingerprint is not None:
+            await response_store.complete(
+                task_id=task.id,
+                request_fingerprint=request_fingerprint,
+                response=final,
+            )
         state.input_tokens += _input_tokens_of(final, request, estimator=estimator)
         state.output_tokens += _output_tokens_of(final)
         return final

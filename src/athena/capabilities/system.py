@@ -220,7 +220,7 @@ class ProcessCapability:
                 collected: list[str] = []
 
                 def walk(pid_, depth):
-                    for p, pp, pg, c in by_parent.get(pid_, []):
+                    for p, _pp, _pg, c in by_parent.get(pid_, []):
                         collected.append(f"{'  ' * depth}{p} {c}")
                         walk(p, depth + 1)
 

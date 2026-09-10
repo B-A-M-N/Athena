@@ -915,11 +915,11 @@ class ExecutionManager:
         session by guessing its ID.
         """
         # Direct task_sessions lookup
-        for rt, known_sid in self._task_sessions.get(task_id, ()):
+        for _, known_sid in self._task_sessions.get(task_id, ()):
             if known_sid == runtime_session_id:
                 return True
         # Check adopted sessions from executions of this task
-        for _exec_id, (rt, adopted_sid) in self._exec_runtimes.items():
+        for _exec_id, (_, adopted_sid) in self._exec_runtimes.items():
             if adopted_sid == runtime_session_id and self._executions.get(_exec_id) == task_id:
                 return True
         return False

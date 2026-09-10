@@ -13,13 +13,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-import ipaddress
 import logging
 import math
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
-from urllib.parse import urlsplit
-
 import httpx
 
 from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
@@ -59,6 +56,7 @@ from athena.protocol.models import (
     PrivacyClass,
     UsageInfo,
 )
+from athena.network import validate_endpoint
 
 _logger = logging.getLogger("athena.provider.openai_compat")
 
@@ -74,25 +72,6 @@ _ROLE_MAP: dict[Role, str] = {
     # generic fallback silently turn a digest into ordinary user input.
     Role.COMPRESSION: "user",
 }
-
-
-def _is_loopback_host(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-def _is_local_host(host: str) -> bool:
-    if _is_loopback_host(host):
-        return True
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return address.is_private or address.is_link_local
 
 
 def _reported_cost_usd(raw: Any) -> float | None:
@@ -234,6 +213,8 @@ class OpenAICompatProvider:
         vision: bool = False,
         audio_input: bool = False,
         audio_output: bool = False,
+        allow_insecure_remote: bool = False,
+        trust_env: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -245,6 +226,14 @@ class OpenAICompatProvider:
             if authentication not in {"none", "bearer", "required"}:
                 raise ValueError("authentication must be one of: none, bearer, required")
         self._authentication = authentication
+        endpoint = validate_endpoint(
+            self.base_url,
+            credentialed=bool(api_key) or authentication in {"bearer", "required"},
+            allow_insecure_remote=allow_insecure_remote,
+            trust_env=trust_env,
+        )
+        self._endpoint_classification = endpoint.classification
+        self._trust_env = endpoint.trust_env
         if isinstance(cost, Mapping):
             cost = CostInfo(
                 per_1m_input=_optional_float(cost.get("per_1m_input")),
@@ -269,7 +258,9 @@ class OpenAICompatProvider:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             http2=http2,
-            headers={"Authorization": f"Bearer {api_key}", **(headers or {})},
+            trust_env=self._trust_env,
+            headers=({"Authorization": f"Bearer {api_key}"} if api_key else {})
+            | dict(headers or {}),
         )
         # P2-67: per-instance stream tracking — multiple configured
         # OpenAI-compatible routes must not share cancellation bookkeeping.
@@ -292,14 +283,13 @@ class OpenAICompatProvider:
         ]
 
     def readiness(self) -> dict[str, Any]:
-        host = (urlsplit(self.base_url).hostname or "").lower()
-        local = _is_local_host(host)
+        local = self._endpoint_classification != "public"
         authentication = self._authentication
         if authentication is None:
             # Loopback is the only automatic no-credential default. Private
             # and link-local topology is reported as local but still requires
             # explicit authentication policy or a bearer credential.
-            authentication = "none" if _is_loopback_host(host) else "required"
+            authentication = "none" if self._endpoint_classification == "loopback" else "required"
         if authentication != "none" and not self._api_key_configured:
             return {
                 "state": "auth_missing",

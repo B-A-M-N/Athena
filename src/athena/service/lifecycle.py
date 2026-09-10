@@ -143,8 +143,23 @@ class ServiceLifecycle:
         # 1. State: DB + stores (migrations apply lazily on first query).
         db_path = cfg.db_path or DEFAULT_DB_PATH()
         db = Database(db_path)
-        await db._ensure_ready()  # noqa: SLF001 - apply migrations exactly once, deterministically
         self._svc._db = db
+        try:
+            await db._ensure_ready()  # noqa: SLF001 - apply migrations exactly once, deterministically
+        except Exception as exc:
+            diagnostics = await db.diagnostics()
+            self._svc._startup_health["checks"]["database"] = {
+                "status": "recovery_required",
+                "blocking": True,
+                "error": f"{type(exc).__name__}: {exc}",
+                "diagnostics": diagnostics,
+            }
+            raise
+        self._svc._startup_health["checks"]["database"] = {
+            "status": "ok",
+            "blocking": False,
+            "diagnostics": await db.diagnostics(),
+        }
         self._svc._runtime_state_root = (
             tempfile.mkdtemp(prefix="athena-runtime-")
             if db_path == ":memory:"
@@ -190,6 +205,9 @@ class ServiceLifecycle:
         from athena.state.provider_usage import ProviderUsageStore
 
         self._svc._provider_usage_store = ProviderUsageStore(db)
+        from athena.state.model_responses import ModelResponseStore
+
+        self._svc._model_response_store = ModelResponseStore(db)
         self._svc._project_index_store = ProjectIndexStore(db)
         self._svc._project_index_builder = ProjectIndexBuilder()
         self._svc._project_index_coordinator = ProjectIndexCoordinator(
@@ -544,6 +562,7 @@ class ServiceLifecycle:
             steering_store=self._svc._steering_store,
             parked_slot_wait_s=cfg.parked_slot_wait_s,
             provider_usage_store=self._svc._provider_usage_store,
+            model_response_store=self._svc._model_response_store,
             interpreter=self._svc._make_interpreter(),
             reality_coordinator=coordinator,
             secret_manager=self._svc._secrets,

@@ -164,6 +164,8 @@ class MCPConfig:
     denied_prompts: tuple[str, ...] = ()
     connect_timeout: float = 10.0
     required: bool = False
+    allow_insecure_remote: bool = False
+    trust_env: bool = False
 
 
 @dataclass(frozen=True)
@@ -370,6 +372,11 @@ class AthenaConfig:
     browser_session_scope: str = "task"
     browser_timeout_ms: int = 12_000
     browser_viewport: tuple[int, int] | None = (1024, 768)
+    # Operator-owned DNS-pinned browser proxy bounds. These values are
+    # decoded from configuration and are never accepted from task arguments.
+    browser_proxy_max_connections: int = 32
+    browser_proxy_idle_timeout_seconds: float = 60.0
+    browser_proxy_max_connection_seconds: float = 300.0
     # Operator-owned browser profiles. Models may select only the opaque key;
     # cookies/tokens and file paths never travel through task arguments.
     browser_auth_profiles: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -461,6 +468,15 @@ class AthenaConfig:
             if width <= 0 or height <= 0:
                 raise ValueError("browser_viewport dimensions must be positive")
             self.browser_viewport = (width, height)
+        self.browser_proxy_max_connections = int(self.browser_proxy_max_connections)
+        self.browser_proxy_idle_timeout_seconds = float(self.browser_proxy_idle_timeout_seconds)
+        self.browser_proxy_max_connection_seconds = float(self.browser_proxy_max_connection_seconds)
+        if not 1 <= self.browser_proxy_max_connections <= 1024:
+            raise ValueError("browser_proxy_max_connections must be between 1 and 1024")
+        if not 0.1 <= self.browser_proxy_idle_timeout_seconds <= 3600.0:
+            raise ValueError("browser_proxy_idle_timeout_seconds must be between 0.1 and 3600")
+        if not 0.1 <= self.browser_proxy_max_connection_seconds <= 86_400.0:
+            raise ValueError("browser_proxy_max_connection_seconds must be between 0.1 and 86400")
 
     @property
     def autonomy_level(self) -> AutonomyLevel:
@@ -605,6 +621,8 @@ def _parse_mcp(data: dict[str, Any]) -> MCPConfig:
         denied_prompts=tuple(str(item) for item in data.get("denied_prompts") or ()),
         connect_timeout=float(data.get("connect_timeout", 10.0)),
         required=bool(data.get("required", False)),
+        allow_insecure_remote=bool(data.get("allow_insecure_remote", False)),
+        trust_env=bool(data.get("trust_env", False)),
     )
 
 
@@ -761,6 +779,8 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
                     "denied_prompts": list(m.denied_prompts),
                     "connect_timeout": m.connect_timeout,
                     "required": m.required,
+                    "allow_insecure_remote": m.allow_insecure_remote,
+                    "trust_env": m.trust_env,
                 }.items()
                 if value is not None
             }
@@ -842,6 +862,12 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["browser_timeout_ms"] = config.browser_timeout_ms
     if config.browser_viewport != (1024, 768):
         d["browser_viewport"] = list(config.browser_viewport) if config.browser_viewport else None
+    if config.browser_proxy_max_connections != 32:
+        d["browser_proxy_max_connections"] = config.browser_proxy_max_connections
+    if config.browser_proxy_idle_timeout_seconds != 60.0:
+        d["browser_proxy_idle_timeout_seconds"] = config.browser_proxy_idle_timeout_seconds
+    if config.browser_proxy_max_connection_seconds != 300.0:
+        d["browser_proxy_max_connection_seconds"] = config.browser_proxy_max_connection_seconds
     if config.browser_auth_profiles:
         d["browser_auth_profiles"] = {
             str(name): dict(profile) for name, profile in config.browser_auth_profiles.items()
@@ -1007,6 +1033,13 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         browser_session_scope=str(data.get("browser_session_scope", "task")),
         browser_timeout_ms=int(data.get("browser_timeout_ms", 12_000)),
         browser_viewport=viewport if "browser_viewport" in data else (1024, 768),
+        browser_proxy_max_connections=int(data.get("browser_proxy_max_connections", 32)),
+        browser_proxy_idle_timeout_seconds=float(
+            data.get("browser_proxy_idle_timeout_seconds", 60.0)
+        ),
+        browser_proxy_max_connection_seconds=float(
+            data.get("browser_proxy_max_connection_seconds", 300.0)
+        ),
         browser_auth_profiles={
             str(name): dict(profile)
             for name, profile in (data.get("browser_auth_profiles") or {}).items()

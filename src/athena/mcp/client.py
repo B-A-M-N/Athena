@@ -19,14 +19,24 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from athena.network import validate_endpoint
 from athena.protocol.errors import MCPError
+
+
+_MAX_DISCOVERY_ITEMS = 4096
+_MAX_NAME_CHARS = 512
+_MAX_DESCRIPTION_CHARS = 16_384
+_MAX_CONTENT_BLOCKS = 4096
+_MAX_CONTENT_CHARS = 1_048_576
+_MAX_JSON_DEPTH = 32
+_MAX_JSON_NODES = 16_384
 
 
 def _require_sdk() -> Any:
     """Import the ``mcp`` SDK lazily; raise a clear error if it is absent."""
     try:
         mcp = importlib.import_module("mcp")
-    except Exception as exc:  # pragma: no cover - only hit when dep missing
+    except Exception as exc:  # noqa: BLE001 - optional SDK import is normalized
         raise MCPError(
             "the 'mcp' package is not installed; add the 'mcp' extra, e.g. "
             "pip install 'athena[mcp]'",
@@ -38,6 +48,14 @@ def _require_str(value: Any) -> str:
     if not isinstance(value, str) or not value:
         raise MCPError("stdio transport requires a non-empty 'command' string")
     return value
+
+
+def _headers_are_credentialed(headers: Mapping[str, str] | None) -> bool:
+    """Recognize credential-bearing headers without logging their values."""
+    return any(
+        str(name).casefold() in {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+        for name in (headers or {})
+    )
 
 
 def _new_lock() -> Any:
@@ -108,6 +126,9 @@ class MCPClient:
         headers: Mapping[str, str] | None = None,
         cwd: str | None = None,
         connect_timeout: float = 10.0,
+        allow_insecure_remote: bool = False,
+        trust_env: bool = False,
+        credentialed: bool | None = None,
         on_transport_failure: Any = None,
     ) -> None:
         if (command is not None) == (url is not None):
@@ -123,6 +144,20 @@ class MCPClient:
         self.headers = dict(headers or {})
         self.cwd = cwd
         self.connect_timeout = connect_timeout
+        self._endpoint = (
+            validate_endpoint(
+                url,
+                credentialed=(
+                    _headers_are_credentialed(headers)
+                    if credentialed is None
+                    else bool(credentialed)
+                ),
+                allow_insecure_remote=allow_insecure_remote,
+                trust_env=trust_env,
+            )
+            if url is not None
+            else None
+        )
         self._on_transport_failure = on_transport_failure
         self._session: Any = None
         self._exit_stack: Any = None
@@ -176,7 +211,7 @@ class MCPClient:
                 if stale_stack is not None:
                     try:
                         await self._bounded(stale_stack.aclose())
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - cleanup cannot mask reconnect failure
                         # The new connection attempt owns the recovery path;
                         # retain the new error if this cleanup also fails.
                         pass
@@ -184,11 +219,26 @@ class MCPClient:
                     streamablehttp_client = importlib.import_module(
                         "mcp.client.streamable_http"
                     ).streamablehttp_client
-                    http_ctx = streamablehttp_client(
-                        self.url,
-                        timeout=float(self.connect_timeout),
-                        headers=self.headers or None,
-                    )
+                    http_kwargs: dict[str, Any] = {
+                        "timeout": float(self.connect_timeout),
+                        "headers": self.headers or None,
+                    }
+                    # Newer MCP SDKs expose the underlying httpx factory;
+                    # use it to make the proxy decision explicit and keep
+                    # environment proxy variables out of the default path.
+                    if self._endpoint is not None:
+                        parameters = inspect.signature(streamablehttp_client).parameters
+                        if "httpx_client_factory" in parameters:
+                            import httpx  # noqa: PLC0415
+
+                            http_kwargs["httpx_client_factory"] = lambda: httpx.AsyncClient(
+                                trust_env=self._endpoint.trust_env
+                            )
+                        elif self._endpoint.trust_env:
+                            raise MCPError(
+                                "configured MCP SDK cannot honor the explicit proxy policy"
+                            )
+                    http_ctx = streamablehttp_client(self.url, **http_kwargs)
                     read, write, _ = await self._bounded(stack.enter_async_context(http_ctx))
                 else:
                     stdio_client = importlib.import_module("mcp.client.stdio").stdio_client
@@ -212,19 +262,19 @@ class MCPClient:
                 self._connected_at = datetime.now(timezone.utc).isoformat()
                 self._last_successful_connection = self._connected_at
                 return self
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - redact and normalize transport failures
             try:
                 await self._bounded(stack.aclose())
-            except Exception:
+            except Exception:  # noqa: BLE001 - close is best effort after transport failure
                 pass
             self._session = None
             self._exit_stack = None
             self._connected = False
-            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._last_error = "transport connection failed"
             raise MCPError(
                 f"failed to connect to MCP server {self.connection_id!r}: "
                 "transport error or server unavailable"
-            )
+            ) from exc
 
     async def close(self) -> None:
         """Close the connection, tolerating server/process crashes."""
@@ -242,7 +292,7 @@ class MCPClient:
         if stack is not None:
             try:
                 await self._bounded(stack.aclose())
-            except Exception:
+            except Exception:  # noqa: BLE001 - health bookkeeping cannot mask transport failure
                 pass
 
     async def __aenter__(self) -> "MCPClient":
@@ -279,16 +329,31 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.list_tools())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalize remote discovery failure
             self._mark_transport_failure(exc)
-            raise MCPError(f"MCP list_tools failed on {self.connection_id!r}: {exc}") from exc
+            raise MCPError(f"MCP list_tools failed on {self.connection_id!r}") from exc
+        tools = list(getattr(result, "tools", None) or ())
+        if len(tools) > _MAX_DISCOVERY_ITEMS:
+            raise MCPError("MCP tool inventory exceeds the maximum allowed count")
         out: list[MCPToolRef] = []
-        for t in result.tools:
+        seen_names: set[str] = set()
+        for t in tools:
+            name = _bounded_text(getattr(t, "name", ""), "tool name", _MAX_NAME_CHARS)
+            if name in seen_names:
+                raise MCPError("MCP tool inventory contains duplicate names")
+            seen_names.add(name)
             out.append(
                 MCPToolRef(
-                    name=t.name,
-                    description=getattr(t, "description", "") or "",
-                    input_schema=(getattr(t, "inputSchema", None) or {}) or {},
+                    name=name,
+                    description=_bounded_text(
+                        getattr(t, "description", "") or "",
+                        "tool description",
+                        _MAX_DESCRIPTION_CHARS,
+                    ),
+                    input_schema=_bounded_value(
+                        (getattr(t, "inputSchema", None) or {}) or {},
+                        label="tool schema",
+                    ),
                     annotations=_normalize_annotations(getattr(t, "annotations", None)),
                     server=self.connection_id,
                 )
@@ -301,18 +366,33 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.list_resources())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalize remote discovery failure
             self._mark_transport_failure(exc)
-            raise MCPError(f"MCP list_resources failed on {self.connection_id!r}: {exc}") from exc
-        refs = [
-            MCPResourceRef(
-                uri=r.uri,
-                name=getattr(r, "name", "") or "",
-                description=getattr(r, "description", "") or "",
-                server=self.connection_id,
+            raise MCPError(f"MCP list_resources failed on {self.connection_id!r}") from exc
+        resources = list(getattr(result, "resources", None) or ())
+        if len(resources) > _MAX_DISCOVERY_ITEMS:
+            raise MCPError("MCP resource inventory exceeds the maximum allowed count")
+        refs: list[MCPResourceRef] = []
+        seen_uris: set[str] = set()
+        for r in resources:
+            uri = _bounded_text(getattr(r, "uri", ""), "resource URI", _MAX_NAME_CHARS)
+            if uri in seen_uris:
+                raise MCPError("MCP resource inventory contains duplicate URIs")
+            seen_uris.add(uri)
+            refs.append(
+                MCPResourceRef(
+                    uri=uri,
+                    name=_bounded_text(
+                        getattr(r, "name", "") or "", "resource name", _MAX_NAME_CHARS
+                    ),
+                    description=_bounded_text(
+                        getattr(r, "description", "") or "",
+                        "resource description",
+                        _MAX_DESCRIPTION_CHARS,
+                    ),
+                    server=self.connection_id,
+                )
             )
-            for r in result.resources
-        ]
         self._resource_cache = {r.uri: r for r in refs}
         return refs
 
@@ -321,18 +401,36 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.list_prompts())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalize remote discovery failure
             self._mark_transport_failure(exc)
-            raise MCPError(f"MCP list_prompts failed on {self.connection_id!r}: {exc}") from exc
-        refs = [
-            MCPPromptRef(
-                name=p.name,
-                description=getattr(p, "description", "") or "",
-                arguments=tuple(getattr(p, "arguments", None) or []),
-                server=self.connection_id,
+            raise MCPError(f"MCP list_prompts failed on {self.connection_id!r}") from exc
+        prompts = list(getattr(result, "prompts", None) or ())
+        if len(prompts) > _MAX_DISCOVERY_ITEMS:
+            raise MCPError("MCP prompt inventory exceeds the maximum allowed count")
+        refs: list[MCPPromptRef] = []
+        seen_names: set[str] = set()
+        for p in prompts:
+            name = _bounded_text(getattr(p, "name", ""), "prompt name", _MAX_NAME_CHARS)
+            if name in seen_names:
+                raise MCPError("MCP prompt inventory contains duplicate names")
+            seen_names.add(name)
+            refs.append(
+                MCPPromptRef(
+                    name=name,
+                    description=_bounded_text(
+                        getattr(p, "description", "") or "",
+                        "prompt description",
+                        _MAX_DESCRIPTION_CHARS,
+                    ),
+                    arguments=tuple(
+                        _bounded_text(value, "prompt argument", _MAX_NAME_CHARS)
+                        for value in list(getattr(p, "arguments", None) or [])[
+                            :_MAX_DISCOVERY_ITEMS
+                        ]
+                    ),
+                    server=self.connection_id,
+                )
             )
-            for p in result.prompts
-        ]
         self._prompt_cache = {ref.name: ref for ref in refs}
         return refs
 
@@ -351,11 +449,12 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.get_prompt(name, dict(arguments or {})))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalize remote prompt failure
             self._mark_transport_failure(exc)
-            raise MCPError(
-                f"mcp get_prompt {name!r} failed on {self.connection_id!r}: {exc}"
-            ) from exc
+            raise MCPError(f"mcp get_prompt {name!r} failed on {self.connection_id!r}") from exc
+        messages = list(getattr(result, "messages", None) or ())
+        if len(messages) > _MAX_CONTENT_BLOCKS:
+            raise MCPError("MCP prompt response exceeds the maximum allowed message count")
         return [
             MCPMessage(
                 role=str(getattr(message, "role", "user")),
@@ -377,11 +476,9 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.call_tool(name, dict(arguments or {})))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalize remote tool failure
             self._mark_transport_failure(exc)
-            raise MCPError(
-                f"mcp call_tool {name!r} failed on {self.connection_id!r}: {exc}"
-            ) from exc
+            raise MCPError(f"mcp call_tool {name!r} failed on {self.connection_id!r}") from exc
         return MCPToolResult(
             is_error=_is_error(result),
             content=_render_mcp_content(getattr(result, "content", None) or []),
@@ -394,11 +491,9 @@ class MCPClient:
         try:
             async with self._lock:
                 result = await self._bounded(session.read_resource(uri))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - normalize remote resource failure
             self._mark_transport_failure(exc)
-            raise MCPError(
-                f"mcp read_resource {uri!r} failed on {self.connection_id!r}: {exc}"
-            ) from exc
+            raise MCPError(f"mcp read_resource {uri!r} failed on {self.connection_id!r}") from exc
         blocks = list(getattr(result, "contents", None) or ())
         return MCPToolResult(
             is_error=False,
@@ -416,7 +511,7 @@ class MCPClient:
         reporting a stale connected state.
         """
         self._connected = False
-        self._last_error = f"{type(exc).__name__}: {exc}"
+        self._last_error = "transport connection failed"
         self._tool_count = 0
         self._resource_cache.clear()
         self._prompt_cache.clear()
@@ -434,7 +529,7 @@ class MCPClient:
                     )
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
-            except Exception:
+            except Exception:  # noqa: BLE001 - health bookkeeping cannot mask transport failure
                 # A health callback is bookkeeping; never hide the transport
                 # failure that made the request unusable.
                 pass
@@ -466,14 +561,60 @@ def _is_error(result: Any) -> bool:
 
 def _structured(result: Any) -> Any:
     if isinstance(result, dict):
-        return result
-    return {
+        value = _bounded_value(result, label="structured tool result")
+        if len(str(value)) > _MAX_CONTENT_CHARS:
+            raise MCPError("MCP structured tool result exceeds the maximum allowed size")
+        return value
+    value = {
         "isError": bool(getattr(result, "isError", False)),
         "structuredContent": getattr(result, "structuredContent", None),
     }
+    if len(str(value)) > _MAX_CONTENT_CHARS:
+        raise MCPError("MCP structured tool result exceeds the maximum allowed size")
+    return value
+
+
+def _bounded_text(value: Any, label: str, limit: int) -> str:
+    text = str(value or "")
+    if len(text) > limit:
+        raise MCPError(f"MCP {label} exceeds the maximum allowed size")
+    return text
+
+
+def _bounded_value(value: Any, *, label: str, depth: int = 0, nodes: list[int] | None = None):
+    """Copy JSON-like remote data while enforcing depth, nodes, and strings."""
+    counter = nodes if nodes is not None else [0]
+    counter[0] += 1
+    if counter[0] > _MAX_JSON_NODES:
+        raise MCPError(f"MCP {label} exceeds the maximum allowed JSON node count")
+    if depth > _MAX_JSON_DEPTH:
+        raise MCPError(f"MCP {label} exceeds the maximum allowed JSON depth")
+    if isinstance(value, Mapping):
+        if len(value) > _MAX_DISCOVERY_ITEMS:
+            raise MCPError(f"MCP {label} exceeds the maximum allowed object size")
+        return {
+            _bounded_text(key, f"{label} key", _MAX_NAME_CHARS): _bounded_value(
+                item,
+                label=label,
+                depth=depth + 1,
+                nodes=counter,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        if len(value) > _MAX_DISCOVERY_ITEMS:
+            raise MCPError(f"MCP {label} exceeds the maximum allowed array size")
+        return [_bounded_value(item, label=label, depth=depth + 1, nodes=counter) for item in value]
+    if isinstance(value, str):
+        return _bounded_text(value, label, _MAX_CONTENT_CHARS)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _bounded_text(value, label, _MAX_CONTENT_CHARS)
 
 
 def _render_mcp_content(blocks: list) -> str:
+    if len(blocks) > _MAX_CONTENT_BLOCKS:
+        raise MCPError("MCP content exceeds the maximum allowed block count")
     parts: list[str] = []
     for b in blocks:
         if isinstance(b, dict):
@@ -498,10 +639,15 @@ def _render_mcp_content(blocks: list) -> str:
                 parts.append(str(text))
             else:
                 parts.append(str(getattr(b, "data", "") or b))
-    return "\n".join(parts)
+    rendered = "\n".join(parts)
+    if len(rendered) > _MAX_CONTENT_CHARS:
+        raise MCPError("MCP content exceeds the maximum allowed size")
+    return rendered
 
 
 def _render_resource_contents(blocks: list) -> str:
+    if len(blocks) > _MAX_CONTENT_BLOCKS:
+        raise MCPError("MCP resource exceeds the maximum allowed block count")
     parts: list[str] = []
     for b in blocks:
         if isinstance(b, dict):
@@ -512,7 +658,10 @@ def _render_resource_contents(blocks: list) -> str:
                 parts.append(str(b.get("uri", "") or b))
         else:
             parts.append(getattr(b, "text", None) or str(b))
-    return "\n".join(parts)
+    rendered = "\n".join(parts)
+    if len(rendered) > _MAX_CONTENT_CHARS:
+        raise MCPError("MCP resource exceeds the maximum allowed size")
+    return rendered
 
 
 __all__ = [

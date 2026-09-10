@@ -113,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         evidence / "static-checks.json",
         evidence / "pytest-summary.json",
         evidence / "release-scenarios.json",
+        evidence / "release-sbom.spdx.json",
     )
     for path in required_json:
         if not path.is_file():
@@ -130,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         static_checks = json.loads((evidence / "static-checks.json").read_text(encoding="utf-8"))
         pytest_summary = json.loads((evidence / "pytest-summary.json").read_text(encoding="utf-8"))
         scenarios = json.loads((evidence / "release-scenarios.json").read_text(encoding="utf-8"))
+        sbom = json.loads((evidence / "release-sbom.spdx.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return fail(f"invalid evidence JSON: {exc}")
 
@@ -163,6 +165,22 @@ def main(argv: list[str] | None = None) -> int:
         return fail("certified evidence skipped installed-artifact acceptance")
     if manifest.get("source_status") != "frozen-clean":
         return fail("artifact manifest does not identify a frozen clean source")
+    sbom_record = manifest.get("sbom")
+    if not isinstance(sbom_record, dict):
+        return fail("artifact manifest has no SBOM record")
+    if sbom_record.get("path") != "release-sbom.spdx.json":
+        return fail("artifact manifest SBOM path is not the certified evidence file")
+    sbom_binding = sbom.get("athenaBinding")
+    if not isinstance(sbom_binding, dict):
+        return fail("SBOM has no Athena source binding")
+    if sbom_binding.get("source_sha") != args.sha:
+        return fail("SBOM source binding does not match certified SHA")
+    if sbom_binding.get("cargo_lock_sha256") != manifest.get("cargo_lock_sha256"):
+        return fail("SBOM Cargo.lock binding does not match manifest")
+    if sbom_binding.get("uv_lock_sha256") != manifest.get("uv_lock_sha256"):
+        return fail("SBOM uv.lock binding does not match manifest")
+    if sha256(evidence / "release-sbom.spdx.json") != sbom_record.get("sha256"):
+        return fail("SBOM SHA-256 does not match the artifact manifest")
 
     for label, payload in (
         ("optional integrations", optional_integrations),

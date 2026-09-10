@@ -52,6 +52,24 @@ def _write_supporting_evidence(evidence: Path, sha: str, run_id: str) -> None:
     )
 
 
+def _attach_sbom(evidence: Path, manifest: dict, sha: str) -> None:
+    lock_sha = "c" * 64
+    sbom = {
+        "spdxVersion": "SPDX-2.3",
+        "athenaBinding": {"source_sha": sha, "cargo_lock_sha256": lock_sha},
+        "packages": [],
+    }
+    sbom_path = evidence / "release-sbom.spdx.json"
+    sbom_path.write_text(json.dumps(sbom))
+    manifest["cargo_lock_sha256"] = lock_sha
+    manifest["sbom"] = {
+        "path": sbom_path.name,
+        "sha256": _VERIFY["sha256"](sbom_path),
+        "component_count": 0,
+        "bound_to": {"source_sha": sha, "cargo_lock_sha256": lock_sha},
+    }
+
+
 def test_verify_release_evidence_accepts_frozen_manifest(tmp_path: Path) -> None:
     sha = "a" * 40
     run_id = "run-1"
@@ -76,6 +94,7 @@ def test_verify_release_evidence_accepts_frozen_manifest(tmp_path: Path) -> None
         ],
         "release_run_id": run_id,
     }
+    _attach_sbom(evidence, manifest, sha)
     (evidence / "release-manifest.json").write_text(json.dumps(manifest))
     (evidence / "release-identity.json").write_text(
         json.dumps({"commit_sha": sha, "release_run_id": run_id, "skip_e2e": False})
@@ -173,6 +192,7 @@ def test_verify_release_evidence_rejects_unexpected_distribution(tmp_path: Path)
         ],
         "release_run_id": run_id,
     }
+    _attach_sbom(evidence, manifest, sha)
     (evidence / "release-manifest.json").write_text(json.dumps(manifest))
     (evidence / "release-identity.json").write_text(
         json.dumps({"commit_sha": sha, "release_run_id": run_id, "skip_e2e": False})
@@ -215,6 +235,7 @@ def test_verify_release_evidence_selects_commit_run_transaction(tmp_path: Path) 
         ],
         "release_run_id": run_id,
     }
+    _attach_sbom(evidence, manifest, sha)
     (evidence / "release-manifest.json").write_text(json.dumps(manifest))
     (evidence / "release-identity.json").write_text(
         json.dumps({"commit_sha": sha, "release_run_id": run_id, "skip_e2e": False})

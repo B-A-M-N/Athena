@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -110,6 +114,46 @@ async def test_checkpoint_capture_and_restore(tmp_path: Path):
     assert (ws / "keep.txt").read_text() == "original"
     assert (ws / "sub" / "nested.txt").read_text() == "nested"
     assert not (ws / "extra.txt").exists(), "file added after capture should be removed on restore"
+
+
+def test_shadow_checkpoint_worker_has_no_state_execution_import_cycle(tmp_path: Path):
+    """The isolated clone worker must start from a clean interpreter.
+
+    Importing ``athena.state.database`` first used to enter the eager
+    ``athena.execution`` and ``athena.state`` package initializers in a cycle.
+    The speculative restart path exercises this worker, so keep the boundary
+    regression explicit rather than relying only on the parent process import
+    order used by the rest of the suite.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value.txt").write_text("value", encoding="utf-8")
+    state = tmp_path / "state"
+    env = os.environ.copy()
+    repo_src = str(Path(__file__).parents[3] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(item for item in (repo_src, env.get("PYTHONPATH")) if item)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "athena.causal.checkpoint_worker",
+            "clone",
+            "--root",
+            str(state),
+            "--checkpoint-id",
+            "branch_test",
+            "--workspace-root",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert json.loads(result.stdout)["base_manifest"]
 
 
 async def test_checkpoint_inspects_immutable_metadata(tmp_path: Path):

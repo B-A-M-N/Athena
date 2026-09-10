@@ -7,6 +7,12 @@ from athena.network.transport import (
 )
 from athena.network.target_policy import ValidatedTarget, validate_target
 from athena.network.browser_proxy import BrowserProxyConfig
+from athena.network.endpoint_security import (
+    EndpointIdentity,
+    EndpointSecurityError,
+    classify_endpoint,
+    validate_endpoint,
+)
 
 __all__ = [
     "ValidatedTarget",
@@ -15,4 +21,8 @@ __all__ = [
     "resolve_addresses",
     "validate_target",
     "BrowserProxyConfig",
+    "EndpointIdentity",
+    "EndpointSecurityError",
+    "classify_endpoint",
+    "validate_endpoint",
 ]

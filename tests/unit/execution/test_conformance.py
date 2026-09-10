@@ -15,7 +15,11 @@ class _ConformanceManager:
         return {
             "supported_runtimes": ("python", "shell", "node"),
             "runtime_capabilities": {
-                runtime: {"persistent_runtime_state": True}
+                runtime: {
+                    "persistent_runtime_state": True,
+                    "reattach": True,
+                    "process_signals": True,
+                }
                 for runtime in ("python", "shell", "node")
             },
         }
@@ -45,6 +49,7 @@ async def test_conformance_executes_every_advertised_persistent_cell():
     assert {receipt.runtime for receipt in receipts} == {"python", "shell", "node"}
     assert all(receipt.passed for receipt in receipts), receipts
     assert all("persistent_runtime_state" in receipt.checks for receipt in receipts)
+    assert all("reattach" in receipt.unverified_claims for receipt in receipts)
 
 
 @pytest.mark.asyncio

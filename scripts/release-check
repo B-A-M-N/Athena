@@ -406,6 +406,13 @@ def main(argv: list[str] | None = None) -> int:
                         evidence_stage / "release-manifest.json",
                         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                     )
+                    sbom = manifest.get("sbom")
+                    if not isinstance(sbom, dict) or not sbom.get("path"):
+                        raise RuntimeError("release artifact manifest has no SBOM record")
+                    sbom_source = checkout / "release-artifacts" / str(sbom["path"])
+                    if not sbom_source.is_file():
+                        raise RuntimeError("release artifact manifest SBOM file is missing")
+                    shutil.copy2(sbom_source, evidence_stage / sbom_source.name)
                     artifact_evidence = evidence_stage / "distributions"
                     if artifact_evidence.exists():
                         raise RuntimeError(
@@ -462,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
                 "mypy",
                 "compileall",
                 "dependency-audit",
+                "rust-supply-chain",
+                "static-critical",
                 "uv-lock-check",
             }
             _write_json(

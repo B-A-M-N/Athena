@@ -178,6 +178,8 @@ async def test_operator_grant_binds_schedule_control_to_task_without_bearer_toke
     )
     assert grant is not None
     assert "control_token" not in grant
+    stored = await api._scheduler._store.get_job_id(created["job_id"])
+    assert all("token" not in item for item in stored["metadata"]["_delegated_control_grants"])
 
     delegated = ScheduleControl(
         origin="model",

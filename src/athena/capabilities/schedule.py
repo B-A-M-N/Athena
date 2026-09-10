@@ -67,7 +67,6 @@ class ScheduleControl:
     resource_budget: Any = None
     workspace: Any = None
     autonomy: Any = None
-    grant_token: str | None = None
     narrow_to_caller: bool = False
 
 
@@ -195,16 +194,11 @@ def _grant_allows(grant: Mapping[str, Any], *, operation: str, now: datetime) ->
 
 
 def _grant_matches_control(grant: Mapping[str, Any], control: ScheduleControl) -> bool:
-    authorized_by_token = bool(control.grant_token and control.grant_token == grant.get("token"))
-    if not authorized_by_token:
-        expected_task = grant.get("grantee_task_id") or grant.get("creator_task_id")
-        if expected_task and expected_task != control.task_id:
-            return False
-        if (
-            grant.get("creator_session_id")
-            and grant.get("creator_session_id") != control.session_id
-        ):
-            return False
+    expected_task = grant.get("grantee_task_id") or grant.get("creator_task_id")
+    if expected_task and expected_task != control.task_id:
+        return False
+    if grant.get("creator_session_id") and grant.get("creator_session_id") != control.session_id:
+        return False
     for key in ("principal_id", "project_id"):
         if grant.get(key) and grant.get(key) != getattr(control, key):
             return False
@@ -752,7 +746,6 @@ class ScheduleAPI:
         )
         authority["authority_digest"] = _authority_digest(authority)
         control_grant = {
-            "token": new_id("schedule-token"),
             "schedule_id": job_id,
             "creator_task_id": owner_data.get("task_id"),
             "creator_session_id": owner_data.get("session_id"),
@@ -863,7 +856,6 @@ class ScheduleAPI:
             raise PermissionError("caller authority cannot grant schedule control")
         authority = (job.get("metadata") or {}).get("_authority_snapshot") or {}
         grant = {
-            "token": new_id("schedule-token"),
             "schedule_id": job_id,
             "principal_id": principal_id,
             "project_id": project_id,

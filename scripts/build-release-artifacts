@@ -106,6 +106,7 @@ if canonical_version(native_version) != python_version:
         f"{native_version} != {python_version}"
     )
 lock_text = (root / "native" / "Cargo.lock").read_text()
+lock_data = tomllib.loads(lock_text)
 binary = root / "native" / "target" / "release" / "athena-terminal"
 bridge = (root / "src" / "athena" / "cli" / "native_bridge.py").read_text()
 bridge_version = next(
@@ -140,6 +141,47 @@ alacritty_match = re.search(
     r'source = "git\+[^#]+#([0-9a-f]+)"',
     lock_text,
 )
+sbom_packages = []
+cargo_lock_sha256 = sha(root / "native" / "Cargo.lock")
+python_lock_path = root / "uv.lock"
+python_lock_sha256 = sha(python_lock_path) if python_lock_path.is_file() else "unavailable"
+for package_index, package in enumerate(lock_data.get("package", []), 1):
+    if not isinstance(package, dict):
+        continue
+    sbom_package = {
+        "SPDXID": "SPDXRef-Cargo-" + str(package_index) + "-" + re.sub(
+            r"[^A-Za-z0-9.-]", "-", package["name"] + "-" + package["version"]
+        ),
+        "name": package["name"],
+        "versionInfo": package["version"],
+        "downloadLocation": package.get("source", "NOASSERTION"),
+        "licenseConcluded": "NOASSERTION",
+        "licenseDeclared": "NOASSERTION",
+    }
+    if package.get("checksum"):
+        sbom_package["checksums"] = [
+            {"algorithm": "SHA256", "checksumValue": package["checksum"]}
+        ]
+    sbom_packages.append(sbom_package)
+sbom = {
+    "spdxVersion": "SPDX-2.3",
+    "dataLicense": "CC0-1.0",
+    "SPDXID": "SPDXRef-DOCUMENT",
+    "name": "athena-native-dependencies",
+    "documentNamespace": f"https://athena.invalid/release/{source_sha}/sbom",
+    "creationInfo": {
+        "created": datetime.now(timezone.utc).isoformat(),
+        "creators": ["Tool: Athena release builder"],
+    },
+    "athenaBinding": {
+        "source_sha": source_sha,
+        "cargo_lock_sha256": cargo_lock_sha256,
+        "uv_lock_sha256": python_lock_sha256,
+    },
+    "packages": sbom_packages,
+}
+sbom_path = out / "release-sbom.spdx.json"
+sbom_path.write_text(json.dumps(sbom, indent=2, sort_keys=True) + "\n")
 record = {
     "format": 1,
     "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -153,7 +195,8 @@ record = {
     "python_version": python_version,
     "native_version": native_version,
     "native_package_version": native_package_version,
-    "cargo_lock_sha256": sha(root / "native" / "Cargo.lock"),
+    "cargo_lock_sha256": cargo_lock_sha256,
+    "uv_lock_sha256": python_lock_sha256,
     "alacritty_git_revision": (
         alacritty_match.group(1) if alacritty_match is not None else "unavailable"
     ),
@@ -168,6 +211,16 @@ record = {
         "dynamic_section": native_dynamic,
     },
     "native_abi_policy": native_abi,
+    "sbom": {
+        "path": sbom_path.name,
+        "sha256": sha(sbom_path),
+        "component_count": len(sbom_packages),
+        "bound_to": {
+            "source_sha": source_sha,
+            "cargo_lock_sha256": cargo_lock_sha256,
+            "uv_lock_sha256": python_lock_sha256,
+        },
+    },
     "bridge_schema_version": int(bridge_version),
     "artifacts": artifacts,
 }

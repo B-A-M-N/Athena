@@ -9,6 +9,7 @@
 """
 
 from __future__ import annotations
+from datetime import datetime, timedelta
 import pytest
 
 from athena.capabilities.dispatcher import CapabilityDispatcher
@@ -110,6 +111,48 @@ def test_denied_approval_grant_is_rejected():
         raised = True
     assert raised
     assert mgr.covers_request(_principal_request()) is None
+
+
+@pytest.mark.athena_claim("BHV-046")
+@pytest.mark.athena_evidence("test", "security")
+def test_expired_task_grant_cannot_be_inherited_by_a_later_request():
+    mgr = ApprovalManager()
+    aid = mgr.create_request(
+        _principal(),
+        ApprovalScope.TASK,
+        capability="files.write",
+        effect="WRITE_LOCAL",
+        task_id="t1",
+        expires_at=datetime.now() - timedelta(seconds=1),
+    )
+    mgr.grant(aid)
+    assert mgr.covers_request(_principal_request()) is None
+    assert mgr.state(aid).value == "expired"
+
+
+@pytest.mark.athena_claim("BHV-047")
+@pytest.mark.athena_evidence("test", "security")
+def test_approval_scope_never_widens_across_capability_or_effect():
+    mgr = ApprovalManager()
+    aid = mgr.create_request(
+        _principal(),
+        ApprovalScope.TASK,
+        capability="files.write",
+        effect="WRITE_LOCAL",
+        task_id="t1",
+    )
+    mgr.grant(aid)
+    read_request = _policy_request(cap="files.read")
+    assert mgr.covers_request(read_request) is None
+    external_request = PolicyRequest(
+        principal=_principal(),
+        task_id="t1",
+        capability_id="files.write",
+        arguments={"path": "/ws/a", "content": "x"},
+        workspace=WorkspaceSpec(id="w", root="/ws"),
+        effects=frozenset({EffectClass.NETWORK_WRITE}),
+    )
+    assert mgr.covers_request(external_request) is None
 
 
 class _DeniedExecutor:

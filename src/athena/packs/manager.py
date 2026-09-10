@@ -24,7 +24,12 @@ from typing import Any, Mapping
 
 from athena.packs.models import PackManifest, PackState
 from athena.mcp.client import MCPClient
-from athena.network import pinned_sync_transport, validate_target
+from athena.network import (
+    classify_endpoint,
+    pinned_sync_transport,
+    validate_endpoint,
+    validate_target,
+)
 from athena.protocol.ids import stable_id
 from athena.protocol.messages import utcnow
 from athena.protocol.tasks import CapabilityPolicy, TrustedTaskMetadata
@@ -223,7 +228,7 @@ class PackManager:
                     _hook_outbox_row=row,
                 )
                 await callback(event)
-            except Exception as exc:  # recovery remains retryable
+            except Exception as exc:  # noqa: BLE001 - recovery remains retryable
                 kwargs = {"claim_token": row.get("claim_token")} if row.get("claim_token") else {}
                 await self._hook_outbox.mark_failed(str(row.get("id") or ""), str(exc), **kwargs)
             else:
@@ -249,7 +254,7 @@ class PackManager:
                 except asyncio.CancelledError:
                     self._hook_health["state"] = "stopped"
                     raise
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - one retry iteration must not stop the dispatcher
                     self._hook_health.update(
                         state="degraded",
                         last_error_at=utcnow().isoformat(),
@@ -317,10 +322,21 @@ class PackManager:
         parsed = urllib.parse.urlparse(str(source_url))
         if parsed.scheme not in {"https", "http"} or not parsed.netloc:
             raise ValueError("remote pack source must be an http(s) URL")
+        endpoint = validate_endpoint(
+            str(source_url),
+            credentialed=False,
+            allow_insecure_remote=classify_endpoint(str(source_url)) == "loopback",
+        )
+        if endpoint.scheme != "https" and not endpoint.loopback:
+            raise ValueError("non-loopback remote packs require HTTPS")
         target = _govern_remote_target(str(source_url), network_policy)
         expected = str(expected_sha256 or "").lower()
         if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
             raise ValueError("expected_sha256 must be a 64-character hex digest")
+        if not expected and not endpoint.loopback:
+            raise ValueError(
+                "non-loopback remote packs require an operator-provided expected_sha256"
+            )
         quarantine = Path(tempfile.mkdtemp(prefix=".pack-quarantine-", dir=str(self._root)))
         archive = quarantine / "source.archive"
         try:
@@ -359,6 +375,13 @@ class PackManager:
                 "manifest": manifest.to_record(computed_integrity=integrity),
                 "quarantined": True,
                 "operator_approval_required": True,
+                "authenticity": {
+                    "transport": endpoint.scheme,
+                    "endpoint_classification": endpoint.classification,
+                    "archive_sha256": archive_hash,
+                    "operator_expected_sha256": expected or None,
+                    "operator_approved": False,
+                },
             }
         finally:
             shutil.rmtree(quarantine, ignore_errors=True)
@@ -383,7 +406,7 @@ class PackManager:
             entries.append((mtime, size, entry))
         total = sum(size for _mtime, size, _entry in entries)
         target = max(0, _REMOTE_CONTENT_CACHE_LIMIT - max(0, int(reserve_bytes)))
-        for mtime, size, entry in sorted(entries):
+        for _, size, entry in sorted(entries):
             if total <= target:
                 break
             shutil.rmtree(entry, ignore_errors=True)
@@ -470,7 +493,7 @@ class PackManager:
         if enable and self._integrations_bound:
             try:
                 await self._activate(state)
-            except Exception:
+            except Exception:  # noqa: BLE001 - disable durable state after admission failure
                 # Do not leave a durable enabled bit for a pack whose live
                 # contributions failed admission.
                 await self._store.set_enabled(manifest.id, False)
@@ -510,7 +533,7 @@ class PackManager:
                     raise RuntimeError(f"upgraded pack disappeared: {manifest.id}")
                 try:
                     await self._activate(enabled)
-                except Exception:
+                except Exception:  # noqa: BLE001 - optional contribution may already be gone
                     await self._store.set_enabled(manifest.id, False)
                     # The old contribution rows were removed before activation,
                     # so restore the prior durable state and live surface when
@@ -518,11 +541,11 @@ class PackManager:
                     try:
                         await self._store.save(prior)
                         await self._activate(prior)
-                    except Exception as restore_error:
+                    except Exception as restore_error:  # noqa: BLE001 - report restore failure
                         raise RuntimeError(
                             f"pack upgrade failed and prior version could not be "
                             f"restored: {restore_error}"
-                        )
+                        ) from restore_error
                     raise
                 self._remove_installed_path(prior.install_path)
                 return enabled
@@ -548,7 +571,7 @@ class PackManager:
         if self._integrations_bound:
             try:
                 await self._activate(state)
-            except Exception:
+            except Exception:  # noqa: BLE001 - disable durable state after reactivation failure
                 await self._store.set_enabled(pack_id, False)
                 raise
         if self._hook_outbox is not None:
@@ -633,7 +656,7 @@ class PackManager:
                 contributions.extend(created)
                 for kind, contribution_id in created:
                     await self._save_contribution(state.id, kind, contribution_id)
-        except Exception:
+        except Exception:  # noqa: BLE001 - deactivate partial contributions during rollback
             await self._deactivate(state, remove=True)
             raise
 
@@ -687,7 +710,7 @@ class PackManager:
                 registry = self._fabric.global_registry
                 try:
                     descriptor = registry.resolve(contribution_id)
-                except Exception:
+                except Exception:  # noqa: BLE001 - optional contribution may already be gone
                     descriptor = None
                 if descriptor is not None and descriptor.origin.value == "plugin":
                     registry.unregister(contribution_id)
@@ -695,7 +718,7 @@ class PackManager:
                 registry = self._fabric.global_registry
                 try:
                     descriptor = registry.resolve(contribution_id)
-                except Exception:
+                except Exception:  # noqa: BLE001 - optional contribution may already be gone
                     descriptor = None
                 if descriptor is not None and descriptor.origin.value == "plugin":
                     registry.unregister(contribution_id)
@@ -953,7 +976,7 @@ class PackManager:
                                     "pack hook dispatch completion lost lease for %s",
                                     hook_task_id,
                                 )
-                    except Exception as exc:  # hook failures do not break event append
+                    except Exception as exc:  # noqa: BLE001 - hook failures do not break event append
                         if self._hook_outbox is not None and outbox_row is not None:
                             kwargs = (
                                 {"claim_token": outbox_row.get("claim_token")}
@@ -1003,11 +1026,11 @@ class PackManager:
                 )
                 await self._skill_lifecycle.install(skill)
                 results.append(("skill", skill_id))
-        except Exception:
+        except Exception:  # noqa: BLE001 - roll back installed skills, then preserve failure
             for _, skill_id in results:
                 try:
                     await self._skill_lifecycle.archive(skill_id)
-                except Exception:
+                except Exception:  # noqa: BLE001 - rollback is best effort after failed activation
                     pass
             raise
         return results
@@ -1080,12 +1103,12 @@ class PackManager:
                         if self._mcp_client_sink is not None:
                             self._mcp_client_sink(client)
                         created.append(("mcp", connection_id))
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - clean up failed MCP admission
                         self._mcp_adapter.unregister_connection(connection_id)
                         if client is not None:
                             await client.close()
                         raise
-        except Exception:
+        except Exception:  # noqa: BLE001 - roll back installed workflows, then preserve failure
             for _, connection_id in created:
                 if self._mcp_adapter is not None:
                     self._mcp_adapter.unregister_connection(connection_id)
@@ -1166,11 +1189,11 @@ class PackManager:
                     )
                 await self._workflow_store.save(workflow)
                 saved.append(workflow.id)
-        except Exception:
+        except Exception:  # noqa: BLE001 - roll back saved workflows
             for workflow_id in saved:
                 try:
                     await self._workflow_store.delete(workflow_id)
-                except Exception:
+                except Exception:  # noqa: BLE001 - rollback is best effort after failed activation
                     pass
             raise
         return [("workflow", workflow.id) for workflow in workflows]
@@ -1228,7 +1251,7 @@ class PackManager:
                     )
                     registry.register(alias, authority=f"pack:{state.id}")
                     created.append(alias_id)
-        except Exception:
+        except Exception:  # noqa: BLE001 - roll back registered instruments
             for alias_id in created:
                 registry.unregister(alias_id)
             raise
@@ -1274,7 +1297,7 @@ class PackManager:
                         continue
                     registry.register(alias, authority=f"pack:{state.id}")
                     results.append(("capability", alias_id))
-        except Exception:
+        except Exception:  # noqa: BLE001 - roll back registered capability aliases
             for _, alias_id in results:
                 registry.unregister(alias_id)
             raise
@@ -1375,7 +1398,7 @@ def _parse_manifest(raw: Mapping[str, Any]) -> PackManifest:
     if not isinstance(provides_raw, Mapping):
         raise ValueError("pack provides must be a table")
     provides: dict[str, tuple[str, ...]] = {}
-    for kind, suffixes in _PROVIDED_FILES.items():
+    for kind, _suffixes in _PROVIDED_FILES.items():
         value = provides_raw.get(kind) or ()
         if not isinstance(value, (list, tuple)):
             raise ValueError(f"pack provides.{kind} must be an array")
@@ -1648,7 +1671,7 @@ def _inside(root: Path, target: Path) -> bool:
 def _registered(registry: Any, capability_id: str) -> bool:
     try:
         registry.resolve(capability_id)
-    except Exception:
+    except Exception:  # noqa: BLE001 - registry lookup treats missing optional capability as false
         return False
     return True
 

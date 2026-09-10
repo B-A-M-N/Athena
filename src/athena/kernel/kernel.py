@@ -21,6 +21,7 @@ pseudocode (BUILDSPEC §§17-18):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 from dataclasses import dataclass, field, replace
@@ -314,8 +315,16 @@ def _assistant_message(task: TaskSpec, response: ModelResponse) -> Message:
         metadata["inference_receipt"] = receipt.to_dict()
     except Exception as exc:
         _logger.warning("could not build inference receipt: %s", exc)
+    if response.request_id:
+        identity = hashlib.sha256(
+            f"assistant-response\0{task.id}\0{response.request_id}".encode("utf-8")
+        ).hexdigest()[:32]
+        message_id = f"msg_assistant_{identity}"
+        metadata["response_identity"] = f"{task.id}:{response.request_id}"
+    else:
+        message_id = new_id("msg")
     return Message(
-        id=new_id("msg"),
+        id=message_id,
         role=Role.ASSISTANT,
         blocks=blocks,
         created_at=utcnow(),
@@ -484,6 +493,7 @@ class AgentKernel:
         budgets=None,
         cancellations=None,
         provider_usage_store=None,
+        model_response_store=None,
         continuation_store=None,
         workflow_run_store=None,
         input_request_store=None,
@@ -516,6 +526,7 @@ class AgentKernel:
         self._token_sink = token_sink
         self._dispatch_factory = dispatch_factory
         self._provider_usage_store = provider_usage_store
+        self._model_response_store = model_response_store
         self._continuation_store = continuation_store
         self._workflow_run_store = workflow_run_store
         # Operator-clarification continuation: a model-issued request_input
@@ -1457,9 +1468,15 @@ class AgentKernel:
         request: ModelRequest,
         *,
         estimator: ModelTokenEstimator | None = None,
+        request_fingerprint: str | None = None,
     ) -> ModelResponse:
         return await InferenceBroker(self)._consume(
-            task, state, provider, request, estimator=estimator
+            task,
+            state,
+            provider,
+            request,
+            estimator=estimator,
+            request_fingerprint=request_fingerprint,
         )
 
     async def _relay_delta(self, task: TaskSpec, delta: ModelDelta) -> None:
@@ -1735,7 +1752,11 @@ class AgentKernel:
         if response.request_id and response.request_id in self._stored_responses:
             return
         message = _assistant_message(task, response)
-        await self._messages.append(message)
+        appended = await self._append_assistant_message(message)
+        if not appended:
+            if response.request_id:
+                self._stored_responses.add(response.request_id)
+            return
         await self._emit(
             "TaskMessage",
             {
@@ -1747,6 +1768,15 @@ class AgentKernel:
         )
         if response.request_id:
             self._stored_responses.add(response.request_id)
+
+    async def _append_assistant_message(self, message: Message) -> bool:
+        """Persist an assistant response through the durable replay boundary."""
+        append_idempotent = getattr(self._messages, "append_idempotent", None)
+        if append_idempotent is not None:
+            return bool(await append_idempotent(message))
+        # Narrow compatibility path for test doubles and legacy adapters.
+        await self._messages.append(message)
+        return True
 
     async def _append_final_response(self, task: TaskSpec, response: ModelResponse) -> None:
         return await RunFinalizer(self)._append_final_response(task, response)

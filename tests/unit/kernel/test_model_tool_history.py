@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from athena.kernel.kernel import AgentKernel, _assistant_message
+from athena.kernel.inference_broker import _request_fingerprint
 from athena.models.providers.anthropic import AnthropicProvider
 from athena.models.providers.openai_compat import OpenAICompatProvider
 from athena.protocol.messages import (
@@ -53,6 +54,55 @@ def test_assistant_message_preserves_reasoning_text_and_calls():
         CapabilityCallBlock,
     ]
     assert message.blocks[-1].call_id == "tool-1"
+
+
+def test_assistant_message_identity_is_stable_for_replay():
+    task = TaskSpec(id="task-1", objective="inspect", session_id="session-1")
+    assert _assistant_message(task, _response()).id == _assistant_message(task, _response()).id
+
+
+def test_provider_receipt_fingerprint_excludes_transport_request_id():
+    task = TaskSpec(id="task-1", objective="inspect")
+    first = ModelRequest(
+        messages=(
+            Message(
+                id="message-1",
+                role=Role.USER,
+                blocks=(TextBlock(text="inspect"),),
+                created_at=None,
+                provenance=None,
+            ),
+        ),
+        model="m",
+        provider="p",
+        request_id="random-a",
+    )
+    retry = ModelRequest(
+        messages=first.messages,
+        model="m",
+        provider="p",
+        request_id="random-b",
+    )
+    changed = ModelRequest(
+        messages=(
+            Message(
+                id="message-2",
+                role=Role.USER,
+                blocks=(TextBlock(text="inspect again"),),
+                created_at=None,
+                provenance=None,
+            ),
+        ),
+        model="m",
+        provider="p",
+        request_id="random-c",
+    )
+    assert _request_fingerprint(
+        task, first, inference_kind=None, attempt=0
+    ) == _request_fingerprint(task, retry, inference_kind=None, attempt=0)
+    assert _request_fingerprint(
+        task, first, inference_kind=None, attempt=0
+    ) != _request_fingerprint(task, changed, inference_kind=None, attempt=0)
 
 
 @pytest.mark.athena_scenario("COMPAT-002")

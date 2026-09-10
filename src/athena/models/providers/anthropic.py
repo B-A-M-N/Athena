@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import logging
 import math
+import inspect
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from typing import Any
@@ -57,6 +58,7 @@ from athena.protocol.models import (
     PrivacyClass,
     UsageInfo,
 )
+from athena.network import validate_endpoint
 
 _PATH = "/v1/messages"
 _CACHEABLE_MODES = frozenset({"session-key", "explicit-cache-api"})
@@ -215,6 +217,8 @@ class AnthropicProvider:
         use_sdk: bool = True,
         cost: CostInfo | Mapping[str, object] | None = None,
         latency_class: str | None = None,
+        allow_insecure_remote: bool = False,
+        trust_env: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -232,6 +236,14 @@ class AnthropicProvider:
         self._latency_class = latency_class
         self._api_key = api_key
         self._api_key_configured = bool(api_key)
+        endpoint = validate_endpoint(
+            self.base_url,
+            credentialed=bool(api_key),
+            allow_insecure_remote=allow_insecure_remote,
+            trust_env=trust_env,
+        )
+        self._endpoint_classification = endpoint.classification
+        self._trust_env = endpoint.trust_env
         self._timeout = timeout
         self._headers = dict(headers or {})
         self._anthropic = _load_anthropic() if use_sdk else None
@@ -246,6 +258,7 @@ class AnthropicProvider:
                 )
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self._timeout),
+                trust_env=self._trust_env,
                 headers={
                     "x-api-key": self._api_key,
                     "anthropic-version": "2023-06-01",
@@ -270,9 +283,10 @@ class AnthropicProvider:
         ]
 
     def readiness(self) -> dict[str, str | bool]:
+        local = self._endpoint_classification != "public"
         if not self._api_key_configured:
-            return {"state": "auth_missing", "kind": "anthropic", "local": False}
-        return {"state": "ready", "kind": "anthropic", "local": False}
+            return {"state": "auth_missing", "kind": "anthropic", "local": local}
+        return {"state": "ready", "kind": "anthropic", "local": local}
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         if self._anthropic is not None:
@@ -291,9 +305,25 @@ class AnthropicProvider:
 
     async def _complete_sdk(self, request: ModelRequest) -> ModelEvent:
         assert self._anthropic is not None  # guarded by `complete` before dispatch
-        client = self._anthropic.AsyncAnthropic(api_key=self._api_key, base_url=self.base_url)
+        sdk_kwargs: dict[str, Any] = {}
+        http_client: httpx.AsyncClient | None = None
+        if "http_client" in inspect.signature(self._anthropic.AsyncAnthropic).parameters:
+            http_client = httpx.AsyncClient(trust_env=self._trust_env)
+            sdk_kwargs["http_client"] = http_client
+        elif not self._trust_env:
+            raise ProviderUnavailable(
+                f"{self.provider} SDK cannot honor Athena's explicit proxy policy"
+            )
+        client = self._anthropic.AsyncAnthropic(
+            api_key=self._api_key,
+            base_url=self.base_url,
+            **sdk_kwargs,
+        )
         kwargs = self._build_kwargs(request, stream=False)
-        response = await client.messages.create(**kwargs)
+        try:
+            response = await client.messages.create(**kwargs)
+        finally:
+            await client.close()
         blocks: list[ContentBlock] = []
         for content in response.content:
             if content.type == "text" and getattr(content, "text", None):

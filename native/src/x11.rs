@@ -1073,6 +1073,56 @@ enum WindowMoveStrategy {
     ClientManagedFallback,
 }
 
+const EWMH_GESTURE_GRACE: Duration = Duration::from_millis(80);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowMoveTelemetry {
+    ewmh_advertised: bool,
+    ewmh_attempted: bool,
+    ewmh_confirmed: bool,
+    active_strategy: &'static str,
+    fallback_reason: Option<&'static str>,
+}
+
+impl WindowMoveTelemetry {
+    fn for_strategy(strategy: WindowMoveStrategy) -> Self {
+        Self {
+            ewmh_advertised: strategy.uses_ewmh(),
+            ewmh_attempted: false,
+            ewmh_confirmed: false,
+            active_strategy: if strategy.uses_ewmh() {
+                "ewmh_preferred"
+            } else {
+                "client_managed"
+            },
+            fallback_reason: None,
+        }
+    }
+
+    fn begin_ewmh(&mut self) {
+        self.ewmh_attempted = true;
+        self.active_strategy = "ewmh_preferred";
+    }
+
+    fn confirm_ewmh(&mut self) {
+        if !self.fallback_used() {
+            self.ewmh_confirmed = true;
+            self.active_strategy = "ewmh_confirmed";
+        }
+    }
+
+    fn activate_fallback(&mut self, reason: &'static str) {
+        if !self.ewmh_confirmed {
+            self.active_strategy = "client_managed";
+            self.fallback_reason = Some(reason);
+        }
+    }
+
+    fn fallback_used(self) -> bool {
+        self.fallback_reason.is_some()
+    }
+}
+
 impl WindowMoveStrategy {
     fn name(self) -> &'static str {
         match self {
@@ -1123,9 +1173,8 @@ fn net_supported_contains(display: *mut Display, screen: c_int, wanted: &str) ->
         )
     };
     let found = if status == 0 && actual_format == 32 && !data.is_null() {
-        let atoms = unsafe {
-            std::slice::from_raw_parts(data.cast::<c_ulong>(), item_count as usize)
-        };
+        let atoms =
+            unsafe { std::slice::from_raw_parts(data.cast::<c_ulong>(), item_count as usize) };
         atoms.iter().any(|atom| *atom == wanted_atom)
     } else {
         false
@@ -1140,10 +1189,19 @@ fn window_management_diagnostics(
     display: *mut Display,
     screen: c_int,
     strategy: WindowMoveStrategy,
+    telemetry: WindowMoveTelemetry,
 ) -> serde_json::Value {
     serde_json::json!({
         "moveresize_supported": strategy.uses_ewmh(),
-        "strategy": strategy.name(),
+        "selected_strategy": strategy.name(),
+        "strategy": telemetry.active_strategy,
+        "adaptive": true,
+        "ewmh_advertised": telemetry.ewmh_advertised,
+        "ewmh_attempted": telemetry.ewmh_attempted,
+        "ewmh_confirmed": telemetry.ewmh_confirmed,
+        "active_strategy": telemetry.active_strategy,
+        "fallback_reason": telemetry.fallback_reason,
+        "client_managed_fallback": true,
         "protocol": "_NET_WM_MOVERESIZE",
         "source_indication": 1,
         "display": env::var("DISPLAY").unwrap_or_else(|_| "unknown".to_owned()),
@@ -1161,6 +1219,30 @@ struct WindowDrag {
     start_window_y: i32,
     start_width: i32,
     start_height: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingEwmhGesture {
+    drag: WindowDrag,
+    configure_events_at_start: u64,
+    deadline: Instant,
+}
+
+impl PendingEwmhGesture {
+    fn new(drag: WindowDrag, configure_events: u64) -> Self {
+        Self {
+            drag,
+            configure_events_at_start: configure_events,
+            deadline: Instant::now() + EWMH_GESTURE_GRACE,
+        }
+    }
+
+    fn geometry_changed(self, x: i32, y: i32, width: i32, height: i32) -> bool {
+        x != self.drag.start_window_x
+            || y != self.drag.start_window_y
+            || width != self.drag.start_width
+            || height != self.drag.start_height
+    }
 }
 
 impl WindowDrag {
@@ -1439,6 +1521,7 @@ pub(crate) fn dump_live_layout_json(
     }
     let root = unsafe { XRootWindow(display, screen) };
     let window_move_strategy = select_window_move_strategy(display, screen);
+    let window_move_telemetry = WindowMoveTelemetry::for_strategy(window_move_strategy);
     let colormap = unsafe { XDefaultColormap(display, screen) };
     let mut window_attributes = XSetWindowAttributes {
         background_pixmap: 0,
@@ -1522,7 +1605,12 @@ pub(crate) fn dump_live_layout_json(
         );
         object.insert(
             "window_management".to_owned(),
-            window_management_diagnostics(display, screen, window_move_strategy),
+            window_management_diagnostics(
+                display,
+                screen,
+                window_move_strategy,
+                window_move_telemetry,
+            ),
         );
         Ok(dump)
     })();
@@ -1713,6 +1801,7 @@ fn run_window(
         heading: text.metrics_for(FontRole::Heading),
         instrument: text.metrics_for(FontRole::Instrument),
     };
+    let mut window_move_telemetry = WindowMoveTelemetry::for_strategy(window_move_strategy);
     resize_terminal(core, pty, width, height, metrics);
     write_runtime_layout_dump(
         display,
@@ -1724,6 +1813,7 @@ fn run_window(
         text_zoom,
         0,
         window_move_strategy,
+        window_move_telemetry,
     );
     resize_cursors.set(window, None);
     // XSetInputFocus is a BadMatch until the WM has made the mapped window
@@ -1736,6 +1826,7 @@ fn run_window(
     let mut window_destroyed = false;
     let mut child_exited = false;
     let mut window_drag: Option<WindowDrag> = None;
+    let mut pending_ewmh_gesture: Option<PendingEwmhGesture> = None;
     let mut dirty = true;
     let mut terminal_dirty = false;
     let mut oi_motion_dirty = false;
@@ -1892,6 +1983,7 @@ fn run_window(
                                     text_zoom,
                                     configure_events,
                                     window_move_strategy,
+                                    window_move_telemetry,
                                 );
                                 dirty = true;
                                 activity_dirty = true;
@@ -2042,17 +2134,21 @@ fn run_window(
                         if let Some(zone) = resize_zone(button.x, button.y, width, height) {
                             selection = None;
                             resize_cursors.set(window, Some(zone));
+                            let drag = WindowDrag::new(
+                                display,
+                                window,
+                                button,
+                                width,
+                                height,
+                                WindowDragKind::Resize(zone),
+                            );
                             if window_move_strategy.uses_ewmh() {
+                                window_move_telemetry.begin_ewmh();
                                 begin_window_resize(display, window, button, zone);
+                                pending_ewmh_gesture =
+                                    Some(PendingEwmhGesture::new(drag, configure_events));
                             } else {
-                                window_drag = Some(WindowDrag::new(
-                                    display,
-                                    window,
-                                    button,
-                                    width,
-                                    height,
-                                    WindowDragKind::Resize(zone),
-                                ));
+                                window_drag = Some(drag);
                                 grab_window_pointer(display, window);
                             }
                         } else {
@@ -2066,17 +2162,21 @@ fn run_window(
                                     activity_dirty = true;
                                 }
                             } else if geometry.header.contains(button.x, button.y) {
+                                let drag = WindowDrag::new(
+                                    display,
+                                    window,
+                                    button,
+                                    width,
+                                    height,
+                                    WindowDragKind::Move,
+                                );
                                 if window_move_strategy.uses_ewmh() {
+                                    window_move_telemetry.begin_ewmh();
                                     begin_window_move(display, window, button);
+                                    pending_ewmh_gesture =
+                                        Some(PendingEwmhGesture::new(drag, configure_events));
                                 } else {
-                                    window_drag = Some(WindowDrag::new(
-                                        display,
-                                        window,
-                                        button,
-                                        width,
-                                        height,
-                                        WindowDragKind::Move,
-                                    ));
+                                    window_drag = Some(drag);
                                     grab_window_pointer(display, window);
                                 }
                             } else if geometry.rail.primary_encoder.contains(button.x, button.y) {
@@ -2112,6 +2212,15 @@ fn run_window(
                     let zone = resize_zone(motion.x, motion.y, width, height);
                     if motion.state & BUTTON1_MASK == 0 {
                         resize_cursors.set(window, zone);
+                    }
+                    if let Some(pending) = pending_ewmh_gesture {
+                        if Instant::now() >= pending.deadline {
+                            pending_ewmh_gesture = None;
+                            window_move_telemetry
+                                .activate_fallback("ewmh_no_configure_before_grace");
+                            window_drag = Some(pending.drag);
+                            grab_window_pointer(display, window);
+                        }
                     }
                     if let Some(drag) = window_drag {
                         // Keep using the button-press-owned drag state even
@@ -2154,8 +2263,24 @@ fn run_window(
                 BUTTON_RELEASE => {
                     let button = unsafe { &*((&event as *const XEvent).cast::<XButtonEvent>()) };
                     if button.button == 1 {
+                        if let Some(pending) = pending_ewmh_gesture.take() {
+                            // A short synthetic drag can produce one motion
+                            // and release before the grace timer expires.
+                            // Preserve the gesture by applying the final
+                            // release geometry through Athena's fallback.
+                            window_move_telemetry
+                                .activate_fallback("ewmh_no_configure_before_release");
+                            apply_window_drag(
+                                display,
+                                window,
+                                pending.drag,
+                                button.x_root,
+                                button.y_root,
+                            );
+                        }
+                        let had_client_drag = window_drag.is_some();
                         window_drag = None;
-                        if !window_move_strategy.uses_ewmh() {
+                        if had_client_drag {
                             unsafe { XUngrabPointer(display, CURRENT_TIME) };
                         }
                         if let (Some((anchor, _)), Some(cell)) = (
@@ -2209,6 +2334,14 @@ fn run_window(
                     }
                     resize_terminal(core, pty, width, height, metrics);
                     configure_events = configure_events.saturating_add(1);
+                    if let Some(pending) = pending_ewmh_gesture {
+                        if configure_events > pending.configure_events_at_start
+                            && pending.geometry_changed(configure.x, configure.y, width, height)
+                        {
+                            pending_ewmh_gesture = None;
+                            window_move_telemetry.confirm_ewmh();
+                        }
+                    }
                     write_runtime_layout_dump(
                         display,
                         screen,
@@ -2219,6 +2352,7 @@ fn run_window(
                         text_zoom,
                         configure_events,
                         window_move_strategy,
+                        window_move_telemetry,
                     );
                     dirty = true;
                     activity_dirty = true;
@@ -2531,6 +2665,7 @@ fn write_runtime_layout_dump(
     text_scale: f32,
     configure_events: u64,
     window_move_strategy: WindowMoveStrategy,
+    window_move_telemetry: WindowMoveTelemetry,
 ) {
     let Ok(path) = env::var("ATHENA_NATIVE_LAYOUT_DUMP") else {
         return;
@@ -2584,7 +2719,7 @@ fn write_runtime_layout_dump(
     );
     object.insert(
         "window_management".to_owned(),
-        window_management_diagnostics(display, screen, window_move_strategy),
+        window_management_diagnostics(display, screen, window_move_strategy, window_move_telemetry),
     );
     if let Err(error) = std::fs::write(path, value.to_string()) {
         eprintln!("could not write native layout dump: {error}");
@@ -2886,7 +3021,8 @@ mod tests {
     use super::render::oi::AttentionAction;
     use super::{
         FrameGeometry, PresentationClock, Projection, ResizeZone, VisualMode, WindowMoveStrategy,
-        is_wm_delete_message, moveresize_message_data, resize_zone, write_attention_action,
+        WindowMoveTelemetry, is_wm_delete_message, moveresize_message_data, resize_zone,
+        write_attention_action,
     };
     use crate::ProjectionView;
     use alacritty_terminal::term::TermMode;
@@ -3100,6 +3236,31 @@ mod tests {
             WindowMoveStrategy::Ewmh.name(),
             WindowMoveStrategy::ClientManagedFallback.name()
         );
+    }
+
+    #[test]
+    fn adaptive_window_move_telemetry_requires_a_real_confirmation() {
+        let mut telemetry = WindowMoveTelemetry::for_strategy(WindowMoveStrategy::Ewmh);
+        assert_eq!(telemetry.active_strategy, "ewmh_preferred");
+        assert!(!telemetry.ewmh_attempted);
+        assert!(!telemetry.ewmh_confirmed);
+
+        telemetry.begin_ewmh();
+        telemetry.confirm_ewmh();
+        assert_eq!(telemetry.active_strategy, "ewmh_confirmed");
+        assert!(telemetry.ewmh_confirmed);
+
+        telemetry.activate_fallback("late_test_fallback");
+        assert_eq!(telemetry.active_strategy, "ewmh_confirmed");
+        assert_eq!(telemetry.fallback_reason, None);
+
+        let mut fallback = WindowMoveTelemetry::for_strategy(WindowMoveStrategy::Ewmh);
+        fallback.begin_ewmh();
+        fallback.activate_fallback("no_configure");
+        fallback.confirm_ewmh();
+        assert_eq!(fallback.active_strategy, "client_managed");
+        assert!(!fallback.ewmh_confirmed);
+        assert_eq!(fallback.fallback_reason, Some("no_configure"));
     }
 
     #[test]

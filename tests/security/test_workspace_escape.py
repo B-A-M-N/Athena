@@ -76,6 +76,24 @@ async def test_symlink_escape_write_is_denied(tmp_path):
 
 @pytest.mark.athena_claim("BHV-145")
 @pytest.mark.athena_evidence("test", "security")
+async def test_parent_component_symlink_swap_cannot_escape_workspace(tmp_path):
+    outside = tmp_path.parent / "outside-directory"
+    outside.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "safe").mkdir()
+    (workspace / "safe" / "inside.txt").write_text("inside")
+    (workspace / "redirect").symlink_to(outside, target_is_directory=True)
+
+    fs = _fs(str(workspace))
+    result = await fs.invoke(_write_req(str(workspace), "redirect/escaped.txt"))
+
+    assert result.status == CapabilityResultStatus.FAILED
+    assert not (outside / "escaped.txt").exists()
+
+
+@pytest.mark.athena_claim("BHV-145")
+@pytest.mark.athena_evidence("test", "security")
 async def test_directory_traversal_via_dotdot_denied(tmp_path):
     sub = tmp_path / "sub"
     sub.mkdir()

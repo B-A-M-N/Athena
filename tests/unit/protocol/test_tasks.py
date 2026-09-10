@@ -12,8 +12,18 @@ from athena.protocol.tasks import (
     ResourceBudgetCeiling,
     TaskStatus,
     capability_policy_covers,
+    effective_capability_policy,
     intersect_resource_budgets,
 )
+
+
+def test_effective_capability_policy_applies_deny_before_reflection_or_delegation():
+    effective = effective_capability_policy(
+        {"allow": ["files.write"], "ask": ["files.read"], "deny": ["files.write"]}
+    )
+    assert effective.allow == ()
+    assert effective.ask == ("files.read",)
+    assert not capability_policy_covers(effective, {"allow": ["files.write"]})
 
 
 @pytest.mark.athena_claim("BHV-014")

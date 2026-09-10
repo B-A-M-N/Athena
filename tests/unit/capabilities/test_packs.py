@@ -1,7 +1,13 @@
 import asyncio
+import hashlib
+import io
 import json
 from types import SimpleNamespace
+import zipfile
 
+import pytest
+
+import athena.packs.manager as pack_manager_module
 from athena.packs.manager import PackManager
 from athena.affordances import CapabilityFabric
 from athena.capabilities.registry import CapabilityRegistry
@@ -74,6 +80,48 @@ def _pack(root):
         encoding="utf-8",
     )
     return pack
+
+
+def _pack_archive(pack) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for path in pack.rglob("*"):
+            if path.is_file():
+                archive.write(path, path.relative_to(pack.parent))
+    return buffer.getvalue()
+
+
+def test_remote_pack_requires_operator_hash_and_separates_authenticity(tmp_path, monkeypatch):
+    pack = _pack(tmp_path)
+    archive = _pack_archive(pack)
+    digest = hashlib.sha256(archive).hexdigest()
+    manager = PackManager(_PackStore(), install_root=str(tmp_path / "installed"))
+
+    def download(_url, *, destination, **_kwargs):
+        destination.write_bytes(archive)
+        return archive
+
+    monkeypatch.setattr(pack_manager_module, "_download_remote", download)
+    result = manager.fetch_remote(
+        "https://packs.example.test/example.zip",
+        expected_sha256=digest,
+    )
+    assert result["archive_sha256"] == digest
+    assert result["authenticity"] == {
+        "transport": "https",
+        "endpoint_classification": "public",
+        "archive_sha256": digest,
+        "operator_expected_sha256": digest,
+        "operator_approved": False,
+    }
+    with pytest.raises(ValueError, match="expected_sha256"):
+        manager.fetch_remote("https://packs.example.test/example.zip")
+
+
+def test_remote_pack_rejects_non_loopback_http_even_with_hash(tmp_path):
+    manager = PackManager(_PackStore(), install_root=str(tmp_path / "installed"))
+    with pytest.raises(ValueError, match="remote HTTP"):
+        manager.fetch_remote("http://packs.example.test/example.zip", expected_sha256="0" * 64)
 
 
 def test_rehydrate_records_individual_pack_failure(tmp_path):

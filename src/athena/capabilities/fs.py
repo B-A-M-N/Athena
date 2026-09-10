@@ -36,6 +36,7 @@ from athena.protocol.capabilities import (
 )
 from athena.protocol.errors import FilesystemConflict, PolicyDenied
 from athena.protocol.tasks import PathRule, WorkspaceSpec
+from athena.execution.async_call import run_blocking
 
 _OPERATIONS = (
     "read",
@@ -345,9 +346,10 @@ class FilesystemCapability:
                 await self.mutation_store.mark_started(intent_id)
             try:
                 if create_dirs:
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    directory_fd = _ensure_directory_beneath(os.path.dirname(path), ws)
+                    os.close(directory_fd)
                 after = _atomic_write(path, content, ws)
-                self._apply_expected_mode(path, context)
+                self._apply_expected_mode(path, context, ws)
             except OSError as e:
                 await self._abort(intent_id, str(e))
                 return _fail(request, str(e))
@@ -383,7 +385,7 @@ class FilesystemCapability:
                 await self.mutation_store.mark_started(intent_id)
             try:
                 after = _atomic_write(path, new_content, ws)
-                self._apply_expected_mode(path, context)
+                self._apply_expected_mode(path, context, ws)
             except OSError as e:
                 await self._abort(intent_id, str(e))
                 return _fail(request, str(e))
@@ -429,7 +431,13 @@ class FilesystemCapability:
 
     async def _mkdir(self, request, args, path, ws, context=None):
         # Check existence BEFORE recording intent (write-ahead)
-        existed_before = os.path.isdir(path)
+        try:
+            existing_fd = self._safe_open_directory(path, ws)
+        except FileNotFoundError:
+            existed_before = False
+        else:
+            existed_before = True
+            os.close(existing_fd)
         # If the directory already existed, this is a no-op mutation
         reversible = not existed_before
         intent_id = await self._intent(
@@ -442,7 +450,8 @@ class FilesystemCapability:
         if self.mutation_store is not None and intent_id is not None:
             await self.mutation_store.mark_started(intent_id)
         try:
-            os.makedirs(path, exist_ok=True)
+            directory_fd = _ensure_directory_beneath(path, ws)
+            os.close(directory_fd)
         except OSError as e:
             await self._abort(intent_id, str(e))
             return _fail(request, str(e))
@@ -479,7 +488,7 @@ class FilesystemCapability:
                 with self._safe_open_read(path, ws) as source:
                     content = source.read()
                 after = _atomic_write(dest, content, ws)
-                self._apply_expected_mode(dest, context)
+                self._apply_expected_mode(dest, context, ws)
             except OSError as e:
                 await self._abort(intent_id, str(e))
                 return _fail(request, str(e))
@@ -603,13 +612,25 @@ class FilesystemCapability:
         if current != expected:
             raise FilesystemConflict(f"expected sha256 {expected} but resource has changed: {path}")
 
-    def _apply_expected_mode(self, path: str, context) -> None:
+    def _apply_expected_mode(self, path: str, context, ws: WorkspaceSpec) -> None:
         """Apply a trusted candidate mode during canonical commit."""
         directives = getattr(context, "directives", None)
         expected_modes = getattr(directives, "expected_modes", {})
         mode = expected_modes.get(self._real(path))
         if mode is not None:
-            os.chmod(path, int(mode))
+            directory_fd = _open_directory_beneath(os.path.dirname(path), ws)
+            try:
+                target_fd = os.open(
+                    os.path.basename(path),
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    os.fchmod(target_fd, int(mode))
+                finally:
+                    os.close(target_fd)
+            finally:
+                os.close(directory_fd)
 
     def _real(self, p: str) -> str:
         return os.path.realpath(os.path.abspath(p))
@@ -643,39 +664,40 @@ class FilesystemCapability:
         workspace, closing the TOCTOU window between policy check and read.
         """
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
+        directory_fd = _open_directory_beneath(os.path.dirname(path), ws)
+        fd = -1
         try:
+            fd = os.open(os.path.basename(path), flags, dir_fd=directory_fd)
             real = self._real(f"/proc/self/fd/{fd}")
             if not self._within_root(real, ws):
                 raise PolicyDenied(f"path escapes workspace: {path}")
             return os.fdopen(fd, "rb")
         except BaseException:
-            os.close(fd)
+            if fd >= 0:
+                os.close(fd)
             raise
+        finally:
+            os.close(directory_fd)
 
     def _safe_open_directory(self, path: str, ws: WorkspaceSpec) -> int:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
-        try:
-            real = self._real(f"/proc/self/fd/{fd}")
-            if not self._within_root(real, ws):
-                raise PolicyDenied(f"path escapes workspace: {path}")
-            return fd
-        except BaseException:
-            os.close(fd)
-            raise
+        return _open_directory_beneath(path, ws)
 
     def _safe_open_stat(self, path: str, ws: WorkspaceSpec) -> int:
-        flags = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
+        directory_fd = _open_directory_beneath(os.path.dirname(path), ws)
+        fd = -1
         try:
+            flags = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(os.path.basename(path), flags, dir_fd=directory_fd)
             real = self._real(f"/proc/self/fd/{fd}")
             if not self._within_root(real, ws):
                 raise PolicyDenied(f"path escapes workspace: {path}")
             return fd
         except BaseException:
-            os.close(fd)
+            if fd >= 0:
+                os.close(fd)
             raise
+        finally:
+            os.close(directory_fd)
 
     def _within_root(self, path: str, ws: WorkspaceSpec) -> bool:
         root = self._real(ws.root)
@@ -697,12 +719,7 @@ class FilesystemCapability:
     async def _capture_before(self, task_id, path, ws=None):
         if not _exists(path) or os.path.isdir(path):
             return None, None
-        if ws is not None:
-            with self._safe_open_read(path, ws) as f:
-                data = f.read()
-        else:
-            with open(path, "rb") as f:
-                data = f.read()
+        data = await run_blocking(self._read_capture_bytes, path, ws)
         h = hashlib.sha256(data).hexdigest()
         ref = None
         if self.artifact_store is not None:
@@ -717,6 +734,13 @@ class FilesystemCapability:
             except Exception:
                 ref = None
         return ref, h
+
+    def _read_capture_bytes(self, path, ws=None) -> bytes:
+        if ws is not None:
+            with self._safe_open_read(path, ws) as handle:
+                return handle.read()
+        with open(path, "rb") as handle:
+            return handle.read()
 
     async def _intent(self, task_id, path, op, before_ref, inverse):
         if self.mutation_store is None:
@@ -819,8 +843,7 @@ def _atomic_write(path: str, content: bytes, ws: WorkspaceSpec) -> str:
     state.
     """
     directory = os.path.dirname(path) or "."
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    directory_fd = os.open(directory, flags)
+    directory_fd = _open_directory_beneath(directory, ws)
     try:
         directory_real = os.path.realpath(f"/proc/self/fd/{directory_fd}")
         root_real = os.path.realpath(os.path.abspath(ws.root))
@@ -858,6 +881,62 @@ def _atomic_write(path: str, content: bytes, ws: WorkspaceSpec) -> str:
         raise
     finally:
         os.close(directory_fd)
+
+
+def _workspace_relative(path: str, ws: WorkspaceSpec) -> tuple[str, list[str]]:
+    """Return a canonical workspace root and descriptor-relative components."""
+    root = _real_path(ws.root)
+    target = _real_path(path)
+    if target != root and not target.startswith(root + os.sep):
+        raise PolicyDenied(f"path escapes workspace: {path}")
+    relative = os.path.relpath(target, root)
+    if relative == os.curdir:
+        return root, []
+    return root, [part for part in relative.split(os.sep) if part not in ("", os.curdir)]
+
+
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_directory_beneath(path: str, ws: WorkspaceSpec) -> int:
+    """Open every directory component relative to a stable workspace fd.
+
+    Resolving a path and then reopening it by name leaves a parent-directory
+    symlink-swap window.  This walker opens each component with ``openat`` and
+    ``O_NOFOLLOW``, so a component replaced during the operation cannot redirect
+    the operation outside the already-open workspace root.
+    """
+    root, components = _workspace_relative(path, ws)
+    current_fd = os.open(root, _directory_open_flags())
+    try:
+        for component in components:
+            next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _ensure_directory_beneath(path: str, ws: WorkspaceSpec) -> int:
+    """Create and return a directory using descriptor-relative components."""
+    root, components = _workspace_relative(path, ws)
+    current_fd = os.open(root, _directory_open_flags())
+    try:
+        for component in components:
+            try:
+                next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+            except FileNotFoundError:
+                os.mkdir(component, 0o755, dir_fd=current_fd)
+                next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
 
 
 def _match_path(real_path: str, pattern: str) -> bool:

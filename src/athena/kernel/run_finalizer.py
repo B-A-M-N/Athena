@@ -183,7 +183,11 @@ class RunFinalizer:
         message = _assistant_message(task, response)
         if not any((getattr(b, "text", "") or "") for b in message.blocks):
             return
-        await self._k._messages.append(message)
+        appended = await self._k._append_assistant_message(message)
+        if not appended:
+            if response.request_id:
+                self._k._stored_responses.add(response.request_id)
+            return
         await self._k._emit(
             "TaskMessage",
             {

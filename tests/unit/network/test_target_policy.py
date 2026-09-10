@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
 from types import SimpleNamespace
 
 import pytest
+from hypothesis import given, strategies as st
 
 from athena.capabilities.browser import BrowserCapability, ElementSnapshot, PlaywrightBrowserDriver
 from athena.network.target_policy import validate_target
@@ -33,6 +35,59 @@ def test_restricted_target_policy_returns_pinned_public_addresses():
     assert target is not None
     assert target.hostname == "public.example.test"
     assert target.addresses == ("93.184.216.34", "2606:4700:4700::1111")
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://[::ffff:127.0.0.1]/",
+        "http://user:pass@example.test/",
+        "ftp://example.test/",
+        "http://example.test:99999/",
+        "http://[broken/",
+    ],
+)
+def test_target_policy_rejects_hostile_http_authorities(target):
+    _validated, error = validate_target(target, "restricted")
+    assert error
+
+
+def test_restricted_target_rejects_dns_rebinding_to_private_address():
+    calls = []
+
+    def resolver(host, port):
+        calls.append((host, port))
+        return ("93.184.216.34", "169.254.169.254")
+
+    target, error = validate_target("https://public.example.test", "restricted", resolver=resolver)
+    assert target is None
+    assert "private/local" in (error or "")
+    assert calls == [("public.example.test", 0)]
+
+
+@given(st.integers(min_value=0, max_value=2**32 - 1))
+def test_restricted_policy_never_accepts_non_public_resolved_ipv4(value):
+    """The resolver result, not the hostname spelling, is the authority."""
+    address = ipaddress.IPv4Address(value)
+    target, error = validate_target(
+        "https://arbitrary.example.test/resource",
+        "restricted",
+        resolver=lambda _host, _port: (str(address),),
+    )
+    non_public = (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    )
+    if non_public:
+        assert target is None
+        assert error
+    else:
+        assert target is not None
+        assert error is None
 
 
 class _PolicyDriver:

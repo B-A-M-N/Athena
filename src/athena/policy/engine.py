@@ -368,7 +368,7 @@ class PolicyEngine:
             return True
         canonical_rules = snapshot.writable_rules if writable_only else snapshot.readable_rules
         matched = False
-        for rule, pattern_real in zip(rules, canonical_rules):
+        for rule, pattern_real in zip(rules, canonical_rules, strict=True):
             if _path_match_canonical(target, pattern_real):
                 if not rule.allow:
                     return False

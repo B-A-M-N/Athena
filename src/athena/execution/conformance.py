@@ -26,6 +26,21 @@ class ConformanceReceipt:
     def passed(self) -> bool:
         return not self.failures
 
+    @property
+    def unverified_claims(self) -> tuple[str, ...]:
+        return tuple(str(item) for item in self.metadata.get("unverified_claims", ()))
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "runtime": self.runtime,
+            "checks": list(self.checks),
+            "failures": list(self.failures),
+            "unverified_claims": list(self.unverified_claims),
+            "metadata": dict(self.metadata),
+            "passed": self.passed,
+        }
+
 
 def _state_sources(runtime: str) -> tuple[str, str, str]:
     if runtime == "python":
@@ -71,6 +86,7 @@ async def run_backend_conformance(
     workspace_id: str = "conformance",
     cwd: str | None = None,
     workspace_root: str | None = None,
+    require_all_claims: bool = False,
 ) -> tuple[ConformanceReceipt, ...]:
     """Run behavioral probes for every runtime advertised by ``backend``.
 
@@ -173,8 +189,29 @@ async def run_backend_conformance(
                     checks.append("persistent_runtime_state")
             if hasattr(first_result, "status") and hasattr(first_result, "exit_code"):
                 checks.append("stdout_stderr_framing")
+            advertised_contract = {
+                str(name): bool(value)
+                for name, value in cell.items()
+                if isinstance(value, bool) and value
+            }
+            proven_contract = {
+                "persistent_runtime_state": "persistent_runtime_state" in checks,
+                "secret_materialization": "secret_materialization" in checks,
+                "execution": "execution" in checks,
+                "stdout_stderr_framing": "stdout_stderr_framing" in checks,
+            }
+            unverified = tuple(
+                name
+                for name, claimed in advertised_contract.items()
+                if claimed and not proven_contract.get(name, False)
+            )
+            if require_all_claims and unverified:
+                failures.append(
+                    "advertised capability claims lack behavioral proof: " + ", ".join(unverified)
+                )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             failures.append(str(exc))
+            unverified = ()
         finally:
             if session_id is not None:
                 try:
@@ -187,7 +224,10 @@ async def run_backend_conformance(
                 runtime=str(runtime),
                 checks=tuple(checks),
                 failures=tuple(failures),
-                metadata={"advertised": True},
+                metadata={
+                    "advertised": True,
+                    "unverified_claims": unverified,
+                },
             )
         )
     return tuple(receipts)

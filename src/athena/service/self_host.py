@@ -366,7 +366,7 @@ class SelfHostService:
                 "proof_id": command_proof_id(command),
                 "passed": bool(passed),
             }
-            for command, passed in zip(commands, results)
+            for command, passed in zip(commands, results, strict=True)
         ]
         failed = [str(item["proof_id"]) for item in evidence if not item["passed"]]
         if failed:

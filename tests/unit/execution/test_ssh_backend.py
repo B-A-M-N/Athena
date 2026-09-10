@@ -34,6 +34,7 @@ def _start_remote_fixture(tmp_path, runtime):
             f"task-{runtime}",
             runtime,
             str(tmp_path),
+            "authority-test",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -100,6 +101,7 @@ def test_remote_python_supervisor_owns_worker_and_authenticates_env(tmp_path):
             task_id,
             "python",
             str(tmp_path),
+            "authority-test",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -118,11 +120,20 @@ def test_remote_python_supervisor_owns_worker_and_authenticates_env(tmp_path):
             raise AssertionError(error)
         assert socket_path.exists()
         token = token_path.read_text(encoding="utf-8").strip()
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert len(metadata["session_nonce"]) >= 16
+        assert len(metadata["worker_source_sha256"]) == 64
+        assert metadata["authority_digest"] == "authority-test"
 
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.settimeout(35)
         connection.connect(str(socket_path))
-        connection.sendall((json.dumps({"token": token}) + "\n").encode())
+        connection.sendall(
+            (
+                json.dumps({"token": token, "protocol": "athena-ssh-supervisor", "version": 1})
+                + "\n"
+            ).encode()
+        )
         configure = json.dumps(
             {"op": "configure", "env": {"ATHENA_SECRET": "not-on-argv"}}
         ).encode()
@@ -145,7 +156,19 @@ def test_remote_python_supervisor_owns_worker_and_authenticates_env(tmp_path):
 
         shutdown = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         shutdown.connect(str(socket_path))
-        shutdown.sendall((json.dumps({"token": token, "op": "shutdown"}) + "\n").encode())
+        shutdown.sendall(
+            (
+                json.dumps(
+                    {
+                        "token": token,
+                        "op": "shutdown",
+                        "protocol": "athena-ssh-supervisor",
+                        "version": 1,
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
         shutdown_stream = shutdown.makefile("rb")
         receipt = json.loads(shutdown_stream.readline().decode())
         shutdown.close()
@@ -180,7 +203,12 @@ def test_remote_supervisor_preserves_runtime_state(runtime, tmp_path):
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.settimeout(35)
         connection.connect(str(socket_path))
-        connection.sendall((json.dumps({"token": token}) + "\n").encode())
+        connection.sendall(
+            (
+                json.dumps({"token": token, "protocol": "athena-ssh-supervisor", "version": 1})
+                + "\n"
+            ).encode()
+        )
 
         sources = (
             (
@@ -214,7 +242,19 @@ def test_remote_supervisor_preserves_runtime_state(runtime, tmp_path):
 
         shutdown = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         shutdown.connect(str(socket_path))
-        shutdown.sendall((json.dumps({"token": token, "op": "shutdown"}) + "\n").encode())
+        shutdown.sendall(
+            (
+                json.dumps(
+                    {
+                        "token": token,
+                        "op": "shutdown",
+                        "protocol": "athena-ssh-supervisor",
+                        "version": 1,
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
         receipt = json.loads(shutdown.makefile("rb").readline().decode())
         shutdown.close()
         assert receipt["confirmed"] is True
@@ -236,6 +276,8 @@ def test_remote_supervisor_dependency_inventory_rpc(tmp_path):
         request = {
             "token": token,
             "op": "dependency",
+            "protocol": "athena-ssh-supervisor",
+            "version": 1,
             "operation": "inventory",
             "manager": "python",
             "name": "demo",

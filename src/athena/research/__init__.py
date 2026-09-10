@@ -7,6 +7,7 @@ of relying on an old transcript.
 """
 
 from athena.research.models import (
+    EvidenceBundle,
     EvidenceObject,
     ResearchGap,
     SourceRecord,
@@ -16,6 +17,7 @@ from athena.research.policy import SourcePolicy, SourcePolicyError
 from athena.research.store import ResearchStore
 
 __all__ = [
+    "EvidenceBundle",
     "EvidenceObject",
     "ResearchGap",
     "ResearchStore",

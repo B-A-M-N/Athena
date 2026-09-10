@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+manifest="native/Cargo.toml"
+lockfile="native/Cargo.lock"
+denyfile="native/deny.toml"
+
+[[ -f "$lockfile" ]] || {
+  printf '%s\n' 'rust-supply-chain-audit: FAIL — native/Cargo.lock is missing' >&2
+  exit 1
+}
+[[ -f "$denyfile" ]] || {
+  printf '%s\n' 'rust-supply-chain-audit: FAIL — native/deny.toml is missing' >&2
+  exit 1
+}
+cargo metadata --manifest-path "$manifest" --locked --offline --format-version 1 >/dev/null
+
+if command -v cargo-audit >/dev/null 2>&1; then
+  cargo audit --file "$lockfile"
+elif command -v cargo-deny >/dev/null 2>&1; then
+  cargo deny check advisories sources licenses --config "$denyfile" --manifest-path "$manifest"
+else
+  printf '%s\n' 'rust-supply-chain-audit: FAIL — install cargo-audit or cargo-deny for release qualification' >&2
+  exit 2
+fi

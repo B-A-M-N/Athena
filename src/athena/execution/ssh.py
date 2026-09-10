@@ -9,6 +9,7 @@ protocols as local execution.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ from athena.execution.process_tree import spawn_owned
 from athena.execution.runtimes.base import BaseRuntime
 from athena.execution.runtimes.node import _NodeSession
 from athena.execution.runtimes.python import _PythonSession
+from athena.execution.ssh_protocol import PROTOCOL_NAME, PROTOCOL_VERSION, encode_frame
 from athena.protocol.execution import ExecutionEvent, ExecutionEventType, ExecutionRequest
 from athena.protocol.tasks import NetworkPolicy
 
@@ -154,7 +156,7 @@ with open(token_path, encoding="utf-8") as handle:
     token = handle.read().strip()
 connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 connection.connect(socket_path)
-connection.sendall((json.dumps({"token": token}, separators=(",", ":")) + "\n").encode())
+connection.sendall((json.dumps({"token": token, "op": "stream", "protocol": "athena-ssh-supervisor", "version": 1}, separators=(",", ":")) + "\n").encode())
 while True:
     readable, _, _ = select.select([0, connection], [], [])
     if 0 in readable:
@@ -176,7 +178,12 @@ connection.close()
 _REMOTE_PYTHON_SUPERVISOR_V2 = r"""
 import base64, hashlib, json, os, re, signal, socket, subprocess, sys, threading, time
 
-socket_path, token_path, metadata_path, session_id, task_id, runtime, remote_cwd = sys.argv[1:]
+PROTOCOL_NAME = "athena-ssh-supervisor"
+PROTOCOL_VERSION = 1
+MAX_FRAME_BYTES = 8 * 1024 * 1024
+MAX_LENGTH_LINE_BYTES = 64
+
+socket_path, token_path, metadata_path, session_id, task_id, runtime, remote_cwd, authority_digest = sys.argv[1:]
 if runtime not in {"python", "node", "shell"}:
     raise SystemExit("unsupported remote supervisor runtime")
 
@@ -343,7 +350,11 @@ while True:
     if not line:
         break
     try:
+        if len(line.encode()) > 64 or not line.endswith("\n"):
+            raise ValueError("invalid frame length line")
         length = int(line.strip())
+        if length < 0 or length > 8 * 1024 * 1024:
+            raise ValueError("frame exceeds maximum size")
         payload = json.loads(sys.stdin.read(length))
         source = str(payload.get("source") or "")
     except Exception:
@@ -397,6 +408,8 @@ with open(token_path, "w", encoding="utf-8") as handle:
     os.fsync(handle.fileno())
 controller_pid = os.getpid()
 metadata = {
+    "protocol": PROTOCOL_NAME,
+    "protocol_version": PROTOCOL_VERSION,
     "session_id": session_id,
     "task_id": task_id,
     "runtime": runtime,
@@ -405,7 +418,17 @@ metadata = {
     "socket_path": socket_path,
     "token_path": token_path,
     "metadata_path": metadata_path,
+    "authority_digest": authority_digest,
 }
+session_nonce = __import__("secrets").token_urlsafe(24)
+runtime_identity = f"{runtime}:{sys.executable}:{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+metadata.update(
+    {
+        "session_nonce": session_nonce,
+        "runtime_identity": runtime_identity,
+        "worker_source_sha256": hashlib.sha256(WORKER.encode("utf-8")).hexdigest(),
+    }
+)
 with open(metadata_path, "w", encoding="utf-8") as handle:
     os.chmod(metadata_path, 0o600)
     json.dump(metadata, handle, separators=(",", ":"))
@@ -424,6 +447,9 @@ server.listen(16)
 server.settimeout(0.2)
 
 def send(connection, value):
+    value = dict(value)
+    value.setdefault("protocol", PROTOCOL_NAME)
+    value.setdefault("protocol_version", PROTOCOL_VERSION)
     connection.sendall((json.dumps(value, separators=(",", ":")) + "\n").encode())
 
 def dependency_inventory(target, manager, requested_name):
@@ -627,7 +653,11 @@ def handle(connection):
         stream = connection.makefile("rb")
         auth_line = stream.readline()
         auth = json.loads(auth_line.decode())
-        if auth.get("token") != token:
+        if (
+            auth.get("token") != token
+            or auth.get("protocol") != PROTOCOL_NAME
+            or auth.get("version") != PROTOCOL_VERSION
+        ):
             send(connection, {"kind": "error", "error": "remote supervisor authentication failed"})
             return
         operation = auth.get("op")
@@ -669,7 +699,11 @@ def handle(connection):
             length_line = stream.readline()
             if not length_line:
                 break
+            if len(length_line) > MAX_LENGTH_LINE_BYTES or not length_line.endswith(b"\n"):
+                raise ValueError("invalid frame length line")
             length = int(length_line.strip())
+            if length < 0 or length > MAX_FRAME_BYTES:
+                raise ValueError("frame exceeds maximum size")
             payload = stream.read(length)
             if len(payload) != length:
                 break
@@ -803,8 +837,8 @@ class _SSHPythonSession(_PythonSession, _SSHWorker):
         # authenticated, length-framed supervisor protocol. They never appear
         # in the SSH command line or a process argument list.
         if self._env and self.process.stdin is not None:
-            payload = json.dumps({"op": "configure", "env": self._env})
-            self.process.stdin.write(f"{len(payload)}\n{payload}")
+            frame = encode_frame({"op": "configure", "env": self._env})
+            self.process.stdin.write(frame.decode("utf-8"))
             self.process.stdin.flush()
 
 
@@ -842,6 +876,10 @@ class _SSHSession:
     worker: Any
     host: str
     start_identity: str
+    runtime_identity: str | None = None
+    worker_source_sha256: str | None = None
+    session_nonce: str | None = None
+    authority_digest: str | None = None
     key_path: str | None = None
     remote_socket: str | None = None
     remote_token_path: str | None = None
@@ -1059,6 +1097,7 @@ class SSHBackend(ExecutionBackend):
         remote_cwd: str,
         key_path: str | None,
         runtime: str = "python",
+        authority_digest: str = "",
     ) -> dict[str, str]:
         paths = self._supervisor_paths(task_id, session_id)
         root = self._remote_arg(remote_cwd)
@@ -1071,6 +1110,7 @@ class SSHBackend(ExecutionBackend):
             f"mkdir -p -- {root} {self._remote_arg(paths['socket'].rsplit('/', 1)[0])}; "
             f"nohup python3 -u -c {shlex.quote(launcher)} {socket_path} {token_path} "
             f"{metadata_path} {shlex.quote(session_id)} {shlex.quote(task_id)} {shlex.quote(runtime)} {root} "
+            f"{shlex.quote(authority_digest)} "
             "></dev/null >/dev/null 2>&1 &"
         )
         self._run_remote_command(command, key_path=key_path)
@@ -1086,6 +1126,11 @@ class SSHBackend(ExecutionBackend):
                 except json.JSONDecodeError:
                     metadata = None
                 if isinstance(metadata, dict) and metadata.get("session_id") == session_id:
+                    if (
+                        metadata.get("protocol") != PROTOCOL_NAME
+                        or int(metadata.get("protocol_version", -1)) != PROTOCOL_VERSION
+                    ):
+                        raise RuntimeError("remote supervisor protocol is unsupported")
                     return {str(key): str(value) for key, value in metadata.items()}
             time.sleep(0.1)
         raise RuntimeError("remote Python supervisor did not become ready")
@@ -1110,7 +1155,7 @@ class SSHBackend(ExecutionBackend):
                 "import json,socket,sys; "
                 "p,t=sys.argv[1:]; token=open(t).read().strip(); "
                 "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(p); "
-                "s.sendall((json.dumps({'token':token,'op':'describe'})+'\\n').encode()); "
+                "s.sendall((json.dumps({'token':token,'op':'describe','protocol':'athena-ssh-supervisor','version':1})+'\\n').encode()); "
                 "print(s.recv(65536).decode().strip()); s.close()"
             ).encode()
         ).decode("ascii")
@@ -1131,7 +1176,12 @@ class SSHBackend(ExecutionBackend):
             value = json.loads((completed.stdout or "").strip().splitlines()[-1])
         except (IndexError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError("remote supervisor describe response is invalid") from exc
-        if not isinstance(value, Mapping) or value.get("kind") != "response":
+        if (
+            not isinstance(value, Mapping)
+            or value.get("kind") != "response"
+            or value.get("protocol") != PROTOCOL_NAME
+            or int(value.get("protocol_version", -1)) != PROTOCOL_VERSION
+        ):
             raise RuntimeError("remote supervisor describe response is not authoritative")
         return value
 
@@ -1150,7 +1200,7 @@ class SSHBackend(ExecutionBackend):
         client = (
             "import base64,json,socket,sys; "
             "p,t,b=sys.argv[1:]; token=open(t,encoding='utf-8').read().strip(); "
-            "payload=json.loads(base64.b64decode(b)); payload.update({'token':token,'op':'dependency'}); "
+            "payload=json.loads(base64.b64decode(b)); payload.update({'token':token,'op':'dependency','protocol':'athena-ssh-supervisor','version':1}); "
             "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(p); "
             "s.sendall((json.dumps(payload,separators=(',',':'))+'\\n').encode()); "
             "print(s.makefile('rb').readline().decode().strip()); s.close()"
@@ -1254,7 +1304,7 @@ class SSHBackend(ExecutionBackend):
                 "import json,socket,sys; "
                 "p,t=sys.argv[1:]; token=open(t).read().strip(); "
                 "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(p); "
-                "s.sendall((json.dumps({'token':token,'op':'interrupt'})+'\\n').encode()); "
+                "s.sendall((json.dumps({'token':token,'op':'interrupt','protocol':'athena-ssh-supervisor','version':1})+'\\n').encode()); "
                 "print(s.recv(65536).decode().strip()); s.close()"
             ).encode()
         ).decode("ascii")
@@ -1284,7 +1334,7 @@ class SSHBackend(ExecutionBackend):
                 "import json,socket,sys; "
                 "p,t=sys.argv[1:]; token=open(t).read().strip(); "
                 "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(p); "
-                "s.sendall((json.dumps({'token':token,'op':'shutdown'})+'\\n').encode()); "
+                "s.sendall((json.dumps({'token':token,'op':'shutdown','protocol':'athena-ssh-supervisor','version':1})+'\\n').encode()); "
                 "print(s.recv(65536).decode().strip()); s.close()"
             ).encode()
         ).decode("ascii")
@@ -1369,6 +1419,20 @@ class SSHBackend(ExecutionBackend):
         ):
             remote_cwd = self._target_root(task_id)
         session_id = f"ssh_{task_id}_{secrets.token_hex(8)}"
+        authority_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "profile": self.profile.name,
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "runtime": canonical,
+                    "remote_cwd": remote_cwd,
+                    "network_policy": str(policy or ""),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         remote_metadata: dict[str, str] | None = None
         worker: Any
         try:
@@ -1378,6 +1442,7 @@ class SSHBackend(ExecutionBackend):
                 remote_cwd=remote_cwd,
                 key_path=key_path,
                 runtime=canonical,
+                authority_digest=authority_digest,
             )
             relay_paths = {
                 "socket_path": remote_metadata["socket_path"],
@@ -1398,6 +1463,10 @@ class SSHBackend(ExecutionBackend):
                         worker=None,
                         host=self.profile.host,
                         start_identity=remote_metadata.get("start_identity", session_id),
+                        runtime_identity=remote_metadata.get("runtime_identity"),
+                        worker_source_sha256=remote_metadata.get("worker_source_sha256"),
+                        session_nonce=remote_metadata.get("session_nonce"),
+                        authority_digest=remote_metadata.get("authority_digest"),
                         key_path=key_path,
                         remote_socket=remote_metadata.get("socket_path"),
                         remote_token_path=remote_metadata.get("token_path"),
@@ -1418,6 +1487,10 @@ class SSHBackend(ExecutionBackend):
             worker=worker,
             host=self.profile.host,
             start_identity=(remote_metadata or {}).get("start_identity", session_id),
+            runtime_identity=(remote_metadata or {}).get("runtime_identity"),
+            worker_source_sha256=(remote_metadata or {}).get("worker_source_sha256"),
+            session_nonce=(remote_metadata or {}).get("session_nonce"),
+            authority_digest=(remote_metadata or {}).get("authority_digest"),
             key_path=key_path if self.profile.identity_file is None else None,
             remote_socket=(remote_metadata or {}).get("socket_path"),
             remote_token_path=(remote_metadata or {}).get("token_path"),
@@ -1477,6 +1550,10 @@ class SSHBackend(ExecutionBackend):
                 "host": session.host,
                 "remote_cwd": session.remote_cwd,
                 "start_identity": session.start_identity,
+                "runtime_identity": session.runtime_identity,
+                "worker_source_sha256": session.worker_source_sha256,
+                "session_nonce": session.session_nonce,
+                "authority_digest": session.authority_digest,
             },
         )
         try:
@@ -1533,6 +1610,10 @@ class SSHBackend(ExecutionBackend):
                     "remote_metadata_path": session.remote_metadata_path or "",
                     "controller_pid": session.remote_controller_pid or "",
                     "remote_supervisor": "athena-controller-worker-v2",
+                    "runtime_identity": session.runtime_identity or "",
+                    "worker_source_sha256": session.worker_source_sha256 or "",
+                    "session_nonce": session.session_nonce or "",
+                    "authority_digest": session.authority_digest or "",
                 }
             )
         return value
@@ -1567,7 +1648,9 @@ class SSHBackend(ExecutionBackend):
             f"/.athena-supervisor/{session_id}.json",
         )
         for path, suffix in zip(
-            (remote_socket, remote_token_path, remote_metadata_path), expected_suffixes
+            (remote_socket, remote_token_path, remote_metadata_path),
+            expected_suffixes,
+            strict=True,
         ):
             if (
                 _SAFE_REMOTE_PATH.fullmatch(path) is None
@@ -1602,6 +1685,17 @@ class SSHBackend(ExecutionBackend):
             )
             if expected_start and str(remote.get("start_identity")) != expected_start:
                 raise RuntimeError("remote supervisor process identity mismatch")
+            for identity_key in (
+                "runtime_identity",
+                "worker_source_sha256",
+                "session_nonce",
+                "authority_digest",
+            ):
+                expected_identity = str(
+                    record.get(identity_key) or metadata.get(identity_key) or ""
+                )
+                if expected_identity and str(remote.get(identity_key) or "") != expected_identity:
+                    raise RuntimeError(f"remote supervisor {identity_key} mismatch")
             pid = str(remote.get("pid") or "")
             if not pid.isdigit():
                 raise RuntimeError("remote supervisor pid identity is invalid")
@@ -1635,6 +1729,10 @@ class SSHBackend(ExecutionBackend):
                 worker=worker,
                 host=self.profile.host,
                 start_identity=str(remote.get("start_identity") or expected_start),
+                runtime_identity=str(remote.get("runtime_identity") or "") or None,
+                worker_source_sha256=str(remote.get("worker_source_sha256") or "") or None,
+                session_nonce=str(remote.get("session_nonce") or "") or None,
+                authority_digest=str(remote.get("authority_digest") or "") or None,
                 key_path=key_path if self.profile.identity_file is None else None,
                 remote_socket=remote_socket,
                 remote_token_path=remote_token_path,

@@ -5,12 +5,12 @@ import threading
 import httpx
 import pytest
 
-from athena.capabilities import research as research_module
 from athena.capabilities.research import (
     BraveSearchProvider,
     HttpDiscoveryProvider,
     TavilySearchProvider,
 )
+from athena.research import discovery as discovery_module
 from athena.research.policy import SourcePolicy, SourcePolicyError
 
 
@@ -26,7 +26,7 @@ async def test_http_discovery_provider_returns_bounded_candidate_metadata(monkey
         )
 
     monkeypatch.setattr(
-        research_module,
+        discovery_module,
         "pinned_async_transport",
         lambda host, addresses: httpx.MockTransport(handler),
     )
@@ -46,7 +46,7 @@ async def test_http_discovery_provider_returns_bounded_candidate_metadata(monkey
 @pytest.mark.asyncio
 async def test_http_discovery_provider_rechecks_resolved_addresses(monkeypatch):
     monkeypatch.setattr(
-        research_module,
+        discovery_module,
         "pinned_async_transport",
         lambda host, addresses: httpx.MockTransport(
             lambda request: httpx.Response(200, json={"results": []})
@@ -98,7 +98,7 @@ async def test_brave_search_provider_uses_header_credential_and_maps_results(mon
         )
 
     monkeypatch.setattr(
-        research_module,
+        discovery_module,
         "pinned_async_transport",
         lambda host, addresses: httpx.MockTransport(handler),
     )
@@ -140,7 +140,7 @@ async def test_tavily_search_provider_sends_bounded_json_body(monkeypatch):
         )
 
     monkeypatch.setattr(
-        research_module,
+        discovery_module,
         "pinned_async_transport",
         lambda host, addresses: httpx.MockTransport(handler),
     )
