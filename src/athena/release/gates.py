@@ -133,6 +133,7 @@ def release_commands(
     integration``. ``None`` (the default) returns every lane — the full gate.
     """
     prefix = [uv, "run", "--frozen", "--extra", "dev"]
+    test_prefix = [*prefix, "--extra", "mcp", "--extra", "anthropic"]
     commands: list[tuple[str, list[str]]] = [
         ("uv-version", [uv, "--version"]),
         ("python-version", [*prefix, "python", "--version"]),
@@ -211,7 +212,7 @@ def release_commands(
         (
             "pytest",
             [
-                *prefix,
+                *test_prefix,
                 "pytest",
                 "-q",
                 "-p",
@@ -224,13 +225,13 @@ def release_commands(
         ),
         (
             "functional-proof",
-            [*prefix, "python", "-m", "pytest", "-q", *FUNCTIONAL_PROOF_NODEIDS],
+            [*test_prefix, "python", "-m", "pytest", "-q", *FUNCTIONAL_PROOF_NODEIDS],
         ),
         # Wall-clock budget tests measure real latency; they run serially so
         # their measurement is not fighting other workers for CPU.
         (
             "pytest-performance",
-            [*prefix, "pytest", "-q", "-p", "no:cacheprovider", "tests/performance"],
+            [*test_prefix, "pytest", "-q", "-p", "no:cacheprovider", "tests/performance"],
         ),
         (
             "release-scenarios",
@@ -333,7 +334,7 @@ def release_commands(
             (
                 "e2e",
                 [
-                    *prefix,
+                    *test_prefix,
                     "pytest",
                     "-q",
                     "-p",
@@ -358,7 +359,7 @@ def release_commands(
                 (
                     "workflow-strategy",
                     [
-                        *prefix,
+                        *test_prefix,
                         "pytest",
                         "-q",
                         "-p",
@@ -410,7 +411,7 @@ def release_commands(
                 (
                     "hermes-live",
                     [
-                        *prefix,
+                        *test_prefix,
                         "pytest",
                         "-q",
                         "-p",
