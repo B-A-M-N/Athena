@@ -11,6 +11,7 @@ surface; it creates no new authority and changes no decision boundary.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from dataclasses import replace
@@ -45,6 +46,18 @@ class SelfHostService:
 
     def __init__(self, service: AthenaService) -> None:
         self._svc = service
+        self._fault_injector: Any = None
+
+    def set_fault_injector(self, injector: Any = None) -> None:
+        """Install a narrow test hook for self-host intake crash windows."""
+        self._fault_injector = injector
+
+    async def _fault_point(self, name: str) -> None:
+        if self._fault_injector is None:
+            return
+        result = self._fault_injector(name)
+        if inspect.isawaitable(result):
+            await result
 
     async def reconcile_created_task(self, task: TaskSpec) -> bool:
         """Ensure a CREATED self-host task has a matching mission anchor.
@@ -284,7 +297,9 @@ class SelfHostService:
                 current_gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
                 plan=plan,
             )
+        await self._fault_point("self-host-mission-persisted")
         created = await tm.create(spec)
+        await self._fault_point("self-host-task-created")
         budgets = getattr(tm, "budgets", None)
         persist_budget = getattr(budgets, "_persist_usage", None)
         if callable(persist_budget):
@@ -293,8 +308,10 @@ class SelfHostService:
         # Self-host plans are still user-initiated task turns. Persist their
         # canonical service-owned prompt before the worker can observe them.
         await self._svc._record_canonical_user_turn(request, created)
+        await self._fault_point("self-host-canonical-user-turn-persisted")
         await self._mark_intake_phase(created.id, "canonical_user_turn_persisted")
         await tm.enqueue(created.id)
+        await self._fault_point("self-host-enqueued")
         await self._mark_intake_phase(created.id, "enqueued")
         if wait:
             await self._svc.wait_for(created.id)
