@@ -56,7 +56,7 @@ pub(crate) fn draw_terminal_text(
             geometry.operator_viewport.y,
             "ATHENA // SESSION READY",
             body_scale,
-            (0.37, 0.49, 0.60),
+            (0.55, 0.70, 0.78),
             geometry.operator_viewport.right(),
         );
         draw_bitmap_text(
@@ -66,7 +66,7 @@ pub(crate) fn draw_terminal_text(
             (text.metrics_for(FontRole::Instrument).height / 7.0)
                 .round()
                 .max(2.0),
-            (0.23, 0.34, 0.40),
+            (0.42, 0.58, 0.67),
             geometry.operator_viewport.right(),
         );
     }
@@ -107,9 +107,9 @@ pub(crate) fn draw_terminal_text(
         }
         if cell.flags.contains(Flags::DIM) {
             foreground = (
-                foreground.0.saturating_mul(2) / 3,
-                foreground.1.saturating_mul(2) / 3,
-                foreground.2.saturating_mul(2) / 3,
+                foreground.0.saturating_mul(4) / 5,
+                foreground.1.saturating_mul(4) / 5,
+                foreground.2.saturating_mul(4) / 5,
             );
         }
         if !has_run || run_row != row || run_next_column != column || run_color != foreground {

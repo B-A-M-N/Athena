@@ -31,6 +31,7 @@ mod x11;
 
 const NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 3;
 const LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const DEFAULT_TEXT_SCALE: f32 = 1.15;
 
 fn default_bridge_schema_version() -> u32 {
     LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION
@@ -752,7 +753,7 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
         text_scale: env::var("ATHENA_NATIVE_TEXT_SCALE")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(1.0),
+            .unwrap_or(DEFAULT_TEXT_SCALE),
         ..Args::default()
     };
     let mut values = values.into_iter();

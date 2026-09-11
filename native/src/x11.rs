@@ -507,7 +507,7 @@ impl Default for RendererOptions {
             mascot: "owl".to_owned(),
             animations: true,
             reduced_motion: false,
-            text_scale: 1.0,
+            text_scale: crate::DEFAULT_TEXT_SCALE,
             cabinet_only: false,
         }
     }

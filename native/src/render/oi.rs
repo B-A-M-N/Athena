@@ -868,7 +868,7 @@ fn draw_chrome(
     right: f32,
 ) {
     let bright = (color.0 * 0.92, color.1 * 0.92, color.2 * 0.92);
-    let dim = (color.0 * 0.58, color.1 * 0.58, color.2 * 0.58);
+    let dim = (color.0 * 0.78, color.1 * 0.78, color.2 * 0.78);
     pixel_text(
         10.0,
         14.0,
@@ -1242,7 +1242,7 @@ fn draw_tree_nodes(
     phase: f32,
     active_id: Option<&str>,
 ) {
-    let dim = (color.0 * 0.45, color.1 * 0.45, color.2 * 0.45);
+    let dim = (color.0 * 0.62, color.1 * 0.62, color.2 * 0.62);
     // Edges first so nodes sit on top.
     for node in nodes.iter() {
         if let Some(parent) = node.parent.and_then(|index| nodes.get(index)) {
@@ -1405,10 +1405,10 @@ fn draw_idle_scene(
         projection.status.to_ascii_uppercase()
     };
     pixel_text(
-        cx - bitmap_width(&status, 1.0) * 0.5,
+        cx - bitmap_width(&status, PIXEL_TEXT_SCALE) * 0.5,
         cy + 26.0,
         &status,
-        (color.0 * 0.7, color.1 * 0.7, color.2 * 0.7),
+        (color.0 * 0.84, color.1 * 0.84, color.2 * 0.84),
         layout.stage.right(),
     );
 }
@@ -1547,10 +1547,10 @@ fn draw_execute_scene(
         "EXECUTE"
     };
     pixel_text(
-        cx - bitmap_width(label, 1.0) * 0.5,
+        cx - bitmap_width(label, PIXEL_TEXT_SCALE) * 0.5,
         cy + 18.0,
         label,
-        (color.0 * 0.7, color.1 * 0.7, color.2 * 0.7),
+        (color.0 * 0.84, color.1 * 0.84, color.2 * 0.84),
         layout.stage.right(),
     );
     if let Some(readout) = layout.readout {
@@ -1736,10 +1736,10 @@ fn draw_think_scene(
         .map(str::to_owned)
         .unwrap_or_else(|| "REASONING".to_owned());
     pixel_text(
-        cx - bitmap_width(&label, 1.0) * 0.5,
+        cx - bitmap_width(&label, PIXEL_TEXT_SCALE) * 0.5,
         cy + 24.0,
         &label,
-        (color.0 * 0.7, color.1 * 0.7, color.2 * 0.7),
+        (color.0 * 0.84, color.1 * 0.84, color.2 * 0.84),
         layout.stage.right() - 8.0,
     );
 }
@@ -2004,8 +2004,30 @@ fn entity_label(entity: &ProjectionEntity) -> String {
 }
 
 fn pixel_text(x: f32, y: f32, value: &str, color: (f32, f32, f32), right: f32) {
-    draw_bitmap_text(x, y, value, 1.0, color, right);
+    let available = (right - x).max(0.0);
+    let max_chars = (available / (6.0 * PIXEL_TEXT_SCALE)).floor() as usize;
+    if max_chars == 0 {
+        return;
+    }
+    let fitted = if value.chars().count() > max_chars {
+        if max_chars <= 3 {
+            value.chars().take(max_chars).collect::<String>()
+        } else {
+            format!(
+                "{}...",
+                value
+                    .chars()
+                    .take(max_chars.saturating_sub(3))
+                    .collect::<String>()
+            )
+        }
+    } else {
+        value.to_owned()
+    };
+    draw_bitmap_text(x, y, &fitted, PIXEL_TEXT_SCALE, color, right);
 }
+
+const PIXEL_TEXT_SCALE: f32 = 1.2;
 
 #[allow(dead_code)]
 fn pixel_text_scaled(x: f32, y: f32, value: &str, color: (f32, f32, f32), right: f32, scale: f32) {

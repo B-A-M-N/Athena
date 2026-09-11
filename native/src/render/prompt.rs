@@ -54,7 +54,7 @@ pub(crate) fn draw_status_text(
                 status_row.top,
                 &status,
                 fit_bitmap_scale(&status, scale, content_width as f32),
-                (0.43, 0.59, 0.68),
+                (0.62, 0.77, 0.85),
                 (prompt_x + content_width) as f32,
             );
         });
@@ -84,7 +84,7 @@ pub(crate) fn draw_status_text(
                 if focused {
                     (0.81, 0.86, 0.90)
                 } else {
-                    (0.52, 0.57, 0.61)
+                    (0.70, 0.76, 0.81)
                 },
                 (prompt_x + content_width) as f32,
             );
@@ -123,7 +123,7 @@ pub(crate) fn draw_status_text(
                     hint_row.top,
                     hint,
                     fit_bitmap_scale(hint, scale, content_width as f32),
-                    (0.37, 0.49, 0.60),
+                    (0.58, 0.72, 0.80),
                     (prompt_x + content_width) as f32,
                 );
             });
@@ -133,7 +133,7 @@ pub(crate) fn draw_status_text(
                 prompt_x,
                 hint_row.baseline as c_int,
                 hint,
-                (94, 126, 153),
+                (148, 184, 204),
             );
         }
     }

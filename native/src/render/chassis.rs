@@ -542,9 +542,12 @@ pub(crate) fn draw_chassis(
 
 fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
     let scale = geometry.scale.max(0.08);
-    let glyph_scale = (1.35 * scale).round().max(2.0);
-    let instrument_color = (0.42, 0.54, 0.62);
-    let heading_color = (0.64, 0.74, 0.83);
+    // The authored cabinet scale bottoms out near 0.76 at 1280x800. Keep
+    // cabinet labels on a readable matrix instead of rounding them down to
+    // the 2px glyphs that made the native screen look like a dim status HUD.
+    let glyph_scale = (1.55 * scale).max(2.5);
+    let instrument_color = (0.62, 0.74, 0.82);
+    let heading_color = (0.82, 0.88, 0.93);
     let oi_color = rgb_f32(mode_color(VisualMode::from_projection(projection).as_str()));
 
     with_scissor(geometry.height, geometry.header, || {
@@ -561,12 +564,12 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             geometry.header.x + geometry.u(145.0),
             header_y + geometry.u(1.0),
             "// OPERATOR INSTRUMENT",
-            (glyph_scale * 0.76).round().max(2.0),
+            (glyph_scale * 0.76).max(2.25),
             instrument_color,
             geometry.header.right() - geometry.u(310.0),
         );
         let glass = "GLASS COMPUTE ENGINE";
-        let glass_scale = (glyph_scale * 0.76).round().max(2.0);
+        let glass_scale = (glyph_scale * 0.76).max(2.25);
         draw_bitmap_text(
             geometry.header.right() - geometry.u(44.0) - bitmap_width(glass, glass_scale),
             header_y + geometry.u(1.0),
@@ -590,7 +593,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
                 rect.x + geometry.u(24.0),
                 rect.y + geometry.u(14.0),
                 label,
-                (glyph_scale * 0.70).round().max(2.0),
+                (glyph_scale * 0.70).max(2.25),
                 color,
                 rect.right() - geometry.u(24.0),
             );
@@ -603,7 +606,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             speaker.x + geometry.u(9.0),
             speaker.bottom() - geometry.u(17.0),
             "VENT",
-            (glyph_scale * 0.58).round().max(2.0),
+            (glyph_scale * 0.58).max(2.25),
             instrument_color,
             speaker.right() - geometry.u(9.0),
         );
@@ -619,7 +622,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
                 system.x + geometry.u(5.0) + index as f32 * geometry.u(32.0),
                 system.bottom() - geometry.u(17.0),
                 label,
-                (glyph_scale * 0.56).round().max(2.0),
+                (glyph_scale * 0.56).max(2.25),
                 instrument_color,
                 system.x + geometry.u(5.0) + index as f32 * geometry.u(32.0) + geometry.u(26.0),
             );
@@ -632,7 +635,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             encoder.x + geometry.u(12.0),
             encoder.y + geometry.u(11.0),
             "ENC",
-            (glyph_scale * 0.62).round().max(2.0),
+            (glyph_scale * 0.62).max(2.25),
             instrument_color,
             encoder.right() - geometry.u(8.0),
         );
@@ -644,7 +647,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
         (geometry.rail.power, "CRT"),
     ] {
         with_scissor(geometry.height, rect, || {
-            let label_scale = (glyph_scale * 0.60).round().max(2.0);
+            let label_scale = (glyph_scale * 0.60).max(2.25);
             let x = rect.x + (rect.width - bitmap_width(label, label_scale)) * 0.5;
             draw_bitmap_text(
                 x,
@@ -659,7 +662,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
 
     let plate = geometry.rail.identity_plate;
     with_scissor(geometry.height, plate, || {
-        let plate_scale = (glyph_scale * 0.62).round().max(2.0);
+        let plate_scale = (glyph_scale * 0.62).max(2.25);
         draw_bitmap_text(
             plate.x + geometry.u(18.0),
             plate.y + geometry.u(16.0),
@@ -672,7 +675,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             plate.x + geometry.u(18.0),
             plate.y + geometry.u(34.0),
             "OI // GLASS",
-            (plate_scale * 0.72).round().max(2.0),
+            (plate_scale * 0.72).max(2.0),
             instrument_color,
             plate.right() - geometry.u(18.0),
         );
@@ -680,7 +683,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             plate.x + geometry.u(18.0),
             plate.y + geometry.u(58.0),
             "MODEL 001-A",
-            (plate_scale * 0.62).round().max(2.0),
+            2.0,
             instrument_color,
             plate.right() - geometry.u(18.0),
         );
@@ -688,7 +691,7 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             plate.x + geometry.u(18.0),
             plate.y + geometry.u(76.0),
             "SERIAL 0001-A",
-            (plate_scale * 0.62).round().max(2.0),
+            2.0,
             instrument_color,
             plate.right() - geometry.u(18.0),
         );
