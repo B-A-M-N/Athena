@@ -192,11 +192,11 @@ pub struct CellMetrics {
 impl CellMetrics {
     pub const fn fallback() -> Self {
         Self {
-            width: 9.0,
-            height: 18.0,
-            ascent: 14.0,
+            width: 8.0,
+            height: 17.0,
+            ascent: 13.0,
             descent: 4.0,
-            baseline: 14.0,
+            baseline: 13.0,
         }
     }
 
@@ -229,10 +229,10 @@ pub struct UiFontMetrics {
 impl UiFontMetrics {
     pub fn fallback() -> Self {
         Self {
-            body: CellMetrics::new(10.0, 20.0, 16.0, 4.0),
-            input: CellMetrics::new(11.0, 21.0, 17.0, 4.0),
-            heading: CellMetrics::new(8.0, 17.0, 13.0, 4.0),
-            instrument: CellMetrics::new(7.0, 14.0, 11.0, 3.0),
+            body: CellMetrics::new(8.0, 17.0, 13.0, 4.0),
+            input: CellMetrics::new(8.0, 17.0, 13.0, 4.0),
+            heading: CellMetrics::new(7.0, 15.0, 11.0, 4.0),
+            instrument: CellMetrics::new(6.0, 13.0, 10.0, 3.0),
         }
     }
 }
@@ -268,13 +268,13 @@ impl TextRow {
     }
 }
 
-/// The prompt is a three-row instrument, not a pile of offsets.
+/// The prompt is a compact two-row instrument: editable input first, then a
+/// single status/control footer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 pub struct PromptLayout {
     pub rect: PixelRect,
-    pub status_row: Option<TextRow>,
     pub input_row: TextRow,
-    pub hint_row: Option<TextRow>,
+    pub footer_row: TextRow,
 }
 
 /// Physical regions in the lower AthenaBOX instrument rail.
@@ -300,69 +300,50 @@ pub struct RailLayout {
 impl PromptLayout {
     pub fn required_height(
         input: CellMetrics,
-        status: CellMetrics,
-        hint: CellMetrics,
+        footer: CellMetrics,
         padding: f32,
         gap: f32,
         bottom_padding: f32,
-        with_hint: bool,
+        _with_hint: bool,
     ) -> f32 {
-        let rows = status.height + gap + input.height;
-        let rows = if with_hint {
-            rows + gap + hint.height
-        } else {
-            rows
-        };
-        padding + rows + bottom_padding
+        padding + input.height + gap + footer.height + bottom_padding
     }
 
     pub fn from_rect(
         rect: PixelRect,
         input: CellMetrics,
-        status: CellMetrics,
+        footer: CellMetrics,
         padding: f32,
         gap: f32,
         bottom_padding: f32,
-        with_hint: bool,
+        _with_hint: bool,
     ) -> Self {
         let safe_padding = padding.min((rect.height * 0.5).max(0.0));
         let available = (rect.height - safe_padding - bottom_padding.max(0.0)).max(0.0);
-        let status_and_input = status.height + gap + input.height;
-        let full = status_and_input + gap + status.height <= available;
-        let status_fits = status_and_input <= available;
         let input_top = rect.y + safe_padding;
-        let input_height = input.height.min((available).max(0.5));
-        let (status_row, input_row, hint_row) = if full && with_hint {
-            let status_row = TextRow::new(input_top, status);
-            let input_row = TextRow::new(status_row.bottom() + gap, input);
-            let hint_row = TextRow::new(input_row.bottom() + gap, status);
-            (Some(status_row), input_row, Some(hint_row))
-        } else if status_fits {
-            let status_row = TextRow::new(input_top, status);
-            let input_row = TextRow::new(status_row.bottom() + gap, input);
-            (Some(status_row), input_row, None)
-        } else {
-            (
-                None,
-                TextRow {
-                    top: input_top,
-                    baseline: input_top + input.baseline.min(input_height),
-                    height: input_height,
-                },
-                None,
-            )
+        let gap = gap.min((available * 0.12).max(0.0));
+        let footer_height = footer.height.min((available * 0.40).max(1.0));
+        let input_height = input.height.min((available - gap - footer_height).max(1.0));
+        let input_row = TextRow {
+            top: input_top,
+            baseline: input_top + input.baseline.min(input_height),
+            height: input_height,
+        };
+        let footer_top = input_row.bottom() + gap;
+        let footer_row = TextRow {
+            top: footer_top,
+            baseline: footer_top + footer.baseline.min(footer_height),
+            height: footer_height,
         };
         Self {
             rect,
-            status_row,
             input_row,
-            hint_row,
+            footer_row,
         }
     }
 
     pub fn content_bottom(self) -> f32 {
-        self.hint_row
-            .map_or(self.input_row.bottom(), TextRow::bottom)
+        self.footer_row.bottom()
     }
 
     pub fn rows_fit(self, bottom_padding: f32) -> bool {
@@ -445,11 +426,12 @@ impl NativePixelLayout {
         const DESIGN_WIDTH: f32 = 1672.0;
         const DESIGN_HEIGHT: f32 = 941.0;
         let scale = Self::scale_for_window(width, height);
-        // The reference remains the authoring coordinate system, but the
-        // native shell owns the whole drawable.  This prevents a 16:10
-        // window from growing a dead letterbox around the instrument.
-        let scale_x = width_f / DESIGN_WIDTH;
-        let scale_y = height_f / DESIGN_HEIGHT;
+        // Preserve authored proportions. Extra space becomes a centered
+        // gutter rather than stretching bezels, knobs, or glyph matrices.
+        let scale_x = scale;
+        let scale_y = scale;
+        let offset_x = (width_f - DESIGN_WIDTH * scale).max(0.0) * 0.5;
+        let offset_y = (height_f - DESIGN_HEIGHT * scale).max(0.0) * 0.5;
         let canvas = PixelRect {
             x: 0.0,
             y: 0.0,
@@ -458,8 +440,8 @@ impl NativePixelLayout {
         };
         let compact = scale < 0.66 || width < 900 || height < 620;
         let map = |x: f32, y: f32, width: f32, height: f32| PixelRect {
-            x: x * scale_x,
-            y: y * scale_y,
+            x: offset_x + x * scale_x,
+            y: offset_y + y * scale_y,
             width: width * scale_x,
             height: height * scale_y,
         };
@@ -470,7 +452,7 @@ impl NativePixelLayout {
         let operator_outer = map(72.0, 132.0, 740.0, 614.0);
         let oi_outer = map(860.0, 132.0, 740.0, 614.0);
         let operator_inner = map(112.0, 182.0, 660.0, 534.0);
-        let operator_viewport = map(128.0, 224.0, 628.0, 474.0);
+        let operator_viewport = map(128.0, 218.0, 628.0, 340.0);
         let oi_inner = map(900.0, 182.0, 660.0, 534.0);
         let controls = map(48.0, 750.0, 1576.0, 142.0);
         let left_x = operator_outer.x;
@@ -485,58 +467,27 @@ impl NativePixelLayout {
         let prompt_required = PromptLayout::required_height(
             input_metrics,
             metrics.instrument,
-            metrics.instrument,
             prompt_padding_y,
             prompt_gap,
             prompt_bottom_padding,
             !compact,
         );
-        let prompt_rect = map(214.0, 765.0, 416.0, 108.0);
-        let prompt_height = if compact {
-            prompt_rect.height.min(controls.height)
-        } else {
-            prompt_rect.height.max(prompt_required).min(controls.height)
-        };
+        let prompt_rect = map(128.0, 580.0, 628.0, 75.0);
         let prompt = PixelRect {
-            y: controls.y + (controls.height - prompt_height).max(0.0) * 0.5,
-            height: prompt_height,
+            height: prompt_rect
+                .height
+                .max(prompt_required.min(prompt_rect.height)),
             ..prompt_rect
-        };
-        let prompt_layout = PromptLayout::from_rect(
-            prompt,
-            input_metrics,
-            metrics.instrument,
-            prompt_padding_y,
-            prompt_gap,
-            prompt_bottom_padding,
-            !compact,
-        );
-        let row_rect = |row: Option<TextRow>| {
-            row.map(|row| PixelRect {
-                x: prompt.x,
-                y: row.top,
-                width: prompt.width,
-                height: row.height,
-            })
-            .unwrap_or_default()
         };
         let rail = RailLayout {
             rail: controls,
             speaker: map(48.0, 758.0, 132.0, 126.0),
             operator_panel: map(196.0, 758.0, 650.0, 126.0),
-            operator_status: PixelRect {
-                x: prompt.x,
-                y: prompt_layout.status_row.map_or(prompt.y, |row| row.top),
-                width: prompt.width,
-                height: prompt_layout.status_row.map_or(0.0, |row| row.height),
-            },
-            operator_input: row_rect(Some(prompt_layout.input_row)),
-            operator_hint: prompt_layout.hint_row.map(|row| PixelRect {
-                x: prompt.x,
-                y: row.top,
-                width: prompt.width,
-                height: row.height,
-            }),
+            // These legacy rail fields remain serialized for operator tooling,
+            // but the live prompt now belongs to the operator CRT aperture.
+            operator_status: PixelRect::default(),
+            operator_input: PixelRect::default(),
+            operator_hint: None,
             system_status: map(638.0, 758.0, 102.0, 126.0),
             primary_encoder: map(748.0, 758.0, 90.0, 126.0),
             brightness: map(870.0, 758.0, 120.0, 126.0),
@@ -642,8 +593,8 @@ mod tests {
         assert_eq!(layout.operator_inner.height, layout.oi_inner.height);
         assert_eq!(layout.rail.rail, layout.controls);
         assert!(layout.rail.speaker.right() <= layout.rail.rail.right());
-        assert!(layout.rail.operator_status.bottom() <= layout.prompt.bottom());
-        assert!(layout.rail.operator_input.bottom() <= layout.prompt.bottom());
+        assert!(layout.prompt.y > layout.operator_viewport.y);
+        assert!(layout.prompt.bottom() <= layout.operator_inner.bottom());
         assert!(layout.rail.system_status.right() <= layout.rail.primary_encoder.x);
         assert!(layout.rail.primary_encoder.right() <= layout.rail.brightness.x);
         assert!(layout.rail.brightness.right() <= layout.rail.focus.x);
@@ -696,8 +647,7 @@ mod tests {
             6.0,
             true,
         );
-        assert!(prompt.status_row.unwrap().bottom() + 4.0 <= prompt.input_row.top);
-        assert!(prompt.input_row.bottom() + 4.0 <= prompt.hint_row.unwrap().top);
+        assert!(prompt.input_row.bottom() + 4.0 <= prompt.footer_row.top);
         assert!(prompt.rows_fit(6.0));
 
         let compact = PromptLayout::from_rect(
@@ -749,5 +699,22 @@ mod tests {
         terminal.feed(b"\x1b[?1l\x1b[?2004l");
         assert!(!terminal.mode().contains(TermMode::APP_CURSOR));
         assert!(!terminal.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    #[test]
+    fn terminal_snapshot_contract_covers_short_writes_cursor_moves_and_scrollback() {
+        let mut terminal = NativeTerminalCore::new(16, 3);
+        terminal.feed(b"LONGER OUTPUT");
+        terminal.feed(b"\r\x1b[2Kshort");
+        assert_eq!(terminal.snapshot()[0].trim_end(), "short");
+
+        terminal.feed(b"\r\x1b[3CX");
+        // Cursor movement must address the current grid rather than append to
+        // the prior run; the erased line remains free of stale characters.
+        assert_eq!(&terminal.snapshot()[0][0..4], "shoX");
+
+        terminal.feed(b"\r\nsecond\r\nthird\r\nfourth");
+        assert_eq!(terminal.snapshot().len(), 3);
+        assert!(terminal.snapshot()[2].starts_with("fourth"));
     }
 }

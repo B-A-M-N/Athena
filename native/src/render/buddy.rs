@@ -1,4 +1,5 @@
 use super::primitives::draw_rect;
+use super::theme::{AMBER, FAILURE, PRIMARY, SECONDARY, SUCCESS};
 use crate::buddy::{
     BuddyKind, BuddyPose, REQUIRED_POSES, SPRITE_FRAME_COUNT, SPRITE_SCALE, pose_for_state,
     sprite_frame,
@@ -11,18 +12,19 @@ pub(crate) fn draw_buddy(x: f32, y: f32, state: &str, status: &str, character: &
     let pose = pose_for_state(if state.is_empty() { status } else { state });
     debug_assert_eq!(kind.pose_frame_count(pose), SPRITE_FRAME_COUNT);
     let _ = REQUIRED_POSES;
-    let color = match pose {
-        BuddyPose::Failure => (0.92, 0.32, 0.36),
-        BuddyPose::Approval => (0.93, 0.69, 0.25),
-        BuddyPose::Success => (0.46, 0.91, 0.67),
-        _ => (0.36, 0.82, 0.78),
+    let color = super::theme::rgb(PRIMARY);
+    let status_accent = match pose {
+        BuddyPose::Failure => super::theme::rgb(FAILURE),
+        BuddyPose::Approval => super::theme::rgb(AMBER),
+        BuddyPose::Success => super::theme::rgb(SUCCESS),
+        _ => super::theme::rgb(SECONDARY),
     };
     let frame_period = match pose {
-        BuddyPose::Idle => 0.20,
-        BuddyPose::Approval => 0.16,
-        BuddyPose::Failure => 0.14,
-        BuddyPose::Success => 0.22,
-        _ => 0.18,
+        BuddyPose::Idle => 0.52,
+        BuddyPose::Approval => 0.34,
+        BuddyPose::Failure => 0.40,
+        BuddyPose::Success => 0.56,
+        _ => 0.36,
     };
     let frame = ((phase.max(0.0) / frame_period).floor() as usize) % SPRITE_FRAME_COUNT;
     let scale = SPRITE_SCALE;
@@ -45,17 +47,31 @@ pub(crate) fn draw_buddy(x: f32, y: f32, state: &str, status: &str, character: &
                     (row == 1 && column == 16)
                         || (row == 2 && (column == 15 || column == 16 || column == 17))
                 }
-                BuddyKind::Owl => row == 5 && (column == 10 || column == 21),
+                BuddyKind::Owl => false,
             };
             if !lit {
                 continue;
             }
-            let mut pixel_color = color;
-            if matches!(kind, BuddyKind::Cat) && (row == 8 || row == 9) {
-                pixel_color = (0.98, 0.84, 0.42);
-            }
-            if matches!(kind, BuddyKind::Bot) && row <= 3 {
-                pixel_color = (0.63, 0.88, 0.86);
+            let mut pixel_color = if matches!(kind, BuddyKind::Owl) && row >= 19 {
+                super::theme::rgb(SECONDARY)
+            } else {
+                color
+            };
+            if matches!(kind, BuddyKind::Owl)
+                && ((row == 11 && (column == 15 || column == 16))
+                    || (row == 12 && (14..=17).contains(&column))
+                    || (row == 13 && (column == 15 || column == 16)))
+            {
+                // A small warm beak gives the owl a readable species cue
+                // without changing the restrained phosphor palette around it.
+                pixel_color = super::theme::rgb(AMBER);
+            } else if (matches!(kind, BuddyKind::Owl)
+                && (row == 10 || row == 11)
+                && (column == 10 || column == 21))
+                || (matches!(kind, BuddyKind::Cat) && (row == 8 || row == 9))
+                || (matches!(kind, BuddyKind::Bot) && row <= 3)
+            {
+                pixel_color = status_accent;
             }
             let px = left + column as f32 * scale;
             let py = top + row as f32 * scale;

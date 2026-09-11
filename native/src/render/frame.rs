@@ -2,7 +2,7 @@ use super::super::*;
 use super::chassis::{ChassisMaterial, PresentationSettings, draw_chassis};
 use super::oi::{OiTarget, draw_oi_scene};
 use super::primitives::{draw_rect, with_crt_mask, with_scissor};
-use super::prompt::draw_status_text;
+use super::prompt::draw_status_cursor;
 use super::terminal::{draw_terminal_background, draw_terminal_text};
 use super::text::TextRenderer;
 
@@ -90,7 +90,7 @@ pub(crate) fn draw_frame(
                 geometry.oi_inner.y,
                 geometry.oi_inner.width,
                 geometry.oi_inner.height,
-                (0.010, 0.028, 0.037),
+                super::theme::GLASS_BACKGROUND,
             );
             draw_oi_scene(
                 oi_target,
@@ -109,37 +109,72 @@ pub(crate) fn draw_frame(
         });
     }
 
+    // The hardware cursor is part of the GL cabinet and therefore needs to
+    // be present before the offscreen surface is copied to the window. Xft
+    // text is painted in draw_text_layer after that copy.
     if dirty.full && !options.cabinet_only {
-        unsafe {
-            glFinish();
-            glXWaitGL();
-        }
-        with_scissor(height, geometry.operator_viewport, || {
-            text.with_clip(geometry.operator_viewport, || {
-                draw_terminal_text(
-                    text,
-                    core,
-                    &geometry,
-                    VisualMode::from_projection(projection) == VisualMode::Idle,
-                );
-            });
-        });
         text.with_clip(geometry.prompt, || {
-            draw_status_text(text, &geometry, projection, focused, input_buffer, phase);
-        });
-    } else if dirty.terminal && !options.cabinet_only {
-        unsafe {
-            glFinish();
-            glXWaitGL();
-        }
-        with_scissor(height, geometry.operator_viewport, || {
-            text.with_clip(geometry.operator_viewport, || {
-                draw_terminal_text(text, core, &geometry, false);
-            });
+            draw_status_cursor(text, &geometry, focused, input_buffer, phase);
         });
     }
     unsafe {
         glFlush();
         XFlush(display);
     }
+}
+
+/// Paint the modern text layer after the GL cabinet has been copied to the
+/// visible X11 window. Xft is intentionally window-owned: several GLX/X11
+/// implementations do not expose XRender writes made to a GLX pixmap when
+/// that pixmap is subsequently copied with XCopyArea.
+pub(crate) fn draw_text_layer(
+    display: *mut Display,
+    width: i32,
+    height: i32,
+    core: &NativeTerminalCore,
+    projection: &Projection,
+    text: &TextRenderer,
+    focused: bool,
+    input_buffer: &InputBuffer,
+    options: &RendererOptions,
+    dirty: DirtyDomains,
+) {
+    if options.cabinet_only || !(dirty.full || dirty.terminal || dirty.oi_motion) {
+        return;
+    }
+    let metrics = UiFontMetrics {
+        body: text.metrics_for(FontRole::Body),
+        input: text.metrics_for(FontRole::Input),
+        heading: text.metrics_for(FontRole::Heading),
+        instrument: text.metrics_for(FontRole::Instrument),
+    };
+    let geometry = FrameGeometry::for_window(width, height, metrics);
+    if dirty.full || dirty.oi_motion {
+        text.with_clip(geometry.oi_inner, || {
+            super::oi_overlay::draw_oi_text_overlay(text, geometry.oi_inner, projection);
+        });
+    }
+    if dirty.full || dirty.terminal {
+        text.with_clip(geometry.operator_viewport, || {
+            draw_terminal_text(
+                text,
+                core,
+                &geometry,
+                VisualMode::from_projection(projection) == VisualMode::Idle,
+            );
+        });
+    }
+    if dirty.full {
+        text.with_clip(geometry.prompt, || {
+            super::prompt::draw_status_text(
+                text,
+                &geometry,
+                projection,
+                focused,
+                input_buffer,
+                false,
+            );
+        });
+    }
+    unsafe { XFlush(display) };
 }

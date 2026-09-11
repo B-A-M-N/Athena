@@ -1,9 +1,10 @@
 use super::super::*;
 use super::buddy::draw_buddy;
-use super::chassis::{PresentationSettings, bitmap_width, draw_bitmap_text};
+use super::chassis::{PresentationSettings, draw_bitmap_text};
 use super::primitives::{
     draw_line, draw_line_alpha, draw_node, draw_rect, draw_round_outline, draw_round_rect,
 };
+use super::theme::{AMBER, DIM, FAILURE, GLASS_BACKGROUND, PRIMARY, SECONDARY, SUCCESS};
 use crate::buddy::{
     SPRITE_DIRTY_HEIGHT, SPRITE_DIRTY_WIDTH, SPRITE_HEIGHT, SPRITE_SCALE, SPRITE_WIDTH,
 };
@@ -66,7 +67,7 @@ impl AttentionHitMap {
     }
 }
 
-const SCENE_WIDTH: f32 = 384.0;
+pub(crate) const SCENE_WIDTH: f32 = 384.0;
 const SCENE_HEIGHT: f32 = 256.0;
 
 struct BuddyMotion {
@@ -98,13 +99,15 @@ fn scene_safe_area(attention_count: usize) -> SceneSafeArea {
         };
     }
     let rail = PixelRect {
-        x: 252.0,
-        y: 12.0,
-        width: 122.0,
-        height: 218.0,
+        // Keep operator telemetry and the world actor unobscured. The
+        // attention bay occupies the quiet lower-left deck below telemetry.
+        x: 12.0,
+        y: 174.0,
+        width: 206.0,
+        height: 76.0,
     };
     SceneSafeArea {
-        unobscured_right: rail.x - 8.0,
+        unobscured_right: full.right(),
         attention_rail: Some(rail),
     }
 }
@@ -404,7 +407,12 @@ pub(crate) fn draw_oi_scene(
             glDisable(GL_SCISSOR_TEST);
             glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
             set_projection(SCENE_WIDTH as i32, SCENE_HEIGHT as i32);
-            glClearColor(0.008, 0.026, 0.036, 1.0);
+            glClearColor(
+                GLASS_BACKGROUND.0,
+                GLASS_BACKGROUND.1,
+                GLASS_BACKGROUND.2,
+                1.0,
+            );
             glClear(GL_COLOR_BUFFER_BIT);
         }
         draw_scene_contents(
@@ -606,22 +614,22 @@ fn set_projection(width: i32, height: i32) {
 
 const HEADER_TOP: f32 = 8.0;
 const HEADER_HEIGHT: f32 = 22.0;
-const READOUT_HEIGHT: f32 = 96.0;
 const MARGIN: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct SceneLayout {
-    full: PixelRect,
     header: PixelRect,
+    telemetry: PixelRect,
+    world: PixelRect,
     stage: PixelRect,
-    readout: Option<PixelRect>,
 }
 
-fn scene_layout(safe_area: SceneSafeArea) -> SceneLayout {
+fn scene_layout(_safe_area: SceneSafeArea) -> SceneLayout {
     let full = PixelRect {
         x: MARGIN,
         y: HEADER_TOP + HEADER_HEIGHT + 4.0,
-        width: (safe_area.unobscured_right - MARGIN * 2.0).max(20.0),
+        width: (SCENE_WIDTH - MARGIN * 2.0).max(20.0),
         height: SCENE_HEIGHT - HEADER_TOP - HEADER_HEIGHT - 14.0,
     };
     let header = PixelRect {
@@ -630,33 +638,23 @@ fn scene_layout(safe_area: SceneSafeArea) -> SceneLayout {
         width: full.width,
         height: HEADER_HEIGHT,
     };
+    let telemetry = PixelRect {
+        x: 12.0,
+        y: 40.0,
+        width: 206.0,
+        height: 124.0,
+    };
+    let world = PixelRect {
+        x: 220.0,
+        y: 40.0,
+        width: (full.right() - 220.0).max(24.0),
+        height: full.bottom() - 40.0,
+    };
     SceneLayout {
-        full,
         header,
-        stage: full,
-        readout: None,
-    }
-}
-
-fn scene_layout_with_readout(safe_area: SceneSafeArea) -> SceneLayout {
-    let base = scene_layout(safe_area);
-    let readout = PixelRect {
-        x: base.full.x + 8.0,
-        y: base.full.bottom() - READOUT_HEIGHT - 2.0,
-        width: (base.full.width - 16.0).max(20.0),
-        height: READOUT_HEIGHT,
-    };
-    let stage = PixelRect {
-        x: base.full.x,
-        y: base.full.y,
-        width: base.full.width,
-        height: (readout.y - base.full.y - 6.0).max(20.0),
-    };
-    SceneLayout {
-        full: base.full,
-        header: base.header,
-        stage,
-        readout: Some(readout),
+        telemetry,
+        world,
+        stage: world,
     }
 }
 
@@ -673,14 +671,18 @@ fn draw_scene_contents(
     safe_area: SceneSafeArea,
 ) {
     let mode = VisualMode::from_projection(projection);
-    let color = rgb_f32(mode_color(mode.as_str()));
+    let color = super::theme::rgb(super::theme::mode_color(mode.as_str()));
     let brightness = presentation.brightness;
     draw_rect(
         0.0,
         0.0,
         SCENE_WIDTH,
         SCENE_HEIGHT,
-        (0.008 * brightness, 0.026 * brightness, 0.036 * brightness),
+        (
+            GLASS_BACKGROUND.0 * brightness,
+            GLASS_BACKGROUND.1 * brightness,
+            GLASS_BACKGROUND.2 * brightness,
+        ),
     );
     if !presentation.display_enabled {
         return;
@@ -695,15 +697,10 @@ fn draw_scene_contents(
         mode,
         presentation.focus,
         safe_area.unobscured_right,
+        220.0,
     );
 
-    let layout = if mode.shows_readout() {
-        scene_layout_with_readout(safe_area)
-    } else {
-        scene_layout(safe_area)
-    };
-
-    draw_chrome(projection, mode, &layout, color, safe_area.unobscured_right);
+    let layout = scene_layout(safe_area);
 
     match mode {
         VisualMode::Idle => draw_idle_scene(projection, &layout, color, phase),
@@ -797,7 +794,14 @@ fn draw_crt_treatment(color: (f32, f32, f32), brightness: f32, focus: f32, phase
     }
 }
 
-fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, _focus: f32, right: f32) {
+fn draw_terrain(
+    color: (f32, f32, f32),
+    phase: f32,
+    mode: VisualMode,
+    _focus: f32,
+    right: f32,
+    world_left: f32,
+) {
     let horizon = 152.0;
     let quiet = matches!(mode, VisualMode::Idle);
     let base_grid = (color.0 * 0.34, color.1 * 0.34, color.2 * 0.34);
@@ -806,24 +810,29 @@ fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, _focus: f3
     } else {
         base_grid
     };
-    let near_grid = (grid.0 * 1.35, grid.1 * 1.35, grid.2 * 1.35);
-    let far_grid = (grid.0 * 0.55, grid.1 * 0.55, grid.2 * 0.55);
-    // A dense perspective vector ground plane receding beneath Buddy.
-    // Horizontal rungs are spaced with quadratic perspective (t*t) and crawl
-    // downward so the plane feels alive without drifting the horizon.
-    let crawl = ((phase.max(0.0) * 0.25).floor() % 16.0) / 16.0;
-    for index in 0..16 {
-        let t = ((index as f32 + crawl) / 16.0).min(0.995);
+    let near_grid = (grid.0 * 1.18, grid.1 * 1.18, grid.2 * 1.18);
+    let far_grid = (grid.0 * 0.42, grid.1 * 0.42, grid.2 * 0.42);
+    // A restrained perspective plane anchors the world. Its geometry is
+    // fixed; semantic scene motion belongs to the actor/graph, not the floor.
+    for index in 0..12 {
+        let t = ((index as f32 + 0.5) / 12.0).min(0.995);
         let perspective = t * t;
         let row_y = horizon + (SCENE_HEIGHT - horizon - 8.0) * perspective;
         let line_color = if t > 0.75 { near_grid } else { grid };
-        draw_dotted_span(14.0, row_y, (right - 14.0).max(14.0), line_color, 2.0);
+        draw_dotted_span(14.0, row_y, world_left.min(right - 14.0), far_grid, 2.0);
+        draw_dotted_span(
+            world_left.min(right - 14.0),
+            row_y,
+            (right - 14.0).max(world_left),
+            line_color,
+            2.0,
+        );
     }
     // Vertical perspective lines fanning out from a vanishing point behind
     // the active information panel, matching the DAGOAL reference wireframe.
     let vanish_x = right * 0.35;
     let bottom_y = SCENE_HEIGHT - 8.0;
-    let line_count = 18;
+    let line_count = 12;
     for index in 0..line_count {
         let bottom_t = index as f32 / (line_count - 1) as f32;
         let bottom_x = 14.0 + bottom_t * (right - 28.0);
@@ -838,21 +847,35 @@ fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, _focus: f3
         (color.0 * 0.65, color.1 * 0.65, color.2 * 0.65),
         3.0,
     );
-    // Sparse ambient markers only in idle; active scenes reserve the field
-    // for semantic motion.
-    if quiet {
-        for index in 0..6 {
-            let px = (index * 67 % ((right as usize).saturating_sub(36)) + 18) as f32;
-            let py = (index * 31 % 96 + 18) as f32;
-            let pulse = 0.45 + 0.25 * ((phase * 2.0 + index as f32 * 1.1).sin());
-            draw_rect(
-                px,
-                py,
-                1.0,
-                1.0,
-                (color.0 * pulse, color.1 * pulse, color.2 * pulse),
-            );
+    // Sparse fixed stars keep the upper viewport alive in every semantic
+    // scene. Their restrained pulse adds liveness without making the whole
+    // world drift like a screensaver.
+    const STARS: [(f32, f32, f32); 8] = [
+        (238.0, 23.0, 0.62),
+        (264.0, 42.0, 0.46),
+        (289.0, 18.0, 0.72),
+        (316.0, 53.0, 0.52),
+        (340.0, 27.0, 0.66),
+        (356.0, 70.0, 0.42),
+        (248.0, 84.0, 0.38),
+        (301.0, 91.0, 0.32),
+    ];
+    for (index, (px, py, intensity)) in STARS.iter().copied().enumerate() {
+        if px >= right - 8.0 {
+            continue;
         }
+        let pulse = if quiet {
+            intensity * (0.88 + 0.08 * (phase * 1.7 + index as f32).sin())
+        } else {
+            intensity * (0.94 + 0.06 * (phase * 2.1 + index as f32 * 0.7).sin())
+        };
+        draw_rect(
+            px,
+            py,
+            if index % 3 == 0 { 2.0 } else { 1.0 },
+            if index % 3 == 0 { 2.0 } else { 1.0 },
+            (color.0 * pulse, color.1 * pulse, color.2 * pulse),
+        );
     }
 }
 
@@ -860,23 +883,15 @@ fn draw_terrain(color: (f32, f32, f32), phase: f32, mode: VisualMode, _focus: f3
 // Chrome
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn draw_chrome(
     projection: &Projection,
     mode: VisualMode,
-    _layout: &SceneLayout,
+    layout: &SceneLayout,
     color: (f32, f32, f32),
     right: f32,
 ) {
-    let bright = (color.0 * 0.92, color.1 * 0.92, color.2 * 0.92);
-    let dim = (color.0 * 0.78, color.1 * 0.78, color.2 * 0.78);
-    pixel_text(
-        10.0,
-        14.0,
-        "ATHENA OI // GLASS COMPUTE",
-        bright,
-        right - 10.0,
-    );
-
+    let dim = (0.48, 0.58, 0.63);
     let operation = projection.active_operation.as_ref();
     let action = projection.current_action.as_ref();
     let label = operation
@@ -896,19 +911,19 @@ fn draw_chrome(
     let badge = mode.as_str().to_ascii_uppercase();
     let badge_width = badge.chars().count() as f32 * 7.0;
     pixel_text(
-        (right - badge_width - 10.0).max(10.0),
-        14.0,
+        (layout.header.right() - badge_width - 4.0).max(layout.header.x),
+        layout.header.y + 6.0,
         &badge,
         dim,
-        right - 10.0,
+        layout.header.right(),
     );
 
     // Dotted header rule.
-    let mut rule_x = 10.0;
-    while rule_x + 3.0 < right - 10.0 {
+    let mut rule_x = layout.header.x;
+    while rule_x + 3.0 < layout.header.right() {
         draw_rect(
             rule_x,
-            27.0,
+            layout.header.bottom() - 1.0,
             2.0,
             1.0,
             (color.0 * 0.42, color.1 * 0.42, color.2 * 0.42),
@@ -923,14 +938,20 @@ fn draw_chrome(
         label.to_owned()
     };
     if !context.is_empty() {
-        pixel_text(10.0, 35.0, &context, dim, right - 10.0);
+        pixel_text(
+            layout.header.x,
+            layout.header.bottom() + 5.0,
+            &context,
+            dim,
+            right - 10.0,
+        );
     }
 
     if let Some(request) = projection.model_request.as_ref() {
         if request.status.eq_ignore_ascii_case("unconfigured") {
             pixel_text(
-                (right - 170.0).max(10.0),
-                35.0,
+                (right - 170.0).max(layout.header.x),
+                layout.header.bottom() + 5.0,
                 "MODEL UNCONFIGURED",
                 (0.91, 0.62, 0.22),
                 right - 10.0,
@@ -939,217 +960,192 @@ fn draw_chrome(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Live readout pane
-// ---------------------------------------------------------------------------
-
-fn draw_readout_frame(rect: PixelRect, color: (f32, f32, f32)) {
-    if rect.width <= 0.0 || rect.height <= 0.0 {
-        return;
-    }
-    let glass = (color.0 * 0.12, color.1 * 0.22, color.2 * 0.24);
-    let rim = (color.0 * 0.55, color.1 * 0.55, color.2 * 0.55);
-    draw_round_rect(
-        rect.x,
-        rect.y,
-        rect.width,
-        rect.height,
-        5.0,
-        (0.006, 0.014, 0.016),
-    );
-    draw_round_outline(rect.x, rect.y, rect.width, rect.height, rim);
-    // Inner glass sheen
-    draw_line_alpha(
-        rect.x + 4.0,
-        rect.y + 2.0,
-        rect.x + rect.width * 0.55,
-        rect.y + 2.0,
-        glass,
-        0.35,
-    );
-}
-
-fn draw_live_readout(
+/// Persistent structured telemetry. This is deliberately text-first: the
+/// world actor and graph are secondary decoration, while the projection's
+/// real fields remain readable in every operation mode.
+#[allow(dead_code)]
+fn draw_operation_telemetry(
     projection: &Projection,
     mode: VisualMode,
     rect: PixelRect,
     color: (f32, f32, f32),
-    phase: f32,
+    _phase: f32,
 ) {
-    draw_readout_frame(rect, color);
-    if rect.width <= 14.0 || rect.height <= 14.0 {
-        return;
+    let primary = super::theme::rgb(PRIMARY);
+    let secondary = super::theme::rgb(SECONDARY);
+    let active = super::theme::rgb(SECONDARY);
+    let mut lines: Vec<(String, (f32, f32, f32))> = Vec::new();
+    lines.push((format!("TELEMETRY // {}", mode.as_str()), primary));
+
+    if let Some(request) = projection.model_request.as_ref() {
+        let provider = if request.provider.is_empty() {
+            "UNKNOWN"
+        } else {
+            request.provider.as_str()
+        };
+        let model = if request.model.is_empty() {
+            "UNSPECIFIED"
+        } else {
+            request.model.as_str()
+        };
+        lines.push((
+            format!("MODEL {provider}/{model}"),
+            telemetry_status_color(&request.status, active),
+        ));
+        if !request.status.is_empty() {
+            lines.push((format!("MODEL STATUS {}", request.status), secondary));
+        }
     }
-    let inner_x = rect.x + 6.0;
-    let inner_y = rect.y + 7.0;
-    let inner_right = rect.right() - 6.0;
-    let line_height = 9.0;
-    let bright = (color.0 * 0.92, color.1 * 0.92, color.2 * 0.92);
-    let dim = (color.0 * 0.58, color.1 * 0.58, color.2 * 0.58);
-
-    let mut y = inner_y;
-    let max_lines = ((rect.height - 14.0) / line_height).floor().max(1.0) as usize;
-
-    match mode {
-        VisualMode::Read => {
-            if let Some(code) = projection.code_view.as_ref() {
-                let header = format!("READ  {}", code.path);
-                pixel_text(inner_x, y, &header, bright, inner_right);
-                y += line_height;
-                let lines = if !code.lines.is_empty() {
-                    &code.lines
-                } else {
-                    &code.text.lines().map(str::to_owned).collect::<Vec<_>>()
-                };
-                let scan_index = ((phase * 1.4).floor() as usize) % lines.len().max(1);
-                for (index, line) in lines.iter().take(max_lines.saturating_sub(1)).enumerate() {
-                    let _ = index;
-                    let dimmed = if index == scan_index { 1.0 } else { 0.65 };
-                    pixel_text(
-                        inner_x,
-                        y,
-                        line,
-                        (
-                            color.0 * 0.75 * dimmed,
-                            color.1 * 0.82 * dimmed,
-                            color.2 * 0.85 * dimmed,
-                        ),
-                        inner_right,
-                    );
-                    y += line_height;
-                }
-                if code.preview_truncated {
-                    pixel_text(inner_x, y, "...", dim, inner_right);
-                }
+    if let Some(operation) = projection.active_operation.as_ref() {
+        let label = if !operation.label.is_empty() {
+            operation.label.as_str()
+        } else if !operation.operation.is_empty() {
+            operation.operation.as_str()
+        } else {
+            operation.capability.as_str()
+        };
+        if !label.is_empty() {
+            let target = if operation.target.is_empty() {
+                String::new()
             } else {
-                pixel_text(inner_x, y, "AWAITING ARTIFACT", dim, inner_right);
-            }
+                format!(" -> {}", operation.target)
+            };
+            lines.push((format!("OP {label}{target}"), active));
         }
-        VisualMode::Code => {
-            if let Some(code) = projection.code_view.as_ref() {
-                let header = format!("MODIFY  {}", code.path);
-                pixel_text(inner_x, y, &header, bright, inner_right);
-                y += line_height;
-                let lines = if !code.diff.is_empty() {
-                    code.diff.clone()
-                } else if !code.lines.is_empty() {
-                    code.lines.clone()
-                } else {
-                    code.text.lines().map(str::to_owned).collect()
-                };
-                for line in lines.iter().take(max_lines.saturating_sub(1)) {
-                    let line_color = if line.starts_with('+') {
-                        (0.46, 0.91, 0.67)
-                    } else if line.starts_with('-') {
-                        (0.88, 0.28, 0.32)
-                    } else {
-                        (color.0 * 0.75, color.1 * 0.82, color.2 * 0.85)
-                    };
-                    pixel_text(inner_x, y, line, line_color, inner_right);
-                    y += line_height;
-                }
-                if !code.mutation_state.is_empty() {
-                    pixel_text(
-                        inner_x,
-                        y,
-                        &code.mutation_state.to_ascii_uppercase(),
-                        dim,
-                        inner_right,
-                    );
-                }
-            } else {
-                pixel_text(inner_x, y, "AWAITING CODE VIEW", dim, inner_right);
-            }
+        if !operation.state.is_empty() {
+            lines.push((format!("OP STATE {}", operation.state), secondary));
         }
-        VisualMode::Execute | VisualMode::Generate | VisualMode::Recover => {
-            let operation = projection.active_operation.as_ref();
-            let command =
-                operation.and_then(|op| (!op.command.is_empty()).then_some(op.command.as_str()));
-            if let Some(command) = command {
-                pixel_text(inner_x, y, &format!("$ {command}"), bright, inner_right);
-                y += line_height;
-            }
-            let tail: Vec<&str> = projection
-                .stream_tail
-                .iter()
-                .rev()
-                .take(max_lines.saturating_sub(1))
-                .map(String::as_str)
-                .collect();
-            for line in tail.iter().rev() {
-                pixel_text(inner_x, y, line, dim, inner_right);
-                y += line_height;
-            }
-            if operation.is_some_and(|op| op.progress_determinate) {
-                if let Some(value) = operation.and_then(|op| op.progress_value) {
-                    let bar_width = (rect.width - 16.0).max(4.0);
-                    let filled = bar_width * value as f32;
-                    draw_rect(
-                        inner_x,
-                        y,
-                        bar_width,
-                        3.0,
-                        (color.0 * 0.22, color.1 * 0.22, color.2 * 0.22),
-                    );
-                    draw_rect(inner_x, y, filled, 3.0, color);
-                }
-            }
+    }
+    if let Some(action) = projection.current_action.as_ref() {
+        if !action.kind.is_empty() || !action.target.is_empty() {
+            lines.push((
+                format!("ACTION {} {}", action.kind, action.target)
+                    .trim()
+                    .to_owned(),
+                active,
+            ));
         }
-        VisualMode::Test | VisualMode::Verify => {
-            pixel_text(inner_x, y, "VERIFICATION", bright, inner_right);
-            y += line_height;
-            let status = projection.verification.status.to_ascii_uppercase();
-            if !status.is_empty() {
-                pixel_text(inner_x, y, &status, dim, inner_right);
-                y += line_height;
-            }
-            for check in projection
-                .verification
-                .checks
-                .iter()
-                .take(max_lines.saturating_sub(2))
-            {
-                let text = check.to_string();
-                let status = check_status(check);
-                let check_color = if status == "failed" {
-                    (0.88, 0.28, 0.32)
-                } else if status == "passed" || status == "complete" {
-                    (0.46, 0.91, 0.67)
-                } else {
-                    dim
-                };
-                pixel_text(inner_x, y, &text, check_color, inner_right);
-                y += line_height;
-            }
+    }
+    if let Some(item) = projection.attention_items.first() {
+        let title = if item.title.is_empty() {
+            item.kind.as_str()
+        } else {
+            item.title.as_str()
+        };
+        let summary = if item.summary.is_empty() {
+            String::new()
+        } else {
+            format!(" :: {}", item.summary)
+        };
+        lines.push((
+            format!("ATTN {title}{summary}"),
+            telemetry_status_color(&item.severity, super::theme::rgb(AMBER)),
+        ));
+    }
+    if !projection.workspace_tree.is_empty() {
+        lines.push(("WORKSPACE".to_owned(), primary));
+        let mut tree_lines = Vec::new();
+        telemetry_tree_lines(&projection.workspace_tree, 0, &mut tree_lines, 2);
+        lines.extend(tree_lines.into_iter().map(|line| (line, secondary)));
+    }
+    if let Some(code) = projection.code_view.as_ref() {
+        if !code.path.is_empty() {
+            lines.push((format!("CODE {}", code.path), active));
         }
-        VisualMode::Failure => {
-            pixel_text(inner_x, y, "DIAGNOSTICS", bright, inner_right);
-            y += line_height;
-            for diagnostic in projection
-                .diagnostics
-                .iter()
-                .take(max_lines.saturating_sub(1))
-            {
-                let location = if diagnostic.path.is_empty() {
-                    diagnostic.message.clone()
-                } else {
-                    format!(
-                        "{}{}",
-                        diagnostic.path,
-                        diagnostic
-                            .line
-                            .map_or(String::new(), |line| format!(":{line}"))
-                    )
-                };
-                pixel_text(inner_x, y, &location, (0.84, 0.45, 0.30), inner_right);
-                y += line_height;
-                if !diagnostic.detail.is_empty() {
-                    pixel_text(inner_x, y, &diagnostic.detail, dim, inner_right);
-                    y += line_height;
-                }
-            }
+    }
+    if !projection.verification.status.is_empty() {
+        lines.push((
+            format!("VERIFY {}", projection.verification.status),
+            telemetry_status_color(&projection.verification.status, active),
+        ));
+    }
+    if let Some(diagnostic) = projection.diagnostics.first() {
+        if !diagnostic.message.is_empty() {
+            lines.push((
+                format!("DIAG {}", diagnostic.message),
+                super::theme::rgb(FAILURE),
+            ));
         }
-        _ => {}
+    }
+    if let Some(tail) = projection.stream_tail.last() {
+        if !tail.is_empty() {
+            lines.push((format!("STREAM {}", tail), secondary));
+        }
+    }
+    if let Some(progress) = projection
+        .progress
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(value) = progress
+            .get("value")
+            .or_else(|| progress.get("progress_value"))
+            .and_then(serde_json::Value::as_f64)
+        {
+            lines.push((
+                format!("PROGRESS {:>3.0}%", (value * 100.0).clamp(0.0, 100.0)),
+                active,
+            ));
+        }
+    }
+
+    draw_dotted_span(
+        rect.x,
+        rect.y,
+        rect.right(),
+        (color.0 * 0.48, color.1 * 0.48, color.2 * 0.48),
+        2.0,
+    );
+    draw_dotted_span(
+        rect.x,
+        rect.bottom(),
+        rect.right(),
+        (color.0 * 0.30, color.1 * 0.30, color.2 * 0.30),
+        2.0,
+    );
+    let line_height = 10.0;
+    for (index, (line, line_color)) in lines.iter().take(12).enumerate() {
+        pixel_text(
+            rect.x,
+            rect.y + 10.0 + index as f32 * line_height,
+            line,
+            *line_color,
+            rect.right(),
+        );
+    }
+}
+
+#[allow(dead_code)]
+fn telemetry_tree_lines(
+    nodes: &[ProjectionTreeNode],
+    depth: usize,
+    output: &mut Vec<String>,
+    limit: usize,
+) {
+    for node in nodes {
+        if output.len() >= limit {
+            return;
+        }
+        let label = if !node.label.is_empty() {
+            node.label.as_str()
+        } else if !node.id.is_empty() {
+            node.id.as_str()
+        } else {
+            node.kind.as_str()
+        };
+        let marker = if node.children.is_empty() { "-" } else { "+" };
+        output.push(format!("{}{} {}", "  ".repeat(depth), marker, label));
+        telemetry_tree_lines(&node.children, depth + 1, output, limit);
+    }
+}
+
+#[allow(dead_code)]
+fn telemetry_status_color(status: &str, base: (f32, f32, f32)) -> (f32, f32, f32) {
+    match status.to_ascii_lowercase().as_str() {
+        "failed" | "failure" | "error" => super::theme::rgb(FAILURE),
+        "passed" | "complete" | "success" | "ready" => super::theme::rgb(SUCCESS),
+        "waiting" | "approval" | "paused" => super::theme::rgb(AMBER),
+        _ => base,
     }
 }
 
@@ -1224,9 +1220,11 @@ fn layout_tree(tree: &[ProjectionTreeNode], stage: PixelRect) -> Vec<TreeLayoutN
 
 fn node_status_color(status: &str, base: (f32, f32, f32)) -> (f32, f32, f32) {
     match status.to_ascii_lowercase().as_str() {
-        "failed" | "error" | "failure" => (0.88, 0.28, 0.32),
-        "passed" | "complete" | "ready" | "ok" | "success" | "succeeded" => (0.46, 0.91, 0.67),
-        "approval" | "warning" => (0.91, 0.62, 0.22),
+        "failed" | "error" | "failure" => super::theme::rgb(FAILURE),
+        "passed" | "complete" | "ready" | "ok" | "success" | "succeeded" => {
+            super::theme::rgb(SUCCESS)
+        }
+        "approval" | "warning" => super::theme::rgb(AMBER),
         "reading" | "testing" | "running" | "active" | "working" => (
             base.0 * (0.72 + 0.28),
             base.1 * (0.72 + 0.28),
@@ -1270,15 +1268,6 @@ fn draw_tree_nodes(
                     node_color.1 * pulse,
                     node_color.2 * pulse,
                 ),
-            );
-        }
-        if node.label.len() <= 16 {
-            pixel_text(
-                node.x - 18.0,
-                node.y + radius + 6.0,
-                &node.label,
-                (node_color.0 * 0.8, node_color.1 * 0.8, node_color.2 * 0.8),
-                node.x + 40.0,
             );
         }
     }
@@ -1349,20 +1338,6 @@ fn draw_runtime_graph(
     for (x, y, radius, entity) in layout.iter() {
         let node_color = node_status_color(&entity.status, color);
         draw_node(*x, *y, *radius, node_color);
-        let label = if entity.label.is_empty() {
-            entity_label(entity)
-        } else {
-            entity.label.clone()
-        };
-        if label.len() <= 16 {
-            pixel_text(
-                x - 20.0,
-                y + radius + 6.0,
-                &label,
-                (node_color.0 * 0.8, node_color.1 * 0.8, node_color.2 * 0.8),
-                x + 40.0,
-            );
-        }
     }
     // Activity packets travel along edges.
     let edges: Vec<((f32, f32), (f32, f32))> = layout
@@ -1383,7 +1358,7 @@ fn draw_runtime_graph(
 // ---------------------------------------------------------------------------
 
 fn draw_idle_scene(
-    projection: &Projection,
+    _projection: &Projection,
     layout: &SceneLayout,
     color: (f32, f32, f32),
     phase: f32,
@@ -1397,19 +1372,6 @@ fn draw_idle_scene(
         cy,
         16.0,
         (color.0 * pulse, color.1 * pulse, color.2 * pulse),
-    );
-    // Small status word.
-    let status = if projection.status.is_empty() {
-        "READY".to_string()
-    } else {
-        projection.status.to_ascii_uppercase()
-    };
-    pixel_text(
-        cx - bitmap_width(&status, PIXEL_TEXT_SCALE) * 0.5,
-        cy + 26.0,
-        &status,
-        (color.0 * 0.84, color.1 * 0.84, color.2 * 0.84),
-        layout.stage.right(),
     );
 }
 
@@ -1447,7 +1409,7 @@ fn draw_workspace_scene(
 }
 
 fn draw_read_scene(
-    projection: &Projection,
+    _projection: &Projection,
     layout: &SceneLayout,
     color: (f32, f32, f32),
     phase: f32,
@@ -1464,22 +1426,6 @@ fn draw_read_scene(
         scan_radius * 2.0,
         (color.0 * 0.55, color.1 * 0.55, color.2 * 0.55),
     );
-    if let Some(code) = projection.code_view.as_ref() {
-        let name = code
-            .path
-            .rsplit_once('/')
-            .map_or(code.path.as_str(), |(_, name)| name);
-        pixel_text(
-            cx - 22.0,
-            cy + 28.0,
-            name,
-            color,
-            layout.stage.right() - 8.0,
-        );
-    }
-    if let Some(readout) = layout.readout {
-        draw_live_readout(projection, VisualMode::Read, readout, color, phase);
-    }
 }
 
 fn draw_code_scene(
@@ -1502,23 +1448,17 @@ fn draw_code_scene(
         });
     draw_tree_nodes(&tree, color, phase, active_id);
 
-    // Focal artifact glow near the readout.
-    if let Some(readout) = layout.readout {
-        let cx = readout.x + readout.width * 0.88;
-        let cy = layout.stage.y + layout.stage.height * 0.72;
-        let pulse = 0.5 + 0.5 * (phase * std::f32::consts::TAU * 1.2).sin();
-        draw_rect(
-            cx - 3.0,
-            cy - 3.0,
-            6.0,
-            6.0,
-            (color.0 * pulse, color.1 * pulse, color.2 * pulse),
-        );
-    }
-
-    if let Some(readout) = layout.readout {
-        draw_live_readout(projection, VisualMode::Code, readout, color, phase);
-    }
+    // Small active marker stays in the world field, away from telemetry.
+    let cx = layout.world.x + layout.world.width * 0.82;
+    let cy = layout.world.y + layout.world.height * 0.72;
+    let pulse = 0.5 + 0.5 * (phase * std::f32::consts::TAU * 1.2).sin();
+    draw_rect(
+        cx - 3.0,
+        cy - 3.0,
+        6.0,
+        6.0,
+        (color.0 * pulse, color.1 * pulse, color.2 * pulse),
+    );
 }
 
 fn draw_execute_scene(
@@ -1526,7 +1466,7 @@ fn draw_execute_scene(
     layout: &SceneLayout,
     color: (f32, f32, f32),
     phase: f32,
-    mode: VisualMode,
+    _mode: VisualMode,
 ) {
     let entities = runtime_entity_nodes(projection);
     let graph = layout_runtime_graph(&entities, layout.stage);
@@ -1541,41 +1481,19 @@ fn draw_execute_scene(
         10.0,
         (color.0 * pulse, color.1 * pulse, color.2 * pulse),
     );
-    let label = if mode == VisualMode::Recover {
-        "RECOVER"
-    } else {
-        "EXECUTE"
-    };
-    pixel_text(
-        cx - bitmap_width(label, PIXEL_TEXT_SCALE) * 0.5,
-        cy + 18.0,
-        label,
-        (color.0 * 0.84, color.1 * 0.84, color.2 * 0.84),
-        layout.stage.right(),
-    );
-    if let Some(readout) = layout.readout {
-        draw_live_readout(projection, mode, readout, color, phase);
-    }
 }
 
 fn draw_test_scene(
     projection: &Projection,
     layout: &SceneLayout,
     color: (f32, f32, f32),
-    phase: f32,
+    _phase: f32,
 ) {
     let checks = &projection.verification.checks;
     let cx = layout.stage.x + layout.stage.width * 0.5;
     let cy = layout.stage.y + layout.stage.height * 0.42;
     if checks.is_empty() {
         draw_node(cx, cy, 14.0, color);
-        pixel_text(
-            cx - 28.0,
-            cy + 22.0,
-            "AWAITING EVIDENCE",
-            color,
-            layout.stage.right() - 8.0,
-        );
     } else {
         let count = checks.len().min(5);
         let radius = 48.0_f32.min(layout.stage.width * 0.22);
@@ -1600,29 +1518,18 @@ fn draw_test_scene(
                 y,
                 (color.0 * 0.45, color.1 * 0.45, color.2 * 0.45),
             );
-            let glyph = if status == "passed" || status == "complete" {
-                "OK"
-            } else if status == "failed" {
-                "X"
-            } else {
-                ".."
-            };
-            pixel_text(x - 4.0, y + 3.0, glyph, gate_color, x + 12.0);
         }
         draw_node(cx, cy, 14.0, color);
-    }
-    if let Some(readout) = layout.readout {
-        draw_live_readout(projection, VisualMode::Test, readout, color, phase);
     }
 }
 
 fn draw_approval_scene(
-    projection: &Projection,
+    _projection: &Projection,
     layout: &SceneLayout,
-    color: (f32, f32, f32),
+    _color: (f32, f32, f32),
     phase: f32,
 ) {
-    let amber = (0.91, 0.62, 0.22);
+    let amber = super::theme::rgb(AMBER);
     let cx = layout.stage.x + layout.stage.width * 0.5;
     let cy = layout.stage.y + layout.stage.height * 0.45;
     let pulse = (phase / 0.28).clamp(0.0, 1.0);
@@ -1631,40 +1538,15 @@ fn draw_approval_scene(
     draw_round_outline(cx - width * 0.5, cy - height * 0.5, width, height, amber);
     draw_rect(cx - 14.0, cy, 28.0, 2.0, amber);
     draw_rect(cx, cy - 14.0, 2.0, 28.0, amber);
-    pixel_text(
-        cx - 40.0,
-        cy + 32.0,
-        "POLICY GATE",
-        amber,
-        layout.stage.right() - 8.0,
-    );
-    // Approval summary in readout area even though readout is not the primary
-    // surface; it keeps the required action legible.
-    if let Some(readout) = layout.readout {
-        draw_readout_frame(readout, color);
-        if let Some(item) = projection.attention_items.first() {
-            let x = readout.x + 6.0;
-            let mut y = readout.y + 9.0;
-            pixel_text(x, y, &item.title, amber, readout.right() - 6.0);
-            y += 9.0;
-            pixel_text(
-                x,
-                y,
-                &item.summary,
-                (color.0 * 0.75, color.1 * 0.82, color.2 * 0.85),
-                readout.right() - 6.0,
-            );
-        }
-    }
 }
 
 fn draw_failure_scene(
-    projection: &Projection,
+    _projection: &Projection,
     layout: &SceneLayout,
-    color: (f32, f32, f32),
+    _color: (f32, f32, f32),
     phase: f32,
 ) {
-    let red = (0.88, 0.28, 0.32);
+    let red = super::theme::rgb(FAILURE);
     let cx = layout.stage.x + layout.stage.width * 0.35;
     let cy = layout.stage.y + layout.stage.height * 0.45;
     // Fracture marks around the focal failure.
@@ -1674,20 +1556,10 @@ fn draw_failure_scene(
     draw_rect(cx + 8.0, cy - 18.0, 2.0, 18.0, red);
     draw_rect(cx + 18.0, cy + 4.0, 2.0, 24.0, red);
     draw_node(cx, cy, 16.0, red);
-    pixel_text(
-        cx - 20.0,
-        cy + 26.0,
-        "FAILURE",
-        red,
-        layout.stage.right() - 8.0,
-    );
-    if let Some(readout) = layout.readout {
-        draw_live_readout(projection, VisualMode::Failure, readout, color, phase);
-    }
 }
 
 fn draw_success_scene(layout: &SceneLayout, _color: (f32, f32, f32), phase: f32) {
-    let green = (0.46, 0.91, 0.67);
+    let green = super::theme::rgb(SUCCESS);
     let cx = layout.stage.x + layout.stage.width * 0.5;
     let cy = layout.stage.y + layout.stage.height * 0.45;
     let pulse = 0.85 + 0.15 * (phase * std::f32::consts::TAU * 0.6).sin();
@@ -1699,48 +1571,41 @@ fn draw_success_scene(layout: &SceneLayout, _color: (f32, f32, f32), phase: f32)
     );
     draw_line(cx - 12.0, cy + 2.0, cx - 2.0, cy + 12.0, green);
     draw_line(cx - 2.0, cy + 12.0, cx + 14.0, cy - 8.0, green);
-    pixel_text(
-        cx - 34.0,
-        cy + 30.0,
-        "VERIFIED",
-        green,
-        layout.stage.right() - 8.0,
-    );
 }
 
 fn draw_think_scene(
-    projection: &Projection,
+    _projection: &Projection,
     layout: &SceneLayout,
     color: (f32, f32, f32),
     phase: f32,
 ) {
-    let cx = layout.stage.x + layout.stage.width * 0.5;
-    let cy = layout.stage.y + layout.stage.height * 0.42;
-    for index in 0..3 {
-        let radius = 18.0 + ((phase * 34.0 + index as f32 * 24.0) % 60.0);
-        draw_round_outline(
-            cx - radius,
-            cy - radius,
-            radius * 2.0,
-            radius * 2.0,
-            (color.0 * 0.34, color.1 * 0.34, color.2 * 0.34),
+    let cx = layout.world.x + layout.world.width * 0.52;
+    let cy = layout.world.y + layout.world.height * 0.36;
+    let active_index = (phase.max(0.0) * 1.4).floor() as usize % 4;
+    for index in 0..4 {
+        let x = layout.world.x + 14.0 + index as f32 * 22.0;
+        let y = cy + index as f32 * 2.0;
+        let activity = if index == active_index { 0.82 } else { 0.34 };
+        draw_dotted_line(
+            x,
+            y,
+            x + 14.0,
+            y - 8.0,
+            (color.0 * 0.30, color.1 * 0.36, color.2 * 0.38),
+        );
+        draw_rect(
+            x + 12.0,
+            y - 9.0,
+            3.0,
+            3.0,
+            (color.0 * activity, color.1 * activity, color.2 * activity),
         );
     }
-    draw_node(cx, cy, 10.0, color);
-    let label = projection
-        .progress
-        .as_ref()
-        .and_then(|value| value.as_object())
-        .and_then(|object| object.get("label"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| "REASONING".to_owned());
-    pixel_text(
-        cx - bitmap_width(&label, PIXEL_TEXT_SCALE) * 0.5,
-        cy + 24.0,
-        &label,
-        (color.0 * 0.84, color.1 * 0.84, color.2 * 0.84),
-        layout.stage.right() - 8.0,
+    draw_node(
+        cx,
+        cy,
+        7.0,
+        (color.0 * 0.52, color.1 * 0.58, color.2 * 0.60),
     );
 }
 
@@ -1763,11 +1628,14 @@ fn draw_attention_rail(projection: &Projection, safe_area: SceneSafeArea) {
     draw_round_outline(rail.x, rail.y, rail.width, rail.height, (0.16, 0.32, 0.34));
     let (start, end) = attention_page_range(projection);
     let mut y = rail.y + 12.0;
-    for item in projection.attention_items[start..end].iter() {
+    // The lower bay is intentionally a single high-signal alert slot. Page
+    // controls still expose additional items without covering telemetry or
+    // the world actor.
+    for item in projection.attention_items[start..end].iter().take(1) {
         let accent = match item.severity.to_ascii_lowercase().as_str() {
-            "failure" | "error" => (0.88, 0.28, 0.32),
-            "warning" | "approval" => (0.91, 0.62, 0.22),
-            _ => (0.34, 0.76, 0.72),
+            "failure" | "error" => super::theme::rgb(FAILURE),
+            "warning" | "approval" => super::theme::rgb(AMBER),
+            _ => super::theme::rgb(SECONDARY),
         };
         draw_round_rect(
             rail.x + 6.0,
@@ -1788,7 +1656,7 @@ fn draw_attention_rail(projection: &Projection, safe_area: SceneSafeArea) {
             rail.x + 10.0,
             y + 20.0,
             &item.summary,
-            (0.68, 0.78, 0.80),
+            super::theme::rgb(SECONDARY),
             rail.right() - 8.0,
         );
         if item.requires_action {
@@ -1809,7 +1677,7 @@ fn draw_attention_rail(projection: &Projection, safe_area: SceneSafeArea) {
                 rail.x + 10.0,
                 y + 42.0,
                 related,
-                (0.40, 0.58, 0.60),
+                super::theme::rgb(DIM),
                 rail.right() - 8.0,
             );
         } else if !item.id.is_empty() {
@@ -1817,7 +1685,7 @@ fn draw_attention_rail(projection: &Projection, safe_area: SceneSafeArea) {
                 rail.x + 10.0,
                 y + 42.0,
                 &item.id,
-                (0.40, 0.58, 0.60),
+                super::theme::rgb(DIM),
                 rail.right() - 8.0,
             );
         }
@@ -1831,7 +1699,7 @@ fn draw_attention_rail(projection: &Projection, safe_area: SceneSafeArea) {
             rail.x + 8.0,
             rail.bottom() - 6.0,
             &format!("PAGE {page}/{pages}  SCROLL"),
-            (0.42, 0.72, 0.74),
+            super::theme::rgb(SECONDARY),
             rail.right() - 6.0,
         );
         if end < total {
@@ -1839,7 +1707,7 @@ fn draw_attention_rail(projection: &Projection, safe_area: SceneSafeArea) {
                 rail.x + 8.0,
                 rail.bottom() - 18.0,
                 &format!("+{} MORE", total - end),
-                (0.91, 0.62, 0.22),
+                super::theme::rgb(AMBER),
                 rail.right() - 6.0,
             );
         }
@@ -1849,7 +1717,7 @@ fn draw_attention_rail(projection: &Projection, safe_area: SceneSafeArea) {
             rail.x + 8.0,
             rail.y + 4.0,
             &format!("BRIDGE {} // STALE", projection.bridge_status),
-            (0.88, 0.28, 0.32),
+            super::theme::rgb(FAILURE),
             rail.right() - 6.0,
         );
     }
@@ -1944,7 +1812,7 @@ pub(crate) fn attention_hit_map(projection: &Projection) -> AttentionHitMap {
     let mut hits = Vec::new();
     let mut y = rail.y + 12.0;
     let (start, end) = attention_page_range(projection);
-    for item in projection.attention_items[start..end].iter() {
+    for item in projection.attention_items[start..end].iter().take(1) {
         if item.requires_action {
             hits.extend(
                 attention_button_rects(item, rail.x + 10.0, y + 36.0, rail.right() - 10.0)
@@ -1989,6 +1857,7 @@ fn draw_dotted_line(x1: f32, y1: f32, x2: f32, y2: f32, color: (f32, f32, f32)) 
     }
 }
 
+#[cfg(test)]
 fn entity_label(entity: &ProjectionEntity) -> String {
     if !entity.label.is_empty() {
         return entity.label.clone();
@@ -2116,22 +1985,6 @@ fn buddy_anchor_is_clear(candidate: (f32, f32), projection: &Projection, right: 
 // ---------------------------------------------------------------------------
 // Mode helpers and tests
 // ---------------------------------------------------------------------------
-
-impl VisualMode {
-    fn shows_readout(self) -> bool {
-        matches!(
-            self,
-            VisualMode::Read
-                | VisualMode::Code
-                | VisualMode::Execute
-                | VisualMode::Generate
-                | VisualMode::Recover
-                | VisualMode::Test
-                | VisualMode::Verify
-                | VisualMode::Failure
-        )
-    }
-}
 
 fn check_status(check: &serde_json::Value) -> &str {
     if check.get("passed").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -2642,7 +2495,7 @@ mod tests {
             if let Some(rail) = safe_area.attention_rail {
                 assert!(rail.x >= 0.0 && rail.y >= 0.0);
                 assert!(rail.right() <= SCENE_WIDTH && rail.bottom() <= SCENE_HEIGHT);
-                assert!(safe_area.unobscured_right < rail.x);
+                assert!(rail.right() < safe_area.unobscured_right);
             }
             let target = buddy_target(&projection, mode, safe_area.unobscured_right);
             assert!(buddy_anchor_is_clear(
@@ -2807,7 +2660,7 @@ mod tests {
             )
         };
 
-        let (x, y) = physical(278.0, 67.0);
+        let (x, y) = physical(52.0, 229.0);
         assert_eq!(
             map.hit_physical(x, y, oi_inner),
             Some(&AttentionAction::Approve {
@@ -2815,7 +2668,7 @@ mod tests {
                 scope: "call".to_owned(),
             })
         );
-        let (x, y) = physical(313.0, 67.0);
+        let (x, y) = physical(114.0, 229.0);
         assert_eq!(
             map.hit_physical(x, y, oi_inner),
             Some(&AttentionAction::Approve {
@@ -2823,7 +2676,7 @@ mod tests {
                 scope: "task".to_owned(),
             })
         );
-        let (x, y) = physical(347.0, 67.0);
+        let (x, y) = physical(176.0, 229.0);
         assert_eq!(
             map.hit_physical(x, y, oi_inner),
             Some(&AttentionAction::Deny {

@@ -36,7 +36,13 @@ def main() -> int:
     def lit(x: int, y: int) -> bool:
         red, green, blue, alpha = pixel(x, y)
         channel_range = max(red, green, blue) - min(red, green, blue)
-        return alpha > 180 and max(red, green, blue) > 90 and channel_range > 18
+        # The current Buddy palette is intentionally pale/neutral like the
+        # DAGOAL reference, so chroma alone cannot distinguish foreground
+        # from the dark field. Keep the chromatic threshold for colored
+        # telemetry while admitting bright neutral phosphor cells.
+        return alpha > 180 and max(red, green, blue) > 90 and (
+            channel_range > 18 or max(red, green, blue) > 150
+        )
 
     lit_count = sum(lit(x, y) for y in range(HEIGHT) for x in range(WIDTH))
     if lit_count < 120:

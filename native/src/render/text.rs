@@ -133,13 +133,10 @@ impl TextRenderer {
     fn pixel_sizes(scale: f32) -> [i32; 4] {
         let scale = scale.max(0.1);
         [
-            // UI type is intentionally floor-constrained and independent of
-            // cabinet geometry. The window may shrink, but native text never
-            // turns into a 9px diagnostic label at 1280x800.
-            (16.0 * scale).round().max(16.0) as i32,
-            (17.0 * scale).round().max(17.0) as i32,
-            (13.0 * scale).round().max(13.0) as i32,
-            (11.0 * scale).round().max(11.0) as i32,
+            (16.0 * scale).round().max(11.0) as i32,
+            (16.0 * scale).round().max(11.0) as i32,
+            (14.0 * scale).round().max(10.0) as i32,
+            (12.0 * scale).round().max(9.0) as i32,
         ]
     }
 
@@ -172,19 +169,6 @@ impl TextRenderer {
 
     pub(crate) fn font_pixel_sizes(&self) -> [i32; 4] {
         self.font_pixel_sizes
-    }
-
-    /// Rebind the Xft picture when the unified offscreen presentation
-    /// drawable is resized.  Text and OpenGL therefore continue composing on
-    /// the same surface before it is copied to the visible window.
-    pub(crate) fn rebind_drawable(&mut self, drawable: Window) -> Result<(), String> {
-        let draw = unsafe { XftDrawCreate(self.display, drawable, self.visual, self.colormap) };
-        if draw.is_null() {
-            return Err("could not recreate the native Xft text surface".to_owned());
-        }
-        unsafe { XftDrawDestroy(self.draw) };
-        self.draw = draw;
-        Ok(())
     }
 
     fn face(&self, role: FontRole) -> FontFace {
@@ -353,9 +337,9 @@ mod tests {
 
     #[test]
     fn native_text_sizes_keep_legibility_floor_when_cabinet_shrinks() {
-        assert_eq!(TextRenderer::pixel_sizes(0.7655), [16, 17, 13, 11]);
-        assert_eq!(TextRenderer::pixel_sizes(1.0), [16, 17, 13, 11]);
-        assert_eq!(TextRenderer::pixel_sizes(1.10), [18, 19, 14, 12]);
-        assert_eq!(TextRenderer::pixel_sizes(1.25), [20, 21, 16, 14]);
+        assert_eq!(TextRenderer::pixel_sizes(0.7655), [12, 12, 11, 9]);
+        assert_eq!(TextRenderer::pixel_sizes(1.0), [16, 16, 14, 12]);
+        assert_eq!(TextRenderer::pixel_sizes(1.10), [18, 18, 15, 13]);
+        assert_eq!(TextRenderer::pixel_sizes(1.25), [20, 20, 18, 15]);
     }
 }

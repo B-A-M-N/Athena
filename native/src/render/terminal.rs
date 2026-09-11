@@ -1,7 +1,7 @@
 use super::super::*;
-use super::chassis::draw_bitmap_text;
 use super::primitives::{draw_outline_rect, draw_rect};
 use super::text::{FontRole, TextRenderer};
+use super::theme::{DIM, OPERATOR_BACKGROUND, PRIMARY, SECONDARY};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
@@ -11,6 +11,16 @@ pub(crate) fn draw_terminal_background(
     geometry: &FrameGeometry,
     selection: Option<((usize, usize), (usize, usize))>,
 ) {
+    // Terminal-only invalidation must be a repaint, not an additive draw.
+    // Clearing the entire aperture first removes glyphs left behind by
+    // shorter writes, carriage returns, ANSI cursor movement, and scrollback.
+    draw_rect(
+        geometry.operator_viewport.x,
+        geometry.operator_viewport.y,
+        geometry.operator_viewport.width,
+        geometry.operator_viewport.height,
+        rgb_f32(OPERATOR_BACKGROUND),
+    );
     let content = core.renderable_content();
     let columns = core.size().columns.max(1);
     for (index, indexed) in content.display_iter.enumerate() {
@@ -21,7 +31,7 @@ pub(crate) fn draw_terminal_background(
         if cell.flags.contains(Flags::INVERSE) {
             background = resolve_term_color(cell.fg, content.colors, true);
         }
-        if background != (7, 12, 19) {
+        if background != OPERATOR_BACKGROUND {
             draw_rect(
                 geometry.operator_viewport.x + column as f32 * geometry.cell_width,
                 geometry.operator_viewport.y + row as f32 * geometry.cell_height,
@@ -50,24 +60,19 @@ pub(crate) fn draw_terminal_text(
         let body = text.metrics_for(FontRole::Body);
         let x =
             geometry.operator_viewport.x as c_int + (geometry.cell_width * 2.0).round() as c_int;
-        let body_scale = (body.height / 7.0).round().max(2.0);
-        draw_bitmap_text(
-            x as f32,
-            geometry.operator_viewport.y,
+        text.draw_in(
+            FontRole::Body,
+            x,
+            geometry.operator_viewport.y as c_int + body.baseline as c_int,
             "ATHENA // SESSION READY",
-            body_scale,
-            (0.55, 0.70, 0.78),
-            geometry.operator_viewport.right(),
+            (118, 154, 170),
         );
-        draw_bitmap_text(
-            x as f32,
-            geometry.operator_viewport.y + body_scale * 9.0,
+        text.draw_in(
+            FontRole::Instrument,
+            x,
+            geometry.operator_viewport.y as c_int + body.height as c_int + 8,
             "TYPE A COMMAND TO BEGIN",
-            (text.metrics_for(FontRole::Instrument).height / 7.0)
-                .round()
-                .max(2.0),
-            (0.42, 0.58, 0.67),
-            geometry.operator_viewport.right(),
+            (96, 128, 144),
         );
     }
     let content = core.renderable_content();
@@ -77,6 +82,7 @@ pub(crate) fn draw_terminal_text(
     let mut run_start_column = 0;
     let mut run_next_column = 0;
     let mut run_color = (0, 0, 0);
+    let mut run_flags = Flags::empty();
     let mut has_run = false;
     for (index, indexed) in content.display_iter.enumerate() {
         let cell = indexed.cell;
@@ -85,18 +91,15 @@ pub(crate) fn draw_terminal_text(
             .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
             || cell.c == ' '
         {
-            if has_run && !run_text.is_ascii() {
-                draw_terminal_run(
-                    text,
-                    geometry,
-                    run_row,
-                    run_start_column,
-                    &run_text,
-                    run_color,
-                );
-                run_text.clear();
-                has_run = false;
-            }
+            flush_terminal_run(
+                text,
+                geometry,
+                &mut run_text,
+                &mut has_run,
+                run_row,
+                run_start_column,
+                run_color,
+            );
             continue;
         }
         let row = index / columns;
@@ -112,83 +115,57 @@ pub(crate) fn draw_terminal_text(
                 foreground.2.saturating_mul(4) / 5,
             );
         }
-        if !has_run || run_row != row || run_next_column != column || run_color != foreground {
-            if has_run && !run_text.is_ascii() {
-                draw_terminal_run(
-                    text,
-                    geometry,
-                    run_row,
-                    run_start_column,
-                    &run_text,
-                    run_color,
-                );
-                run_text.clear();
-            }
+        let attributes = cell.flags & (Flags::BOLD | Flags::DIM | Flags::INVERSE);
+        if !has_run
+            || run_row != row
+            || run_next_column != column
+            || run_color != foreground
+            || run_flags != attributes
+        {
+            flush_terminal_run(
+                text,
+                geometry,
+                &mut run_text,
+                &mut has_run,
+                run_row,
+                run_start_column,
+                run_color,
+            );
             run_row = row;
             run_start_column = column;
             run_color = foreground;
+            run_flags = attributes;
             has_run = true;
         }
         run_text.push(cell.c);
         run_next_column = column + 1;
     }
-    if has_run && !run_text.is_ascii() {
-        draw_terminal_run(
-            text,
-            geometry,
-            run_row,
-            run_start_column,
-            &run_text,
-            run_color,
-        );
-    }
-
-    // Keep a GL-authored pixel fallback on the same offscreen surface as the
-    // chassis. Xft remains the preferred full glyph path, while this makes
-    // terminal copy/paste and readiness text visible on compositors that do
-    // not composite XRender over a GLX pixmap reliably.
-    draw_terminal_bitmap_text(core, geometry);
+    flush_terminal_run(
+        text,
+        geometry,
+        &mut run_text,
+        &mut has_run,
+        run_row,
+        run_start_column,
+        run_color,
+    );
 }
 
-fn draw_terminal_bitmap_text(core: &NativeTerminalCore, geometry: &FrameGeometry) {
-    let content = core.renderable_content();
-    let columns = core.size().columns.max(1);
-    let scale = (geometry.cell_width / 6.0).clamp(1.4, 2.6);
-    for (index, indexed) in content.display_iter.enumerate() {
-        let cell = indexed.cell;
-        if cell
-            .flags
-            .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
-            || cell.c == ' '
-        {
-            continue;
-        }
-        let row = index / columns;
-        let column = index % columns;
-        let mut foreground = resolve_term_color(cell.fg, content.colors, true);
-        if cell.flags.contains(Flags::INVERSE) {
-            foreground = resolve_term_color(cell.bg, content.colors, false);
-        }
-        if cell.flags.contains(Flags::DIM) {
-            foreground = (
-                foreground.0.saturating_mul(2) / 3,
-                foreground.1.saturating_mul(2) / 3,
-                foreground.2.saturating_mul(2) / 3,
-            );
-        }
-        if !cell.c.is_ascii() {
-            continue;
-        }
-        let glyph = cell.c.to_string();
-        draw_bitmap_text(
-            geometry.operator_viewport.x + column as f32 * geometry.cell_width,
-            geometry.operator_viewport.y + row as f32 * geometry.cell_height,
-            &glyph,
-            scale,
-            rgb_f32(foreground),
-            geometry.operator_viewport.right(),
-        );
+fn flush_terminal_run(
+    text: &TextRenderer,
+    geometry: &FrameGeometry,
+    run_text: &mut String,
+    has_run: &mut bool,
+    row: usize,
+    column: usize,
+    color: (u8, u8, u8),
+) {
+    if !*has_run || run_text.is_empty() {
+        return;
     }
+    draw_terminal_run(text, geometry, row, column, run_text, color);
+    run_text.clear();
+    *has_run = false;
 }
 
 fn draw_terminal_run(
@@ -245,11 +222,7 @@ fn draw_selection(
 }
 
 fn resolve_term_color(color: TermColor, colors: &Colors, foreground: bool) -> (u8, u8, u8) {
-    let fallback = if foreground {
-        (211, 225, 234)
-    } else {
-        (7, 12, 19)
-    };
+    let fallback = if foreground { PRIMARY } else { (7, 12, 19) };
     match color {
         TermColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
         TermColor::Named(name) => colors[name]
@@ -264,23 +237,23 @@ fn resolve_term_color(color: TermColor, colors: &Colors, foreground: bool) -> (u
 fn named_color(name: NamedColor, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
     match name {
         NamedColor::Black | NamedColor::DimBlack => (18, 24, 31),
-        NamedColor::Red | NamedColor::DimRed => (231, 102, 111),
-        NamedColor::Green | NamedColor::DimGreen => (100, 205, 159),
-        NamedColor::Yellow | NamedColor::DimYellow => (235, 190, 106),
-        NamedColor::Blue | NamedColor::DimBlue => (112, 165, 232),
-        NamedColor::Magenta | NamedColor::DimMagenta => (205, 132, 221),
-        NamedColor::Cyan | NamedColor::DimCyan => (92, 199, 216),
-        NamedColor::White | NamedColor::DimWhite => (205, 218, 229),
-        NamedColor::BrightBlack => (87, 105, 119),
-        NamedColor::BrightRed => (255, 133, 140),
-        NamedColor::BrightGreen => (130, 240, 186),
-        NamedColor::BrightYellow => (255, 216, 125),
-        NamedColor::BrightBlue => (145, 193, 255),
-        NamedColor::BrightMagenta => (232, 165, 245),
-        NamedColor::BrightCyan => (125, 232, 240),
-        NamedColor::BrightWhite => (244, 248, 251),
-        NamedColor::Background => (7, 12, 19),
-        NamedColor::Cursor => (128, 220, 209),
+        NamedColor::Red | NamedColor::DimRed => (184, 90, 99),
+        NamedColor::Green | NamedColor::DimGreen => (116, 162, 145),
+        NamedColor::Yellow | NamedColor::DimYellow => (184, 158, 102),
+        NamedColor::Blue | NamedColor::DimBlue => (128, 153, 181),
+        NamedColor::Magenta | NamedColor::DimMagenta => (161, 137, 170),
+        NamedColor::Cyan | NamedColor::DimCyan => SECONDARY,
+        NamedColor::White | NamedColor::DimWhite => PRIMARY,
+        NamedColor::BrightBlack => DIM,
+        NamedColor::BrightRed => (212, 116, 123),
+        NamedColor::BrightGreen => (139, 190, 166),
+        NamedColor::BrightYellow => (212, 180, 111),
+        NamedColor::BrightBlue => (159, 184, 214),
+        NamedColor::BrightMagenta => (190, 160, 199),
+        NamedColor::BrightCyan => (176, 207, 218),
+        NamedColor::BrightWhite => PRIMARY,
+        NamedColor::Background => OPERATOR_BACKGROUND,
+        NamedColor::Cursor => SECONDARY,
         NamedColor::Foreground | NamedColor::DimForeground | NamedColor::BrightForeground => {
             fallback
         }

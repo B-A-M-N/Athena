@@ -31,7 +31,7 @@ mod x11;
 
 const NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 3;
 const LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION: u32 = 2;
-pub(crate) const DEFAULT_TEXT_SCALE: f32 = 1.15;
+pub(crate) const DEFAULT_TEXT_SCALE: f32 = 1.0;
 
 fn default_bridge_schema_version() -> u32 {
     LEGACY_NATIVE_BRIDGE_SCHEMA_VERSION
@@ -145,6 +145,7 @@ impl ProjectionFrame {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[allow(dead_code)]
 struct ProjectionEntity {
     id: String,
     #[serde(default)]
@@ -904,7 +905,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("NativePixelLayout serializes as an object")
             .insert(
                 "font_pixel_sizes".to_owned(),
-                serde_json::json!([16, 17, 13, 11]),
+                serde_json::json!([16, 16, 14, 12]),
             );
         dump.as_object_mut()
             .expect("NativePixelLayout serializes as an object")

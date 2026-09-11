@@ -1,5 +1,6 @@
 use super::super::*;
 use super::primitives::*;
+use super::theme::{GRAPHITE, PRIMARY, SECONDARY};
 
 const CHASSIS_NOISE: &[u8] = include_bytes!("../../assets/athenabox/chassis_noise.ppm");
 
@@ -181,7 +182,7 @@ pub(crate) struct PresentationSettings {
 impl Default for PresentationSettings {
     fn default() -> Self {
         Self {
-            brightness: 0.82,
+            brightness: 0.92,
             focus: 0.72,
             display_enabled: true,
         }
@@ -297,33 +298,41 @@ pub(crate) fn draw_chassis(
         deck.width,
         deck.height,
         14.0 * scale,
-        (0.028, 0.030, 0.031),
+        GRAPHITE,
     );
     draw_round_outline(deck.x, deck.y, deck.width, deck.height, (0.11, 0.12, 0.12));
 
-    draw_round_rect(
+    // The top rail is a small physical nameplate and vent, not a second
+    // dashboard. Screen titles live at their CRT apertures below.
+    draw_rect(
         geometry.header.x,
-        geometry.header.y,
+        geometry.header.y + geometry.header.height * 0.70,
         geometry.header.width,
-        geometry.header.height,
-        10.0 * scale,
-        (0.075, 0.078, 0.079),
+        1.0 * scale,
+        (0.12, 0.14, 0.15),
     );
-    material.draw_surface(inset(geometry.header, 5.0 * scale));
+    draw_round_rect(
+        geometry.header.x + 10.0 * scale,
+        geometry.header.y + 12.0 * scale,
+        94.0 * scale,
+        28.0 * scale,
+        4.0 * scale,
+        (0.045, 0.050, 0.053),
+    );
     draw_round_outline(
-        geometry.header.x,
-        geometry.header.y,
-        geometry.header.width,
-        geometry.header.height,
-        (0.22, 0.23, 0.23),
+        geometry.header.x + 10.0 * scale,
+        geometry.header.y + 12.0 * scale,
+        94.0 * scale,
+        28.0 * scale,
+        (0.18, 0.22, 0.23),
     );
     for index in 0..8 {
-        let x = geometry.header.x + geometry.header.width * 0.48 + index as f32 * 11.0 * scale;
+        let x = geometry.header.right() - 112.0 * scale + index as f32 * 11.0 * scale;
         draw_round_rect(
             x,
-            geometry.header.y + geometry.header.height * 0.38,
+            geometry.header.y + 19.0 * scale,
             3.0 * scale,
-            12.0 * scale,
+            10.0 * scale,
             1.5 * scale,
             (0.012, 0.014, 0.015),
         );
@@ -348,7 +357,7 @@ pub(crate) fn draw_chassis(
     } else {
         (0.45, 0.48, 0.48)
     };
-    let lamp_x = geometry.header.right() - 42.0 * scale;
+    let lamp_x = geometry.header.right() - 20.0 * scale;
     draw_round_rect(
         lamp_x - 5.0 * scale,
         geometry.header.y + geometry.header.height * 0.26,
@@ -454,6 +463,14 @@ pub(crate) fn draw_chassis(
         (0.048, 0.050, 0.051),
         (0.011, 0.013, 0.014),
     );
+    let deck_nameplate = inset(geometry.rail.operator_panel, 18.0 * scale);
+    draw_round_outline(
+        deck_nameplate.x,
+        deck_nameplate.y,
+        deck_nameplate.width,
+        deck_nameplate.height,
+        (0.13, 0.17, 0.18),
+    );
     draw_recessed_instrument(geometry.prompt, scale, focused);
     draw_rect(
         geometry.prompt.x + 12.0 * scale,
@@ -540,15 +557,16 @@ pub(crate) fn draw_chassis(
     draw_static_labels(geometry, projection);
 }
 
-fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
+fn draw_static_labels(geometry: &FrameGeometry, _projection: &Projection) {
     let scale = geometry.scale.max(0.08);
     // The authored cabinet scale bottoms out near 0.76 at 1280x800. Keep
     // cabinet labels on a readable matrix instead of rounding them down to
     // the 2px glyphs that made the native screen look like a dim status HUD.
     let glyph_scale = (1.55 * scale).max(2.5);
-    let instrument_color = (0.62, 0.74, 0.82);
-    let heading_color = (0.82, 0.88, 0.93);
-    let oi_color = rgb_f32(mode_color(VisualMode::from_projection(projection).as_str()));
+    let instrument_color = super::theme::rgb(SECONDARY);
+    let heading_color = super::theme::rgb(PRIMARY);
+    let oi_color = (0.62, 0.72, 0.76);
+    let deck_nameplate = inset(geometry.rail.operator_panel, 18.0 * scale);
 
     with_scissor(geometry.height, geometry.header, || {
         let header_y = geometry.header.y + (geometry.header.height - 7.0 * glyph_scale) * 0.5;
@@ -556,27 +574,9 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             geometry.header.x + geometry.u(22.0),
             header_y,
             "ATHENA",
-            glyph_scale,
-            (0.78, 0.86, 0.91),
-            geometry.header.right() - geometry.u(44.0),
-        );
-        draw_bitmap_text(
-            geometry.header.x + geometry.u(145.0),
-            header_y + geometry.u(1.0),
-            "// OPERATOR INSTRUMENT",
-            (glyph_scale * 0.76).max(2.25),
-            instrument_color,
-            geometry.header.right() - geometry.u(310.0),
-        );
-        let glass = "GLASS COMPUTE ENGINE";
-        let glass_scale = (glyph_scale * 0.76).max(2.25);
-        draw_bitmap_text(
-            geometry.header.right() - geometry.u(44.0) - bitmap_width(glass, glass_scale),
-            header_y + geometry.u(1.0),
-            glass,
-            glass_scale,
-            (0.72, 0.76, 0.72),
-            geometry.header.right() - geometry.u(44.0),
+            (glyph_scale * 0.82).max(2.25),
+            (0.74, 0.82, 0.86),
+            geometry.header.x + geometry.u(112.0),
         );
     });
 
@@ -694,6 +694,17 @@ fn draw_static_labels(geometry: &FrameGeometry, projection: &Projection) {
             2.0,
             instrument_color,
             plate.right() - geometry.u(18.0),
+        );
+    });
+
+    with_scissor(geometry.height, deck_nameplate, || {
+        draw_bitmap_text(
+            deck_nameplate.x + geometry.u(14.0),
+            deck_nameplate.y + deck_nameplate.height * 0.5 - geometry.u(4.0),
+            "ATHENA // CONTROL DECK",
+            (glyph_scale * 0.62).max(2.0),
+            heading_color,
+            deck_nameplate.right() - geometry.u(14.0),
         );
     });
 }

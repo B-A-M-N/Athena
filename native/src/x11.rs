@@ -1699,14 +1699,8 @@ fn run_window(
     let visual_ptr = unsafe { (*visual).visual };
     let mut text_zoom = options.text_scale.clamp(0.75, 2.5);
     let mut resize_cursors = ResizeCursors::new(display);
-    let mut text = match TextRenderer::new(
-        display,
-        screen,
-        presentation_surface.pixmap,
-        visual_ptr,
-        colormap,
-        text_zoom,
-    ) {
+    let mut text = match TextRenderer::new(display, screen, window, visual_ptr, colormap, text_zoom)
+    {
         Ok(text) => text,
         Err(error) => {
             drop(resize_cursors);
@@ -2244,7 +2238,6 @@ fn run_window(
                     if let Err(error) = (|| {
                         unsafe { glXMakeCurrent(display, 0, ptr::null_mut()) };
                         presentation_surface.resize(width as CUint, height as CUint)?;
-                        text.rebind_drawable(presentation_surface.pixmap)?;
                         presentation_surface.reap_retired();
                         if unsafe {
                             glXMakeCurrent(display, presentation_surface.glx_pixmap, context)
@@ -2448,12 +2441,27 @@ fn run_window(
                     0.0
                 },
             );
-            // Xft targets the same offscreen pixmap as GL. Force the XRender
-            // text requests to land before the pixmap is copied to the mapped
-            // window; without this fence the cabinet can present a complete
-            // GL frame while silently dropping the terminal glyph layer.
-            unsafe { XSync(display, 0) };
             presentation_surface.present(width as CUint, height as CUint);
+            render::frame::draw_text_layer(
+                display,
+                width,
+                height,
+                core,
+                projection,
+                &text,
+                focused,
+                &input_buffer,
+                options,
+                DirtyDomains {
+                    full: dirty,
+                    terminal: terminal_dirty,
+                    oi_motion: oi_motion_dirty,
+                },
+            );
+            // The sync file is an external capture contract. Publish it only
+            // after Xft has painted the visible window, so a consumer waiting
+            // on the sequence cannot capture a text-less GL frame.
+            unsafe { XSync(display, 0) };
             presented_frame_sequence = presented_frame_sequence.saturating_add(1);
             write_presentation_sync(presented_frame_sequence, width, height, projection);
             if !oi_dumped {
@@ -2965,16 +2973,6 @@ fn rgb_f32(color: (u8, u8, u8)) -> (f32, f32, f32) {
         color.1 as f32 / 255.0,
         color.2 as f32 / 255.0,
     )
-}
-
-fn mode_color(mode: &str) -> (u8, u8, u8) {
-    if mode.eq_ignore_ascii_case("failure") || mode.eq_ignore_ascii_case("blocked") {
-        (235, 112, 116)
-    } else if mode.eq_ignore_ascii_case("approval") {
-        (239, 194, 105)
-    } else {
-        (103, 202, 212)
-    }
 }
 
 fn selection_bounds(

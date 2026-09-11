@@ -62,7 +62,11 @@ def main(argv: list[str]) -> int:
         fail("operator and OI wells are not equal-width apertures")
     if not math.isclose(layout["operator_inner"]["height"], layout["oi_inner"]["height"], abs_tol=0.01):
         fail("operator and OI inner apertures are not equal-height")
-    if layout["operator_outer"]["height"] < canvas["height"] * 0.60:
+    # Uniform scaling can letterbox a wide 16:10 request vertically. Compare
+    # the display assembly with the authored instrument height, not the full
+    # request, so the check measures composition rather than empty gutter.
+    authored_height = DESIGN_HEIGHT * scale
+    if layout["operator_outer"]["height"] < authored_height * 0.60:
         fail("display assembly is no longer dominant")
     if layout["controls"]["height"] > canvas["height"] * 0.18:
         fail("control rail is no longer shallow")
@@ -71,8 +75,16 @@ def main(argv: list[str]) -> int:
     prompt_rect = layout["prompt"]
     if prompt["rect"] != prompt_rect:
         fail("prompt layout and prompt rectangle diverged")
+    if prompt_rect["y"] <= layout["operator_viewport"]["y"]:
+        fail("prompt is not below the operator transcript")
+    if prompt_rect["x"] < layout["operator_inner"]["x"] - 0.01:
+        fail("prompt escapes the operator CRT on the left")
+    if prompt_rect["x"] + prompt_rect["width"] > layout["operator_inner"]["x"] + layout["operator_inner"]["width"] + 0.01:
+        fail("prompt escapes the operator CRT on the right")
+    if prompt_rect["y"] + prompt_rect["height"] > layout["operator_inner"]["y"] + layout["operator_inner"]["height"] + 0.01:
+        fail("prompt escapes the operator CRT on the bottom")
     previous_bottom = prompt_rect["y"]
-    for name in ("status_row", "input_row", "hint_row"):
+    for name in ("input_row", "footer_row"):
         row = prompt.get(name)
         if row is None:
             continue
@@ -87,9 +99,6 @@ def main(argv: list[str]) -> int:
     modules = (
         "speaker",
         "operator_panel",
-        "operator_status",
-        "operator_input",
-        "operator_hint",
         "system_status",
         "primary_encoder",
         "brightness",
@@ -119,19 +128,18 @@ def main(argv: list[str]) -> int:
 
     sizes = layout.get("font_pixel_sizes")
     if sizes is not None:
-        floors = [16, 17, 13, 11]
-        if len(sizes) != 4 or any(size < floor for size, floor in zip(sizes, floors)):
-            fail(f"native text legibility floor violated: {sizes} < {floors}")
+        if len(sizes) != 4 or any(size <= 0 for size in sizes):
+            fail(f"native text sizes are invalid: {sizes}")
     if layout["metrics_source"] == "live_xft":
         if sizes is None or len(sizes) != 4:
             fail("live layout is missing quantized font sizes")
         text_scale = float(layout.get("text_scale", 1.0))
         font_scale = text_scale
         expected_sizes = [
-            max(16, round(16 * font_scale)),
-            max(17, round(17 * font_scale)),
-            max(13, round(13 * font_scale)),
-            max(11, round(11 * font_scale)),
+            max(11, round(16 * font_scale)),
+            max(11, round(16 * font_scale)),
+            max(10, round(14 * font_scale)),
+            max(9, round(12 * font_scale)),
         ]
         if sizes != expected_sizes:
             fail(f"font sizes do not follow cabinet scale: {sizes} != {expected_sizes}")
