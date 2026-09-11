@@ -41,6 +41,28 @@ def main(argv: list[str] | None = None) -> int:
             "create-certification-manifest: FAIL — evidence directory is missing", file=sys.stderr
         )
         return 1
+    source_manifest = evidence / "source-tree-manifest.json"
+    try:
+        source_manifest_record = json.loads(source_manifest.read_text(encoding="utf-8"))
+        source_tree_digest = source_manifest_record["tree_sha256"]
+    except (KeyError, OSError, TypeError, ValueError):
+        print(
+            "create-certification-manifest: FAIL — canonical source manifest is missing or invalid",
+            file=sys.stderr,
+        )
+        return 1
+    if source_manifest_record.get("source_sha") not in {None, args.source_sha}:
+        print(
+            "create-certification-manifest: FAIL — source manifest SHA does not match certification",
+            file=sys.stderr,
+        )
+        return 1
+    if not source_tree_digest:
+        print(
+            "create-certification-manifest: FAIL — canonical source tree digest is missing",
+            file=sys.stderr,
+        )
+        return 1
     files = []
     for path in sorted(item for item in evidence.rglob("*") if item.is_file()):
         relative = path.relative_to(evidence).as_posix()
@@ -54,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         "kind": "athena_release_certification_manifest",
         "schema_version": 1,
         "source_sha": args.source_sha,
+        "source_tree_digest": source_tree_digest,
         "release_run_id": args.release_run_id,
         "files": files,
     }

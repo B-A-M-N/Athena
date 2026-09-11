@@ -78,11 +78,45 @@ def _profile_requires_restricted_execution(config: Any) -> bool:
     return False
 
 
+def sandbox_status(config: Any = None) -> dict[str, Any]:
+    """Return the concrete sandbox backend state for operator projections."""
+    executable = shutil.which("bwrap") if os.name == "posix" else None
+    available, detail = _bubblewrap_probe()
+    configured = [
+        str(value)
+        for value in getattr(config, "effective_required_capabilities", ()) or ()
+        if str(value).partition(":")[-1].casefold()
+        in {
+            "sandbox",
+            "sandboxed-local",
+            "terminal",
+            "terminal_session",
+            "generated_capability",
+            "synthesis",
+        }
+    ]
+    return {
+        "backend": "bubblewrap",
+        "available": available,
+        "executable": executable,
+        "detail": detail,
+        "surfaces_require_it": [
+            "restricted_execution",
+            "generated_capability",
+            "synthesis",
+            "terminal_session",
+        ],
+        "configured_required_surfaces": configured,
+    }
+
+
 def doctor_startup(o: Any, config: Any) -> int:
     """Start the service briefly and report readiness-owned checks."""
     from athena.cli.app import ServiceUnavailable, build_service
 
-    sandbox_ready, sandbox_detail = _bubblewrap_probe()
+    sandbox = sandbox_status(config)
+    sandbox_ready = bool(sandbox["available"])
+    sandbox_detail = str(sandbox["detail"])
     requires_sandbox = _profile_requires_restricted_execution(config)
     if sandbox_ready:
         print(f"Sandbox: READY (bubblewrap {sandbox_detail})")
@@ -96,7 +130,10 @@ def doctor_startup(o: Any, config: Any) -> int:
 
     async def probe() -> dict[str, Any]:
         try:
-            await service.start()
+            # Doctor is a passive preflight. It initializes the durable graph
+            # so readiness can be inspected, but must not start workers,
+            # schedulers, or ambient watch producers.
+            await service.start(activate_runtime=False)
             health = service.startup_health()
             health["operational_matrix"] = service.operational_matrix()
             return health

@@ -269,6 +269,17 @@ async def test_model_reservation_release_is_idempotent_by_reservation_id():
     assert (await tracker.remaining(task.id))["cost_usd"] == Decimal("5.00")
 
 
+async def test_model_reservation_id_replay_cannot_change_amount():
+    task = _task("task", budget=ResourceBudget(max_cost_usd=Decimal("5.00")))
+    tracker = BudgetTracker(task_store=_TreeStore([task]))
+    tracker.register(task)
+
+    await tracker.reserve_model_cost(task.id, Decimal("1.00"), reservation_id="attempt-a")
+    with pytest.raises(ValueError, match="replayed with a different amount"):
+        await tracker.reserve_model_cost(task.id, Decimal("2.00"), reservation_id="attempt-a")
+    assert (await tracker.remaining(task.id))["cost_usd"] == Decimal("4.00")
+
+
 async def test_model_reservation_survives_restart_as_reservation_not_spend():
     root = _task("root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
     child = _task("child", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))

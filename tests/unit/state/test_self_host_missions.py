@@ -39,6 +39,40 @@ async def test_self_host_mission_survives_store_reload(db):
     assert loaded["plan"]["bounded"] is True
 
 
+async def test_self_host_mission_explicit_id_is_idempotent_and_identity_bound(db):
+    await TaskStore(db).insert_task("task-1", None, None, "bounded repair")
+    store = SelfHostMissionStore(db)
+    first = await store.create(
+        mission_id="mission-fixed",
+        project_root="/repo",
+        objective="bounded repair",
+        task_id="task-1",
+        base_revision="abc123",
+        design_bundle_hash="design-hash",
+        gate_bundle_hash="gate-hash",
+    )
+    replay = await store.create(
+        mission_id="mission-fixed",
+        project_root="/repo",
+        objective="bounded repair",
+        task_id="task-1",
+        base_revision="abc123",
+        design_bundle_hash="design-hash",
+        gate_bundle_hash="gate-hash",
+    )
+    assert replay["id"] == first["id"] == "mission-fixed"
+    with pytest.raises(ValueError, match="identifies different work"):
+        await store.create(
+            mission_id="mission-fixed",
+            project_root="/repo",
+            objective="different repair",
+            task_id="task-1",
+            base_revision="abc123",
+            design_bundle_hash="design-hash",
+            gate_bundle_hash="gate-hash",
+        )
+
+
 def test_self_host_risk_is_deterministic_and_operator_bound():
     resources = [
         {"path": "src/athena/kernel/kernel.py", "operation": "write"},

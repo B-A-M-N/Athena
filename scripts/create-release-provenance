@@ -35,7 +35,12 @@ def main() -> int:
         return 1
     source_sha = str(manifest.get("source_sha") or "")
     release_run_id = str(manifest.get("release_run_id") or "")
-    if manifest.get("source_status") != "frozen-clean" or not source_sha or not release_run_id:
+    if (
+        manifest.get("source_status") != "frozen-clean"
+        or not source_sha
+        or not manifest.get("source_tree_digest")
+        or not release_run_id
+    ):
         print(
             "create-release-provenance: FAIL — manifest must bind a frozen source and run",
             file=sys.stderr,
@@ -64,6 +69,7 @@ def main() -> int:
         "kind": "athena_release_provenance",
         "schema_version": 1,
         "source_sha": source_sha,
+        "source_tree_digest": manifest.get("source_tree_digest"),
         "release_run_id": release_run_id,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "artifacts": artifacts,

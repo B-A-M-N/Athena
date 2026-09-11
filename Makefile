@@ -1,4 +1,4 @@
-.PHONY: format format-check lint typecheck compile test check scenarios arch-lint demo native-check native-test native-smoke native-package release-check
+.PHONY: format format-check lint typecheck compile test check scenarios arch-lint demo native-check native-test native-smoke native-package release-check static-critical support-matrix-check migration-baseline
 
 UV ?= uv
 UV_RUN_DEV := $(UV) run --frozen --extra dev
@@ -46,6 +46,15 @@ demo:
 arch-lint:
 	$(PYTHON) scripts/architecture-lint
 
+static-critical:
+	bash scripts/static-critical
+
+support-matrix-check:
+	$(PYTHON) scripts/support-matrix-check
+
+migration-baseline:
+	$(PYTHON) scripts/verify-migration-baseline
+
 native-check:
 	cargo check --manifest-path native/Cargo.toml --offline
 
@@ -73,7 +82,7 @@ release-check:
 # Appended (P1.29/P1.30/P1.32): the scenario manifest and the architecture
 # lint are part of the gate.  The kernel router-fallback defect that once
 # made arch-lint run red is fixed; the lint is part of the GREEN gate.
-check: lint typecheck compile
+check: format-check lint typecheck compile static-critical support-matrix-check migration-baseline
 	@set -eu; \
 	check_before="$$(git status --porcelain --untracked-files=no)"; \
 	check_status() { \

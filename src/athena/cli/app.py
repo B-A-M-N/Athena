@@ -672,6 +672,15 @@ class Options:
     recovery_authorized_by: str | None = None
 
 
+def _cli_runtime_mode(options: Options) -> bool:
+    """Return whether a CLI command needs background execution producers."""
+    if options.command in {"chat", "run", "resume", "acp", "oi-stream"}:
+        return True
+    # ``self status`` and ``self continue`` are operator reads/mutations. They
+    # must not start the worker or scheduler as an incidental side effect.
+    return options.command == "self" and options.self_action not in {"status", "continue"}
+
+
 def dispatch(o: Options) -> int:
     """Run a parsed command synchronously (asyncio.run at the top)."""
     if o.command == "completion":
@@ -731,7 +740,7 @@ def dispatch(o: Options) -> int:
         try:
             start = getattr(service, "start", None)
             if start is not None:
-                await start()
+                await start(activate_runtime=_cli_runtime_mode(o))
             return await _run(o, service)
         finally:
             stop = getattr(service, "stop", None)

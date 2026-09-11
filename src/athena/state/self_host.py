@@ -20,6 +20,7 @@ class SelfHostMissionStore:
     async def create(
         self,
         *,
+        mission_id: str | None = None,
         project_root: str,
         objective: str,
         task_id: str,
@@ -32,7 +33,19 @@ class SelfHostMissionStore:
         current_gate_bundle_hash: str | None = None,
         plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        mission_id = new_id("mission")
+        mission_id = mission_id or new_id("mission")
+        existing = await self.get(mission_id)
+        if existing is not None:
+            identity = {
+                "project_root": project_root,
+                "objective": objective,
+                "base_revision": base_revision,
+                "design_bundle_hash": design_bundle_hash,
+                "gate_bundle_hash": gate_bundle_hash,
+            }
+            if any(existing.get(key) != value for key, value in identity.items()):
+                raise ValueError(f"self-host mission id {mission_id!r} identifies different work")
+            return existing
         now = utcnow().isoformat()
         mission_plan = dict(plan or {"bounded": True, "step": 1})
         record = {

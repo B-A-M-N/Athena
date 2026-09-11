@@ -534,6 +534,30 @@ class ModelResponseStore:
         )
         return [dict(row) for row in rows]
 
+    async def reservation_amounts(
+        self, task_id: str, reservation_ids: set[str]
+    ) -> dict[str, Decimal]:
+        """Recover exact reservation amounts for legacy budget checkpoints."""
+        ids = tuple(sorted(str(value) for value in reservation_ids if value))
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        rows = await self._db.fetch_all(
+            "SELECT attempt_id, reservation_amount FROM model_response_attempts "
+            f"WHERE task_id = ? AND attempt_id IN ({placeholders}) "
+            "AND reservation_amount IS NOT NULL AND reservation_released_at IS NULL",
+            (task_id, *ids),
+        )
+        amounts: dict[str, Decimal] = {}
+        for row in rows:
+            try:
+                amount = Decimal(str(row.get("reservation_amount")))
+            except (TypeError, InvalidOperation):
+                continue
+            if amount > 0:
+                amounts[str(row["attempt_id"])] = amount
+        return amounts
+
     async def mark_attempt_reservation_released(self, attempt_id: str) -> bool:
         return await self.mark_reservation_released(attempt_id=attempt_id)
 

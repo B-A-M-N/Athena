@@ -414,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
     final_status = "FAIL"
     error: str | None = None
     release_env: dict[str, str] | None = None
+    source_manifest_path: Path | None = None
+    source_tree_digest: str | None = None
     certification_failure: str | None = None
     try:
         if evidence_dir is not None:
@@ -448,6 +450,34 @@ def main(argv: list[str] | None = None) -> int:
         _extract_commit(resolved, checkout, timeout=args.timeout)
         env = dict(os.environ)
         release_env = env
+        source_manifest_path = temp_root / "source-tree-manifest.json"
+        source_manifest_record = _run(
+            [
+                sys.executable,
+                str(checkout / "scripts/source-manifest"),
+                "--root",
+                str(checkout),
+                "--output",
+                str(source_manifest_path),
+                "--source-sha",
+                resolved,
+            ],
+            cwd=checkout,
+            env=env,
+            timeout=args.timeout,
+        )
+        source_manifest_record.update(
+            {"name": "frozen-source-manifest", "commit_sha": resolved, "release_run_id": run_id}
+        )
+        lanes.append(source_manifest_record)
+        if int(source_manifest_record.get("exit_code") or 0) != 0:
+            raise RuntimeError("frozen source manifest creation failed")
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        source_tree_digest = str(source_manifest.get("tree_sha256") or "")
+        if not source_tree_digest:
+            raise RuntimeError("frozen source manifest has no canonical tree digest")
+        if evidence_dir is not None:
+            shutil.copy2(source_manifest_path, evidence_stage / source_manifest_path.name)
         env["PYTHONPATH"] = str(checkout / "src") + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
@@ -456,6 +486,8 @@ def main(argv: list[str] | None = None) -> int:
         env["ATHENA_RELEASE_SHA"] = resolved
         env["ATHENA_RELEASE_RUN_ID"] = run_id
         env["ATHENA_FROZEN_SOURCE"] = "1"
+        env["ATHENA_FROZEN_SOURCE_MANIFEST"] = str(source_manifest_path)
+        env["ATHENA_SOURCE_TREE_DIGEST"] = source_tree_digest
         env["ATHENA_RELEASE_GATE"] = "1"
         if args.include_hermes_live:
             env["ATHENA_HERMES_INTEGRATION_GATE"] = "1"
@@ -552,6 +584,32 @@ def main(argv: list[str] | None = None) -> int:
             if name in static_by_name:
                 record = static_by_name[name]
             else:
+                if name == "release-artifacts":
+                    verify_record = _run(
+                        [
+                            sys.executable,
+                            str(checkout / "scripts/source-manifest"),
+                            "--root",
+                            str(checkout),
+                            "--verify",
+                            str(source_manifest_path),
+                            "--source-sha",
+                            resolved,
+                        ],
+                        cwd=checkout,
+                        env=env,
+                        timeout=args.timeout,
+                    )
+                    verify_record.update(
+                        {
+                            "name": "frozen-source-verify",
+                            "commit_sha": resolved,
+                            "release_run_id": run_id,
+                        }
+                    )
+                    lanes.append(verify_record)
+                    if int(verify_record.get("exit_code") or 0) != 0:
+                        raise RuntimeError("frozen source tree changed before artifact packaging")
                 command_timeout = (
                     max(args.timeout, ENDURANCE_TIMEOUT_SECONDS)
                     if name == "endurance"
@@ -570,6 +628,10 @@ def main(argv: list[str] | None = None) -> int:
                 if manifest.get("source_sha") != resolved:
                     raise RuntimeError(
                         "release artifact manifest source_sha does not match frozen commit"
+                    )
+                if manifest.get("source_tree_digest") != source_tree_digest:
+                    raise RuntimeError(
+                        "release artifact manifest source_tree_digest does not match frozen source"
                     )
                 if evidence_dir is not None:
                     manifest["release_run_id"] = run_id

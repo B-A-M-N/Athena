@@ -52,6 +52,7 @@ root = Path.cwd()
 import sys as _sys
 _sys.path.insert(0, str(root / "src"))
 from athena.release.native_abi import inspect_native_abi
+from athena.release.source_manifest import verify_manifest
 
 
 def run(*args: str) -> str:
@@ -76,6 +77,21 @@ native = tomllib.loads((root / "native" / "Cargo.toml").read_text())
 native_package = tomllib.loads((root / "native" / "package" / "pyproject.toml").read_text())
 source_sha = os.environ.get("ATHENA_RELEASE_SHA") or run("git", "rev-parse", "HEAD")
 release_run_id = os.environ.get("ATHENA_RELEASE_RUN_ID", "local")
+source_manifest_path = os.environ.get("ATHENA_FROZEN_SOURCE_MANIFEST")
+source_tree_digest = os.environ.get("ATHENA_SOURCE_TREE_DIGEST")
+if source_manifest_path:
+    try:
+        source_manifest = json.loads(Path(source_manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"frozen source manifest is invalid: {exc}") from exc
+    valid, detail = verify_manifest(root, source_manifest, source_sha=source_sha)
+    if not valid:
+        raise SystemExit(f"frozen source tree verification failed: {detail}")
+    if source_tree_digest and source_tree_digest != detail:
+        raise SystemExit("frozen source tree digest disagrees with its manifest")
+    source_tree_digest = detail
+elif os.environ.get("ATHENA_FROZEN_SOURCE") == "1":
+    raise SystemExit("frozen release packaging requires ATHENA_FROZEN_SOURCE_MANIFEST")
 
 
 def canonical_version(value: str) -> str:
@@ -383,6 +399,10 @@ record = {
     "format": 1,
     "created_at_utc": datetime.now(timezone.utc).isoformat(),
     "source_sha": source_sha,
+    "source_tree_digest": source_tree_digest,
+    "source_manifest_sha256": (
+        sha(Path(source_manifest_path)) if source_manifest_path else None
+    ),
     "release_run_id": release_run_id,
     "source_status": (
         "frozen-clean"

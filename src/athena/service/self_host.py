@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -25,6 +26,7 @@ from athena.protocol.tasks import (
     NetworkPolicy,
     ResourceBudget,
     TaskSpec,
+    TaskStatus,
     WorkspaceSpec,
 )
 from athena.self_host.controller import SelfHostMissionController
@@ -43,6 +45,83 @@ class SelfHostService:
 
     def __init__(self, service: AthenaService) -> None:
         self._svc = service
+
+    async def reconcile_created_task(self, task: TaskSpec) -> bool:
+        """Ensure a CREATED self-host task has a matching mission anchor.
+
+        This runs before ordinary intake recovery. A self-host task is never
+        allowed to become runnable merely because its generic canonical-turn
+        protocol can be completed; its mission identity is part of the safety
+        boundary.
+        """
+        metadata = dict(task.metadata or {})
+        mission_id = str(metadata.get("_self_host_mission_id") or "")
+        raw_record = metadata.get("_self_host_intake")
+        record = dict(raw_record) if isinstance(raw_record, Mapping) else {}
+        missions = getattr(self._svc, "_self_host_missions", None)
+        manager = self._svc._require_task_manager()
+
+        async def quarantine(reason: str) -> bool:
+            await manager.transition(task.id, TaskStatus.RECOVERY_REQUIRED, reason=reason)
+            return False
+
+        if not mission_id or record.get("mission_id") != mission_id:
+            return await quarantine("self-host CREATED task has no trusted mission identity")
+        if missions is None:
+            return await quarantine("self-host mission store is unavailable during recovery")
+
+        mission = await missions.get(mission_id)
+        if mission is None:
+            required = (
+                "project_root",
+                "objective",
+                "task_id",
+                "base_revision",
+                "design_bundle_hash",
+                "gate_bundle_hash",
+                "plan",
+            )
+            if (
+                any(not record.get(key) for key in required)
+                or str(record.get("task_id")) != str(task.id)
+                or not isinstance(record.get("plan"), Mapping)
+            ):
+                return await quarantine(
+                    "self-host mission is missing and trusted reconstruction metadata is incomplete"
+                )
+            try:
+                mission = await missions.create(
+                    mission_id=mission_id,
+                    project_root=str(record["project_root"]),
+                    objective=str(record["objective"]),
+                    task_id=str(record["task_id"]),
+                    base_revision=str(record["base_revision"]),
+                    design_bundle_hash=str(record["design_bundle_hash"]),
+                    gate_bundle_hash=str(record["gate_bundle_hash"]),
+                    current_base_fingerprint=record.get("current_base_fingerprint"),
+                    current_git_revision=record.get("current_git_revision"),
+                    current_design_bundle_hash=record.get("current_design_bundle_hash"),
+                    current_gate_bundle_hash=record.get("current_gate_bundle_hash"),
+                    plan=record["plan"],
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                return await quarantine(f"self-host mission reconstruction failed: {exc}")
+
+        identity = (
+            ("project_root", str(record.get("project_root") or "")),
+            ("objective", str(record.get("objective") or "")),
+            ("base_revision", str(record.get("base_revision") or "")),
+            ("design_bundle_hash", str(record.get("design_bundle_hash") or "")),
+            ("gate_bundle_hash", str(record.get("gate_bundle_hash") or "")),
+        )
+        if any(mission.get(key) != value for key, value in identity):
+            return await quarantine("self-host task and mission identity do not match")
+        current_task_id = str(mission.get("current_task_id") or "")
+        if current_task_id and current_task_id != str(task.id):
+            return await quarantine("self-host mission points at a different task")
+        if not current_task_id:
+            await missions.update(mission_id, current_task_id=str(task.id))
+        return True
 
     async def submit_self_host(
         self,
@@ -67,6 +146,9 @@ class SelfHostService:
         tm = self._svc._require_task_manager()
         root = str(Path(workspace_root or os.getcwd()).resolve())
         planned_task_id = task_id or new_id("task")
+        # Allocate the mission identity before its Task row so recovery never
+        # has to infer which mission owns a CREATED self-host task.
+        mission_id = mission_id or new_id("mission")
         bundle = SelfHostGateBundle.capture(root, allow_dirty=_allow_known_dirty)
         # Bind the task-local context cache and execution provenance to the
         # source revision that the self-host authority actually captured.
@@ -151,34 +233,50 @@ class SelfHostService:
             trusted_gate_bundle=bundle.to_record(),
             trusted_mission_plan=plan,
         )
-        created = await tm.create(spec)
-        budgets = getattr(tm, "budgets", None)
-        persist_budget = getattr(budgets, "_persist_usage", None)
-        if callable(persist_budget):
-            await persist_budget(created.id)
         missions = self._svc._self_host_missions
         if missions is None:
             raise RuntimeError("self-host mission store is not started")
         bundle_record = bundle.to_record()
-        if mission_id is None:
-            await missions.create(
-                project_root=root,
-                objective=str(objective),
-                task_id=created.id,
-                base_revision=str(bundle_record.get("source_revision") or ""),
-                design_bundle_hash=str(bundle_record.get("design_bundle_hash") or ""),
-                gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
-                current_base_fingerprint=base_fingerprint,
-                current_git_revision=str(bundle_record.get("source_revision") or ""),
-                current_design_bundle_hash=str(bundle_record.get("design_bundle_hash") or ""),
-                current_gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
-                plan=plan,
-            )
+        mission_identity = {
+            "mission_id": mission_id,
+            "project_root": root,
+            "objective": str(objective),
+            "task_id": planned_task_id,
+            "base_revision": str(bundle_record.get("source_revision") or ""),
+            "design_bundle_hash": str(bundle_record.get("design_bundle_hash") or ""),
+            "gate_bundle_hash": str(bundle_record.get("gate_bundle_hash") or ""),
+            "current_base_fingerprint": base_fingerprint,
+            "current_git_revision": str(bundle_record.get("source_revision") or ""),
+            "current_design_bundle_hash": str(bundle_record.get("design_bundle_hash") or ""),
+            "current_gate_bundle_hash": str(bundle_record.get("gate_bundle_hash") or ""),
+            "plan": plan,
+        }
+        spec = replace(
+            spec,
+            metadata={
+                **dict(spec.metadata),
+                "_intake_owner": "self_host",
+                "_self_host_mission_id": mission_id,
+                # Service-created metadata used only for trusted intake
+                # recovery if an older database has no mission row.
+                "_self_host_intake": mission_identity,
+                "_intake_phase": "task_created",
+            },
+        )
+        # Persist the recovery anchor before creating the Task row. Explicit
+        # IDs make retries safe and prevent a missionless CREATED task.
+        existing_mission = await missions.get(mission_id)
+        if existing_mission is None:
+            await missions.create(**mission_identity)
+        elif existing_mission.get("project_root") != root or existing_mission.get(
+            "objective"
+        ) != str(objective):
+            raise ValueError(f"self-host mission id {mission_id!r} identifies different work")
         else:
             await missions.update(
                 mission_id,
                 status="active",
-                current_task_id=created.id,
+                current_task_id=planned_task_id,
                 last_error=None,
                 current_base_fingerprint=base_fingerprint,
                 current_git_revision=str(bundle_record.get("source_revision") or ""),
@@ -186,13 +284,27 @@ class SelfHostService:
                 current_gate_bundle_hash=str(bundle_record.get("gate_bundle_hash") or ""),
                 plan=plan,
             )
+        created = await tm.create(spec)
+        budgets = getattr(tm, "budgets", None)
+        persist_budget = getattr(budgets, "_persist_usage", None)
+        if callable(persist_budget):
+            await persist_budget(created.id)
+        await self._mark_intake_phase(created.id, "task_created")
         # Self-host plans are still user-initiated task turns. Persist their
         # canonical service-owned prompt before the worker can observe them.
         await self._svc._record_canonical_user_turn(request, created)
+        await self._mark_intake_phase(created.id, "canonical_user_turn_persisted")
         await tm.enqueue(created.id)
+        await self._mark_intake_phase(created.id, "enqueued")
         if wait:
             await self._svc.wait_for(created.id)
         return created
+
+    async def _mark_intake_phase(self, task_id: str, phase: str) -> None:
+        store = getattr(self._svc, "_store_tasks", None)
+        update = getattr(store, "update_metadata", None)
+        if callable(update):
+            await update(str(task_id), {"_intake_phase": phase})
 
     async def _plan_next_self_host_item(
         self,

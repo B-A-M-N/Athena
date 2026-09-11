@@ -159,9 +159,11 @@ class BudgetTracker:
         task_store: Any = None,
         default: DefaultBudget | None = None,
         budget_resolver: Any = None,
+        reservation_store: Any = None,
     ) -> None:
         self._store = task_store
         self._budget_resolver = budget_resolver
+        self._reservation_store = reservation_store
         self._default = default or DefaultBudget()
         self._lock = Lock()
         self._ledger: dict[str, Usage] = {}
@@ -511,6 +513,11 @@ class BudgetTracker:
             reservations = self._model_reservations.setdefault(task_id, {})
             key = reservation_id or new_id("model-reservation")
             if key in reservations:
+                if reservations[key] != amount:
+                    raise ValueError(
+                        f"model reservation {key!r} for task {task_id} "
+                        "was replayed with a different amount"
+                    )
                 return
             for ancestor in ancestors:
                 budget = await self.budget_of_async(ancestor)
@@ -826,6 +833,32 @@ class BudgetTracker:
             # Count it conservatively through recovery instead of resetting the
             # wall-time budget.
             restored.wall_time_s += max(0.0, (utcnow() - active_started).total_seconds())
+        recovery_marker: dict[str, Any] | None = None
+        if outstanding_model and not model_reservations:
+            # Older checkpoints only recorded IDs plus an aggregate. Recover
+            # exact amounts from durable provider attempts when possible.
+            durable_reservations = {}
+            list_reservations = getattr(self._reservation_store, "reservation_amounts", None)
+            if len(reservation_ids) > 1 and callable(list_reservations):
+                durable_reservations = await list_reservations(task_id, reservation_ids)
+            durable_total = sum(durable_reservations.values(), Decimal("0"))
+            if (
+                len(reservation_ids) > 1
+                and set(durable_reservations) == reservation_ids
+                and durable_total == outstanding_model
+            ):
+                model_reservations = durable_reservations
+            elif len(reservation_ids) == 1:
+                model_reservations = {next(iter(reservation_ids)): outstanding_model}
+            else:
+                # Never invent a per-attempt amount from an aggregate.
+                model_reservations = {f"__legacy__:{task_id}": outstanding_model}
+                recovery_marker = {
+                    "kind": "budget_reservation_reconstruction",
+                    "reservation_ids": sorted(reservation_ids),
+                    "outstanding_model_cost": str(outstanding_model),
+                    "reason": "legacy aggregate lacks exact per-reservation amounts",
+                }
         with self._lock:
             current = self._ledger.setdefault(task_id, Usage())
             if _all_zero(current):
@@ -839,20 +872,6 @@ class BudgetTracker:
                     self._model_cost_reservations.get(task_id, Decimal("0")), reserved_model
                 )
             if outstanding_model:
-                if not model_reservations:
-                    # Older checkpoints only recorded IDs plus an aggregate.
-                    # A single ID can be upgraded exactly. Multiple IDs have
-                    # lost their per-ID amounts; retain that amount under a
-                    # quarantine key rather than guessing which attempt owns
-                    # it and risking an incorrect release.
-                    if len(reservation_ids) == 1:
-                        model_reservations = {
-                            next(iter(reservation_ids)): outstanding_model,
-                        }
-                    else:
-                        model_reservations = {
-                            f"__legacy__:{task_id}": outstanding_model,
-                        }
                 self._model_reservations[task_id] = model_reservations
                 self._refresh_model_owner_total(task_id)
             elif model_reservations:
@@ -862,6 +881,18 @@ class BudgetTracker:
             if task_id not in self._model_reservations:
                 self._model_reservation_ids[task_id] = reservation_ids
             self._usage_hydrated.add(task_id)
+        if recovery_marker is not None:
+            marker_store = getattr(self._store, "record_recovery_marker", None)
+            if callable(marker_store):
+                await marker_store(task_id, recovery_marker)
+            transition = getattr(self._store, "transition", None)
+            if callable(transition):
+                from athena.protocol.tasks import TaskStatus
+
+                try:
+                    await transition(task_id, TaskStatus.RECOVERY_REQUIRED)
+                except (KeyError, ValueError):
+                    pass
 
     async def _persist_usage(self, task_id: str) -> None:
         store = self._store

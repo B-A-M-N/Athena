@@ -267,6 +267,10 @@ class AthenaService:
         self._hermes_referee_owned = False
         self._hermes_status_error: str | None = None
         self._started = False
+        # ``_started`` means the durable service graph is initialized. Runtime
+        # producers (worker, scheduler loop, and watch poller) are activated
+        # separately so control-plane reads cannot consume or mutate work.
+        self._runtime_active = False
         self._recovery_status = "not_started"
         self._recovery_summary: dict[str, int] = {}
         self._recovery_error: str | None = None
@@ -348,6 +352,7 @@ class AthenaService:
         self._skills: SkillStore | None = None
         self._skill_lifecycle: SkillLifecycle | None = None
         self._scheduler: Scheduler | None = None
+        self._scheduler_event_subscribed = False
         self._schedule_api: Any = None
         self._artifacts: ArtifactStore | None = None
         self._mcp: MCPAdapter | None = None
@@ -412,8 +417,12 @@ class AthenaService:
     # ------------------------------------------------------------------ #
     # Lifecycle: start / stop
     # ------------------------------------------------------------------ #
-    async def start(self) -> None:
-        return await ServiceLifecycle(self).start()
+    async def start(self, *, activate_runtime: bool = True) -> None:
+        return await ServiceLifecycle(self).start(activate_runtime=activate_runtime)
+
+    async def activate_runtime(self) -> None:
+        """Activate background producers after durable initialization."""
+        return await ServiceLifecycle(self).activate_runtime()
 
     async def _start_impl(self) -> None:
         return await ServiceLifecycle(self)._start_impl()

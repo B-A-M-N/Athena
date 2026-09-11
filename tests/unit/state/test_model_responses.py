@@ -998,3 +998,81 @@ async def test_reservation_release_replay_does_not_consume_sibling_after_crash(t
     assert (await second_store.get_attempt(attempts[1]))["reservation_released_at"] is None
     assert await second_store.has_unresolved_liability(task_id)
     await second_db.close()
+
+
+async def test_legacy_aggregate_rehydrates_exact_durable_reservations(tmp_path):
+    path = tmp_path / "legacy-reservation-checkpoint.sqlite"
+    db = Database(str(path))
+    await db._ensure_ready()
+    task_id = "task-legacy-reservation-checkpoint"
+    checkpoint = {
+        "reserved_model_cost": "3.00",
+        "outstanding_model_cost": "3.00",
+        "model_reservation_ids": ["attempt-a", "attempt-b"],
+    }
+    await db.execute(
+        "INSERT INTO tasks(id, status, autonomy, objective, resource_budget, metadata, created_at, updated_at) "
+        "VALUES (?, 'RUNNING', 'supervised', 'legacy checkpoint', ?, ?, '2026-01-01', '2026-01-01')",
+        (
+            task_id,
+            json.dumps({"max_cost_usd": "5.00"}),
+            json.dumps({"_budget_usage": checkpoint}),
+        ),
+    )
+    responses = ModelResponseStore(db)
+    for suffix, amount in (("a", Decimal("1.25")), ("b", Decimal("1.75"))):
+        await db.execute(
+            "INSERT INTO model_response_attempts("
+            "attempt_id, task_id, request_fingerprint, request_id, provider, model, status, "
+            "reservation_amount, provider_outcome_status, created_at"
+            ") VALUES (?, ?, ?, ?, 'fixture', 'fixture-model', 'PENDING', ?, 'pending', ?)",
+            (
+                f"attempt-{suffix}",
+                task_id,
+                f"legacy-{suffix}",
+                f"request-{suffix}",
+                str(amount),
+                "2026-01-01",
+            ),
+        )
+    tracker = BudgetTracker(
+        task_store=TaskStore(db),
+        reservation_store=responses,
+    )
+
+    assert (await tracker.remaining(task_id))["cost_usd"] == Decimal("2.00")
+    assert tracker._model_reservations[task_id] == {
+        "attempt-a": Decimal("1.25"),
+        "attempt-b": Decimal("1.75"),
+    }
+    await db.close()
+
+
+async def test_legacy_aggregate_without_exact_reservations_requires_recovery(tmp_path):
+    path = tmp_path / "ambiguous-reservation-checkpoint.sqlite"
+    db = Database(str(path))
+    await db._ensure_ready()
+    task_id = "task-ambiguous-reservation-checkpoint"
+    checkpoint = {
+        "reserved_model_cost": "3.00",
+        "outstanding_model_cost": "3.00",
+        "model_reservation_ids": ["attempt-a", "attempt-b"],
+    }
+    await db.execute(
+        "INSERT INTO tasks(id, status, autonomy, objective, resource_budget, metadata, created_at, updated_at) "
+        "VALUES (?, 'RECOVERY_REQUIRED', 'supervised', 'ambiguous checkpoint', ?, ?, '2026-01-01', '2026-01-01')",
+        (
+            task_id,
+            json.dumps({"max_cost_usd": "5.00"}),
+            json.dumps({"_budget_usage": checkpoint}),
+        ),
+    )
+    tracker = BudgetTracker(task_store=TaskStore(db), reservation_store=ModelResponseStore(db))
+
+    assert (await tracker.remaining(task_id))["cost_usd"] == Decimal("2.00")
+    row = await db.fetch_one("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
+    metadata = json.loads(row["metadata"])
+    assert metadata["recovery_required"] is True
+    assert metadata["recovery_markers"][0]["kind"] == "budget_reservation_reconstruction"
+    assert tracker._model_reservations[task_id] == {"__legacy__:" + task_id: Decimal("3.00")}
+    await db.close()

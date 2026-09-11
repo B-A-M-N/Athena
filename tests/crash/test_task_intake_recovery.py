@@ -6,7 +6,8 @@ import pytest
 
 from athena.protocol.tasks import AgentRequest, TaskStatus
 from athena.protocol.artifacts import ArtifactRef
-from athena.protocol.messages import ArtifactRefBlock
+from athena.protocol.messages import ArtifactRefBlock, FileRefBlock
+from athena.protocol.tasks import ContextRef
 from athena.state.database import Database
 from athena.state.tasks import TaskStore
 
@@ -106,3 +107,91 @@ async def test_created_intake_recovery_preserves_durable_attachment_provenance(
     assert recovered_attachment.ref.hash == attachment.hash
     assert recovered_attachment.ref.mime_type == attachment.mime_type
     assert recovered_attachment.ref.producer == attachment.producer
+
+
+def _attachment_signature(message):
+    signatures = []
+    for block in message.blocks:
+        if isinstance(block, ArtifactRefBlock):
+            assert block.ref is not None
+            signatures.append(
+                (
+                    "artifact",
+                    block.uri,
+                    block.ref.id,
+                    block.ref.hash,
+                    block.ref.mime_type,
+                    block.ref.size,
+                    block.ref.storage_path,
+                    block.ref.producer,
+                    dict(block.ref.metadata),
+                )
+            )
+        elif isinstance(block, FileRefBlock):
+            signatures.append(("file", block.uri, block.mime_type))
+    return tuple(signatures)
+
+
+@pytest.mark.athena_claim("RECOVERY-TASK-ATTACHMENT-EQUIVALENCE")
+@pytest.mark.athena_evidence("test", "crash-restart")
+async def test_normal_and_crash_intake_have_identical_attachment_blocks(
+    make_durable_service, durable_db_path
+):
+    first = await make_durable_service(
+        durable_db_path,
+        scripts=None,
+        worker_max_parallel=0,
+    )
+    attachment = ArtifactRef(
+        id="artifact-equivalence-1",
+        uri="artifact://sha256/equivalence-digest",
+        hash="equivalence-digest",
+        mime_type="application/json",
+        size=23,
+        storage_path="objects/equivalence.json",
+        producer="upload",
+        metadata={"source": "test"},
+    )
+    file_ref = ContextRef(
+        kind="file",
+        ref="workspace://notes.txt",
+        mime_type="text/plain",
+    )
+
+    normal_request = AgentRequest(
+        prompt="compare ordinary intake",
+        session_id="session-attachment-normal",
+        attachments=(attachment, file_ref),  # type: ignore[arg-type]
+    )
+    normal_spec = first._build_task_spec(normal_request, normal_request.session_id)
+    await first._task_manager.create(normal_spec)
+    await first._record_canonical_user_turn(normal_request, normal_spec)
+    normal_messages = await first._store_messages.list_session_messages(normal_spec.session_id)
+    normal = next(
+        message
+        for message in normal_messages
+        if (message.metadata or {}).get("canonical_user_turn") is True
+    )
+
+    crash_request = AgentRequest(
+        prompt="compare recovered intake",
+        session_id="session-attachment-crash",
+        attachments=(attachment, file_ref),  # type: ignore[arg-type]
+    )
+    crash_spec = first._build_task_spec(crash_request, crash_request.session_id)
+    await first._task_manager.create(crash_spec)
+    await first.stop()  # crash before the ephemeral request reaches canonical persistence
+
+    second = await make_durable_service(
+        durable_db_path,
+        scripts=None,
+        worker_max_parallel=0,
+    )
+    recovered_messages = await second._store_messages.list_session_messages(crash_spec.session_id)
+    recovered = next(
+        message
+        for message in recovered_messages
+        if (message.metadata or {}).get("canonical_user_turn") is True
+    )
+
+    assert _attachment_signature(normal) == _attachment_signature(recovered)

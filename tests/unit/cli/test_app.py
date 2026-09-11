@@ -9,6 +9,7 @@ from athena.cli.app import (
     _arg_parse,
     _cmd_run,
     _cmd_workflows,
+    _cli_runtime_mode,
     _config_set,
     build_config,
 )
@@ -93,6 +94,20 @@ def test_argparse_workflows_preserves_actions():
 
     assert options.command == "workflows"
     assert options.args == ["describe", "workflow-1", "task-1"]
+
+
+@pytest.mark.parametrize(
+    ("options", "runtime_active"),
+    [
+        (Options(command="jobs", args=["list"]), False),
+        (Options(command="self", self_action="status"), False),
+        (Options(command="self", self_action="continue"), False),
+        (Options(command="run", args=["hello"]), True),
+        (Options(command="chat"), True),
+    ],
+)
+def test_cli_starts_runtime_only_for_live_commands(options, runtime_active):
+    assert _cli_runtime_mode(options) is runtime_active
 
 
 @pytest.mark.asyncio
