@@ -1,11 +1,12 @@
-.PHONY: format format-check lint typecheck compile test check scenarios arch-lint native-check native-test native-smoke native-package release-check
+.PHONY: format format-check lint typecheck compile test check scenarios arch-lint demo native-check native-test native-smoke native-package release-check
 
 UV ?= uv
-UV_RUN_DEV := $(UV) run --extra dev
+UV_RUN_DEV := $(UV) run --frozen --extra dev
 RUFF := $(UV_RUN_DEV) ruff
 MYPY := $(UV_RUN_DEV) mypy
 PYTHON := $(UV_RUN_DEV) python
-PYTEST := $(UV) run --extra dev --extra anthropic pytest
+PYTEST := $(UV) run --frozen --extra dev --extra anthropic pytest
+CHECK_ARTIFACT_DIR ?= .artifacts/check
 
 format:
 	$(RUFF) format src tests
@@ -36,6 +37,11 @@ test:
 #            src/athena/kernel/kernel.py); the lint is expected GREEN.
 scenarios:
 	$(PYTHON) scripts/scenarios --output scenarios-manifest.json
+
+# Regenerate the published terminal demo intentionally.  This is not part of
+# the read-only merge gate because it updates the canonical GIF artifact.
+demo:
+	scripts/render-demo
 
 arch-lint:
 	$(PYTHON) scripts/architecture-lint
@@ -68,6 +74,19 @@ release-check:
 # lint are part of the gate.  The kernel router-fallback defect that once
 # made arch-lint run red is fixed; the lint is part of the GREEN gate.
 check: lint typecheck compile
+	@set -eu; \
+	check_before="$$(git status --porcelain --untracked-files=no)"; \
+	check_status() { \
+		check_after="$$(git status --porcelain --untracked-files=no)"; \
+		if [ "$$check_before" != "$$check_after" ]; then \
+			echo "make check modified tracked files" >&2; \
+			echo "before:" >&2; echo "$$check_before" >&2; \
+			echo "after:" >&2; echo "$$check_after" >&2; \
+			return 1; \
+		fi; \
+	}; \
+	trap 'check_status_code=$$?; if ! check_status; then check_status_code=1; fi; exit "$$check_status_code"' EXIT; \
+	mkdir -p "$(CHECK_ARTIFACT_DIR)"; \
 	$(PYTEST) -q \
 		tests/unit/affordances/test_validation.py \
 		tests/unit/capabilities/test_synthesis_capability.py \
@@ -75,6 +94,6 @@ check: lint typecheck compile
 		tests/unit/models/test_compat_kernel.py \
 		tests/unit/models/test_openai_compat.py \
 		tests/unit/models/test_anthropic.py \
-		tests/unit/capabilities/test_dispatch_many_preflight.py
-	$(PYTHON) scripts/scenarios --output scenarios-manifest.json
+		tests/unit/capabilities/test_dispatch_many_preflight.py; \
+	$(PYTHON) scripts/scenarios --exclude-family VHS --output "$(CHECK_ARTIFACT_DIR)/scenarios-manifest.json"; \
 	$(PYTHON) scripts/architecture-lint

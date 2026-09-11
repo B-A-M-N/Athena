@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import subprocess
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -589,8 +590,82 @@ def _doctor_native(o: "Options", config: Any) -> int:
     return 0 if preflight.ok and binary_ok else 1
 
 
+def _bubblewrap_probe() -> tuple[bool, str]:
+    """Probe the exact network namespace primitive used by restricted code."""
+    if os.name != "posix":
+        return False, "restricted execution is unavailable on this platform"
+    bwrap = shutil.which("bwrap")
+    if bwrap is None:
+        return False, "bubblewrap is not installed; restricted execution fails closed"
+    command = [
+        bwrap,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--unshare-net",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "/usr/bin/true",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"bubblewrap preflight failed: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip().splitlines()
+        return False, f"bubblewrap preflight failed: {detail[-1] if detail else 'unknown error'}"
+    try:
+        version = subprocess.run(
+            [bwrap, "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        version = "version unavailable"
+    return True, version or "version unavailable"
+
+
+def _profile_requires_restricted_execution(config: Any) -> bool:
+    """Return whether configured required capabilities need Bubblewrap."""
+    restricted_ids = {
+        "sandbox",
+        "sandboxed-local",
+        "terminal",
+        "terminal_session",
+        "generated_capability",
+        "synthesis",
+    }
+    for raw in getattr(config, "effective_required_capabilities", ()) or ():
+        kind, separator, identifier = str(raw).partition(":")
+        candidate = identifier if separator else kind
+        if candidate.casefold() in restricted_ids:
+            return True
+    return False
+
+
 def _doctor_startup(o: "Options", config: Any) -> int:
     """Start the service briefly and report readiness-owned checks."""
+    sandbox_ready, sandbox_detail = _bubblewrap_probe()
+    requires_sandbox = _profile_requires_restricted_execution(config)
+    if sandbox_ready:
+        print(f"Sandbox: READY (bubblewrap {sandbox_detail})")
+    else:
+        print(f"Sandbox: UNAVAILABLE (fail-closed: {sandbox_detail})")
     try:
         service = build_service(config)
     except ServiceUnavailable as exc:
@@ -637,6 +712,9 @@ def _doctor_startup(o: "Options", config: Any) -> int:
     memory = matrix.get("memory") or {}
     if isinstance(memory, dict):
         print(f"  semantic-memory: {memory.get('state', 'unknown')}")
+    if requires_sandbox and not sandbox_ready:
+        print("  capability profile: restricted execution is not ready", file=sys.stderr)
+        return 1
     return 0 if health.get("status") == "ok" else 1
 
 
@@ -720,6 +798,7 @@ class Options:
     recovery_resolution: str | None = None
     recovery_provider_response_id: str | None = None
     recovery_actual_cost: str | None = None
+    recovery_authorized_by: str | None = None
 
 
 def dispatch(o: Options) -> int:
@@ -2375,6 +2454,7 @@ def _arg_parse(argv: list[str]) -> Options:
         recovery_resolution=getattr(ns, "recovery_resolution", None),
         recovery_provider_response_id=getattr(ns, "recovery_provider_response_id", None),
         recovery_actual_cost=getattr(ns, "recovery_actual_cost", None),
+        recovery_authorized_by=getattr(ns, "recovery_authorized_by", None),
     )
     if command == "doctor":
         o.args = [ns.target]

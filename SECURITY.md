@@ -1,6 +1,6 @@
 # Security
 
-Athena 0.1 is bounded stable software and should be run with the least
+Athena 0.1 is bounded beta software and should be run with the least
 privilege needed for the workspace. The bounded beta native certification cell
 is Linux x86_64 with an X11 display and Openbox; broader Linux desktop, macOS,
 and Windows behavior is compatibility-targeted, not a parity claim. Agent code

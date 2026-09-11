@@ -179,7 +179,8 @@ _PROVIDER_OUTCOME_CONTRACT: dict[str, dict[str, Any]] = {
     "retry_authorized": {
         "attempt_status": "UNKNOWN",
         "receipt_status": "FAILED",
-        "reservation": "released",
+        "provider_outcome": "unknown",
+        "reservation": "retained as open liability",
         "actual_cost": "not_required",
         "task_transition": "RECOVERY_REQUIRED|INTERRUPTED -> RUNNING",
         "inference_retry": "one replacement attempt",
@@ -1149,6 +1150,7 @@ class AthenaService:
             TrustClass,
             utcnow,
         )
+        from athena.protocol.artifacts import ArtifactRef
 
         blocks: list[Any] = [
             TextBlock(
@@ -1161,23 +1163,66 @@ class AthenaService:
                 ),
             )
         ]
-        for attachment in getattr(request, "attachments", ()) or ():
-            if hasattr(attachment, "uri"):
+        # ``AgentRequest.attachments`` is ephemeral.  CREATED-task recovery
+        # receives only the durable TaskSpec, whose context_refs are the
+        # canonical attachment representation. Prefer the request for the
+        # initial write, but always fall back to those refs after a restart.
+        attachments = getattr(request, "attachments", None)
+        if not attachments:
+            attachments = getattr(task, "context_refs", ())
+        for attachment in attachments or ():
+            if isinstance(attachment, ArtifactRef) or (
+                hasattr(attachment, "uri") and hasattr(attachment, "mime_type")
+            ):
                 blocks.append(
                     ArtifactRefBlock(
                         uri=str(attachment.uri),
                         ref=attachment,
                     )
                 )
+            elif isinstance(attachment, ContextRef):
+                uri = str(attachment.ref or "")
+                if not uri:
+                    continue
+                if attachment.kind == "artifact":
+                    ref = ArtifactRef(
+                        id=str(attachment.source_id or uri),
+                        uri=uri,
+                        hash=attachment.hash,
+                        mime_type=attachment.mime_type,
+                        size=attachment.size,
+                        storage_path=attachment.storage_path,
+                        producer=attachment.producer or attachment.summary,
+                        metadata=dict(attachment.metadata),
+                    )
+                    blocks.append(ArtifactRefBlock(uri=uri, ref=ref))
+                else:
+                    blocks.append(
+                        FileRefBlock(uri=uri, mime_type=attachment.mime_type)
+                    )
             elif isinstance(attachment, Mapping):
+                kind = str(attachment.get("kind") or "file")
                 uri = str(attachment.get("uri") or attachment.get("ref") or "")
                 if uri:
-                    blocks.append(
-                        FileRefBlock(
+                    if kind == "artifact":
+                        ref = ArtifactRef(
+                            id=str(attachment.get("source_id") or uri),
                             uri=uri,
+                            hash=attachment.get("hash"),
                             mime_type=attachment.get("mime_type"),
+                            size=attachment.get("size"),
+                            storage_path=attachment.get("storage_path"),
+                            producer=attachment.get("producer") or attachment.get("summary"),
+                            metadata=dict(attachment.get("metadata") or {}),
                         )
-                    )
+                        blocks.append(ArtifactRefBlock(uri=uri, ref=ref))
+                    else:
+                        blocks.append(
+                            FileRefBlock(
+                                uri=uri,
+                                mime_type=attachment.get("mime_type"),
+                            )
+                        )
         message = Message(
             # Stable association makes retries idempotent without making the
             # task/message identity part of normal opaque ID generation.
@@ -1652,12 +1697,14 @@ class AthenaService:
         note: str,
         provider_response_id: str | None = None,
         actual_cost: Decimal | str | None = None,
+        authorized_by: str | None = None,
     ) -> dict[str, Any]:
         """Apply one explicit provider-outcome disposition and its task effect.
 
         ``confirmed_failed`` releases the reservation and terminally fails the
-        task. ``retry_authorized`` releases the reservation and starts a new
-        attempt. ``confirmed_succeeded`` records the known charge, releases the
+        task. ``retry_authorized`` records authorization while retaining the
+        unknown outcome and reservation, then starts a new attempt.
+        ``confirmed_succeeded`` records the known charge, releases the
         reservation, and terminally fails the task because its response body is
         unavailable. ``abandoned_with_liability`` terminally fails the task but
         deliberately retains the reservation for manual financial closeout.
@@ -1684,10 +1731,11 @@ class AthenaService:
             note=note,
             provider_response_id=provider_response_id,
             actual_cost=normalized_cost,
+            authorized_by=authorized_by,
         )
         task_id = str(resolved.get("task_id") or attempt.get("task_id") or "")
         amount = _validated_actual_cost(resolved.get("reservation_amount")) or Decimal("0")
-        if resolution in {"confirmed_failed", "retry_authorized"}:
+        if resolution == "confirmed_failed":
             await AthenaService._release_provider_reservation(
                 self,
                 store,
@@ -1748,10 +1796,11 @@ class AthenaService:
         attempt = await store.get_attempt(str(attempt_id))
         if attempt is None:
             raise KeyError(f"unknown inference attempt: {attempt_id}")
-        if str(attempt.get("provider_outcome_status") or "").lower() != (
-            "abandoned_with_liability"
-        ):
-            raise ValueError("only abandoned provider liabilities can be manually closed")
+        if str(attempt.get("provider_outcome_status") or "").lower() not in {
+            "unknown",
+            "abandoned_with_liability",
+        }:
+            raise ValueError("only unresolved provider liabilities can be manually closed")
         amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
         budgets = getattr(self, "_budgets", None)
         if budgets is not None and amount > 0:
@@ -1856,8 +1905,16 @@ class AthenaService:
         """Return the disposition plus operator-relevant consequences."""
         view = dict(resolved)
         resolution = str(view.get("provider_outcome_status") or "")
-        if resolution in _PROVIDER_OUTCOME_CONTRACT:
-            view["disposition_contract"] = dict(_PROVIDER_OUTCOME_CONTRACT[resolution])
+        recovery_action = (
+            "retry_authorized"
+            if resolution == "unknown"
+            and view.get("retry_authorized_at")
+            and view.get("reservation_released_at") is None
+            else resolution
+        )
+        view["recovery_action"] = recovery_action
+        if recovery_action in _PROVIDER_OUTCOME_CONTRACT:
+            view["disposition_contract"] = dict(_PROVIDER_OUTCOME_CONTRACT[recovery_action])
         task_id = str(view.get("task_id") or "")
         tasks = getattr(self, "_store_tasks", None)
         if tasks is not None and task_id:
@@ -1872,7 +1929,10 @@ class AthenaService:
             else "0"
         )
         view["next_actions"] = (
-            ["manually close provider liability"]
+            ["reconcile original provider outcome or explicitly close provider liability"]
+            if view.get("provider_outcome_status") == "unknown"
+            and view.get("reservation_released_at") is None
+            else ["manually close provider liability"]
             if view.get("provider_outcome_status") == "abandoned_with_liability"
             else []
         )
@@ -1891,12 +1951,17 @@ class AthenaService:
                 task_id = str(attempt.get("task_id") or "")
                 amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
                 attempt_id = str(attempt.get("attempt_id") or "")
+                retry_authorized = (
+                    resolution == "unknown"
+                    and bool(attempt.get("retry_authorized_at"))
+                    and attempt.get("reservation_released_at") is None
+                )
                 receipt = await store.get_receipt(
                     task_id=task_id,
                     request_fingerprint=str(attempt.get("request_fingerprint") or ""),
                 )
                 if (
-                    resolution == "retry_authorized"
+                    retry_authorized
                     and receipt is not None
                     and str(receipt.get("attempt_id") or "") != attempt_id
                 ):
@@ -1905,7 +1970,7 @@ class AthenaService:
                     # retry after restart.
                     replayed += 1
                     continue
-                if resolution in {"confirmed_failed", "retry_authorized"} and not attempt.get(
+                if resolution == "confirmed_failed" and not attempt.get(
                     "reservation_released_at"
                 ):
                     await self._release_provider_reservation(
@@ -1928,7 +1993,7 @@ class AthenaService:
                         await store.mark_budget_accounted(attempt_id=attempt_id)
                     if not attempt.get("reservation_released_at"):
                         await store.mark_reservation_released(attempt_id=attempt_id)
-                if resolution == "retry_authorized":
+                if retry_authorized:
                     await self._launch_provider_retry(task_id)
                 elif resolution in {
                     "confirmed_failed",
@@ -2438,6 +2503,11 @@ class AthenaService:
                         source_id=getattr(att, "id", None),
                         summary=getattr(att, "producer", None),
                         mime_type=getattr(att, "mime_type", None),
+                        hash=getattr(att, "hash", None),
+                        size=getattr(att, "size", None),
+                        storage_path=getattr(att, "storage_path", None),
+                        producer=getattr(att, "producer", None),
+                        metadata=dict(getattr(att, "metadata", {}) or {}),
                     )
                 )
             elif isinstance(att, dict):
@@ -2448,6 +2518,11 @@ class AthenaService:
                         source_id=att.get("source_id"),
                         summary=att.get("summary"),
                         mime_type=att.get("mime_type"),
+                        hash=att.get("hash"),
+                        size=att.get("size"),
+                        storage_path=att.get("storage_path"),
+                        producer=att.get("producer") or att.get("summary"),
+                        metadata=dict(att.get("metadata") or {}),
                     )
                 )
         spec_kwargs: dict = dict(

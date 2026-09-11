@@ -447,12 +447,15 @@ async def test_attempt_lifecycle_is_addressed_by_attempt_id_and_preserves_histor
         resolution="retry_authorized",
         note="provider has no retrieval endpoint; operator authorized a bounded retry",
     )
-    assert resolved["provider_outcome_status"] == "retry_authorized"
-    with pytest.raises(ValueError, match="not awaiting reconciliation"):
+    assert resolved["provider_outcome_status"] == "unknown"
+    assert resolved["retry_authorized_at"] is not None
+    assert resolved["retry_authorized_by"] == "operator"
+    assert resolved["reservation_released_at"] is None
+    with pytest.raises(ValueError, match="already has retry authorization"):
         await store.resolve_provider_outcome(
             attempt_id=second_id,
-            resolution="confirmed_failed",
-            note="a second disposition must not revise the first",
+            resolution="retry_authorized",
+            note="a second retry authorization must not duplicate the first",
         )
 
     third = await store.prepare(
@@ -476,14 +479,16 @@ async def test_attempt_lifecycle_is_addressed_by_attempt_id_and_preserves_histor
     )
 
     rows = await db.fetch_all(
-        "SELECT attempt_id, status, provider_outcome_status, provider_usage_started_at "
+        "SELECT attempt_id, status, provider_outcome_status, provider_usage_started_at, "
+        "replacement_attempt_id "
         "FROM model_response_attempts WHERE task_id = ? ORDER BY created_at",
         ("task-attempt-history",),
     )
     assert [row["attempt_id"] for row in rows] == [first_id, second_id, third_id]
     assert rows[0]["status"] == "FAILED"
     assert rows[0]["provider_usage_started_at"] is None
-    assert rows[1]["provider_outcome_status"] == "retry_authorized"
+    assert rows[1]["provider_outcome_status"] == "unknown"
+    assert rows[1]["replacement_attempt_id"] == third_id
     assert rows[2]["status"] == "COMPLETED"
     await db.close()
 
@@ -632,12 +637,12 @@ async def test_provider_outcome_dispositions_drive_task_and_accounting_state():
         row = await response_store.get_attempt(attempt_id)
         task = await task_store.get(task_id)
         assert row is not None and task is not None
-        assert row["provider_outcome_status"] == resolution
-        assert (
-            row["reservation_released_at"] is not None
-            if resolution != "abandoned_with_liability"
-            else True
-        )
+        expected_outcome = "unknown" if resolution == "retry_authorized" else resolution
+        assert row["provider_outcome_status"] == expected_outcome
+        assert row["reservation_released_at"] is not None or resolution in {
+            "retry_authorized",
+            "abandoned_with_liability",
+        }
         if resolution == "confirmed_succeeded":
             assert row["status"] == "COMPLETED"
             assert task["status"] == TaskStatus.FAILED.value
@@ -650,7 +655,13 @@ async def test_provider_outcome_dispositions_drive_task_and_accounting_state():
             assert not await response_store.has_unresolved_liability(task_id)
         elif resolution == "retry_authorized":
             assert task["status"] == TaskStatus.RUNNING.value
-            assert not await response_store.has_unresolved_liability(task_id)
+            assert row["retry_authorized_at"] is not None
+            assert row["reservation_released_at"] is None
+            assert resolved["recovery_action"] == "retry_authorized"
+            assert await response_store.has_unresolved_liability(task_id)
+            assert resolved["next_actions"] == [
+                "reconcile original provider outcome or explicitly close provider liability"
+            ]
         else:
             assert row["status"] == "ABANDONED"
             assert task["status"] == TaskStatus.FAILED.value
@@ -761,6 +772,7 @@ async def test_all_provider_dispositions_replay_task_effects_after_restart(tmp_p
     assert success_attempt["reservation_released_at"] is not None
     assert (await second_budgets.total("task-restart-succeeded")).cost == Decimal("0.40")
     assert not await second_store.has_unresolved_liability("task-restart-failed")
+    assert await second_store.has_unresolved_liability("task-restart-retry")
     assert await second_store.has_unresolved_liability("task-restart-abandoned")
     assert retry_calls == ["task-restart-retry"]
 
@@ -777,6 +789,58 @@ async def test_all_provider_dispositions_replay_task_effects_after_restart(tmp_p
     assert closed["liability_closed"] is True
     assert not await second_store.has_unresolved_liability("task-restart-abandoned")
     await second_db.close()
+
+
+async def test_closed_retry_authorization_is_not_replayed(tmp_path):
+    path = tmp_path / "closed-retry.sqlite"
+    db = Database(str(path))
+    await db._ensure_ready()
+    task_id = "task-closed-retry"
+    await db.execute(
+        "INSERT INTO tasks(id, status, autonomy, objective, created_at, updated_at) "
+        "VALUES (?, 'RECOVERY_REQUIRED', 'supervised', 'closed retry', '2026-01-01', '2026-01-01')",
+        (task_id,),
+    )
+    tasks = TaskStore(db)
+    budgets = BudgetTracker(task_store=tasks)
+    store = ModelResponseStore(db)
+    receipt = await store.prepare(
+        task_id=task_id,
+        request_fingerprint="fingerprint-closed-retry",
+        request_id="call-closed-retry",
+        provider="fixture",
+        model="fixture-model",
+        reservation_amount=Decimal("1.00"),
+    )
+    attempt_id = str(receipt["attempt_id"])
+    await budgets.reserve_model_cost(task_id, Decimal("1.00"), reservation_id=attempt_id)
+    await store.mark_reservation_applied(attempt_id=attempt_id)
+    await store.mark_provider_outcome_unknown(attempt_id=attempt_id)
+    await store.resolve_provider_outcome(
+        attempt_id=attempt_id,
+        resolution="retry_authorized",
+        note="retry was authorized before the liability was closed",
+        authorized_by="operator@example.test",
+    )
+
+    service = SimpleNamespace(
+        _model_response_store=store,
+        _budgets=budgets,
+        _store_events=None,
+        _store_tasks=tasks,
+    )
+    closed = await AthenaService.close_provider_liability(
+        service,
+        attempt_id,
+        note="external billing record closed the unknown liability",
+    )
+    assert closed["liability_closed"] is True
+
+    replay = await AthenaService.reconcile_provider_outcomes(service)
+    assert replay == {"replayed": 0, "failed": 0}
+    assert (await tasks.get(task_id))["status"] == TaskStatus.RECOVERY_REQUIRED.value
+    assert not await store.has_unresolved_liability(task_id)
+    await db.close()
 
 
 async def test_confirmed_success_rejects_non_finite_actual_cost():
@@ -854,4 +918,82 @@ async def test_unknown_liability_rehydrates_against_budget_after_restart(tmp_pat
     assert (await restarted_budgets.remaining(task_id))["cost_usd"] == Decimal("0.25")
     restarted_store = ModelResponseStore(second_db)
     assert await restarted_store.has_unresolved_liability(task_id)
+    await second_db.close()
+
+
+async def test_reservation_release_replay_does_not_consume_sibling_after_crash(tmp_path):
+    path = tmp_path / "keyed-reservation-replay.sqlite"
+    task_id = "task-keyed-reservation-replay"
+    first_db = Database(str(path))
+    await first_db._ensure_ready()
+    await first_db.execute(
+        "INSERT INTO tasks(id, status, autonomy, objective, resource_budget, created_at, updated_at) "
+        "VALUES (?, 'RECOVERY_REQUIRED', 'supervised', 'replay reservations', ?, '2026-01-01', '2026-01-01')",
+        (task_id, json.dumps({"max_cost_usd": "5.00"})),
+    )
+    first_tasks = TaskStore(first_db)
+    first_budgets = BudgetTracker(task_store=first_tasks)
+    first_store = ModelResponseStore(first_db)
+    attempts = []
+    for suffix, amount in (("a", Decimal("1.00")), ("b", Decimal("2.00"))):
+        receipt = await first_store.prepare(
+            task_id=task_id,
+            request_fingerprint=f"fingerprint-replay-{suffix}",
+            request_id=f"call-replay-{suffix}",
+            provider="fixture",
+            model="fixture-model",
+            reservation_amount=amount,
+        )
+        attempt_id = str(receipt["attempt_id"])
+        attempts.append(attempt_id)
+        await first_budgets.reserve_model_cost(task_id, amount, reservation_id=attempt_id)
+        await first_store.mark_reservation_applied(attempt_id=attempt_id)
+        await first_store.mark_provider_outcome_unknown(attempt_id=attempt_id)
+    await first_store.resolve_provider_outcome(
+        attempt_id=attempts[0],
+        resolution="confirmed_failed",
+        note="provider confirmed attempt A failed",
+    )
+
+    service = SimpleNamespace(_model_response_store=first_store, _budgets=first_budgets)
+    service._release_provider_reservation = MethodType(
+        AthenaService._release_provider_reservation, service
+    )
+    def inject(name: str) -> None:
+        if name == "attempt-reservation-released":
+            raise RuntimeError("crash after budget release")
+
+    first_store.set_fault_injector(inject)
+    with pytest.raises(RuntimeError, match="crash after budget release"):
+        await service._release_provider_reservation(
+            first_store,
+            task_id=task_id,
+            attempt_id=attempts[0],
+            amount=Decimal("1.00"),
+        )
+    first_store.set_fault_injector(None)
+    await first_db.close()
+
+    second_db = Database(str(path))
+    await second_db._ensure_ready()
+    second_store = ModelResponseStore(second_db)
+    second_budgets = BudgetTracker(task_store=TaskStore(second_db))
+    restarted = SimpleNamespace(
+        _model_response_store=second_store,
+        _budgets=second_budgets,
+        _store_tasks=None,
+        _task_manager=None,
+    )
+    restarted._release_provider_reservation = MethodType(
+        AthenaService._release_provider_reservation, restarted
+    )
+    restarted._finalize_provider_outcome = MethodType(
+        AthenaService._finalize_provider_outcome, restarted
+    )
+    replay = await AthenaService.reconcile_provider_outcomes(restarted)
+    assert replay == {"replayed": 1, "failed": 0}
+    assert (await second_budgets.remaining(task_id))["cost_usd"] == Decimal("3.00")
+    assert (await second_store.get_attempt(attempts[0]))["reservation_released_at"] is not None
+    assert (await second_store.get_attempt(attempts[1]))["reservation_released_at"] is None
+    assert await second_store.has_unresolved_liability(task_id)
     await second_db.close()

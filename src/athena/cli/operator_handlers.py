@@ -67,7 +67,7 @@ async def cmd_inference_recoveries(o: Any, service: Any) -> int:
                 return 1
             consequences = {
                 "confirmed_failed": "close the attempt, release its reservation, and fail the task",
-                "retry_authorized": "release its reservation and launch one new provider attempt",
+                "retry_authorized": "retain the unknown liability and launch one replacement provider attempt",
                 "confirmed_succeeded": "account the supplied cost, release its reservation, and fail the task because the response is unavailable",
                 "abandoned_with_liability": "fail the task while retaining provider liability for manual closeout",
             }
@@ -81,6 +81,7 @@ async def cmd_inference_recoveries(o: Any, service: Any) -> int:
                 note=note,
                 provider_response_id=o.recovery_provider_response_id,
                 actual_cost=o.recovery_actual_cost,
+                authorized_by=o.recovery_authorized_by,
             )
         except (KeyError, RuntimeError, ValueError) as exc:
             print(f"inference recovery failed: {exc}", file=sys.stderr)
@@ -91,7 +92,7 @@ async def cmd_inference_recoveries(o: Any, service: Any) -> int:
         "athena inference-recoveries: use list, inspect ATTEMPT_ID, "
         "close ATTEMPT_ID --note NOTE, or resolve ATTEMPT_ID "
         "--resolution failed|succeeded|retry|abandon --note NOTE "
-        "[--provider-response-id ID] [--actual-cost COST]",
+        "[--provider-response-id ID] [--actual-cost COST] [--authorized-by OPERATOR]",
         file=sys.stderr,
     )
     return 2

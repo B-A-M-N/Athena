@@ -672,6 +672,15 @@ def _resolve_inference_recovery_handler(service: Any) -> Any:
                 "validation_error",
                 "field 'actual_cost' must be a Decimal-compatible number or string",
             )
+        authorized_by = body.get("authorized_by")
+        if authorized_by is not None and (
+            not isinstance(authorized_by, str) or not authorized_by.strip()
+        ):
+            raise HTTPError(
+                400,
+                "validation_error",
+                "field 'authorized_by' must be a non-empty string or null",
+            )
         try:
             row = await service.resolve_provider_outcome(
                 attempt_id,
@@ -679,6 +688,7 @@ def _resolve_inference_recovery_handler(service: Any) -> Any:
                 note=note,
                 provider_response_id=provider_response_id,
                 actual_cost=actual_cost,
+                authorized_by=authorized_by,
             )
         except KeyError:
             raise HTTPError(404, "inference_attempt_not_found", f"attempt {attempt_id!r} not found")
