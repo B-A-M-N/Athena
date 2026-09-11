@@ -54,18 +54,34 @@ pub(crate) fn draw_status_text(
     if draw_cursor {
         draw_status_cursor(text, geometry, focused, input, 0.0);
     }
-    let footer = format!(
-        "{}  |  ↑↓ SCROLL  ←→ EDIT  CTRL-C CANCEL",
-        human_status(projection)
+    let status = super::super::fit_text_in(
+        text,
+        FontRole::Instrument,
+        human_status(projection),
+        content_width,
     );
-    let footer = super::super::fit_text_in(text, FontRole::Instrument, &footer, content_width);
     text.draw_in(
         FontRole::Instrument,
         prompt_x,
-        prompt_layout.footer_row.baseline as c_int,
-        &footer,
-        SECONDARY,
+        prompt_layout.status_row.baseline as c_int,
+        &status,
+        if focused { PRIMARY } else { SECONDARY },
     );
+    if let Some(hint_row) = prompt_layout.hint_row {
+        let hint = super::super::fit_text_in(
+            text,
+            FontRole::Instrument,
+            "↑↓ SCROLL  ←→ EDIT  CTRL-C CANCEL",
+            content_width,
+        );
+        text.draw_in(
+            FontRole::Instrument,
+            prompt_x,
+            hint_row.baseline as c_int,
+            &hint,
+            SECONDARY,
+        );
+    }
 }
 
 pub(crate) fn draw_status_cursor(

@@ -833,26 +833,37 @@ impl PresentationSurface {
         }
     }
 
-    fn present(&self, width: CUint, height: CUint) {
+    fn present_regions(&self, regions: &[PixelRect]) {
         unsafe {
-            // Finish the GL command stream, wait for it before issuing the
-            // XCopyArea request, then copy the composed pixmap in one server
-            // request.
+            // Finish the GL command stream before issuing XCopyArea requests.
+            // Each request is limited to the domain that changed. In
+            // particular, an animated OI frame must never copy over the
+            // window-owned Xft transcript on the opposite CRT.
             glFinish();
             glXWaitGL();
-            XCopyArea(
-                self.display,
-                self.pixmap,
-                self.window,
-                self.gc,
-                0,
-                0,
-                width.min(self.width),
-                height.min(self.height),
-                0,
-                0,
-            );
-            XFlush(self.display);
+            for region in regions {
+                let x = region.x.max(0.0).round() as c_int;
+                let y = region.y.max(0.0).round() as c_int;
+                let right = region.right().min(self.width as f32).round() as c_int;
+                let bottom = region.bottom().min(self.height as f32).round() as c_int;
+                let copy_width = right.saturating_sub(x) as CUint;
+                let copy_height = bottom.saturating_sub(y) as CUint;
+                if copy_width == 0 || copy_height == 0 {
+                    continue;
+                }
+                XCopyArea(
+                    self.display,
+                    self.pixmap,
+                    self.window,
+                    self.gc,
+                    x,
+                    y,
+                    copy_width,
+                    copy_height,
+                    x,
+                    y,
+                );
+            }
         }
     }
 
@@ -2414,7 +2425,6 @@ fn run_window(
                 projection.advance_animation(ACTIVE_FRAME_INTERVAL.as_secs_f32());
             }
             render::frame::draw_frame(
-                display,
                 width,
                 height,
                 core,
@@ -2441,7 +2451,24 @@ fn run_window(
                     0.0
                 },
             );
-            presentation_surface.present(width as CUint, height as CUint);
+            let geometry = FrameGeometry::for_window(width, height, metrics);
+            let mut present_regions = Vec::with_capacity(2);
+            if dirty {
+                present_regions.push(PixelRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                });
+            } else {
+                if terminal_dirty {
+                    present_regions.push(geometry.operator_inner);
+                }
+                if oi_motion_dirty {
+                    present_regions.push(geometry.oi_inner);
+                }
+            }
+            presentation_surface.present_regions(&present_regions);
             render::frame::draw_text_layer(
                 display,
                 width,

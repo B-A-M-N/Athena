@@ -283,11 +283,12 @@ pub(crate) fn draw_chassis(
         (0.090, 0.093, 0.095),
     );
     material.draw_surface(inset(shell, 10.0 * scale));
-    draw_round_outline(
+    draw_round_outline_radius(
         shell.x,
         shell.y,
         shell.width,
         shell.height,
+        28.0 * scale,
         (0.20, 0.21, 0.21),
     );
 
@@ -300,7 +301,14 @@ pub(crate) fn draw_chassis(
         14.0 * scale,
         GRAPHITE,
     );
-    draw_round_outline(deck.x, deck.y, deck.width, deck.height, (0.11, 0.12, 0.12));
+    draw_round_outline_radius(
+        deck.x,
+        deck.y,
+        deck.width,
+        deck.height,
+        14.0 * scale,
+        (0.11, 0.12, 0.12),
+    );
 
     // The top rail is a small physical nameplate and vent, not a second
     // dashboard. Screen titles live at their CRT apertures below.
@@ -319,11 +327,12 @@ pub(crate) fn draw_chassis(
         4.0 * scale,
         (0.045, 0.050, 0.053),
     );
-    draw_round_outline(
+    draw_round_outline_radius(
         geometry.header.x + 10.0 * scale,
         geometry.header.y + 12.0 * scale,
         94.0 * scale,
         28.0 * scale,
+        4.0 * scale,
         (0.18, 0.22, 0.23),
     );
     for index in 0..8 {
@@ -403,11 +412,12 @@ pub(crate) fn draw_chassis(
         4.0 * scale,
         (0.060, 0.063, 0.065),
     );
-    draw_round_outline(
+    draw_round_outline_radius(
         seam_x - 8.0 * scale,
         seam_y - 14.0 * scale,
         16.0 * scale,
         28.0 * scale,
+        4.0 * scale,
         (0.24, 0.28, 0.28),
     );
     draw_rect(
@@ -433,11 +443,12 @@ pub(crate) fn draw_chassis(
         10.0 * scale,
         (0.068, 0.070, 0.071),
     );
-    draw_round_outline(
+    draw_round_outline_radius(
         geometry.controls.x,
         geometry.controls.y,
         geometry.controls.width,
         geometry.controls.height,
+        10.0 * scale,
         (0.17, 0.18, 0.18),
     );
 
@@ -462,14 +473,6 @@ pub(crate) fn draw_chassis(
         scale,
         (0.048, 0.050, 0.051),
         (0.011, 0.013, 0.014),
-    );
-    let deck_nameplate = inset(geometry.rail.operator_panel, 18.0 * scale);
-    draw_round_outline(
-        deck_nameplate.x,
-        deck_nameplate.y,
-        deck_nameplate.width,
-        deck_nameplate.height,
-        (0.13, 0.17, 0.18),
     );
     draw_recessed_instrument(geometry.prompt, scale, focused);
     draw_rect(
@@ -547,11 +550,12 @@ pub(crate) fn draw_chassis(
         3.0 * scale,
         (0.11, 0.11, 0.11),
     );
-    draw_round_outline(
+    draw_round_outline_radius(
         plate.x,
         plate.y,
         plate.width,
         plate.height,
+        3.0 * scale,
         (0.26, 0.26, 0.26),
     );
     draw_static_labels(geometry, projection);
@@ -566,8 +570,6 @@ fn draw_static_labels(geometry: &FrameGeometry, _projection: &Projection) {
     let instrument_color = super::theme::rgb(SECONDARY);
     let heading_color = super::theme::rgb(PRIMARY);
     let oi_color = (0.62, 0.72, 0.76);
-    let deck_nameplate = inset(geometry.rail.operator_panel, 18.0 * scale);
-
     with_scissor(geometry.height, geometry.header, || {
         let header_y = geometry.header.y + (geometry.header.height - 7.0 * glyph_scale) * 0.5;
         draw_bitmap_text(
@@ -694,17 +696,6 @@ fn draw_static_labels(geometry: &FrameGeometry, _projection: &Projection) {
             2.0,
             instrument_color,
             plate.right() - geometry.u(18.0),
-        );
-    });
-
-    with_scissor(geometry.height, deck_nameplate, || {
-        draw_bitmap_text(
-            deck_nameplate.x + geometry.u(14.0),
-            deck_nameplate.y + deck_nameplate.height * 0.5 - geometry.u(4.0),
-            "ATHENA // CONTROL DECK",
-            (glyph_scale * 0.62).max(2.0),
-            heading_color,
-            deck_nameplate.right() - geometry.u(14.0),
         );
     });
 }
@@ -896,6 +887,76 @@ fn static_glyph(character: char) -> [u8; 7] {
         '-' => [
             0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
         ],
+        ' ' => [0; 7],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110,
+        ],
+        ':' => [
+            0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00110, 0b00000,
+        ],
+        ';' => [
+            0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00100, 0b01000,
+        ],
+        '_' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111,
+        ],
+        '[' => [
+            0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110,
+        ],
+        ']' => [
+            0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110,
+        ],
+        '(' => [
+            0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010,
+        ],
+        ')' => [
+            0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000,
+        ],
+        '{' => [
+            0b00011, 0b00100, 0b00100, 0b11000, 0b00100, 0b00100, 0b00011,
+        ],
+        '}' => [
+            0b11000, 0b00100, 0b00100, 0b00011, 0b00100, 0b00100, 0b11000,
+        ],
+        '>' => [
+            0b10000, 0b01000, 0b00100, 0b00010, 0b00100, 0b01000, 0b10000,
+        ],
+        '<' => [
+            0b00001, 0b00010, 0b00100, 0b01000, 0b00100, 0b00010, 0b00001,
+        ],
+        '=' => [
+            0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000,
+        ],
+        '+' => [
+            0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000,
+        ],
+        '*' => [
+            0b00000, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0b00000,
+        ],
+        '!' => [
+            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
+        ],
+        '?' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100,
+        ],
+        '%' => [
+            0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b01011, 0b10011,
+        ],
+        '#' => [
+            0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0b00000,
+        ],
+        '|' => [
+            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        '\\' => [
+            0b10000, 0b10000, 0b01000, 0b00100, 0b00010, 0b00001, 0b00001,
+        ],
+        '^' => [
+            0b00100, 0b01010, 0b10001, 0b00000, 0b00000, 0b00000, 0b00000,
+        ],
+        'v' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b10001, 0b01010, 0b00100,
+        ],
         _ => [0; 7],
     }
 }
@@ -934,7 +995,14 @@ fn draw_recessed_panel(
             .max(4.0 * scale),
         outer,
     );
-    draw_round_outline(rect.x, rect.y, rect.width, rect.height, (0.17, 0.18, 0.18));
+    draw_round_outline_radius(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        4.0 * scale,
+        (0.17, 0.18, 0.18),
+    );
     let cavity = inset(rect, 8.0 * scale);
     draw_round_rect(
         cavity.x,
@@ -964,7 +1032,14 @@ fn draw_recessed_instrument(rect: PixelRect, scale: f32, focused: bool) {
         5.0 * scale,
         (0.050, 0.052, 0.052),
     );
-    draw_round_outline(rect.x, rect.y, rect.width, rect.height, (0.20, 0.21, 0.21));
+    draw_round_outline_radius(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        2.0 * scale,
+        (0.20, 0.21, 0.21),
+    );
     let cavity = inset(rect, 7.0 * scale);
     draw_round_rect(
         cavity.x,
@@ -1011,11 +1086,12 @@ fn draw_operator_well(geometry: &FrameGeometry, focused: bool, scale: f32) {
         inner.height + 4.0 * scale,
         (0.003, 0.005, 0.006),
     );
-    draw_round_outline(
+    draw_round_outline_radius(
         inner.x,
         inner.y,
         inner.width,
         inner.height,
+        2.0 * scale,
         (0.18, 0.23, 0.23),
     );
     draw_rect(
@@ -1052,11 +1128,12 @@ fn draw_glass_crt_well(geometry: &FrameGeometry, scale: f32) {
         (inner.width.min(inner.height) * 0.075).min(40.0 * scale),
         (0.002, 0.007, 0.009),
     );
-    draw_round_outline(
+    draw_round_outline_radius(
         inner.x - 3.0 * scale,
         inner.y - 3.0 * scale,
         inner.width + 6.0 * scale,
         inner.height + 6.0 * scale,
+        (inner.width.min(inner.height) * 0.09).min(48.0 * scale),
         (0.09, 0.25, 0.26),
     );
 }
@@ -1108,11 +1185,12 @@ fn draw_encoder(rect: PixelRect, scale: f32, value: f32, power: bool) {
             (0.067, 0.070, 0.070)
         },
     );
-    draw_round_outline(
+    draw_round_outline_radius(
         x - size * 0.5,
         y - size * 0.5,
         size,
         size,
+        size * 0.5,
         (0.24, 0.25, 0.25),
     );
     if power {
@@ -1165,7 +1243,7 @@ fn draw_power_button(rect: PixelRect, scale: f32, enabled: bool) {
         (0.006, 0.007, 0.008),
     );
     draw_round_rect(x, y, side, side, 4.0 * scale, (0.038, 0.041, 0.042));
-    draw_round_outline(x, y, side, side, (0.24, 0.25, 0.25));
+    draw_round_outline_radius(x, y, side, side, 4.0 * scale, (0.24, 0.25, 0.25));
     let lamp = if enabled {
         (0.72, 0.90, 0.94)
     } else {

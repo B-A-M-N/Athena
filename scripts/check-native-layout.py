@@ -39,6 +39,12 @@ def main(argv: list[str]) -> int:
         fail("responsive canvas is letterboxed")
     if not math.isclose(canvas["width"], width, abs_tol=0.01) or not math.isclose(canvas["height"], height, abs_tol=0.01):
         fail("responsive canvas does not fill the surface")
+    expected_scale_x = width / DESIGN_WIDTH
+    expected_scale_y = height / DESIGN_HEIGHT
+    if not math.isclose(float(layout["scale_x"]), expected_scale_x, rel_tol=0.0, abs_tol=0.001):
+        fail("responsive width axis does not fill the drawable")
+    if not math.isclose(float(layout["scale_y"]), expected_scale_y, rel_tol=0.0, abs_tol=0.001):
+        fail("responsive height axis does not fill the drawable")
     if layout.get("scale_x", 0.0) <= 0 or layout.get("scale_y", 0.0) <= 0:
         fail("responsive axis scales are missing")
 
@@ -62,29 +68,26 @@ def main(argv: list[str]) -> int:
         fail("operator and OI wells are not equal-width apertures")
     if not math.isclose(layout["operator_inner"]["height"], layout["oi_inner"]["height"], abs_tol=0.01):
         fail("operator and OI inner apertures are not equal-height")
-    # Uniform scaling can letterbox a wide 16:10 request vertically. Compare
-    # the display assembly with the authored instrument height, not the full
-    # request, so the check measures composition rather than empty gutter.
-    authored_height = DESIGN_HEIGHT * scale
-    if layout["operator_outer"]["height"] < authored_height * 0.60:
+    if layout["operator_outer"]["height"] <= layout["controls"]["height"] * 3.0:
         fail("display assembly is no longer dominant")
     if layout["controls"]["height"] > canvas["height"] * 0.18:
         fail("control rail is no longer shallow")
 
+    rail = layout["rail"]
     prompt = layout["prompt_layout"]
     prompt_rect = layout["prompt"]
     if prompt["rect"] != prompt_rect:
         fail("prompt layout and prompt rectangle diverged")
-    if prompt_rect["y"] <= layout["operator_viewport"]["y"]:
-        fail("prompt is not below the operator transcript")
-    if prompt_rect["x"] < layout["operator_inner"]["x"] - 0.01:
-        fail("prompt escapes the operator CRT on the left")
-    if prompt_rect["x"] + prompt_rect["width"] > layout["operator_inner"]["x"] + layout["operator_inner"]["width"] + 0.01:
-        fail("prompt escapes the operator CRT on the right")
-    if prompt_rect["y"] + prompt_rect["height"] > layout["operator_inner"]["y"] + layout["operator_inner"]["height"] + 0.01:
-        fail("prompt escapes the operator CRT on the bottom")
+    if prompt_rect["y"] < layout["controls"]["y"] - 0.01:
+        fail("prompt does not belong to the lower hardware rail")
+    if prompt_rect["x"] < rail["operator_panel"]["x"] - 0.01:
+        fail("prompt escapes the operator instrument module on the left")
+    if prompt_rect["x"] + prompt_rect["width"] > rail["operator_panel"]["x"] + rail["operator_panel"]["width"] + 0.01:
+        fail("prompt escapes the operator instrument module on the right")
+    if prompt_rect["y"] + prompt_rect["height"] > rail["operator_panel"]["y"] + rail["operator_panel"]["height"] + 0.01:
+        fail("prompt escapes the operator instrument module on the bottom")
     previous_bottom = prompt_rect["y"]
-    for name in ("input_row", "footer_row"):
+    for name in ("status_row", "input_row", "hint_row"):
         row = prompt.get(name)
         if row is None:
             continue
@@ -94,7 +97,6 @@ def main(argv: list[str]) -> int:
             fail(f"prompt row escapes prompt bay: {name}")
         previous_bottom = row["top"] + row["height"]
 
-    rail = layout["rail"]
     rail_rect = rail["rail"]
     modules = (
         "speaker",
@@ -136,10 +138,10 @@ def main(argv: list[str]) -> int:
         text_scale = float(layout.get("text_scale", 1.0))
         font_scale = text_scale
         expected_sizes = [
-            max(11, round(16 * font_scale)),
-            max(11, round(16 * font_scale)),
-            max(10, round(14 * font_scale)),
-            max(9, round(12 * font_scale)),
+            max(16, round(16 * font_scale)),
+            max(16, round(16 * font_scale)),
+            max(14, round(14 * font_scale)),
+            max(12, round(12 * font_scale)),
         ]
         if sizes != expected_sizes:
             fail(f"font sizes do not follow cabinet scale: {sizes} != {expected_sizes}")

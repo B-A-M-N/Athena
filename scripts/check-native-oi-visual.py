@@ -48,23 +48,30 @@ def main() -> int:
     if lit_count < 120:
         fail(f"OI phosphor field is nearly empty ({lit_count} lit pixels)")
 
-    # Buddy is staged in the middle/lower world. Count occupied row and column
-    # bands there; a former 14x11 ASCII sprite cannot satisfy these floors.
+    telemetry_lit = sum(lit(x, y) for y in range(40, 165) for x in range(12, 218))
+    if telemetry_lit < 80:
+        fail(f"active telemetry lane is nearly empty ({telemetry_lit} lit pixels)")
+
+    # Buddy is a recognizable actor in the world lane, not the dominant
+    # foreground. Bound its occupancy as well as requiring a real silhouette.
     actor_rows = {
         y
-        for y in range(132, 244)
-        if sum(lit(x, y) for x in range(92, 286)) >= 5
+        for y in range(148, 244)
+        if sum(lit(x, y) for x in range(230, 350)) >= 2
     }
     actor_columns = {
         x
-        for x in range(88, 290)
-        if sum(lit(x, y) for y in range(132, 244)) >= 5
+        for x in range(230, 350)
+        if sum(lit(x, y) for y in range(148, 244)) >= 2
     }
     if len(actor_rows) < 18 or len(actor_columns) < 18:
         fail(
-            "lower-world actor does not have a 28x32-class dot-matrix footprint "
+            "world actor does not have a recognizable bounded matrix footprint "
             f"(rows={len(actor_rows)}, columns={len(actor_columns)})"
         )
+    actor_lit = sum(lit(x, y) for y in range(148, 244) for x in range(230, 350))
+    if actor_lit > 2200:
+        fail(f"world actor occupies too much of the CRT ({actor_lit} lit pixels)")
 
     # No post-process scanline may dominate a row. Foreground remains visible
     # because the CRT modulation is required to be subordinate/background-only.
@@ -122,10 +129,13 @@ def main() -> int:
             "a scanline-like full-width foreground overlay dominates the scene "
             f"(row={max_row}, contiguous_lit={row_bounds[max_row][0]})"
         )
+    dense_rows = sum(length > WIDTH * 0.55 for length, _, _ in row_bounds)
+    if dense_rows > 18:
+        fail(f"CRT treatment is too dense ({dense_rows} high-occupancy rows)")
 
     print(
         "native-oi-visual: PASS — "
-        f"{lit_count} phosphor pixels, actor bands {len(actor_rows)}x{len(actor_columns)}"
+        f"{lit_count} phosphor pixels, telemetry {telemetry_lit}, actor {actor_lit}"
     )
     return 0
 

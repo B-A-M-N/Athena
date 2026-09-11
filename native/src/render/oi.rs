@@ -721,6 +721,12 @@ fn draw_scene_contents(
         }
     }
 
+    // The DAGOAL readout is part of the same 384x256 phosphor composition as
+    // the world. Keeping context and telemetry here prevents a high-resolution
+    // Xft dashboard from fighting the matrix-rendered scene during animation.
+    draw_chrome(projection, mode, &layout, color, safe_area.unobscured_right);
+    draw_operation_telemetry(projection, mode, layout.telemetry, color, phase);
+
     let state = projection
         .buddy
         .as_ref()
@@ -748,15 +754,17 @@ fn draw_crt_treatment(color: (f32, f32, f32), brightness: f32, focus: f32, phase
     // This pass stays in the low-resolution target, so the scanline rhythm is
     // coherent after nearest-neighbour composition instead of becoming a
     // monitor-sized overlay that scales differently at every window size.
-    let flicker = 0.986 + (phase * std::f32::consts::TAU * 1.15).sin() * 0.010;
-    let scanline_strength = (0.032 + (1.0 - focus) * 0.035) * flicker;
+    let flicker = 0.998 + (phase * std::f32::consts::TAU * 1.15).sin() * 0.002;
+    let scanline_strength = (0.010 + (1.0 - focus) * 0.010) * flicker;
     let scanline = (
-        color.0 * scanline_strength,
-        color.1 * scanline_strength,
-        color.2 * scanline_strength,
+        GLASS_BACKGROUND.0 * (1.0 - scanline_strength),
+        GLASS_BACKGROUND.1 * (1.0 - scanline_strength),
+        GLASS_BACKGROUND.2 * (1.0 - scanline_strength),
     );
-    // Fine cathode-ray texture stays subordinate to the matrix dots.
-    for y in (2..SCENE_HEIGHT as i32 - 2).step_by(4) {
+    // Subtractive texture stays subordinate to the matrix dots. At this
+    // logical resolution a four-row stripe becomes an overwhelming physical
+    // band after nearest-neighbour scaling, so keep the rhythm sparse.
+    for y in (4..SCENE_HEIGHT as i32 - 4).step_by(7) {
         draw_rect(2.0, y as f32, SCENE_WIDTH - 4.0, 1.0, scanline);
     }
     // Bulbous tube corner vignetting: corners are darker than edges.
@@ -1913,14 +1921,14 @@ fn draw_packets(edges: &[PacketEdge], phase: f32, color: (f32, f32, f32), revers
         }
         let x = *start_x + (*end_x - *start_x) * t;
         let y = *start_y + (*end_y - *start_y) * t;
-        draw_rect(x - 3.0, y - 3.0, 6.0, 6.0, color);
+        draw_rect(x - 1.0, y - 1.0, 2.0, 2.0, color);
     }
 }
 
 fn buddy_target(projection: &Projection, mode: VisualMode, right: f32) -> (f32, f32) {
     // Buddy stands on the perspective grid near the right half of the scene,
     // mirroring the AthenaBOX / DAGOAL reference composition.
-    let stage_x = (right * if right < 300.0 { 0.54 } else { 0.62 }).clamp(132.0, right - 52.0);
+    let stage_x = (right * 0.70).clamp(242.0, right - 40.0);
     let preferred = match mode {
         VisualMode::Failure => (stage_x, 190.0),
         VisualMode::Approval => (stage_x, 194.0),
@@ -1938,8 +1946,8 @@ fn buddy_target(projection: &Projection, mode: VisualMode, right: f32) -> (f32, 
             .map(|buddy| buddy.anchor.to_ascii_lowercase())
             .as_deref()
         {
-            Some("left") => (132.0, 184.0),
-            Some("center") => (228.0, 184.0),
+            Some("left") => (246.0, 184.0),
+            Some("center") => (270.0, 184.0),
             _ => (stage_x, 190.0),
         },
     };

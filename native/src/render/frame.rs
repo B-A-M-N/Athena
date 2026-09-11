@@ -10,7 +10,6 @@ use super::text::TextRenderer;
 /// Event handling stays in x11.rs; this module owns render ordering and dirty
 /// domain isolation.
 pub(crate) fn draw_frame(
-    display: *mut Display,
     width: i32,
     height: i32,
     core: &NativeTerminalCore,
@@ -79,11 +78,13 @@ pub(crate) fn draw_frame(
                 );
             });
         }
-    } else if dirty.terminal && !options.cabinet_only {
+    }
+    if !dirty.full && dirty.terminal && !options.cabinet_only {
         with_scissor(height, geometry.operator_inner, || {
             draw_terminal_background(core, &geometry, selection);
         });
-    } else if dirty.oi_motion && !options.cabinet_only {
+    }
+    if !dirty.full && dirty.oi_motion && !options.cabinet_only {
         with_crt_mask(height, geometry.oi_inner, stencil_available, || {
             draw_rect(
                 geometry.oi_inner.x,
@@ -109,17 +110,16 @@ pub(crate) fn draw_frame(
         });
     }
 
-    // The hardware cursor is part of the GL cabinet and therefore needs to
-    // be present before the offscreen surface is copied to the window. Xft
-    // text is painted in draw_text_layer after that copy.
+    // The cursor is a GL hardware mark in the offscreen surface. It must be
+    // copied with the cabinet before the window-owned Xft text is painted.
     if dirty.full && !options.cabinet_only {
         text.with_clip(geometry.prompt, || {
             draw_status_cursor(text, &geometry, focused, input_buffer, phase);
         });
     }
+
     unsafe {
         glFlush();
-        XFlush(display);
     }
 }
 
@@ -139,7 +139,7 @@ pub(crate) fn draw_text_layer(
     options: &RendererOptions,
     dirty: DirtyDomains,
 ) {
-    if options.cabinet_only || !(dirty.full || dirty.terminal || dirty.oi_motion) {
+    if options.cabinet_only || !(dirty.full || dirty.terminal) {
         return;
     }
     let metrics = UiFontMetrics {
@@ -149,11 +149,6 @@ pub(crate) fn draw_text_layer(
         instrument: text.metrics_for(FontRole::Instrument),
     };
     let geometry = FrameGeometry::for_window(width, height, metrics);
-    if dirty.full || dirty.oi_motion {
-        text.with_clip(geometry.oi_inner, || {
-            super::oi_overlay::draw_oi_text_overlay(text, geometry.oi_inner, projection);
-        });
-    }
     if dirty.full || dirty.terminal {
         text.with_clip(geometry.operator_viewport, || {
             draw_terminal_text(

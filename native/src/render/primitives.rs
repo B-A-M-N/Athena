@@ -71,9 +71,25 @@ pub(crate) fn draw_round_rect(
 }
 
 pub(crate) fn draw_round_outline(x: f32, y: f32, width: f32, height: f32, color: (f32, f32, f32)) {
-    // CRT apertures need a visible tube radius at physical size; keep other
-    // panels restrained while avoiding a one-pixel rectangle at 1280x800.
-    let radius = (width.min(height) * 0.085).clamp(1.0, 42.0);
+    draw_round_outline_radius(
+        x,
+        y,
+        width,
+        height,
+        (width.min(height) * 0.085).clamp(1.0, 42.0),
+        color,
+    );
+}
+
+pub(crate) fn draw_round_outline_radius(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+    color: (f32, f32, f32),
+) {
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(0.0);
     unsafe {
         glColor3f(color.0, color.1, color.2);
         glLineWidth(1.0);

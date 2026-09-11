@@ -133,10 +133,10 @@ impl TextRenderer {
     fn pixel_sizes(scale: f32) -> [i32; 4] {
         let scale = scale.max(0.1);
         [
-            (16.0 * scale).round().max(11.0) as i32,
-            (16.0 * scale).round().max(11.0) as i32,
-            (14.0 * scale).round().max(10.0) as i32,
-            (12.0 * scale).round().max(9.0) as i32,
+            (16.0 * scale).round().max(16.0) as i32,
+            (16.0 * scale).round().max(16.0) as i32,
+            (14.0 * scale).round().max(14.0) as i32,
+            (12.0 * scale).round().max(12.0) as i32,
         ]
     }
 
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn native_text_sizes_keep_legibility_floor_when_cabinet_shrinks() {
-        assert_eq!(TextRenderer::pixel_sizes(0.7655), [12, 12, 11, 9]);
+        assert_eq!(TextRenderer::pixel_sizes(0.7655), [16, 16, 14, 12]);
         assert_eq!(TextRenderer::pixel_sizes(1.0), [16, 16, 14, 12]);
         assert_eq!(TextRenderer::pixel_sizes(1.10), [18, 18, 15, 13]);
         assert_eq!(TextRenderer::pixel_sizes(1.25), [20, 20, 18, 15]);

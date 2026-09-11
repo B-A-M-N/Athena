@@ -20,7 +20,7 @@ pub(crate) struct SpriteFrame {
 pub(crate) const SPRITE_FRAME_COUNT: usize = 4;
 pub(crate) const SPRITE_WIDTH: f32 = 32.0;
 pub(crate) const SPRITE_HEIGHT: f32 = 40.0;
-pub(crate) const SPRITE_SCALE: f32 = 2.6;
+pub(crate) const SPRITE_SCALE: f32 = 1.8;
 pub(crate) const SPRITE_DIRTY_WIDTH: f32 = SPRITE_WIDTH * SPRITE_SCALE;
 pub(crate) const SPRITE_DIRTY_HEIGHT: f32 = SPRITE_HEIGHT * SPRITE_SCALE;
 
@@ -285,7 +285,7 @@ const fn owl_frame(_source: &[u32; 40], phase: usize) -> [u32; 40] {
                 && !eye_left
                 && !eye_right
                 && !pupils
-                && (row * 11 + column * 7 + phase * 3) % 11 < 2;
+                && (row * 11 + column * 7 + phase * 3) % 11 < 1;
             let body = match row {
                 19 => in_range(column, 10, 21),
                 20 => in_range(column, 8, 23),
@@ -330,11 +330,11 @@ const fn owl_frame(_source: &[u32; 40], phase: usize) -> [u32; 40] {
                 row * row * 3 + column * column * 5 + row * column * 7 + column * 17 + phase * 11;
             let wing_dither = in_range(row, 21, 29)
                 && (in_range(column, 5, 7) || in_range(column, 24, 26))
-                && cell_noise % 17 < 7;
+                && cell_noise % 17 < 3;
             let body_dither = body
                 && !body_outline
                 && !((row == 23 || row == 24) && (column == 12 || column == 19))
-                && cell_noise % 17 < 8;
+                && cell_noise % 17 < 3;
             let tail = in_range(row, 33, 37)
                 && in_range(column, 11, 20)
                 && (row + column + phase) % 3 != 0;

@@ -268,13 +268,15 @@ impl TextRow {
     }
 }
 
-/// The prompt is a compact two-row instrument: editable input first, then a
-/// single status/control footer.
+/// The prompt is a three-row instrument: status, editable input, then a
+/// subordinate control hint. The rows remain metric-derived so the prompt
+/// can contract safely on genuinely small surfaces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 pub struct PromptLayout {
     pub rect: PixelRect,
+    pub status_row: TextRow,
     pub input_row: TextRow,
-    pub footer_row: TextRow,
+    pub hint_row: Option<TextRow>,
 }
 
 /// Physical regions in the lower AthenaBOX instrument rail.
@@ -300,50 +302,61 @@ pub struct RailLayout {
 impl PromptLayout {
     pub fn required_height(
         input: CellMetrics,
-        footer: CellMetrics,
+        status: CellMetrics,
         padding: f32,
         gap: f32,
         bottom_padding: f32,
-        _with_hint: bool,
+        with_hint: bool,
     ) -> f32 {
-        padding + input.height + gap + footer.height + bottom_padding
+        let hint_height = if with_hint { status.height } else { 0.0 };
+        let row_gaps = gap * if with_hint { 2.0 } else { 1.0 };
+        padding + status.height + row_gaps + input.height + hint_height + bottom_padding
     }
 
     pub fn from_rect(
         rect: PixelRect,
         input: CellMetrics,
-        footer: CellMetrics,
+        status: CellMetrics,
         padding: f32,
         gap: f32,
         bottom_padding: f32,
-        _with_hint: bool,
+        with_hint: bool,
     ) -> Self {
         let safe_padding = padding.min((rect.height * 0.5).max(0.0));
         let available = (rect.height - safe_padding - bottom_padding.max(0.0)).max(0.0);
-        let input_top = rect.y + safe_padding;
         let gap = gap.min((available * 0.12).max(0.0));
-        let footer_height = footer.height.min((available * 0.40).max(1.0));
-        let input_height = input.height.min((available - gap - footer_height).max(1.0));
+        let status_height = status.height.min((available * 0.28).max(1.0));
+        let input_height = input.height.min((available * 0.48).max(1.0));
+        let status_row = TextRow {
+            top: rect.y + safe_padding,
+            baseline: rect.y + safe_padding + status.baseline.min(status_height),
+            height: status_height,
+        };
+        let input_top = status_row.bottom() + gap;
         let input_row = TextRow {
             top: input_top,
             baseline: input_top + input.baseline.min(input_height),
             height: input_height,
         };
-        let footer_top = input_row.bottom() + gap;
-        let footer_row = TextRow {
-            top: footer_top,
-            baseline: footer_top + footer.baseline.min(footer_height),
-            height: footer_height,
-        };
+        let hint_top = input_row.bottom() + gap;
+        let hint_height = (rect.bottom() - bottom_padding - hint_top).max(0.0);
+        let hint_row = (with_hint && hint_height >= status.height.min(1.0)).then(|| TextRow {
+            top: hint_top,
+            baseline: hint_top + status.baseline.min(hint_height),
+            height: status.height.min(hint_height),
+        });
         Self {
             rect,
+            status_row,
             input_row,
-            footer_row,
+            hint_row,
         }
     }
 
     pub fn content_bottom(self) -> f32 {
-        self.footer_row.bottom()
+        self.hint_row
+            .map(TextRow::bottom)
+            .unwrap_or_else(|| self.input_row.bottom())
     }
 
     pub fn rows_fit(self, bottom_padding: f32) -> bool {
@@ -426,12 +439,14 @@ impl NativePixelLayout {
         const DESIGN_WIDTH: f32 = 1672.0;
         const DESIGN_HEIGHT: f32 = 941.0;
         let scale = Self::scale_for_window(width, height);
-        // Preserve authored proportions. Extra space becomes a centered
-        // gutter rather than stretching bezels, knobs, or glyph matrices.
-        let scale_x = scale;
-        let scale_y = scale;
-        let offset_x = (width_f - DESIGN_WIDTH * scale).max(0.0) * 0.5;
-        let offset_y = (height_f - DESIGN_HEIGHT * scale).max(0.0) * 0.5;
+        // The authored chassis fills the drawable. Keep the minimum-axis
+        // scale for physical strokes and typography, but let responsive
+        // anchors use each live axis so wide/tall windows do not acquire a
+        // dead outer moat.
+        let scale_x = width_f / DESIGN_WIDTH;
+        let scale_y = height_f / DESIGN_HEIGHT;
+        let offset_x = 0.0;
+        let offset_y = 0.0;
         let canvas = PixelRect {
             x: 0.0,
             y: 0.0,
@@ -452,7 +467,7 @@ impl NativePixelLayout {
         let operator_outer = map(72.0, 132.0, 740.0, 614.0);
         let oi_outer = map(860.0, 132.0, 740.0, 614.0);
         let operator_inner = map(112.0, 182.0, 660.0, 534.0);
-        let operator_viewport = map(128.0, 218.0, 628.0, 340.0);
+        let operator_viewport = map(128.0, 218.0, 628.0, 480.0);
         let oi_inner = map(900.0, 182.0, 660.0, 534.0);
         let controls = map(48.0, 750.0, 1576.0, 142.0);
         let left_x = operator_outer.x;
@@ -464,30 +479,17 @@ impl NativePixelLayout {
         let prompt_padding_y = (if compact { 4.0 } else { 8.0 }) * scale;
         let prompt_gap = (if compact { 2.0 } else { 4.0 }) * scale;
         let prompt_bottom_padding = (if compact { 4.0 } else { 8.0 }) * scale;
-        let prompt_required = PromptLayout::required_height(
-            input_metrics,
-            metrics.instrument,
-            prompt_padding_y,
-            prompt_gap,
-            prompt_bottom_padding,
-            !compact,
-        );
-        let prompt_rect = map(128.0, 580.0, 628.0, 75.0);
-        let prompt = PixelRect {
-            height: prompt_rect
-                .height
-                .max(prompt_required.min(prompt_rect.height)),
-            ..prompt_rect
-        };
+        // The editable prompt is a lower-deck instrument, not content inside
+        // the operator CRT. The operator panel remains wide enough for a
+        // readable input line while the adjacent status module stays clear.
+        let prompt = map(208.0, 770.0, 406.0, 102.0);
         let rail = RailLayout {
             rail: controls,
             speaker: map(48.0, 758.0, 132.0, 126.0),
-            operator_panel: map(196.0, 758.0, 650.0, 126.0),
-            // These legacy rail fields remain serialized for operator tooling,
-            // but the live prompt now belongs to the operator CRT aperture.
-            operator_status: PixelRect::default(),
-            operator_input: PixelRect::default(),
-            operator_hint: None,
+            operator_panel: map(196.0, 758.0, 430.0, 126.0),
+            operator_status: map(210.0, 770.0, 406.0, 18.0),
+            operator_input: map(210.0, 792.0, 406.0, 38.0),
+            operator_hint: Some(map(210.0, 838.0, 406.0, 18.0)),
             system_status: map(638.0, 758.0, 102.0, 126.0),
             primary_encoder: map(748.0, 758.0, 90.0, 126.0),
             brightness: map(870.0, 758.0, 120.0, 126.0),
@@ -593,8 +595,8 @@ mod tests {
         assert_eq!(layout.operator_inner.height, layout.oi_inner.height);
         assert_eq!(layout.rail.rail, layout.controls);
         assert!(layout.rail.speaker.right() <= layout.rail.rail.right());
-        assert!(layout.prompt.y > layout.operator_viewport.y);
-        assert!(layout.prompt.bottom() <= layout.operator_inner.bottom());
+        assert!(layout.prompt.y >= layout.controls.y);
+        assert!(layout.prompt.bottom() <= layout.controls.bottom());
         assert!(layout.rail.system_status.right() <= layout.rail.primary_encoder.x);
         assert!(layout.rail.primary_encoder.right() <= layout.rail.brightness.x);
         assert!(layout.rail.brightness.right() <= layout.rail.focus.x);
@@ -647,7 +649,9 @@ mod tests {
             6.0,
             true,
         );
-        assert!(prompt.input_row.bottom() + 4.0 <= prompt.footer_row.top);
+        assert!(prompt.status_row.bottom() + 4.0 <= prompt.input_row.top);
+        assert!(prompt.hint_row.is_some());
+        assert!(prompt.input_row.bottom() + 4.0 <= prompt.hint_row.unwrap().top);
         assert!(prompt.rows_fit(6.0));
 
         let compact = PromptLayout::from_rect(
