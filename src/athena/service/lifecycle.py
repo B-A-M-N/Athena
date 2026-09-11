@@ -96,12 +96,16 @@ class ServiceLifecycle:
     def __init__(self, service: Any) -> None:
         self._svc = service
 
-    async def start(self) -> None:
+    async def start(self, *, activate_runtime: bool = True) -> None:
         if self._svc._started:
+            if activate_runtime:
+                await self.activate_runtime()
             return
 
         try:
             await self._svc._start_impl()
+            if activate_runtime:
+                await self.activate_runtime()
         except BaseException:
             self._svc._startup_health = {
                 **self._svc._startup_health,
@@ -404,7 +408,10 @@ class ServiceLifecycle:
         dispatcher.set_reality_gate(self._svc._reality_gate)
 
         # 7. TaskManager (needs budgets/cancellations, built a bit later).
-        budgets = BudgetTracker(task_store=tasks)
+        budgets = BudgetTracker(
+            task_store=tasks,
+            reservation_store=self._svc._model_response_store,
+        )
         self._svc._budgets = budgets
         dispatcher.set_budget_tracker(budgets)
         self._svc._artifacts.set_budget_tracker(budgets)
@@ -732,7 +739,6 @@ class ServiceLifecycle:
             loop_interval_seconds=cfg.scheduler_interval_seconds,
         )
         self._svc._scheduler = scheduler
-        events.subscribe(scheduler.notify_event, exclude_event_types=FAST_EVENT_TYPES)
         schedule_api = ScheduleAPI(scheduler, task_manager)
         self._svc._schedule_api = schedule_api
         registry.register(ScheduleCapability(schedule_api))
@@ -939,7 +945,6 @@ class ServiceLifecycle:
             try:
                 activated = await self._svc._pack_manager.rehydrate_enabled()
                 await self._svc._pack_manager.replay_hook_outbox()
-                await self._svc._pack_manager.start_hook_dispatcher()
                 failures = self._svc._pack_manager.rehydration_failures()
                 unavailable = {str(item["pack_id"]) for item in failures}
                 quarantined = await self._svc._quarantine_tasks_for_packs(
@@ -984,8 +989,41 @@ class ServiceLifecycle:
             **intake_recovery,
         }
 
-        # 14. Worker + scheduler. Packs and any dependent resumable tasks are
-        # settled before a worker can claim fresh work.
+        # Initialization ends here. The worker, scheduler loop, and watch
+        # poller are runtime producers and are deliberately activated by
+        # ``activate_runtime``. This lets control-plane commands inspect and
+        # mutate durable state without consuming queued work or firing due
+        # schedules as a side effect of startup.
+        self._svc._started = True
+        self._svc._runtime_active = False
+        self._set_startup_health()
+
+    async def activate_runtime(self) -> None:
+        """Start background producers after the service graph is initialized."""
+        if not self._svc._started:
+            await self.start(activate_runtime=True)
+            return
+        if self._svc._runtime_active:
+            return
+        task_manager = self._svc._task_manager
+        kernel = self._svc._kernel
+        scheduler = self._svc._scheduler
+        if task_manager is None or kernel is None or scheduler is None:
+            raise RuntimeError("AthenaService runtime cannot activate before initialization")
+        cfg = self._svc.config
+
+        # These supervisors are ambient producers. Keep them out of passive
+        # control-plane startup and start them only for a live service.
+        await self._svc.start_mcp_supervisor()
+        if self._svc._pack_manager is not None:
+            await self._svc._pack_manager.start_hook_dispatcher()
+        events = self._svc._store_events
+        if events is not None and not self._svc._scheduler_event_subscribed:
+            events.subscribe(scheduler.notify_event, exclude_event_types=FAST_EVENT_TYPES)
+            self._svc._scheduler_event_subscribed = True
+
+        # Packs and any dependent resumable tasks are settled before a worker
+        # can claim fresh work.
         worker = TaskWorker(
             task_manager=task_manager,
             kernel=kernel,
@@ -1005,7 +1043,10 @@ class ServiceLifecycle:
         # routing, recovery, packs, and MCP integrations are ready. A watcher
         # must never publish events into a half-constructed service.
         self._svc._watch_poll_task = asyncio.create_task(self._svc._poll_watches())
-        self._svc._started = True
+        self._svc._runtime_active = True
+        self._set_startup_health()
+
+    def _set_startup_health(self) -> None:
         degraded = any(
             value.get("status") != "ok"
             for value in self._svc._startup_health["checks"].values()
@@ -1052,8 +1093,9 @@ class ServiceLifecycle:
                 await self._svc._scheduler.stop()
             except Exception as exc:
                 _logger.warning("scheduler stop failed: %s", exc)
-            if self._svc._store_events is not None:
+            if self._svc._store_events is not None and self._svc._scheduler_event_subscribed:
                 self._svc._store_events.unsubscribe(self._svc._scheduler.notify_event)
+                self._svc._scheduler_event_subscribed = False
             self._svc._scheduler = None
 
         if self._svc._store_events is not None and self._svc._synthesis_event_observer is not None:
@@ -1244,6 +1286,8 @@ class ServiceLifecycle:
         self._svc._capability_health = None
         self._svc._synthesis = None
         self._svc._world_states = {}
+        self._svc._worker = None
+        self._svc._runtime_active = False
         self._svc._started = False
 
 

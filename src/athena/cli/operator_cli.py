@@ -506,6 +506,7 @@ def register_operator_commands(
     @click.option("--note", required=True, help="Operator evidence and reconciliation note.")
     @click.option("--provider-response-id", default=None)
     @click.option("--actual-cost", default=None, help="Finite non-negative provider cost in USD.")
+    @click.option("--authorized-by", default=None, help="Operator authorizing a retry.")
     @click.pass_context
     def inference_resolve(
         ctx: Any,
@@ -514,6 +515,7 @@ def register_operator_commands(
         note: str,
         provider_response_id: str | None,
         actual_cost: str | None,
+        authorized_by: str | None,
     ) -> None:
         """Record a provider disposition and apply its documented effects."""
         invoke(
@@ -524,6 +526,7 @@ def register_operator_commands(
             recovery_note=note,
             recovery_provider_response_id=provider_response_id,
             recovery_actual_cost=actual_cost,
+            recovery_authorized_by=authorized_by,
         )
 
     @inference_recoveries.command("close-liability")
@@ -531,7 +534,7 @@ def register_operator_commands(
     @click.option("--note", required=True, help="Reason for closing the retained liability.")
     @click.pass_context
     def inference_close(ctx: Any, attempt_id: str, note: str) -> None:
-        """Close an abandoned provider liability with an operator note."""
+        """Close an unresolved provider liability with an operator note."""
         invoke(ctx, "inference-recoveries", ("close-liability", attempt_id), recovery_note=note)
 
     inference_recoveries.add_command(inference_close, "close")
@@ -901,6 +904,7 @@ def register_argparse_commands(sub: Any, globals_: Callable[[Any], None], argpar
     recovery_resolve.add_argument("--note", required=True)
     recovery_resolve.add_argument("--provider-response-id", default=None)
     recovery_resolve.add_argument("--actual-cost", default=None)
+    recovery_resolve.add_argument("--authorized-by", default=None)
     recovery_close = recovery_sub.add_parser(
         "close-liability", aliases=["close"], help="Close retained provider liability."
     )
@@ -1037,6 +1041,7 @@ def apply_argparse_operator_options(ns: Any, command: str, options: Any) -> None
             options.recovery_note = ns.note
             options.recovery_provider_response_id = ns.provider_response_id
             options.recovery_actual_cost = ns.actual_cost
+            options.recovery_authorized_by = ns.authorized_by
         elif action in {"close", "close-liability"}:
             options.args = [action, ns.attempt_id]
             options.recovery_note = ns.note

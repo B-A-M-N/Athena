@@ -184,6 +184,12 @@ class ContextRef:
     source_id: str | None = None
     summary: str | None = None
     mime_type: str | None = None
+    # Preserve attachment provenance after the request envelope is gone.
+    hash: str | None = None
+    size: int | None = None
+    storage_path: str | None = None
+    producer: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

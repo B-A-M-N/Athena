@@ -589,57 +589,6 @@ def _doctor_native(o: "Options", config: Any) -> int:
     return 0 if preflight.ok and binary_ok else 1
 
 
-def _doctor_startup(o: "Options", config: Any) -> int:
-    """Start the service briefly and report readiness-owned checks."""
-    try:
-        service = build_service(config)
-    except ServiceUnavailable as exc:
-        print(f"startup health: failed ({exc})")
-        return 1
-
-    async def probe() -> dict[str, Any]:
-        try:
-            await service.start()
-            health = service.startup_health()
-            health["operational_matrix"] = service.operational_matrix()
-            return health
-        finally:
-            await service.stop()
-
-    try:
-        health = asyncio.run(probe())
-    except Exception as exc:  # pragma: no cover - environment-specific startup failure
-        print(f"startup health: failed ({exc})")
-        return 1
-    print(f"startup health: {health.get('status', 'unknown')}")
-    for name, check in (health.get("checks") or {}).items():
-        status = check.get("status", "unknown") if isinstance(check, dict) else "unknown"
-        print(f"  {name}: {status}")
-    matrix = health.get("operational_matrix") or {}
-    for cell in matrix.get("execution") or ():
-        print(
-            "  execution/{backend}/{runtime}: available={available} persistent={persistent} "
-            "state={state} reattach={reattach} deps={deps}".format(
-                backend=cell.get("backend"),
-                runtime=cell.get("runtime"),
-                available="yes" if cell.get("available") else "no",
-                persistent="yes" if cell.get("persistent_session") else "no",
-                state="yes" if cell.get("persistent_runtime_state") else "no",
-                reattach="yes" if cell.get("reattach") else "no",
-                deps=",".join(cell.get("dependency_installation") or ()) or "none",
-            )
-        )
-    mcp = matrix.get("mcp") or {}
-    if isinstance(mcp, dict):
-        for name, status in sorted(mcp.items()):
-            state = status.get("state", "unknown") if isinstance(status, dict) else "unknown"
-            print(f"  mcp/{name}: {state}")
-    memory = matrix.get("memory") or {}
-    if isinstance(memory, dict):
-        print(f"  semantic-memory: {memory.get('state', 'unknown')}")
-    return 0 if health.get("status") == "ok" else 1
-
-
 class ServiceUnavailable(Exception):
     pass
 
@@ -720,6 +669,16 @@ class Options:
     recovery_resolution: str | None = None
     recovery_provider_response_id: str | None = None
     recovery_actual_cost: str | None = None
+    recovery_authorized_by: str | None = None
+
+
+def _cli_runtime_mode(options: Options) -> bool:
+    """Return whether a CLI command needs background execution producers."""
+    if options.command in {"chat", "run", "resume", "acp", "oi-stream"}:
+        return True
+    # ``self status`` and ``self continue`` are operator reads/mutations. They
+    # must not start the worker or scheduler as an incidental side effect.
+    return options.command == "self" and options.self_action not in {"status", "continue"}
 
 
 def dispatch(o: Options) -> int:
@@ -755,7 +714,9 @@ def dispatch(o: Options) -> int:
     if o.command == "doctor":
         target = o.args[0] if o.args else "startup"
         if target == "startup":
-            return _doctor_startup(o, config)
+            from athena.execution.sandbox_doctor import doctor_startup
+
+            return doctor_startup(o, config)
         if target == "native":
             return _doctor_native(o, config)
         if target != "display":
@@ -779,7 +740,7 @@ def dispatch(o: Options) -> int:
         try:
             start = getattr(service, "start", None)
             if start is not None:
-                await start()
+                await start(activate_runtime=_cli_runtime_mode(o))
             return await _run(o, service)
         finally:
             stop = getattr(service, "stop", None)
@@ -2375,6 +2336,7 @@ def _arg_parse(argv: list[str]) -> Options:
         recovery_resolution=getattr(ns, "recovery_resolution", None),
         recovery_provider_response_id=getattr(ns, "recovery_provider_response_id", None),
         recovery_actual_cost=getattr(ns, "recovery_actual_cost", None),
+        recovery_authorized_by=getattr(ns, "recovery_authorized_by", None),
     )
     if command == "doctor":
         o.args = [ns.target]

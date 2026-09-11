@@ -167,6 +167,12 @@ class TaskAPI:
             # Scheduler reconciliation owns occurrence claims and must finish
             # its task/claim transition before generic intake can enqueue it.
             return
+        if metadata.get("_intake_owner") == "self_host" or metadata.get("_athena_self_host"):
+            reconciler = getattr(
+                getattr(self._svc, "_self_host", None), "reconcile_created_task", None
+            )
+            if not callable(reconciler) or not await reconciler(task):
+                return
         try:
             await self._svc._record_canonical_user_turn(user_request or task, task)
             await self._mark_intake_phase(task.id, "canonical_user_turn_persisted")
@@ -189,11 +195,30 @@ class TaskAPI:
         """Repair ordinary CREATED tasks before workers begin claiming work."""
         manager = self._svc._require_task_manager()
         rows = await manager.list_by_status(TaskStatus.CREATED)
+        self_host_recovered = 0
+        self_host_quarantined = 0
+        # Self-host recovery owns the mission/task safety boundary and must
+        # run before the generic canonical-turn repair below.
+        for task in rows:
+            metadata = dict(task.metadata or {})
+            if metadata.get("_intake_owner") != "self_host" and not metadata.get(
+                "_athena_self_host"
+            ):
+                continue
+            reconciler = getattr(
+                getattr(self._svc, "_self_host", None), "reconcile_created_task", None
+            )
+            if callable(reconciler) and await reconciler(task):
+                self_host_recovered += 1
+            else:
+                self_host_quarantined += 1
         recovered = 0
         quarantined = 0
         skipped = 0
         for task in rows:
             metadata = dict(task.metadata or {})
+            if metadata.get("_intake_owner") == "self_host" or metadata.get("_athena_self_host"):
+                continue
             if metadata.get("_intake_owner") == "scheduler" or metadata.get("_occurrence"):
                 skipped += 1
                 continue
@@ -203,7 +228,12 @@ class TaskAPI:
                 quarantined += 1
                 continue
             recovered += 1
-        return {"recovered": recovered, "quarantined": quarantined, "skipped": skipped}
+        result = {"recovered": recovered, "quarantined": quarantined, "skipped": skipped}
+        if self_host_recovered:
+            result["self_host_recovered"] = self_host_recovered
+        if self_host_quarantined:
+            result["self_host_quarantined"] = self_host_quarantined
+        return result
 
     # ------------------------------------------------------------------ #
     # Observation

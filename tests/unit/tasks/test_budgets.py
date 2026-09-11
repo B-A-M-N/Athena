@@ -251,6 +251,35 @@ async def test_simultaneous_model_reservations_share_root_ceiling():
     assert (await tracker.remaining("root"))["cost_usd"] == Decimal("0.40")
 
 
+async def test_model_reservation_release_is_idempotent_by_reservation_id():
+    task = _task("task", budget=ResourceBudget(max_cost_usd=Decimal("5.00")))
+    tracker = BudgetTracker(task_store=_TreeStore([task]))
+    tracker.register(task)
+
+    await tracker.reserve_model_cost(task.id, Decimal("1.00"), reservation_id="attempt-a")
+    await tracker.reserve_model_cost(task.id, Decimal("2.00"), reservation_id="attempt-b")
+    assert (await tracker.remaining(task.id))["cost_usd"] == Decimal("2.00")
+
+    await tracker.release_model_cost(task.id, Decimal("999.00"), reservation_id="attempt-a")
+    assert (await tracker.remaining(task.id))["cost_usd"] == Decimal("3.00")
+    await tracker.release_model_cost(task.id, Decimal("1.00"), reservation_id="attempt-a")
+    assert (await tracker.remaining(task.id))["cost_usd"] == Decimal("3.00")
+
+    await tracker.release_model_cost(task.id, reservation_id="attempt-b")
+    assert (await tracker.remaining(task.id))["cost_usd"] == Decimal("5.00")
+
+
+async def test_model_reservation_id_replay_cannot_change_amount():
+    task = _task("task", budget=ResourceBudget(max_cost_usd=Decimal("5.00")))
+    tracker = BudgetTracker(task_store=_TreeStore([task]))
+    tracker.register(task)
+
+    await tracker.reserve_model_cost(task.id, Decimal("1.00"), reservation_id="attempt-a")
+    with pytest.raises(ValueError, match="replayed with a different amount"):
+        await tracker.reserve_model_cost(task.id, Decimal("2.00"), reservation_id="attempt-a")
+    assert (await tracker.remaining(task.id))["cost_usd"] == Decimal("4.00")
+
+
 async def test_model_reservation_survives_restart_as_reservation_not_spend():
     root = _task("root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))
     child = _task("child", parent="root", budget=ResourceBudget(max_cost_usd=Decimal("1.00")))

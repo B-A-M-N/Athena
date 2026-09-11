@@ -74,3 +74,4 @@ ui-reference/
 .release-evidence/
 .release-toolchain/
 native-desktop-acceptance.json
+.artifacts/

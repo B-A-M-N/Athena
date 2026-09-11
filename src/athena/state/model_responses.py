@@ -98,7 +98,8 @@ class ModelResponseStore:
             status = str(existing.get("status") or "PENDING")
             if status == "FAILED":
                 current_attempt = await db.fetch_one_raw(
-                    "SELECT status, provider_outcome_status FROM model_response_attempts "
+                    "SELECT status, provider_outcome_status, retry_authorized_at "
+                    "FROM model_response_attempts "
                     "WHERE attempt_id = ?",
                     (existing.get("attempt_id"),),
                 )
@@ -106,15 +107,17 @@ class ModelResponseStore:
                 current_outcome = str(
                     (current_attempt or {}).get("provider_outcome_status") or ""
                 ).lower()
+                retry_authorized_at = (current_attempt or {}).get("retry_authorized_at")
                 if (
                     current_attempt_status == "ABANDONED"
                     or current_outcome == "confirmed_succeeded"
                 ):
                     return dict(existing)
-                if current_attempt_status == "UNKNOWN" and current_outcome != "retry_authorized":
+                if current_attempt_status == "UNKNOWN" and not retry_authorized_at:
                     return dict(existing)
                 if current_attempt_status not in {"UNKNOWN", "ABANDONED"}:
                     await self._archive_attempt(existing, db=db)
+                previous_attempt_id = str(existing.get("attempt_id") or "")
                 attempt_id = new_id("inference")
                 created_at = utcnow().isoformat()
                 await db.execute_raw(
@@ -127,8 +130,9 @@ class ModelResponseStore:
                     "reservation_released_at = NULL, budget_accounted_at = NULL, "
                     "provider_usage_started_at = NULL, provider_usage_completed_at = NULL, "
                     "provider_outcome_status = 'pending', provider_response_id = NULL, "
-                    "idempotency_key = ?, provider_outcome_unknown_at = NULL WHERE task_id = ? "
-                    "AND request_fingerprint = ?",
+                    "idempotency_key = ?, provider_outcome_unknown_at = NULL, "
+                    "retry_authorized_at = NULL, retry_authorized_by = NULL, "
+                    "replacement_attempt_id = NULL WHERE task_id = ? AND request_fingerprint = ?",
                     (
                         request_id,
                         attempt_id,
@@ -157,6 +161,12 @@ class ModelResponseStore:
                         created_at,
                     ),
                 )
+                if retry_authorized_at and previous_attempt_id:
+                    await db.execute_raw(
+                        "UPDATE model_response_attempts SET replacement_attempt_id = ? "
+                        "WHERE attempt_id = ? AND replacement_attempt_id IS NULL",
+                        (attempt_id, previous_attempt_id),
+                    )
                 existing = await db.fetch_one_raw(
                     "SELECT * FROM model_response_receipts "
                     "WHERE task_id = ? AND request_fingerprint = ?",
@@ -241,8 +251,9 @@ class ModelResponseStore:
             "reservation_amount, reservation_applied_at, provider_usage_id, "
             "provider_outcome_status, created_at, completed_at, actual_input_tokens, "
             "actual_output_tokens, actual_cost, response_committed_at, accounting_applied_at, idempotency_key, "
-            "idempotency_semantics, provider_outcome_note, provider_outcome_resolved_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "idempotency_semantics, provider_outcome_note, provider_outcome_resolved_at, "
+            "retry_authorized_at, retry_authorized_by, replacement_attempt_id"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 row["attempt_id"],
                 row["task_id"],
@@ -266,6 +277,9 @@ class ModelResponseStore:
                 row.get("idempotency_semantics") or idempotency_semantics,
                 row.get("provider_outcome_note"),
                 row.get("provider_outcome_resolved_at"),
+                row.get("retry_authorized_at"),
+                row.get("retry_authorized_by"),
+                row.get("replacement_attempt_id"),
             ),
         )
 
@@ -520,6 +534,30 @@ class ModelResponseStore:
         )
         return [dict(row) for row in rows]
 
+    async def reservation_amounts(
+        self, task_id: str, reservation_ids: set[str]
+    ) -> dict[str, Decimal]:
+        """Recover exact reservation amounts for legacy budget checkpoints."""
+        ids = tuple(sorted(str(value) for value in reservation_ids if value))
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        rows = await self._db.fetch_all(
+            "SELECT attempt_id, reservation_amount FROM model_response_attempts "
+            f"WHERE task_id = ? AND attempt_id IN ({placeholders}) "
+            "AND reservation_amount IS NOT NULL AND reservation_released_at IS NULL",
+            (task_id, *ids),
+        )
+        amounts: dict[str, Decimal] = {}
+        for row in rows:
+            try:
+                amount = Decimal(str(row.get("reservation_amount")))
+            except (TypeError, InvalidOperation):
+                continue
+            if amount > 0:
+                amounts[str(row["attempt_id"])] = amount
+        return amounts
+
     async def mark_attempt_reservation_released(self, attempt_id: str) -> bool:
         return await self.mark_reservation_released(attempt_id=attempt_id)
 
@@ -552,8 +590,14 @@ class ModelResponseStore:
         note: str,
         provider_response_id: str | None = None,
         actual_cost: Decimal | str | None = None,
+        authorized_by: str | None = None,
     ) -> dict[str, Any]:
-        """Apply an operator/provider reconciliation decision exactly once."""
+        """Apply an operator/provider reconciliation decision exactly once.
+
+        Retry authorization is deliberately an action over an unknown outcome;
+        it does not convert that outcome into a successful or failed provider
+        result and it does not release the original reservation.
+        """
         resolution = str(resolution).strip().lower()
         allowed = {
             "confirmed_succeeded",
@@ -563,6 +607,10 @@ class ModelResponseStore:
         }
         if resolution not in allowed:
             raise ValueError(f"unsupported provider outcome resolution: {resolution}")
+        if resolution == "retry_authorized":
+            authorized_by = str(authorized_by or "operator").strip()
+            if not authorized_by:
+                raise ValueError("retry authorization requires an operator identity")
         normalized_cost = _validated_actual_cost(actual_cost)
         timestamp = utcnow().isoformat()
         terminal_status = {
@@ -583,20 +631,32 @@ class ModelResponseStore:
                 raise ValueError(
                     f"attempt {attempt_id} is not awaiting reconciliation: {current_outcome or 'unset'}"
                 )
+            if resolution == "retry_authorized" and current.get("retry_authorized_at"):
+                raise ValueError(f"attempt {attempt_id} already has retry authorization")
+            outcome_status = "unknown" if resolution == "retry_authorized" else resolution
+            attempt_status = "UNKNOWN" if resolution == "retry_authorized" else terminal_status
             await db.execute_raw(
                 "UPDATE model_response_attempts SET status = ?, provider_outcome_status = ?, "
                 "provider_outcome_note = ?, provider_outcome_resolved_at = ?, "
                 "provider_response_id = COALESCE(?, provider_response_id), "
                 "actual_cost = COALESCE(?, actual_cost), completed_at = "
-                "COALESCE(completed_at, ?) WHERE attempt_id = ?",
+                "COALESCE(completed_at, ?), retry_authorized_at = CASE "
+                "WHEN ? = 'retry_authorized' THEN COALESCE(retry_authorized_at, ?) "
+                "ELSE retry_authorized_at END, retry_authorized_by = CASE "
+                "WHEN ? = 'retry_authorized' THEN COALESCE(retry_authorized_by, ?) "
+                "ELSE retry_authorized_by END WHERE attempt_id = ?",
                 (
-                    terminal_status,
-                    resolution,
+                    attempt_status,
+                    outcome_status,
                     note,
                     timestamp,
                     provider_response_id,
                     str(normalized_cost) if normalized_cost is not None else None,
                     timestamp,
+                    resolution,
+                    timestamp,
+                    resolution,
+                    authorized_by,
                     attempt_id,
                 ),
             )
@@ -606,14 +666,22 @@ class ModelResponseStore:
                 "provider_response_id = COALESCE(?, provider_response_id), "
                 "actual_cost = COALESCE(?, actual_cost), "
                 "provider_outcome_unknown_at = COALESCE(provider_outcome_unknown_at, ?), "
-                "completed_at = COALESCE(completed_at, ?) WHERE attempt_id = ?",
+                "completed_at = COALESCE(completed_at, ?), retry_authorized_at = CASE "
+                "WHEN ? = 'retry_authorized' THEN COALESCE(retry_authorized_at, ?) "
+                "ELSE retry_authorized_at END, retry_authorized_by = CASE "
+                "WHEN ? = 'retry_authorized' THEN COALESCE(retry_authorized_by, ?) "
+                "ELSE retry_authorized_by END WHERE attempt_id = ?",
                 (
                     "FAILED",
-                    resolution,
+                    outcome_status,
                     provider_response_id,
                     str(normalized_cost) if normalized_cost is not None else None,
                     timestamp,
                     timestamp,
+                    resolution,
+                    timestamp,
+                    resolution,
+                    authorized_by,
                     attempt_id,
                 ),
             )
@@ -644,7 +712,7 @@ class ModelResponseStore:
         return [dict(row) for row in rows]
 
     async def close_provider_liability(self, *, attempt_id: str, note: str) -> dict[str, Any]:
-        """Record operator closeout of an abandoned provider liability."""
+        """Record explicit operator closeout of an unresolved provider liability."""
         note = str(note).strip()
         if not note:
             raise ValueError("provider liability closeout requires a non-empty note")
@@ -656,10 +724,11 @@ class ModelResponseStore:
             )
             if current is None:
                 raise KeyError(f"unknown inference attempt: {attempt_id}")
-            if str(current.get("provider_outcome_status") or "").lower() != (
-                "abandoned_with_liability"
-            ):
-                raise ValueError("only abandoned provider liabilities can be manually closed")
+            if str(current.get("provider_outcome_status") or "").lower() not in {
+                "unknown",
+                "abandoned_with_liability",
+            }:
+                raise ValueError("only unresolved provider liabilities can be manually closed")
             close_note = f"liability closed at {timestamp}: {note}"
             await db.execute_raw(
                 "UPDATE model_response_attempts SET reservation_released_at = "
@@ -690,9 +759,12 @@ class ModelResponseStore:
     async def list_resolved_attempts(self) -> list[dict[str, Any]]:
         """Return durable dispositions that still need task-side replay."""
         rows = await self._db.fetch_all(
-            "SELECT * FROM model_response_attempts WHERE provider_outcome_status IN "
-            "('confirmed_failed', 'retry_authorized', 'confirmed_succeeded', "
-            "'abandoned_with_liability') ORDER BY provider_outcome_resolved_at ASC"
+            "SELECT * FROM model_response_attempts WHERE "
+            "(provider_outcome_status = 'unknown' AND retry_authorized_at IS NOT NULL "
+            "AND reservation_released_at IS NULL) "
+            "OR provider_outcome_status IN "
+            "('confirmed_failed', 'confirmed_succeeded', 'abandoned_with_liability') "
+            "ORDER BY COALESCE(provider_outcome_resolved_at, retry_authorized_at, created_at) ASC"
         )
         return [dict(row) for row in rows]
 

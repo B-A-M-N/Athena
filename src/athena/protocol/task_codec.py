@@ -381,6 +381,11 @@ def encode_context_refs(refs: tuple[ContextRef, ...] | None) -> str:
                 "source_id": ref.source_id,
                 "summary": ref.summary,
                 "mime_type": ref.mime_type,
+                "hash": ref.hash,
+                "size": ref.size,
+                "storage_path": ref.storage_path,
+                "producer": ref.producer,
+                "metadata": dict(ref.metadata),
             }
             for ref in (refs or ())
         ],
@@ -400,6 +405,11 @@ def decode_context_refs(raw: Any) -> tuple[ContextRef, ...]:
                 source_id=item.get("source_id"),
                 summary=item.get("summary"),
                 mime_type=item.get("mime_type"),
+                hash=item.get("hash"),
+                size=item.get("size"),
+                storage_path=item.get("storage_path"),
+                producer=item.get("producer"),
+                metadata=dict(item.get("metadata") or {}),
             )
         )
     return tuple(result)
