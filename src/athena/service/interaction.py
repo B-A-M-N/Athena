@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 from athena.kernel.continuations import ContinuationStore
 from athena.protocol.policy import ApprovalScope, Principal
-from athena.protocol.tasks import AgentRequest, TaskSpec, TaskStatus
+from athena.protocol.tasks import AgentRequest, FINAL_STATUSES, TaskSpec, TaskStatus
 from athena.service.config import AthenaConfig
 from athena.state.approvals import ApprovalStore
 
@@ -497,8 +497,28 @@ class OperatorInteractionService:
         if status == "RUNNING":
             # Already claimed by a live worker.
             return await self._svc.get_task(task_id)
-        if status in ("COMPLETE", "FAILED", "CANCELLED"):
+        if status in {item.value for item in FINAL_STATUSES}:
             raise ValueError(f"task {task_id} is terminal ({status}); cannot resume")
-        # INTERRUPTED (and QUEUED re-queue): hand back to the worker pool.
-        await self._svc._task_manager.enqueue(task_id)
+        if status not in {TaskStatus.INTERRUPTED.value, TaskStatus.QUEUED.value}:
+            actions = {
+                TaskStatus.CREATED.value: "retry task intake or wait for startup intake recovery",
+                TaskStatus.WAITING_APPROVAL.value: "resolve the pending approval",
+                TaskStatus.WAITING_INPUT.value: "provide the pending input",
+                TaskStatus.BLOCKED.value: "resolve the blocking condition before resuming",
+                TaskStatus.RECOVERY_REQUIRED.value: "use the task-specific recovery operation",
+            }
+            action = actions.get(status, "inspect the task's recovery state")
+            raise ValueError(f"task {task_id} is {status}; {action}")
+        # INTERRUPTED -> QUEUED and QUEUED -> QUEUED are the only paused
+        # states this generic operation owns. Provider/resource recovery has
+        # separate explicit operations and must not depend on this method.
+        if status == TaskStatus.INTERRUPTED.value:
+            await self._svc._task_manager.enqueue(task_id)
+        elif status == TaskStatus.QUEUED.value:
+            # A queued task is already eligible; wake the worker if present.
+            callback = getattr(self._svc._task_manager, "_wakeup_callback", None)
+            if callable(callback):
+                outcome = callback()
+                if hasattr(outcome, "__await__"):
+                    await outcome
         return await self._svc.get_task(task_id)

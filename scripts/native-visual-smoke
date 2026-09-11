@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
 
 unavailable() {
   if [[ "${ATHENA_RELEASE_GATE:-0}" == "1" ]]; then
@@ -38,7 +39,7 @@ manifest_path="$golden_dir/manifest.json"
   printf 'native-visual-smoke: FAIL — missing visual golden manifest %s\n' "$manifest_path" >&2
   exit 1
 }
-MANIFEST_PATH="$manifest_path" UPDATE_GOLDENS="$update_goldens" python3 -c '
+MANIFEST_PATH="$manifest_path" UPDATE_GOLDENS="$update_goldens" "$system_python" -c '
 import json
 import os
 from pathlib import Path
@@ -66,7 +67,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 # native process emits the same rectangle model used by its renderer, so this
 # catches aperture drift and prompt/rail overlap independently of OCR.
 layout_json="$("$native_bin" --dump-layout)"
-LAYOUT_JSON="$layout_json" python3 -c '
+LAYOUT_JSON="$layout_json" "$system_python" -c '
 import json
 import os
 
@@ -120,18 +121,20 @@ done
 
 projection='{"schema_version":3,"title":"ATHENA // VISUAL SMOKE","status":"SEARCHING","semantic_state":"search","oi":["SYMBOL GRAPH // FIXED CLOCK"],"current_action":{"kind":"search","label":"workspace","target":"workspace","query":"workspace"},"active_operation":{"id":"op-01","label":"inspect workspace","target":"workspace","state":"running","action_kind":"search","mutation_state":"read-only"},"model_request":{"provider":"local","model":"athena-model","status":"active"},"workspace_tree":[{"id":"workspace","kind":"workspace","label":"/workspace","status":"ready","children":[{"id":"src","kind":"directory","label":"src/athena","status":"ready"},{"id":"native","kind":"file","label":"native.rs","status":"reading"},{"id":"tests","kind":"directory","label":"tests","status":"ready"}]}],"runtime_tree":[{"id":"inspect","kind":"task","label":"inspect workspace","status":"running","children":[{"id":"read","kind":"execution","label":"read native.rs","status":"active"}]}],"entities":[{"id":"root","kind":"operation","label":"workspace","status":"active"},{"id":"child","kind":"task","label":"native.rs","status":"active","parent_id":"root"}],"attention_items":[],"buddy":{"state":"SEARCH","anchor":"right","status":"active","character":"owl"},"trace":["> SEARCH · workspace"],"view":{"mode":"search"}}'
 
-PROJECTION="$projection" NATIVE_BIN="$native_bin" TMP_DIR="$tmp_dir" \
+  PROJECTION="$projection" NATIVE_BIN="$native_bin" TMP_DIR="$tmp_dir" \
   GOLDEN_DIR="$golden_dir" UPDATE_GOLDENS="$update_goldens" CHECK_LAYOUT="$repo_root/scripts/check-native-layout.py" \
   CHECK_OI_VISUAL="$repo_root/scripts/check-native-oi-visual.py" \
+  ATHENA_RELEASE_SYSTEM_PYTHON="$system_python" \
   xvfb-run -a -s '-screen 0 1920x1080x24 -ac' bash -c '
     set -euo pipefail
+    system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
 
     wait_for_window() {
       timeout 10s xdotool search --sync --name "ATHENA" 2>/dev/null | head -1
     }
 
     presentation_sequence() {
-      PRESENTATION_PATH="$1" python3 - <<'PY'
+      PRESENTATION_PATH="$1" "$system_python" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -142,7 +145,7 @@ PY
     }
 
     wait_for_presentation() {
-      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" EXPECTED_STATE="${5:-}" python3 - <<'PY'
+      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" EXPECTED_STATE="${5:-}" "$system_python" - <<'PY'
 import json
 import os
 import time
@@ -214,7 +217,7 @@ PY
       local upper_mode="${scene_mode^^}"
       fixture_projection="${fixture_projection//\"SEARCH\"/\"$upper_mode\"}"
       fixture_projection="${fixture_projection//\"owl\"/\"$mascot\"}"
-      fixture_projection="$(FIXTURE_PROJECTION="$fixture_projection" SCENE_MODE="$scene_mode" python3 -c "import json, os; f=json.loads(os.environ[\"FIXTURE_PROJECTION\"]); m=os.environ[\"SCENE_MODE\"]; f[\"attention_items\"] = ([{\"id\":\"approval:visual-smoke\",\"approval_id\":\"apr-visual-smoke\",\"kind\":\"approval\",\"severity\":\"warning\",\"title\":\"APPROVAL REQUIRED\",\"summary\":\"write workspace\",\"requires_action\":True,\"scopes\":[\"call\",\"task\"],\"related_object_id\":\"op-01\"}] if m == \"approval\" else [{\"id\":\"event:visual-smoke\",\"kind\":\"notification\",\"severity\":\"failure\",\"title\":\"EVENT\",\"summary\":\"visual verification failed\",\"requires_action\":False,\"related_object_id\":\"op-01\"}] if m == \"failure\" else f[\"attention_items\"]); print(json.dumps(f))")"
+      fixture_projection="$(FIXTURE_PROJECTION="$fixture_projection" SCENE_MODE="$scene_mode" "$system_python" -c "import json, os; f=json.loads(os.environ[\"FIXTURE_PROJECTION\"]); m=os.environ[\"SCENE_MODE\"]; f[\"attention_items\"] = ([{\"id\":\"approval:visual-smoke\",\"approval_id\":\"apr-visual-smoke\",\"kind\":\"approval\",\"severity\":\"warning\",\"title\":\"APPROVAL REQUIRED\",\"summary\":\"write workspace\",\"requires_action\":True,\"scopes\":[\"call\",\"task\"],\"related_object_id\":\"op-01\"}] if m == \"approval\" else [{\"id\":\"event:visual-smoke\",\"kind\":\"notification\",\"severity\":\"failure\",\"title\":\"EVENT\",\"summary\":\"visual verification failed\",\"requires_action\":False,\"related_object_id\":\"op-01\"}] if m == \"failure\" else f[\"attention_items\"]); print(json.dumps(f))")"
       local image_path="$TMP_DIR/${label}-${mascot}.png"
       local layout_path="$TMP_DIR/${label}-${mascot}.layout.json"
       local oi_path="$TMP_DIR/${label}-${mascot}.oi.png"
@@ -244,7 +247,7 @@ PY
         printf "native-visual-smoke: FAIL — missing live layout dump %s\\n" "$layout_path" >&2
         return 1
       }
-      LAYOUT_PATH="$layout_path" python3 -c "import json, os; l=json.loads(open(os.environ[\"LAYOUT_PATH\"], encoding=\"utf-8\").read()); assert l[\"metrics_source\"] == \"live_xft\"; assert all(l[\"metrics\"][r][\"height\"] > 0 for r in (\"body\", \"input\", \"heading\", \"instrument\")); p=l[\"prompt_layout\"]; last=p.get(\"hint_row\") or p[\"input_row\"]; assert last[\"top\"] + last[\"height\"] <= l[\"prompt\"][\"y\"] + l[\"prompt\"][\"height\"] + 0.01"
+      LAYOUT_PATH="$layout_path" "$system_python" -c "import json, os; l=json.loads(open(os.environ[\"LAYOUT_PATH\"], encoding=\"utf-8\").read()); assert l[\"metrics_source\"] == \"live_xft\"; assert all(l[\"metrics\"][r][\"height\"] > 0 for r in (\"body\", \"input\", \"heading\", \"instrument\")); p=l[\"prompt_layout\"]; last=p.get(\"hint_row\") or p[\"input_row\"]; assert last[\"top\"] + last[\"height\"] <= l[\"prompt\"][\"y\"] + l[\"prompt\"][\"height\"] + 0.01"
       [[ -s "$oi_path" ]] || {
         printf "native-visual-smoke: FAIL — missing 384x256 OI dump %s\\n" "$oi_path" >&2
         return 1
@@ -253,7 +256,7 @@ PY
         printf "native-visual-smoke: FAIL — OI dump has unexpected dimensions\\n" >&2
         return 1
       }
-      python3 "$CHECK_OI_VISUAL" "$oi_path"
+      "$system_python" "$CHECK_OI_VISUAL" "$oi_path"
 
       if [[ -n "$GOLDEN_DIR" ]]; then
         local golden_path="$GOLDEN_DIR/${label}-${mascot}.png"

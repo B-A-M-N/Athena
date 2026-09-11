@@ -12,6 +12,7 @@ LANE_STAGES: dict[str, str] = {
     "python-version": "bench",
     "cargo-version": "bench",
     "rustc-version": "bench",
+    "toolchain-passport": "bench",
     "alacrity-benchmark": "bench",
     "indexing-benchmark": "bench",
     "rendering-benchmark": "bench",
@@ -26,10 +27,13 @@ LANE_STAGES: dict[str, str] = {
     "compileall": "static",
     "architecture-lint": "static",
     "support-matrix": "static",
+    "migration-baseline": "static",
     # test evidence
     "pytest": "tests",
     "pytest-performance": "tests",
     "functional-proof": "tests",
+    "anthropic-sdk-compat": "tests",
+    "remote-pack-security": "tests",
     "release-scenarios": "tests",
     "backend-passport": "integration",
     "support-matrix-release": "integration",
@@ -53,6 +57,7 @@ LANE_STAGES: dict[str, str] = {
 }
 
 VALID_STAGES = ("static", "tests", "bench", "integration")
+RELEASE_POLICY_VERSION = "release-policy-v1"
 
 FUNCTIONAL_PROOF_NODEIDS = (
     "tests/integration/test_end_to_end.py::test_full_loop_returns_complete_with_answer",
@@ -94,6 +99,7 @@ def candidate_commands() -> tuple[str, ...]:
         "uv lock --check --offline",
         "uv run --frozen --no-sync python scripts/architecture-lint",
         "uv run --frozen --no-sync python scripts/support-matrix-check",
+        "uv run --frozen --no-sync python scripts/verify-migration-baseline",
         "uv run --frozen --no-sync python scripts/scenarios --exclude-family VHS --output /tmp/athena-self-scenarios.json",
         "cargo check --manifest-path native/Cargo.toml --locked --offline",
         "cargo test --manifest-path native/Cargo.toml --locked --offline",
@@ -104,10 +110,10 @@ def candidate_commands() -> tuple[str, ...]:
         "uv run --frozen --no-sync python scripts/bench-alacrity --events 5000 --min-producer-events-per-second 10000",
         "uv run --frozen --no-sync python scripts/bench-indexing --samples 3 --max-full-seconds 5 --hard-max-full-seconds 8 --max-cold-start-seconds 8 --max-incremental-seconds 0.5 --hard-max-incremental-seconds 1",
         "uv run --frozen --no-sync python scripts/bench-rendering --max-scene-p95-ms 2 --max-native-projection-p95-ms 5 --max-idle-redraws-per-second 0.1 --max-idle-cpu-percent 2 --max-active-fps 25 --max-cache-bytes 16777216 --require-native",
-        "scripts/endurance-runner --profile beta --output endurance-receipt.json",
+        "uv run --frozen --no-sync python scripts/endurance-runner --profile beta --output endurance-receipt.json",
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q",
         "uv run --frozen --no-sync --extra dev python scripts/dependency-audit",
-        "scripts/rust-supply-chain-audit",
+        "ATHENA_SELF_HOST_GATE=1 scripts/rust-supply-chain-audit",
         "scripts/static-critical",
         "uv run --frozen --no-sync pytest -p no:cacheprovider -q tests/e2e/test_release_black_box.py",
         "scripts/sandbox-release-matrix",
@@ -124,7 +130,7 @@ def release_commands(
     skip_e2e: bool,
     bootstrap: bool,
     include_hermes_live: bool = False,
-    include_endurance: bool = False,
+    include_endurance: bool = True,
     stage: str | None = None,
 ) -> tuple[tuple[str, list[str]], ...]:
     """Return core lanes, with live Hermes evidence opt-in.
@@ -139,6 +145,16 @@ def release_commands(
         ("python-version", [*prefix, "python", "--version"]),
         ("cargo-version", ["cargo", "--version"]),
         ("rustc-version", ["rustc", "-vV"]),
+        (
+            "toolchain-passport",
+            [
+                *prefix,
+                "python",
+                "scripts/toolchain-passport",
+                "--output",
+                "toolchain-passport.json",
+            ],
+        ),
         (
             "alacrity-benchmark",
             [
@@ -200,7 +216,7 @@ def release_commands(
         ),
         ("ruff-format", [*prefix, "ruff", "format", "--check", "--no-cache", "src", "tests"]),
         ("ruff-check", [*prefix, "ruff", "check", "--no-cache", "src", "tests"]),
-        ("uv-lock-check", ["uv", "lock", "--check", "--offline"]),
+        ("uv-lock-check", [uv, "lock", "--check", "--offline"]),
         ("mypy", [*prefix, "mypy", "src/athena"]),
         (
             "dependency-audit",
@@ -227,6 +243,32 @@ def release_commands(
             "functional-proof",
             [*test_prefix, "python", "-m", "pytest", "-q", *FUNCTIONAL_PROOF_NODEIDS],
         ),
+        (
+            "anthropic-sdk-compat",
+            [
+                *prefix,
+                "--extra",
+                "anthropic",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "tests/unit/models/test_sdk_compat.py",
+                "tests/unit/models/test_anthropic.py",
+            ],
+        ),
+        (
+            "remote-pack-security",
+            [
+                *prefix,
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "tests/unit/capabilities/test_packs.py",
+                "tests/unit/capabilities/test_interaction_packs.py",
+            ],
+        ),
         # Wall-clock budget tests measure real latency; they run serially so
         # their measurement is not fighting other workers for CPU.
         (
@@ -249,26 +291,17 @@ def release_commands(
         (
             "backend-passport",
             [
+                *prefix,
+                "python",
                 "scripts/backend-passport",
                 "--output",
                 "backend-passport.json",
                 "--require-all-claims",
             ],
         ),
-        (
-            "support-matrix-release",
-            [
-                *prefix,
-                "python",
-                "scripts/generate-support-matrix",
-                "--passport",
-                "backend-passport.json",
-                "--output",
-                "release-support-matrix.json",
-            ],
-        ),
         ("architecture-lint", [*prefix, "python", "scripts/architecture-lint"]),
         ("support-matrix", [*prefix, "python", "scripts/support-matrix-check"]),
+        ("migration-baseline", [*prefix, "python", "scripts/verify-migration-baseline"]),
     ]
     if bootstrap:
         commands.append(
@@ -321,6 +354,8 @@ def release_commands(
             (
                 "endurance",
                 [
+                    *prefix,
+                    "python",
                     "scripts/endurance-runner",
                     "--profile",
                     "beta",
@@ -420,6 +455,20 @@ def release_commands(
                     ],
                 )
             )
+    support_matrix_command = [
+        *prefix,
+        "python",
+        "scripts/generate-support-matrix",
+        "--passport",
+        "backend-passport.json",
+        "--release-lanes",
+        "release-lane-results.json",
+        "--output",
+        "release-support-matrix.json",
+    ]
+    if stage is None and not skip_e2e and include_endurance:
+        support_matrix_command.append("--require-certified")
+    commands.append(("support-matrix-release", support_matrix_command))
     if stage is not None:
         if stage not in VALID_STAGES:
             raise ValueError(f"unknown release stage: {stage!r}")
@@ -431,4 +480,4 @@ def release_commands(
     return tuple(sorted(commands, key=lambda item: order.get(lane_stage(item[0]), 9)))
 
 
-__all__ = ["candidate_commands", "release_commands"]
+__all__ = ["RELEASE_POLICY_VERSION", "candidate_commands", "release_commands"]

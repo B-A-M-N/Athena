@@ -33,6 +33,7 @@ __all__ = [
     "CacheMode",
     "CompatibilityProfile",
     "DiscoveryMode",
+    "IdempotencySemantics",
     "ModelProfile",
     "Protocol",
     "ProviderProfile",
@@ -67,6 +68,15 @@ class DiscoveryMode:
     AUTOMATIC = "automatic"
 
 
+class IdempotencySemantics:
+    """Provider guarantees relevant to recovery after an unknown outcome."""
+
+    NONE = "none"
+    REQUEST_KEY = "request_key"
+    RETRIEVABLE_REQUEST = "retrievable_request"
+    PROVIDER_ASSIGNED_RESPONSE_ID = "provider_assigned_response_id"
+
+
 @dataclass(frozen=True)
 class ProviderProfile:
     """Immutable description of one provider/local-server route."""
@@ -91,6 +101,7 @@ class ProviderProfile:
     )
     compatibility_profile: str = "auto"
     discovery_mode: str = DiscoveryMode.MANUAL
+    idempotency_semantics: str = IdempotencySemantics.NONE
 
     def fingerprint(self) -> str:
         return profile_fingerprint(self)
@@ -171,6 +182,7 @@ def profile_fingerprint(profile: ProviderProfile) -> str:
         "timeouts": dict(sorted(profile.timeouts.items())),
         "compatibility_profile": profile.compatibility_profile,
         "discovery_mode": profile.discovery_mode,
+        "idempotency_semantics": profile.idempotency_semantics,
         "api_key_ref": profile.api_key_ref,
     }
     return hashlib.sha256(_canonical_json(data).encode()).hexdigest()[:16]
@@ -221,6 +233,7 @@ PRESETS: dict[str, ProviderProfile] = {
         auth_mode=AuthMode.KEYLESS,
         cache_mode=CacheMode.NONE,
         compatibility_profile="test",
+        idempotency_semantics=IdempotencySemantics.REQUEST_KEY,
     ),
     "ollama": _preset(
         "ollama", "http://127.0.0.1:11434/v1", keyless=True, protocol=Protocol.OPENAI_COMPAT
@@ -253,6 +266,7 @@ PRESETS: dict[str, ProviderProfile] = {
         capabilities=frozenset({"streaming", "tools", "parallel_tools", "vision", "reasoning"}),
         cache_mode=CacheMode.AUTOMATIC_PREFIX,
         compatibility_profile="hosted",
+        idempotency_semantics=IdempotencySemantics.REQUEST_KEY,
     ),
     "anthropic": ProviderProfile(
         id="anthropic",

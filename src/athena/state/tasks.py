@@ -131,6 +131,25 @@ class TaskStore:
         )
         return [_decode_task_row(r) for r in rows]
 
+    async def update_metadata(self, task_id: str, updates: dict[str, Any]) -> bool:
+        """Merge durable metadata fields without changing task authority state."""
+        async with self._db.transaction() as db:
+            row = await db.fetch_one_raw("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
+            if row is None:
+                return False
+            try:
+                metadata = json.loads(row.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.update(dict(updates))
+            cursor = await db.execute_raw(
+                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(metadata, default=str), utcnow().isoformat(), task_id),
+            )
+            return cursor.rowcount == 1
+
     async def list_children(self, parent_task_id: str) -> list[dict]:
         """Every task whose ``parent_task_id`` points at the given task."""
         rows = await self._db.fetch_all(
@@ -341,7 +360,7 @@ class TaskStore:
                 not (
                     allow_recovery_completion
                     and current in {TaskStatus.INTERRUPTED, TaskStatus.RECOVERY_REQUIRED}
-                    and status is TaskStatus.COMPLETE
+                    and status in FINAL_STATUSES
                 )
                 and not recovery_finalization
                 and status not in allowed

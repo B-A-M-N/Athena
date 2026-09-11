@@ -61,6 +61,13 @@ class TaskDeadlineExceeded(TaskError):
     retryable = False
 
 
+class ProviderOutcomeUnknown(TaskError):
+    """A provider may have completed while the local receipt was unavailable."""
+
+    code = "provider_outcome_unknown"
+    retryable = False
+
+
 class IllegalStateTransition(TaskError):
     code = "illegal_state_transition"
 
@@ -243,6 +250,7 @@ __all__ = [
     "TaskError",
     "TaskBudgetExceeded",
     "TaskDeadlineExceeded",
+    "ProviderOutcomeUnknown",
     "IllegalStateTransition",
     "CancellationUncertain",
     "ProviderError",

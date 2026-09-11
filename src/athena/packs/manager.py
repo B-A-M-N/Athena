@@ -311,7 +311,7 @@ class PackManager:
         source_url: str,
         *,
         expected_sha256: str | None = None,
-        expected_sha256_source: str = "operator",
+        expected_sha256_source: str | None = None,
         max_bytes: int = 32 * 1024 * 1024,
         network_policy: str | object | None = None,
     ) -> dict[str, Any]:
@@ -416,7 +416,7 @@ class PackManager:
         source_url: str,
         *,
         expected_sha256: str | None = None,
-        expected_sha256_source: str = "operator",
+        expected_sha256_source: str | None = None,
         approved: bool = False,
         enable: bool = True,
         network_policy: str | object | None = None,

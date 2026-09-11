@@ -43,6 +43,8 @@ _FORCE_RENDER_EVENTS = frozenset(
         "TaskCancelled",
         "TaskPaused",
         "RecoveryRequired",
+        "TaskRecoveryRequired",
+        "ProviderOutcomeUnknown",
     }
 )
 
@@ -166,6 +168,9 @@ class OIStreamViewer:
                 self.projection.ignore_approval_summary()
         elif etype == "PolicyDecisionMade":
             self._last_policy_reason = str(payload.get("reason") or "")
+        elif etype in {"ProviderOutcomeUnknown", "TaskRecoveryRequired"}:
+            reason = str(payload.get("reason") or "provider outcome requires reconciliation")
+            self._write(f"\n{_BOLD}RECOVERY REQUIRED{_RESET}  {reason}")
 
     # -- approvals -------------------------------------------------------
     async def _offer_approval(self, payload: dict) -> None:

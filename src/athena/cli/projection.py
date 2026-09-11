@@ -477,6 +477,7 @@ class ProjectionState:
             "TaskBlocked": "blocked",
             "TaskCancelled": "cancelled",
             "TaskInterrupted": "interrupted",
+            "TaskRecoveryRequired": "recovery_required",
             "ChildTaskCreated": "created",
             "ChildTaskCompleted": "complete",
         }
@@ -1019,6 +1020,13 @@ class ProjectionState:
                 "!" if state in {"BLOCKED", "RECOVERY_REQUIRED"} else "·",
                 f"Task state · {state.lower()}",
             )
+        elif etype == "TaskRecoveryRequired":
+            self.status, self.status_message = (
+                "RECOVERING",
+                sanitize_terminal_text(payload.get("reason") or "Task requires recovery."),
+            )
+            self.thinking = False
+            self.add_recent("!", "Provider outcome requires reconciliation")
         elif etype == "RecoveryStarted":
             self.status, self.status_message = (
                 "RECOVERING",

@@ -19,10 +19,11 @@ critical=(
   src/athena/state
 )
 
-uv run --frozen --extra dev ruff check --no-cache --select B "${critical[@]}"
-uv run --frozen --extra dev ruff check --no-cache \
+uv_bin="${ATHENA_RELEASE_UV:-uv}"
+"$uv_bin" run --frozen --extra dev ruff check --no-cache --select B "${critical[@]}"
+"$uv_bin" run --frozen --extra dev ruff check --no-cache \
   --select ASYNC --ignore ASYNC109,ASYNC240 "${critical[@]}"
-uv run --frozen --extra dev ruff check --no-cache \
+"$uv_bin" run --frozen --extra dev ruff check --no-cache \
   --select BLE001 \
   src/athena/mcp/client.py \
   src/athena/models/providers \
@@ -33,7 +34,7 @@ uv run --frozen --extra dev ruff check --no-cache \
 # recovery is sometimes necessary. Each such catch must carry an inline
 # ``noqa: BLE001`` rationale; this prevents a new catch from silently joining
 # the recovery paths without a reviewable reason.
-uv run --frozen --extra dev python - <<'PY'
+"$uv_bin" run --frozen --extra dev python - <<'PY'
 import ast
 from pathlib import Path
 

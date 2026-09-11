@@ -616,6 +616,100 @@ def _get_result_handler(service: Any) -> Any:
     return handler
 
 
+def _list_inference_recoveries_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        task_id = request.query_params.get("task_id") or None
+        try:
+            rows = await service.list_provider_outcome_recoveries(task_id=task_id)
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        return json_response({"recoveries": _serializable(rows)})
+
+    return handler
+
+
+def _get_inference_recovery_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        attempt_id = request.path_params["attempt_id"]
+        try:
+            row = await service.get_provider_outcome_recovery(attempt_id)
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        if row is None:
+            raise HTTPError(404, "inference_attempt_not_found", f"attempt {attempt_id!r} not found")
+        return json_response({"recovery": _serializable(row)})
+
+    return handler
+
+
+def _resolve_inference_recovery_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        attempt_id = request.path_params["attempt_id"]
+        body = await request.json()
+        if not isinstance(body, Mapping):
+            raise HTTPError(400, "validation_error", "a JSON object is required")
+        resolution = body.get("resolution")
+        note = body.get("note")
+        if not isinstance(resolution, str) or not resolution.strip():
+            raise HTTPError(400, "validation_error", "field 'resolution' is required")
+        if not isinstance(note, str) or not note.strip():
+            raise HTTPError(400, "validation_error", "field 'note' is required")
+        provider_response_id = body.get("provider_response_id")
+        if provider_response_id is not None and (
+            not isinstance(provider_response_id, str) or not provider_response_id.strip()
+        ):
+            raise HTTPError(
+                400,
+                "validation_error",
+                "field 'provider_response_id' must be a non-empty string or null",
+            )
+        actual_cost = body.get("actual_cost")
+        if actual_cost is not None and (
+            isinstance(actual_cost, bool) or not isinstance(actual_cost, (str, int, float))
+        ):
+            raise HTTPError(
+                400,
+                "validation_error",
+                "field 'actual_cost' must be a Decimal-compatible number or string",
+            )
+        try:
+            row = await service.resolve_provider_outcome(
+                attempt_id,
+                resolution=resolution,
+                note=note,
+                provider_response_id=provider_response_id,
+                actual_cost=actual_cost,
+            )
+        except KeyError:
+            raise HTTPError(404, "inference_attempt_not_found", f"attempt {attempt_id!r} not found")
+        except ValueError as exc:
+            raise HTTPError(400, "validation_error", str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        return json_response({"recovery": _serializable(row)}, status=200)
+
+    return handler
+
+
+def _close_inference_liability_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        attempt_id = request.path_params["attempt_id"]
+        body = await request.json()
+        if not isinstance(body, Mapping) or not isinstance(body.get("note"), str):
+            raise HTTPError(400, "validation_error", "a JSON object with a note is required")
+        try:
+            row = await service.close_provider_liability(attempt_id, note=body["note"])
+        except KeyError:
+            raise HTTPError(404, "inference_attempt_not_found", f"attempt {attempt_id!r} not found")
+        except ValueError as exc:
+            raise HTTPError(400, "validation_error", str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        return json_response({"recovery": _serializable(row)}, status=200)
+
+    return handler
+
+
 def _cancel_handler(service: Any) -> Any:
     async def handler(request: Any) -> Any:
         task_id = request.path_params["task_id"]
@@ -835,6 +929,12 @@ def _health_handler(service: Any) -> Any:
         capability_profile = runtime_health.get("capability_profile") or {}
         resources = runtime_health.get("resources") or {}
         execution_recovery = runtime_health.get("execution_recovery") or {}
+        provider_recovery = runtime_health.get("provider_outcome_recovery") or {}
+        # Legacy duck-typed services do not expose this diagnostic yet; the
+        # concrete AthenaService always does and therefore fails closed there.
+        provider_recovery_state = str(
+            provider_recovery.get("state") or ("ready" if not provider_recovery else "unknown")
+        )
         execution_recovery_state = execution_recovery.get(
             "state", getattr(service, "_recovery_status", "healthy")
         )
@@ -856,6 +956,7 @@ def _health_handler(service: Any) -> Any:
             "providers": _providers_ready(getattr(service, "_model_registry", None)),
             "worker_persistence": worker_health.get("status", "ok") == "ok",
             "recovery": getattr(service, "_recovery_status", "healthy") in {"healthy", "recovered"},
+            "provider_outcome_recovery": provider_recovery_state == "ready",
             "capability_profile": capability_profile.get("status", "ok") == "ok",
             "resource_teardown": resources.get("unresolved_count", 0) == 0,
             "execution_recovery": execution_recovery_state in {"healthy", "recovered"},
@@ -965,6 +1066,24 @@ def create_app(service: Any = None) -> Any:
         Route("/v1/tasks", _submit_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}", _get_task_handler(service), methods=["GET"]),
         Route("/v1/tasks/{task_id}/result", _get_result_handler(service), methods=["GET"]),
+        Route(
+            "/v1/inference-recoveries", _list_inference_recoveries_handler(service), methods=["GET"]
+        ),
+        Route(
+            "/v1/inference-recoveries/{attempt_id}",
+            _get_inference_recovery_handler(service),
+            methods=["GET"],
+        ),
+        Route(
+            "/v1/inference-recoveries/{attempt_id}",
+            _resolve_inference_recovery_handler(service),
+            methods=["POST"],
+        ),
+        Route(
+            "/v1/inference-recoveries/{attempt_id}/liability",
+            _close_inference_liability_handler(service),
+            methods=["POST"],
+        ),
         Route("/v1/tasks/{task_id}/voice", _task_voice_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}/cancel", _cancel_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}/interrupt", _interrupt_handler(service), methods=["POST"]),

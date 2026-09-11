@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-_TRUST_ANCHOR_SOURCES = frozenset({"operator", "signed_registry", "model"})
+_TRUST_ANCHOR_SOURCES = frozenset({"operator", "signed_registry", "model", "unknown"})
 
 
 def normalize_trust_anchor_source(source: str | None) -> str:
-    value = str(source or "operator").strip().casefold()
+    value = str(source or "unknown").strip().casefold() or "unknown"
     if value not in _TRUST_ANCHOR_SOURCES:
-        raise ValueError("expected_sha256_source must be one of: model, operator, signed_registry")
+        raise ValueError(
+            "expected_sha256_source must be one of: model, operator, signed_registry, unknown"
+        )
     return value
 
 
@@ -58,7 +60,7 @@ def remote_archive_receipts(
     endpoint: Any,
     archive_sha256: str,
     expected_sha256: str | None,
-    expected_sha256_source: str,
+    expected_sha256_source: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return separate metadata and authenticity records for one archive."""
     expected = str(expected_sha256 or "").lower() or None

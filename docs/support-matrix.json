@@ -1,69 +1,98 @@
 {
-  "schema": 1,
+  "schema": 2,
   "product": "athena-agent",
   "release_channel": "beta",
   "generated_by": "scripts/support-matrix-check",
+  "support_contract": {
+    "python_certified_version": "3.12",
+    "python_compatibility_only_versions": ["3.13"],
+    "native_certification_cell": "linux-x86_64-x11-openbox",
+    "certification_rule": "A surface is certified only by a passing release-bound evidence run; this checked-in contract is not itself certification evidence."
+  },
   "generated_from": {
     "contracts": [
       "pyproject.toml",
+      "uv.lock",
       "src/athena/mcp/sdk_compat.py",
       "src/athena/models/compat/anthropic_sdk.py",
       "src/athena/execution/conformance.py",
-      "src/athena/execution/manager.py",
       "scripts/backend-passport",
       "scripts/generate-support-matrix",
       "scripts/endurance-runner",
-      "src/athena/release/gates.py",
-      "scripts/create-release-provenance",
-      "scripts/sign-release-provenance",
-      "scripts/verify-release-provenance"
+      "src/athena/release/gates.py"
     ],
-    "proof_policy": "advertised claims require an executable evidence reference"
+    "proof_policy": "implementation claims are separate from release certification; certified claims require a passing executable release lane"
   },
   "surfaces": {
     "python": {
-      "supported": ["3.12", "3.13"],
+      "claimed_versions": ["3.12"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
       "verification": "release-check:python-version",
-      "proof": {"status": "implemented", "evidence": ["release-check:python-version"]}
+      "proof": {"status": "not_certified", "evidence": []}
     },
     "mcp": {
-      "supported": ["2.x"],
+      "claimed_versions": ["2.1.1"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
       "verification": "mcp-streamable-http-and-stdio-e2e",
-      "proof": {"status": "implemented", "evidence": ["tests/e2e/test_mcp_streamable_http.py", "tests/e2e/test_mcp_transport.py"]}
+      "proof": {"status": "not_certified", "evidence": []}
     },
     "anthropic_sdk": {
-      "supported": ["1.x"],
-      "verification": "anthropic-sdk-compatibility-tests",
-      "proof": {"status": "implemented", "evidence": ["tests/unit/models/test_sdk_compat.py"]}
+      "claimed_versions": ["1.0.0"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "locked-sdk-compatibility-tests",
+      "proof": {"status": "not_certified", "evidence": []}
     },
     "native": {
-      "supported": ["linux-x86_64", "linux-aarch64", "macos-arm64"],
+      "claimed_versions": ["beta"],
+      "claimed_platforms": ["linux-x86_64-x11-openbox"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
       "verification": "native-check-and-native-test",
-      "proof": {"status": "implemented", "evidence": ["native/Cargo.toml", "native/src"]}
+      "proof": {"status": "not_certified", "evidence": []}
     },
     "remote_packs": {
-      "supported": ["https-with-operator-pinned-sha256"],
+      "claimed_versions": ["https-with-operator-pinned-sha256"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
       "verification": "pack-provenance-tests",
-      "proof": {"status": "implemented", "evidence": ["tests/unit/capabilities/test_packs.py", "src/athena/packs/provenance.py"]}
+      "proof": {"status": "not_certified", "evidence": []}
     },
     "rollback": {
-      "supported": ["durable-pack-upgrade", "frozen-artifact-reinstall"],
+      "claimed_versions": ["durable-pack-upgrade", "frozen-artifact-reinstall"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
       "verification": "release-black-box-and-upgrade-tests",
-      "proof": {"status": "implemented", "evidence": ["tests/e2e/test_release_black_box.py", "tests/unit/capabilities/test_packs.py", "tests/unit/capabilities/test_reality_integrity.py"]}
+      "proof": {"status": "not_certified", "evidence": []}
     },
     "execution_backend_passport": {
-      "supported": ["local-supervised:python", "local-supervised:shell", "local-supervised:node"],
+      "claimed_versions": ["local-supervised:python", "local-supervised:shell", "local-supervised:node"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
       "verification": "release-check:backend-passport",
-      "proof": {"status": "beta", "evidence": ["scripts/backend-passport", "src/athena/execution/conformance.py", "src/athena/execution/manager.py"]}
+      "proof": {"status": "not_certified", "evidence": []}
     },
     "endurance": {
-      "supported": ["beta-30-minute", "nightly-6-hour"],
-      "verification": "release-check:optional-endurance",
-      "proof": {"status": "beta", "evidence": ["scripts/endurance-runner", "tests/crash/test_soak_matrix.py"]}
+      "claimed_versions": ["beta-30-minute"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "release-check:mandatory-endurance",
+      "proof": {"status": "not_certified", "evidence": []}
     }
   },
   "unsupported_claims": [
-    "MCP SDK 1.x",
+    "macOS and non-Linux native certification without a matching release lane",
+    "MCP SDK versions other than the exact locked beta pin",
+    "Anthropic SDK versions other than the exact locked beta pin",
     "credentialed non-loopback HTTP",
     "unsigned release provenance",
     "unverified model-originated pack installation"

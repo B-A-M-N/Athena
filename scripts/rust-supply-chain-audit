@@ -8,19 +8,25 @@ cd "$repo_root"
 manifest="native/Cargo.toml"
 lockfile="native/Cargo.lock"
 denyfile="native/deny.toml"
+policy_file="native/cargo-deny-build-policy.json"
 version_file="native/cargo-deny.version"
 receipt_dir="${ATHENA_SUPPLY_CHAIN_EVIDENCE_DIR:-$repo_root/release-evidence}"
 receipt="$receipt_dir/rust-supply-chain.json"
 max_age_days="${ATHENA_RUSTSEC_MAX_AGE_DAYS:-7}"
 
-for path in "$lockfile" "$denyfile" "$version_file"; do
+for path in "$lockfile" "$denyfile" "$policy_file" "$version_file"; do
   [[ -f "$path" ]] || {
     printf 'rust-supply-chain-audit: FAIL — missing %s\n' "$path" >&2
     exit 1
   }
 done
 
-expected_version="$(tr -d '[:space:]' < "$version_file")"
+system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
+expected_version="$("$system_python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["cargo_deny_version"])' "$policy_file")"
+[[ "$(tr -d '[:space:]' < "$version_file")" == "$expected_version" ]] || {
+  printf '%s\n' 'rust-supply-chain-audit: FAIL — cargo-deny version declarations disagree' >&2
+  exit 1
+}
 [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   printf '%s\n' 'rust-supply-chain-audit: FAIL — invalid pinned cargo-deny version' >&2
   exit 1
@@ -28,12 +34,18 @@ expected_version="$(tr -d '[:space:]' < "$version_file")"
 
 cargo metadata --manifest-path "$manifest" --locked --offline --format-version 1 >/dev/null
 
-cargo_deny_bin="${ATHENA_CARGO_DENY_BIN:-cargo-deny}"
-command -v "$cargo_deny_bin" >/dev/null 2>&1 || {
-  printf 'rust-supply-chain-audit: FAIL — install cargo-deny %s (cargo install --locked --version %s cargo-deny)\n' \
-    "$expected_version" "$expected_version" >&2
-  exit 2
-}
+cargo_deny_bin="${ATHENA_CARGO_DENY_BIN:-}"
+if [[ -z "$cargo_deny_bin" || ! -x "$cargo_deny_bin" ]]; then
+  [[ "${ATHENA_SELF_HOST_GATE:-0}" == "1" ]] || {
+    printf 'rust-supply-chain-audit: FAIL — ATHENA_CARGO_DENY_BIN must point to the controlled cargo-deny %s binary\n' \
+      "$expected_version" >&2
+    exit 2
+  }
+  bootstrap_dir="${ATHENA_SELF_HOST_CARGO_DENY_DIR:-/tmp/athena-self-host-cargo-deny}"
+  scripts/bootstrap-cargo-deny --output-dir "$bootstrap_dir"
+  cargo_deny_bin="$bootstrap_dir/bin/cargo-deny"
+fi
+actual_digest="$(sha256sum "$cargo_deny_bin" | awk '{print $1}')"
 actual_version="$("$cargo_deny_bin" --version | awk 'NR==1 {print $2}')"
 [[ "$actual_version" == "$expected_version" ]] || {
   printf 'rust-supply-chain-audit: FAIL — cargo-deny %s required, found %s\n' \
@@ -41,7 +53,8 @@ actual_version="$("$cargo_deny_bin" --version | awk 'NR==1 {print $2}')"
   exit 1
 }
 deny=("$cargo_deny_bin")
-mechanism="pinned-host-binary"
+mechanism="locked-source-build"
+uv_bin="${ATHENA_RELEASE_UV:-uv}"
 
 (
   cd "$(dirname "$manifest")"
@@ -73,15 +86,16 @@ max_age_seconds=$((max_age_days * 86400))
 }
 
 mkdir -p "$receipt_dir"
-python3 - "$receipt" "$expected_version" "$mechanism" "$denyfile" "$lockfile" \
-  "$age_seconds" "$max_age_days" <<'PY'
+"$uv_bin" run --frozen --extra dev python - "$receipt" "$expected_version" "$mechanism" "$denyfile" "$lockfile" \
+  "$age_seconds" "$max_age_days" "$cargo_deny_bin" "$actual_digest" "$(rustc -vV)" <<'PY'
 import hashlib
 import json
+import os
 import pathlib
 import sys
 from datetime import datetime, timezone
 
-out, version, mechanism, denyfile, lockfile, age, max_age = sys.argv[1:]
+out, version, mechanism, denyfile, lockfile, age, max_age, executable, executable_sha256, rustc_verbose = sys.argv[1:]
 
 def digest(path):
     h = hashlib.sha256()
@@ -92,8 +106,14 @@ def digest(path):
 
 record = {
     "status": "PASS",
+    "source_sha": os.environ.get("ATHENA_RELEASE_SHA"),
+    "release_run_id": os.environ.get("ATHENA_RELEASE_RUN_ID"),
     "generated_at": datetime.now(timezone.utc).isoformat(),
     "cargo_deny_version": version,
+    "cargo_deny_executable": executable,
+    "cargo_deny_executable_sha256": executable_sha256,
+    "cargo_deny_binary_digest_scope": "this-platform-and-toolchain",
+    "rustc_verbose": rustc_verbose,
     "mechanism": mechanism,
     "deny_sha256": digest(denyfile),
     "cargo_lock_sha256": digest(lockfile),

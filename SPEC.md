@@ -13,8 +13,11 @@
 **Primary Interface:** CLI/TUI  
 **Secondary Interfaces:** Python API, HTTP/SSE/WebSocket API, ACP, optional messaging gateway  
 **Design ancestry:** Hermes Agent + Open Interpreter Classic  
-**Target production source size:** ~45,000–70,000 LOC excluding tests and bundled skills  
+**Historical production-source planning range:** ~45,000–70,000 LOC excluding tests and bundled skills
 **Core-kernel target:** ~15,000–25,000 LOC  
+**Size governance:** the planning range is not a release gate; package/module
+ratchets and architecture review triggers are authoritative for the expanded
+beta surface.
 **Primary objective:** Preserve the highest-value capabilities of Hermes Agent and Open Interpreter Classic while eliminating duplicated agent loops, overlapping execution systems, UI sprawl, provider-specific branching, and unnecessary framework complexity.
 
 ---
@@ -2415,9 +2418,23 @@ athena/
 
 ---
 
-# 67. Target LOC Budget
+# 67. Target LOC Budget and Size Governance
 
-This is a design constraint, not an achievement metric.
+This is historical architecture guidance, not a claim about the current tree
+and not an achievement metric. Athena's beta surface now includes durable
+provider/recovery state, research/evidence storage, governed runtimes, native
+desktop rendering, and release-certification infrastructure that were not
+included in the original compact estimate. Those concerns remain outside the
+single reasoning authority: the kernel remains separately bounded while the
+additional complexity lives in explicit stores, adapters, and interface
+packages.
+
+The original total range is retained as planning context. It must not be used
+to imply that a tree is certified or to justify unbounded growth. The active
+enforcement contract is the checked-in per-module baseline in
+`docs/architecture-size-baseline.json`, enforced by `scripts/architecture-lint`.
+Crossing the standard production-source review trigger below requires an
+architecture review and either decomposition or an updated rationale.
 
 Approximate production-code targets:
 
@@ -2454,10 +2471,10 @@ Full repository excluding bundled assets/docs:
 ~65k–100k
 ```
 
-If production code reaches roughly:
+If production code reaches the active review trigger of roughly:
 
 ```text
-100k+
+80k+
 ```
 
 before substantial third-party integrations exist, architecture review should be mandatory.
@@ -3134,10 +3151,13 @@ Tasks, mutations and autonomous changes are inspectable and recoverable.
 
 ### Size
 
-The complete production application should preferably remain below approximately:
+The complete production application should preferably remain below the
+historical planning range, but the beta release contract instead relies on
+the package/module ratchet and mandatory architecture review once standard
+production code exceeds approximately:
 
 ```text
-70,000 LOC
+80,000 LOC
 ```
 
 excluding:

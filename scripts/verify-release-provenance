@@ -1,20 +1,46 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Verify release provenance with the same library used by receipt checks."""
 
-input="${1:-}"
-signature="${2:-}"
-[[ -f "$input" && -s "$signature" ]] || { printf '%s\n' 'verify-release-provenance: usage: verify-release-provenance PROVENANCE.json SIGNATURE' >&2; exit 2; }
-command -v cosign >/dev/null 2>&1 || { printf '%s\n' 'verify-release-provenance: FAIL — cosign is required' >&2; exit 1; }
-if [[ -n "${COSIGN_PUBLIC_KEY:-}" ]]; then
-  cosign verify-blob --key "$COSIGN_PUBLIC_KEY" --signature "$signature" "$input"
-else
-  [[ -n "${COSIGN_CERTIFICATE_IDENTITY:-}" && -n "${COSIGN_CERTIFICATE_OIDC_ISSUER:-}" ]] || {
-    printf '%s\n' 'verify-release-provenance: FAIL — keyless verification requires certificate identity and OIDC issuer' >&2
-    exit 1
-  }
-  cosign verify-blob \
-    --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
-    --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
-    --signature "$signature" "$input"
-fi
-printf '%s\n' 'verify-release-provenance: PASS'
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from athena.release.provenance import (  # noqa: E402
+    ProvenanceVerificationError,
+    verify_provenance,
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("provenance", type=Path)
+    parser.add_argument("signature", type=Path)
+    parser.add_argument("--certificate", type=Path, default=None)
+    parser.add_argument("--metadata", type=Path, default=None)
+    args = parser.parse_args(argv)
+    try:
+        record = verify_provenance(
+            args.provenance,
+            args.signature,
+            certificate=args.certificate,
+        )
+    except ProvenanceVerificationError as exc:
+        print(f"verify-release-provenance: FAIL — {exc}", file=sys.stderr)
+        return 1
+    if args.metadata is not None:
+        args.metadata.parent.mkdir(parents=True, exist_ok=True)
+        args.metadata.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    print("verify-release-provenance: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

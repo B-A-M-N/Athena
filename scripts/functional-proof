@@ -10,7 +10,7 @@ set -euo pipefail
 if [[ -n "${ATHENA_PYTHON:-}" ]]; then
     PYTHON_CMD=("${ATHENA_PYTHON}")
 else
-    PYTHON_CMD=(uv run --frozen --extra dev python)
+    PYTHON_CMD=("${ATHENA_RELEASE_UV:-uv}" run --frozen --extra dev python)
 fi
 
 if (($#)); then

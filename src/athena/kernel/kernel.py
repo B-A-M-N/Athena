@@ -37,6 +37,7 @@ from athena.models.router import (
 )
 from athena.protocol.errors import (
     ContextIntegrityError,
+    ProviderOutcomeUnknown,
     ProviderError,
     RequestCancelled,
     TaskBudgetExceeded,
@@ -211,6 +212,7 @@ class RunState:
     cost_known: bool = True
     request_id: str | None = None
     provider: str | None = None
+    inference_attempt_id: str | None = None
     budget_wall_time_remaining_s: float | None = None
     budget_wall_time_checkpoint_s: float = 0.0
     tool_correction_counts: dict[str, int] = field(default_factory=dict)
@@ -581,7 +583,9 @@ class AgentKernel:
         # timeout/notification handoff window.
         self._resume_armed: set[str] = set()
         self._resume_locks: dict[str, asyncio.Lock] = {}
-        self._stored_responses: set[str] = set()
+        # Ephemeral duplicate-append fast path only; durable message receipts
+        # remain the correctness boundary across restarts.
+        self._response_append_cache: set[str] = set()
         self._prefix_trackers: dict[tuple[str, str, str], Any] = {}
 
     def set_budget_tracker(self, budgets) -> None:
@@ -993,6 +997,16 @@ class AgentKernel:
                 return await self._finalize(task, state, TaskStatus.PARTIAL, "deadline exceeded")
             except TaskBudgetExceeded as exc:
                 return await self._finalize(task, state, TaskStatus.PARTIAL, str(exc))
+            except ProviderOutcomeUnknown as exc:
+                attempt_id = state.inference_attempt_id or "unknown"
+                return await self._finalize(
+                    task,
+                    state,
+                    TaskStatus.RECOVERY_REQUIRED,
+                    "provider outcome unknown; recovery required before retry "
+                    f"(attempt={attempt_id}, provider={state.provider or 'unknown'}, "
+                    f"request={state.request_id or 'unknown'}): {exc}",
+                )
             except ProviderError:
                 return await self._finalize(task, state, TaskStatus.FAILED, "model unavailable")
             except Exception as exc:  # kernel never crashes; truthful terminal.
@@ -1751,13 +1765,13 @@ class AgentKernel:
         state.budget_wall_time_checkpoint_s = state.elapsed_ms / 1000
 
     async def _append_response(self, task: TaskSpec, response: ModelResponse) -> None:
-        if response.request_id and response.request_id in self._stored_responses:
+        if response.request_id and response.request_id in self._response_append_cache:
             return
         message = _assistant_message(task, response)
         appended = await self._append_assistant_message(message)
         if not appended:
             if response.request_id:
-                self._stored_responses.add(response.request_id)
+                self._response_append_cache.add(response.request_id)
             return
         await self._emit(
             "TaskMessage",
@@ -1769,7 +1783,7 @@ class AgentKernel:
             task,
         )
         if response.request_id:
-            self._stored_responses.add(response.request_id)
+            self._response_append_cache.add(response.request_id)
 
     async def _append_assistant_message(self, message: Message) -> bool:
         """Persist an assistant response through the durable replay boundary."""

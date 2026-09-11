@@ -147,6 +147,48 @@ async def test_database_startup_failure_cleans_state_and_can_retry(tmp_path, mon
     await database.close()
 
 
+@pytest.mark.parametrize(
+    "phase", ["open", "foreign_keys", "busy_timeout", "migration", "integrity", "lifecycle"]
+)
+async def test_each_pre_ready_failure_is_retryable(tmp_path, phase):
+    path = tmp_path / f"retry-{phase}.sqlite"
+    failures = {phase}
+
+    def inject(current_phase: str) -> None:
+        if current_phase in failures:
+            failures.remove(current_phase)
+            raise RuntimeError(f"fault at {current_phase}")
+
+    database = Database(str(path), startup_fault_injector=inject)
+    with pytest.raises(RuntimeError, match=f"fault at {phase}"):
+        await database._ensure_ready()
+    assert database._conn is None
+    assert database._migrated is False
+    assert database._closed is False
+
+    await database._ensure_ready()
+    assert database._migrated is True
+    await database.close()
+
+
+async def test_wal_startup_failure_is_retryable(tmp_path):
+    path = tmp_path / "retry-wal.sqlite"
+    failures = {"wal"}
+
+    def inject(phase: str) -> None:
+        if phase in failures:
+            failures.remove(phase)
+            raise RuntimeError("fault at wal")
+
+    database = Database(str(path), startup_fault_injector=inject)
+    with pytest.raises(RuntimeError, match="fault at wal"):
+        await database._ensure_ready()
+    assert database._conn is None
+    assert database._closed is False
+    await database._ensure_ready()
+    await database.close()
+
+
 async def test_migration_fault_hook_rolls_back_ddl_and_ledger(tmp_path):
     path = tmp_path / "fault-hook.sqlite"
 
@@ -159,16 +201,22 @@ async def test_migration_fault_hook_rolls_back_ddl_and_ledger(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         await database._ensure_ready()
     # The first migration contains the core tables. Neither those tables nor
-    # its ledger row may survive a failure after earlier statements ran.
-    assert database._conn is not None
-    tables = await database._conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+    # its ledger row may survive a failure after earlier statements ran, and
+    # failed startup must leave the same wrapper retryable.
+    assert database._conn is None
+    assert database._closed is False
+    connection = sqlite3.connect(path)
+    assert (
+        connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        ).fetchone()
+        is None
     )
-    assert await tables.fetchone() is None
-    ledger = await database._conn.execute(
-        "SELECT version FROM schema_migrations WHERE version = '001'"
+    assert (
+        connection.execute("SELECT version FROM schema_migrations WHERE version = '001'").fetchone()
+        is None
     )
-    assert await ledger.fetchone() is None
+    connection.close()
     await database.close()
 
     recovered = Database(str(path))

@@ -52,6 +52,26 @@ Only `AgentKernel` decides what to do next. A workflow is deterministic
 composition, not another reasoning authority. A delegated child is an
 ordinary bounded Task, not a different agent architecture.
 
+## 1.1 Bounded beta support and size governance
+
+The public beta is intentionally bounded. The certified native desktop cell is
+Linux x86_64 with X11 and Openbox; Python 3.12 is the certification
+interpreter, while Python 3.13 is compatibility-tested by ordinary CI. Other
+desktop environments, operating systems, and integrations are compatibility
+targets unless a release-bound evidence lane certifies them. The checked-in
+[`docs/support-matrix.json`](support-matrix.json) is the machine-readable
+contract, and a checked-in contract is never certification evidence by itself.
+
+The original 45k–70k production-source estimate remains historical planning
+context. The expanded beta surface adds durable recovery/accounting,
+research/evidence, governed runtime backends, native rendering, and release
+provenance infrastructure without turning the kernel into a second
+architecture. Current size control is therefore enforced by the per-module
+ratchet in [`docs/architecture-size-baseline.json`](architecture-size-baseline.json)
+and [`scripts/architecture-lint`](../scripts/architecture-lint); crossing the
+approximately 80k standard-source review trigger requires an explicit
+architecture review, decomposition, or written rationale.
+
 ## 2. Five cooperating layers
 
 ```text
@@ -580,7 +600,7 @@ complete.
 | Dependency acquisition | **Partial**; a governed Python route records resolved versions, source metadata, file hashes, exact runtime identity, and environment fingerprints, and rejects lock replay on mismatch; manager breadth and full policy coverage remain. |
 | Tiered validation | **Partial**; task admission now records parse/interface/security/format/lint checks, candidate/project/user tiers can require Ruff/Mypy, and exact JSON Schema is compiled; generated-test planning, independent evidence, and optional Semgrep remain incomplete. |
 | Promotion and retention | **Live for 0.1 support scope**; `/candidates`, `/candidate`, `/promote`, and `/deprecate` provide explicit project/user review and lifecycle control with durable proof, history, quality scoring, and garbage collection. Richer review/supersession UX remains. |
-| Authority inheritance and isolation | **Supported on Linux for 0.1 scope**; generated, scratch, shadow, verification, workflow, and self-host paths inherit the canonical restricted backend, with an explicit Bubblewrap confinement/process-tree release matrix. Platform parity remains incomplete. |
+| Authority inheritance and isolation | **Supported on the Linux x86_64 release cell for 0.1 scope**; generated, scratch, shadow, verification, workflow, and self-host paths inherit the canonical restricted backend, with an explicit Bubblewrap confinement/process-tree release matrix. Platform parity remains incomplete. |
 
 This table is an alignment guard. It prevents class names, comments, or
 documentation from being treated as evidence that a subsystem is complete.

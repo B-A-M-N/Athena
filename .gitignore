@@ -72,3 +72,5 @@ native/target/
 assets/Screenshot from *.png
 ui-reference/
 .release-evidence/
+.release-toolchain/
+native-desktop-acceptance.json

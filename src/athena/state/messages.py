@@ -107,10 +107,12 @@ class MessageStore:
         # row makes retry cost grow with the whole session and can race with
         # concurrent submissions.
         existing = await self._db.fetch_one(
-            "SELECT id FROM messages WHERE id = ?",
+            "SELECT session_id FROM messages WHERE id = ?",
             (message.id,),
         )
         if existing is not None:
+            if str(existing.get("session_id") or "") != str(session_id):
+                raise ValueError(f"canonical message id belongs to another session: {message.id}")
             return False
         blocks_json = json.dumps([_serialize_block(b) for b in message.blocks])
         prov_json = json.dumps(_serialize_provenance(message.provenance))
@@ -131,6 +133,11 @@ class MessageStore:
             ),
         )
         return cursor.rowcount == 1
+
+    async def get(self, message_id: str) -> Message | None:
+        """Return one durable message by its immutable identity."""
+        row = await self._db.fetch_one("SELECT * FROM messages WHERE id = ?", (message_id,))
+        return _row_to_message(row) if row is not None else None
 
     async def list_session_messages(
         self,

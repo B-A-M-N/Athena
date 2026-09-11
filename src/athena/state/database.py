@@ -253,7 +253,7 @@ class _AsyncSQLiteConnection:
     async def rollback(self) -> None:
         await self._call(lambda: self._require_connection().rollback())
 
-    async def close(self) -> None:
+    async def close(self, *, notify_owner: bool = True) -> None:
         if self._closed:
             return
 
@@ -265,7 +265,7 @@ class _AsyncSQLiteConnection:
                 connection.close()
             finally:
                 self._connection = None
-                if self._on_close is not None:
+                if notify_owner and self._on_close is not None:
                     self._on_close()
 
         try:
@@ -308,6 +308,7 @@ class Database:
         *,
         sqlite_poll_fallback: bool = False,
         migration_fault_injector: Callable[[str, str], str] | None = None,
+        startup_fault_injector: Callable[[str], None] | None = None,
     ) -> None:
         """Create a database wrapper.
 
@@ -320,6 +321,7 @@ class Database:
         self._path = path
         self._sqlite_poll_fallback = bool(sqlite_poll_fallback)
         self._migration_fault_injector = migration_fault_injector
+        self._startup_fault_injector = startup_fault_injector
         self._conn: _AsyncSQLiteConnection | None = None
         self._closed = False
         self._migrated = False
@@ -346,9 +348,13 @@ class Database:
                 poll_fallback=self._sqlite_poll_fallback,
             )
             self._conn = connection
+            startup_phase = "open"
             try:
                 await self._conn.start()
+                self._inject_startup_fault("open")
                 if self._path != ":memory:":
+                    startup_phase = "wal"
+                    self._inject_startup_fault("wal")
                     cursor = await self._conn.execute("PRAGMA journal_mode=WAL")
                     journal = await cursor.fetchone()
                     await cursor.close()
@@ -356,15 +362,42 @@ class Database:
                         raise DatabaseRecoveryRequired(
                             f"SQLite WAL mode could not be established for {self._path}"
                         )
+                startup_phase = "foreign_keys"
+                self._inject_startup_fault("foreign_keys")
                 await self._conn.execute("PRAGMA foreign_keys=ON")
-                await self._conn.execute("PRAGMA busy_timeout=5000")
+                startup_phase = "busy_timeout"
+                self._inject_startup_fault("busy_timeout")
+                # File-backed services may have a short-lived second reader
+                # during restart reconciliation (for example an operator
+                # status probe).  Give SQLite enough time to serialize that
+                # reader with a durable writer instead of surfacing a false
+                # task failure under normal contention.
+                await self._conn.execute("PRAGMA busy_timeout=30000")
+                startup_phase = "migration"
+                self._inject_startup_fault("migration")
+                await self._run_migrations()
+                if self._path != ":memory:":
+                    startup_phase = "integrity"
+                    self._inject_startup_fault("integrity")
+                    # In-memory databases cannot retain an interrupted WAL or
+                    # a truncated file; the explicit ``integrity_check`` API
+                    # still covers them when an operator/test requests it.
+                    await self._check_integrity()
+                startup_phase = "lifecycle"
+                self._inject_startup_fault("lifecycle")
+                await self._mark_started()
+                self._migrated = True
             except BaseException as exc:
                 self._startup_diagnostics = {
                     "status": "recovery_required",
                     "error": f"{type(exc).__name__}: {exc}",
                 }
                 try:
-                    await connection.close()
+                    # Startup cleanup is recoverable.  The public close path
+                    # marks the owning Database terminally closed, but a
+                    # failed open/migration/integrity/lifecycle step must
+                    # leave the same Database instance retryable.
+                    await connection.close(notify_owner=False)
                 except BaseException:
                     pass
                 self._conn = None
@@ -372,21 +405,20 @@ class Database:
                 self._txn_owner = None
                 if isinstance(exc, DatabaseRecoveryRequired):
                     raise
-                if isinstance(exc, sqlite3.DatabaseError):
+                if isinstance(exc, sqlite3.DatabaseError) and startup_phase in {
+                    "open",
+                    "wal",
+                    "foreign_keys",
+                    "busy_timeout",
+                }:
                     raise DatabaseRecoveryRequired(
                         f"SQLite database cannot be opened safely: {type(exc).__name__}: {exc}"
                     ) from exc
                 raise
-        if not self._migrated:
-            await self._run_migrations()
-            # In-memory databases cannot retain an interrupted WAL or a
-            # truncated file; the explicit ``integrity_check`` API still
-            # covers them when an operator/test requests it.  File-backed
-            # databases are checked before any service component is built.
-            if self._path != ":memory:":
-                await self._check_integrity()
-            await self._mark_started()
-            self._migrated = True
+
+    def _inject_startup_fault(self, phase: str) -> None:
+        if self._startup_fault_injector is not None:
+            self._startup_fault_injector(phase)
 
     async def _run_migrations(self) -> None:
         assert self._conn is not None

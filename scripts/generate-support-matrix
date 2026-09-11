@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind the checked-in support contract to the executed release evidence."""
+"""Generate support certification from the contract intersected with lane proof."""
 
 from __future__ import annotations
 
@@ -7,28 +7,94 @@ import argparse
 import json
 import os
 from pathlib import Path
+import platform
+import re
 import sys
+import tomllib
+
+
+SURFACE_LANES: dict[str, tuple[str, ...]] = {
+    "python": ("python-version",),
+    "mcp": ("mcp-stdio", "mcp-streamable-http"),
+    "anthropic_sdk": ("anthropic-sdk-compat",),
+    "native": ("native-check", "native-test", "native-smoke"),
+    "remote_packs": ("remote-pack-security",),
+    "rollback": ("clean-install-upgrade-rollback", "e2e"),
+    "execution_backend_passport": ("backend-passport",),
+    "endurance": ("endurance",),
+}
+
+
+def _platform_cell() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower().replace("amd64", "x86_64")
+    return f"{system}-{machine}"
+
+
+def _native_platform_cell(base: str) -> str:
+    """Return the tested native desktop cell, including its X11 WM profile."""
+    receipt_path = Path("native-desktop-acceptance.json")
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return base
+    if not isinstance(receipt, dict) or receipt.get("status") != "PASS":
+        return base
+    session = re.sub(r"[^a-z0-9]+", "-", str(receipt.get("session_type") or "unknown").lower()).strip("-")
+    wm = re.sub(r"[^a-z0-9]+", "-", str(receipt.get("wm") or "unknown").lower()).strip("-")
+    if session == "x11" and wm and wm != "unknown":
+        return f"{base}-x11-{wm}"
+    return base
+
+
+def _lane_map(path: Path, source_sha: str, run_id: str) -> dict[str, dict[str, object]]:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"invalid release lane evidence: {exc}") from exc
+    lanes = record.get("lanes") if isinstance(record, dict) else None
+    if record.get("commit_sha") != source_sha or record.get("release_run_id") != run_id:
+        raise RuntimeError("release lane evidence is not bound to this release")
+    if not isinstance(lanes, list):
+        raise RuntimeError("release lane evidence has no lane list")
+    result: dict[str, dict[str, object]] = {}
+    for lane in lanes:
+        if (
+            not isinstance(lane, dict)
+            or lane.get("commit_sha") != source_sha
+            or lane.get("release_run_id") != run_id
+        ):
+            raise RuntimeError("release lane evidence contains an unbound record")
+        name = lane.get("name")
+        if isinstance(name, str):
+            result[name] = lane
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--matrix", type=Path, default=Path("docs/support-matrix.json"))
     parser.add_argument("--passport", type=Path, required=True)
+    parser.add_argument("--release-lanes", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("release-support-matrix.json"))
+    parser.add_argument(
+        "--require-certified",
+        action="store_true",
+        help="fail the lane when any desired surface lacks current-run certification",
+    )
     parser.add_argument("--source-sha", default=os.environ.get("ATHENA_RELEASE_SHA"))
     parser.add_argument("--release-run-id", default=os.environ.get("ATHENA_RELEASE_RUN_ID"))
     args = parser.parse_args(argv)
     if not args.source_sha or not args.release_run_id:
-        parser.error(
-            "--source-sha/--release-run-id or ATHENA_RELEASE_SHA/ATHENA_RELEASE_RUN_ID required"
-        )
+        parser.error("--source-sha/--release-run-id or environment values are required")
     try:
-        matrix = json.loads(args.matrix.read_text(encoding="utf-8"))
+        contract = json.loads(args.matrix.read_text(encoding="utf-8"))
         passport = json.loads(args.passport.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        lanes = _lane_map(args.release_lanes, args.source_sha, args.release_run_id)
+    except (OSError, ValueError, RuntimeError) as exc:
         print(f"generate-support-matrix: FAIL — {exc}", file=sys.stderr)
         return 1
-    if not isinstance(matrix, dict) or not isinstance(passport, dict):
+    if not isinstance(contract, dict) or not isinstance(passport, dict):
         print("generate-support-matrix: FAIL — inputs must be JSON objects", file=sys.stderr)
         return 1
     cells = passport.get("cells")
@@ -45,26 +111,112 @@ def main(argv: list[str] | None = None) -> int:
             "generate-support-matrix: FAIL — backend passport is not a bound PASS", file=sys.stderr
         )
         return 1
-    result = dict(matrix)
-    result["generated_by"] = "scripts/generate-support-matrix"
-    generated_from = dict(result.get("generated_from") or {})
-    generated_from["release_sha"] = args.source_sha
-    generated_from["release_run_id"] = args.release_run_id
-    generated_from["behavioral_evidence"] = {
-        "backend_passport": {
-            "path": "backend-passport.json",
-            "status": passport["status"],
-            "backend": passport.get("backend"),
-            "cell_count": len(cells),
-        }
+
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = list(project["project"].get("optional-dependencies", {}).get("mcp", []))
+    anthropic = list(project["project"].get("optional-dependencies", {}).get("anthropic", []))
+    claimed_versions = {
+        "python": list(contract["surfaces"]["python"]["claimed_versions"]),
+        "mcp": [item.removeprefix("mcp==") for item in dependencies],
+        "anthropic_sdk": [item.removeprefix("anthropic==") for item in anthropic],
     }
-    result["generated_from"] = generated_from
+    actual_platform = _platform_cell()
+    native_platform = _native_platform_cell(actual_platform)
+    python_lane_output = str(lanes.get("python-version", {}).get("output") or "")
+    python_match = re.search(r"Python\s+(\d+\.\d+)(?:\.\d+)?", python_lane_output)
+    exercised_python_versions = [python_match.group(1)] if python_match else []
+    surfaces: dict[str, dict[str, object]] = {}
+    for name, desired in contract.get("surfaces", {}).items():
+        if not isinstance(desired, dict):
+            continue
+        required = SURFACE_LANES.get(name, ())
+        passing = [
+            lane
+            for lane in required
+            if int(
+                lanes.get(lane, {}).get("exit_code")
+                if lanes.get(lane, {}).get("exit_code") is not None
+                else 1
+            )
+            == 0
+        ]
+        claimed_platforms = list(desired.get("claimed_platforms") or [])
+        platform_cell = native_platform if name == "native" else actual_platform
+        platform_proven = platform_cell in claimed_platforms
+        certified = bool(required) and len(passing) == len(required) and platform_proven
+        evidence = [f"release-check:{lane}" for lane in passing]
+        result = dict(desired)
+        result["claimed_versions"] = claimed_versions.get(
+            name, list(desired.get("claimed_versions") or [])
+        )
+        certified_versions = result["claimed_versions"] if certified else []
+        if name == "python":
+            certified_versions = [
+                version
+                for version in exercised_python_versions
+                if version in result["claimed_versions"]
+            ]
+            certified = certified and bool(certified_versions)
+        result["certified_versions"] = certified_versions if certified else []
+        result["certified_platforms"] = [platform_cell] if certified else []
+        result["certification_status"] = "certified" if certified else "not_certified"
+        result["evidence_lane"] = list(required)
+        result["evidence_receipt"] = {
+            "release_run_id": args.release_run_id,
+            "source_sha": args.source_sha,
+            "platform": platform_cell,
+            "status": "PASS" if certified else "INCOMPLETE",
+        }
+        result["proof"] = {
+            "status": "certified" if certified else "not_certified",
+            "evidence": evidence,
+            "required_lanes": list(required),
+            "passing_lanes": passing,
+            "downgrade_reason": None
+            if certified
+            else "all required lanes and the current release platform must pass",
+        }
+        surfaces[name] = result
+
+    result = dict(contract)
+    result["schema"] = 2
+    result["surfaces"] = surfaces
+    result["generated_by"] = "scripts/generate-support-matrix"
+    result["generated_from"] = {
+        "contract": str(args.matrix),
+        "release_sha": args.source_sha,
+        "release_run_id": args.release_run_id,
+        "platform": actual_platform,
+        "behavioral_evidence": {
+            "backend_passport": {
+                "path": "backend-passport.json",
+                "status": passport["status"],
+                "backend": passport.get("backend"),
+                "cell_count": len(cells),
+            },
+            "release_lanes": str(args.release_lanes),
+        },
+    }
     result["release_binding"] = {
         "source_sha": args.source_sha,
         "release_run_id": args.release_run_id,
     }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"generate-support-matrix: PASS — {args.output}")
+    if args.require_certified and any(
+        surface.get("certification_status") != "certified" for surface in surfaces.values()
+    ):
+        print(
+            "generate-support-matrix: FAIL — one or more surfaces are not certified",
+            file=sys.stderr,
+        )
+        return 1
+    status = (
+        "PASS"
+        if all(surface.get("certification_status") == "certified" for surface in surfaces.values())
+        else "PARTIAL"
+    )
+    print(f"generate-support-matrix: {status} — {args.output}")
     return 0
 
 

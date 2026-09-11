@@ -11,7 +11,7 @@ Usage::
 
     scripts/release-check                 # check HEAD as a clean commit
     scripts/release-check --sha <commit>  # check an exact release candidate
-    scripts/release-check --bootstrap     # fetch locked Rust deps, then check offline
+    scripts/release-check --bootstrap     # provision pinned cargo-deny, fetch deps, then check offline
     scripts/release-check --skip-e2e      # local fast gate; not the full gate
     scripts/release-check --sha <commit> --evidence-dir .release-evidence
 """
@@ -40,7 +40,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 ENDURANCE_TIMEOUT_SECONDS = 2100.0
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from athena.release.gates import lane_stage, release_commands  # noqa: E402
+from athena.release.gates import (  # noqa: E402
+    RELEASE_POLICY_VERSION,
+    lane_stage,
+    release_commands,
+)
 
 
 def _git(*args: str, cwd: Path = REPO_ROOT) -> str:
@@ -231,6 +235,74 @@ def _release_run_id() -> str:
     return uuid.uuid4().hex
 
 
+def _certify_evidence(
+    evidence: Path,
+    *,
+    checkout: Path,
+    env: dict[str, str],
+    uv: str,
+    source_sha: str,
+    release_run_id: str,
+    timeout: float,
+) -> None:
+    """Create and cryptographically verify the root over final evidence."""
+    create = _run(
+        [
+            uv,
+            "run",
+            "--frozen",
+            "--extra",
+            "dev",
+            "python",
+            "scripts/create-certification-manifest",
+            "--evidence-dir",
+            str(evidence),
+            "--source-sha",
+            source_sha,
+            "--release-run-id",
+            release_run_id,
+            "--output",
+            str(evidence / "release-certification-manifest.json"),
+        ],
+        cwd=checkout,
+        env=env,
+        timeout=timeout,
+    )
+    if int(create.get("exit_code") or 0) != 0:
+        raise RuntimeError("certification manifest creation failed")
+    sign = _run(
+        [
+            "scripts/sign-release-provenance",
+            str(evidence / "release-certification-manifest.json"),
+            str(evidence / "release-certification.sig"),
+        ],
+        cwd=checkout,
+        env=env,
+        timeout=timeout,
+    )
+    if int(sign.get("exit_code") or 0) != 0:
+        raise RuntimeError("certification manifest signing failed")
+    verify_command = [
+        uv,
+        "run",
+        "--frozen",
+        "--extra",
+        "dev",
+        "python",
+        "scripts/verify-release-provenance",
+        str(evidence / "release-certification-manifest.json"),
+        str(evidence / "release-certification.sig"),
+        "--metadata",
+        str(evidence / "release-certification-verification.json"),
+    ]
+    certificate = evidence / "release-certification.crt"
+    if certificate.is_file():
+        verify_command.extend(["--certificate", str(certificate)])
+    verify = _run(verify_command, cwd=checkout, env=env, timeout=timeout)
+    if int(verify.get("exit_code") or 0) != 0:
+        raise RuntimeError("certification manifest failed cryptographic verification")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="scripts/release-check",
@@ -275,12 +347,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--include-endurance",
         action="store_true",
+        default=True,
         help="include the real 30-minute beta endurance lane",
+    )
+    parser.add_argument(
+        "--skip-endurance",
+        action="store_false",
+        dest="include_endurance",
+        help="skip beta endurance; the resulting evidence is not releasable",
     )
     parser.add_argument(
         "--bootstrap",
         action="store_true",
-        help="fetch locked Rust dependencies before the offline native checks",
+        help="provision pinned cargo-deny and fetch locked Rust dependencies before offline checks",
+    )
+    parser.add_argument(
+        "--defer-signing",
+        action="store_true",
+        help="leave signing to the isolated release signer job after evidence upload",
     )
     parser.add_argument(
         "--evidence-dir",
@@ -329,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
     lanes: list[dict[str, object]] = []
     final_status = "FAIL"
     error: str | None = None
+    release_env: dict[str, str] | None = None
+    certification_failure: str | None = None
     try:
         if evidence_dir is not None:
             _write_json(
@@ -355,14 +441,18 @@ def main(argv: list[str] | None = None) -> int:
                         }
                     },
                     "bootstrap": bool(args.bootstrap),
+                    "defer_signing": bool(args.defer_signing),
+                    "release_policy": RELEASE_POLICY_VERSION,
                 },
             )
         _extract_commit(resolved, checkout, timeout=args.timeout)
         env = dict(os.environ)
+        release_env = env
         env["PYTHONPATH"] = str(checkout / "src") + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
         env.pop("PYTHONHOME", None)
+        env.pop("VIRTUAL_ENV", None)
         env["ATHENA_RELEASE_SHA"] = resolved
         env["ATHENA_RELEASE_RUN_ID"] = run_id
         env["ATHENA_FROZEN_SOURCE"] = "1"
@@ -372,11 +462,65 @@ def main(argv: list[str] | None = None) -> int:
         else:
             env.pop("ATHENA_HERMES_INTEGRATION_GATE", None)
         env["ATHENA_RELEASE_UV"] = args.uv
+        env["ATHENA_SUPPLY_CHAIN_EVIDENCE_DIR"] = str(
+            evidence_stage if evidence_stage is not None else checkout / "release-evidence"
+        )
         # Keep uv's environment outside the checkout. Otherwise the first
         # ``uv run`` can create an untracked .venv and make the later
         # scenarios --require-clean assertion fail for the wrong reason.
         env["UV_PROJECT_ENVIRONMENT"] = str(temp_root / "venv")
         env["UV_CACHE_DIR"] = str(temp_root / "uv-cache")
+        resolved_uv = shutil.which(args.uv) or args.uv
+        if not Path(resolved_uv).is_file():
+            raise RuntimeError(f"configured uv executable is unavailable: {args.uv}")
+        args.uv = str(Path(resolved_uv).resolve())
+        env["ATHENA_RELEASE_UV"] = args.uv
+        toolchain_bin = temp_root / "toolchain-bin"
+        toolchain_bin.mkdir()
+        for tool in ("cargo", "rustc"):
+            resolved_tool = shutil.which(tool)
+            if not resolved_tool:
+                raise RuntimeError(f"required toolchain executable is unavailable: {tool}")
+            (toolchain_bin / tool).symlink_to(Path(resolved_tool).resolve())
+        env["PATH"] = str(toolchain_bin) + os.pathsep + env.get("PATH", "")
+        cosign_configured = env.get("ATHENA_COSIGN") or env.get("COSIGN_BIN")
+        resolved_cosign = (
+            shutil.which(cosign_configured) if cosign_configured else shutil.which("cosign")
+        )
+        if resolved_cosign:
+            env["ATHENA_COSIGN"] = str(Path(resolved_cosign).resolve())
+        resolved_system_python = shutil.which("python3")
+        if resolved_system_python:
+            env["ATHENA_RELEASE_SYSTEM_PYTHON"] = str(Path(resolved_system_python).resolve())
+        if args.bootstrap:
+            cargo_deny_root = temp_root / "cargo-deny"
+            cargo_deny_receipt = temp_root / "cargo-deny-bootstrap.json"
+            bootstrap_command = [
+                "scripts/bootstrap-cargo-deny",
+                "--output-dir",
+                str(cargo_deny_root),
+            ]
+            bootstrap_record = _run(
+                bootstrap_command,
+                cwd=checkout,
+                env={**env, "ATHENA_CARGO_DENY_RECEIPT": str(cargo_deny_receipt)},
+                timeout=args.timeout,
+            )
+            bootstrap_record.update(
+                {
+                    "name": "cargo-deny-bootstrap",
+                    "commit_sha": resolved,
+                    "release_run_id": run_id,
+                }
+            )
+            lanes.append(bootstrap_record)
+            if int(bootstrap_record.get("exit_code") or 0) != 0:
+                raise RuntimeError(
+                    "cargo-deny bootstrap failed: " + str(bootstrap_record.get("output") or "")
+                )
+            env["ATHENA_CARGO_DENY_BIN"] = str(cargo_deny_root / "bin" / "cargo-deny")
+            if evidence_dir is not None and cargo_deny_receipt.is_file():
+                shutil.copy2(cargo_deny_receipt, evidence_stage / cargo_deny_receipt.name)
         lanes_to_run = release_commands(
             args.uv,
             skip_e2e=args.skip_e2e,
@@ -396,6 +540,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             static_by_name = {}
         for name, command in lanes_to_run:
+            if name == "support-matrix-release":
+                _write_json(
+                    checkout / "release-lane-results.json",
+                    {
+                        "commit_sha": resolved,
+                        "release_run_id": run_id,
+                        "lanes": [_evidence_record(item) for item in lanes],
+                    },
+                )
             if name in static_by_name:
                 record = static_by_name[name]
             else:
@@ -465,6 +618,14 @@ def main(argv: list[str] | None = None) -> int:
                         evidence_stage / "backend-passport.json",
                         json.dumps(passport, indent=2, sort_keys=True) + "\n",
                     )
+            if name == "toolchain-passport" and int(record.get("exit_code") or 0) == 0:
+                passport_path = checkout / "toolchain-passport.json"
+                if not passport_path.is_file():
+                    raise RuntimeError(
+                        "toolchain passport lane did not produce toolchain-passport.json"
+                    )
+                if evidence_dir is not None:
+                    shutil.copy2(passport_path, evidence_stage / passport_path.name)
             if name == "endurance" and int(record.get("exit_code") or 0) == 0:
                 receipt_path = checkout / "endurance-receipt.json"
                 if not receipt_path.is_file():
@@ -538,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
                 "support-matrix",
                 "architecture-lint",
                 "uv-lock-check",
+                "migration-baseline",
             }
             _write_json(
                 evidence_stage / "static-checks.json",
@@ -589,7 +751,7 @@ def main(argv: list[str] | None = None) -> int:
                     "SKIPPED: installed-artifact acceptance was explicitly omitted\n",
                 )
             if args.stage is None and not args.skip_e2e:
-                provenance_commands = (
+                provenance_commands = [
                     (
                         "release-provenance",
                         [
@@ -607,16 +769,19 @@ def main(argv: list[str] | None = None) -> int:
                             "--output",
                             str(evidence_stage / "release-provenance.json"),
                         ],
-                    ),
-                    (
-                        "release-provenance-signature",
-                        [
-                            "scripts/sign-release-provenance",
-                            str(evidence_stage / "release-provenance.json"),
-                            str(evidence_stage / "release-provenance.sig"),
-                        ],
-                    ),
-                )
+                    )
+                ]
+                if not args.defer_signing:
+                    provenance_commands.append(
+                        (
+                            "release-provenance-signature",
+                            [
+                                "scripts/sign-release-provenance",
+                                str(evidence_stage / "release-provenance.json"),
+                                str(evidence_stage / "release-provenance.sig"),
+                            ],
+                        )
+                    )
                 for name, command in provenance_commands:
                     record = _run(command, cwd=checkout, env=env, timeout=args.timeout)
                     record["name"] = name
@@ -627,6 +792,37 @@ def main(argv: list[str] | None = None) -> int:
                         raise RuntimeError(
                             f"command failed with exit {record['exit_code']}: {' '.join(command)}"
                         )
+                    if name == "release-provenance-signature":
+                        verification_command = [
+                            args.uv,
+                            "run",
+                            "--frozen",
+                            "--extra",
+                            "dev",
+                            "python",
+                            "scripts/verify-release-provenance",
+                            str(evidence_stage / "release-provenance.json"),
+                            str(evidence_stage / "release-provenance.sig"),
+                            "--metadata",
+                            str(evidence_stage / "release-provenance-verification.json"),
+                        ]
+                        certificate = evidence_stage / "release-provenance.crt"
+                        if certificate.is_file():
+                            verification_command.extend(["--certificate", str(certificate)])
+                        record = _run(
+                            verification_command,
+                            cwd=checkout,
+                            env=env,
+                            timeout=args.timeout,
+                        )
+                        record["name"] = "release-provenance-verification"
+                        record["commit_sha"] = resolved
+                        record["release_run_id"] = run_id
+                        lanes.append(record)
+                        if int(record.get("exit_code") or 0) != 0:
+                            raise RuntimeError(
+                                "release provenance failed immediate cryptographic verification"
+                            )
         if args.stage is not None:
             final_status = f"STAGE_{args.stage.upper()}_PASS"
             print(
@@ -635,10 +831,18 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
         else:
-            final_status = "PARTIAL_PASS" if args.skip_e2e else "PASS"
+            releasable_gate = (
+                not args.skip_e2e and args.include_endurance and evidence_dir is not None
+            )
+            final_status = "PASS" if releasable_gate else "PARTIAL_PASS"
             if args.skip_e2e:
                 print(
                     "release-check: PARTIAL PASS — e2e omitted, not releasable",
+                    flush=True,
+                )
+            elif not args.include_endurance:
+                print(
+                    "release-check: PARTIAL PASS — endurance omitted, not releasable",
                     flush=True,
                 )
             else:
@@ -659,36 +863,73 @@ def main(argv: list[str] | None = None) -> int:
             and evidence_stage is not None
             and final_status != "INTERRUPTED"
         ):
-            _write_json(
-                evidence_stage / "final-release-result.json",
-                {
-                    "commit_sha": resolved,
-                    "release_run_id": run_id,
-                    "status": final_status,
-                    "releasable": final_status == "PASS",
-                    "error": error,
-                    "optional_integrations": {
-                        "hermes_referee": {
-                            "required_for_core_release": False,
-                            "source_sha": resolved,
-                            "commit_sha": resolved,
-                            "release_run_id": run_id,
-                            "status": (
-                                "PASS"
-                                if any(
-                                    item.get("name") == "hermes-live"
-                                    and int(item.get("exit_code") or 0) == 0
-                                    for item in lanes
-                                )
-                                else "FAIL"
-                                if args.include_hermes_live
-                                else "not_certified_live"
-                            ),
-                        }
-                    },
-                    "lanes": [_evidence_record(item) for item in lanes],
+            result_record = {
+                "commit_sha": resolved,
+                "release_run_id": run_id,
+                "release_policy": RELEASE_POLICY_VERSION,
+                "status": final_status,
+                "releasable": (
+                    final_status == "PASS"
+                    and evidence_dir is not None
+                    and args.skip_e2e is False
+                    and args.include_endurance is True
+                ),
+                "provenance_verification": (
+                    json.loads(
+                        (evidence_stage / "release-provenance-verification.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    if (evidence_stage / "release-provenance-verification.json").is_file()
+                    else None
+                ),
+                "error": error,
+                "optional_integrations": {
+                    "hermes_referee": {
+                        "required_for_core_release": False,
+                        "source_sha": resolved,
+                        "commit_sha": resolved,
+                        "release_run_id": run_id,
+                        "status": (
+                            "PASS"
+                            if any(
+                                item.get("name") == "hermes-live"
+                                and int(item.get("exit_code") or 0) == 0
+                                for item in lanes
+                            )
+                            else "FAIL"
+                            if args.include_hermes_live
+                            else "not_certified_live"
+                        ),
+                    }
                 },
-            )
+                "lanes": [_evidence_record(item) for item in lanes],
+            }
+            _write_json(evidence_stage / "final-release-result.json", result_record)
+            if (
+                final_status == "PASS"
+                and result_record["releasable"] is True
+                and release_env is not None
+                and not args.defer_signing
+            ):
+                try:
+                    _certify_evidence(
+                        evidence_stage,
+                        checkout=checkout,
+                        env=release_env,
+                        uv=args.uv,
+                        source_sha=resolved,
+                        release_run_id=run_id,
+                        timeout=args.timeout,
+                    )
+                except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+                    error = f"certification root failed: {exc}"
+                    certification_failure = error
+                    final_status = "FAIL"
+                    result_record["status"] = final_status
+                    result_record["releasable"] = False
+                    result_record["error"] = error
+                    _write_json(evidence_stage / "final-release-result.json", result_record)
             evidence_dir.parent.mkdir(parents=True, exist_ok=True)
             if evidence_dir.exists():
                 raise RuntimeError(f"release evidence target already exists: {evidence_dir}")
@@ -697,6 +938,8 @@ def main(argv: list[str] | None = None) -> int:
         shutil.rmtree(temp_root, ignore_errors=True)
         if evidence_dir is not None:
             print(f"release-check: evidence published at {evidence_dir}", flush=True)
+        if certification_failure is not None:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

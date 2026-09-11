@@ -112,20 +112,26 @@ def test_remote_pack_requires_operator_hash_and_separates_authenticity(tmp_path,
         "endpoint_classification": "public",
         "archive_sha256": digest,
         "expected_sha256": digest,
-        "expected_sha256_source": "operator",
+        "expected_sha256_source": "unknown",
         "digest_match": True,
-        "source_authenticated": True,
-        "operator_expected_sha256": digest,
+        "source_authenticated": False,
+        "operator_expected_sha256": None,
         "operator_approved": False,
     }
     assert result["provenance"]["digest_verification"] == {
         "algorithm": "sha256",
         "computed": digest,
         "expected": digest,
-        "expected_source": "operator",
+        "expected_source": "unknown",
         "matched": True,
-        "source_authenticated": True,
+        "source_authenticated": False,
     }
+    explicit_operator = manager.fetch_remote(
+        "https://packs.example.test/example.zip",
+        expected_sha256=digest,
+        expected_sha256_source="operator",
+    )
+    assert explicit_operator["authenticity"]["source_authenticated"] is True
     with pytest.raises(ValueError, match="expected_sha256"):
         manager.fetch_remote("https://packs.example.test/example.zip")
 

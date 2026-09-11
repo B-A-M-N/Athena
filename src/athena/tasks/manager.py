@@ -109,6 +109,7 @@ class TaskManager:
         self._events = events
         self._sessions = sessions
         self._budgets = budgets
+        self._model_response_store: Any = None
         self._cancellations = cancellations
         self._admission = admission
         self._principal_id = principal_id
@@ -134,6 +135,26 @@ class TaskManager:
     def set_budget_tracker(self, budgets: Any) -> None:
         """Late-bind the budget authority (construction-order tolerant, §19)."""
         self._budgets = budgets
+
+    def set_model_response_store(self, store: Any) -> None:
+        """Bind durable provider-outcome liability checks."""
+        self._model_response_store = store
+
+    async def _release_model_reservations_if_safe(self, task_id: str) -> None:
+        """Release only reservations whose provider outcome is known.
+
+        An UNKNOWN provider outcome is an external liability, not an ordinary
+        failed call. Keep its reservation across task finalization and restart
+        until an operator reconciles the attempt.
+        """
+        store = self._model_response_store
+        if store is not None:
+            unresolved = getattr(store, "has_unresolved_liability", None)
+            if callable(unresolved) and await unresolved(task_id):
+                return
+        release = getattr(self._budgets, "release_model_cost", None)
+        if release is not None:
+            await release(task_id)
 
     def set_cancellation_manager(self, cancellations: Any) -> None:
         """Late-bind the cancellation authority (construction-order tolerant, §20)."""
@@ -417,6 +438,7 @@ class TaskManager:
         reason: str | None = None,
         usage: UsageSummary | None = None,
         summary: str = "",
+        unresolved: tuple | None = None,
         evidence: tuple = (),
         artifacts: tuple = (),
         mutations: tuple = (),
@@ -434,6 +456,11 @@ class TaskManager:
 
         if usage is None:
             usage = UsageSummary()
+        result_unresolved = (
+            tuple(unresolved)
+            if unresolved is not None
+            else tuple(getattr(decision, "unresolved", ()) or ())
+        )
         result = TaskResult(
             task_id=task_id,
             status=status,
@@ -441,7 +468,7 @@ class TaskManager:
             evidence=tuple(evidence or ()),
             artifacts=tuple(artifacts or ()),
             mutations=tuple(mutations or ()),
-            unresolved=tuple(getattr(decision, "unresolved", ()) or ()),
+            unresolved=result_unresolved,
             usage=usage,
             created_at=utcnow(),
         )
@@ -603,9 +630,7 @@ class TaskManager:
         await self._emit(task, result.status)
 
         if self._budgets is not None:
-            release = getattr(self._budgets, "release_model_cost", None)
-            if release is not None:
-                await release(task_id)
+            await self._release_model_reservations_if_safe(task_id)
             self._budgets.consume_result(task_id, result.usage)
             persist_budget = getattr(self._budgets, "_persist_usage", None)
             if persist_budget is not None:
@@ -729,9 +754,7 @@ class TaskManager:
     async def apply_result(self, task_id: str, result: TaskResult) -> None:
         await self._persist_result(task_id, result)
         if self._budgets is not None:
-            release = getattr(self._budgets, "release_model_cost", None)
-            if release is not None:
-                await release(task_id)
+            await self._release_model_reservations_if_safe(task_id)
             self._budgets.consume_result(task_id, result.usage)
             persist_budget = getattr(self._budgets, "_persist_usage", None)
             if persist_budget is not None:

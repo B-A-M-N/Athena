@@ -29,6 +29,7 @@ import os
 import tempfile
 from dataclasses import replace
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -114,6 +115,7 @@ from athena.protocol.tasks import (
     AutonomyLevel,
     CapabilityPolicy,
     ContextRef,
+    FINAL_STATUSES,
     ResourceBudget,
     MutationMode,
     NetworkPolicy,
@@ -149,6 +151,59 @@ _DEFAULT_ANSWER_SCRIPTS = (
 )
 
 _logger = logging.getLogger("athena.service")
+
+
+def _validated_actual_cost(value: Decimal | str | None) -> Decimal | None:
+    """Validate the operator/API cost at the application boundary."""
+    if value is None:
+        return None
+    try:
+        cost = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("actual_cost must be a finite, non-negative Decimal") from exc
+    if not cost.is_finite() or cost < 0:
+        raise ValueError("actual_cost must be a finite, non-negative Decimal")
+    return cost
+
+
+_PROVIDER_OUTCOME_CONTRACT: dict[str, dict[str, Any]] = {
+    "confirmed_failed": {
+        "attempt_status": "FAILED",
+        "receipt_status": "FAILED",
+        "reservation": "released",
+        "actual_cost": "not_required",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+    "retry_authorized": {
+        "attempt_status": "UNKNOWN",
+        "receipt_status": "FAILED",
+        "reservation": "released",
+        "actual_cost": "not_required",
+        "task_transition": "RECOVERY_REQUIRED|INTERRUPTED -> RUNNING",
+        "inference_retry": "one replacement attempt",
+        "operator_revisable": False,
+    },
+    "confirmed_succeeded": {
+        "attempt_status": "COMPLETED",
+        "receipt_status": "FAILED",
+        "reservation": "released after actual-cost accounting",
+        "actual_cost": "required finite non-negative Decimal",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+    "abandoned_with_liability": {
+        "attempt_status": "ABANDONED",
+        "receipt_status": "FAILED",
+        "reservation": "retained until manual liability closeout",
+        "actual_cost": "optional/unknown",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+}
 
 _RESERVED_REQUEST_METADATA = frozenset(
     {
@@ -214,6 +269,11 @@ class AthenaService:
         self._recovery_status = "not_started"
         self._recovery_summary: dict[str, int] = {}
         self._recovery_error: str | None = None
+        self._provider_recovery_health: dict[str, Any] = {
+            "state": "not_started",
+            "unresolved_count": 0,
+            "error": None,
+        }
         self._startup_health: dict[str, Any] = {
             "status": "not_started",
             "checks": {},
@@ -456,6 +516,7 @@ class AthenaService:
                 "summary": dict(self._recovery_summary),
                 "error": self._recovery_error,
             },
+            "provider_outcome_recovery": dict(self._provider_recovery_health),
             "mcp": mcp,
             "capability_profile": capability_profile,
             "optional_capabilities": {
@@ -913,9 +974,14 @@ class AthenaService:
         wait: bool = False,
         user_request: Any | None = None,
         trusted: bool = False,
+        enqueue: bool = True,
     ) -> TaskSpec:
         return await TaskAPI(self).submit_spec(
-            spec, wait=wait, user_request=user_request, trusted=trusted
+            spec,
+            wait=wait,
+            user_request=user_request,
+            trusted=trusted,
+            enqueue=enqueue,
         )
 
     async def submit_self_host(
@@ -1036,10 +1102,14 @@ class AthenaService:
         *,
         wait: bool,
         user_request: AgentRequest | None = None,
+        enqueue: bool = True,
     ):
         return await TaskAPI(self)._enqueue_spec(
-            task_manager, spec, wait=wait, user_request=user_request
+            task_manager, spec, wait=wait, user_request=user_request, enqueue=enqueue
         )
+
+    async def _reconcile_created_intake(self) -> dict[str, int]:
+        return await TaskAPI(self).reconcile_created_intake()
 
     def _spawn_static_prefetch(self, task: TaskSpec) -> None:
         compiler = self._compiler
@@ -1065,7 +1135,9 @@ class AthenaService:
     async def _record_canonical_user_turn(self, request: Any, task: TaskSpec) -> None:
         """Append the service-owned user turn exactly once before enqueueing."""
         if self._store_messages is None or not task.session_id:
-            return
+            raise RuntimeError(
+                f"task {task.id!r} cannot enter the queue without a durable session/message store"
+            )
         from athena.protocol.messages import (
             ArtifactRefBlock,
             FileRefBlock,
@@ -1540,6 +1612,337 @@ class AthenaService:
 
     async def get_result(self, task_id: str):
         return await TaskAPI(self).get_result(task_id)
+
+    async def list_provider_outcome_recoveries(
+        self, task_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List provider attempts that still require operator reconciliation."""
+        store = self._model_response_store
+        if store is None:
+            self._provider_recovery_health.update(
+                {"state": "unavailable", "error": "provider recovery store is unavailable"}
+            )
+            raise RuntimeError("provider outcome recovery store is unavailable")
+        try:
+            rows = await store.list_unresolved_attempts(task_id=task_id)
+        except Exception as exc:
+            self._provider_recovery_health.update({"state": "unavailable", "error": str(exc)})
+            raise RuntimeError("provider outcome recovery store could not be read") from exc
+        self._provider_recovery_health.update(
+            {
+                "state": "degraded" if rows else "ready",
+                "unresolved_count": len(rows),
+                "error": None,
+            }
+        )
+        return rows
+
+    async def get_provider_outcome_recovery(self, attempt_id: str) -> dict[str, Any] | None:
+        """Return one durable provider-outcome recovery record."""
+        store = self._model_response_store
+        if store is None:
+            raise RuntimeError("provider outcome recovery store is unavailable")
+        return await store.get_attempt(str(attempt_id))
+
+    async def resolve_provider_outcome(
+        self,
+        attempt_id: str,
+        *,
+        resolution: str,
+        note: str,
+        provider_response_id: str | None = None,
+        actual_cost: Decimal | str | None = None,
+    ) -> dict[str, Any]:
+        """Apply one explicit provider-outcome disposition and its task effect.
+
+        ``confirmed_failed`` releases the reservation and terminally fails the
+        task. ``retry_authorized`` releases the reservation and starts a new
+        attempt. ``confirmed_succeeded`` records the known charge, releases the
+        reservation, and terminally fails the task because its response body is
+        unavailable. ``abandoned_with_liability`` terminally fails the task but
+        deliberately retains the reservation for manual financial closeout.
+        """
+        resolution = str(resolution).strip().lower()
+        note = str(note).strip()
+        if not note:
+            raise ValueError("provider outcome resolution requires a non-empty note")
+        normalized_cost = _validated_actual_cost(actual_cost)
+        store = self._model_response_store
+        if store is None:
+            raise RuntimeError("provider outcome recovery is unavailable")
+        attempt = await store.get_attempt(str(attempt_id))
+        if attempt is None:
+            raise KeyError(f"unknown inference attempt: {attempt_id}")
+        if resolution == "confirmed_succeeded" and normalized_cost is None:
+            prior_cost = attempt.get("actual_cost")
+            if prior_cost in (None, ""):
+                raise ValueError("confirmed_succeeded requires actual_cost")
+            normalized_cost = _validated_actual_cost(str(prior_cost))
+        resolved = await store.resolve_provider_outcome(
+            attempt_id=str(attempt_id),
+            resolution=resolution,
+            note=note,
+            provider_response_id=provider_response_id,
+            actual_cost=normalized_cost,
+        )
+        task_id = str(resolved.get("task_id") or attempt.get("task_id") or "")
+        amount = _validated_actual_cost(resolved.get("reservation_amount")) or Decimal("0")
+        if resolution in {"confirmed_failed", "retry_authorized"}:
+            await AthenaService._release_provider_reservation(
+                self,
+                store,
+                task_id=task_id,
+                attempt_id=str(attempt_id),
+                amount=amount,
+            )
+        elif resolution == "confirmed_succeeded":
+            budgets = getattr(self, "_budgets", None)
+            if budgets is not None:
+                await budgets.apply_model_accounting(
+                    task_id,
+                    str(attempt_id),
+                    reserved=amount,
+                    input_tokens=int(resolved.get("actual_input_tokens") or 0),
+                    output_tokens=int(resolved.get("actual_output_tokens") or 0),
+                    actual_cost=normalized_cost,
+                    reservation_id=str(attempt_id),
+                )
+                await store.mark_budget_accounted(attempt_id=str(attempt_id))
+            await store.mark_reservation_released(attempt_id=str(attempt_id))
+        if self._store_events is not None:
+            await self._store_events.append_event(
+                "ProviderOutcomeResolved",
+                {
+                    "attempt_id": str(attempt_id),
+                    "task_id": task_id,
+                    "resolution": str(resolution),
+                    "provider": resolved.get("provider"),
+                    "model": resolved.get("model"),
+                    "provider_response_id": resolved.get("provider_response_id"),
+                },
+                task_id=task_id or None,
+            )
+        if resolution == "retry_authorized":
+            await AthenaService._launch_provider_retry(self, task_id)
+        elif resolution in {
+            "confirmed_failed",
+            "confirmed_succeeded",
+            "abandoned_with_liability",
+        }:
+            await AthenaService._finalize_provider_outcome(
+                self,
+                task_id,
+                resolution=resolution,
+                attempt_id=str(attempt_id),
+            )
+        return await AthenaService._provider_resolution_view(self, resolved)
+
+    async def close_provider_liability(self, attempt_id: str, *, note: str) -> dict[str, Any]:
+        """Close the financial reservation for an abandoned provider attempt."""
+        note = str(note).strip()
+        if not note:
+            raise ValueError("provider liability closeout requires a non-empty note")
+        store = self._model_response_store
+        if store is None:
+            raise RuntimeError("provider outcome recovery store is unavailable")
+        attempt = await store.get_attempt(str(attempt_id))
+        if attempt is None:
+            raise KeyError(f"unknown inference attempt: {attempt_id}")
+        if str(attempt.get("provider_outcome_status") or "").lower() != (
+            "abandoned_with_liability"
+        ):
+            raise ValueError("only abandoned provider liabilities can be manually closed")
+        amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
+        budgets = getattr(self, "_budgets", None)
+        if budgets is not None and amount > 0:
+            await budgets.release_model_cost(
+                str(attempt.get("task_id") or ""), amount, reservation_id=str(attempt_id)
+            )
+        closed = await store.close_provider_liability(attempt_id=str(attempt_id), note=note)
+        if self._store_events is not None:
+            await self._store_events.append_event(
+                "ProviderLiabilityClosed",
+                {
+                    "attempt_id": str(attempt_id),
+                    "task_id": closed.get("task_id"),
+                    "note": note,
+                },
+                task_id=str(closed.get("task_id") or "") or None,
+            )
+        view = await AthenaService._provider_resolution_view(self, closed)
+        view["liability_closed"] = True
+        view["next_actions"] = []
+        return view
+
+    async def _release_provider_reservation(
+        self,
+        store: Any,
+        *,
+        task_id: str,
+        attempt_id: str,
+        amount: Decimal,
+    ) -> None:
+        budgets = getattr(self, "_budgets", None)
+        if budgets is not None and amount > 0:
+            await budgets.release_model_cost(task_id, amount, reservation_id=attempt_id)
+        await store.mark_reservation_released(attempt_id=attempt_id)
+
+    async def _finalize_provider_outcome(
+        self,
+        task_id: str,
+        *,
+        resolution: str,
+        attempt_id: str,
+    ) -> None:
+        manager = getattr(self, "_task_manager", None)
+        tasks = getattr(self, "_store_tasks", None)
+        if manager is None or tasks is None or not task_id:
+            return
+        row = await tasks.get(task_id)
+        if row is None:
+            return
+        current = TaskStatus(str(row.get("status") or ""))
+        if current in FINAL_STATUSES:
+            return
+        if current is not TaskStatus.RECOVERY_REQUIRED:
+            await manager.transition(
+                task_id,
+                TaskStatus.RECOVERY_REQUIRED,
+                reason=f"provider outcome {resolution} requires task finalization",
+            )
+        unresolved = (
+            (f"provider_response_unavailable:{attempt_id}",)
+            if resolution == "confirmed_succeeded"
+            else (f"provider_liability:{attempt_id}",)
+            if resolution == "abandoned_with_liability"
+            else ()
+        )
+        await manager.finalize(
+            task_id,
+            status=TaskStatus.FAILED,
+            reason=f"provider outcome resolved as {resolution}",
+            summary=f"Provider outcome resolved as {resolution}; no safe continuation remains.",
+            unresolved=unresolved,
+            _allow_recovery_completion=True,
+        )
+
+    async def _launch_provider_retry(self, task_id: str) -> None:
+        manager = getattr(self, "_task_manager", None)
+        tasks = getattr(self, "_store_tasks", None)
+        kernel = getattr(self, "_kernel", None)
+        if manager is None or tasks is None or kernel is None or not task_id:
+            return
+        row = await tasks.get(task_id)
+        if row is None or str(row.get("status") or "") in {item.value for item in FINAL_STATUSES}:
+            return
+        status = TaskStatus(str(row.get("status") or ""))
+        if status in {TaskStatus.RECOVERY_REQUIRED, TaskStatus.INTERRUPTED}:
+            await manager.transition(
+                task_id,
+                TaskStatus.RUNNING,
+                reason="provider outcome reconciled; retry authorized",
+            )
+        elif status is not TaskStatus.RUNNING:
+            return
+        recovery = asyncio.create_task(kernel.run_task(task_id))
+        registry = getattr(self, "_approval_recovery_tasks", None)
+        if registry is not None:
+            registry.add(recovery)
+        recovery.add_done_callback(
+            self._log_background_failure(f"provider outcome recovery {task_id}")
+        )
+
+    async def _provider_resolution_view(self, resolved: dict[str, Any]) -> dict[str, Any]:
+        """Return the disposition plus operator-relevant consequences."""
+        view = dict(resolved)
+        resolution = str(view.get("provider_outcome_status") or "")
+        if resolution in _PROVIDER_OUTCOME_CONTRACT:
+            view["disposition_contract"] = dict(_PROVIDER_OUTCOME_CONTRACT[resolution])
+        task_id = str(view.get("task_id") or "")
+        tasks = getattr(self, "_store_tasks", None)
+        if tasks is not None and task_id:
+            row = await tasks.get(task_id)
+            view["task_status"] = row.get("status") if row is not None else None
+        store = getattr(self, "_model_response_store", None)
+        if store is not None and task_id:
+            view["liability_open"] = await store.has_unresolved_liability(task_id)
+        view["accounted_amount"] = (
+            view.get("actual_cost")
+            if view.get("provider_outcome_status") == "confirmed_succeeded"
+            else "0"
+        )
+        view["next_actions"] = (
+            ["manually close provider liability"]
+            if view.get("provider_outcome_status") == "abandoned_with_liability"
+            else []
+        )
+        return view
+
+    async def reconcile_provider_outcomes(self) -> dict[str, int]:
+        """Replay resolved provider dispositions after a process restart."""
+        store = self._model_response_store
+        if store is None:
+            return {"replayed": 0, "failed": 0}
+        replayed = 0
+        failed = 0
+        for attempt in await store.list_resolved_attempts():
+            try:
+                resolution = str(attempt.get("provider_outcome_status") or "")
+                task_id = str(attempt.get("task_id") or "")
+                amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
+                attempt_id = str(attempt.get("attempt_id") or "")
+                receipt = await store.get_receipt(
+                    task_id=task_id,
+                    request_fingerprint=str(attempt.get("request_fingerprint") or ""),
+                )
+                if (
+                    resolution == "retry_authorized"
+                    and receipt is not None
+                    and str(receipt.get("attempt_id") or "") != attempt_id
+                ):
+                    # A replacement attempt was already prepared. The old
+                    # authorization is historical and must not launch a second
+                    # retry after restart.
+                    replayed += 1
+                    continue
+                if resolution in {"confirmed_failed", "retry_authorized"} and not attempt.get(
+                    "reservation_released_at"
+                ):
+                    await self._release_provider_reservation(
+                        store, task_id=task_id, attempt_id=attempt_id, amount=amount
+                    )
+                elif resolution == "confirmed_succeeded":
+                    cost = _validated_actual_cost(attempt.get("actual_cost"))
+                    if cost is None:
+                        raise RuntimeError(f"resolved success {attempt_id} has no actual cost")
+                    if not attempt.get("budget_accounted_at") and self._budgets is not None:
+                        await self._budgets.apply_model_accounting(
+                            task_id,
+                            attempt_id,
+                            reserved=amount,
+                            input_tokens=int(attempt.get("actual_input_tokens") or 0),
+                            output_tokens=int(attempt.get("actual_output_tokens") or 0),
+                            actual_cost=cost,
+                            reservation_id=attempt_id,
+                        )
+                        await store.mark_budget_accounted(attempt_id=attempt_id)
+                    if not attempt.get("reservation_released_at"):
+                        await store.mark_reservation_released(attempt_id=attempt_id)
+                if resolution == "retry_authorized":
+                    await self._launch_provider_retry(task_id)
+                elif resolution in {
+                    "confirmed_failed",
+                    "confirmed_succeeded",
+                    "abandoned_with_liability",
+                }:
+                    await self._finalize_provider_outcome(
+                        task_id, resolution=resolution, attempt_id=attempt_id
+                    )
+                replayed += 1
+            except Exception:
+                failed += 1
+                raise
+        return {"replayed": replayed, "failed": failed}
 
     async def stream_events(self, task_id: str, after_sequence: int = 0):
         async for ev in TaskAPI(self).stream_events(task_id, after_sequence=after_sequence):

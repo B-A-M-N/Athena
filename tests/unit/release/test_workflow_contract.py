@@ -8,6 +8,7 @@ def test_workflow_keeps_core_release_and_hermes_certification_separate():
     text = WORKFLOW.read_text(encoding="utf-8")
 
     assert "  core-release-certification:" in text
+    assert "  release-signer:" in text
     assert "  hermes-referee-transport-certification:" in text
     assert "  protected-release:\n" not in text
     assert "vars.ATHENA_HERMES_E2E_ENABLED == 'true'" in text
@@ -21,7 +22,9 @@ def test_workflow_keeps_core_release_and_hermes_certification_separate():
 def test_workflow_verification_and_publish_depend_on_core_evidence():
     text = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "needs: [core-release-certification]" in text
+    assert "needs: [release-signer]" in text
+    assert "--defer-signing" in text
+    assert "id-token: write" in text
     assert "needs: [verify-release]" in text
     assert "name: athena-release-verified-${{ github.sha }}" in text
 

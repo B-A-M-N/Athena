@@ -7,7 +7,7 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/athena-uv-cache}"
 # This script is invoked directly by the frozen release lane, not inside an
 # already-synchronized ``uv run``.  ``--no-sync`` would create an empty
 # release venv and make the declared ``build`` dev dependency unavailable.
-build_python=(uv run --frozen --extra dev python)
+build_python=("${ATHENA_RELEASE_UV:-uv}" run --frozen --extra dev python)
 
 output_dir="dist"
 if [[ "${1:-}" == "--output-dir" ]]; then
@@ -35,6 +35,7 @@ rm -rf "$repo_root/build"
 
 "${build_python[@]}" - "$output_dir" "$distributions_dir" <<'PY'
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -107,6 +108,7 @@ if canonical_version(native_version) != python_version:
     )
 lock_text = (root / "native" / "Cargo.lock").read_text()
 lock_data = tomllib.loads(lock_text)
+uv_lock_data = tomllib.loads((root / "uv.lock").read_text())
 binary = root / "native" / "target" / "release" / "athena-terminal"
 bridge = (root / "src" / "athena" / "cli" / "native_bridge.py").read_text()
 bridge_version = next(
@@ -145,6 +147,113 @@ sbom_packages = []
 cargo_lock_sha256 = sha(root / "native" / "Cargo.lock")
 python_lock_path = root / "uv.lock"
 python_lock_sha256 = sha(python_lock_path) if python_lock_path.is_file() else "unavailable"
+
+
+def _license_from_python_metadata(package_name: str) -> tuple[str, dict[str, str]]:
+    """Return an SPDX expression plus the metadata provenance for it.
+
+    ``uv.lock`` intentionally records resolution data, not package license
+    declarations.  Prefer the standardized PEP 639 field, then the legacy
+    metadata field/classifiers.  Packages that are locked for another
+    platform may not be installed in this builder; those are explicit
+    ``NOASSERTION`` records rather than silently omitted components.
+    """
+    if _normalized_package_name(package_name) == _normalized_package_name(project["project"]["name"]):
+        value = str(project["project"].get("license") or "NOASSERTION")
+        return value, {"source": "pyproject.toml", "field": "project.license", "value": value}
+    try:
+        metadata = importlib.metadata.metadata(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "NOASSERTION", {
+            "source": "unavailable",
+            "reason": "locked package is not installed for this build platform",
+        }
+    for field in ("License-Expression", "License"):
+        values = [str(value).strip() for value in metadata.get_all(field) or [] if str(value).strip()]
+        if values:
+            value = values[0]
+            if field == "License-Expression":
+                return value, {"source": "python-dist-metadata", "field": field, "value": value}
+            known = {
+                "Apache Software License": "Apache-2.0",
+                "Apache Software License 2.0": "Apache-2.0",
+                "Apache 2.0": "Apache-2.0",
+                "BSD License": "BSD-3-Clause",
+                "ISC license": "ISC",
+                "ISC License": "ISC",
+                "MIT License": "MIT",
+                "PSFL": "PSF-2.0",
+                "UNKNOWN": "NOASSERTION",
+            }
+            return known.get(value, value), {
+                "source": "python-dist-metadata",
+                "field": field,
+                "value": value,
+            }
+    for classifier in metadata.get_all("Classifier") or []:
+        if not classifier.startswith("License ::"):
+            continue
+        label = classifier.split("::")[-1].strip()
+        known = {
+            "Apache Software License": "Apache-2.0",
+            "BSD License": "BSD-3-Clause",
+            "GNU Lesser General Public License v3 (LGPLv3)": "LGPL-3.0-only",
+            "ISC License": "ISC",
+            "MIT License": "MIT",
+            "Mozilla Public License 2.0 (MPL 2.0)": "MPL-2.0",
+            "Python Software Foundation License": "PSF-2.0",
+        }
+        return known.get(label, "NOASSERTION"), {
+            "source": "python-dist-metadata",
+            "field": "Classifier",
+            "value": label,
+        }
+    return "NOASSERTION", {
+        "source": "python-dist-metadata",
+        "reason": "distribution did not declare a license",
+    }
+
+
+def _source_location(source: object, package_name: str) -> str:
+    if isinstance(source, dict):
+        for key in ("registry", "git", "url", "path"):
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                return value
+        if source.get("editable") == ".":
+            return f"https://athena.invalid/source/{source_sha}"
+    return f"https://athena.invalid/source/{source_sha}/{package_name}"
+
+
+def _cargo_license(package_name: str, package_version: str, metadata: dict[tuple[str, str], dict]) -> str:
+    package = metadata.get((package_name, package_version), {})
+    return str(package.get("license") or "NOASSERTION")
+
+
+try:
+    cargo_metadata = json.loads(
+        run("cargo", "metadata", "--manifest-path", "native/Cargo.toml", "--locked", "--offline", "--format-version", "1")
+    )
+    cargo_license_metadata = {
+        (str(package.get("name")), str(package.get("version"))): package
+        for package in cargo_metadata.get("packages", [])
+        if isinstance(package, dict)
+    }
+except (json.JSONDecodeError, TypeError, AttributeError):
+    cargo_license_metadata = {}
+
+
+def _normalized_package_name(value: str) -> str:
+    return re.split(r"[ <>=!~\[]", value, maxsplit=1)[0].lower().replace("-", "_")
+
+
+runtime_dependency_names = {
+    _normalized_package_name(item) for item in project["project"].get("dependencies", [])
+}
+optional_dependency_names = {
+    group: {_normalized_package_name(item) for item in values}
+    for group, values in project["project"].get("optional-dependencies", {}).items()
+}
 for package_index, package in enumerate(lock_data.get("package", []), 1):
     if not isinstance(package, dict):
         continue
@@ -155,14 +264,100 @@ for package_index, package in enumerate(lock_data.get("package", []), 1):
         "name": package["name"],
         "versionInfo": package["version"],
         "downloadLocation": package.get("source", "NOASSERTION"),
-        "licenseConcluded": "NOASSERTION",
-        "licenseDeclared": "NOASSERTION",
+        "licenseConcluded": _cargo_license(package["name"], package["version"], cargo_license_metadata),
+        "licenseDeclared": _cargo_license(package["name"], package["version"], cargo_license_metadata),
     }
+    sbom_package["athena_dependency_scope"] = "native"
     if package.get("checksum"):
         sbom_package["checksums"] = [
             {"algorithm": "SHA256", "checksumValue": package["checksum"]}
         ]
     sbom_packages.append(sbom_package)
+python_package_offset = len(sbom_packages)
+for package_index, package in enumerate(uv_lock_data.get("package", []), 1):
+    if not isinstance(package, dict):
+        continue
+    source = package.get("source")
+    source_url = _source_location(source, package["name"])
+    sdist = package.get("sdist")
+    if isinstance(sdist, dict) and isinstance(sdist.get("url"), str):
+        source_url = sdist["url"]
+    elif package.get("wheels") and isinstance(package["wheels"][0], dict):
+        wheel_url = package["wheels"][0].get("url")
+        if isinstance(wheel_url, str):
+            source_url = wheel_url
+    license_declared, license_metadata = _license_from_python_metadata(package["name"])
+    sbom_package = {
+        "SPDXID": "SPDXRef-Python-" + str(package_index) + "-" + re.sub(
+            r"[^A-Za-z0-9.-]", "-", package["name"] + "-" + package["version"]
+        ),
+        "name": package["name"],
+        "versionInfo": package["version"],
+        "downloadLocation": source_url,
+        "licenseConcluded": "NOASSERTION",
+        "licenseDeclared": license_declared,
+        "athena_license_metadata": license_metadata,
+    }
+    normalized_name = _normalized_package_name(package["name"])
+    if normalized_name == _normalized_package_name(project["project"]["name"]):
+        dependency_scope = "project"
+    elif normalized_name in runtime_dependency_names:
+        dependency_scope = "python-runtime-direct"
+    else:
+        optional_groups = [
+            group
+            for group, names in optional_dependency_names.items()
+            if normalized_name in names
+        ]
+        dependency_scope = (
+            "python-optional-direct:" + ",".join(sorted(optional_groups))
+            if optional_groups
+            else "python-transitive"
+        )
+    sbom_package["athena_dependency_scope"] = dependency_scope
+    if isinstance(sdist, dict) and isinstance(sdist.get("hash"), str):
+        sbom_package["checksums"] = [
+            {"algorithm": "SHA256", "checksumValue": sdist["hash"].removeprefix("sha256:")}
+        ]
+    elif package.get("wheels"):
+        wheel_hash = next(
+            (
+                wheel.get("hash", "").removeprefix("sha256:")
+                for wheel in package["wheels"]
+                if isinstance(wheel, dict) and isinstance(wheel.get("hash"), str)
+            ),
+            "",
+        )
+        if wheel_hash:
+            sbom_package["checksums"] = [
+                {"algorithm": "SHA256", "checksumValue": wheel_hash}
+            ]
+    sbom_packages.append(sbom_package)
+native_wheel = next(
+    (path for path in distributions.iterdir() if path.name.startswith("athena_agent_native-") and path.suffix == ".whl"),
+    None,
+)
+if native_wheel is None:
+    raise SystemExit("native companion wheel is missing from the release artifact directory")
+native_license = str(native_package["project"].get("license") or "NOASSERTION")
+sbom_packages.append(
+    {
+        "SPDXID": "SPDXRef-AthenaNativeDistribution",
+        "name": native_package["project"]["name"],
+        "versionInfo": native_package["project"]["version"],
+        "downloadLocation": f"https://athena.invalid/release/{source_sha}/{native_wheel.name}",
+        "licenseConcluded": native_license,
+        "licenseDeclared": native_license,
+        "athena_dependency_scope": "distribution",
+        "athena_license_metadata": {
+            "source": "native/package/pyproject.toml",
+            "field": "project.license",
+            "value": native_license,
+        },
+        "athena_artifact_path": str(Path("distributions") / native_wheel.name),
+        "checksums": [{"algorithm": "SHA256", "checksumValue": sha(native_wheel)}],
+    }
+)
 sbom = {
     "spdxVersion": "SPDX-2.3",
     "dataLicense": "CC0-1.0",
@@ -177,6 +372,8 @@ sbom = {
         "source_sha": source_sha,
         "cargo_lock_sha256": cargo_lock_sha256,
         "uv_lock_sha256": python_lock_sha256,
+        "python_package_count": len(sbom_packages) - python_package_offset,
+        "native_distribution_count": 1,
     },
     "packages": sbom_packages,
 }
@@ -215,6 +412,7 @@ record = {
         "path": sbom_path.name,
         "sha256": sha(sbom_path),
         "component_count": len(sbom_packages),
+        "python_package_count": len(sbom_packages) - python_package_offset,
         "bound_to": {
             "source_sha": source_sha,
             "cargo_lock_sha256": cargo_lock_sha256,

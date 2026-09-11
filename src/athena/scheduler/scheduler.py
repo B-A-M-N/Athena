@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Mapping
@@ -40,6 +43,7 @@ from athena.scheduler.triggers import TriggerType, TriggerSpec, next_fire
 from athena.state.schedules import ScheduleStore
 
 _logger = logging.getLogger("athena.scheduler")
+_claim_context: ContextVar[bool] = ContextVar("athena_scheduler_claim_context", default=False)
 
 
 @dataclass(frozen=True)
@@ -379,6 +383,13 @@ class Scheduler:
         self._loop_interval = loop_interval_seconds
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # Every claim-producing entry point shares one boundary.  The
+        # background tick loop, an operator-triggered run, and an event
+        # callback can otherwise race on the same SQLite-backed schedule and
+        # make a valid task look failed under lock contention.
+        self._claim_lock = asyncio.Lock()
+        self._deferred_events: deque[Any] = deque()
+        self._event_drain_task: asyncio.Task | None = None
         self._health: dict[str, Any] = {
             "started_at": None,
             "last_tick_at": None,
@@ -392,20 +403,21 @@ class Scheduler:
 
     async def tick(self, now: datetime | None = None) -> int:
         """Claim and enqueue due jobs for this tick. Returns number fired."""
-        now = now or utcnow()
-        fires = 0
-        while True:
-            if self._max_concurrent and fires >= self._max_concurrent:
-                break
-            claim = await claim_next(self._store, now)
-            if claim is None:
-                break
-            job = await self._store.get_job_id(claim.job_id)
-            if job is None:
-                break
-            await self._fire_claim(job, claim)
-            fires += 1
-        return fires
+        async with self._claim_boundary():
+            now = now or utcnow()
+            fires = 0
+            while True:
+                if self._max_concurrent and fires >= self._max_concurrent:
+                    break
+                claim = await claim_next(self._store, now)
+                if claim is None:
+                    break
+                job = await self._store.get_job_id(claim.job_id)
+                if job is None:
+                    break
+                await self._fire_claim(job, claim)
+                fires += 1
+            return fires
 
     async def run_now(self, job_id: str) -> str | None:
         """Run one enabled job occurrence through the normal claim path.
@@ -415,28 +427,68 @@ class Scheduler:
         second execution loop and are deliberately refused for disabled or
         missing jobs.
         """
-        job = await self._store.get_job_id(job_id)
-        if job is None or not bool(job.get("enabled")):
-            return None
-        scheduled_for = utcnow().isoformat()
-        claim = await self._store.claim_next_due(job_id, scheduled_for)
-        if claim is None:
-            return None
-        try:
-            await self._fire_claim(job, _to_claim(claim))
-        except Exception:
-            # _fire_claim releases an unmaterialized claim; preserve the
-            # exception for the operator instead of reporting a false run.
-            raise
-        run = await self._store.last_run(job_id)
-        return str(run.get("task_id")) if run and run.get("task_id") else None
+        async with self._claim_boundary():
+            job = await self._store.get_job_id(job_id)
+            if job is None or not bool(job.get("enabled")):
+                return None
+            scheduled_for = utcnow().isoformat()
+            claim = await self._store.claim_next_due(job_id, scheduled_for)
+            if claim is None:
+                return None
+            try:
+                await self._fire_claim(job, _to_claim(claim))
+            except Exception:
+                # _fire_claim releases an unmaterialized claim; preserve the
+                # exception for the operator instead of reporting a false run.
+                raise
+            run = await self._store.last_run(job_id)
+            return str(run.get("task_id")) if run and run.get("task_id") else None
 
     async def notify_event(self, event: Any) -> int:
+        # EventStore delivers durable callbacks synchronously. If a task
+        # creation event is emitted while tick/run_now already owns the claim
+        # boundary, queue the event and drain it through that same serialized
+        # boundary after the owner releases it. External event deliveries take
+        # the boundary directly, so all three claim entry points share one
+        # concurrency model.
+        if _claim_context.get():
+            self._deferred_events.append(event)
+            self._ensure_event_drain()
+            return 0
         try:
-            return await self._notify_event(event)
+            async with self._claim_boundary():
+                return await self._notify_event(event)
         except Exception as exc:
             self._record_error(exc)
             raise
+
+    @asynccontextmanager
+    async def _claim_boundary(self):
+        async with self._claim_lock:
+            token = _claim_context.set(True)
+            try:
+                yield
+            finally:
+                _claim_context.reset(token)
+
+    def _ensure_event_drain(self) -> None:
+        if self._event_drain_task is None or self._event_drain_task.done():
+            self._event_drain_task = asyncio.create_task(self._drain_deferred_events())
+
+    async def _drain_deferred_events(self) -> None:
+        try:
+            while self._deferred_events:
+                event = self._deferred_events.popleft()
+                async with self._claim_boundary():
+                    await self._notify_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_error(exc)
+            _logger.warning("deferred scheduler event failed: %s", exc)
+        finally:
+            if self._deferred_events and not self._stop.is_set():
+                self._ensure_event_drain()
 
     async def _notify_event(self, event: Any) -> int:
         """Fire matching EVENT jobs using the same durable claim path.
@@ -511,7 +563,7 @@ class Scheduler:
         created = None
         try:
             if self._intake is not None:
-                result = self._intake(spec, wait=False, trusted=True)
+                result = self._intake(spec, wait=False, trusted=True, enqueue=False)
                 created = await result if asyncio.iscoroutine(result) else result
             else:
                 if self._admission is not None:
@@ -523,7 +575,6 @@ class Scheduler:
                     raise RuntimeError(
                         "TaskManager.create returned no Task for scheduled occurrence"
                     )
-                await self._tm.enqueue(created.id)
             if created is None:
                 raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")
         except Exception:
@@ -534,6 +585,11 @@ class Scheduler:
                 await self._store.release_claim(claim.claim_id, job["id"], claim.scheduled_for)
             raise
         task_id = created.id
+        # Enqueue only after the durable task row exists, but before marking
+        # the occurrence FIRED.  If enqueue fails, the claim remains CLAIMED
+        # and startup reconciliation can retry the existing task without
+        # creating a duplicate occurrence.
+        await self._tm.enqueue(task_id)
         trigger = _trigger_from_job(job)
         disable = bool(
             trigger is not None
@@ -627,6 +683,15 @@ class Scheduler:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
             self._task = None
+        drain = self._event_drain_task
+        if drain is not None and not drain.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(drain), timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                drain.cancel()
+            except Exception as exc:
+                self._record_error(exc)
+        self._event_drain_task = None
         self._health["health"] = "stopped"
 
     def is_running(self) -> bool:

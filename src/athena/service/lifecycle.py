@@ -418,6 +418,7 @@ class ServiceLifecycle:
             finalizations=self._svc._pending_finalization_store,
             steering_store=self._svc._steering_store,
         )
+        task_manager.set_model_response_store(self._svc._model_response_store)
         self._svc._task_manager = task_manager
         execution.set_recovery_sink(self._svc._mark_execution_uncertain)
 
@@ -825,6 +826,25 @@ class ServiceLifecycle:
         if any(recovery_result.summary.values()):
             _logger.info("crash recovery reconciled: %s", recovery_result.summary)
 
+        # Provider dispositions are committed separately from task effects.
+        # Replay the task-side half before workers start so a crash after the
+        # provider resolution cannot leave a terminal disposition attached to
+        # an inert RECOVERY_REQUIRED task (or a retry authorization unused).
+        provider_recovery = await self._svc.reconcile_provider_outcomes()
+        unresolved_provider = await self._svc._model_response_store.list_unresolved_attempts()
+        self._svc._provider_recovery_health = {
+            "state": "degraded" if unresolved_provider else "ready",
+            "unresolved_count": len(unresolved_provider),
+            "replayed": provider_recovery["replayed"],
+            "error": None,
+        }
+        self._svc._startup_health["checks"]["provider_outcomes"] = {
+            "status": "degraded" if unresolved_provider else "ok",
+            "blocking": bool(unresolved_provider),
+            "unresolved_count": len(unresolved_provider),
+            "replayed": provider_recovery["replayed"],
+        }
+
         # Reconcile transaction ownership after the mutation ledger has
         # classified any in-flight effects, but before workers can route new
         # calls into a durable in-place candidate.
@@ -952,6 +972,17 @@ class ServiceLifecycle:
                 f"{item['id']}: {item['reason']}" for item in capability_profile.get("missing", ())
             )
             raise RuntimeError(f"required capability profile is not ready: {missing}")
+
+        # Ordinary intake has a three-step durable protocol: task row, causal
+        # user turn, then queue transition. Repair CREATED rows left between
+        # those steps before a worker can start claiming work. Scheduler-owned
+        # occurrence rows are intentionally left to scheduler reconciliation.
+        intake_recovery = await self._svc._reconcile_created_intake()
+        self._svc._startup_health["checks"]["task_intake"] = {
+            "status": "degraded" if intake_recovery["quarantined"] else "ok",
+            "blocking": bool(intake_recovery["quarantined"]),
+            **intake_recovery,
+        }
 
         # 14. Worker + scheduler. Packs and any dependent resumable tasks are
         # settled before a worker can claim fresh work.

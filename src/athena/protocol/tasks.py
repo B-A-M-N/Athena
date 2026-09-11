@@ -96,6 +96,7 @@ LEGAL_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     ),
     TaskStatus.INTERRUPTED: frozenset(
         {
+            TaskStatus.QUEUED,
             TaskStatus.RUNNING,
             TaskStatus.CANCELLED,
             TaskStatus.RECOVERY_REQUIRED,
@@ -424,6 +425,8 @@ def intersect_capability_policies(
     retained whenever either side requires approval for a surviving capability;
     deny remains a hard union.
     """
+    raw_left = _policy_parts(left)
+    raw_right = _policy_parts(right)
     a = _effective_capability_policy(left)
     b = _effective_capability_policy(right)
     a_visible = set(a.allow) | set(a.ask)
@@ -437,7 +440,13 @@ def intersect_capability_policies(
     if "*" in deny:
         allow.clear()
         ask.clear()
-    if not allow and not ask and (a_visible or b_visible):
+    canceled_left_authority = bool(raw_left.allow or raw_left.ask) and not a_visible
+    canceled_right_authority = bool(raw_right.allow or raw_right.ask) and not b_visible
+    if (
+        not allow
+        and not ask
+        and (a_visible or b_visible or canceled_left_authority or canceled_right_authority)
+    ):
         allow.add(_NO_CAPABILITY_INTERSECTION)
     effects = _intersect_unrestricted_sets(set(a.effects), set(b.effects))
     if a.effects and b.effects and not effects:
@@ -455,6 +464,7 @@ def capability_policy_covers(
     lower: CapabilityPolicy | Mapping[str, Any] | None,
 ) -> bool:
     """Return whether ``lower`` is contained by the ``upper`` ceiling."""
+    raw_lower = _policy_parts(lower)
     a = _effective_capability_policy(upper)
     b = _effective_capability_policy(lower)
     upper_allow = set(a.allow)
@@ -468,6 +478,12 @@ def capability_policy_covers(
     lower_ask.discard(_NO_CAPABILITY_INTERSECTION)
     upper_visible = upper_allow | upper_ask
     lower_visible = lower_allow | lower_ask
+    lower_is_empty = (
+        lower_is_empty
+        or "*" in b.deny
+        or bool(raw_lower.allow or raw_lower.ask)
+        and not lower_visible
+    )
     # Empty allow/ask is the protocol's unrestricted value.  Once a policy
     # names an allow/ask ceiling, preserve the distinction: ASK is weaker than
     # ALLOW for a caller, but it cannot cover a stored autonomous ALLOW.
@@ -475,9 +491,6 @@ def capability_policy_covers(
     # empty authority set. It is narrower than any non-denying ceiling; the
     # absence of visible rules alone must not be confused with the protocol's
     # unrestricted empty policy.
-    lower_is_empty = (
-        lower_is_empty or "*" in b.deny or (not lower_visible and bool(b.allow or b.ask or b.deny))
-    )
     if upper_visible and not lower_visible and not lower_is_empty:
         return False
     if upper_visible and not lower_allow.issubset(upper_allow):
@@ -490,7 +503,13 @@ def capability_policy_covers(
         return False
     if not upper_visible and not lower_visible and "*" in a.deny and "*" not in b.deny:
         return False
-    if not upper_visible and not lower_visible and "*" not in a.deny:
+    if (
+        not upper_visible
+        and not lower_visible
+        and "*" not in a.deny
+        and "*" not in b.deny
+        and not lower_is_empty
+    ):
         if not set(a.deny).issubset(set(b.deny)):
             return False
     upper_effects = set(a.effects)

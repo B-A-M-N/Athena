@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Record the exact executables inherited by every release lane."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import sysconfig
+import tomllib
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _executable(name: str) -> dict[str, object]:
+    path = shutil.which(name)
+    if path is None:
+        return {"name": name, "status": "MISSING"}
+    candidate = Path(path).resolve()
+    return {
+        "name": name,
+        "status": "FOUND",
+        "path": str(candidate),
+        "sha256": _sha256(candidate),
+    }
+
+
+def _run(command: list[str]) -> str:
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"unavailable: {exc}"
+    return (result.stdout or result.stderr).strip()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=Path, default=Path("toolchain-passport.json"))
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    policy = json.loads((root / "docs" / "toolchain-policy.json").read_text(encoding="utf-8"))
+    cargo_deny_policy = json.loads(
+        (root / "native" / "cargo-deny-build-policy.json").read_text(encoding="utf-8")
+    )
+    python = Path(sys.executable).resolve()
+    uv = os.environ.get("ATHENA_RELEASE_UV", "uv")
+    cargo_deny = os.environ.get("ATHENA_CARGO_DENY_BIN", "")
+    cosign = os.environ.get("ATHENA_COSIGN", "cosign")
+    system_python = os.environ.get("ATHENA_RELEASE_SYSTEM_PYTHON", "python3")
+    tools = [_executable(name) for name in (uv, "cargo", "rustc")]
+    tools.append(
+        _executable(cargo_deny) if cargo_deny else {"name": "cargo-deny", "status": "MISSING"}
+    )
+    tools.append(_executable(cosign))
+    tools.append(_executable(system_python))
+    missing = [str(item["name"]) for item in tools if item.get("status") != "FOUND"]
+    cargo_deny_version = _run([cargo_deny, "--version"]) if cargo_deny else "unavailable"
+    uv_version = _run([uv, "--version"])
+    cosign_version = _run([cosign, "version"]) if not missing else "unavailable"
+    policy_errors = []
+    requires_python = project["project"]["requires-python"]
+    runtime_version = (sys.version_info.major, sys.version_info.minor)
+    if requires_python == ">=3.12,<3.14" and runtime_version not in {(3, 12), (3, 13)}:
+        policy_errors.append(f"Python {platform.python_version()} is outside {requires_python}")
+    if uv_version != f"uv {policy['uv_version']}" and not uv_version.startswith(
+        f"uv {policy['uv_version']} "
+    ):
+        policy_errors.append(f"uv must be {policy['uv_version']}")
+    if not cargo_deny_version.startswith(f"cargo-deny {policy['cargo_deny_version']}"):
+        policy_errors.append(f"cargo-deny must be {policy['cargo_deny_version']}")
+    if f"GitVersion:    v{policy['cosign_version']}" not in cosign_version:
+        policy_errors.append(f"cosign must be {policy['cosign_version']}")
+    cargo_deny_policy_sha256 = _sha256(root / "native" / "cargo-deny-build-policy.json")
+    if cargo_deny_policy_sha256 != policy["cargo_deny_policy_sha256"]:
+        policy_errors.append("cargo-deny build policy digest does not match toolchain policy")
+    record = {
+        "kind": "athena_toolchain_passport",
+        "schema_version": 1,
+        "status": "PASS" if not missing and not policy_errors else "FAIL",
+        "release_sha": os.environ.get("ATHENA_RELEASE_SHA"),
+        "release_run_id": os.environ.get("ATHENA_RELEASE_RUN_ID"),
+        "requires_python": requires_python,
+        "python": {
+            "version": platform.python_version(),
+            "executable": str(python),
+            "sha256": _sha256(python),
+            "implementation": platform.python_implementation(),
+        },
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "libc": platform.libc_ver(),
+            "python_abi": sysconfig.get_config_var("SOABI"),
+        },
+        "tools": tools,
+        "policy": {
+            "path": "docs/toolchain-policy.json",
+            "sha256": _sha256(root / "docs" / "toolchain-policy.json"),
+            "cargo_deny_build_policy_sha256": cargo_deny_policy_sha256,
+            "cargo_deny_build_policy_version": cargo_deny_policy.get("cargo_deny_version"),
+        },
+        "versions": {
+            "uv": uv_version,
+            "cargo": _run(["cargo", "--version"]),
+            "rustc": _run(["rustc", "-vV"]),
+            "cargo_deny": cargo_deny_version,
+            "cosign": cosign_version,
+            "system_python": _run([system_python, "--version"]),
+        },
+        "lock_hashes": {
+            "uv_lock_sha256": _sha256(root / "uv.lock"),
+            "cargo_lock_sha256": _sha256(root / "native" / "Cargo.lock"),
+        },
+        "missing_tools": missing,
+        "policy_errors": policy_errors,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if missing or policy_errors:
+        print(
+            "toolchain-passport: FAIL — "
+            + "; ".join([*("missing " + item for item in missing), *policy_errors]),
+            file=sys.stderr,
+        )
+        return 1
+    print(f"toolchain-passport: PASS — {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

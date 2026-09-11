@@ -33,6 +33,7 @@ from athena.models.router import (
 from athena.protocol.errors import (
     ContextOverflow,
     ModelUnavailable,
+    ProviderOutcomeUnknown,
     ProviderError,
     RequestCancelled,
     TaskBudgetExceeded,
@@ -169,7 +170,11 @@ class InferenceBroker:
         attempt_id = str(receipt.get("attempt_id") or "")
         if not attempt_id:
             return
-        if receipt.get("accounting_applied_at"):
+        budget_done = self._k._budgets is None or bool(receipt.get("budget_accounted_at"))
+        usage_done = self._k._provider_usage_store is None or bool(
+            receipt.get("provider_usage_completed_at")
+        )
+        if budget_done and usage_done:
             return
         input_tokens = int(
             receipt.get("actual_input_tokens")
@@ -185,8 +190,7 @@ class InferenceBroker:
         response_store = getattr(self._k, "_model_response_store", None)
         if response_store is not None:
             await response_store.set_actual_usage(
-                task_id=task.id,
-                request_fingerprint=str(receipt["request_fingerprint"]),
+                attempt_id=attempt_id,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cost_usd=actual_cost,
@@ -205,6 +209,8 @@ class InferenceBroker:
             )
             await self._fault_point("budget-charge")
             await self._fault_point("budget-checkpoint")
+            if response_store is not None:
+                await response_store.mark_budget_accounted(attempt_id=attempt_id)
         usage_id = str(receipt.get("provider_usage_id") or "")
         if self._k._provider_usage_store is not None:
             if not usage_id:
@@ -221,10 +227,10 @@ class InferenceBroker:
                 )
                 if response_store is not None:
                     await response_store.set_provider_usage_id(
-                        task_id=task.id,
-                        request_fingerprint=str(receipt["request_fingerprint"]),
+                        attempt_id=attempt_id,
                         provider_usage_id=usage_id,
                     )
+                    await response_store.mark_provider_usage_started(attempt_id=attempt_id)
             await self._k._provider_usage_store.record_completion(
                 usage_id,
                 input_tokens=input_tokens,
@@ -232,11 +238,14 @@ class InferenceBroker:
                 cost_usd=str(actual_cost) if actual_cost is not None else None,
                 metadata={"state": "success", "attempt_id": attempt_id},
             )
+            if response_store is not None:
+                await response_store.mark_provider_usage_started(attempt_id=attempt_id)
             await self._fault_point("usage-completion")
+            if response_store is not None:
+                await response_store.mark_provider_usage_completed(attempt_id=attempt_id)
         if response_store is not None:
             await response_store.mark_accounting_applied(
-                task_id=task.id,
-                request_fingerprint=str(receipt["request_fingerprint"]),
+                attempt_id=attempt_id,
             )
 
     async def _select_model(
@@ -419,10 +428,40 @@ class InferenceBroker:
                     provider=selection_for_attempt.provider,
                     model=selection_for_attempt.model,
                     reservation_amount=worst_cost,
+                    idempotency_semantics=str(
+                        request.metadata.get("idempotency_semantics") or "none"
+                    ),
                 )
+                state.inference_attempt_id = str(receipt.get("attempt_id") or "") or None
+                if self._k._budgets is not None:
+                    for stale in await response_store.list_unreleased_reservations(task.id):
+                        stale_amount = Decimal(str(stale.get("reservation_amount") or "0"))
+                        if stale_amount > 0:
+                            await self._k._budgets.release_model_cost(
+                                task.id,
+                                stale_amount,
+                                reservation_id=str(stale["attempt_id"]),
+                            )
+                        await response_store.mark_attempt_reservation_released(
+                            str(stale["attempt_id"])
+                        )
                 stored_request_id = str(receipt.get("request_id") or "")
                 if stored_request_id and stored_request_id != request.request_id:
                     request = replace(request, request_id=stored_request_id)
+                idempotency_key = str(
+                    receipt.get("idempotency_key") or receipt.get("attempt_id") or ""
+                )
+                if idempotency_key and request.metadata.get("idempotency_key") != idempotency_key:
+                    request = replace(
+                        request,
+                        metadata={**dict(request.metadata), "idempotency_key": idempotency_key},
+                    )
+                outcome_status = str(receipt.get("provider_outcome_status") or "").casefold()
+                if outcome_status not in {"", "pending", "known", "failed"}:
+                    raise ProviderOutcomeUnknown(
+                        "provider outcome requires reconciliation before retrying: "
+                        f"{outcome_status}"
+                    )
                 cached_response = response_store.response_from_row(receipt)
                 if cached_response is not None:
                     await self._reconcile_receipt(
@@ -477,13 +516,14 @@ class InferenceBroker:
                 )
                 if response_store is not None and not receipt.get("reservation_applied_at"):
                     await response_store.mark_reservation_applied(
-                        task_id=task.id, request_fingerprint=request_fingerprint
+                        attempt_id=str(receipt["attempt_id"])
                     )
                 reservation = True
                 await self._fault_point("reservation")
             # One durable row and one inspectable event per actual provider /
             # model attempt. Fallbacks must never overwrite the first row.
             attempt_usage_id: str | None = None
+            provider_started = False
             attempt_started = time.monotonic()
             # Inference-kind metadata (P1-8): auxiliary subturns carry the
             # same lifecycle events as primary inference — emitted here, once
@@ -522,8 +562,7 @@ class InferenceBroker:
                     )
                     if response_store is not None:
                         await response_store.set_provider_usage_id(
-                            task_id=task.id,
-                            request_fingerprint=request_fingerprint,
+                            attempt_id=str(receipt["attempt_id"]),
                             provider_usage_id=attempt_usage_id,
                         )
                 except Exception as exc:
@@ -531,6 +570,7 @@ class InferenceBroker:
                     _bookkeeping_failure("provider usage attempt record", task, exc)
                 await self._fault_point("provider-usage-start")
             try:
+                provider_started = True
                 if self._k._budgets is not None:
                     async with self._k._budgets.model_call_lease(task.id):
                         response = await self._k._consume(
@@ -574,8 +614,7 @@ class InferenceBroker:
                     state.cost_known = False
                 if response_store is not None:
                     await response_store.set_actual_usage(
-                        task_id=task.id,
-                        request_fingerprint=request_fingerprint,
+                        attempt_id=str(receipt["attempt_id"]),
                         input_tokens=_input_tokens_of(response, request, estimator=token_estimator),
                         output_tokens=_output_tokens_of(response),
                         cost_usd=actual_cost,
@@ -609,6 +648,10 @@ class InferenceBroker:
                     )
                     await self._fault_point("budget-charge")
                     await self._fault_point("budget-checkpoint")
+                    if response_store is not None:
+                        await response_store.mark_budget_accounted(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
                 state.cost += actual_cost or Decimal("0")
                 reservation = False
                 # Record final usage
@@ -638,19 +681,21 @@ class InferenceBroker:
                         # P1-11: cost/audit evidence must not vanish silently.
                         usage_completion_ok = False
                         _bookkeeping_failure("provider usage completion record", task, exc)
+                    if usage_completion_ok and response_store is not None:
+                        await response_store.mark_provider_usage_completed(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
                     await self._fault_point("usage-completion")
                 if response_store is not None and usage_completion_ok:
                     await response_store.mark_accounting_applied(
-                        task_id=task.id,
-                        request_fingerprint=request_fingerprint,
+                        attempt_id=str(receipt["attempt_id"]),
                     )
                 return response
             except ProviderError as exc:
                 if response_store is not None:
                     try:
                         await response_store.fail(
-                            task_id=task.id,
-                            request_fingerprint=request_fingerprint,
+                            attempt_id=str(receipt["attempt_id"]),
                         )
                     except Exception as receipt_exc:
                         _bookkeeping_failure("model response failure receipt", task, receipt_exc)
@@ -660,6 +705,10 @@ class InferenceBroker:
                         worst_cost,
                         reservation_id=str(receipt.get("attempt_id") or request.request_id),
                     )
+                    if response_store is not None:
+                        await response_store.mark_reservation_released(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
                 last_err = exc
                 state.request_id = None
                 if self._k._provider_usage_store is not None and attempt_usage_id is not None:
@@ -714,13 +763,36 @@ class InferenceBroker:
                         compiled_for_attempt = await self._k._compile(
                             task, context_window=int(fallback_limit)
                         )
-            except BaseException:
-                if self._k._budgets is not None and reservation and worst_cost is not None:
+            except BaseException as exc:
+                outcome_unknown = False
+                if provider_started and response_store is not None:
+                    current = await response_store.get_receipt(
+                        task_id=task.id, request_fingerprint=request_fingerprint
+                    )
+                    if current is not None and str(current.get("status") or "") == "PENDING":
+                        outcome_unknown = await response_store.mark_provider_outcome_unknown(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
+                if (
+                    self._k._budgets is not None
+                    and reservation
+                    and worst_cost is not None
+                    and not outcome_unknown
+                ):
                     await self._k._budgets.release_model_cost(
                         task.id,
                         worst_cost,
                         reservation_id=str(receipt.get("attempt_id") or request.request_id),
                     )
+                    if response_store is not None:
+                        await response_store.mark_reservation_released(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
+                if outcome_unknown:
+                    raise ProviderOutcomeUnknown(
+                        "provider outcome became unknown after the request was sent; "
+                        f"attempt {receipt.get('attempt_id') or 'unknown'} requires reconciliation"
+                    ) from exc
                 raise
         raise last_err or ModelUnavailable("no model available")
 
@@ -1028,6 +1100,7 @@ class InferenceBroker:
             "tool_repair_mode": compatibility.tool_repair,
             "max_tool_correction_cycles": compatibility.max_tool_correction_cycles,
             "protocol": getattr(profile, "protocol", "openai-compat"),
+            "idempotency_semantics": getattr(profile, "idempotency_semantics", "none"),
             "model_profile": (dict(vars(model_profile)) if model_profile is not None else None),
         }
 
@@ -1255,6 +1328,7 @@ class InferenceBroker:
             "compatibility_profile",
             "model_profile",
             "protocol",
+            "idempotency_semantics",
             "tool_repair_mode",
             "max_tool_correction_cycles",
             "cache_mode",
@@ -1295,10 +1369,15 @@ class InferenceBroker:
         final = replace(final, usage=usage, metadata=response_metadata)
         response_store = getattr(self._k, "_model_response_store", None)
         if response_store is not None and request_fingerprint is not None:
+            # This is the last local point before the durable response commit.
+            # A crash/fault here means the provider outcome may be real but is
+            # not locally observable; the caller must record UNKNOWN and must
+            # not silently retry a non-idempotent request.
+            await self._fault_point("provider-assembled-before-receipt")
             await response_store.complete(
-                task_id=task.id,
-                request_fingerprint=request_fingerprint,
+                attempt_id=attempt_id or "",
                 response=final,
+                provider_response_id=str(final.metadata.get("response_id") or "") or None,
             )
             await self._fault_point("response-receipt-commit")
         state.input_tokens += _input_tokens_of(final, request, estimator=estimator)

@@ -330,6 +330,9 @@ class AnthropicProvider:
         except ValueError as exc:
             raise ProviderUnavailable(str(exc)) from exc
         kwargs = self._build_kwargs(request, stream=False)
+        idempotency_key = request.metadata.get("idempotency_key")
+        if idempotency_key:
+            kwargs["extra_headers"] = {"idempotency-key": str(idempotency_key)}
         try:
             response = await client.messages.create(**kwargs)
         finally:
@@ -383,9 +386,14 @@ class AnthropicProvider:
 
     async def _complete_rest(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         payload = self._build_kwargs(request, stream=True)
+        headers = (
+            {"idempotency-key": str(request.metadata["idempotency_key"])}
+            if request.metadata.get("idempotency_key")
+            else None
+        )
         try:
             async with self._http_client().stream(
-                "POST", self.base_url + _PATH, json=payload
+                "POST", self.base_url + _PATH, json=payload, headers=headers
             ) as resp:
                 self._active_streams[request.request_id] = resp
                 try:

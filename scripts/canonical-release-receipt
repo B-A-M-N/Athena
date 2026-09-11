@@ -4,16 +4,37 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
+import runpy
 import subprocess
 import sys
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from athena.release.provenance import (  # noqa: E402
+    ProvenanceVerificationError,
+    verify_provenance,
+)
+
+_EVIDENCE_VERIFIER = runpy.run_path(str(REPO_ROOT / "scripts" / "verify-release-evidence"))
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--sha", default=None)
+    parser.add_argument("--run-id", default=None)
     args = parser.parse_args()
     try:
         sha = args.sha or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -21,27 +42,72 @@ def main() -> int:
         print(f"canonical-release-receipt: FAIL — cannot resolve SHA: {exc}", file=sys.stderr)
         return 2
     root = args.evidence_dir.resolve() / sha
-    runs = (
-        sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
-        if root.is_dir()
-        else []
-    )
+    if args.run_id:
+        candidate = root / args.run_id
+        runs = [candidate] if candidate.is_dir() else []
+    else:
+        runs = (
+            sorted(
+                path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")
+            )
+            if root.is_dir()
+            else []
+        )
+        releasable = []
+        for candidate in runs:
+            try:
+                candidate_result = json.loads(
+                    (candidate / "final-release-result.json").read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                continue
+            if (
+                candidate_result.get("status") == "PASS"
+                and candidate_result.get("releasable") is True
+            ):
+                releasable.append(candidate)
+        if len(releasable) == 1:
+            runs = releasable
     if len(runs) != 1:
         print(
-            f"canonical-release-receipt: FAIL — expected exactly one run for {sha}, found {len(runs)}",
+            f"canonical-release-receipt: FAIL — expected one selected run for {sha}, found {len(runs)}",
             file=sys.stderr,
         )
         return 1
     result_path = runs[0] / "final-release-result.json"
     identity_path = runs[0] / "release-identity.json"
+    manifest_path = runs[0] / "release-manifest.json"
+    artifact_dir = runs[0] / "distributions"
     provenance_path = runs[0] / "release-provenance.json"
     signature_path = runs[0] / "release-provenance.sig"
+    certificate_path = runs[0] / "release-provenance.crt"
+    verification_path = runs[0] / "release-provenance-verification.json"
+    endurance_path = runs[0] / "endurance-receipt.json"
+    certification_paths = (
+        "release-certification-manifest.json",
+        "release-certification.sig",
+        "release-certification-verification.json",
+    )
+    certification_files = (
+        "release-sbom.spdx.json",
+        "backend-passport.json",
+        "toolchain-passport.json",
+        "support-matrix.json",
+    )
     if (
         not result_path.is_file()
         or not identity_path.is_file()
+        or not manifest_path.is_file()
+        or not artifact_dir.is_dir()
+        or not any(path.is_file() for path in artifact_dir.rglob("*"))
         or not provenance_path.is_file()
         or not signature_path.is_file()
         or not signature_path.stat().st_size
+        or not verification_path.is_file()
+        or not endurance_path.is_file()
+        or any(not (runs[0] / name).is_file() for name in certification_files)
+        or any(not (runs[0] / name).is_file() for name in certification_paths)
+        or not (runs[0] / "release-certification.sig").stat().st_size
     ):
         print(
             "canonical-release-receipt: FAIL — canonical identity/result missing", file=sys.stderr
@@ -50,8 +116,103 @@ def main() -> int:
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
         identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        verification = json.loads(verification_path.read_text(encoding="utf-8"))
+        endurance = json.loads(endurance_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         print(f"canonical-release-receipt: FAIL — invalid receipt: {exc}", file=sys.stderr)
+        return 1
+    try:
+        verified = verify_provenance(
+            provenance_path,
+            signature_path,
+            certificate=certificate_path if certificate_path.is_file() else None,
+        )
+    except ProvenanceVerificationError as exc:
+        print(f"canonical-release-receipt: FAIL — {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(verification, dict) or verification.get("status") != "PASS":
+        print(
+            "canonical-release-receipt: FAIL — cryptographic verification record missing",
+            file=sys.stderr,
+        )
+        return 1
+    for key in ("mechanism", "cosign_version", "signer_identity", "oidc_issuer", "key_fingerprint"):
+        if verification.get(key) != verified.get(key):
+            print(
+                f"canonical-release-receipt: FAIL — verification metadata mismatch: {key}",
+                file=sys.stderr,
+            )
+            return 1
+    if (
+        not isinstance(provenance, dict)
+        or provenance.get("source_sha") != sha
+        or provenance.get("release_run_id") != identity.get("release_run_id")
+        or provenance.get("manifest_sha256") != _sha256(manifest_path)
+        or not isinstance(provenance.get("artifacts"), list)
+        or not provenance["artifacts"]
+    ):
+        print(
+            "canonical-release-receipt: FAIL — provenance is not bound to the receipt",
+            file=sys.stderr,
+        )
+        return 1
+    certification_error = _EVIDENCE_VERIFIER["_check_certification_root"](
+        runs[0],
+        commit_sha=sha,
+        release_run_id=identity.get("release_run_id"),
+    )
+    if certification_error:
+        print(
+            f"canonical-release-receipt: FAIL — {certification_error}",
+            file=sys.stderr,
+        )
+        return 1
+    actual_artifacts = {
+        f"distributions/{path.relative_to(artifact_dir).as_posix()}": _sha256(path)
+        for path in artifact_dir.rglob("*")
+        if path.is_file()
+    }
+    recorded_artifacts = {
+        str(item.get("path")): str(item.get("sha256"))
+        for item in provenance["artifacts"]
+        if isinstance(item, dict)
+    }
+    if recorded_artifacts != actual_artifacts:
+        print(
+            "canonical-release-receipt: FAIL — provenance does not cover exact artifacts",
+            file=sys.stderr,
+        )
+        return 1
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("source_status") != "frozen-clean"
+        or manifest.get("source_sha") != sha
+        or manifest.get("release_run_id") != identity.get("release_run_id")
+        or not isinstance(manifest.get("artifacts"), list)
+        or not manifest["artifacts"]
+    ):
+        print(
+            "canonical-release-receipt: FAIL — artifact manifest is not a bound frozen release",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        endurance_duration = float(endurance.get("duration_hours", 0))
+    except (AttributeError, TypeError, ValueError):
+        endurance_duration = 0.0
+    if (
+        not isinstance(endurance, dict)
+        or endurance.get("status") != "PASS"
+        or endurance.get("source_sha") != sha
+        or endurance.get("release_run_id") != identity.get("release_run_id")
+        or endurance_duration < 0.5
+    ):
+        print(
+            "canonical-release-receipt: FAIL — beta endurance receipt is not a bound 30-minute PASS",
+            file=sys.stderr,
+        )
         return 1
     if not (
         result.get("status") == "PASS"
@@ -59,6 +220,7 @@ def main() -> int:
         and result.get("commit_sha") == sha
         and identity.get("commit_sha") == sha
         and identity.get("skip_e2e") is False
+        and identity.get("include_endurance") is True
         and result.get("release_run_id") == identity.get("release_run_id")
     ):
         print(

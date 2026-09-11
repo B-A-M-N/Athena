@@ -12,6 +12,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -23,6 +24,18 @@ from athena.execution.runtime_host import (  # noqa: E402
     LocalRuntimeSupervisor,
     SupervisedLocalBackend,
 )
+
+
+def _validate_interpreter() -> str:
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    requires_python = str(project["project"]["requires-python"])
+    version = sys.version_info[:3]
+    if version < (3, 12) or version >= (3, 14):
+        raise RuntimeError(
+            f"backend passport requires {requires_python}; refusing {sys.executable} "
+            f"({platform.python_version()})"
+        )
+    return requires_python
 
 
 def _release_sha() -> str:
@@ -40,6 +53,7 @@ def _release_sha() -> str:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    requires_python = _validate_interpreter()
     # The supervised host is a separate Python process.  Make the checkout
     # importable there when this script is run directly from a source tree;
     # release-check already supplies the same binding for its frozen checkout.
@@ -64,6 +78,7 @@ async def _run(args: argparse.Namespace) -> int:
             release_sha=_release_sha(),
             environment={
                 "python": platform.python_version(),
+                "requires_python": requires_python,
                 "platform": platform.platform(),
                 "executable": sys.executable,
                 "runtimes": manager.available_runtimes(),

@@ -124,10 +124,11 @@ wheel for local inspection. For an installed release, use the exact matching
 pair: `pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"`.
 The companion uses `py3-none-<platform>` because it is not a CPython extension;
 that tag does not make the bundled ELF portable. The certified deployment
-floor is Linux x86_64 GNU/glibc >= 2.34 with external X11, Xft, and OpenGL
-libraries; the release linker policy separately caps imported GLIBC symbols
-at 2.34 and requires those libraries to remain linked.
-It remains operating-system, architecture, libc, and native-runtime specific.
+cell is Linux x86_64 GNU/glibc >= 2.34 with an X11 display, Openbox, and
+external X11, Xft, and OpenGL libraries; the release linker policy separately
+caps imported GLIBC symbols at 2.34 and requires those libraries to remain
+linked. It remains operating-system, architecture, libc, desktop, and
+native-runtime specific.
 `ATHENA_NATIVE_BIN` remains an explicit override for platform-specific
 installations. `athena native` starts the Python
 service session inside the PTY and connects its local Unix-socket projection

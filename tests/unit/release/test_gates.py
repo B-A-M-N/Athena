@@ -55,3 +55,15 @@ def test_release_can_opt_into_real_beta_endurance():
     }
 
     assert "endurance" in names
+
+
+def test_python_release_lanes_use_frozen_uv_interpreter():
+    lanes = dict(release_commands("uv", skip_e2e=False, bootstrap=False))
+    for name in ("backend-passport", "endurance", "toolchain-passport"):
+        assert lanes[name][:4] == ["uv", "run", "--frozen", "--extra"]
+        assert "python" in lanes[name]
+
+
+def test_uv_lock_check_uses_the_resolved_release_uv():
+    lanes = dict(release_commands("/opt/athena/uv", skip_e2e=False, bootstrap=False))
+    assert lanes["uv-lock-check"] == ["/opt/athena/uv", "lock", "--check", "--offline"]

@@ -312,8 +312,14 @@ class OpenAICompatProvider:
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         payload = self._build_request(request)
+        headers = {}
+        idempotency_key = request.metadata.get("idempotency_key")
+        if idempotency_key:
+            headers["Idempotency-Key"] = str(idempotency_key)
         try:
-            async with self._client.stream("POST", self.base_url + _PATH, json=payload) as resp:
+            async with self._client.stream(
+                "POST", self.base_url + _PATH, json=payload, headers=headers or None
+            ) as resp:
                 if resp.status_code >= 400:
                     raise await self._map_err(resp)
                 # Register active stream for cancellation
