@@ -45,8 +45,8 @@ def test_build_config_auto_wires_freeinference_glm_flash(monkeypatch):
     provider = config.providers[0]
     assert provider.kind == "openai-compat"
     assert provider.name == "freeinference"
-    assert provider.model == "glm-5.3-flash"
-    assert provider.base_url == "https://freeinference.org/v1"
+    assert provider.model == "deepseek-v4-flash"
+    assert provider.base_url == "http://127.0.0.1:18769/v1"
     assert provider.credential_id == "FREEINFERENCE_API_KEY"
     assert provider.api_key is None
 

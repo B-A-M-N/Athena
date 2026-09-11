@@ -44,8 +44,8 @@ from athena.cli.operator_handlers import (
 )
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, WorkspaceSpec
 
-FREEINFERENCE_DEFAULT_BASE_URL = "https://freeinference.org/v1"
-FREEINFERENCE_DEFAULT_MODEL = "glm-5.3-flash"
+FREEINFERENCE_DEFAULT_BASE_URL = "http://127.0.0.1:18769/v1"
+FREEINFERENCE_DEFAULT_MODEL = "deepseek-v4-flash"
 OPENROUTER_DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
 
 
