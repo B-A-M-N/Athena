@@ -232,6 +232,10 @@ done
   printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window did not appear' >&2
   exit 1
 }
+focus_window "$window" || {
+  printf '%s\n' 'native-desktop-acceptance: FAIL — Athena window could not be focused' >&2
+  exit 1
+}
 clear_maximize_state "$window"
 sleep 0.3
 sleep 0.3
