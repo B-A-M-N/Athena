@@ -1140,8 +1140,6 @@ class AthenaService:
                 f"task {task.id!r} cannot enter the queue without a durable session/message store"
             )
         from athena.protocol.messages import (
-            ArtifactRefBlock,
-            FileRefBlock,
             Message,
             Provenance,
             Role,
@@ -1150,7 +1148,7 @@ class AthenaService:
             TrustClass,
             utcnow,
         )
-        from athena.protocol.artifacts import ArtifactRef
+        from athena.service.intake import attachment_blocks
 
         blocks: list[Any] = [
             TextBlock(
@@ -1170,59 +1168,7 @@ class AthenaService:
         attachments = getattr(request, "attachments", None)
         if not attachments:
             attachments = getattr(task, "context_refs", ())
-        for attachment in attachments or ():
-            if isinstance(attachment, ArtifactRef) or (
-                hasattr(attachment, "uri") and hasattr(attachment, "mime_type")
-            ):
-                blocks.append(
-                    ArtifactRefBlock(
-                        uri=str(attachment.uri),
-                        ref=attachment,
-                    )
-                )
-            elif isinstance(attachment, ContextRef):
-                uri = str(attachment.ref or "")
-                if not uri:
-                    continue
-                if attachment.kind == "artifact":
-                    ref = ArtifactRef(
-                        id=str(attachment.source_id or uri),
-                        uri=uri,
-                        hash=attachment.hash,
-                        mime_type=attachment.mime_type,
-                        size=attachment.size,
-                        storage_path=attachment.storage_path,
-                        producer=attachment.producer or attachment.summary,
-                        metadata=dict(attachment.metadata),
-                    )
-                    blocks.append(ArtifactRefBlock(uri=uri, ref=ref))
-                else:
-                    blocks.append(
-                        FileRefBlock(uri=uri, mime_type=attachment.mime_type)
-                    )
-            elif isinstance(attachment, Mapping):
-                kind = str(attachment.get("kind") or "file")
-                uri = str(attachment.get("uri") or attachment.get("ref") or "")
-                if uri:
-                    if kind == "artifact":
-                        ref = ArtifactRef(
-                            id=str(attachment.get("source_id") or uri),
-                            uri=uri,
-                            hash=attachment.get("hash"),
-                            mime_type=attachment.get("mime_type"),
-                            size=attachment.get("size"),
-                            storage_path=attachment.get("storage_path"),
-                            producer=attachment.get("producer") or attachment.get("summary"),
-                            metadata=dict(attachment.get("metadata") or {}),
-                        )
-                        blocks.append(ArtifactRefBlock(uri=uri, ref=ref))
-                    else:
-                        blocks.append(
-                            FileRefBlock(
-                                uri=uri,
-                                mime_type=attachment.get("mime_type"),
-                            )
-                        )
+        blocks.extend(attachment_blocks(attachments))
         message = Message(
             # Stable association makes retries idempotent without making the
             # task/message identity part of normal opaque ID generation.
@@ -1902,41 +1848,9 @@ class AthenaService:
         )
 
     async def _provider_resolution_view(self, resolved: dict[str, Any]) -> dict[str, Any]:
-        """Return the disposition plus operator-relevant consequences."""
-        view = dict(resolved)
-        resolution = str(view.get("provider_outcome_status") or "")
-        recovery_action = (
-            "retry_authorized"
-            if resolution == "unknown"
-            and view.get("retry_authorized_at")
-            and view.get("reservation_released_at") is None
-            else resolution
-        )
-        view["recovery_action"] = recovery_action
-        if recovery_action in _PROVIDER_OUTCOME_CONTRACT:
-            view["disposition_contract"] = dict(_PROVIDER_OUTCOME_CONTRACT[recovery_action])
-        task_id = str(view.get("task_id") or "")
-        tasks = getattr(self, "_store_tasks", None)
-        if tasks is not None and task_id:
-            row = await tasks.get(task_id)
-            view["task_status"] = row.get("status") if row is not None else None
-        store = getattr(self, "_model_response_store", None)
-        if store is not None and task_id:
-            view["liability_open"] = await store.has_unresolved_liability(task_id)
-        view["accounted_amount"] = (
-            view.get("actual_cost")
-            if view.get("provider_outcome_status") == "confirmed_succeeded"
-            else "0"
-        )
-        view["next_actions"] = (
-            ["reconcile original provider outcome or explicitly close provider liability"]
-            if view.get("provider_outcome_status") == "unknown"
-            and view.get("reservation_released_at") is None
-            else ["manually close provider liability"]
-            if view.get("provider_outcome_status") == "abandoned_with_liability"
-            else []
-        )
-        return view
+        from athena.service.provider_recovery import resolution_view
+
+        return await resolution_view(self, resolved, _PROVIDER_OUTCOME_CONTRACT)
 
     async def reconcile_provider_outcomes(self) -> dict[str, int]:
         """Replay resolved provider dispositions after a process restart."""
@@ -1970,9 +1884,7 @@ class AthenaService:
                     # retry after restart.
                     replayed += 1
                     continue
-                if resolution == "confirmed_failed" and not attempt.get(
-                    "reservation_released_at"
-                ):
+                if resolution == "confirmed_failed" and not attempt.get("reservation_released_at"):
                     await self._release_provider_reservation(
                         store, task_id=task_id, attempt_id=attempt_id, amount=amount
                     )

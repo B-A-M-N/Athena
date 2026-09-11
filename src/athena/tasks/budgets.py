@@ -801,11 +801,15 @@ class BudgetTracker:
             reserved_model = _dec(checkpoint, "reserved_model_cost")
             outstanding_model = _dec(checkpoint, "outstanding_model_cost")
             raw_model_reservations = checkpoint.get("model_reservations")
-            model_reservations = {
-                str(key): _dec({"value": value}, "value")
-                for key, value in raw_model_reservations.items()
-                if key and _dec({"value": value}, "value") > 0
-            } if isinstance(raw_model_reservations, Mapping) else {}
+            model_reservations = (
+                {
+                    str(key): _dec({"value": value}, "value")
+                    for key, value in raw_model_reservations.items()
+                    if key and _dec({"value": value}, "value") > 0
+                }
+                if isinstance(raw_model_reservations, Mapping)
+                else {}
+            )
             accounting_ids = {
                 str(value) for value in (checkpoint.get("model_accounting_ids") or ()) if value
             }
@@ -871,8 +875,7 @@ class BudgetTracker:
         current = self.own(task_id)
         with self._lock:
             model_reservations = {
-                key: str(value)
-                for key, value in self._model_reservations.get(task_id, {}).items()
+                key: str(value) for key, value in self._model_reservations.get(task_id, {}).items()
             }
             reserved_model = self._model_cost_reservations.get(task_id, Decimal("0"))
         await persist(
@@ -891,9 +894,9 @@ class BudgetTracker:
                 "active_compute_started_at": active_started,
                 "reserved_artifact_bytes": self._artifact_reservations.get(task_id, 0),
                 "reserved_model_cost": str(reserved_model),
-                "outstanding_model_cost": str(sum(
-                    (Decimal(value) for value in model_reservations.values()), Decimal("0")
-                )),
+                "outstanding_model_cost": str(
+                    sum((Decimal(value) for value in model_reservations.values()), Decimal("0"))
+                ),
                 "model_reservations": model_reservations,
                 # Compatibility projection for older readers. It is derived
                 # from the keyed authority and no longer used for releases.

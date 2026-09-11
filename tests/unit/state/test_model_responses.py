@@ -959,6 +959,7 @@ async def test_reservation_release_replay_does_not_consume_sibling_after_crash(t
     service._release_provider_reservation = MethodType(
         AthenaService._release_provider_reservation, service
     )
+
     def inject(name: str) -> None:
         if name == "attempt-reservation-released":
             raise RuntimeError("crash after budget release")
