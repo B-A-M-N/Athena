@@ -1,0 +1,206 @@
+"""Durable outbox for declarative capability-pack hooks."""
+
+from __future__ import annotations
+
+import json
+import secrets
+from datetime import timedelta
+from typing import Any, Mapping
+
+from athena.protocol.ids import new_id, stable_id
+from athena.protocol.messages import utcnow
+from athena.state.database import Database
+
+
+class PackHookOutbox:
+    """Persist hook deliveries before asking task intake to enqueue work."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    async def enqueue(
+        self,
+        *,
+        pack_id: str,
+        hook_id: str,
+        event_id: str,
+        event_type: str,
+        task_id: str | None,
+        session_id: str | None,
+        payload: Mapping[str, Any],
+        depth: int,
+        pack_version: str | None = None,
+        pack_integrity: str | None = None,
+        workflow_id: str | None = None,
+        workflow_integrity: str | None = None,
+        effect_ceiling: tuple[str, ...] | list[str] = (),
+        recursion_limit: int | None = None,
+        hook_contract_digest: str | None = None,
+    ) -> dict[str, Any]:
+        now = utcnow().isoformat()
+        hook_task_id = stable_id("pack-hook-task", hook_id, event_id)
+        hook_session_id = stable_id("pack-hook-session", hook_id, event_id)
+        await self._db.execute(
+            "INSERT OR IGNORE INTO pack_hook_outbox("
+            "id, pack_id, hook_id, event_id, event_type, task_id, session_id, "
+            "hook_task_id, hook_session_id, pack_version, pack_integrity, workflow_id, "
+            "workflow_integrity, effect_ceiling, recursion_limit, hook_contract_digest, "
+            "payload, depth, status, attempts, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)",
+            (
+                new_id("hook-delivery"),
+                str(pack_id),
+                str(hook_id),
+                str(event_id),
+                str(event_type),
+                task_id,
+                session_id,
+                hook_task_id,
+                hook_session_id,
+                pack_version,
+                pack_integrity,
+                workflow_id,
+                workflow_integrity,
+                json.dumps(list(effect_ceiling), sort_keys=True),
+                recursion_limit,
+                hook_contract_digest,
+                json.dumps(dict(payload), sort_keys=True, default=str),
+                int(depth),
+                now,
+                now,
+            ),
+        )
+        row = await self._db.fetch_one(
+            "SELECT * FROM pack_hook_outbox WHERE hook_id = ? AND event_id = ?",
+            (str(hook_id), str(event_id)),
+        )
+        if row is not None and (not row.get("hook_task_id") or not row.get("hook_session_id")):
+            await self._db.execute(
+                "UPDATE pack_hook_outbox SET hook_task_id = COALESCE(hook_task_id, ?), "
+                "hook_session_id = COALESCE(hook_session_id, ?), updated_at = ? WHERE id = ?",
+                (hook_task_id, hook_session_id, utcnow().isoformat(), str(row["id"])),
+            )
+            row = await self._db.fetch_one(
+                "SELECT * FROM pack_hook_outbox WHERE id = ?", (str(row["id"]),)
+            )
+        return dict(row or {})
+
+    async def pending(self) -> list[dict[str, Any]]:
+        rows = await self._db.fetch_all(
+            "SELECT * FROM pack_hook_outbox WHERE status NOT IN "
+            "('DISPATCHED', 'CANCELLED', 'SUSPENDED', 'STALE_CONTRACT') "
+            "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at, id",
+            (utcnow().isoformat(),),
+        )
+        return [dict(row) for row in rows]
+
+    async def suspend_pack(self, pack_id: str, reason: str = "pack disabled") -> None:
+        await self._db.execute(
+            "UPDATE pack_hook_outbox SET status = 'SUSPENDED', error = ?, "
+            "next_attempt_at = NULL, updated_at = ? "
+            "WHERE pack_id = ? AND status NOT IN ('DISPATCHED', 'CANCELLED')",
+            (str(reason)[:2000], utcnow().isoformat(), str(pack_id)),
+        )
+
+    async def resume_pack(self, pack_id: str) -> None:
+        await self._db.execute(
+            "UPDATE pack_hook_outbox SET status = 'PENDING', error = NULL, "
+            "next_attempt_at = NULL, updated_at = ? WHERE pack_id = ? AND status = 'SUSPENDED'",
+            (utcnow().isoformat(), str(pack_id)),
+        )
+
+    async def cancel_pack(self, pack_id: str, reason: str = "pack uninstalled") -> None:
+        await self._db.execute(
+            "UPDATE pack_hook_outbox SET status = 'CANCELLED', error = ?, "
+            "next_attempt_at = NULL, updated_at = ? WHERE pack_id = ? "
+            "AND status NOT IN ('DISPATCHED', 'CANCELLED')",
+            (str(reason)[:2000], utcnow().isoformat(), str(pack_id)),
+        )
+
+    async def claim(self, row_id: str) -> dict[str, Any] | None:
+        now = utcnow().isoformat()
+        token = secrets.token_urlsafe(24)
+        lease_expires = (utcnow() + timedelta(seconds=60)).isoformat()
+        cursor = await self._db.execute(
+            "UPDATE pack_hook_outbox SET status = 'CLAIMED', attempts = attempts + 1, "
+            "claimed_at = ?, claim_token = ?, claim_expires_at = ?, "
+            "updated_at = ?, error = NULL WHERE id = ? "
+            "AND ((status IN ('PENDING', 'FAILED') AND "
+            "(next_attempt_at IS NULL OR next_attempt_at <= ?)) OR "
+            "(status = 'CLAIMED' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?))",
+            (now, token, lease_expires, now, str(row_id), now, now),
+        )
+        if not cursor.rowcount:
+            return None
+        row = await self._db.fetch_one(
+            "SELECT * FROM pack_hook_outbox WHERE id = ?", (str(row_id),)
+        )
+        return dict(row or {})
+
+    async def mark_dispatched(
+        self, row_id: str, task_id: str | None, *, claim_token: str | None = None
+    ) -> bool:
+        cursor = await self._db.execute(
+            "UPDATE pack_hook_outbox SET status = 'DISPATCHED', dispatched_task_id = ?, "
+            "hook_task_id = COALESCE(hook_task_id, ?), next_attempt_at = NULL, "
+            "claim_token = NULL, claim_expires_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'CLAIMED' AND claim_token = ?",
+            (task_id, task_id, utcnow().isoformat(), str(row_id), claim_token),
+        )
+        return cursor.rowcount == 1
+
+    async def mark_failed(
+        self,
+        row_id: str,
+        error: str,
+        *,
+        attempts: int | None = None,
+        claim_token: str | None = None,
+    ) -> bool:
+        row = await self._db.fetch_one(
+            "SELECT attempts FROM pack_hook_outbox WHERE id = ?", (str(row_id),)
+        )
+        count = int(attempts if attempts is not None else (row.get("attempts", 1) if row else 1))
+        delay = min(300.0, 2.0 ** max(0, count - 1))
+        retry_at = (utcnow() + timedelta(seconds=delay)).isoformat()
+        cursor = await self._db.execute(
+            "UPDATE pack_hook_outbox SET status = 'FAILED', error = ?, next_attempt_at = ?, "
+            "claim_token = NULL, claim_expires_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'CLAIMED' AND claim_token = ?",
+            (str(error)[:2000], retry_at, utcnow().isoformat(), str(row_id), claim_token),
+        )
+        return cursor.rowcount == 1
+
+    async def mark_stale_contract(
+        self,
+        row_id: str,
+        reason: str,
+        *,
+        claim_token: str | None = None,
+    ) -> bool:
+        if claim_token:
+            cursor = await self._db.execute(
+                "UPDATE pack_hook_outbox SET status = 'STALE_CONTRACT', error = ?, "
+                "next_attempt_at = NULL, claim_token = NULL, claim_expires_at = NULL, "
+                "updated_at = ? WHERE id = ? AND status = 'CLAIMED' AND claim_token = ?",
+                (str(reason)[:2000], utcnow().isoformat(), str(row_id), claim_token),
+            )
+        else:
+            cursor = await self._db.execute(
+                "UPDATE pack_hook_outbox SET status = 'STALE_CONTRACT', error = ?, "
+                "next_attempt_at = NULL, updated_at = ? WHERE id = ? "
+                "AND status IN ('PENDING', 'FAILED')",
+                (str(reason)[:2000], utcnow().isoformat(), str(row_id)),
+            )
+        return cursor.rowcount == 1
+
+    async def mark_cancelled(self, row_id: str, reason: str) -> None:
+        await self._db.execute(
+            "UPDATE pack_hook_outbox SET status = 'CANCELLED', error = ?, "
+            "next_attempt_at = NULL, claim_token = NULL, claim_expires_at = NULL, "
+            "updated_at = ? WHERE id = ?",
+            (str(reason)[:2000], utcnow().isoformat(), str(row_id)),
+        )
+
+
+__all__ = ["PackHookOutbox"]

@@ -53,6 +53,11 @@ class WorkEvidence:
     mutation_ref: str | None = None
     artifact_ref: str | None = None
     external_receipt: str | None = None
+    research_ready: bool = False
+    research_bundle_id: str | None = None
+    research_requirement_ids: tuple[str, ...] = ()
+    research_evidence_ids: tuple[str, ...] = ()
+    research_gap_ids: tuple[str, ...] = ()
 
 
 _CONTROL_CAPABILITIES = frozenset(
@@ -154,6 +159,21 @@ def result_qualifies_as_work_evidence(
     )
     receipt = metadata.get("external_receipt") or metadata.get("receipt_id")
     external_receipt = str(receipt) if receipt else None
+    research_completion = metadata.get("research_completion")
+    research_ready = bool(
+        isinstance(research_completion, dict) and research_completion.get("ready") is True
+    )
+    research_bundle_id = (
+        str(research_completion.get("bundle_id"))
+        if isinstance(research_completion, dict) and research_completion.get("bundle_id")
+        else None
+    )
+    completion_record = research_completion if isinstance(research_completion, dict) else {}
+    research_requirement_ids = tuple(
+        str(item) for item in completion_record.get("requirement_ids") or ()
+    )
+    research_evidence_ids = tuple(str(item) for item in completion_record.get("evidence_ids") or ())
+    research_gap_ids = tuple(str(item) for item in completion_record.get("closed_gap_ids") or ())
 
     capability_leaf = capability_id.rsplit(".", 1)[-1]
     # Canonical receipt path: the dispatcher has already resolved the exact
@@ -201,6 +221,11 @@ def result_qualifies_as_work_evidence(
         mutation_ref=mutation_ref,
         artifact_ref=artifact_ref,
         external_receipt=external_receipt,
+        research_ready=research_ready,
+        research_bundle_id=research_bundle_id,
+        research_requirement_ids=research_requirement_ids,
+        research_evidence_ids=research_evidence_ids,
+        research_gap_ids=research_gap_ids,
     )
     if required_kind is not None and required_kind not in {
         kind,
@@ -230,6 +255,26 @@ def work_evidence_satisfies(
     # A compatibility caller may request the generic observable gate for a
     # novel action; any non-control typed evidence is sufficient.
     return bool(evidence)
+
+
+def _criterion_research_evidence_satisfied(
+    criterion: Criterion,
+    evidence: Sequence[WorkEvidence],
+    *,
+    total_required: int,
+) -> bool:
+    requirement_id = str(criterion.evidence_requirement_id or criterion.id)
+    for item in evidence:
+        if not item.research_ready:
+            continue
+        if requirement_id in item.research_requirement_ids:
+            return True
+        # A legacy single-bundle criterion has no stable requirement id. Keep
+        # that compatibility path only when there cannot be cross-criterion
+        # evidence confusion; multiple evidence criteria fail closed.
+        if total_required == 1 and not item.research_requirement_ids:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -379,6 +424,17 @@ class TerminationEvaluator:
         #     that prove Athena performed the requested action.
         required_criteria = [c for c in task.acceptance_criteria if c.required]
         unresolved = await self._unresolved_criteria(task)
+        evidence_criteria = [
+            criterion for criterion in required_criteria if criterion.evidence_required
+        ]
+        evidence_unresolved = tuple(
+            criterion.id
+            for criterion in evidence_criteria
+            if not _criterion_research_evidence_satisfied(
+                criterion, work_evidence, total_required=len(evidence_criteria)
+            )
+        )
+        unresolved = tuple(dict.fromkeys((*unresolved, *evidence_unresolved)))
         if unresolved:
             return TerminationDecision(
                 terminal=True,

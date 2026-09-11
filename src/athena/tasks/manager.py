@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -18,6 +20,7 @@ from athena.protocol.messages import utcnow
 from athena.protocol.tasks import (
     ContextRef,
     Durability,
+    FINAL_STATUSES,
     TaskResult,
     TaskSpec,
     TaskStatus,
@@ -27,6 +30,15 @@ from athena.protocol.tasks import (
 from athena.state.events import EventStore
 from athena.state.sessions import SessionRepository
 from athena.state.tasks import TaskStore
+from athena.state.task_finalizations import (
+    COMMITTED,
+    OBSERVER_DONE,
+    OBSERVER_FAILED,
+    OBSERVER_RUNNING,
+    QUIESCING,
+    RECOVERY_REQUIRED,
+    TaskFinalizationStore,
+)
 
 _logger = logging.getLogger("athena.tasks")
 
@@ -90,14 +102,19 @@ class TaskManager:
         cancellations: Any = None,
         admission: Any = None,
         principal_id: str | None = None,
+        finalizations: TaskFinalizationStore | None = None,
+        steering_store: Any = None,
     ) -> None:
         self._store = task_store
         self._events = events
         self._sessions = sessions
         self._budgets = budgets
+        self._model_response_store: Any = None
         self._cancellations = cancellations
         self._admission = admission
         self._principal_id = principal_id
+        self._finalizations = finalizations
+        self._steering_store = steering_store
         self._running_emitted: set[str] = set()
         # Optional post-finalization observers (knowledge pipeline). Each is an
         # async callable ``(task, result)`` invoked AFTER the terminal state is
@@ -118,6 +135,26 @@ class TaskManager:
     def set_budget_tracker(self, budgets: Any) -> None:
         """Late-bind the budget authority (construction-order tolerant, §19)."""
         self._budgets = budgets
+
+    def set_model_response_store(self, store: Any) -> None:
+        """Bind durable provider-outcome liability checks."""
+        self._model_response_store = store
+
+    async def _release_model_reservations_if_safe(self, task_id: str) -> None:
+        """Release only reservations whose provider outcome is known.
+
+        An UNKNOWN provider outcome is an external liability, not an ordinary
+        failed call. Keep its reservation across task finalization and restart
+        until an operator reconciles the attempt.
+        """
+        store = self._model_response_store
+        if store is not None:
+            unresolved = getattr(store, "has_unresolved_liability", None)
+            if callable(unresolved) and await unresolved(task_id):
+                return
+        release = getattr(self._budgets, "release_model_cost", None)
+        if release is not None:
+            await release(task_id)
 
     def set_cancellation_manager(self, cancellations: Any) -> None:
         """Late-bind the cancellation authority (construction-order tolerant, §20)."""
@@ -154,6 +191,16 @@ class TaskManager:
             result = self._admission(spec)
             if inspect.isawaitable(result):
                 await result
+        existing = await self._store.get(spec.id)
+        if existing is not None:
+            current = _deserialize(existing)
+            if (
+                current.objective != spec.objective
+                or current.session_id != spec.session_id
+                or current.parent_task_id != spec.parent_task_id
+            ):
+                raise ValueError(f"task id {spec.id!r} already identifies different work")
+            return current
         await self._ensure_session(spec)
         # AUTHORITY (Durability.AUTHORITY): the durable task row is the single
         # source of truth for the task's existence and state. It commits first
@@ -162,23 +209,36 @@ class TaskManager:
         # the authority commit (durability split, P1-27): a budget/cancellation
         # registration or event-emit failure cannot surface as a failed
         # ``create`` for a task that was actually admitted.
-        await self._store.insert_task(
-            spec.id,
-            spec.session_id,
-            spec.parent_task_id,
-            spec.objective,
-            autonomy=_autonomy(spec),
-            acceptance_criteria=spec.acceptance_criteria,
-            context_refs=spec.context_refs,
-            workspace=spec.workspace,
-            capability_policy=spec.capability_policy,
-            model_policy=spec.model_policy,
-            resource_budget=spec.resource_budget,
-            deadline=spec.deadline,
-            delivery=spec.delivery,
-            metadata=dict(spec.metadata),
-            status=TaskStatus.CREATED,
-        )
+        try:
+            await self._store.insert_task(
+                spec.id,
+                spec.session_id,
+                spec.parent_task_id,
+                spec.objective,
+                autonomy=_autonomy(spec),
+                acceptance_criteria=spec.acceptance_criteria,
+                context_refs=spec.context_refs,
+                workspace=spec.workspace,
+                capability_policy=spec.capability_policy,
+                model_policy=spec.model_policy,
+                resource_budget=spec.resource_budget,
+                deadline=spec.deadline,
+                delivery=spec.delivery,
+                metadata=dict(spec.metadata),
+                status=TaskStatus.CREATED,
+            )
+        except sqlite3.IntegrityError:
+            existing = await self._store.get(spec.id)
+            if existing is None:
+                raise
+            current = _deserialize(existing)
+            if (
+                current.objective != spec.objective
+                or current.session_id != spec.session_id
+                or current.parent_task_id != spec.parent_task_id
+            ):
+                raise ValueError(f"task id {spec.id!r} already identifies different work")
+            return current
 
         # ---- BOOKKEEPING (Durability.BOOKKEEPING), after the commit ------ #
         # Derived in-memory state (budget ledger, cancellation reset) and the
@@ -378,6 +438,7 @@ class TaskManager:
         reason: str | None = None,
         usage: UsageSummary | None = None,
         summary: str = "",
+        unresolved: tuple | None = None,
         evidence: tuple = (),
         artifacts: tuple = (),
         mutations: tuple = (),
@@ -395,6 +456,11 @@ class TaskManager:
 
         if usage is None:
             usage = UsageSummary()
+        result_unresolved = (
+            tuple(unresolved)
+            if unresolved is not None
+            else tuple(getattr(decision, "unresolved", ()) or ())
+        )
         result = TaskResult(
             task_id=task_id,
             status=status,
@@ -402,11 +468,19 @@ class TaskManager:
             evidence=tuple(evidence or ()),
             artifacts=tuple(artifacts or ()),
             mutations=tuple(mutations or ()),
-            unresolved=tuple(getattr(decision, "unresolved", ()) or ()),
+            unresolved=result_unresolved,
             usage=usage,
             created_at=utcnow(),
         )
         barrier = self._finalization_events.setdefault(task_id, asyncio.Event())
+
+        # Write the complete intended result before attempting resource
+        # quiescence. If the process dies in the barrier, recovery must have
+        # the original terminal status and payload — not just a marker saying
+        # that cleanup was uncertain.
+        if self._finalizations is not None and status in FINAL_STATUSES:
+            await self._finalizations.prepare(result)
+            await self._finalizations.set_phase(task_id, QUIESCING)
 
         # Resource ownership is part of the completion claim. Do not publish
         # COMPLETE/PARTIAL/FAILED/CANCELLED while a task-owned process or
@@ -448,6 +522,12 @@ class TaskManager:
                     usage=usage,
                     created_at=utcnow(),
                 )
+                if self._finalizations is not None:
+                    await self._finalizations.set_phase(
+                        task_id,
+                        RECOVERY_REQUIRED,
+                        error=blocked_summary,
+                    )
                 marker_store = getattr(self._store, "record_recovery_marker", None)
                 if marker_store is not None:
                     await marker_store(
@@ -468,6 +548,7 @@ class TaskManager:
                     TaskStatus.RECOVERY_REQUIRED,
                     reason=blocked_summary,
                 )
+                barrier.set()
                 return blocked
 
         # Status + result MUST land atomically (§86): do the transition and the
@@ -480,37 +561,9 @@ class TaskManager:
                 status,
                 result,
                 allow_recovery_completion=_allow_recovery_completion,
+                commit_pending=self._finalizations is not None,
             )
-
-            self._running_emitted.discard(task_id)
-
-            await self._emit(resolved, status)
-
-            if self._budgets is not None:
-                release = getattr(self._budgets, "release_model_cost", None)
-                if release is not None:
-                    await release(task_id)
-                self._budgets.consume_result(task_id, usage)
-                persist_budget = getattr(self._budgets, "_persist_usage", None)
-                if persist_budget is not None:
-                    await persist_budget(task_id)
-            if self._cancellations is not None:
-                self._cancellations.reset(task_id)
-
-            # Post-finalization knowledge pipeline (BUILDSPEC 64/68): observers see
-            # the DURABLE result and may propose memory/skill candidates. Their
-            # failures are logged, never propagated — finalization already landed.
-            for observer in self._finalize_observers:
-                try:
-                    await observer(resolved, result)
-                except Exception as exc:
-                    _logger.warning(
-                        "finalize observer %s failed for task %s: %s",
-                        getattr(observer, "__name__", type(observer).__name__),
-                        task_id,
-                        exc,
-                    )
-
+            await self._post_commit(resolved, result)
             return result
         finally:
             barrier.set()
@@ -537,6 +590,8 @@ class TaskManager:
         result: TaskResult,
         *,
         allow_recovery_completion: bool = False,
+        recovery_finalization: bool = False,
+        commit_pending: bool = False,
     ) -> None:
         usage = {
             "input_tokens": result.usage.input_tokens,
@@ -559,7 +614,136 @@ class TaskManager:
             unresolved=list(result.unresolved),
             usage=usage,
             allow_recovery_completion=allow_recovery_completion,
+            recovery_finalization=recovery_finalization,
+            commit_pending=commit_pending,
         )
+
+    async def _post_commit(self, task: Task, result: TaskResult) -> None:
+        """Publish a committed result and drain durable observers."""
+        task_id = result.task_id
+        if result.status in FINAL_STATUSES and self._steering_store is not None:
+            try:
+                await self._steering_store.mark_missed(task_id)
+            except Exception as exc:
+                _logger.warning("could not mark pending steering missed for %s: %s", task_id, exc)
+        self._running_emitted.discard(task_id)
+        await self._emit(task, result.status)
+
+        if self._budgets is not None:
+            await self._release_model_reservations_if_safe(task_id)
+            self._budgets.consume_result(task_id, result.usage)
+            persist_budget = getattr(self._budgets, "_persist_usage", None)
+            if persist_budget is not None:
+                await persist_budget(task_id)
+        if self._cancellations is not None:
+            self._cancellations.reset(task_id)
+
+        pending = await self._finalizations.get(task_id) if self._finalizations else None
+        observer_state = dict(pending.observer_state) if pending is not None else {}
+        observer_failed = False
+        for index, observer in enumerate(self._finalize_observers):
+            key = _observer_key(observer, index)
+            if observer_state.get(key) == OBSERVER_DONE:
+                continue
+            if self._finalizations is not None:
+                await self._finalizations.set_observer_state(task_id, key, OBSERVER_RUNNING)
+            current_observer_failed = False
+            try:
+                await observer(task, result)
+            except Exception as exc:
+                # Preserve failure isolation for the terminal task, but keep
+                # the observer pending so a restart can replay the durable
+                # bookkeeping/projection.  A process crash while RUNNING is
+                # likewise retried on startup.
+                current_observer_failed = True
+                observer_failed = True
+                _logger.warning(
+                    "finalize observer %s failed for task %s: %s",
+                    getattr(observer, "__name__", type(observer).__name__),
+                    task_id,
+                    exc,
+                )
+                if self._finalizations is not None:
+                    await self._finalizations.set_observer_state(
+                        task_id, key, OBSERVER_FAILED, error=str(exc)
+                    )
+            finally:
+                if self._finalizations is not None and not current_observer_failed:
+                    await self._finalizations.set_observer_state(task_id, key, OBSERVER_DONE)
+        if self._finalizations is not None and not observer_failed:
+            await self._finalizations.delete(task_id)
+
+    async def commit_pending_finalization(self, task_id: str) -> TaskResult | None:
+        """Commit the exact result retained by the finalization write-ahead."""
+        if self._finalizations is None:
+            return None
+        pending = await self._finalizations.get(task_id)
+        if pending is None:
+            return None
+        task = await self.get(task_id)
+        raw = await self._store.get(task_id)
+        current = TaskStatus(raw["status"]) if raw is not None else None
+        if current in FINAL_STATUSES:
+            await self._post_commit(task, pending.result)
+            return pending.result
+        if current is not TaskStatus.RECOVERY_REQUIRED:
+            return None
+        await self._finalize_atomically(
+            task_id,
+            pending.intended_status,
+            pending.result,
+            recovery_finalization=True,
+            commit_pending=True,
+        )
+        await self._post_commit(task, pending.result)
+        return pending.result
+
+    async def reconcile_pending_finalizations(self, resource_finalizer: Any = None) -> int:
+        """Recover pending terminal claims before workers are allowed to run."""
+        if self._finalizations is None:
+            return 0
+        recovered = 0
+        for pending in await self._finalizations.list_recoverable():
+            raw = await self._store.get(pending.task_id)
+            if raw is None:
+                await self._finalizations.delete(pending.task_id)
+                continue
+            current = TaskStatus(raw["status"])
+            if current in FINAL_STATUSES or pending.phase == COMMITTED:
+                if pending.phase != COMMITTED:
+                    await self._finalizations.set_phase(pending.task_id, COMMITTED)
+                committed = await self.commit_pending_finalization(pending.task_id)
+                if committed is not None and await self._finalizations.get(pending.task_id) is None:
+                    recovered += 1
+                continue
+            if current is not TaskStatus.RECOVERY_REQUIRED:
+                await self._store.transition(pending.task_id, TaskStatus.RECOVERY_REQUIRED)
+                await self._emit(
+                    await self.get(pending.task_id),
+                    TaskStatus.RECOVERY_REQUIRED,
+                    reason="pending terminal result requires resource recovery",
+                )
+            if resource_finalizer is None:
+                continue
+            task = await self.get(pending.task_id)
+            await resource_finalizer.retry(task, pending.result)
+            health = resource_finalizer.health()
+            unresolved = getattr(resource_finalizer, "unresolved_for_task", None)
+            task_unresolved = (
+                unresolved(pending.task_id)
+                if callable(unresolved)
+                else [
+                    item
+                    for item in health.get("unresolved", ())
+                    if item.get("task_id") == pending.task_id
+                ]
+            )
+            if task_unresolved or health.get("durability_error"):
+                continue
+            committed = await self.commit_pending_finalization(pending.task_id)
+            if committed is not None and await self._finalizations.get(pending.task_id) is None:
+                recovered += 1
+        return recovered
 
     async def get_result(self, task_id: str) -> TaskResult | None:
         row = await self._store.get(task_id)
@@ -570,9 +754,7 @@ class TaskManager:
     async def apply_result(self, task_id: str, result: TaskResult) -> None:
         await self._persist_result(task_id, result)
         if self._budgets is not None:
-            release = getattr(self._budgets, "release_model_cost", None)
-            if release is not None:
-                await release(task_id)
+            await self._release_model_reservations_if_safe(task_id)
             self._budgets.consume_result(task_id, result.usage)
             persist_budget = getattr(self._budgets, "_persist_usage", None)
             if persist_budget is not None:
@@ -612,6 +794,25 @@ class TaskManager:
         payload: dict[str, Any] = {"status": status.value}
         if reason:
             payload["reason"] = reason
+        causal = (task.metadata or {}).get("_causal")
+        if isinstance(causal, dict) and causal.get("kind") == "pack_hook":
+            # Only the durable TaskSpec metadata may establish hook lineage;
+            # event payload fields are never consulted as authority.
+            try:
+                causal_depth = max(0, int(causal.get("depth", 0)))
+            except (TypeError, ValueError):
+                causal_depth = 0
+            payload["_causal"] = {
+                "kind": "pack_hook",
+                "root_event_id": str(causal.get("root_event_id") or task.id),
+                "hook_id": str(causal.get("hook_id") or ""),
+                "depth": causal_depth,
+            }
+        causal_id = None
+        if isinstance(causal, dict) and causal.get("kind") == "pack_hook":
+            causal_id = "athena-pack-hook:" + json.dumps(
+                payload["_causal"], sort_keys=True, separators=(",", ":")
+            )
         mission_plan = (task.metadata or {}).get("_athena_mission_plan")
         if isinstance(mission_plan, dict) and mission_plan.get("phase"):
             # Self-host phase is durable mission state, not a renderer guess.
@@ -629,6 +830,8 @@ class TaskManager:
             payload,
             task_id=task.id,
             session_id=task.session_id,
+            causal_id=causal_id,
+            id=(f"task-lifecycle:{task.id}:{status.value}" if status in FINAL_STATUSES else None),
         )
         # Child lifecycle events are emitted on the parent's stream as well
         # as the child's own TaskCreated/TaskCompleted stream.  This keeps
@@ -689,6 +892,15 @@ def _autonomy(spec: TaskSpec) -> str:
         except Exception:
             return "supervised"
     return str(val or "supervised")
+
+
+def _observer_key(observer: Any, index: int) -> str:
+    owner = getattr(observer, "__self__", None)
+    module = getattr(owner, "__module__", None) or getattr(observer, "__module__", "")
+    qualname = getattr(observer, "__qualname__", None) or getattr(
+        observer, "__name__", type(observer).__name__
+    )
+    return f"{module}:{qualname}:{index}"
 
 
 def _ref_kv(r: Any) -> dict:

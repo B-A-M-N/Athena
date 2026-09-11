@@ -130,6 +130,7 @@ class MCPAdapter:
             effects=effects,
             tags=frozenset(tags),
             origin=self.origin,
+            source_schema=dict(tool.input_schema or {}),
         )
 
     # ------------------------------------------------------------------ #

@@ -4,7 +4,7 @@ import math
 import re
 import inspect
 from dataclasses import replace
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from athena.memory.embeddings import SemanticRetrievalUnavailable
 from athena.protocol.memory import MemoryRecord, MemoryScope, RetrievalMode
@@ -50,20 +50,65 @@ class MemoryRetriever:
         mode: RetrievalMode | str,
         limit: int,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         mode = RetrievalMode(mode)
+        if mode is RetrievalMode.HISTORY:
+            include_inactive = True
+            include_conflicts = True
+            mode = RetrievalMode.RELEVANCE
         limit = max(0, int(limit or 0))
         if limit == 0:
             return []
         if mode is RetrievalMode.RECENCY:
-            return await self._store.retrieve_by_recency(scope, scope_id, limit, tags=tags)
+            return await self._store.retrieve_by_recency(
+                scope,
+                scope_id,
+                limit,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
         if mode is RetrievalMode.EXACT:
-            return await self._store.retrieve_by_fts(query, scope, scope_id, limit, tags=tags)
+            return await self._store.retrieve_by_fts(
+                query,
+                scope,
+                scope_id,
+                limit,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
         if mode is RetrievalMode.SEMANTIC:
-            return await self._by_semantic(query, scope, scope_id, limit, tags=tags)
+            return await self._by_semantic(
+                query,
+                scope,
+                scope_id,
+                limit,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
         if mode is RetrievalMode.HYBRID:
-            return await self._by_hybrid(query, scope, scope_id, limit, tags=tags)
-        return await self._by_relevance(query, scope, scope_id, limit, tags=tags)
+            return await self._by_hybrid(
+                query,
+                scope,
+                scope_id,
+                limit,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
+        return await self._by_relevance(
+            query,
+            scope,
+            scope_id,
+            limit,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
 
     async def retrieve_all(self, query: str, limit: int = 10) -> list[MemoryRecord]:
         return await self._by_relevance(query, None, None, limit)
@@ -76,8 +121,14 @@ class MemoryRetriever:
         mode: RetrievalMode | str,
         limit: int,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         mode = RetrievalMode(mode)
+        if mode is RetrievalMode.HISTORY:
+            include_inactive = True
+            include_conflicts = True
+            mode = RetrievalMode.RELEVANCE
         limit = max(0, int(limit or 0))
         if limit == 0 or not scopes:
             return []
@@ -87,14 +138,46 @@ class MemoryRetriever:
             rows: list[MemoryRecord] = []
             for scope, scope_id in scopes:
                 rows.extend(
-                    await self._store.retrieve_by_recency(scope, scope_id, limit, tags=tags)
+                    await self._store.retrieve_by_recency(
+                        scope,
+                        scope_id,
+                        limit,
+                        tags=tags,
+                        include_inactive=include_inactive,
+                        include_conflicts=include_conflicts,
+                    )
                 )
             return sorted(rows, key=lambda item: item.created_at, reverse=True)[:limit]
         if mode is RetrievalMode.SEMANTIC:
-            return await self._by_semantic_scopes(query, scopes, limit, tags=tags)
+            return await self._by_semantic_scopes(
+                query,
+                scopes,
+                limit,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
         if mode is RetrievalMode.HYBRID:
-            return await self._by_hybrid_scopes(query, scopes, limit, tags=tags)
-        candidate = await self._store.retrieve_by_fts_scopes(query, scopes, limit * 8, tags=tags)
+            return await self._by_hybrid_scopes(
+                query,
+                scopes,
+                limit,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
+        fts_kwargs: dict[str, Any] = {"tags": tags}
+        if include_inactive or include_conflicts:
+            fts_kwargs.update(
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
+        candidate = await self._store.retrieve_by_fts_scopes(
+            query,
+            scopes,
+            limit * 8,
+            **fts_kwargs,
+        )
         if mode is RetrievalMode.EXACT:
             return candidate[:limit]
         return self._rank(candidate, query, limit)
@@ -108,6 +191,8 @@ class MemoryRetriever:
         limit: int,
         tags: Sequence[str] | None = None,
         weights: Mapping[str, float] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         """Rank scope-weighted: score = text_overlap * scope_weight (P1-12).
 
@@ -119,12 +204,22 @@ class MemoryRetriever:
         ranking property rather than a post-hoc sort.
         """
         mode = RetrievalMode(mode)
+        if mode is RetrievalMode.HISTORY:
+            include_inactive = True
+            include_conflicts = True
+            mode = RetrievalMode.RELEVANCE
         limit = max(0, int(limit or 0))
         if limit == 0 or not scopes:
             return []
         if mode in (RetrievalMode.SEMANTIC, RetrievalMode.HYBRID):
             records = await self.retrieve_scopes(
-                query=query, scopes=scopes, mode=mode, limit=limit * 8, tags=tags
+                query=query,
+                scopes=scopes,
+                mode=mode,
+                limit=limit * 8,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
             )
             weight_map = {str(k).lower(): float(v) for k, v in (weights or {}).items()}
             weighted_scores = [
@@ -143,7 +238,18 @@ class MemoryRetriever:
         # ("session" / "project" / "global"), so callers may use either the
         # enum name (SESSION) or the value.
         weight_map = {str(k).lower(): float(v) for k, v in (weights or {}).items()}
-        candidate = await self._store.retrieve_by_fts_scopes(query, scopes, limit * 8, tags=tags)
+        fts_kwargs: dict[str, Any] = {"tags": tags}
+        if include_inactive or include_conflicts:
+            fts_kwargs.update(
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
+        candidate = await self._store.retrieve_by_fts_scopes(
+            query,
+            scopes,
+            limit * 8,
+            **fts_kwargs,
+        )
         qset = _tokens(query)
         scope_key = {scope.value: weight_map.get(scope.value, 0.0) for scope, _ in scopes}
         scored: list[tuple[float, MemoryRecord]] = []
@@ -179,8 +285,18 @@ class MemoryRetriever:
         scope_id: str | None,
         limit: int,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
-        candidate = await self._store.retrieve_by_fts(query, scope, scope_id, limit * 8, tags=tags)
+        candidate = await self._store.retrieve_by_fts(
+            query,
+            scope,
+            scope_id,
+            limit * 8,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         return self._rank(candidate, query, limit)
 
     async def _query_embedding(self, query: str) -> Sequence[float]:
@@ -210,11 +326,25 @@ class MemoryRetriever:
         scope_id: str | None,
         limit: int,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
-        await self._store.ensure_embeddings(scope, scope_id, tags=tags)
+        await self._store.ensure_embeddings(
+            scope,
+            scope_id,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         vector = await self._query_embedding(query)
         candidates = await self._store.retrieve_by_embedding(
-            vector, scope, scope_id, limit * 8, tags=tags
+            vector,
+            scope,
+            scope_id,
+            limit * 8,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
         )
         return [
             _with_retrieval_score(record, score)
@@ -234,12 +364,25 @@ class MemoryRetriever:
         scopes: Sequence[tuple[MemoryScope, str | None]],
         limit: int,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         for scope, scope_id in scopes:
-            await self._store.ensure_embeddings(scope, scope_id, tags=tags)
+            await self._store.ensure_embeddings(
+                scope,
+                scope_id,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
         vector = await self._query_embedding(query)
         candidates = await self._store.retrieve_by_embedding_scopes(
-            vector, scopes, limit * 8, tags=tags
+            vector,
+            scopes,
+            limit * 8,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
         )
         return [record for record, _ in _rank_vector(candidates, limit)]
 
@@ -250,12 +393,34 @@ class MemoryRetriever:
         scope_id: str | None,
         limit: int,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
-        await self._store.ensure_embeddings(scope, scope_id, tags=tags)
+        await self._store.ensure_embeddings(
+            scope,
+            scope_id,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         vector = await self._query_embedding(query)
-        lexical = await self._store.retrieve_by_fts(query, scope, scope_id, limit * 8, tags=tags)
+        lexical = await self._store.retrieve_by_fts(
+            query,
+            scope,
+            scope_id,
+            limit * 8,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         vectors = await self._store.retrieve_by_embedding(
-            vector, scope, scope_id, limit * 8, tags=tags
+            vector,
+            scope,
+            scope_id,
+            limit * 8,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
         )
         return _fuse(lexical, vectors, limit)
 
@@ -265,13 +430,33 @@ class MemoryRetriever:
         scopes: Sequence[tuple[MemoryScope, str | None]],
         limit: int,
         tags: Sequence[str] | None = None,
+        include_inactive: bool = False,
+        include_conflicts: bool = False,
     ) -> list[MemoryRecord]:
         for scope, scope_id in scopes:
-            await self._store.ensure_embeddings(scope, scope_id, tags=tags)
+            await self._store.ensure_embeddings(
+                scope,
+                scope_id,
+                tags=tags,
+                include_inactive=include_inactive,
+                include_conflicts=include_conflicts,
+            )
         vector = await self._query_embedding(query)
-        lexical = await self._store.retrieve_by_fts_scopes(query, scopes, limit * 8, tags=tags)
+        lexical = await self._store.retrieve_by_fts_scopes(
+            query,
+            scopes,
+            limit * 8,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
+        )
         vectors = await self._store.retrieve_by_embedding_scopes(
-            vector, scopes, limit * 8, tags=tags
+            vector,
+            scopes,
+            limit * 8,
+            tags=tags,
+            include_inactive=include_inactive,
+            include_conflicts=include_conflicts,
         )
         return _fuse(lexical, vectors, limit)
 

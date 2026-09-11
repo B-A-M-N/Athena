@@ -332,7 +332,7 @@ class ChildRuntime:
             else None
         )
         if cap.runtime != "python_persistent" or request.task_id is None:
-            return await self._e._run_child_async(
+            result = await self._e._run_child_async(
                 child,
                 payload,
                 timeout=timeout,
@@ -341,6 +341,27 @@ class ChildRuntime:
                 python_paths=python_paths,
                 host=host,
             )
+            # A read-only generated child may lose its entire timeout budget
+            # to sandbox/process startup when the host is heavily contended.
+            # A second isolated attempt is safe for this class of capability;
+            # write/delete/network-write children deliberately do not retry so
+            # an unknown timed-out effect is never duplicated.
+            retryable_effects = {"WRITE_LOCAL", "DELETE", "NETWORK_WRITE"}
+            if (
+                result[2] == 124
+                and result[1].strip() == "synthetic execution timed out"
+                and not (set(effects or ()) & retryable_effects)
+            ):
+                result = await self._e._run_child_async(
+                    child,
+                    payload,
+                    timeout=timeout,
+                    workspace_root=workspace_root,
+                    effects=effects,
+                    python_paths=python_paths,
+                    host=host,
+                )
+            return result
         root_key = os.path.realpath(os.path.abspath(workspace_root or f"<task:{request.task_id}>"))
         return await self._e._run_persistent_child_async(
             child,

@@ -35,7 +35,9 @@ async def run_blocking(function: Callable[..., Any], *args: Any, **kwargs: Any) 
             result.ready.set()
 
     threading.Thread(target=invoke, name="athena-blocking-call", daemon=True).start()
-    while not result.ready.is_set():
+    # The worker owns a threading.Event; converting it to asyncio.Event would
+    # require cross-thread loop mutation. The zero-cost yield is deliberate.
+    while not result.ready.is_set():  # noqa: ASYNC110
         await asyncio.sleep(0)
     if result.error is not None:
         raise result.error

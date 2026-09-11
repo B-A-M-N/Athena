@@ -32,6 +32,16 @@ from pathlib import Path
 from typing import Any
 
 from athena.execution.environment import VerificationEnvironment
+from athena.cli.operator_handlers import (
+    cmd_artifacts,
+    cmd_candidates,
+    cmd_capabilities,
+    cmd_context,
+    cmd_generated_capabilities,
+    cmd_inference_recoveries,
+    cmd_mutations,
+    cmd_permissions,
+)
 from athena.protocol.tasks import AgentRequest, AutonomyLevel, WorkspaceSpec
 
 FREEINFERENCE_DEFAULT_BASE_URL = "https://freeinference.org/v1"
@@ -282,6 +292,7 @@ def _config_set(o: "Options") -> int:
             ("browser_enabled",),
             ("browser_headless",),
             ("research_allow_private_network",),
+            ("local_runtime_supervisor",),
             ("animations",),
             ("reduced_motion",),
         }
@@ -394,6 +405,123 @@ def _cmd_config(o: "Options", config: Any) -> int:
     return 2
 
 
+def _cmd_setup(o: "Options", config: Any) -> int:
+    """Create a usable operator profile without starting an agent loop."""
+    from getpass import getpass
+
+    from athena.policy.credentials import write_user_secret
+    from athena.service.config import (
+        config_from_dict,
+        global_config_path,
+        load_toml_file,
+        write_toml_atomic_private,
+    )
+
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+
+    def ask(label: str, default: str = "") -> str:
+        if not interactive:
+            return default
+        suffix = f" [{default}]" if default else ""
+        value = input(f"{label}{suffix}: ").strip()
+        return value or default
+
+    existing_provider = next(iter(getattr(config, "providers", ()) or ()), None)
+    provider_name = str(
+        o.setup_provider
+        or getattr(existing_provider, "name", None)
+        or ask("Model provider name", "openai")
+    ).strip()
+    model = str(
+        o.setup_model
+        or getattr(o, "model", None)
+        or getattr(existing_provider, "model", None)
+        or ask("Model", "gpt-4o-mini")
+    ).strip()
+    credential_id = str(
+        o.setup_credential_id
+        or getattr(existing_provider, "credential_id", None)
+        or f"{provider_name.upper().replace('-', '_')}_API_KEY"
+    ).strip()
+    provider_kind = str(
+        o.setup_provider_kind
+        or getattr(existing_provider, "kind", None)
+        or (
+            provider_name
+            if provider_name in {"openai", "anthropic", "ollama", "lmstudio", "vllm", "llamacpp"}
+            else "openai-compat"
+        )
+    ).strip()
+    workspace = str(o.setup_workspace or config.workspace_root or ask("Workspace", os.getcwd()))
+    workspace = os.path.abspath(os.path.expanduser(workspace))
+    if not provider_name or not model or not credential_id:
+        print("athena setup: provider, model, and credential id are required", file=sys.stderr)
+        return 2
+
+    path = Path(o.config_path).expanduser() if o.config_path else global_config_path()
+    raw = load_toml_file(path)
+    providers = [dict(item) for item in raw.get("providers", ()) if isinstance(item, dict)]
+    provider_record = {
+        "kind": provider_kind,
+        "name": provider_name,
+        "model": model,
+        "credential_id": credential_id,
+    }
+    if o.setup_base_url:
+        provider_record["base_url"] = str(o.setup_base_url)
+    replaced = False
+    for index, item in enumerate(providers):
+        if str(item.get("name") or "") == provider_name:
+            providers[index] = {**item, **provider_record}
+            replaced = True
+            break
+    if not replaced:
+        providers.append(provider_record)
+    raw["providers"] = providers
+    raw["workspace_root"] = workspace
+
+    voice_enabled = o.setup_voice
+    if voice_enabled is None and interactive:
+        voice_enabled = ask("Enable voice transcription and synthesis?", "yes").casefold() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+    if voice_enabled:
+        voice = dict(raw.get("voice") or {})
+        voice.update(
+            {
+                "enabled": True,
+                "transcription_provider": provider_name,
+                "synthesis_provider": provider_name,
+            }
+        )
+        raw["voice"] = voice
+
+    runtime_supervisor = getattr(o, "setup_runtime_supervisor", None)
+    if runtime_supervisor is not None:
+        raw["local_runtime_supervisor"] = bool(runtime_supervisor)
+
+    if interactive:
+        secret = getpass(f"Credential value for {credential_id} (empty to keep existing): ").strip()
+        if secret:
+            write_user_secret(credential_id, secret)
+    try:
+        config_from_dict(raw)
+        write_toml_atomic_private(path, raw)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(f"athena setup: could not save configuration: {exc}", file=sys.stderr)
+        return 1
+    print(f"configured {provider_name}/{model}")
+    print(f"workspace: {workspace}")
+    print(f"credential: {credential_id} (stored outside config)")
+    print(f"voice: {'enabled' if voice_enabled else 'not enabled'}")
+    print("next: athena doctor startup")
+    return 0
+
+
 def _cmd_referee(o: "Options") -> int:
     """Run an explicit Hermes referee lifecycle action."""
     from athena.hermes.manager import run_referee_action
@@ -472,7 +600,9 @@ def _doctor_startup(o: "Options", config: Any) -> int:
     async def probe() -> dict[str, Any]:
         try:
             await service.start()
-            return service.startup_health()
+            health = service.startup_health()
+            health["operational_matrix"] = service.operational_matrix()
+            return health
         finally:
             await service.stop()
 
@@ -485,6 +615,28 @@ def _doctor_startup(o: "Options", config: Any) -> int:
     for name, check in (health.get("checks") or {}).items():
         status = check.get("status", "unknown") if isinstance(check, dict) else "unknown"
         print(f"  {name}: {status}")
+    matrix = health.get("operational_matrix") or {}
+    for cell in matrix.get("execution") or ():
+        print(
+            "  execution/{backend}/{runtime}: available={available} persistent={persistent} "
+            "state={state} reattach={reattach} deps={deps}".format(
+                backend=cell.get("backend"),
+                runtime=cell.get("runtime"),
+                available="yes" if cell.get("available") else "no",
+                persistent="yes" if cell.get("persistent_session") else "no",
+                state="yes" if cell.get("persistent_runtime_state") else "no",
+                reattach="yes" if cell.get("reattach") else "no",
+                deps=",".join(cell.get("dependency_installation") or ()) or "none",
+            )
+        )
+    mcp = matrix.get("mcp") or {}
+    if isinstance(mcp, dict):
+        for name, status in sorted(mcp.items()):
+            state = status.get("state", "unknown") if isinstance(status, dict) else "unknown"
+            print(f"  mcp/{name}: {state}")
+    memory = matrix.get("memory") or {}
+    if isinstance(memory, dict):
+        print(f"  semantic-memory: {memory.get('state', 'unknown')}")
     return 0 if health.get("status") == "ok" else 1
 
 
@@ -556,10 +708,24 @@ class Options:
     referee_credential_id: str = "HERMES_REFEREE_API_KEY"
     referee_supervision: str | None = None
     _providers: tuple[Any, ...] = ()
+    setup_provider: str | None = None
+    setup_provider_kind: str | None = None
+    setup_model: str | None = None
+    setup_credential_id: str | None = None
+    setup_base_url: str | None = None
+    setup_workspace: str | None = None
+    setup_voice: bool | None = None
+    setup_runtime_supervisor: bool | None = None
+    recovery_note: str | None = None
+    recovery_resolution: str | None = None
+    recovery_provider_response_id: str | None = None
+    recovery_actual_cost: str | None = None
 
 
 def dispatch(o: Options) -> int:
     """Run a parsed command synchronously (asyncio.run at the top)."""
+    if o.command == "completion":
+        return _cmd_completion(o.args[0] if o.args else "")
     if o.command == "referee":
         return _cmd_referee(o)
     try:
@@ -577,6 +743,8 @@ def dispatch(o: Options) -> int:
         o.reduced_motion = bool(getattr(config, "reduced_motion", False))
     if o.command == "config":
         return _cmd_config(o, config)
+    if o.command == "setup":
+        return _cmd_setup(o, config)
     if o.command == "serve":
         from athena.api.app import create_app
         from athena.api.sse import run as run_server
@@ -634,6 +802,21 @@ def dispatch(o: Options) -> int:
     return code
 
 
+def _cmd_completion(shell: str) -> int:
+    try:
+        import click
+        from athena.cli.operator_cli import completion_source
+    except ImportError:
+        print("athena completion: Click is required for shell completion", file=sys.stderr)
+        return 1
+    try:
+        print(completion_source(_click_cli(click), shell, click=click), end="")
+    except click.ClickException as exc:
+        print(f"athena completion: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 async def _run(o: Options, service: Any) -> int:
     cmd = o.command
     if cmd == "chat":
@@ -650,7 +833,7 @@ async def _run(o: Options, service: Any) -> int:
 
         return await run_inspect(service, o.args[0], verbose=o.verbose)
     if cmd == "sessions":
-        return await _cmd_sessions(service)
+        return await _cmd_sessions(service, o)
     if cmd == "resume":
         from athena.cli.chat import ChatREPL
 
@@ -667,6 +850,8 @@ async def _run(o: Options, service: Any) -> int:
         return await _cmd_tasks(o, service)
     if cmd == "models":
         return await _cmd_models(service)
+    if cmd == "inference-recoveries":
+        return await cmd_inference_recoveries(o, service)
     if cmd == "skills":
         return await _cmd_skills(o, service)
     if cmd == "jobs":
@@ -679,6 +864,20 @@ async def _run(o: Options, service: Any) -> int:
         return await _cmd_memory(o, service)
     if cmd == "mcp":
         return await _cmd_mcp(o, service)
+    if cmd == "artifacts":
+        return await cmd_artifacts(o, service)
+    if cmd == "candidates":
+        return await cmd_candidates(o, service)
+    if cmd == "mutations":
+        return await cmd_mutations(o, service)
+    if cmd == "permissions":
+        return await cmd_permissions(service)
+    if cmd == "capabilities":
+        return await cmd_capabilities(service)
+    if cmd == "context":
+        return await cmd_context(o, service)
+    if cmd == "generated-capabilities":
+        return await cmd_generated_capabilities(o, service)
     if cmd == "acp":
         return await _cmd_acp(service)
     if cmd == "oi-stream":
@@ -1012,13 +1211,43 @@ def _print_hermes_verdict(candidate: dict[str, Any]) -> None:
             print(f"  challenge: {challenge.get('request') or challenge.get('claim') or challenge}")
 
 
-async def _cmd_sessions(service: Any) -> int:
+async def _cmd_sessions(service: Any, o: Options | None = None) -> int:
+    action = (o.args[0] if o and o.args else "list").casefold()
     try:
         sessions = await service.list_sessions()
     except (NotImplementedError, AttributeError):
         print("(session listing unavailable)", file=sys.stderr)
         return 1
     sessions = list(sessions or [])
+    if action == "show":
+        session_id = o.args[1] if o and len(o.args) > 1 else ""
+        match = next(
+            (
+                item
+                for item in sessions
+                if str(item.get("id") if isinstance(item, dict) else getattr(item, "id", ""))
+                == session_id
+            ),
+            None,
+        )
+        if match is None:
+            print(f"session not found: {session_id}", file=sys.stderr)
+            return 1
+        import json
+
+        print(json.dumps(match, indent=2, default=str, sort_keys=True))
+        return 0
+    if action == "close":
+        session_id = o.args[1] if o and len(o.args) > 1 else ""
+        closed = await service.close_session(session_id)
+        if not closed:
+            print(f"session not found: {session_id}", file=sys.stderr)
+            return 1
+        print(f"session {session_id}: closed")
+        return 0
+    if action != "list":
+        print("athena sessions: use list, show SESSION_ID, or close SESSION_ID", file=sys.stderr)
+        return 2
     if not sessions:
         print("(no sessions)")
         return 0
@@ -1066,7 +1295,15 @@ async def _cmd_tasks(o: Options, service: Any) -> int:
     action = (o.args[0] if o.args else "list").casefold()
     task_id = o.args[1] if len(o.args) > 1 else None
     if action == "list":
-        rows = await service.list_tasks()
+        status_value = getattr(o, "task_status", None)
+        status = None
+        if status_value:
+            from athena.protocol.tasks import TaskStatus
+
+            status = TaskStatus(status_value)
+        rows = (
+            await service.list_tasks(status=status) if status_value else await service.list_tasks()
+        )
         if not rows:
             print("(no tasks)")
             return 0
@@ -1096,8 +1333,34 @@ async def _cmd_tasks(o: Options, service: Any) -> int:
         status = await service.interrupt(task_id)
         print(f"interrupt requested for {task_id}: {getattr(status, 'value', status)}")
         return 0
+    if action == "resume":
+        await service.resume_task(task_id)
+        print(f"resume requested for {task_id}")
+        return 0
+    if action == "steer":
+        text = o.args[2] if len(o.args) > 2 else ""
+        if not text.strip():
+            print("athena tasks steer: missing steering text", file=sys.stderr)
+            return 2
+        record = await service.steer_task(
+            task_id,
+            text,
+            source_task_id=getattr(o, "steer_source_task_id", None),
+        )
+        print(f"steering queued for {task_id}: {record.get('id', 'accepted')}")
+        return 0
+    if action == "input":
+        answer = o.args[2] if len(o.args) > 2 else ""
+        if not answer.strip():
+            print("athena tasks input: missing answer", file=sys.stderr)
+            return 2
+        await service.provide_input(task_id, answer)
+        print(f"input provided for {task_id}")
+        return 0
     print(
-        "athena tasks: use list, show TASK_ID, result TASK_ID, cancel TASK_ID, or interrupt TASK_ID"
+        "athena tasks: use list, show TASK_ID, result TASK_ID, cancel TASK_ID, "
+        "interrupt TASK_ID, resume TASK_ID, steer TASK_ID TEXT, or input TASK_ID ANSWER",
+        file=sys.stderr,
     )
     return 2
 
@@ -1183,9 +1446,12 @@ async def _cmd_jobs(o: Options, service: Any) -> int:
     action = (o.args[0] if o.args else "list").casefold()
     value = o.args[1] if len(o.args) > 1 else None
     if action in {"list", "show"}:
-        rows = await service.list_jobs(enabled_only=False)
+        rows = await service.list_jobs(enabled_only=bool(getattr(o, "jobs_enabled_only", False)))
         if action == "show" and value:
             rows = [row for row in rows if str(row.get("id")) == value]
+            if not rows:
+                print(f"job not found: {value}", file=sys.stderr)
+                return 1
         if not rows:
             print("(no scheduled jobs)")
         for row in rows:
@@ -1209,8 +1475,34 @@ async def _cmd_jobs(o: Options, service: Any) -> int:
             return 1
         print(f"job {value}: started task {task_id}")
         return 0
+    if action == "grant" and value and len(o.args) > 2:
+        kwargs = {}
+        for attr, key in (
+            ("job_principal_id", "principal_id"),
+            ("job_project_id", "project_id"),
+            ("job_expires_at", "expires_at"),
+        ):
+            item = getattr(o, attr, None)
+            if item:
+                kwargs[key] = item
+        operations = tuple(getattr(o, "job_operations", ()) or ())
+        if operations:
+            kwargs["operations"] = operations
+        result = await service.grant_job_control(value, o.args[2], **kwargs)
+        if result is None:
+            print(f"job not found or scheduler unavailable: {value}", file=sys.stderr)
+            return 1
+        print(f"job {value}: control granted to task {o.args[2]}")
+        return 0
+    if action == "revoke" and value:
+        if not await service.revoke_job_control(value):
+            print(f"job not found or grant absent: {value}", file=sys.stderr)
+            return 1
+        print(f"job {value}: control revoked")
+        return 0
     print(
-        "athena jobs: use list, show JOB_ID, enable JOB_ID, disable JOB_ID, or run-now JOB_ID",
+        "athena jobs: use list, show JOB_ID, enable JOB_ID, disable JOB_ID, "
+        "run-now JOB_ID, grant JOB_ID TASK_ID, or revoke JOB_ID",
         file=sys.stderr,
     )
     return 2
@@ -1277,7 +1569,7 @@ async def _cmd_packs(o: Options, service: Any) -> int:
             print(json.dumps(row, indent=2, default=str, sort_keys=True))
             return 0
         if action == "install" and value:
-            row = await service.install_pack(value)
+            row = await service.install_pack(value, enable=getattr(o, "pack_enable", True))
             print(f"installed {row.get('id')}@{row.get('version')}")
             return 0
         if action in {"enable", "disable"} and value:
@@ -1360,6 +1652,16 @@ async def _cmd_mcp(o: Options, service: Any) -> int:
         for tool in await client.list_tools():
             print(f"{tool.name}\t{tool.description}")
         return 0
+    if action == "resources":
+        import json
+
+        print(json.dumps(service.mcp_resources(), indent=2, default=str, sort_keys=True))
+        return 0
+    if action == "prompts":
+        import json
+
+        print(json.dumps(await service.mcp_prompts(), indent=2, default=str, sort_keys=True))
+        return 0
     if action == "doctor" and name:
         client = next((item for item in service._mcp_clients if item.connection_id == name), None)
         if client is None:
@@ -1378,7 +1680,8 @@ async def _cmd_mcp(o: Options, service: Any) -> int:
         print(f"{name}: {state.get('state')} {state.get('last_error') or ''}".rstrip())
         return 0 if state.get("state") == "connected" else 1
     print(
-        "athena mcp: use list, status, tools SERVER, reconnect SERVER, or doctor SERVER",
+        "athena mcp: use list, status, tools SERVER, resources, prompts, reconnect SERVER, "
+        "or doctor SERVER",
         file=sys.stderr,
     )
     return 2
@@ -1561,6 +1864,49 @@ def _click_cli(click: Any):
     def config(ctx):
         """Inspect or update operator configuration."""
 
+    @cli.command("setup")
+    @click.option("--provider", "setup_provider", default=None, help="Provider name.")
+    @click.option(
+        "--provider-kind",
+        "setup_provider_kind",
+        default=None,
+        help="Provider adapter preset (openai, anthropic, openai-compat, ollama, and more).",
+    )
+    @click.option("--model", "setup_model", default=None, help="Default model.")
+    @click.option("--credential-id", "setup_credential_id", default=None)
+    @click.option("--base-url", "setup_base_url", default=None)
+    @click.option("--workspace", "setup_workspace", default=None)
+    @click.option("--voice/--no-voice", "setup_voice", default=None)
+    @click.option(
+        "--runtime-supervisor/--no-runtime-supervisor",
+        "setup_runtime_supervisor",
+        default=None,
+        help="Use the durable local runtime supervisor for reattachment.",
+    )
+    @click.pass_context
+    def setup(
+        ctx,
+        setup_provider,
+        setup_provider_kind,
+        setup_model,
+        setup_credential_id,
+        setup_base_url,
+        setup_workspace,
+        setup_voice,
+        setup_runtime_supervisor,
+    ):
+        """Configure an operator profile and optional voice routes."""
+        o = base_options(ctx, "setup")
+        o.setup_provider = setup_provider
+        o.setup_provider_kind = setup_provider_kind
+        o.setup_model = setup_model
+        o.setup_credential_id = setup_credential_id
+        o.setup_base_url = setup_base_url
+        o.setup_workspace = setup_workspace
+        o.setup_voice = setup_voice
+        o.setup_runtime_supervisor = setup_runtime_supervisor
+        sys.exit(dispatch(o))
+
     @config.command("show")
     @click.pass_context
     def config_show(ctx):
@@ -1739,11 +2085,6 @@ def _click_cli(click: Any):
     def inspect(ctx, task_id):
         sys.exit(dispatch(base_options(ctx, "inspect", [task_id])))
 
-    @cli.command("sessions")
-    @click.pass_context
-    def sessions(ctx):
-        sys.exit(dispatch(base_options(ctx, "sessions")))
-
     @cli.command()
     @click.argument("session_id")
     @click.pass_context
@@ -1765,60 +2106,20 @@ def _click_cli(click: Any):
     def cancel(ctx, task_id):
         sys.exit(dispatch(base_options(ctx, "cancel", [task_id])))
 
-    @cli.command("tasks")
-    @click.argument("actions", nargs=-1)
-    @click.pass_context
-    def tasks(ctx, actions):
-        """List or inspect durable task state."""
-        sys.exit(dispatch(base_options(ctx, "tasks", list(actions))))
-
     @cli.command("models")
     @click.pass_context
     def models(ctx):
         """List configured models and declared capabilities."""
         sys.exit(dispatch(base_options(ctx, "models")))
 
-    @cli.command("skills")
-    @click.argument("actions", nargs=-1)
-    @click.pass_context
-    def skills(ctx, actions):
-        """List installed skills and lifecycle state."""
-        sys.exit(dispatch(base_options(ctx, "skills", list(actions))))
+    from athena.cli.operator_cli import register_operator_commands
 
-    @cli.command("jobs")
-    @click.argument("actions", nargs=-1)
-    @click.pass_context
-    def jobs(ctx, actions):
-        """Inspect and control scheduled jobs."""
-        sys.exit(dispatch(base_options(ctx, "jobs", list(actions))))
-
-    @cli.command("workflows")
-    @click.argument("actions", nargs=-1)
-    @click.pass_context
-    def workflows(ctx, actions):
-        """Inspect durable workflow definitions and lifecycle state."""
-        sys.exit(dispatch(base_options(ctx, "workflows", list(actions))))
-
-    @cli.command("packs")
-    @click.argument("actions", nargs=-1)
-    @click.pass_context
-    def packs(ctx, actions):
-        """Inspect and control declarative capability packs."""
-        sys.exit(dispatch(base_options(ctx, "packs", list(actions))))
-
-    @cli.command("memory")
-    @click.argument("actions", nargs=-1)
-    @click.pass_context
-    def memory(ctx, actions):
-        """Review durable memory candidates."""
-        sys.exit(dispatch(base_options(ctx, "memory", list(actions))))
-
-    @cli.command("mcp")
-    @click.argument("actions", nargs=-1)
-    @click.pass_context
-    def mcp(ctx, actions):
-        """Inspect and reconnect configured MCP servers."""
-        sys.exit(dispatch(base_options(ctx, "mcp", list(actions))))
+    register_operator_commands(
+        cli,
+        click,
+        base_options=base_options,
+        dispatch=dispatch,
+    )
 
     @cli.command("acp")
     @click.pass_context
@@ -1951,22 +2252,17 @@ def _arg_parse(argv: list[str]) -> Options:
     sp = sub.add_parser("chat", help="Start the interactive REPL.")
     globals_(sp)
     sp.add_argument("objective", nargs="?", default=None)
-    sp = sub.add_parser("sessions", help="List sessions.")
-    globals_(sp)
-    for name, help_ in (
-        ("tasks", "List or inspect durable task state."),
-        ("memory", "Review durable memory candidates."),
-        ("mcp", "Inspect and reconnect configured MCP servers."),
-        ("jobs", "Inspect and control scheduled jobs."),
-        ("workflows", "Inspect durable workflow definitions and lifecycle state."),
-        ("packs", "Inspect and control declarative capability packs."),
-    ):
-        sp = sub.add_parser(name, help=help_)
-        globals_(sp)
-        sp.add_argument("action", nargs="*")
+
+    from athena.cli.operator_cli import (
+        OPERATOR_COMMANDS,
+        apply_argparse_operator_options,
+        register_argparse_commands,
+    )
+
+    register_argparse_commands(sub, globals_, argparse)
     sp = sub.add_parser("models", help="List configured models and capabilities.")
     globals_(sp)
-    sp = sub.add_parser("skills", help="List installed skills and lifecycle state.")
+    sp = sub.add_parser("capabilities", help="List available capability descriptors.")
     globals_(sp)
     sp = sub.add_parser("acp", help="Run the local JSON-lines ACP server.")
     globals_(sp)
@@ -1979,6 +2275,26 @@ def _arg_parse(argv: list[str]) -> Options:
         nargs="?",
         choices=["startup", "display", "native"],
         default="startup",
+    )
+    sp = sub.add_parser("setup", help="Configure an operator profile and optional voice.")
+    globals_(sp)
+    sp.add_argument("--provider", dest="setup_provider", default=None)
+    sp.add_argument("--provider-kind", dest="setup_provider_kind", default=None)
+    sp.add_argument("--credential-id", dest="setup_credential_id", default=None)
+    sp.add_argument("--base-url", dest="setup_base_url", default=None)
+    sp.add_argument(
+        "--setup-workspace", dest="setup_workspace", default=None, help=argparse.SUPPRESS
+    )
+    sp.add_argument("--voice", dest="setup_voice", action="store_true", default=None)
+    sp.add_argument("--no-voice", dest="setup_voice", action="store_false")
+    sp.add_argument(
+        "--runtime-supervisor",
+        dest="setup_runtime_supervisor",
+        action="store_true",
+        default=None,
+    )
+    sp.add_argument(
+        "--no-runtime-supervisor", dest="setup_runtime_supervisor", action="store_false"
     )
     sp = sub.add_parser("config", help="Inspect or update operator configuration.")
     globals_(sp)
@@ -2016,6 +2332,8 @@ def _arg_parse(argv: list[str]) -> Options:
     sp.add_argument("--task", dest="task_id", default=None)
     sp = sub.add_parser("native", help="Launch the native Athena terminal frontend.")
     globals_(sp)
+    sp = sub.add_parser("completion", help="Print shell completion for the Athena CLI.")
+    sp.add_argument("shell", choices=["bash", "zsh", "fish", "powershell"])
 
     ns = p.parse_args(argv)
     command = ns.command or "chat"
@@ -2043,6 +2361,20 @@ def _arg_parse(argv: list[str]) -> Options:
         referee_port=getattr(ns, "referee_port", 8643),
         referee_credential_id=getattr(ns, "referee_credential_id", "HERMES_REFEREE_API_KEY"),
         referee_supervision=getattr(ns, "referee_supervision", None),
+        setup_provider=getattr(ns, "setup_provider", None),
+        setup_provider_kind=getattr(ns, "setup_provider_kind", None),
+        setup_model=getattr(ns, "setup_model", None)
+        or (getattr(ns, "model", None) if command == "setup" else None),
+        setup_credential_id=getattr(ns, "setup_credential_id", None),
+        setup_base_url=getattr(ns, "setup_base_url", None),
+        setup_workspace=getattr(ns, "setup_workspace", None)
+        or (getattr(ns, "workspace", None) if command == "setup" else None),
+        setup_voice=getattr(ns, "setup_voice", None),
+        setup_runtime_supervisor=getattr(ns, "setup_runtime_supervisor", None),
+        recovery_note=getattr(ns, "recovery_note", None),
+        recovery_resolution=getattr(ns, "recovery_resolution", None),
+        recovery_provider_response_id=getattr(ns, "recovery_provider_response_id", None),
+        recovery_actual_cost=getattr(ns, "recovery_actual_cost", None),
     )
     if command == "doctor":
         o.args = [ns.target]
@@ -2050,10 +2382,14 @@ def _arg_parse(argv: list[str]) -> Options:
         o.config_action = getattr(ns, "config_action", None)
         o.config_key = getattr(ns, "key", None)
         o.config_value = getattr(ns, "value", None)
-    if command == "oi-stream":
+    if command == "completion":
+        o.args = [ns.shell]
+    elif command == "oi-stream":
         o.args = [ns.task_id] if ns.task_id else []
-    elif command in {"tasks", "memory", "mcp", "jobs", "workflows", "packs"}:
-        o.args = list(getattr(ns, "action", []) or [])
+    elif command in OPERATOR_COMMANDS:
+        apply_argparse_operator_options(ns, command, o)
+    elif command == "permissions":
+        o.args = []
     elif command == "run":
         o.args = [ns.objective]
     elif command == "self":

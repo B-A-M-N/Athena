@@ -14,9 +14,8 @@ import hashlib
 import json
 import socket
 import sqlite3
-import threading
 from collections.abc import Mapping
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
 
 from athena.network import pinned_async_transport
@@ -30,13 +29,27 @@ from athena.protocol.capabilities import (
     EffectClass,
     ResourceClass,
 )
-from athena.research.models import EvidenceObject, ResearchGap, SourceRecord
+from athena.research.models import (
+    EvidenceBundle,
+    EvidenceObject,
+    ResearchGap,
+    SourceRecord,
+    classify_evidence_quality,
+)
+from athena.research.discovery import (
+    BraveSearchProvider,
+    HttpDiscoveryProvider,
+    ResearchDiscoveryProvider,
+    TavilySearchProvider,
+    _resolve_with_timeout,
+)
 from athena.research.policy import (
     SourcePolicy,
     SourcePolicyError,
     canonicalize_uri,
     classify_source,
 )
+from athena.research.verification import verify_evidence
 
 _SOURCE_TYPES = ("web", "paper", "documentation", "dataset", "code", "local")
 _EVIDENCE_TYPES = ("quote", "measurement", "observation", "derivation", "execution")
@@ -47,135 +60,6 @@ _GAP_KINDS = (
     "source_quality",
     "unanswered_question",
 )
-
-
-@runtime_checkable
-class ResearchDiscoveryProvider(Protocol):
-    """Provider boundary for bounded candidate discovery.
-
-    Providers return untrusted metadata only. The research capability remains
-    the authority that applies source policy and performs immutable capture.
-    """
-
-    name: str
-
-    async def search(
-        self, *, query: str, limit: int, context: Any = None, **kwargs: Any
-    ) -> list[Mapping[str, Any]]: ...
-
-
-class HttpDiscoveryProvider:
-    """First-party JSON source-discovery adapter.
-
-    The endpoint is an index, not a source of truth. Its response is bounded
-    and returned as candidate metadata; every candidate is still checked by
-    ``ResearchCapability`` and must be separately acquired into an immutable
-    snapshot before it can support a claim.
-    """
-
-    def __init__(
-        self,
-        endpoint: str,
-        *,
-        source_policy: SourcePolicy,
-        timeout: float = 10.0,
-        host_resolver=None,
-        max_bytes: int = 1_000_000,
-    ) -> None:
-        self._endpoint = str(endpoint).strip()
-        self._source_policy = source_policy
-        self._timeout = max(0.1, float(timeout))
-        self._host_resolver = host_resolver or socket.getaddrinfo
-        self._max_bytes = max(1, min(int(max_bytes), 5_000_000))
-        self.name = "http-index"
-
-    async def search(self, *, query: str, limit: int, **_context: Any) -> list[dict[str, Any]]:
-        canonical = self._source_policy.check(self._endpoint)
-        parsed = urlsplit(canonical)
-        host = parsed.hostname or ""
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        infos = await _resolve_with_timeout(
-            self._host_resolver,
-            host,
-            port,
-            timeout=self._timeout,
-        )
-        addresses = self._source_policy.check_resolved(host, [str(info[4][0]) for info in infos])
-        import httpx
-
-        transport = pinned_async_transport(host, addresses)
-        async with httpx.AsyncClient(
-            timeout=self._timeout,
-            follow_redirects=False,
-            trust_env=False,
-            headers={"User-Agent": "Athena-Research-Discovery/1"},
-            transport=transport,
-        ) as client:
-            async with client.stream(
-                "GET", canonical, params={"q": query, "limit": max(1, min(int(limit), 50))}
-            ) as response:
-                if response.status_code >= 300:
-                    raise RuntimeError(f"discovery endpoint returned HTTP {response.status_code}")
-                body = await response.aread()
-        if len(body) > self._max_bytes:
-            raise RuntimeError(f"discovery response exceeds max_bytes={self._max_bytes}")
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("discovery endpoint returned invalid JSON") from exc
-        if isinstance(payload, list):
-            records = payload
-        elif isinstance(payload, Mapping):
-            records = payload.get("results", payload.get("candidates", payload.get("items")))
-        else:
-            records = None
-        if not isinstance(records, list):
-            raise RuntimeError("discovery response must contain a results array")
-        return [dict(item) for item in records if isinstance(item, Mapping)]
-
-    async def __call__(self, *, query: str, limit: int, **context: Any) -> list[dict[str, Any]]:
-        """Compatibility call surface for pre-provider deployments."""
-        return await self.search(query=query, limit=limit, **context)
-
-
-async def _resolve_with_timeout(resolver, host: str, port: int, *, timeout: float):
-    """Run potentially blocking DNS resolution without leaking an executor.
-
-    ``socket.getaddrinfo`` has no per-call timeout and the default asyncio
-    executor is process-lifetime state. A daemon thread gives resolution a
-    hard upper bound without allowing a stuck libc resolver to keep Athena
-    alive during shutdown.
-    """
-    loop = asyncio.get_running_loop()
-    result: asyncio.Future = loop.create_future()
-
-    def finish(value: tuple[str, object]) -> None:
-        if not result.done():
-            result.set_result(value)
-
-    def resolve() -> None:
-        try:
-            value = resolver(host, port, type=socket.SOCK_STREAM)
-        except BaseException as exc:  # surface resolver failures to the caller
-            payload: tuple[str, object] = ("error", exc)
-        else:
-            payload = ("ok", value)
-        try:
-            loop.call_soon_threadsafe(finish, payload)
-        except RuntimeError:
-            # The loop may close immediately after a timeout; the thread is
-            # daemonized specifically so this late callback cannot pin exit.
-            pass
-
-    threading.Thread(target=resolve, name="athena-dns-resolver", daemon=True).start()
-    try:
-        status, value = await asyncio.wait_for(result, timeout=timeout)
-    except asyncio.TimeoutError as exc:
-        raise RuntimeError(f"discovery DNS resolution timed out after {timeout}s") from exc
-    if status == "error":
-        assert isinstance(value, BaseException)
-        raise value
-    return value
 
 
 class ResearchCapability:
@@ -224,6 +108,7 @@ class ResearchCapability:
                         "verify",
                         "plan",
                         "assess",
+                        "critique",
                         "bundle",
                         "run",
                     ],
@@ -246,6 +131,7 @@ class ResearchCapability:
                 "extraction_model": {"type": "string", "maxLength": 256},
                 "receipt": {"type": "object", "additionalProperties": True},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "confidence_calibration": {"type": "object", "additionalProperties": True},
                 "corroborates": {"type": "array", "items": {"type": "string"}},
                 "contradicts": {"type": "array", "items": {"type": "string"}},
                 "objective": {"type": "string", "minLength": 1, "maxLength": 20_000},
@@ -318,6 +204,10 @@ class ResearchCapability:
                             "extraction_model": {"type": "string", "maxLength": 256},
                             "receipt": {"type": "object", "additionalProperties": True},
                             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            "confidence_calibration": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
                             "corroborates": {"type": "array", "items": {"type": "string"}},
                             "contradicts": {"type": "array", "items": {"type": "string"}},
                             "metadata": {"type": "object", "additionalProperties": True},
@@ -329,11 +219,21 @@ class ResearchCapability:
                 "required": {"type": "boolean"},
                 "evidence_ids": {"type": "array", "items": {"type": "string"}},
                 "claim_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}},
+                "min_independent_groups": {"type": "integer", "minimum": 1, "maximum": 10},
                 "query": {"type": "string", "maxLength": 2000},
                 "status": {"type": "string", "enum": ["OPEN", "CLOSED"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "autonomous": {"type": "boolean"},
+                "max_research_rounds": {"type": "integer", "minimum": 1, "maximum": 3},
+                "max_sources": {"type": "integer", "minimum": 1, "maximum": 20},
+                "max_queries": {"type": "integer", "minimum": 1, "maximum": 20},
                 "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30},
                 "max_bytes": {"type": "integer", "minimum": 1, "maximum": 10_000_000},
+                "max_research_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50_000_000,
+                },
                 "metadata": {"type": "object", "additionalProperties": True},
             },
             "additionalProperties": False,
@@ -358,6 +258,7 @@ class ResearchCapability:
         host_resolver=None,
         discovery_provider=None,
         discovery_providers: Sequence[ResearchDiscoveryProvider | Any] | None = None,
+        utility_inference: Callable[..., Any] | None = None,
     ) -> None:
         self._store = store
         self._artifacts = artifact_store
@@ -367,6 +268,7 @@ class ResearchCapability:
         if discovery_provider is not None and discovery_provider not in configured:
             configured = (*configured, discovery_provider)
         self._discovery_providers = configured
+        self._utility_inference = utility_inference
 
     async def invoke(self, request: CapabilityRequest, **kw) -> CapabilityResult:
         args = dict(request.arguments or {})
@@ -401,6 +303,8 @@ class ResearchCapability:
                 return await self._plan(request, args, context)
             if operation == "assess":
                 return await self._assess(request, args, context)
+            if operation == "critique":
+                return await self._critique(request, args, context)
             if operation == "bundle":
                 return await self._bundle(request, args, context)
             if operation == "run":
@@ -853,10 +757,17 @@ class ResearchCapability:
             if not isinstance(receipt, Mapping):
                 return _result(request, ok=False, error="receipt must be an object")
             metadata["receipt"] = dict(receipt)
+        excerpt = str(args.get("excerpt") or "")
+        # The model may propose the excerpt, but the immutable source snapshot
+        # remains the authority.  Persist enough provenance to make that
+        # later verification auditable without trusting the proposal itself.
+        metadata.setdefault("source_content_hash", source.content_hash)
+        metadata.setdefault("excerpt_hash", hashlib.sha256(excerpt.encode("utf-8")).hexdigest())
+        metadata.setdefault("normalization_version", "1")
         evidence = EvidenceObject.for_content(
             source_id=source_id,
             extracted_claim=str(args.get("claim") or ""),
-            exact_supporting_excerpt=str(args.get("excerpt") or ""),
+            exact_supporting_excerpt=excerpt,
             locator=args.get("locator") or {},
             evidence_type=str(args.get("evidence_type") or "quote"),
             # Authority is derived from the source, not model input.
@@ -868,6 +779,10 @@ class ResearchCapability:
             claim_id=args.get("claim_id"),
             corroborates=tuple(args.get("corroborates") or ()),
             contradicts=tuple(args.get("contradicts") or ()),
+            source_revision=source.revision,
+            source_content_hash=source.content_hash,
+            acquired_at=source.retrieved_at,
+            confidence_calibration=args.get("confidence_calibration") or {},
             metadata=metadata,
         )
         await self._store.save_evidence(evidence)
@@ -1081,13 +996,12 @@ class ResearchCapability:
             checks: list[dict[str, Any]] = []
             for item in candidates:
                 source = await self._store.get_source(item.source_id)
-                if source is not None:
-                    checks.append(
-                        {
-                            "evidence_id": item.id,
-                            **await self._verify_evidence(item, source),
-                        }
-                    )
+                checks.append(
+                    {
+                        "evidence_id": item.id,
+                        **await self._verify_evidence(item, source),
+                    }
+                )
             candidate_ids = {item.id for item in candidates}
             conflicts = [
                 item.id
@@ -1103,13 +1017,18 @@ class ResearchCapability:
                 )
             ]
             verified = [
-                check["evidence_id"] for check in checks if check.get("status") == "verified"
+                check["evidence_id"]
+                for check in checks
+                if check.get("status") == "verified" and check.get("quality") == "supported"
             ]
             can_close = (
                 bool(candidates)
                 and bool(verified)
                 and not conflicts
-                and all(check.get("status") == "verified" for check in checks)
+                and all(
+                    check.get("status") == "verified" and check.get("quality") == "supported"
+                    for check in checks
+                )
             )
             updated = gap
             if gap.status == "OPEN" and can_close:
@@ -1146,6 +1065,95 @@ class ResearchCapability:
             ),
         )
 
+    async def _critique(self, request, args, context) -> CapabilityResult:
+        """Run bounded, deterministic evidence-quality critique questions."""
+        if not request.task_id:
+            return _result(request, ok=False, error="critique requires a task")
+        workspace_id = getattr(getattr(context, "workspace", None), "id", None)
+        evidence = await self._store.list_evidence(
+            task_id=request.task_id,
+            project_id=workspace_id,
+            claim_id=None,
+            limit=200,
+        )
+        wanted_claims = {str(value) for value in args.get("claim_ids") or ()}
+        if wanted_claims:
+            evidence = [item for item in evidence if item.claim_id in wanted_claims]
+        groups: dict[str, list[str]] = {}
+        source_records: dict[str, Any] = {}
+        quality_counts: dict[str, int] = {}
+        for item in evidence:
+            source = await self._store.get_source(item.source_id)
+            if source is None or not await _evidence_visible(
+                item, request, context, self._store.get_source
+            ):
+                continue
+            quality = classify_evidence_quality(item, source)
+            quality_counts[quality] = quality_counts.get(quality, 0) + 1
+            source_records[source.id] = source
+            metadata = dict(source.metadata)
+            group = str(
+                metadata.get("independence_group")
+                or metadata.get("source_family")
+                or metadata.get("canonical_domain")
+                or source.canonical_uri
+            )
+            groups.setdefault(group, []).append(item.id)
+        # Report the evidence objects that make a contradiction claim.  The
+        # related IDs are useful edges, but returning only those targets would
+        # misidentify which source asserted the conflict.
+        contradictions = sorted(item.id for item in evidence if item.contradicts)
+        min_groups = max(1, min(int(args.get("min_independent_groups") or 2), 10))
+        independent_groups = sorted(groups)
+        primary_sources = [
+            source.id
+            for source in source_records.values()
+            if str(source.metadata.get("primary_secondary") or "").casefold() == "primary"
+            or source.authority_class in {"primary", "official"}
+        ]
+        return _result(
+            request,
+            output=_json(
+                {
+                    "evidence_count": len(evidence),
+                    "independent_evidence_groups": independent_groups,
+                    "independent_group_count": len(independent_groups),
+                    "meets_independence_threshold": len(independent_groups) >= min_groups,
+                    "single_group_warning": len(independent_groups) <= 1 and bool(evidence),
+                    "contradiction_evidence_ids": contradictions,
+                    "primary_source_candidates": sorted(primary_sources),
+                    "quality_counts": quality_counts,
+                    "quality_questions": [
+                        question
+                        for quality, question in (
+                            (
+                                "no_evidence",
+                                "Which claims still lack a captured source artifact?",
+                            ),
+                            (
+                                "weak",
+                                "Which low-confidence evidence needs calibration or corroboration?",
+                            ),
+                            (
+                                "stale",
+                                "Which evidence must be refreshed against the current source revision?",
+                            ),
+                            (
+                                "contradicted",
+                                "Which contradicted evidence must be resolved before synthesis?",
+                            ),
+                        )
+                        if quality_counts.get(quality, 0)
+                    ],
+                    "questions": [
+                        "What evidence would falsify this claim?",
+                        "Which contradiction materially changes the answer?",
+                        "Can a primary source replace this secondary source?",
+                    ],
+                }
+            ),
+        )
+
     async def _bundle(self, request, args, context) -> CapabilityResult:
         """Return a bounded, task-scoped research packet for synthesis/judgment."""
         if not request.task_id:
@@ -1165,6 +1173,11 @@ class ResearchCapability:
         gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
         required_open = [gap.id for gap in gaps if gap.required and gap.status != "CLOSED"]
         unverified_closed: list[str] = []
+        quality_counts: dict[str, int] = {}
+        for item in evidence:
+            source = await self._store.get_source(item.source_id)
+            quality = classify_evidence_quality(item, source)
+            quality_counts[quality] = quality_counts.get(quality, 0) + 1
         for gap in gaps:
             if gap.status != "CLOSED" or not gap.required:
                 continue
@@ -1174,25 +1187,197 @@ class ResearchCapability:
             for evidence_id in gap.evidence_ids:
                 item = await self._store.get_evidence(evidence_id)
                 source = await self._store.get_source(item.source_id) if item else None
+                verification = (
+                    await self._verify_evidence(item, source)
+                    if item is not None
+                    else {"status": "unverified", "quality": "no_evidence"}
+                )
                 if (
-                    item is None
-                    or source is None
-                    or (await self._verify_evidence(item, source))["status"] != "verified"
+                    verification.get("status") != "verified"
+                    or verification.get("quality") != "supported"
                 ):
                     unverified_closed.append(gap.id)
                     break
-        return _result(
-            request,
-            output=_json(
-                {
-                    "ready": not required_open and not unverified_closed,
-                    "required_open_gaps": required_open,
-                    "unverified_closed_gaps": unverified_closed,
-                    "sources": [source.to_record() for source in sources],
-                    "evidence": [item.to_record() for item in evidence],
-                    "gaps": [gap.to_record() for gap in gaps],
-                }
-            ),
+        source_records = [source.to_record() for source in sources]
+        evidence_records = [item.to_record() for item in evidence]
+        gap_records = [gap.to_record() for gap in gaps]
+        groups = sorted(
+            {
+                str(
+                    source.metadata.get("independence_group")
+                    or source.metadata.get("source_family")
+                    or source.canonical_uri
+                )
+                for source in sources
+            }
+        )
+        contradictions = sorted({related for item in evidence for related in item.contradicts})
+        bundle = EvidenceBundle.create(
+            request.task_id,
+            ready=not required_open and not unverified_closed,
+            sources=source_records,
+            evidence=evidence_records,
+            gaps=gap_records,
+            required_open_gaps=required_open,
+            unverified_closed_gaps=unverified_closed,
+            independence_groups=groups,
+            contradiction_evidence_ids=contradictions,
+            evidence_quality_counts=quality_counts,
+        )
+        return _result(request, output=_json(bundle.to_record()))
+
+    async def _autonomous_acquire(
+        self,
+        request,
+        context,
+        requirements: Sequence[Mapping[str, Any]],
+        args: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        """Run bounded discovery/acquisition over the existing research primitives.
+
+        This is deliberately not a second reasoning authority. The kernel or
+        caller supplies the research questions; this helper only performs a
+        finite discover -> policy-check -> immutable-fetch loop. Evidence
+        extraction still requires explicit excerpts (and therefore remains
+        verifiable rather than inferred from search snippets).
+        """
+        max_rounds = max(1, min(int(args.get("max_research_rounds") or 1), 3))
+        max_sources = max(1, min(int(args.get("max_sources") or 5), 20))
+        max_queries = max(1, min(int(args.get("max_queries") or 10), 20))
+        max_bytes = max(1, min(int(args.get("max_research_bytes") or 20_000_000), 50_000_000))
+        queries = _strings(args.get("queries"), limit=max_queries)
+        for requirement in requirements:
+            queries.extend(_strings(requirement.get("queries"), limit=5))
+            if not requirement.get("queries") and requirement.get("question"):
+                queries.append(str(requirement["question"]))
+        queries = _unique_strings(queries)[:max_queries]
+
+        captures: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        seen_uris: set[str] = set()
+        discovered = 0
+        fetched = 0
+        bytes_fetched = 0
+        rounds_run = 0
+        attempted_queries: set[str] = set()
+        for round_number in range(max_rounds):
+            if fetched >= max_sources or bytes_fetched >= max_bytes:
+                break
+            rounds_run += 1
+            round_queries = [query for query in queries if query not in attempted_queries]
+            if not round_queries:
+                # Adapt from durable gaps after the prior round's failed or
+                # contradictory evidence. Utility inference is advisory and
+                # bounded; deterministic gap questions remain the fallback.
+                gaps = await self._store.list_gaps(task_id=request.task_id, limit=200)
+                gap_context = [
+                    {
+                        "id": gap.id,
+                        "question": gap.question,
+                        "metadata": dict(gap.metadata),
+                    }
+                    for gap in gaps
+                    if gap.status == "OPEN" and gap.required
+                ][:50]
+                inferred: Any = None
+                if round_number + 1 < max_rounds and self._utility_inference is not None:
+                    try:
+                        prompt = json.dumps(
+                            {
+                                "remaining_gaps": gap_context,
+                                "attempted_queries": sorted(attempted_queries),
+                                "failed_queries": errors[-50:],
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                        inferred = self._utility_inference(
+                            system_prompt=(
+                                "Return only a JSON array of at most 10 better research queries. "
+                                "Do not claim evidence or answer the gaps."
+                            ),
+                            user_prompt=prompt,
+                            role="summarizer",
+                            task_id=request.task_id,
+                            metadata={"purpose": "research_query_utility_inference"},
+                        )
+                        if asyncio.iscoroutine(inferred):
+                            inferred = await asyncio.wait_for(inferred, timeout=10.0)
+                    except Exception as exc:  # advisory path; deterministic fallback remains
+                        errors.append({"utility_inference": str(exc)[:600]})
+                        inferred = None
+                parsed_queries: list[str] = []
+                if isinstance(inferred, str):
+                    try:
+                        decoded = json.loads(inferred)
+                        if isinstance(decoded, list):
+                            parsed_queries = _strings(decoded, limit=max_queries)
+                    except json.JSONDecodeError:
+                        parsed_queries = []
+                if not parsed_queries:
+                    parsed_queries = _unique_strings(
+                        [str(item.get("question") or "") for item in gap_context]
+                    )[:max_queries]
+                round_queries = [
+                    query for query in parsed_queries if query not in attempted_queries
+                ]
+            for query in round_queries:
+                attempted_queries.add(query)
+                discovered_result = await self._discover(
+                    request,
+                    {"query": query, "limit": min(20, max_sources)},
+                    context,
+                )
+                if discovered_result.status is not CapabilityResultStatus.OK:
+                    errors.append({"query": query, "error": discovered_result.error})
+                    continue
+                payload = _decode_object(discovered_result.output)
+                candidates = payload.get("candidates")
+                if not isinstance(candidates, list):
+                    continue
+                discovered += len(candidates)
+                for candidate in candidates:
+                    if (
+                        fetched >= max_sources
+                        or bytes_fetched >= max_bytes
+                        or not isinstance(candidate, Mapping)
+                    ):
+                        break
+                    uri = str(candidate.get("uri") or "")
+                    if not uri or uri in seen_uris or not uri.startswith(("http://", "https://")):
+                        continue
+                    seen_uris.add(uri)
+                    fetched_result = await self._fetch(
+                        request,
+                        {
+                            "uri": uri,
+                            "title": candidate.get("title"),
+                            "source_type": candidate.get("source_type") or "web",
+                            "max_bytes": min(10_000_000, max_bytes - bytes_fetched),
+                        },
+                        context,
+                    )
+                    if fetched_result.status is not CapabilityResultStatus.OK:
+                        errors.append({"uri": uri, "error": fetched_result.error})
+                        continue
+                    source = _decode_object(fetched_result.output).get("source")
+                    if isinstance(source, Mapping):
+                        captures.append(dict(source))
+                        fetched += 1
+                        bytes_fetched += int((fetched_result.metadata or {}).get("bytes") or 0)
+        return (
+            captures,
+            errors,
+            {
+                "rounds": rounds_run,
+                "queries": queries,
+                "discovered": discovered,
+                "fetched": fetched,
+                "max_sources": max_sources,
+                "bytes_fetched": bytes_fetched,
+                "max_research_bytes": max_bytes,
+                "attempted_queries": sorted(attempted_queries),
+            },
         )
 
     async def _run(self, request, args, context) -> CapabilityResult:
@@ -1241,6 +1426,16 @@ class ResearchCapability:
 
         captures: list[dict[str, Any]] = []
         capture_errors: list[dict[str, Any]] = []
+        acquisition: dict[str, Any] | None = None
+        if bool(args.get("autonomous")):
+            auto_captures, auto_errors, acquisition = await self._autonomous_acquire(
+                request,
+                context,
+                [item for item in raw_requirements if isinstance(item, Mapping)],
+                args,
+            )
+            captures.extend(auto_captures)
+            capture_errors.extend(auto_errors)
         source_specs = args.get("source_specs")
         if isinstance(source_specs, list):
             for index, raw_spec in enumerate(source_specs[:10]):
@@ -1367,6 +1562,41 @@ class ResearchCapability:
         ready = bool(bundle.get("ready")) and not (
             capture_errors or search_errors or evidence_errors
         )
+        required_open_gaps = bundle.get("required_open_gaps")
+        if not isinstance(required_open_gaps, (list, tuple)):
+            required_open_gaps = ()
+        unverified_closed_gaps = bundle.get("unverified_closed_gaps")
+        if not isinstance(unverified_closed_gaps, (list, tuple)):
+            unverified_closed_gaps = ()
+        gaps_raw = bundle.get("gaps")
+        gaps: list[Mapping[str, Any]] = (
+            [item for item in gaps_raw if isinstance(item, Mapping)]
+            if isinstance(gaps_raw, list)
+            else []
+        )
+        research_completion = {
+            "ready": ready,
+            "bundle_id": hashlib.sha256(
+                json.dumps(
+                    {"task_id": request.task_id, "objective": objective, "gap_ids": gap_ids},
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()[:32],
+            "requirement_ids": [
+                str((item.get("gap") or {}).get("metadata", {}).get("requirement_id"))
+                for item in plan.get("requirements", [])
+                if isinstance(item, Mapping)
+                and isinstance(item.get("gap"), Mapping)
+                and (item.get("gap") or {}).get("metadata", {}).get("requirement_id")
+            ],
+            "closed_gap_ids": [
+                str((item or {}).get("id")) for item in gaps if item.get("status") == "CLOSED"
+            ],
+            "evidence_ids": [str(item.get("id")) for item in evidence_records if item.get("id")],
+            "required_open_gaps": list(required_open_gaps),
+            "unverified_closed_gaps": list(unverified_closed_gaps),
+            "bundle_ready": bool(bundle.get("ready")),
+        }
         return _result(
             request,
             output=_json(
@@ -1376,6 +1606,7 @@ class ResearchCapability:
                     "plan": plan,
                     "captures": captures,
                     "capture_errors": capture_errors,
+                    "autonomous_acquisition": acquisition,
                     "search": search_results,
                     "search_errors": search_errors,
                     "evidence": evidence_records,
@@ -1385,85 +1616,15 @@ class ResearchCapability:
                     "ready": ready,
                 }
             ),
+            metadata={"research_completion": research_completion},
         )
 
     async def _verify_evidence(
         self,
         evidence: EvidenceObject,
-        source: SourceRecord,
+        source: SourceRecord | None,
     ) -> dict[str, Any]:
-        if not source.artifact_uri or self._artifacts is None:
-            return {"status": "unverified", "reason": "source snapshot not captured"}
-        content = await self._artifacts.load(source.artifact_uri)
-        content_hash = hashlib.sha256(content).hexdigest()
-        hash_matches = not source.content_hash or content_hash == source.content_hash
-        found = hash_matches and evidence.exact_supporting_excerpt.encode("utf-8") in content
-        result: dict[str, Any] = {
-            "status": "verified" if found else "invalid",
-            "content_hash": content_hash,
-            "hash_matches": hash_matches,
-        }
-        if not found:
-            return result
-
-        # Structured evidence is still evidence only when its receipt is
-        # internally coherent.  The source hash/excerpt check above proves
-        # the captured bytes; these checks prove that a measurement or
-        # execution claim has the fields needed for replay/review.
-        if evidence.evidence_type in {
-            "execution",
-            "measurement",
-            "observation",
-            "derivation",
-        }:
-            receipt = evidence.metadata.get("receipt")
-            structured = _verify_receipt(evidence.evidence_type, receipt)
-            result["receipt"] = structured
-            if structured["status"] != "verified":
-                result["status"] = "invalid"
-        return result
-
-
-def _verify_receipt(evidence_type: str, receipt: Any) -> dict[str, Any]:
-    """Validate the minimum replay boundary for structured evidence."""
-    if not isinstance(receipt, Mapping):
-        return {"status": "unverified", "reason": "structured receipt is missing"}
-    required: dict[str, tuple[str, ...]] = {
-        "execution": ("capability_id", "input_hash", "environment_fingerprint"),
-        "measurement": ("value", "unit", "observed_at", "environment_fingerprint"),
-        "observation": ("observation", "observed_at", "environment_fingerprint"),
-        "derivation": ("inputs", "derivation", "environment_fingerprint"),
-    }
-    missing = [
-        field
-        for field in required.get(evidence_type, ())
-        if field not in receipt or receipt[field] in (None, "", [])
-    ]
-    if missing:
-        return {"status": "invalid", "missing": missing}
-    if evidence_type == "execution":
-        exit_code = receipt.get("exit_code")
-        ok = receipt.get("ok")
-        status = str(receipt.get("status") or "").casefold()
-        if (
-            exit_code not in (None, 0)
-            or ok is False
-            or status
-            in {
-                "failed",
-                "error",
-                "cancelled",
-            }
-        ):
-            return {
-                "status": "invalid",
-                "reason": "execution receipt does not show a successful exit",
-            }
-    return {
-        "status": "verified",
-        "evidence_type": evidence_type,
-        "fields": sorted(str(key) for key in receipt),
-    }
+        return await verify_evidence(evidence, source, self._artifacts)
 
 
 def _json(value: Any) -> str:
@@ -1595,4 +1756,10 @@ async def _artifact_visible(artifacts: Any, uri: str, task_id: str) -> bool:
     return any(getattr(ref, "uri", None) == uri for ref in refs)
 
 
-__all__ = ["HttpDiscoveryProvider", "ResearchDiscoveryProvider", "ResearchCapability"]
+__all__ = [
+    "BraveSearchProvider",
+    "HttpDiscoveryProvider",
+    "ResearchDiscoveryProvider",
+    "ResearchCapability",
+    "TavilySearchProvider",
+]

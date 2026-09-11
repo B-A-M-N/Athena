@@ -10,6 +10,12 @@ without a concrete textual match; allow-listed matches are printed as INFO.
 
 Rules (audit-mandated)
 ----------------------
+module-size-budget
+    Existing orchestration modules retain explicit debt ceilings while all
+    new Python modules are capped at 2,000 lines.  This is containment until
+    the legacy modules are split; it prevents another god object from growing
+    unnoticed.
+
 router-construction
     ``ModelRouter(`` may be constructed only in src/athena/service/service.py
     (the single sanctioned construction site).  Everywhere else is a second
@@ -56,35 +62,75 @@ Usage
     scripts/architecture-lint --root .
     scripts/architecture-lint --quiet    # violations only, no INFO lines
 
+If a committed baseline is widened relative to the PR merge-base (or the
+parent commit outside a PR), the change must include an exact entry in
+``docs/architecture-debt-waivers.json`` with the old budget, new budget, and
+review rationale.
+
 Exit codes: 0 clean, 1 violations found, 2 usage/scan error.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
+import json
+import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = "src/athena"
+BROAD_EXCEPTION_ROOTS = frozenset(
+    {"state", "kernel", "execution", "scheduler", "reality", "approval", "policy"}
+)
+BROAD_EXCEPTION_POLICY = "docs/broad-exception-policy.json"
+ARCHITECTURE_DEBT_WAIVERS = "docs/architecture-debt-waivers.json"
+ARCHITECTURE_EXCEPTION_POLICY = "docs/architecture-exception-policy.json"
+
+# These are deliberately checked-in debt ceilings, not a claim that the
+# modules are healthy.  The first follow-up refactor must lower these values;
+# until then a one-line increase is a visible architecture failure.
+LEGACY_SIZE_BUDGETS: dict[str, int] = {
+    "service/service.py": 3_617,
+    "kernel/kernel.py": 1_996,
+    "cli/app.py": 2_356,
+    "capabilities/research.py": 1_789,
+    "packs/manager.py": 1_795,
+}
+DEFAULT_MODULE_SIZE_BUDGET = 2_000
+
+# Native orchestration/rendering modules have the same ratcheted ceiling.
+# These are deliberately exact current baselines; a future decomposition must
+# lower a value, never increase it. Feature work must first extract a helper
+# rather than silently expanding an authority module.
+RUST_SIZE_BUDGETS: dict[str, int] = {
+    "main.rs": 1_658,
+    "x11.rs": 3_294,
+    "render/oi.rs": 2_890,
+    "render/chassis.rs": 1_169,
+}
+DEFAULT_RUST_MODULE_SIZE_BUDGET = 2_000
 
 # ---------------------------------------------------------------------------
 # Data tables — new rules are one-line additions here.
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Rule:
     id: str
     description: str
-    pattern: re.Pattern          # matched against each physical line
-    include: tuple[str, ...]     # path prefixes (relative to src/athena/) scanned
-    exclude: tuple[str, ...]     # path prefixes exempt from VIOLATION reporting
-    allow: tuple[str, ...]       # retained for rules with narrow path exceptions
+    pattern: re.Pattern  # matched against each physical line
+    include: tuple[str, ...]  # path prefixes (relative to src/athena/) scanned
+    exclude: tuple[str, ...]  # path prefixes exempt from VIOLATION reporting
+    allow: tuple[str, ...]  # retained for rules with narrow path exceptions
     receiver_filter: str | None = None  # optional regex the text before the
-                                        # match must also match (noise gating)
+    # match must also match (noise gating)
 
 
 def _r(pattern: str) -> re.Pattern:
@@ -95,7 +141,7 @@ RULES: tuple[Rule, ...] = (
     Rule(
         id="router-construction",
         description="ModelRouter constructed outside the sanctioned site "
-                    "(src/athena/service/service.py)",
+        "(src/athena/service/service.py)",
         pattern=_r(r"\bModelRouter\s*\("),
         include=("",),
         exclude=("service/service.py", "models/", "protocol/models.py"),
@@ -104,24 +150,27 @@ RULES: tuple[Rule, ...] = (
     Rule(
         id="provider-invocation-outside-authority",
         description="direct .complete(/.stream( on a provider object outside "
-                    "src/athena/models/ and src/athena/kernel/",
+        "src/athena/models/ and src/athena/kernel/",
         pattern=_r(r"\.(?:complete|stream)\s*\("),
         include=("",),
         exclude=("models/", "kernel/"),
         allow=(),
         receiver_filter=_r(
             r"(?i)\b(?:self\.)?_?[A-Za-z_]*provider_?[A-Za-z_]*\s*\.\s*"
-            r"(?:complete|stream)\s*\("),
+            r"(?:complete|stream)\s*\("
+        ),
     ),
     Rule(
         id="subprocess-outside-approved-backends",
         description="subprocess/os.system creation outside src/athena/execution/, "
-                    "capabilities/, affordances/ (plus file allow-list)",
-        pattern=_r(r"\b(?:subprocess\.(?:run|Popen|call|check_call|check_output)"
-                   r"\s*\(|asyncio\.create_subprocess_(?:exec|shell)\s*\("
-                   r"|os\.system\s*\()"),
+        "capabilities/, affordances/ (plus file allow-list)",
+        pattern=_r(
+            r"\b(?:subprocess\.(?:run|Popen|call|check_call|check_output)"
+            r"\s*\(|asyncio\.create_subprocess_(?:exec|shell)\s*\("
+            r"|os\.system\s*\()"
+        ),
         include=("",),
-        exclude=("execution/", "capabilities/", "affordances/"),
+        exclude=("execution/", "capabilities/", "affordances/", "release/"),
         allow=(),
     ),
     Rule(
@@ -135,17 +184,18 @@ RULES: tuple[Rule, ...] = (
     Rule(
         id="scheduler-watcher-inference",
         description="athena.models import or provider call inside scheduler/ "
-                    "or capabilities/watch.py",
-        pattern=_r(r"\b(?:from\s+athena\.models|import\s+athena\.models|"
-                   r"provider\s*\.\s*(?:complete|stream)\s*\()"),
+        "or capabilities/watch.py",
+        pattern=_r(
+            r"\b(?:from\s+athena\.models|import\s+athena\.models|"
+            r"provider\s*\.\s*(?:complete|stream)\s*\()"
+        ),
         include=("scheduler/", "capabilities/watch.py"),
         exclude=(),
         allow=(),
     ),
     Rule(
         id="kernel-router-construction",
-        description="kernel constructs its own ModelRouter instead of "
-                    "receiving an injected one",
+        description="kernel constructs its own ModelRouter instead of receiving an injected one",
         pattern=_r(r"self\._router\s*=[^=].*\bModelRouter\s*\("),
         include=("kernel/",),
         exclude=(),
@@ -156,6 +206,7 @@ RULES: tuple[Rule, ...] = (
 # ---------------------------------------------------------------------------
 # Checker
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Hit:
@@ -190,28 +241,456 @@ def _annotated_allow(rule: Rule, line: str) -> bool:
     )
 
 
+def _load_exception_catalog(
+    root: Path,
+) -> tuple[dict[tuple[str, str, int], dict[str, object]], list[Hit]]:
+    """Load exact exception sites and reject malformed or duplicate entries."""
+    path = root / ARCHITECTURE_EXCEPTION_POLICY
+    if not path.exists():
+        return {}, []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {}, [
+            Hit(
+                "architecture-exception-policy",
+                ARCHITECTURE_EXCEPTION_POLICY,
+                1,
+                f"invalid exception policy: {exc}",
+                "violation",
+            )
+        ]
+    categories = payload.get("categories") if isinstance(payload, dict) else None
+    allowed_categories = set(categories) if isinstance(categories, dict) else set()
+    catalog: dict[tuple[str, str, int], dict[str, object]] = {}
+    hits: list[Hit] = []
+    rule_names = {
+        "subprocess": "subprocess-outside-approved-backends",
+        "raw_database": "raw-db-outside-state",
+    }
+    if not isinstance(payload, dict) or payload.get("schema") != 1:
+        return {}, [
+            Hit(
+                "architecture-exception-policy",
+                ARCHITECTURE_EXCEPTION_POLICY,
+                1,
+                "exception policy must declare schema 1",
+                "violation",
+            )
+        ]
+    for group, rule_name in rule_names.items():
+        entries = payload.get(group)
+        if not isinstance(entries, list):
+            hits.append(
+                Hit(
+                    "architecture-exception-policy",
+                    ARCHITECTURE_EXCEPTION_POLICY,
+                    1,
+                    f"exception policy group {group!r} must be a list",
+                    "violation",
+                )
+            )
+            continue
+        for index, entry in enumerate(entries, start=1):
+            path_value = entry.get("path") if isinstance(entry, dict) else None
+            line_value = entry.get("line") if isinstance(entry, dict) else None
+            category = entry.get("category") if isinstance(entry, dict) else None
+            rationale = entry.get("rationale") if isinstance(entry, dict) else None
+            model_reachable = entry.get("model_reachable") if isinstance(entry, dict) else None
+            authority_boundary = (
+                entry.get("authority_boundary") if isinstance(entry, dict) else None
+            )
+            classification_valid = True
+            if group == "subprocess":
+                classification_valid = (
+                    isinstance(model_reachable, bool)
+                    and (
+                        (category == "model_reachable_data_plane" and model_reachable)
+                        or (category == "trusted_control_plane" and not model_reachable)
+                    )
+                    and (
+                        not model_reachable
+                        or (
+                            isinstance(authority_boundary, str) and bool(authority_boundary.strip())
+                        )
+                    )
+                )
+            valid = (
+                isinstance(path_value, str)
+                and path_value.startswith(f"{SRC}/")
+                and isinstance(line_value, int)
+                and not isinstance(line_value, bool)
+                and line_value > 0
+                and isinstance(category, str)
+                and category in allowed_categories
+                and isinstance(rationale, str)
+                and bool(rationale.strip())
+                and classification_valid
+            )
+            key = (rule_name, str(path_value), int(line_value or 0))
+            if not valid or key in catalog:
+                hits.append(
+                    Hit(
+                        "architecture-exception-policy",
+                        ARCHITECTURE_EXCEPTION_POLICY,
+                        index,
+                        f"invalid or duplicate {group} exception entry",
+                        "violation",
+                    )
+                )
+                continue
+            catalog[key] = dict(entry)
+    return catalog, hits
+
+
+def _broad_exception_hits(root: Path, path: Path, rel: str, text: str) -> list[Hit]:
+    """Require a reviewable rationale or a hash-pinned legacy rationale.
+
+    The hash pin makes the legacy catalog fail closed when a file changes: a
+    new broad catch must carry an inline ``broad-exception:`` rationale before
+    the architecture lane can pass.
+    """
+    if rel.split("/", 1)[0] not in BROAD_EXCEPTION_ROOTS:
+        return []
+    try:
+        policy = json.loads((root / BROAD_EXCEPTION_POLICY).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        policy = {}
+    files = policy.get("files") if isinstance(policy, dict) else {}
+    entry = files.get(f"{SRC}/{rel}") if isinstance(files, dict) else None
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    legacy_ok = isinstance(entry, dict) and entry.get("sha256") == digest
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as exc:
+        return [
+            Hit("broad-exception-rationale", f"{SRC}/{rel}", exc.lineno or 1, str(exc), "violation")
+        ]
+    hits: list[Hit] = []
+    lines = text.splitlines()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        broad = node.type is None or (
+            isinstance(node.type, ast.Name) and node.type.id in {"Exception", "BaseException"}
+        )
+        if not broad:
+            continue
+        line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+        if re.search(r"broad-exception:|rationale:|noqa:\s*BLE001", line, re.IGNORECASE):
+            continue
+        if legacy_ok:
+            hits.append(
+                Hit(
+                    "broad-exception-rationale",
+                    f"{SRC}/{rel}",
+                    node.lineno,
+                    "hash-pinned legacy catch: " + str(entry.get("rationale")),
+                    "info",
+                )
+            )
+        else:
+            hits.append(
+                Hit(
+                    "broad-exception-rationale",
+                    f"{SRC}/{rel}",
+                    node.lineno,
+                    "broad catch requires inline rationale or updated hash-pinned policy entry",
+                    "violation",
+                )
+            )
+    return hits
+
+
+def _git_output(root: Path, *args: str) -> str | None:
+    """Return a git value when this checkout has the requested history."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _architecture_reference(root: Path) -> str | None:
+    """Choose the PR merge-base when available, otherwise the parent commit."""
+    requested = os.environ.get("ATHENA_ARCHITECTURE_BASE_REF") or os.environ.get("GITHUB_BASE_REF")
+    if requested:
+        candidates = [requested]
+        if "/" not in requested:
+            candidates.append(f"origin/{requested}")
+        for candidate in candidates:
+            if _git_output(root, "rev-parse", "--verify", f"{candidate}^{{commit}}"):
+                merge_base = _git_output(root, "merge-base", "HEAD", candidate)
+                if merge_base:
+                    return merge_base
+    return _git_output(root, "rev-parse", "--verify", "HEAD^{commit}")
+
+
+def _load_budget_map(value: object, *, label: str) -> tuple[dict[str, int] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, f"{label} must be an object"
+    parsed: dict[str, int] = {}
+    for key, raw in value.items():
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return None, f"{label}.{key} must be a positive integer"
+        parsed[str(key)] = raw
+    return parsed, None
+
+
+def _read_baseline_payload(
+    payload: str, *, label: str
+) -> tuple[dict[str, dict[str, int]] | None, str | None]:
+    try:
+        value = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        return None, f"{label} is not valid JSON: {exc}"
+    if not isinstance(value, dict):
+        return None, f"{label} must be an object"
+    python, error = _load_budget_map(value.get("python"), label=f"{label}.python")
+    if error:
+        return None, error
+    rust, error = _load_budget_map(value.get("rust"), label=f"{label}.rust")
+    if error:
+        return None, error
+    assert python is not None and rust is not None
+    return {"python": python, "rust": rust}, None
+
+
+def _load_debt_waivers(root: Path) -> tuple[dict[tuple[str, str], dict[str, object]], list[Hit]]:
+    path = root / ARCHITECTURE_DEBT_WAIVERS
+    if not path.exists():
+        return {}, []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {}, [
+            Hit(
+                "architecture-size-baseline",
+                ARCHITECTURE_DEBT_WAIVERS,
+                1,
+                f"invalid architecture debt waiver file: {exc}",
+                "violation",
+            )
+        ]
+    entries = payload.get("waivers") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return {}, [
+            Hit(
+                "architecture-size-baseline",
+                ARCHITECTURE_DEBT_WAIVERS,
+                1,
+                "architecture debt waivers must contain a waivers list",
+                "violation",
+            )
+        ]
+    waivers: dict[tuple[str, str], dict[str, object]] = {}
+    hits: list[Hit] = []
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            hits.append(
+                Hit(
+                    "architecture-size-baseline",
+                    ARCHITECTURE_DEBT_WAIVERS,
+                    index,
+                    "each architecture debt waiver must be an object",
+                    "violation",
+                )
+            )
+            continue
+        family = entry.get("family")
+        module = entry.get("path")
+        old_budget = entry.get("old_budget")
+        new_budget = entry.get("new_budget")
+        rationale = entry.get("rationale")
+        key = (str(family), str(module))
+        valid = (
+            family in {"python", "rust"}
+            and isinstance(module, str)
+            and bool(module)
+            and isinstance(old_budget, int)
+            and not isinstance(old_budget, bool)
+            and old_budget > 0
+            and isinstance(new_budget, int)
+            and not isinstance(new_budget, bool)
+            and new_budget > old_budget
+            and isinstance(rationale, str)
+            and bool(rationale.strip())
+        )
+        if not valid or key in waivers:
+            hits.append(
+                Hit(
+                    "architecture-size-baseline",
+                    ARCHITECTURE_DEBT_WAIVERS,
+                    index,
+                    "waiver must uniquely identify a python/rust path, provide positive old/new budgets with new > old, and include a rationale",
+                    "violation",
+                )
+            )
+            continue
+        waivers[key] = entry
+    return waivers, hits
+
+
+def _budget_widening_hits(
+    root: Path, current: dict[str, dict[str, int]], baseline_line: int
+) -> list[Hit]:
+    """Reject unwaived ceiling increases relative to the PR merge-base."""
+    reference = _architecture_reference(root)
+    if not reference:
+        return []
+    previous_text = _git_output(
+        root, "show", f"{reference}:{'docs/architecture-size-baseline.json'}"
+    )
+    if previous_text is None:
+        # This is the initial introduction of the baseline, not a widening.
+        return []
+    previous, error = _read_baseline_payload(
+        previous_text, label="historical architecture baseline"
+    )
+    if error:
+        return [
+            Hit(
+                "architecture-size-baseline",
+                "docs/architecture-size-baseline.json",
+                1,
+                error,
+                "violation",
+            )
+        ]
+    assert previous is not None
+    waivers, waiver_hits = _load_debt_waivers(root)
+    hits = list(waiver_hits)
+    seen: set[tuple[str, str]] = set()
+    for family in ("python", "rust"):
+        old_map = previous[family]
+        new_map = current[family]
+        for module in sorted(set(old_map) | set(new_map)):
+            old_budget = old_map.get(
+                module,
+                LEGACY_SIZE_BUDGETS.get(module, DEFAULT_MODULE_SIZE_BUDGET)
+                if family == "python"
+                else RUST_SIZE_BUDGETS.get(module, DEFAULT_RUST_MODULE_SIZE_BUDGET),
+            )
+            new_budget = new_map.get(
+                module,
+                LEGACY_SIZE_BUDGETS.get(module, DEFAULT_MODULE_SIZE_BUDGET)
+                if family == "python"
+                else RUST_SIZE_BUDGETS.get(module, DEFAULT_RUST_MODULE_SIZE_BUDGET),
+            )
+            if new_budget <= old_budget:
+                continue
+            key = (family, module)
+            seen.add(key)
+            waiver = waivers.get(key)
+            if (
+                waiver is not None
+                and waiver.get("old_budget") == old_budget
+                and waiver.get("new_budget") == new_budget
+            ):
+                hits.append(
+                    Hit(
+                        "architecture-size-baseline",
+                        ARCHITECTURE_DEBT_WAIVERS,
+                        1,
+                        f"waived {family}/{module}: {old_budget} -> {new_budget}",
+                        "info",
+                    )
+                )
+                continue
+            hits.append(
+                Hit(
+                    "architecture-size-baseline",
+                    "docs/architecture-size-baseline.json",
+                    baseline_line,
+                    f"{family}/{module} budget widened {old_budget} -> {new_budget}; add an exact waiver with old_budget, new_budget, and rationale",
+                    "violation",
+                )
+            )
+    for key in sorted(set(waivers) - seen):
+        hits.append(
+            Hit(
+                "architecture-size-baseline",
+                ARCHITECTURE_DEBT_WAIVERS,
+                1,
+                f"stale architecture debt waiver for {key[0]}/{key[1]}",
+                "violation",
+            )
+        )
+    return hits
+
+
 def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
     hits: list[Hit] = []
+    exception_catalog, exception_policy_hits = _load_exception_catalog(root)
+    hits.extend(exception_policy_hits)
+    seen_exception_sites: set[tuple[str, str, int]] = set()
     src_dir = root / SRC
     if not src_dir.is_dir():
         raise SystemExit(f"architecture-lint: {src_dir} not found")
 
-    files = sorted(
-        p for p in src_dir.rglob("*.py")
-        if not (skip_tests and "/tests/" in str(p))
-    )
+    baseline_path = root / "docs" / "architecture-size-baseline.json"
+    try:
+        baseline_text = baseline_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [
+            Hit(
+                "architecture-size-baseline",
+                "docs/architecture-size-baseline.json",
+                1,
+                f"missing or invalid architecture baseline: {exc}",
+                "violation",
+            )
+        ]
+    baseline, baseline_error = _read_baseline_payload(baseline_text, label="architecture baseline")
+    if baseline_error:
+        return [
+            Hit(
+                "architecture-size-baseline",
+                "docs/architecture-size-baseline.json",
+                1,
+                baseline_error,
+                "violation",
+            )
+        ]
+    assert baseline is not None
+    hits.extend(_budget_widening_hits(root, baseline, 1))
+    python_budgets = dict(LEGACY_SIZE_BUDGETS)
+    rust_budgets = dict(RUST_SIZE_BUDGETS)
+    python_budgets.update(baseline["python"])
+    rust_budgets.update(baseline["rust"])
+
+    files = sorted(p for p in src_dir.rglob("*.py") if not (skip_tests and "/tests/" in str(p)))
     for path in files:
         rel = str(path.relative_to(src_dir))
+        try:
+            line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError as exc:
+            print(f"architecture-lint: cannot read {path}: {exc}", file=sys.stderr)
+            continue
+        budget = python_budgets.get(rel, DEFAULT_MODULE_SIZE_BUDGET)
+        if line_count > budget:
+            hits.append(
+                Hit(
+                    "module-size-budget",
+                    f"{SRC}/{rel}",
+                    line_count,
+                    f"module has {line_count} lines; budget is {budget}",
+                    "violation",
+                )
+            )
         active = [(rule, _classify(rule, rel)) for rule in RULES]
         active = [(r, sev) for r, sev in active if sev]
         if not active:
             continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            print(f"architecture-lint: cannot read {path}: {exc}",
-                  file=sys.stderr)
-            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        hits.extend(_broad_exception_hits(Path(root), path, rel, text))
         for lineno, line in enumerate(text.splitlines(), start=1):
             stripped = line.lstrip()
             if stripped.startswith("#"):
@@ -221,25 +700,75 @@ def scan(root: Path, *, skip_tests: bool = True) -> list[Hit]:
                 if not m:
                     continue
                 if rule.receiver_filter is not None:
-                    window = line[max(0, m.start() - 60):m.end() + 1]
+                    window = line[max(0, m.start() - 60) : m.end() + 1]
                     if not rule.receiver_filter.search(window):
                         continue
                 severity = "info" if sev == "info" or _annotated_allow(rule, line) else sev
-                hits.append(Hit(rule.id, f"{SRC}/{rel}", lineno,
-                                line.strip(), severity))
+                if severity == "info" and rule.id in {
+                    "subprocess-outside-approved-backends",
+                    "raw-db-outside-state",
+                }:
+                    site = (rule.id, f"{SRC}/{rel}", lineno)
+                    if site not in exception_catalog:
+                        hits.append(
+                            Hit(
+                                "architecture-exception-policy",
+                                f"{SRC}/{rel}",
+                                lineno,
+                                f"new {rule.id} exception site is not cataloged",
+                                "violation",
+                            )
+                        )
+                    else:
+                        seen_exception_sites.add(site)
+                hits.append(Hit(rule.id, f"{SRC}/{rel}", lineno, line.strip(), severity))
+
+    native_dir = root / "native" / "src"
+    if native_dir.is_dir():
+        for path in sorted(native_dir.rglob("*.rs")):
+            rel = str(path.relative_to(native_dir))
+            try:
+                line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError as exc:
+                print(f"architecture-lint: cannot read {path}: {exc}", file=sys.stderr)
+                continue
+            budget = rust_budgets.get(rel, DEFAULT_RUST_MODULE_SIZE_BUDGET)
+            if line_count > budget:
+                hits.append(
+                    Hit(
+                        "rust-module-size-budget",
+                        f"native/src/{rel}",
+                        line_count,
+                        f"module has {line_count} lines; budget is {budget}",
+                        "violation",
+                    )
+                )
+    for site in sorted(set(exception_catalog) - seen_exception_sites):
+        rule_name, path_name, lineno = site
+        hits.append(
+            Hit(
+                "architecture-exception-policy",
+                path_name,
+                lineno,
+                f"stale {rule_name} exception site is no longer annotated at this location",
+                "violation",
+            )
+        )
     return hits
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="scripts/architecture-lint",
-        description="Scan src/athena for audit-prohibited structural patterns.")
-    parser.add_argument("--root", default=str(REPO_ROOT),
-                        help="repository root (default: auto-detected)")
-    parser.add_argument("--quiet", "-q", action="store_true",
-                        help="suppress INFO (allow-listed) lines")
-    parser.add_argument("--list-rules", action="store_true",
-                        help="print the rule table and exit")
+        description="Scan src/athena for audit-prohibited structural patterns.",
+    )
+    parser.add_argument(
+        "--root", default=str(REPO_ROOT), help="repository root (default: auto-detected)"
+    )
+    parser.add_argument(
+        "--quiet", "-q", action="store_true", help="suppress INFO (allow-listed) lines"
+    )
+    parser.add_argument("--list-rules", action="store_true", help="print the rule table and exit")
     args = parser.parse_args(argv)
 
     if args.list_rules:
@@ -265,10 +794,10 @@ def main(argv: list[str] | None = None) -> int:
             rule_viol = [h for h in violations if h.rule == rule.id]
             rule_info = [h for h in infos if h.rule == rule.id]
             if rule_viol or rule_info:
-                print(f"    {rule.id}: {len(rule_viol)} violation(s), "
-                      f"{len(rule_info)} allow-listed")
-        print(f"architecture-lint: {len(violations)} violation(s), "
-              f"{len(infos)} allow-listed INFO")
+                print(
+                    f"    {rule.id}: {len(rule_viol)} violation(s), {len(rule_info)} allow-listed"
+                )
+        print(f"architecture-lint: {len(violations)} violation(s), {len(infos)} allow-listed INFO")
     else:
         print(f"architecture-lint: {len(violations)} violation(s)")
 

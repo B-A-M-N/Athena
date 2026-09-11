@@ -4,12 +4,26 @@ from datetime import timedelta
 
 
 from athena.protocol.tasks import (
+    CapabilityPolicy,
     FINAL_STATUSES,
     LEGAL_TRANSITIONS,
     PAUSED_STATUSES,
     ResourceBudget,
+    ResourceBudgetCeiling,
     TaskStatus,
+    capability_policy_covers,
+    effective_capability_policy,
+    intersect_resource_budgets,
 )
+
+
+def test_effective_capability_policy_applies_deny_before_reflection_or_delegation():
+    effective = effective_capability_policy(
+        {"allow": ["files.write"], "ask": ["files.read"], "deny": ["files.write"]}
+    )
+    assert effective.allow == ()
+    assert effective.ask == ("files.read",)
+    assert not capability_policy_covers(effective, {"allow": ["files.write"]})
 
 
 @pytest.mark.athena_claim("BHV-014")
@@ -105,3 +119,43 @@ def test_terminal_statuses_aliases_final():
     from athena.protocol.tasks import TERMINAL_STATUSES
 
     assert TERMINAL_STATUSES is FINAL_STATUSES
+
+
+def test_capability_policy_coverage_preserves_ask_vs_allow_lattice():
+    assert capability_policy_covers(
+        CapabilityPolicy(allow=("files.write",)),
+        CapabilityPolicy(allow=("files.write",)),
+    )
+    assert capability_policy_covers(
+        CapabilityPolicy(allow=("files.write",)),
+        CapabilityPolicy(ask=("files.write",)),
+    )
+    assert capability_policy_covers(
+        CapabilityPolicy(ask=("files.write",)),
+        CapabilityPolicy(ask=("files.write",)),
+    )
+    assert not capability_policy_covers(
+        CapabilityPolicy(ask=("files.write",)),
+        CapabilityPolicy(allow=("files.write",)),
+    )
+
+
+def test_capability_policy_coverage_handles_unrestricted_and_deny_rules():
+    assert capability_policy_covers(CapabilityPolicy(), CapabilityPolicy(allow=("files.write",)))
+    assert not capability_policy_covers(
+        CapabilityPolicy(allow=("files.write",)), CapabilityPolicy()
+    )
+    assert not capability_policy_covers(
+        CapabilityPolicy(deny=("files.write",)), CapabilityPolicy(ask=("files.write",))
+    )
+    assert capability_policy_covers(
+        CapabilityPolicy(allow=("files.write",)),
+        CapabilityPolicy(allow=("files.write",), deny=("files.write",)),
+    )
+
+
+def test_resource_budget_ceiling_keeps_unbounded_dimensions_explicit():
+    ceiling = intersect_resource_budgets({}, {"max_children": 2})
+    assert isinstance(ceiling, ResourceBudgetCeiling)
+    assert ceiling.max_children == 2
+    assert ceiling.max_agent_iterations is None

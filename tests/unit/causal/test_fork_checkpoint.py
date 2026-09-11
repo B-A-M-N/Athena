@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -112,6 +116,46 @@ async def test_checkpoint_capture_and_restore(tmp_path: Path):
     assert not (ws / "extra.txt").exists(), "file added after capture should be removed on restore"
 
 
+def test_shadow_checkpoint_worker_has_no_state_execution_import_cycle(tmp_path: Path):
+    """The isolated clone worker must start from a clean interpreter.
+
+    Importing ``athena.state.database`` first used to enter the eager
+    ``athena.execution`` and ``athena.state`` package initializers in a cycle.
+    The speculative restart path exercises this worker, so keep the boundary
+    regression explicit rather than relying only on the parent process import
+    order used by the rest of the suite.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value.txt").write_text("value", encoding="utf-8")
+    state = tmp_path / "state"
+    env = os.environ.copy()
+    repo_src = str(Path(__file__).parents[3] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(item for item in (repo_src, env.get("PYTHONPATH")) if item)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "athena.causal.checkpoint_worker",
+            "clone",
+            "--root",
+            str(state),
+            "--checkpoint-id",
+            "branch_test",
+            "--workspace-root",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert json.loads(result.stdout)["base_manifest"]
+
+
 async def test_checkpoint_inspects_immutable_metadata(tmp_path: Path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -133,6 +177,90 @@ async def test_checkpoint_inspects_immutable_metadata(tmp_path: Path):
     assert inspected["id"] == manifest["id"]
     assert inspected["metadata"]["type"] == "semantic_state_checkpoint"
     assert inspected["metadata"]["state"]["event_boundary"]["last_sequence"] == 4
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_classifies_reconstructible_resources(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "state.txt").write_text("state", encoding="utf-8")
+    manager = CheckpointManager(str(tmp_path / "checkpoints"))
+    captured = await manager.capture(
+        task_id="task-resources",
+        workspace_root=str(workspace),
+        label="resume",
+        metadata={
+            "resources": [
+                {"name": "python", "reattachable": True, "identity": "session-1"},
+                {"name": "dependencies", "environment_id": "env-1"},
+                {"name": "browser", "recipe": "restore-storage"},
+                {"name": "lost-process"},
+            ]
+        },
+    )
+    inspected = await manager.inspect(captured["id"])
+    states = {item["name"]: item["state"] for item in inspected["metadata"]["resources"]}
+    assert states == {
+        "python": "reattached",
+        "dependencies": "reconstructed",
+        "browser": "reconstructed",
+        "lost-process": "lost",
+    }
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_manifest_carries_recovery_contract_and_typed_outcomes(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "state.txt").write_text("state", encoding="utf-8")
+    manager = CheckpointManager(str(tmp_path / "checkpoints"))
+    captured = await manager.capture(
+        task_id="task-manifest",
+        workspace_root=str(workspace),
+        label="full-manifest",
+        metadata={
+            "continuation_id": "continuation-7",
+            "dependency_environment_id": "env-7",
+            "runtime_session_receipts": [{"session_id": "runtime-1", "state": "closed"}],
+            "scheduler_checkpoint": {"next_trigger": "2026-09-09T12:00:00Z"},
+            "workflow_checkpoint": {"workflow_id": "wf-1", "step": "verify"},
+            "browser_storage_state_ref": "secret://browser-state-7",
+            "database_checkpoint_receipt": {"wal_frame": 42},
+            "world_state_revision": "world-19",
+            "non_restorable_obligations": ["live-child-process"],
+            "resources": [
+                {"name": "reattach", "state": "reattached", "identity": "r-1"},
+                {"name": "rebuild", "state": "reconstructed", "recipe": "rebuild"},
+                {"name": "stale", "stale": True, "identity": "stale-1"},
+                {"name": "conflict", "conflict": True, "identity": "conflict-1"},
+                {"name": "lost"},
+            ],
+        },
+    )
+
+    contract = captured["computational_checkpoint"]
+    assert contract["task_id"] == "task-manifest"
+    assert contract["continuation_id"] == "continuation-7"
+    assert contract["workspace_fingerprint"] == captured["workspace_fingerprint"]
+    assert contract["dependency_environment_id"] == "env-7"
+    assert contract["runtime_session_receipts"] == [{"session_id": "runtime-1", "state": "closed"}]
+    assert contract["scheduler_checkpoint"] == {"next_trigger": "2026-09-09T12:00:00Z"}
+    assert contract["workflow_checkpoint"] == {"workflow_id": "wf-1", "step": "verify"}
+    assert contract["browser_storage_state_ref"] == "secret://browser-state-7"
+    assert contract["database_checkpoint_receipt"] == {"wal_frame": 42}
+    assert contract["world_state_revision"] == "world-19"
+    assert contract["non_restorable_obligations"] == ["live-child-process"]
+    assert {item["state"] for item in contract["recovery_outcomes"]} == {
+        "reattached",
+        "reconstructed",
+        "stale",
+        "conflict",
+        "lost",
+    }
+
+    restored = await manager.restore(captured["id"], str(workspace))
+    assert restored["recovery_outcomes"] == contract["recovery_outcomes"]
+    assert restored["computational_checkpoint"] == contract
 
 
 async def test_restore_unknown_checkpoint(tmp_path: Path):

@@ -1,10 +1,11 @@
 .PHONY: format format-check lint typecheck compile test check scenarios arch-lint native-check native-test native-smoke native-package release-check
 
 UV ?= uv
-RUFF := $(UV) run ruff
-MYPY := $(UV) run mypy
-PYTHON := $(UV) run python
-PYTEST := $(UV) run pytest
+UV_RUN_DEV := $(UV) run --extra dev
+RUFF := $(UV_RUN_DEV) ruff
+MYPY := $(UV_RUN_DEV) mypy
+PYTHON := $(UV_RUN_DEV) python
+PYTEST := $(UV) run --extra dev --extra anthropic pytest
 
 format:
 	$(RUFF) format src tests

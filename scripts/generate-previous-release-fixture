@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Generate a canonical N-1 database dump from an actual Athena wheel.
+
+The release qualification fixture must come from the previous installed
+artifact, not from the current migration directory.  This tool extracts the
+wheel into a private directory, lets that wheel initialize SQLite, inserts
+fixed representative state through the old schema, normalizes timestamps, and
+emits a deterministic SQL dump plus provenance metadata.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+
+_CHILD = r'''
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+import sqlite3
+import sys
+
+from athena.state.database import Database
+from athena.kernel.continuations import ContinuationStore
+
+
+DATABASE = Path(sys.argv[1])
+NOW = "2026-01-01T00:00:00+00:00"
+
+
+async def initialize() -> None:
+    database = Database(str(DATABASE))
+    await database._ensure_ready()
+    await database.close()
+
+
+def seed() -> None:
+    connection = sqlite3.connect(DATABASE)
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(
+        "UPDATE schema_migrations SET applied_at = 'previous-release'"
+    )
+    connection.executescript(
+        f"""
+        INSERT INTO sessions(id, created_at, updated_at, metadata)
+        VALUES ('previous-session', '{NOW}', '{NOW}',
+                '{{"release":"0.1.0b1","source":"previous-wheel"}}');
+        INSERT INTO tasks(
+            id, session_id, status, autonomy, objective, summary, created_at, updated_at
+        ) VALUES (
+            'previous-task', 'previous-session', 'COMPLETE', 'supervised',
+            'preserve N-1 task', 'previous release task', '{NOW}', '{NOW}'
+        );
+        INSERT INTO messages(
+            id, session_id, role, blocks, text_content, created_at, provenance, metadata
+        ) VALUES (
+            'previous-message', 'previous-session', 'user', '[]',
+            'preserve N-1 transcript', '{NOW}', '{{}}', '{{"source":"previous-wheel"}}'
+        );
+        INSERT INTO memories(
+            id, scope, content, text_content, kind, source_task_id, source_session_id,
+            created_at, updated_at, metadata
+        ) VALUES (
+            'previous-memory', 'session', 'remembered beta fact', 'remembered beta fact',
+            'fact', 'previous-task', 'previous-session', '{NOW}', '{NOW}', '{{}}'
+        );
+        INSERT INTO scheduled_jobs(
+            id, name, cron, payload, enabled, next_run, created_at, updated_at, metadata
+        ) VALUES (
+            'previous-job', 'previous scheduled job', '0 * * * *', '{{}}', 1,
+            '{NOW}', '{NOW}', '{NOW}', '{{}}'
+        );
+        INSERT INTO job_runs(
+            id, job_id, task_id, started_at, ended_at, status, metadata, scheduled_for
+        ) VALUES (
+            'previous-job-run', 'previous-job', 'previous-task', '{NOW}', '{NOW}',
+            'SUCCEEDED', '{{}}', '{NOW}'
+        );
+        INSERT INTO approvals(
+            id, task_id, capability_id, arguments, status, created_at, metadata
+        ) VALUES (
+            'previous-approval', 'previous-task', 'files.write', '{{}}', 'APPROVED',
+            '{NOW}', '{{}}'
+        );
+        INSERT INTO mutations(
+            id, task_id, resource, operation, reversible, before_state, after_state,
+            created_at, metadata, status, inverse, sequence
+        ) VALUES (
+            'previous-mutation', 'previous-task', 'workspace/file.txt', 'write', 1,
+            '{{}}', '{{"content":"old beta"}}', '{NOW}', '{{}}', 'COMPLETED',
+            '{{"operation":"restore"}}', 1
+        );
+        INSERT INTO workflows(
+            id, name, scope, task_scope, definition, created_at, updated_at
+        ) VALUES (
+            'previous-workflow', 'previous workflow', 'task', 'previous-task',
+            '{{"id":"previous-workflow","name":"previous workflow","steps":[],"scope":"task","task_scope":"previous-task","version":1}}',
+            '{NOW}', '{NOW}'
+        );
+        INSERT INTO workflow_runs(
+            id, workflow_id, task_id, status, inputs, outputs, created_at, updated_at
+        ) VALUES (
+            'previous-workflow-run', 'previous-workflow', 'previous-task', 'COMPLETE',
+            '{{}}', '{{}}', '{NOW}', '{NOW}'
+        );
+        INSERT INTO capability_packs(
+            id, version, manifest, install_path, enabled, source_integrity, installed_at
+        ) VALUES (
+            'previous-pack', '1.0.0', '{{"id":"previous-pack"}}',
+            '/previous-pack', 1, '{{"sha256":"previous"}}', '{NOW}'
+        );
+        INSERT INTO provider_usage(
+            id, provider, model, task_id, session_id, input_tokens, output_tokens,
+            cost_usd, started_at, ended_at, metadata
+        ) VALUES (
+            'previous-usage', 'fixture-provider', 'fixture-model', 'previous-task',
+            'previous-session', 10, 5, '0.01', '{NOW}', '{NOW}', '{{}}'
+        );
+        INSERT INTO events(
+            id, task_id, session_id, type, sequence, timestamp, schema_version, payload
+        ) VALUES (
+            'previous-event', 'previous-task', 'previous-session', 'task.completed',
+            1, '{NOW}', 1, '{{"source":"previous-wheel"}}'
+        );
+        INSERT INTO self_host_missions(
+            id, project_root, objective, status, current_task_id, base_revision,
+            design_bundle_hash, gate_bundle_hash, plan, created_at, updated_at
+        ) VALUES (
+            'previous-mission', '/previous-project', 'preserve N-1 continuation',
+            'PAUSED', 'previous-task', 'previous-source', 'previous-design',
+            'previous-gates', '{{"phase":"CONTINUE","source":"previous-wheel"}}',
+            '{NOW}', '{NOW}'
+        );
+        INSERT INTO delegate_sessions(
+            id, delegate_id, task_id, session_id, remote_session_id, workspace_root,
+            state, created_at, last_seen_at, launch_signature, metadata
+        ) VALUES (
+            'previous-delegate', 'previous-delegate-id', 'previous-task',
+            'previous-session', 'remote-previous', '/previous-project', 'PAUSED',
+            '{NOW}', '{NOW}', 'previous-launch', '{{}}'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
+async def seed_continuation() -> None:
+    database = Database(str(DATABASE))
+    store = ContinuationStore(database)
+    await store.record(
+        id="previous-continuation",
+        task_id="previous-task",
+        call_id="previous-call",
+        capability_id="files.write",
+        canonical_arguments={"path": "workspace/file.txt", "content": "old beta"},
+        schema_hash="previous-schema",
+        effects=["FILESYSTEM_WRITE"],
+        workspace_id="/previous-project",
+        approval_id="previous-approval",
+    )
+    await store.mark_resolved("previous-continuation", "granted")
+    await database.execute(
+        "UPDATE continuations SET created_at = ?, resolved_at = ? WHERE id = ?",
+        (NOW, NOW, "previous-continuation"),
+    )
+    await database.close()
+
+
+asyncio.run(initialize())
+seed()
+asyncio.run(seed_continuation())
+'''
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _schema_fingerprint(connection: sqlite3.Connection) -> str:
+    rows = connection.execute(
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    payload = json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _migration_manifest(extracted: Path, output: Path) -> str:
+    entries = {
+        path.name: _sha256(path)
+        for path in sorted(
+            (extracted / "athena" / "state" / "migrations").glob("[0-9][0-9][0-9]_*.sql")
+        )
+    }
+    output.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    return _sha256(output)
+
+
+def _dump(database: Path, output: Path) -> None:
+    connection = sqlite3.connect(database)
+    try:
+        raw = list(connection.iterdump())
+    finally:
+        connection.close()
+
+    # sqlite3's iterdump uses writable_schema for FTS5 virtual tables. That
+    # output is not executable in a fresh connection because the virtual
+    # table is inserted into sqlite_master before it is materialized. Emit
+    # the real CREATE VIRTUAL TABLE statement and rebuild its index from the
+    # canonical content rows instead.
+    fts_sql = {
+        "memories_fts": "CREATE VIRTUAL TABLE memories_fts USING fts5(text_content, content='memories', content_rowid='rowid');",
+        "messages_fts": "CREATE VIRTUAL TABLE messages_fts USING fts5(text_content, content='messages', content_rowid='rowid');",
+        "skills_fts": "CREATE VIRTUAL TABLE skills_fts USING fts5(text_content, content='skills', content_rowid='rowid');",
+    }
+    lines: list[str] = []
+    active_fts: str | None = None
+    for line in raw:
+        if line == "PRAGMA writable_schema=ON;":
+            continue
+        if line == "PRAGMA writable_schema=OFF;":
+            continue
+        if line.startswith("INSERT INTO sqlite_master"):
+            active_fts = next((name for name in fts_sql if f"'{name}'" in line), None)
+            if active_fts is not None:
+                continue
+        if active_fts is not None:
+            if line.endswith("');"):
+                name = active_fts
+                lines.extend(
+                    [
+                        fts_sql[name],
+                        f"INSERT INTO {name}(rowid, text_content) "
+                        f"SELECT rowid, text_content FROM {name.removesuffix('_fts')};",
+                    ]
+                )
+                active_fts = None
+            continue
+        if any(
+            line.startswith(prefix)
+            for prefix in (
+                'INSERT INTO "memories_fts',
+                'INSERT INTO "messages_fts',
+                'INSERT INTO "skills_fts',
+                "CREATE TABLE 'memories_fts_",
+                "CREATE TABLE 'messages_fts_",
+                "CREATE TABLE 'skills_fts_",
+            )
+        ):
+            continue
+        lines.append(line)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--wheel", type=Path, required=True)
+    parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--source-distribution", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--metadata", type=Path, required=True)
+    parser.add_argument("--migration-manifest", type=Path, required=True)
+    args = parser.parse_args()
+
+    wheel = args.wheel.resolve()
+    if not wheel.is_file() or wheel.suffix != ".whl":
+        parser.error(f"wheel does not exist: {wheel}")
+    if len(args.source_sha) != 40:
+        parser.error("--source-sha must be a full 40-character commit SHA")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.metadata.parent.mkdir(parents=True, exist_ok=True)
+    args.migration_manifest.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="athena-previous-release-") as raw:
+        work = Path(raw)
+        extracted = work / "wheel"
+        extracted.mkdir()
+        with zipfile.ZipFile(wheel) as archive:
+            archive.extractall(extracted)
+        database = work / "previous-release.sqlite"
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(extracted)
+        subprocess.run(
+            [sys.executable, "-c", _CHILD, str(database)],
+            cwd=work,
+            env=environment,
+            check=True,
+        )
+        migration_manifest_sha = _migration_manifest(extracted, args.migration_manifest)
+        _dump(database, args.output)
+        verification = sqlite3.connect(":memory:")
+        try:
+            verification.executescript(args.output.read_text(encoding="utf-8"))
+            schema_fingerprint = _schema_fingerprint(verification)
+        finally:
+            verification.close()
+
+    wheel_hash = _sha256(wheel)
+    source_dist = args.source_distribution.resolve() if args.source_distribution else None
+    metadata = {
+        "release": "0.1.0b1",
+        "source_sha": args.source_sha,
+        "schema_migration_version": "038",
+        "schema_fixture": args.output.name,
+        "schema_fixture_sha256": _sha256(args.output),
+        "schema_fingerprint_sha256": schema_fingerprint,
+        "schema_object_count": 0,
+        "migration_manifest": args.migration_manifest.name,
+        "migration_manifest_sha256": migration_manifest_sha,
+        "generation_command": (
+            "scripts/generate-previous-release-fixture "
+            "--wheel retained/athena_agent-0.1.0b1-py3-none-any.whl "
+            f"--source-sha {args.source_sha} --output {args.output.name} "
+            f"--metadata {args.metadata.name} --migration-manifest {args.migration_manifest.name}"
+        ),
+        "previous_release_artifacts": {
+            "python_wheel": {"name": wheel.name, "sha256": wheel_hash},
+        },
+        "purpose": "clean-install-upgrade-rollback starts from the database produced by the previous beta wheel",
+        "upgrade_contract": {
+            "previous_schema_is_artifact_derived": True,
+            "must_apply_new_migrations": True,
+            "must_retry_failed_migration": True,
+            "must_preserve_existing_rows": True,
+            "must_exercise_application_repositories": True,
+        },
+    }
+    if source_dist is not None:
+        metadata["previous_release_artifacts"]["source_distribution"] = {
+            "name": source_dist.name,
+            "sha256": _sha256(source_dist),
+        }
+    metadata["schema_object_count"] = len(
+        [
+            line
+            for line in args.output.read_text(encoding="utf-8").splitlines()
+            if line.startswith("CREATE TABLE") or line.startswith("CREATE VIRTUAL TABLE")
+        ]
+    )
+    args.metadata.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    print(f"generated previous-release fixture: {args.output}")
+    print(f"wheel sha256: {wheel_hash}")
+    print(f"schema fingerprint: {schema_fingerprint}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

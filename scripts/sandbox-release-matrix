@@ -19,10 +19,11 @@ matrix_repeats="${ATHENA_SANDBOX_MATRIX_REPEATS:-5}"
   printf '%s\n' 'sandbox-release-matrix: ATHENA_SANDBOX_MATRIX_REPEATS must be a positive integer' >&2
   exit 2
 }
+uv_bin="${ATHENA_RELEASE_UV:-uv}"
 if [[ "${ATHENA_SANDBOX_NO_SYNC:-0}" == "1" ]]; then
-  uv_run=(uv run --frozen --no-sync)
+  uv_run=("$uv_bin" run --frozen --no-sync)
 else
-  uv_run=(uv run --frozen --extra dev)
+  uv_run=("$uv_bin" run --frozen --extra dev)
 fi
 matrix_tests=(
   tests/e2e/test_release_sandbox_matrix.py

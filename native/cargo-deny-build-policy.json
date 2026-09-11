@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "cargo_deny_version": "0.20.2",
+  "source": "crates.io",
+  "install_mode": "cargo-install-locked",
+  "binary_digest_policy": "record-per-build",
+  "notes": "cargo install verifies registry checksums and Cargo.lock; the executable hash is recorded per target/toolchain and is not reused across platforms."
+}

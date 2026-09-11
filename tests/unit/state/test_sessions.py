@@ -111,3 +111,46 @@ async def test_canonical_user_turn_is_idempotent_by_stable_message_identity(db):
     assert await messages.append_user_turn("sess-canonical", message) is True
     assert await messages.append_user_turn("sess-canonical", message) is False
     assert await messages.count_session_messages("sess-canonical") == 1
+
+
+async def test_assistant_response_append_is_durable_and_idempotent(db):
+    sessions = SessionRepository(db)
+    await sessions.create("sess-assistant")
+    messages = MessageStore(db)
+    message = Message(
+        id="msg_assistant_stable",
+        role=Role.ASSISTANT,
+        blocks=(TextBlock(text="done"),),
+        created_at=utcnow(),
+        provenance=Provenance(source_type=SourceType.GENERATED),
+        metadata={"session_id": "sess-assistant", "task_id": "task-1"},
+    )
+
+    assert await messages.append_idempotent(message) is True
+    assert await messages.append_idempotent(message) is False
+    assert await messages.count_session_messages("sess-assistant") == 1
+
+
+async def test_assistant_response_identity_cannot_cross_sessions(db):
+    sessions = SessionRepository(db)
+    await sessions.create("sess-a")
+    await sessions.create("sess-b")
+    messages = MessageStore(db)
+    message = Message(
+        id="msg_assistant_collision",
+        role=Role.ASSISTANT,
+        blocks=(TextBlock(text="done"),),
+        created_at=utcnow(),
+        provenance=Provenance(source_type=SourceType.GENERATED),
+        metadata={"session_id": "sess-a", "task_id": "task-a"},
+    )
+    await messages.append_idempotent(message)
+    with pytest.raises(ValueError, match="another session"):
+        await messages.append_idempotent(
+            Message(
+                **{
+                    **message.__dict__,
+                    "metadata": {"session_id": "sess-b", "task_id": "task-b"},
+                }
+            )
+        )

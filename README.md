@@ -1,7 +1,7 @@
 # Athena
 
 A compact, local-first autonomous agent runtime with durable knowledge,
-structured delegation, universal execution, a programmable execution
+structured delegation, governed multi-runtime execution, a programmable execution
 environment, and a **single authoritative reasoning loop**.
 
 Athena brings capability discovery, evidence, execution, policy, and learning
@@ -9,11 +9,12 @@ into one durable kernel. The normative contracts live in `SPEC.md`,
 `BUILDSPEC.md`, `BEHAVIORSPEC.md`, and `RESEARCHSPEC.md`; the architectural
 overview is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-> **Status: public beta candidate (`0.1.0b1`).** Linux is the certified native
-> and isolation platform. macOS and Windows native/isolation parity and other
-> unlisted integrations are outside the 0.1 support contract. A release stamp
-> requires the core release gate and real X11 desktop acceptance described
-> below. Hermes live evidence is an optional integration certification. The
+> **Status: public beta candidate (`0.1.0b1`).** The bounded beta native
+> certification cell is Linux x86_64 with an X11 display and Openbox; broader
+> Linux desktop, macOS, and Windows native/isolation parity are compatibility
+> targets, not certification claims. A release stamp requires the core release
+> gate and real X11/Openbox desktop acceptance described below. Hermes live
+> evidence is an optional integration certification. The
 > version is a PEP 440 beta pre-release, not stable: it becomes stable only
 > when one frozen SHA has passed every required gate
 > (`./scripts/release-check`).
@@ -36,8 +37,10 @@ loosely coordinated agents.
 
 ## Install
 
-Requires Python 3.12 or 3.13. Python 3.14 is not part of the certified beta
-matrix yet.
+The certified beta surface uses Python 3.12. Python 3.13 is compatibility-tested
+by ordinary CI and is accepted by the package metadata, but is not release-
+certified until a protected lane exercises it. Python 3.14 is not part of the
+beta matrix.
 
 ```bash
 pip install athena-agent==0.1.0b1
@@ -51,8 +54,8 @@ or retrieval is first used:
 pip install "athena-agent[semantic]==0.1.0b1"
 ```
 
-On a supported Linux host, install the optional native companion alongside the
-matching runtime:
+On the certified Linux x86_64 X11/Openbox cell, install the optional native
+companion alongside the matching runtime:
 
 ```bash
 pip install "athena-agent==0.1.0b1" "athena-agent-native==0.1.0b1"
@@ -78,7 +81,7 @@ make check           # run the full local verification gate
 `make format-check` verifies formatting without changing files. The release
 gate requires it to be green for the complete `src` and `tests` trees.
 
-The core release gate is `scripts/release-check --sha <clean-commit>`. It
+The core release gate is `scripts/release-check --sha <clean-commit> --evidence-dir <durable-evidence-root>`. It
 includes installed wheel/sdist acceptance, the actual Bubblewrap confinement
 matrix, nested workflow/strategy recovery, and native input/visual checks. The
 native input and visual lanes require a usable X display for their automation,
@@ -89,6 +92,45 @@ releasable result. To certify the optional operator-owned Hermes integration on
 the same commit, provide its endpoint and add `--include-hermes-live`; that
 lane is recorded separately and is never required for core publication.
 
+For a complete local qualification, provision the locked Rust supply-chain
+tool and retain durable evidence:
+
+```bash
+source scripts/cosign-env
+scripts/release-check --sha <clean-commit> --bootstrap \
+  --evidence-dir .release-evidence
+```
+
+The bootstrap receipt records the cargo-deny version, binary hash, host, and
+Rust toolchain for that build; the hash is intentionally scoped to that
+platform/toolchain rather than reused as a cross-platform checksum. The final
+evidence also contains a signed certification root covering the complete
+evidence tree.
+
+### Release signing setup
+
+The release gate requires cosign for the toolchain passport and cryptographic
+provenance. CI installs the pinned cosign 2.6.4 release and uses GitHub
+Actions OIDC keyless signing. For local toolchain checks, source the repo-local
+environment helper:
+
+```bash
+source scripts/cosign-env
+cosign version
+python --version       # Athena's project Python, not the host fallback
+uv --version
+```
+
+The helper also exports `ATHENA_RELEASE_UV` and `ATHENA_RELEASE_PYTHON` and
+puts the project environment first on `PATH`; it also keeps UV's cache and
+project environment inside the repository's ignored `.release-toolchain`/
+`.venv` paths. Native X11 checks use the separately resolved
+`ATHENA_RELEASE_SYSTEM_PYTHON` when they need host Xlib bindings.
+
+Local keyless signing still requires an OIDC-capable identity provider; do not
+invent `COSIGN_CERTIFICATE_IDENTITY`. For a local key-based release, provide
+`COSIGN_KEY` while signing and `COSIGN_PUBLIC_KEY` while verifying.
+
 ## Quickstart
 
 ```bash
@@ -98,7 +140,7 @@ athena chat
 # hosted raster OI on a Kitty-compatible graphics transport
 athena --display glass chat
 
-# universal terminal fallback
+# governed terminal fallback
 athena --display ansi chat
 
 # native Athena terminal (Alacritty core + Athena compositor)
@@ -116,6 +158,25 @@ and review-before-commit boundary. Athena verifies the candidate while the
 live checkout remains unchanged, then offers Apply, Discard, or Later. Apply
 uses the same shadow commit path as other verified work; a failed or stale
 candidate cannot be applied.
+
+### Operator CLI
+
+The CLI exposes typed nested command families for the durable service and
+operator projections. Run `athena jobs --help` (or any family with
+`--help`) to discover its actions and validated arguments:
+
+```bash
+athena jobs list
+athena tasks show TASK_ID
+athena inference-recoveries resolve ATTEMPT_ID \
+  --resolution failed --note "provider receipt verified"
+athena candidates promote CANDIDATE_ID --scope project
+eval "$(athena completion bash)"
+```
+
+The complete Service/API-to-CLI parity matrix, intentional transport
+boundaries, aliases, and exit-code contract live in
+[`docs/CLI-PARITY.md`](docs/CLI-PARITY.md).
 
 Inside the console, direct commands use the same policy and execution path as
 model-requested commands:
@@ -531,7 +592,8 @@ the optional demo wrapper.
 The Termux script is an optional ANSI/PTY compatibility probe, not an
 Athena 0.1 support target or release gate. Athena's supported terminal
 surfaces are hosted Glass over Kitty Graphics Protocol (Kitty and WezTerm),
-the ANSI fallback, and the Linux native Alacritty-core frontend. From a
+the ANSI fallback, and the Linux x86_64 X11/Openbox native Alacritty-core
+frontend. From a
 checkout, run the optional probe manually:
 
 ```bash
@@ -581,7 +643,11 @@ deterministic `research:plan`, `research:assess`, `research:bundle`, and
 `research:run` operations are live. `research:run` composes an explicit
 objective, requirements, selected source captures, exact evidence excerpts,
 contradiction checks, and a final readiness bundle without creating a separate
-research brain. Open-ended autonomous research planning remains in development.
+research brain. With `autonomous=true`, it also performs a bounded
+discover→policy-check→immutable-fetch acquisition loop. Later rounds are
+gap-driven and byte-bounded; evidence-required tasks remain partial until a
+typed ready-bundle receipt exists. Model-generated extraction remains
+intentionally bounded.
 
 ## Current limitations
 
@@ -699,6 +765,41 @@ allowed = ["anthropic/claude-opus-4"]     # main reasoning loop
 Built-in roles: `primary` (task reasoning), `summarizer` (context compression),
 `judge` (model-judged acceptance criteria). A caller's explicit allowlist
 always wins over role defaults.
+
+### Voice input and output
+
+Voice is an opt-in transport around the normal durable task path. Configure
+named OpenAI-compatible providers for transcription and speech synthesis; the
+provider credentials stay in the ordinary provider/SecretManager boundary:
+
+```toml
+[[providers]]
+kind = "openai"
+name = "openai"
+model = "gpt-4o-mini"
+credential_id = "OPENAI_API_KEY"
+
+[voice]
+enabled = true
+transcription_provider = "openai"
+transcription_model = "gpt-4o-mini-transcribe"
+synthesis_provider = "openai"
+synthesis_model = "gpt-4o-mini-tts"
+voice = "alloy"
+response_format = "mp3"
+```
+
+The HTTP API accepts raw audio or JSON with `audio_base64`:
+
+- `POST /v1/voice/transcribe` returns the transcript and immutable input artifact.
+- `POST /v1/voice/turn` transcribes audio and submits an ordinary Athena task,
+  retaining the audio artifact as provenance.
+- `POST /v1/voice/synthesize` returns spoken audio.
+- `POST /v1/tasks/{task_id}/voice` speaks a finalized task summary.
+
+Audio sizes and synthesized text are bounded by `[voice]` configuration. A
+voice turn is transcribed once, so ordinary text-capable reasoning models can
+handle it without silently receiving a second ungoverned audio payload.
 
 ### Required capability profiles
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import inspect
-from typing import Any
+from typing import Any, Callable
 
 from athena.protocol.ids import new_id
 from athena.protocol.messages import utcnow
@@ -13,8 +13,25 @@ from athena.state.database import Database
 class ScheduleStore:
     """Scheduled job persistence and atomic occurrence claims (§74-77)."""
 
-    def __init__(self, db: Database) -> None:
+    def __init__(
+        self,
+        db: Database,
+        *,
+        fault_injector: Callable[[str], Any] | None = None,
+    ) -> None:
         self._db = db
+        self._fault_injector = fault_injector
+
+    def set_fault_injector(self, injector: Callable[[str], Any] | None) -> None:
+        """Install a test-only fault hook around occurrence completion."""
+        self._fault_injector = injector
+
+    async def _fault_point(self, name: str) -> None:
+        if self._fault_injector is None:
+            return
+        result = self._fault_injector(name)
+        if inspect.isawaitable(result):
+            await result
 
     async def upsert_job(
         self,
@@ -163,20 +180,27 @@ class ScheduleStore:
         disable: bool = False,
     ) -> None:
         now = self._now_iso()
-        await self._db.execute(
-            "UPDATE job_runs SET status = ?, task_id = ?, ended_at = ? WHERE id = ?",
-            ("FIRED", task_id, now, claim_id),
-        )
-        if job_id is not None:
-            await self._db.execute(
-                "UPDATE scheduled_jobs SET next_run = ?, updated_at = ? WHERE id = ?",
-                (next_run, now, job_id),
+        # The fired marker, next occurrence, and exhaustion flag are one
+        # occurrence transition.  Keeping these writes in separate auto-
+        # committed calls can strand a recurring job when the process dies
+        # after FIRED but before next_run advances.
+        async with self._db.transaction() as db:
+            await db.execute_raw(
+                "UPDATE job_runs SET status = ?, task_id = ?, ended_at = ? WHERE id = ?",
+                ("FIRED", task_id, now, claim_id),
             )
-            if disable:
-                await self._db.execute(
-                    "UPDATE scheduled_jobs SET enabled = 0 WHERE id = ?",
-                    (job_id,),
+            await self._fault_point("schedule-complete-after-fired")
+            if job_id is not None:
+                await db.execute_raw(
+                    "UPDATE scheduled_jobs SET next_run = ?, updated_at = ? WHERE id = ?",
+                    (next_run, now, job_id),
                 )
+                await self._fault_point("schedule-complete-after-next-run")
+                if disable:
+                    await db.execute_raw(
+                        "UPDATE scheduled_jobs SET enabled = 0 WHERE id = ?",
+                        (job_id,),
+                    )
 
     async def release_claim(self, claim_id: str, job_id: str, scheduled_for: str) -> None:
         """Release a CLAIMED occurrence without marking it fired.
@@ -213,10 +237,14 @@ class ScheduleStore:
         Uses json_extract on the explicit _occurrence metadata key for reliable
         matching instead of LIKE substring search on JSON metadata.
         """
+        repaired = 0
+        if next_run_resolver is not None:
+            repaired = await self.repair_fired_occurrences(next_run_resolver)
+
         rows = await self._db.fetch_all(
             "SELECT id, job_id, scheduled_for FROM job_runs WHERE status = 'CLAIMED'"
         )
-        reconciled = 0
+        reconciled = repaired
         for row in rows or []:
             claim_id = row["id"]
             job_id = row["job_id"]
@@ -282,10 +310,59 @@ class ScheduleStore:
             reconciled += 1
         return reconciled
 
+    async def repair_fired_occurrences(self, next_run_resolver: Any) -> int:
+        """Repair the pre-atomicity ``FIRED``/unchanged-``next_run`` state.
+
+        Older releases committed the run marker before advancing the job.  On
+        startup that exact durable inconsistency is safe to repair because the
+        occurrence identity is already FIRED; recomputing the next fire from
+        the persisted trigger specification cannot create a duplicate run.
+        """
+        rows = await self._db.fetch_all(
+            "SELECT r.id, r.job_id, r.scheduled_for, j.next_run "
+            "FROM job_runs AS r JOIN scheduled_jobs AS j ON j.id = r.job_id "
+            "WHERE r.status = 'FIRED' AND j.next_run = r.scheduled_for"
+        )
+        repaired = 0
+        for row in rows or []:
+            job = await self.get_job_id(str(row["job_id"]))
+            if job is None:
+                continue
+            schedule = next_run_resolver(job, str(row["scheduled_for"]))
+            if inspect.isawaitable(schedule):
+                schedule = await schedule
+            next_run, disable = schedule
+            now = self._now_iso()
+            async with self._db.transaction() as db:
+                # Recheck under the write lock so a concurrent reconciler does
+                # not advance a job twice.
+                current = await db.fetch_one_raw(
+                    "SELECT next_run FROM scheduled_jobs WHERE id = ?",
+                    (str(row["job_id"]),),
+                )
+                if current is None or current.get("next_run") != row["scheduled_for"]:
+                    continue
+                await db.execute_raw(
+                    "UPDATE scheduled_jobs SET next_run = ?, enabled = CASE WHEN ? THEN 0 ELSE enabled END, "
+                    "updated_at = ? WHERE id = ?",
+                    (next_run, 1 if disable else 0, now, str(row["job_id"])),
+                )
+            repaired += 1
+        return repaired
+
     async def last_run(self, job_id: str) -> dict | None:
         row = await self._db.fetch_one(
             "SELECT * FROM job_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1",
             (job_id,),
+        )
+        return _decode_run(row) if row else None
+
+    async def previous_completed_run(self, job_id: str, before: str) -> dict | None:
+        row = await self._db.fetch_one(
+            "SELECT * FROM job_runs WHERE job_id = ? AND scheduled_for < ? "
+            "AND status = 'FIRED' AND task_id IS NOT NULL "
+            "ORDER BY started_at DESC LIMIT 1",
+            (job_id, before),
         )
         return _decode_run(row) if row else None
 

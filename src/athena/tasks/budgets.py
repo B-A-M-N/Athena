@@ -169,6 +169,8 @@ class BudgetTracker:
         self._artifact_reservations: dict[str, int] = {}
         self._model_cost_reservations: dict[str, Decimal] = {}
         self._model_cost_by_task: dict[str, Decimal] = {}
+        self._model_reservation_ids: dict[str, set[str]] = {}
+        self._model_accounting_ids: dict[str, set[str]] = {}
         self._usage_hydrated: set[str] = set()
         self._model_semaphores: dict[str, Any] = {}
         self._model_limits: dict[str, int] = {}
@@ -489,12 +491,21 @@ class BudgetTracker:
         for ancestor in ancestors:
             await self._persist_usage(ancestor)
 
-    async def reserve_model_cost(self, task_id: str, amount: Decimal) -> None:
+    async def reserve_model_cost(
+        self,
+        task_id: str,
+        amount: Decimal,
+        *,
+        reservation_id: str | None = None,
+    ) -> None:
         """Reserve a bounded worst-case model cost across the root lineage."""
         if amount < 0:
             raise ValueError("model cost reservation must be non-negative")
         ancestors = await self._ancestor_ids(task_id)
         async with self._artifact_lock:
+            reservation_ids = self._model_reservation_ids.setdefault(task_id, set())
+            if reservation_id and reservation_id in reservation_ids:
+                return
             for ancestor in ancestors:
                 budget = await self.budget_of_async(ancestor)
                 if budget.max_cost_usd is None:
@@ -513,10 +524,66 @@ class BudgetTracker:
             self._model_cost_by_task[task_id] = (
                 self._model_cost_by_task.get(task_id, Decimal("0")) + amount
             )
+            if reservation_id:
+                reservation_ids.add(reservation_id)
         for ancestor in ancestors:
             await self._persist_usage(ancestor)
 
-    async def release_model_cost(self, task_id: str, amount: Decimal | None = None) -> None:
+    async def apply_model_accounting(
+        self,
+        task_id: str,
+        accounting_id: str,
+        *,
+        reserved: Decimal,
+        input_tokens: int,
+        output_tokens: int,
+        actual_cost: Decimal | None,
+        reservation_id: str | None = None,
+    ) -> bool:
+        """Apply one provider turn exactly once and checkpoint the result."""
+        if reserved < 0 or (actual_cost is not None and actual_cost < 0):
+            raise ValueError("model accounting values must be non-negative")
+        ancestors = await self._ancestor_ids(task_id)
+        for ancestor in ancestors:
+            await self._hydrate_usage(ancestor)
+        async with self._artifact_lock:
+            applied = self._model_accounting_ids.setdefault(task_id, set())
+            if accounting_id in applied:
+                return False
+            outstanding = self._model_cost_by_task.get(task_id, Decimal("0"))
+            release = min(outstanding, reserved)
+            remaining = outstanding - release
+            if remaining:
+                self._model_cost_by_task[task_id] = remaining
+            else:
+                self._model_cost_by_task.pop(task_id, None)
+            if reservation_id:
+                self._model_reservation_ids.setdefault(task_id, set()).discard(reservation_id)
+            elif not remaining:
+                self._model_reservation_ids.pop(task_id, None)
+            for ancestor in ancestors:
+                self._model_cost_reservations[ancestor] = max(
+                    Decimal("0"),
+                    self._model_cost_reservations.get(ancestor, Decimal("0")) - release,
+                )
+            entry = self._ledger.setdefault(task_id, Usage())
+            entry.input_tokens += max(0, int(input_tokens))
+            entry.output_tokens += max(0, int(output_tokens))
+            entry.model_calls += 1
+            if actual_cost is not None:
+                entry.cost += actual_cost
+            applied.add(accounting_id)
+        for ancestor in ancestors:
+            await self._persist_usage(ancestor)
+        return True
+
+    async def release_model_cost(
+        self,
+        task_id: str,
+        amount: Decimal | None = None,
+        *,
+        reservation_id: str | None = None,
+    ) -> None:
         """Release outstanding call reservations when a task is finalized."""
         ancestors = await self._ancestor_ids(task_id)
         for ancestor in ancestors:
@@ -529,6 +596,10 @@ class BudgetTracker:
                 self._model_cost_by_task[task_id] = remaining
             else:
                 self._model_cost_by_task.pop(task_id, None)
+            if reservation_id:
+                self._model_reservation_ids.setdefault(task_id, set()).discard(reservation_id)
+            elif not remaining:
+                self._model_reservation_ids.pop(task_id, None)
             for ancestor in ancestors:
                 self._model_cost_reservations[ancestor] = max(
                     Decimal("0"),
@@ -686,6 +757,12 @@ class BudgetTracker:
             reserved_artifact = _int(checkpoint, "reserved_artifact_bytes")
             reserved_model = _dec(checkpoint, "reserved_model_cost")
             outstanding_model = _dec(checkpoint, "outstanding_model_cost")
+            accounting_ids = {
+                str(value) for value in (checkpoint.get("model_accounting_ids") or ()) if value
+            }
+            reservation_ids = {
+                str(value) for value in (checkpoint.get("model_reservation_ids") or ()) if value
+            }
             active_started = _parse_datetime(checkpoint.get("active_compute_started_at"))
         except (TypeError, ValueError, ArithmeticError) as exc:
             raise BudgetStateUnavailable(
@@ -712,6 +789,8 @@ class BudgetTracker:
                 self._model_cost_by_task[task_id] = max(
                     self._model_cost_by_task.get(task_id, Decimal("0")), outstanding_model
                 )
+            self._model_accounting_ids[task_id] = accounting_ids
+            self._model_reservation_ids[task_id] = reservation_ids
             self._usage_hydrated.add(task_id)
 
     async def _persist_usage(self, task_id: str) -> None:
@@ -743,6 +822,8 @@ class BudgetTracker:
                     self._model_cost_reservations.get(task_id, Decimal("0"))
                 ),
                 "outstanding_model_cost": str(self._model_cost_by_task.get(task_id, Decimal("0"))),
+                "model_reservation_ids": sorted(self._model_reservation_ids.get(task_id, set())),
+                "model_accounting_ids": sorted(self._model_accounting_ids.get(task_id, set())),
             },
         )
 

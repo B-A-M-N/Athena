@@ -12,6 +12,8 @@ error if Starlette is missing.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import enum
 import inspect
 import json
@@ -324,6 +326,253 @@ def _submit_handler(service: Any) -> Any:
     return handler
 
 
+async def _read_voice_audio(
+    request: Any, service: Any
+) -> tuple[bytes, str, str, Mapping[str, Any]]:
+    """Read bounded raw-audio or JSON/base64 voice input."""
+    config = getattr(service, "config", None)
+    voice_config = getattr(config, "voice", None)
+    max_bytes = int(getattr(voice_config, "max_input_bytes", 25 * 1024 * 1024))
+    content_type = str(request.headers.get("content-type", "audio/wav"))
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    wire_limit = (
+        (max_bytes * 4 + 2) // 3 + 16 * 1024 if media_type == "application/json" else max_bytes
+    )
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            # JSON/base64 adds roughly one third over the decoded audio. The
+            # post-decode check below remains authoritative.
+            if int(content_length) > wire_limit:
+                from athena.protocol.errors import VoiceInputError
+
+                raise VoiceInputError("voice input exceeds the configured size limit")
+        except ValueError:
+            pass
+    metadata: Mapping[str, Any] = {}
+    if media_type == "application/json":
+        raw_body = await _read_request_bytes(request, wire_limit)
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            from athena.protocol.errors import VoiceInputError
+
+            raise VoiceInputError("voice JSON body is invalid", cause=exc) from exc
+        if not isinstance(body, Mapping):
+            from athena.protocol.errors import VoiceInputError
+
+            raise VoiceInputError("voice JSON body must be an object")
+        encoded = body.get("audio_base64")
+        if not isinstance(encoded, str) or not encoded:
+            from athena.protocol.errors import VoiceInputError
+
+            raise VoiceInputError("voice JSON requires a non-empty audio_base64 field")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            from athena.protocol.errors import VoiceInputError
+
+            raise VoiceInputError("audio_base64 is not valid base64", cause=exc) from exc
+        mime_type = str(body.get("mime_type") or "audio/wav")
+        filename = str(body.get("filename") or "voice-input")
+        metadata = body
+    else:
+        data = await _read_request_bytes(request, max_bytes)
+        mime_type = media_type or "audio/wav"
+        filename = str(request.headers.get("x-filename") or "voice-input")
+    if len(data) > max_bytes:
+        from athena.protocol.errors import VoiceInputError
+
+        raise VoiceInputError("voice input exceeds the configured size limit")
+    return data, mime_type, filename, metadata
+
+
+async def _read_request_bytes(request: Any, limit: int) -> bytes:
+    """Read a request body incrementally with a hard wire-size ceiling."""
+    if limit <= 0:
+        raise ValueError("request body limit must be positive")
+    stream = getattr(request, "stream", None)
+    if callable(stream):
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in stream():
+            data = bytes(chunk)
+            size += len(data)
+            if size > limit:
+                from athena.protocol.errors import VoiceInputError
+
+                raise VoiceInputError("voice input exceeds the configured size limit")
+            chunks.append(data)
+        return b"".join(chunks)
+    body = await request.body()
+    if len(body) > limit:
+        from athena.protocol.errors import VoiceInputError
+
+        raise VoiceInputError("voice input exceeds the configured size limit")
+    return body
+
+
+async def _voice_audio_response(service: Any, synthesis: Any) -> Any:
+    from starlette.responses import Response
+
+    artifacts = getattr(service, "_artifacts", None)
+    if artifacts is None:
+        from athena.protocol.errors import VoiceUnavailable
+
+        raise VoiceUnavailable("artifact store is unavailable for voice output")
+    data = await artifacts.load(synthesis.artifact)
+    fmt = str(getattr(synthesis, "response_format", "mp3"))
+    mime = getattr(synthesis.artifact, "mime_type", None) or "audio/mpeg"
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "X-Athena-Artifact-URI": str(synthesis.artifact.uri),
+            "Content-Disposition": f'inline; filename="athena-voice.{fmt}"',
+        },
+    )
+
+
+def _voice_health_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        del request
+        health = service.voice_health()
+        status = 200 if health.get("state") in {"ready", "disabled"} else 503
+        return json_response({"voice": health}, status=status)
+
+    return handler
+
+
+def _voice_transcribe_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        try:
+            data, mime_type, filename, metadata = await _read_voice_audio(request, service)
+            transcript = await service.transcribe_voice(
+                data,
+                mime_type=mime_type,
+                filename=filename,
+                language=(str(metadata["language"]) if metadata.get("language") else None),
+            )
+            return json_response({"transcript": transcript.to_dict()})
+        except HTTPError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transport error translation boundary
+            raise _status_for_error(exc)
+
+    return handler
+
+
+def _voice_turn_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        try:
+            data, mime_type, filename, metadata = await _read_voice_audio(request, service)
+            transcript = await service.transcribe_voice(
+                data,
+                mime_type=mime_type,
+                filename=filename,
+                language=(str(metadata["language"]) if metadata.get("language") else None),
+            )
+            session_id = metadata.get("session_id")
+            task_id = metadata.get("task_id")
+            if session_id is not None and not isinstance(session_id, str):
+                raise HTTPError(400, "validation_error", "session_id must be a string or null")
+            if task_id is not None and not isinstance(task_id, str):
+                raise HTTPError(400, "validation_error", "task_id must be a string or null")
+            autonomy = AutonomyLevel.SUPERVISED
+            if metadata.get("autonomy") is not None:
+                try:
+                    autonomy = AutonomyLevel(str(metadata["autonomy"]))
+                except ValueError as exc:
+                    raise HTTPError(400, "validation_error", "invalid autonomy") from exc
+            voice_attachment: Any = {
+                "kind": "voice",
+                "ref": transcript.artifact.uri,
+                "source_id": transcript.artifact.id,
+                "summary": "immutable audio captured for this voice turn",
+            }
+            request_envelope = AgentRequest(
+                prompt=transcript.text,
+                session_id=session_id,
+                task_id=task_id,
+                autonomy=autonomy,
+                # Keep the captured audio as provenance without making the
+                # reasoning model consume it a second time after transcription.
+                attachments=(voice_attachment,),
+                metadata={
+                    "voice_input_artifact": transcript.artifact.uri,
+                    "voice_transcription_provider": transcript.provider,
+                    "voice_transcription_model": transcript.model,
+                },
+            )
+            task = await service.submit(request_envelope, wait=False)
+            task_id_value = _get_task_id(task)
+            return json_response(
+                {
+                    "task_id": task_id_value,
+                    "session_id": getattr(task, "session_id", None) or session_id,
+                    "status": "QUEUED",
+                    "transcript": transcript.to_dict(),
+                    "voice_result_endpoint": f"/v1/tasks/{task_id_value}/voice",
+                },
+                status=202,
+            )
+        except HTTPError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transport error translation boundary
+            raise _status_for_error(exc)
+
+    return handler
+
+
+def _voice_synthesize_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        try:
+            body = await request.json()
+            if not isinstance(body, Mapping) or not isinstance(body.get("text"), str):
+                raise HTTPError(400, "validation_error", "field 'text' is required")
+            synthesis = await service.synthesize_voice(
+                body["text"],
+                voice=(str(body["voice"]) if body.get("voice") else None),
+                response_format=(
+                    str(body["response_format"]) if body.get("response_format") else None
+                ),
+            )
+            return await _voice_audio_response(service, synthesis)
+        except HTTPError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transport error translation boundary
+            raise _status_for_error(exc)
+
+    return handler
+
+
+def _task_voice_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        try:
+            body: Mapping[str, Any] = {}
+            if request.headers.get("content-length", "0") != "0":
+                try:
+                    decoded = await request.json()
+                    if isinstance(decoded, Mapping):
+                        body = decoded
+                except Exception:
+                    body = {}
+            synthesis = await service.synthesize_task_result(
+                request.path_params["task_id"],
+                voice=(str(body["voice"]) if body.get("voice") else None),
+                response_format=(
+                    str(body["response_format"]) if body.get("response_format") else None
+                ),
+            )
+            return await _voice_audio_response(service, synthesis)
+        except HTTPError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transport error translation boundary
+            raise _status_for_error(exc)
+
+    return handler
+
+
 def _get_task_handler(service: Any) -> Any:
     async def handler(request: Any) -> Any:
         task_id = request.path_params["task_id"]
@@ -367,6 +616,100 @@ def _get_result_handler(service: Any) -> Any:
     return handler
 
 
+def _list_inference_recoveries_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        task_id = request.query_params.get("task_id") or None
+        try:
+            rows = await service.list_provider_outcome_recoveries(task_id=task_id)
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        return json_response({"recoveries": _serializable(rows)})
+
+    return handler
+
+
+def _get_inference_recovery_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        attempt_id = request.path_params["attempt_id"]
+        try:
+            row = await service.get_provider_outcome_recovery(attempt_id)
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        if row is None:
+            raise HTTPError(404, "inference_attempt_not_found", f"attempt {attempt_id!r} not found")
+        return json_response({"recovery": _serializable(row)})
+
+    return handler
+
+
+def _resolve_inference_recovery_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        attempt_id = request.path_params["attempt_id"]
+        body = await request.json()
+        if not isinstance(body, Mapping):
+            raise HTTPError(400, "validation_error", "a JSON object is required")
+        resolution = body.get("resolution")
+        note = body.get("note")
+        if not isinstance(resolution, str) or not resolution.strip():
+            raise HTTPError(400, "validation_error", "field 'resolution' is required")
+        if not isinstance(note, str) or not note.strip():
+            raise HTTPError(400, "validation_error", "field 'note' is required")
+        provider_response_id = body.get("provider_response_id")
+        if provider_response_id is not None and (
+            not isinstance(provider_response_id, str) or not provider_response_id.strip()
+        ):
+            raise HTTPError(
+                400,
+                "validation_error",
+                "field 'provider_response_id' must be a non-empty string or null",
+            )
+        actual_cost = body.get("actual_cost")
+        if actual_cost is not None and (
+            isinstance(actual_cost, bool) or not isinstance(actual_cost, (str, int, float))
+        ):
+            raise HTTPError(
+                400,
+                "validation_error",
+                "field 'actual_cost' must be a Decimal-compatible number or string",
+            )
+        try:
+            row = await service.resolve_provider_outcome(
+                attempt_id,
+                resolution=resolution,
+                note=note,
+                provider_response_id=provider_response_id,
+                actual_cost=actual_cost,
+            )
+        except KeyError:
+            raise HTTPError(404, "inference_attempt_not_found", f"attempt {attempt_id!r} not found")
+        except ValueError as exc:
+            raise HTTPError(400, "validation_error", str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        return json_response({"recovery": _serializable(row)}, status=200)
+
+    return handler
+
+
+def _close_inference_liability_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        attempt_id = request.path_params["attempt_id"]
+        body = await request.json()
+        if not isinstance(body, Mapping) or not isinstance(body.get("note"), str):
+            raise HTTPError(400, "validation_error", "a JSON object with a note is required")
+        try:
+            row = await service.close_provider_liability(attempt_id, note=body["note"])
+        except KeyError:
+            raise HTTPError(404, "inference_attempt_not_found", f"attempt {attempt_id!r} not found")
+        except ValueError as exc:
+            raise HTTPError(400, "validation_error", str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        return json_response({"recovery": _serializable(row)}, status=200)
+
+    return handler
+
+
 def _cancel_handler(service: Any) -> Any:
     async def handler(request: Any) -> Any:
         task_id = request.path_params["task_id"]
@@ -387,6 +730,30 @@ def _interrupt_handler(service: Any) -> Any:
         except Exception as exc:  # noqa: BLE001
             raise _status_for_error(exc)
         return json_response({"task_id": task_id, "status": "interrupted"}, status=200)
+
+    return handler
+
+
+def _steer_handler(service: Any) -> Any:
+    async def handler(request: Any) -> Any:
+        task_id = request.path_params["task_id"]
+        body = await request.json()
+        if not isinstance(body, Mapping) or not isinstance(body.get("text"), str):
+            raise HTTPError(400, "validation_error", "field 'text' must be a string")
+        source_task_id = body.get("source_task_id")
+        if source_task_id is not None and not isinstance(source_task_id, str):
+            raise HTTPError(400, "validation_error", "field 'source_task_id' must be a string")
+        try:
+            record = await service.steer_task(
+                task_id,
+                body["text"],
+                source_task_id=source_task_id,
+            )
+        except ValueError as exc:
+            raise HTTPError(400, "validation_error", str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - thin translation boundary
+            raise _status_for_error(exc)
+        return json_response({"steering": _serializable(record)}, status=202)
 
     return handler
 
@@ -562,6 +929,12 @@ def _health_handler(service: Any) -> Any:
         capability_profile = runtime_health.get("capability_profile") or {}
         resources = runtime_health.get("resources") or {}
         execution_recovery = runtime_health.get("execution_recovery") or {}
+        provider_recovery = runtime_health.get("provider_outcome_recovery") or {}
+        # Legacy duck-typed services do not expose this diagnostic yet; the
+        # concrete AthenaService always does and therefore fails closed there.
+        provider_recovery_state = str(
+            provider_recovery.get("state") or ("ready" if not provider_recovery else "unknown")
+        )
         execution_recovery_state = execution_recovery.get(
             "state", getattr(service, "_recovery_status", "healthy")
         )
@@ -583,6 +956,7 @@ def _health_handler(service: Any) -> Any:
             "providers": _providers_ready(getattr(service, "_model_registry", None)),
             "worker_persistence": worker_health.get("status", "ok") == "ok",
             "recovery": getattr(service, "_recovery_status", "healthy") in {"healthy", "recovered"},
+            "provider_outcome_recovery": provider_recovery_state == "ready",
             "capability_profile": capability_profile.get("status", "ok") == "ok",
             "resource_teardown": resources.get("unresolved_count", 0) == 0,
             "execution_recovery": execution_recovery_state in {"healthy", "recovered"},
@@ -692,8 +1066,28 @@ def create_app(service: Any = None) -> Any:
         Route("/v1/tasks", _submit_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}", _get_task_handler(service), methods=["GET"]),
         Route("/v1/tasks/{task_id}/result", _get_result_handler(service), methods=["GET"]),
+        Route(
+            "/v1/inference-recoveries", _list_inference_recoveries_handler(service), methods=["GET"]
+        ),
+        Route(
+            "/v1/inference-recoveries/{attempt_id}",
+            _get_inference_recovery_handler(service),
+            methods=["GET"],
+        ),
+        Route(
+            "/v1/inference-recoveries/{attempt_id}",
+            _resolve_inference_recovery_handler(service),
+            methods=["POST"],
+        ),
+        Route(
+            "/v1/inference-recoveries/{attempt_id}/liability",
+            _close_inference_liability_handler(service),
+            methods=["POST"],
+        ),
+        Route("/v1/tasks/{task_id}/voice", _task_voice_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}/cancel", _cancel_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}/interrupt", _interrupt_handler(service), methods=["POST"]),
+        Route("/v1/tasks/{task_id}/steer", _steer_handler(service), methods=["POST"]),
         Route("/v1/tasks/{task_id}/events", _events_handler(service), methods=["GET"]),
         Route("/v1/tasks/{task_id}/input", _input_handler(service), methods=["POST"]),
         Route("/v1/approvals/{approval_id}", _approve_handler(service), methods=["POST"]),
@@ -702,6 +1096,10 @@ def create_app(service: Any = None) -> Any:
         Route("/v1/sessions/{session_id}", _close_session_handler(service), methods=["DELETE"]),
         Route("/v1/sessions/{session_id}/resume", _resume_handler(service), methods=["POST"]),
         Route("/v1/models", _models_handler(service), methods=["GET"]),
+        Route("/v1/voice", _voice_health_handler(service), methods=["GET"]),
+        Route("/v1/voice/transcribe", _voice_transcribe_handler(service), methods=["POST"]),
+        Route("/v1/voice/turn", _voice_turn_handler(service), methods=["POST"]),
+        Route("/v1/voice/synthesize", _voice_synthesize_handler(service), methods=["POST"]),
         Route("/v1/capabilities", _capabilities_handler(service), methods=["GET"]),
         Route("/v1/health", _health_handler(service), methods=["GET"]),
         Route("/v1/live", _live_handler(service), methods=["GET"]),

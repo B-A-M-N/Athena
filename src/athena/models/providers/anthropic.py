@@ -11,6 +11,8 @@ in/out remain canonical provider-neutral ModelRequest/ModelEvent types.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
 import math
 from collections.abc import AsyncIterator, Mapping
@@ -55,6 +57,8 @@ from athena.protocol.models import (
     PrivacyClass,
     UsageInfo,
 )
+from athena.network import validate_endpoint
+from athena.network.endpoint_security import headers_are_credentialed, merge_provider_headers
 
 _PATH = "/v1/messages"
 _CACHEABLE_MODES = frozenset({"session-key", "explicit-cache-api"})
@@ -213,6 +217,8 @@ class AnthropicProvider:
         use_sdk: bool = True,
         cost: CostInfo | Mapping[str, object] | None = None,
         latency_class: str | None = None,
+        allow_insecure_remote: bool = False,
+        trust_env: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -229,26 +235,38 @@ class AnthropicProvider:
         self._cost = cost
         self._latency_class = latency_class
         self._api_key = api_key
-        self._api_key_configured = bool(api_key)
-        self._timeout = timeout
         self._headers = dict(headers or {})
+        self._api_key_configured = bool(api_key) or headers_are_credentialed(self._headers)
+        endpoint = validate_endpoint(
+            self.base_url,
+            credentialed=self._api_key_configured,
+            allow_insecure_remote=allow_insecure_remote,
+            trust_env=trust_env,
+        )
+        self._endpoint_classification = endpoint.classification
+        self._trust_env = endpoint.trust_env
+        self._timeout = timeout
         self._anthropic = _load_anthropic() if use_sdk else None
         self._client: httpx.AsyncClient | None = None
         self._active_streams: dict[str, httpx.Response] = {}
 
     def _http_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            if not self._api_key:
+            if not self._api_key and not self._api_key_configured:
                 raise ProviderAuthenticationError(
-                    f"{self.provider} requires an api_key (no anthropic SDK available)"
+                    f"{self.provider} requires an api_key or credential-bearing header"
                 )
+            canonical_headers = {"anthropic-version": "2023-06-01"}
+            if self._api_key:
+                canonical_headers["x-api-key"] = self._api_key
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self._timeout),
-                headers={
-                    "x-api-key": self._api_key,
-                    "anthropic-version": "2023-06-01",
-                    **self._headers,
-                },
+                trust_env=self._trust_env,
+                headers=merge_provider_headers(
+                    canonical_headers,
+                    self._headers,
+                    protected=("x-api-key", "anthropic-version"),
+                ),
             )
         return self._client
 
@@ -268,9 +286,10 @@ class AnthropicProvider:
         ]
 
     def readiness(self) -> dict[str, str | bool]:
+        local = self._endpoint_classification != "public"
         if not self._api_key_configured:
-            return {"state": "auth_missing", "kind": "anthropic", "local": False}
-        return {"state": "ready", "kind": "anthropic", "local": False}
+            return {"state": "auth_missing", "kind": "anthropic", "local": local}
+        return {"state": "ready", "kind": "anthropic", "local": local}
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         if self._anthropic is not None:
@@ -289,9 +308,35 @@ class AnthropicProvider:
 
     async def _complete_sdk(self, request: ModelRequest) -> ModelEvent:
         assert self._anthropic is not None  # guarded by `complete` before dispatch
-        client = self._anthropic.AsyncAnthropic(api_key=self._api_key, base_url=self.base_url)
+        from athena.models.compat.anthropic_sdk import build_async_client
+
+        try:
+            # The SDK owns canonical authentication/version headers. Reject a
+            # custom case-variant override here so REST and SDK transport
+            # cannot silently disagree about which secret/header wins.
+            merge_provider_headers(
+                {"x-api-key": "managed", "anthropic-version": "managed"},
+                self._headers,
+                protected=("x-api-key", "anthropic-version"),
+            )
+            client = build_async_client(
+                self._anthropic,
+                api_key=self._api_key,
+                base_url=self.base_url,
+                headers=self._headers,
+                timeout=self._timeout,
+                trust_env=self._trust_env,
+            )
+        except ValueError as exc:
+            raise ProviderUnavailable(str(exc)) from exc
         kwargs = self._build_kwargs(request, stream=False)
-        response = await client.messages.create(**kwargs)
+        idempotency_key = request.metadata.get("idempotency_key")
+        if idempotency_key:
+            kwargs["extra_headers"] = {"idempotency-key": str(idempotency_key)}
+        try:
+            response = await client.messages.create(**kwargs)
+        finally:
+            await client.close()
         blocks: list[ContentBlock] = []
         for content in response.content:
             if content.type == "text" and getattr(content, "text", None):
@@ -341,9 +386,14 @@ class AnthropicProvider:
 
     async def _complete_rest(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         payload = self._build_kwargs(request, stream=True)
+        headers = (
+            {"idempotency-key": str(request.metadata["idempotency_key"])}
+            if request.metadata.get("idempotency_key")
+            else None
+        )
         try:
             async with self._http_client().stream(
-                "POST", self.base_url + _PATH, json=payload
+                "POST", self.base_url + _PATH, json=payload, headers=headers
             ) as resp:
                 self._active_streams[request.request_id] = resp
                 try:
@@ -723,7 +773,10 @@ class AnthropicProvider:
         if code in (401, 403):
             return ProviderAuthenticationError(message)
         if code == 429:
-            return ProviderRateLimitError(message)
+            return ProviderRateLimitError(
+                message,
+                retry_after=_retry_after_seconds(resp.headers.get("Retry-After")),
+            )
         if code == 400 and ("context" in body.lower() or "token" in body.lower()):
             return ContextOverflow(message)
         if code == 404:
@@ -740,6 +793,21 @@ def _optional_float(value: object) -> float | None:
         return float(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _retry_after_seconds(value: object) -> float | None:
+    try:
+        return max(0.0, float(str(value))) if value is not None else None
+    except (TypeError, ValueError):
+        if value is None:
+            return None
+        try:
+            parsed = parsedate_to_datetime(str(value))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 __all__ = ["AnthropicProvider"]

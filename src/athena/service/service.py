@@ -29,6 +29,7 @@ import os
 import tempfile
 from dataclasses import replace
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -52,7 +53,6 @@ from athena.execution.manager import ExecutionManager
 from athena.state.external_effects import ExternalEffectStore
 from athena.execution.environment import VerificationEnvironment
 from athena.interpreter import InterpreterExtension
-from athena.models.compat.profiles import ModelProfile, resolve_profile
 from athena.hermes import (
     HermesAgentEvaluator,
     HermesReferee,
@@ -62,12 +62,13 @@ from athena.kernel.kernel import AgentKernel
 from athena.kernel.dispatch import CapabilityDispatchShim
 from athena.mcp.adapter import MCPAdapter
 from athena.mcp.client import MCPClient
+from athena.mcp.prompts import MCPPromptProvider
+from athena.mcp.resources import MCPResourceProvider
+from athena.mcp.supervisor import MCPConnectionSupervisor
 from athena.memory.store import MemoryStore
-from athena.models.providers.anthropic import AnthropicProvider
-from athena.models.providers.fake import FakeModelProvider
-from athena.models.providers.openai_compat import OpenAICompatProvider
 from athena.models.registry import ProviderRegistry
 from athena.models.router import ModelRouter
+from athena.network.browser_proxy import BrowserProxyConfig
 from athena.policy.credentials import SecretError, SecretManager
 from athena.policy.engine import PolicyEngine
 from athena.scheduler.scheduler import Scheduler
@@ -87,6 +88,7 @@ from athena.state.tool_repairs import ToolRepairStore
 from athena.state.context_blocks import ContextBlockStore
 from athena.state.self_host import SelfHostMissionStore
 from athena.packs.store import PackStore
+from athena.service.operational_matrix import build_operational_matrix
 from athena.self_host.gates import SelfHostGateBundle
 from athena.state.delegate_sessions import DelegateSessionStore
 from athena.project.index.store import ProjectIndexStore
@@ -99,6 +101,7 @@ from athena.tasks.cancellation import CancellationManager
 from athena.tasks.delegation import DelegationManager
 from athena.tasks.manager import TaskManager
 from athena.tasks.worker import TaskWorker
+from athena.voice import VoiceManager
 
 if TYPE_CHECKING:
     from athena.state.input_requests import InputRequestStore
@@ -112,12 +115,12 @@ from athena.protocol.tasks import (
     AutonomyLevel,
     CapabilityPolicy,
     ContextRef,
+    FINAL_STATUSES,
     ResourceBudget,
     MutationMode,
     NetworkPolicy,
     TaskSpec,
     TaskStatus,
-    TERMINAL_STATUSES,
     WorkspaceSpec,
 )
 from athena.protocol.task_codec import decode_criteria, encode_criteria
@@ -129,6 +132,11 @@ from athena.service.operator_query import OperatorQueryService
 from athena.service.recovery import RecoveryCoordinator
 from athena.service.lifecycle import ServiceLifecycle
 from athena.service.self_host import SelfHostService
+from athena.service.provider_runtime import ProviderRuntime
+from athena.service.mcp_runtime import MCPRuntime
+from athena.service.records import (
+    default_model_policy as _default_model_policy,
+)
 from athena.service.config import (
     AthenaConfig,
     HermesSupervisionMode,
@@ -143,6 +151,59 @@ _DEFAULT_ANSWER_SCRIPTS = (
 )
 
 _logger = logging.getLogger("athena.service")
+
+
+def _validated_actual_cost(value: Decimal | str | None) -> Decimal | None:
+    """Validate the operator/API cost at the application boundary."""
+    if value is None:
+        return None
+    try:
+        cost = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("actual_cost must be a finite, non-negative Decimal") from exc
+    if not cost.is_finite() or cost < 0:
+        raise ValueError("actual_cost must be a finite, non-negative Decimal")
+    return cost
+
+
+_PROVIDER_OUTCOME_CONTRACT: dict[str, dict[str, Any]] = {
+    "confirmed_failed": {
+        "attempt_status": "FAILED",
+        "receipt_status": "FAILED",
+        "reservation": "released",
+        "actual_cost": "not_required",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+    "retry_authorized": {
+        "attempt_status": "UNKNOWN",
+        "receipt_status": "FAILED",
+        "reservation": "released",
+        "actual_cost": "not_required",
+        "task_transition": "RECOVERY_REQUIRED|INTERRUPTED -> RUNNING",
+        "inference_retry": "one replacement attempt",
+        "operator_revisable": False,
+    },
+    "confirmed_succeeded": {
+        "attempt_status": "COMPLETED",
+        "receipt_status": "FAILED",
+        "reservation": "released after actual-cost accounting",
+        "actual_cost": "required finite non-negative Decimal",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+    "abandoned_with_liability": {
+        "attempt_status": "ABANDONED",
+        "receipt_status": "FAILED",
+        "reservation": "retained until manual liability closeout",
+        "actual_cost": "optional/unknown",
+        "task_transition": "RECOVERY_REQUIRED -> FAILED",
+        "inference_retry": "no",
+        "operator_revisable": False,
+    },
+}
 
 _RESERVED_REQUEST_METADATA = frozenset(
     {
@@ -208,6 +269,11 @@ class AthenaService:
         self._recovery_status = "not_started"
         self._recovery_summary: dict[str, int] = {}
         self._recovery_error: str | None = None
+        self._provider_recovery_health: dict[str, Any] = {
+            "state": "not_started",
+            "unresolved_count": 0,
+            "error": None,
+        }
         self._startup_health: dict[str, Any] = {
             "status": "not_started",
             "checks": {},
@@ -234,6 +300,7 @@ class AthenaService:
         self._context_block_store: ContextBlockStore | None = None
         self._pack_store: PackStore | None = None
         self._pack_manager: Any = None
+        self._pack_hook_outbox: Any = None
         self._delegate_session_store: DelegateSessionStore | None = None
         self._delegate_registry = DelegateRegistry()
         self._external_delegate_manager: Any = None
@@ -261,6 +328,7 @@ class AthenaService:
         self._acceptance_verifier: Any = None
         self._compiler: ContextCompiler | None = None
         self._model_registry: ProviderRegistry | None = None
+        self._voice: VoiceManager | None = None
         self._kernel: AgentKernel | None = None
         self._task_manager: TaskManager | None = None
         self._worker: TaskWorker | None = None
@@ -270,6 +338,7 @@ class AthenaService:
         self._shutdown_hooks: list[tuple[str, Any]] = []
         self._resource_finalizer: Any = None
         self._resource_obligation_store: Any = None
+        self._pending_finalization_store: Any = None
         self._shutdown_status: dict[str, Any] = {"state": "not_started"}
         self._budgets: BudgetTracker | None = None
         self._cancellations: CancellationManager | None = None
@@ -278,6 +347,7 @@ class AthenaService:
         self._skills: SkillStore | None = None
         self._skill_lifecycle: SkillLifecycle | None = None
         self._scheduler: Scheduler | None = None
+        self._schedule_api: Any = None
         self._artifacts: ArtifactStore | None = None
         self._mcp: MCPAdapter | None = None
         self._workflow_store: Any = None
@@ -288,19 +358,30 @@ class AthenaService:
         # Set by ServiceLifecycle during startup (P1-10 extraction); declared
         # here so the facade's type surface stays complete.
         self._store_input_requests: InputRequestStore | None = None
+        self._steering_store: Any = None
         self._external_effect_store: ExternalEffectStore | None = None
         self._knowledge: Any = None
         self._provider_usage_store: Any = None
+        self._model_response_store: Any = None
         self._runtime_state_root: Path | None = None
+        self._runtime_host_supervisor: Any = None
         self._router: ModelRouter | None = None
         # Self-host orchestration mechanism (P1-10): constructed against
         # the facade; every authority seam still resolves through self.
         self._self_host = SelfHostService(self)
         self._candidates = CandidateService(self)
+        self._provider_runtime = ProviderRuntime(self)
+        self._mcp_runtime = MCPRuntime(self)
 
         self._mcp_clients: list[MCPClient] = []
+        # Injection seam retained for transport fixtures and host adapters;
+        # MCPRuntime owns lifecycle, while the service owns the client type.
+        self._mcp_client_factory = MCPClient
+        self._mcp_resources: MCPResourceProvider | None = None
+        self._mcp_prompts: MCPPromptProvider | None = None
         self._mcp_connection_status: dict[str, dict[str, Any]] = {}
         self._mcp_reconnect_failures: dict[str, int] = {}
+        self._mcp_supervisor: MCPConnectionSupervisor | None = None
 
     # ------------------------------------------------------------------ #
     # Factories for tests / smoke
@@ -435,6 +516,7 @@ class AthenaService:
                 "summary": dict(self._recovery_summary),
                 "error": self._recovery_error,
             },
+            "provider_outcome_recovery": dict(self._provider_recovery_health),
             "mcp": mcp,
             "capability_profile": capability_profile,
             "optional_capabilities": {
@@ -449,6 +531,10 @@ class AthenaService:
             "shutdown": dict(self._shutdown_status),
         }
 
+    def operational_matrix(self) -> dict[str, Any]:
+        """Return the concrete backend/runtime readiness matrix for operators."""
+        return build_operational_matrix(self)
+
     async def retry_resource_cleanup(self, task_id: str) -> dict[str, Any]:
         """Run the operator-visible retry path for durable resource obligations."""
         finalizer = self._resource_finalizer
@@ -456,7 +542,9 @@ class AthenaService:
         if finalizer is None or manager is None:
             raise ServiceNotReady("resource finalization is not initialized")
         task = await manager.get(str(task_id))
-        result = await manager.get_result(str(task_id))
+        pending_store = self._pending_finalization_store
+        pending = await pending_store.get(str(task_id)) if pending_store is not None else None
+        result = pending.result if pending is not None else await manager.get_result(str(task_id))
         if result is None:
             from athena.protocol.tasks import TaskResult
 
@@ -467,6 +555,17 @@ class AthenaService:
             )
         await finalizer.retry(task, result)
         health = finalizer.health()
+        task_unresolved = finalizer.unresolved_for_task(str(task_id))
+        if pending is not None and not task_unresolved and not health.get("durability_error"):
+            recovered = await manager.commit_pending_finalization(str(task_id))
+            if recovered is not None:
+                health = {
+                    **health,
+                    "pending_finalization": {
+                        "status": "committed",
+                        "result_status": recovered.status.value,
+                    },
+                }
         check = self._startup_health.get("checks", {}).get("resource_obligations")
         if isinstance(check, dict):
             check.update(
@@ -663,26 +762,25 @@ class AthenaService:
         return status
 
     def mcp_status(self) -> dict[str, dict[str, Any]]:
-        """Return configured MCP transport/discovery state for operators."""
-        status = dict(self._mcp_connection_status)
-        configured = {server.name: server for server in self.config.mcp_servers}
-        for name, server in configured.items():
-            status.setdefault(
-                name,
-                {
-                    "id": name,
-                    "configured": True,
-                    "required": bool(server.required),
-                    "state": "configured",
-                    "transport": "http" if server.url else "stdio",
-                    "tool_count": 0,
-                    "last_successful_connection": None,
-                    "last_error": None,
-                },
-            )
-        for client in self._mcp_clients:
-            status[client.connection_id] = client.health()
-        return {name: dict(status[name]) for name in sorted(status)}
+        return self._mcp_runtime.status()
+
+    def mcp_resources(self) -> list[dict[str, Any]]:
+        return self._mcp_runtime.resources()
+
+    async def read_mcp_resource(self, uri: str, *, connection_id: str | None = None) -> list[Any]:
+        return await self._mcp_runtime.read_resource(uri, connection_id=connection_id)
+
+    async def mcp_prompts(self) -> list[dict[str, Any]]:
+        return await self._mcp_runtime.prompts()
+
+    async def render_mcp_prompt(
+        self,
+        name: str,
+        arguments: Mapping[str, str] | None = None,
+        *,
+        connection_id: str | None = None,
+    ) -> list[Any]:
+        return await self._mcp_runtime.render_prompt(name, arguments, connection_id=connection_id)
 
     @property
     def _hermes_supervision_mode(self) -> HermesSupervisionMode:
@@ -798,6 +896,77 @@ class AthenaService:
     async def submit(self, request: AgentRequest, *, wait: bool = True) -> TaskSpec:
         return await TaskAPI(self).submit(request, wait=wait)
 
+    def voice_health(self) -> dict[str, Any]:
+        """Return bounded voice readiness without exposing credentials."""
+        if self._voice is None:
+            return {"enabled": False, "state": "not_started"}
+        return self._voice.health()
+
+    async def transcribe_voice(
+        self,
+        data: bytes,
+        *,
+        mime_type: str,
+        filename: str = "voice-input",
+        language: str | None = None,
+        task_id: str | None = None,
+    ):
+        """Transcribe audio through the configured voice route."""
+        if self._voice is None:
+            from athena.protocol.errors import VoiceUnavailable
+
+            raise VoiceUnavailable("voice subsystem is not started")
+        return await self._voice.transcribe(
+            data,
+            mime_type=mime_type,
+            filename=filename,
+            language=language,
+            task_id=task_id,
+        )
+
+    async def synthesize_voice(
+        self,
+        text: str,
+        *,
+        task_id: str | None = None,
+        voice: str | None = None,
+        response_format: str | None = None,
+    ):
+        """Synthesize bounded spoken output into a task-owned artifact."""
+        if self._voice is None:
+            from athena.protocol.errors import VoiceUnavailable
+
+            raise VoiceUnavailable("voice subsystem is not started")
+        return await self._voice.synthesize(
+            text,
+            task_id=task_id,
+            voice=voice,
+            response_format=response_format,
+        )
+
+    async def synthesize_task_result(
+        self,
+        task_id: str,
+        *,
+        voice: str | None = None,
+        response_format: str | None = None,
+    ):
+        """Speak the durable task summary once the task has finalized."""
+        from athena.protocol.errors import VoiceResultNotReady
+
+        result = await self.get_result(task_id)
+        if result is None:
+            raise VoiceResultNotReady(f"result not ready for task {task_id!r}")
+        summary = str(getattr(result, "summary", "") or "").strip()
+        if not summary:
+            raise VoiceResultNotReady(f"task {task_id!r} has no speakable summary")
+        return await self.synthesize_voice(
+            summary,
+            task_id=task_id,
+            voice=voice,
+            response_format=response_format,
+        )
+
     async def submit_spec(
         self,
         spec: TaskSpec,
@@ -805,9 +974,14 @@ class AthenaService:
         wait: bool = False,
         user_request: Any | None = None,
         trusted: bool = False,
+        enqueue: bool = True,
     ) -> TaskSpec:
         return await TaskAPI(self).submit_spec(
-            spec, wait=wait, user_request=user_request, trusted=trusted
+            spec,
+            wait=wait,
+            user_request=user_request,
+            trusted=trusted,
+            enqueue=enqueue,
         )
 
     async def submit_self_host(
@@ -928,10 +1102,14 @@ class AthenaService:
         *,
         wait: bool,
         user_request: AgentRequest | None = None,
+        enqueue: bool = True,
     ):
         return await TaskAPI(self)._enqueue_spec(
-            task_manager, spec, wait=wait, user_request=user_request
+            task_manager, spec, wait=wait, user_request=user_request, enqueue=enqueue
         )
+
+    async def _reconcile_created_intake(self) -> dict[str, int]:
+        return await TaskAPI(self).reconcile_created_intake()
 
     def _spawn_static_prefetch(self, task: TaskSpec) -> None:
         compiler = self._compiler
@@ -957,7 +1135,9 @@ class AthenaService:
     async def _record_canonical_user_turn(self, request: Any, task: TaskSpec) -> None:
         """Append the service-owned user turn exactly once before enqueueing."""
         if self._store_messages is None or not task.session_id:
-            return
+            raise RuntimeError(
+                f"task {task.id!r} cannot enter the queue without a durable session/message store"
+            )
         from athena.protocol.messages import (
             ArtifactRefBlock,
             FileRefBlock,
@@ -1337,6 +1517,46 @@ class AthenaService:
             return None
         return await self._scheduler.run_now(job_id)
 
+    async def grant_job_control(
+        self,
+        job_id: str,
+        task_id: str,
+        *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+        operations: tuple[str, ...] = ("inspect", "update", "enable", "disable", "run"),
+        expires_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Grant a schedule lease to a task through the operator API.
+
+        The lease is bound to the task identity; no bearer token is returned
+        to model-visible context.
+        """
+        if self._schedule_api is None:
+            return None
+        from athena.capabilities.schedule import ScheduleControl
+
+        return await self._schedule_api.grant_control(
+            job_id,
+            control=ScheduleControl(origin="user_direct"),
+            principal_id=principal_id,
+            project_id=project_id,
+            task_id=task_id,
+            operations=operations,
+            expires_at=expires_at,
+        )
+
+    async def revoke_job_control(self, job_id: str) -> bool:
+        """Revoke a task-bound schedule lease through the operator API."""
+        if self._schedule_api is None:
+            return False
+        from athena.capabilities.schedule import ScheduleControl
+
+        return await self._schedule_api.revoke_control(
+            job_id,
+            control=ScheduleControl(origin="user_direct"),
+        )
+
     async def list_packs(self, query: str | None = None) -> list[dict[str, Any]]:
         """List installed declarative packs and their live health."""
         manager = self._pack_manager
@@ -1393,6 +1613,337 @@ class AthenaService:
     async def get_result(self, task_id: str):
         return await TaskAPI(self).get_result(task_id)
 
+    async def list_provider_outcome_recoveries(
+        self, task_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List provider attempts that still require operator reconciliation."""
+        store = self._model_response_store
+        if store is None:
+            self._provider_recovery_health.update(
+                {"state": "unavailable", "error": "provider recovery store is unavailable"}
+            )
+            raise RuntimeError("provider outcome recovery store is unavailable")
+        try:
+            rows = await store.list_unresolved_attempts(task_id=task_id)
+        except Exception as exc:
+            self._provider_recovery_health.update({"state": "unavailable", "error": str(exc)})
+            raise RuntimeError("provider outcome recovery store could not be read") from exc
+        self._provider_recovery_health.update(
+            {
+                "state": "degraded" if rows else "ready",
+                "unresolved_count": len(rows),
+                "error": None,
+            }
+        )
+        return rows
+
+    async def get_provider_outcome_recovery(self, attempt_id: str) -> dict[str, Any] | None:
+        """Return one durable provider-outcome recovery record."""
+        store = self._model_response_store
+        if store is None:
+            raise RuntimeError("provider outcome recovery store is unavailable")
+        return await store.get_attempt(str(attempt_id))
+
+    async def resolve_provider_outcome(
+        self,
+        attempt_id: str,
+        *,
+        resolution: str,
+        note: str,
+        provider_response_id: str | None = None,
+        actual_cost: Decimal | str | None = None,
+    ) -> dict[str, Any]:
+        """Apply one explicit provider-outcome disposition and its task effect.
+
+        ``confirmed_failed`` releases the reservation and terminally fails the
+        task. ``retry_authorized`` releases the reservation and starts a new
+        attempt. ``confirmed_succeeded`` records the known charge, releases the
+        reservation, and terminally fails the task because its response body is
+        unavailable. ``abandoned_with_liability`` terminally fails the task but
+        deliberately retains the reservation for manual financial closeout.
+        """
+        resolution = str(resolution).strip().lower()
+        note = str(note).strip()
+        if not note:
+            raise ValueError("provider outcome resolution requires a non-empty note")
+        normalized_cost = _validated_actual_cost(actual_cost)
+        store = self._model_response_store
+        if store is None:
+            raise RuntimeError("provider outcome recovery is unavailable")
+        attempt = await store.get_attempt(str(attempt_id))
+        if attempt is None:
+            raise KeyError(f"unknown inference attempt: {attempt_id}")
+        if resolution == "confirmed_succeeded" and normalized_cost is None:
+            prior_cost = attempt.get("actual_cost")
+            if prior_cost in (None, ""):
+                raise ValueError("confirmed_succeeded requires actual_cost")
+            normalized_cost = _validated_actual_cost(str(prior_cost))
+        resolved = await store.resolve_provider_outcome(
+            attempt_id=str(attempt_id),
+            resolution=resolution,
+            note=note,
+            provider_response_id=provider_response_id,
+            actual_cost=normalized_cost,
+        )
+        task_id = str(resolved.get("task_id") or attempt.get("task_id") or "")
+        amount = _validated_actual_cost(resolved.get("reservation_amount")) or Decimal("0")
+        if resolution in {"confirmed_failed", "retry_authorized"}:
+            await AthenaService._release_provider_reservation(
+                self,
+                store,
+                task_id=task_id,
+                attempt_id=str(attempt_id),
+                amount=amount,
+            )
+        elif resolution == "confirmed_succeeded":
+            budgets = getattr(self, "_budgets", None)
+            if budgets is not None:
+                await budgets.apply_model_accounting(
+                    task_id,
+                    str(attempt_id),
+                    reserved=amount,
+                    input_tokens=int(resolved.get("actual_input_tokens") or 0),
+                    output_tokens=int(resolved.get("actual_output_tokens") or 0),
+                    actual_cost=normalized_cost,
+                    reservation_id=str(attempt_id),
+                )
+                await store.mark_budget_accounted(attempt_id=str(attempt_id))
+            await store.mark_reservation_released(attempt_id=str(attempt_id))
+        if self._store_events is not None:
+            await self._store_events.append_event(
+                "ProviderOutcomeResolved",
+                {
+                    "attempt_id": str(attempt_id),
+                    "task_id": task_id,
+                    "resolution": str(resolution),
+                    "provider": resolved.get("provider"),
+                    "model": resolved.get("model"),
+                    "provider_response_id": resolved.get("provider_response_id"),
+                },
+                task_id=task_id or None,
+            )
+        if resolution == "retry_authorized":
+            await AthenaService._launch_provider_retry(self, task_id)
+        elif resolution in {
+            "confirmed_failed",
+            "confirmed_succeeded",
+            "abandoned_with_liability",
+        }:
+            await AthenaService._finalize_provider_outcome(
+                self,
+                task_id,
+                resolution=resolution,
+                attempt_id=str(attempt_id),
+            )
+        return await AthenaService._provider_resolution_view(self, resolved)
+
+    async def close_provider_liability(self, attempt_id: str, *, note: str) -> dict[str, Any]:
+        """Close the financial reservation for an abandoned provider attempt."""
+        note = str(note).strip()
+        if not note:
+            raise ValueError("provider liability closeout requires a non-empty note")
+        store = self._model_response_store
+        if store is None:
+            raise RuntimeError("provider outcome recovery store is unavailable")
+        attempt = await store.get_attempt(str(attempt_id))
+        if attempt is None:
+            raise KeyError(f"unknown inference attempt: {attempt_id}")
+        if str(attempt.get("provider_outcome_status") or "").lower() != (
+            "abandoned_with_liability"
+        ):
+            raise ValueError("only abandoned provider liabilities can be manually closed")
+        amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
+        budgets = getattr(self, "_budgets", None)
+        if budgets is not None and amount > 0:
+            await budgets.release_model_cost(
+                str(attempt.get("task_id") or ""), amount, reservation_id=str(attempt_id)
+            )
+        closed = await store.close_provider_liability(attempt_id=str(attempt_id), note=note)
+        if self._store_events is not None:
+            await self._store_events.append_event(
+                "ProviderLiabilityClosed",
+                {
+                    "attempt_id": str(attempt_id),
+                    "task_id": closed.get("task_id"),
+                    "note": note,
+                },
+                task_id=str(closed.get("task_id") or "") or None,
+            )
+        view = await AthenaService._provider_resolution_view(self, closed)
+        view["liability_closed"] = True
+        view["next_actions"] = []
+        return view
+
+    async def _release_provider_reservation(
+        self,
+        store: Any,
+        *,
+        task_id: str,
+        attempt_id: str,
+        amount: Decimal,
+    ) -> None:
+        budgets = getattr(self, "_budgets", None)
+        if budgets is not None and amount > 0:
+            await budgets.release_model_cost(task_id, amount, reservation_id=attempt_id)
+        await store.mark_reservation_released(attempt_id=attempt_id)
+
+    async def _finalize_provider_outcome(
+        self,
+        task_id: str,
+        *,
+        resolution: str,
+        attempt_id: str,
+    ) -> None:
+        manager = getattr(self, "_task_manager", None)
+        tasks = getattr(self, "_store_tasks", None)
+        if manager is None or tasks is None or not task_id:
+            return
+        row = await tasks.get(task_id)
+        if row is None:
+            return
+        current = TaskStatus(str(row.get("status") or ""))
+        if current in FINAL_STATUSES:
+            return
+        if current is not TaskStatus.RECOVERY_REQUIRED:
+            await manager.transition(
+                task_id,
+                TaskStatus.RECOVERY_REQUIRED,
+                reason=f"provider outcome {resolution} requires task finalization",
+            )
+        unresolved = (
+            (f"provider_response_unavailable:{attempt_id}",)
+            if resolution == "confirmed_succeeded"
+            else (f"provider_liability:{attempt_id}",)
+            if resolution == "abandoned_with_liability"
+            else ()
+        )
+        await manager.finalize(
+            task_id,
+            status=TaskStatus.FAILED,
+            reason=f"provider outcome resolved as {resolution}",
+            summary=f"Provider outcome resolved as {resolution}; no safe continuation remains.",
+            unresolved=unresolved,
+            _allow_recovery_completion=True,
+        )
+
+    async def _launch_provider_retry(self, task_id: str) -> None:
+        manager = getattr(self, "_task_manager", None)
+        tasks = getattr(self, "_store_tasks", None)
+        kernel = getattr(self, "_kernel", None)
+        if manager is None or tasks is None or kernel is None or not task_id:
+            return
+        row = await tasks.get(task_id)
+        if row is None or str(row.get("status") or "") in {item.value for item in FINAL_STATUSES}:
+            return
+        status = TaskStatus(str(row.get("status") or ""))
+        if status in {TaskStatus.RECOVERY_REQUIRED, TaskStatus.INTERRUPTED}:
+            await manager.transition(
+                task_id,
+                TaskStatus.RUNNING,
+                reason="provider outcome reconciled; retry authorized",
+            )
+        elif status is not TaskStatus.RUNNING:
+            return
+        recovery = asyncio.create_task(kernel.run_task(task_id))
+        registry = getattr(self, "_approval_recovery_tasks", None)
+        if registry is not None:
+            registry.add(recovery)
+        recovery.add_done_callback(
+            self._log_background_failure(f"provider outcome recovery {task_id}")
+        )
+
+    async def _provider_resolution_view(self, resolved: dict[str, Any]) -> dict[str, Any]:
+        """Return the disposition plus operator-relevant consequences."""
+        view = dict(resolved)
+        resolution = str(view.get("provider_outcome_status") or "")
+        if resolution in _PROVIDER_OUTCOME_CONTRACT:
+            view["disposition_contract"] = dict(_PROVIDER_OUTCOME_CONTRACT[resolution])
+        task_id = str(view.get("task_id") or "")
+        tasks = getattr(self, "_store_tasks", None)
+        if tasks is not None and task_id:
+            row = await tasks.get(task_id)
+            view["task_status"] = row.get("status") if row is not None else None
+        store = getattr(self, "_model_response_store", None)
+        if store is not None and task_id:
+            view["liability_open"] = await store.has_unresolved_liability(task_id)
+        view["accounted_amount"] = (
+            view.get("actual_cost")
+            if view.get("provider_outcome_status") == "confirmed_succeeded"
+            else "0"
+        )
+        view["next_actions"] = (
+            ["manually close provider liability"]
+            if view.get("provider_outcome_status") == "abandoned_with_liability"
+            else []
+        )
+        return view
+
+    async def reconcile_provider_outcomes(self) -> dict[str, int]:
+        """Replay resolved provider dispositions after a process restart."""
+        store = self._model_response_store
+        if store is None:
+            return {"replayed": 0, "failed": 0}
+        replayed = 0
+        failed = 0
+        for attempt in await store.list_resolved_attempts():
+            try:
+                resolution = str(attempt.get("provider_outcome_status") or "")
+                task_id = str(attempt.get("task_id") or "")
+                amount = _validated_actual_cost(attempt.get("reservation_amount")) or Decimal("0")
+                attempt_id = str(attempt.get("attempt_id") or "")
+                receipt = await store.get_receipt(
+                    task_id=task_id,
+                    request_fingerprint=str(attempt.get("request_fingerprint") or ""),
+                )
+                if (
+                    resolution == "retry_authorized"
+                    and receipt is not None
+                    and str(receipt.get("attempt_id") or "") != attempt_id
+                ):
+                    # A replacement attempt was already prepared. The old
+                    # authorization is historical and must not launch a second
+                    # retry after restart.
+                    replayed += 1
+                    continue
+                if resolution in {"confirmed_failed", "retry_authorized"} and not attempt.get(
+                    "reservation_released_at"
+                ):
+                    await self._release_provider_reservation(
+                        store, task_id=task_id, attempt_id=attempt_id, amount=amount
+                    )
+                elif resolution == "confirmed_succeeded":
+                    cost = _validated_actual_cost(attempt.get("actual_cost"))
+                    if cost is None:
+                        raise RuntimeError(f"resolved success {attempt_id} has no actual cost")
+                    if not attempt.get("budget_accounted_at") and self._budgets is not None:
+                        await self._budgets.apply_model_accounting(
+                            task_id,
+                            attempt_id,
+                            reserved=amount,
+                            input_tokens=int(attempt.get("actual_input_tokens") or 0),
+                            output_tokens=int(attempt.get("actual_output_tokens") or 0),
+                            actual_cost=cost,
+                            reservation_id=attempt_id,
+                        )
+                        await store.mark_budget_accounted(attempt_id=attempt_id)
+                    if not attempt.get("reservation_released_at"):
+                        await store.mark_reservation_released(attempt_id=attempt_id)
+                if resolution == "retry_authorized":
+                    await self._launch_provider_retry(task_id)
+                elif resolution in {
+                    "confirmed_failed",
+                    "confirmed_succeeded",
+                    "abandoned_with_liability",
+                }:
+                    await self._finalize_provider_outcome(
+                        task_id, resolution=resolution, attempt_id=attempt_id
+                    )
+                replayed += 1
+            except Exception:
+                failed += 1
+                raise
+        return {"replayed": replayed, "failed": failed}
+
     async def stream_events(self, task_id: str, after_sequence: int = 0):
         async for ev in TaskAPI(self).stream_events(task_id, after_sequence=after_sequence):
             yield ev
@@ -1409,6 +1960,61 @@ class AthenaService:
 
     async def interrupt(self, task_id: str, reason: str = "externally interrupted") -> TaskStatus:
         return await OperatorInteractionService(self).interrupt(task_id, reason)
+
+    async def steer_task(
+        self,
+        task_id: str,
+        text: str,
+        *,
+        principal_id: str | None = None,
+        source_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Queue operator/parent steering for the next safe model boundary."""
+        if self._steering_store is None or self._task_manager is None:
+            raise ServiceNotReady("task steering is not initialized")
+        task = await self._task_manager.get(str(task_id))
+        if source_task_id is not None:
+            source_id = str(source_task_id)
+            try:
+                source = await self._task_manager.get(source_id)
+            except KeyError as exc:
+                raise ValueError(f"source task {source_id!r} does not exist") from exc
+            # A parent may steer any descendant, but unrelated tasks must not
+            # be able to inject authority-bearing content into one another.
+            cursor = task
+            related = False
+            visited: set[str] = set()
+            while cursor.parent_task_id and cursor.parent_task_id not in visited:
+                visited.add(cursor.id)
+                if cursor.parent_task_id == source.id:
+                    related = True
+                    break
+                try:
+                    cursor = await self._task_manager.get(cursor.parent_task_id)
+                except KeyError:
+                    break
+            if not related:
+                raise ValueError(
+                    f"source task {source_id!r} is not an ancestor of task {task_id!r}"
+                )
+        status = await self.get_task_status(str(task_id))
+        if status not in {
+            TaskStatus.QUEUED.value,
+            TaskStatus.RUNNING.value,
+            TaskStatus.INTERRUPTED.value,
+        }:
+            raise ValueError(f"task {task_id!r} is not steerable in status {status}")
+        record = await self._steering_store.enqueue(
+            str(task_id),
+            text,
+            principal_id=str(principal_id or self.config.cache_namespace),
+            source_task_id=source_task_id,
+            source="operator",
+        )
+        worker = self._worker
+        if worker is not None:
+            worker.notify()
+        return record
 
     async def pending_input(self, task_id: str) -> dict | None:
         return await OperatorInteractionService(self).pending_input(task_id)
@@ -1863,6 +2469,8 @@ class AthenaService:
 
     @staticmethod
     def _validate_request_metadata(metadata: Mapping[str, Any] | None) -> None:
+        if getattr(metadata, "_athena_trusted", False):
+            return
         for key in metadata or {}:
             name = str(key)
             if name.startswith("_") or name in _RESERVED_REQUEST_METADATA:
@@ -2155,6 +2763,7 @@ class AthenaService:
                     else None
                 ),
                 require_declared_quality=bool(spec.get("require_declared_quality", False)),
+                max_model_attempts=int(spec.get("max_model_attempts", 2)),
             )
         return out
 
@@ -2301,7 +2910,12 @@ class AthenaService:
         from athena.capabilities.dependency import DependencyCapability
         from athena.capabilities.reflection import CapabilityReflection
         from athena.capabilities.truth import TruthCapability
-        from athena.capabilities.research import HttpDiscoveryProvider, ResearchCapability
+        from athena.capabilities.research import (
+            BraveSearchProvider,
+            HttpDiscoveryProvider,
+            ResearchCapability,
+            TavilySearchProvider,
+        )
         from athena.capabilities.scratch import ScratchCapability
         from athena.capabilities.observer import ObserverCapability
         from athena.capabilities.capsule import ProcedureCapsuleCapability
@@ -2403,7 +3017,7 @@ class AthenaService:
                 if self.config.research_discovery_endpoint
                 else ()
             )
-            discovery_providers = tuple(
+            discovery_providers: list[Any] = list(
                 HttpDiscoveryProvider(
                     endpoint,
                     source_policy=research_policy,
@@ -2411,12 +3025,54 @@ class AthenaService:
                 )
                 for endpoint in discovery_endpoints
             )
+
+            # Resolve API credentials lazily at search time. This keeps raw
+            # keys out of config, capability descriptors, and model context,
+            # while allowing the configured SecretManager source (env,
+            # keyring, 1Password, Bitwarden, or operator resolver) to rotate.
+            def research_credential(name: str):
+                def resolve() -> str | None:
+                    try:
+                        return (
+                            self._secrets.resolve(
+                                name,
+                                owner_task="system",
+                                backend="research",
+                            )
+                            if self._secrets is not None
+                            else None
+                        )
+                    except SecretError:
+                        return None
+
+                return resolve
+
+            if self.config.research_brave_api_key_credential:
+                discovery_providers.append(
+                    BraveSearchProvider(
+                        source_policy=research_policy,
+                        api_key_resolver=research_credential(
+                            self.config.research_brave_api_key_credential
+                        ),
+                        timeout=self.config.research_discovery_timeout,
+                    )
+                )
+            if self.config.research_tavily_api_key_credential:
+                discovery_providers.append(
+                    TavilySearchProvider(
+                        source_policy=research_policy,
+                        api_key_resolver=research_credential(
+                            self.config.research_tavily_api_key_credential
+                        ),
+                        timeout=self.config.research_discovery_timeout,
+                    )
+                )
             registry.register(
                 ResearchCapability(
                     research_store,
                     artifact_store=self._artifacts,
                     source_policy=research_policy,
-                    discovery_providers=discovery_providers,
+                    discovery_providers=tuple(discovery_providers),
                 )
             )
         if self._workflow_store is not None and self._fabric is not None:
@@ -2537,6 +3193,11 @@ class AthenaService:
                                 cdp_endpoint=self.config.browser_cdp_endpoint,
                                 timeout_ms=self.config.browser_timeout_ms,
                                 viewport=self.config.browser_viewport,
+                                proxy_config=BrowserProxyConfig(
+                                    max_concurrent_tunnels=self.config.browser_proxy_max_connections,
+                                    idle_timeout_seconds=self.config.browser_proxy_idle_timeout_seconds,
+                                    max_tunnel_seconds=self.config.browser_proxy_max_connection_seconds,
+                                ),
                             )
                     else:
                         self._browser_health = {
@@ -2569,6 +3230,8 @@ class AthenaService:
                 self._browser = BrowserCapability(
                     driver_factory=browser_factory,
                     session_scope=self.config.browser_session_scope,
+                    artifact_store=self._artifacts,
+                    auth_profiles=self.config.browser_auth_profiles,
                 )
                 self._browser_health = self._browser.health()
                 self._optional_capability_health["browser"] = {
@@ -2668,6 +3331,8 @@ class AthenaService:
             else None
         )
         self._checkpoints = CheckpointManager(root=checkpoint_root or "/tmp/athena-checkpoints")
+        if self._resource_finalizer is not None:
+            self._resource_finalizer.bind_checkpoint_manager(self._checkpoints)
         self._reality_gate.bind_checkpoint_manager(self._checkpoints)
         registry.register(
             WorkspaceCapability(
@@ -2788,15 +3453,16 @@ class AthenaService:
                 except Exception as exc:
                     registry.record_poll_error(exc)
                     continue
+            event_store = events
 
-            async def sink(type_, payload, task_id=None):
+            async def sink(type_, payload, task_id=None, event_store=event_store):
                 if type_ == "WatchObserved":
                     # External reality changes are proof invalidators too.
                     # Apply this before EventStore subscribers wake the
                     # maintenance task, so its first verification sees stale
                     # claims rather than a transiently trusted snapshot.
                     await self._invalidate_watch_claims(payload)
-                await events.append_event(type_, payload, task_id=task_id)
+                await event_store.append_event(type_, payload, task_id=task_id)
 
             try:
                 await registry.poll_all(sink)
@@ -2972,180 +3638,28 @@ class AthenaService:
         return ws
 
     def _register_providers(self, registry: ProviderRegistry) -> None:
-        pcs = tuple(self.config.providers)
-        if not pcs:
-            return
-        provider: Any = None
-        for pc in pcs:
-            if pc.kind == "fake":
-                provider = FakeModelProvider(
-                    tool_calling=True,
-                    model=pc.model,
-                    provider=pc.name,
-                    scripts=list(pc.extra.get("scripts") or []),
-                    vision=bool(pc.extra.get("vision", False)),
-                    cost=pc.extra.get("cost"),
-                    latency_class=pc.latency_class or pc.extra.get("latency_class"),
-                )
-                registry.register(pc.name, provider)
-                registry.set_profile(pc.name, resolve_profile("fake", model_id=pc.model))
-                registry.set_model_profile(
-                    pc.name,
-                    pc.model,
-                    _model_profile_from_config(pc.model, pc.extra.get("model_profile")),
-                )
-                continue
-            profile = resolve_profile(
-                pc.kind,
-                base_url=pc.base_url,
-                model_id=pc.model,
-                cache_mode=pc.cache_mode,
-            )
-            if profile.protocol in {"openai", "openai-compat"}:
-                if not profile.base_url:
-                    raise ValueError(f"provider {pc.name!r} needs an explicit base_url")
-                provider = OpenAICompatProvider(
-                    base_url=profile.base_url,
-                    api_key=self._resolve_api_key(pc),
-                    model=profile.model_id or pc.model,
-                    provider=pc.name,
-                    headers=pc.extra.get("headers"),
-                    timeout=float(pc.extra.get("timeout", 60.0)),
-                    http2=bool(pc.extra.get("http2", False)),
-                    authentication=pc.authentication,
-                    cost=pc.extra.get("cost"),
-                    latency_class=pc.latency_class or pc.extra.get("latency_class"),
-                    vision=bool(pc.extra.get("vision", False)),
-                )
-            elif profile.protocol == "anthropic":
-                provider = AnthropicProvider(
-                    api_key=self._resolve_api_key(pc) or None,
-                    base_url=profile.base_url,
-                    model=profile.model_id or pc.model,
-                    provider=pc.name,
-                    headers=pc.extra.get("headers"),
-                    timeout=float(pc.extra.get("timeout", 60.0)),
-                    use_sdk=bool(pc.extra.get("use_sdk", True)),
-                    cost=pc.extra.get("cost"),
-                    latency_class=pc.latency_class or pc.extra.get("latency_class"),
-                )
-            else:
-                raise ValueError(f"unsupported provider protocol: {profile.protocol!r}")
-            registry.register(pc.name, provider)
-            registry.set_profile(pc.name, profile)
-            registry.set_model_profile(
-                pc.name,
-                profile.model_id or pc.model,
-                _model_profile_from_config(
-                    profile.model_id or pc.model,
-                    pc.extra.get("model_profile"),
-                ),
-            )
+        self._provider_runtime.register(registry)
+
+    def _build_provider(self, pc: ProviderConfig, credential_id: str | None = None) -> Any:
+        return self._provider_runtime.build(pc, credential_id)
 
     async def _connect_mcp(self) -> None:
-        for server in self.config.mcp_servers:
-            await self._connect_mcp_server(server)
-            status = self._mcp_connection_status.get(server.name, {})
-            if server.required and status.get("state") != "connected":
-                raise RuntimeError(
-                    f"required MCP server {server.name!r} is not ready: "
-                    f"{status.get('last_error') or status.get('state') or 'unknown'}"
-                )
+        await self._mcp_runtime.connect()
+
+    async def start_mcp_supervisor(self) -> None:
+        await self._mcp_runtime.start_supervisor()
+
+    async def _handle_mcp_transport_failure(self, connection_id: str, error: BaseException) -> None:
+        await self._mcp_runtime.handle_transport_failure(connection_id, error)
 
     async def _connect_mcp_server(self, server: MCPConfig) -> dict[str, Any]:
-        transport = "http" if server.url else "stdio"
-        self._mcp_connection_status[server.name] = {
-            "id": server.name,
-            "configured": True,
-            "required": bool(server.required),
-            "state": "connecting",
-            "transport": transport,
-            "tool_count": 0,
-            "last_successful_connection": None,
-            "last_error": None,
-        }
-        client: MCPClient | None = None
-        try:
-            env = dict(server.env)
-            if server.secret_env and self._secrets is not None:
-                for env_name, credential_id in server.secret_env.items():
-                    env[env_name] = self._secrets.resolve(credential_id)
-            client = MCPClient(
-                server.name,
-                command=server.command,
-                args=list(server.args),
-                url=server.url,
-                env=env,
-                connect_timeout=server.connect_timeout,
-            )
-            await client.connect()
-            self._mcp_clients.append(client)
-            if self._mcp is not None:
-                descriptors = await self._mcp.collect_and_register(client, server_alias=server.name)
-            else:
-                descriptors = []
-            self._mcp_connection_status[server.name] = {
-                **client.health(),
-                "state": "connected",
-                "tool_count": len(descriptors),
-            }
-            self._mcp_reconnect_failures[server.name] = 0
-        except Exception as exc:
-            _logger.warning("MCP server %s failed to connect: %s", server.name, exc)
-            if client is not None:
-                if client in self._mcp_clients:
-                    self._mcp_clients.remove(client)
-                if self._mcp is not None:
-                    self._mcp.unregister_connection(server.name)
-                try:
-                    await client.close()
-                except Exception as close_exc:  # noqa: BLE001 - preserve original failure
-                    _logger.info("MCP failed-connection cleanup failed: %s", close_exc)
-            failures = self._mcp_reconnect_failures.get(server.name, 0) + 1
-            self._mcp_reconnect_failures[server.name] = failures
-            self._mcp_connection_status[server.name] = {
-                **self._mcp_connection_status[server.name],
-                "state": "circuit_open" if failures >= 3 else "failed",
-                "consecutive_failures": failures,
-                "circuit_open": failures >= 3,
-                "last_error": f"{type(exc).__name__}: {exc}",
-            }
-        return dict(self._mcp_connection_status[server.name])
+        return await self._mcp_runtime.connect_server(server)
 
     async def mcp_reconnect(self, name: str) -> dict[str, Any]:
-        """Reconnect one configured MCP server and refresh its tool inventory."""
-        server = next((item for item in self.config.mcp_servers if item.name == name), None)
-        if server is None:
-            return {"id": name, "state": "failed", "last_error": "server is not configured"}
-        for client in list(self._mcp_clients):
-            if client.connection_id != name:
-                continue
-            if self._mcp is not None:
-                self._mcp.unregister_connection(name)
-            await client.close()
-            self._mcp_clients.remove(client)
-        return await self._connect_mcp_server(server)
+        return await self._mcp_runtime.reconnect(name)
 
-    def _resolve_api_key(self, pc: ProviderConfig) -> str:
-        """Return the key for a provider, preferring a leased credential.
-
-        A ``credential_id`` is treated as the NAME of a secret and resolved
-        through the SecretManager at the authorized boundary; the raw
-        ``api_key`` field remains a backward-compatible fallback.
-        """
-        if pc.credential_id and self._secrets is not None:
-            try:
-                return self._secrets.resolve(pc.credential_id)
-            except SecretError as exc:
-                # Provider registration is diagnostic and must not turn a
-                # missing credential into a half-started service. The adapter
-                # remains registered and reports ``auth_missing`` readiness;
-                # admission then fails closed through require_agent_ready().
-                _logger.warning("provider credential %s unavailable: %s", pc.credential_id, exc)
-                return ""
-        if pc.api_key is not None:
-            return pc.api_key
-        return ""
+    def _resolve_api_key(self, pc: ProviderConfig, *, credential_id: str | None = None) -> str:
+        return self._provider_runtime.resolve_api_key(pc, credential_id=credential_id)
 
     async def _preflight_hermes_referee(self) -> None:
         """Run the optional safety probe without blocking normal startup."""
@@ -3459,137 +3973,8 @@ class AthenaService:
         return self._store_events
 
 
-def _default_model_policy():
-    from athena.protocol.tasks import ModelPolicy
-
-    return ModelPolicy(require_tools=False)
-
-
 # Privacy values ModelRouter treats as a hard LOCAL-only gate. OFFLINE
 # autonomy and network-DENY workspaces narrow task model policy into this
 # set; "local-preferred" (the default) is deliberately NOT in it because the
 # router only biases, never hard-gates, under that value.
 _OFFLINE_MODEL_PRIVACY = frozenset({"offline", "local"})
-
-
-def _model_profile_from_config(
-    model_id: str,
-    raw: Any,
-) -> ModelProfile:
-    """Build a behavioral model profile from optional provider config.
-
-    Unknown keys are rejected at startup instead of silently changing the
-    meaning of a route.  The default profile is still explicit and durable;
-    it is not an untracked ``getattr`` fallback in the kernel.
-    """
-    if raw is None:
-        return ModelProfile(model_pattern=model_id)
-    if not isinstance(raw, Mapping):
-        raise ValueError("provider model_profile must be a mapping")
-    allowed = {
-        "tools_structured",
-        "tools_parallel",
-        "tools_textual_fallback",
-        "reasoning_native",
-        "empty_content_with_tools",
-        "requires_tool_result_name",
-        "requires_assistant_replay_fields",
-        "malformed_json_tendency",
-        "context_window",
-        "output_limit",
-    }
-    unknown = set(raw) - allowed
-    if unknown:
-        raise ValueError("unknown model_profile fields: " + ", ".join(sorted(unknown)))
-    return ModelProfile(model_pattern=model_id, **dict(raw))
-
-
-def _is_terminal_status(status: str | None) -> bool:
-    if not status:
-        return False
-    return status in {s.value for s in TERMINAL_STATUSES}
-
-
-def _result_from_row(row: dict):
-    """Build a :class:`TaskResult` from a decoded ``TaskStore.get`` row.
-
-    The store decodes JSON columns (including ``usage``) into dicts; this
-    reconstructs the typed result without relying on the manager's re-parse.
-    """
-    status_raw = row.get("result_status") or row.get("status")
-    if not status_raw or status_raw not in {s.value for s in TERMINAL_STATUSES}:
-        return None
-
-    usage = row.get("usage") or {}
-    from decimal import Decimal
-
-    cost = usage.get("cost_usd")
-    from athena.protocol.tasks import UsageSummary, TaskResult
-
-    return TaskResult(
-        task_id=row["id"],
-        status=TaskStatus(status_raw),
-        summary=row.get("summary") or "",
-        evidence=_decode_map_rows(row.get("evidence"), "ContextRef"),
-        artifacts=_decode_map_rows(row.get("artifacts"), "ArtifactRef"),
-        mutations=_decode_map_rows(row.get("mutations"), "MutationRef"),
-        unresolved=tuple(row.get("unresolved") or []),
-        usage=UsageSummary(
-            input_tokens=int(usage.get("input_tokens") or 0),
-            output_tokens=int(usage.get("output_tokens") or 0),
-            model_calls=int(usage.get("model_calls") or 0),
-            cost_usd=Decimal(str(cost)) if cost is not None else Decimal(0),
-            cost_known=bool(usage.get("cost_known", cost is not None)),
-            duration_ms=int(usage.get("duration_ms") or 0),
-            executions=int(usage.get("executions") or 0),
-            mutations=int(usage.get("mutations") or 0),
-        ),
-    )
-
-
-def _decode_map_rows(raw, kind: str):
-    if not raw:
-        return ()
-    items = raw if isinstance(raw, list) else []
-    from athena.protocol.artifacts import ArtifactRef
-    from athena.protocol.tasks import ContextRef, MutationRef
-
-    if kind == "ContextRef":
-        return tuple(
-            ContextRef(
-                kind=i.get("kind", "session"),
-                ref=i.get("ref", ""),
-                source_id=i.get("source_id"),
-                summary=i.get("summary"),
-                mime_type=i.get("mime_type"),
-            )
-            for i in items
-            if isinstance(i, dict)
-        )
-    if kind == "ArtifactRef":
-        return tuple(
-            ArtifactRef(
-                id=i.get("id", ""),
-                uri=i.get("uri", ""),
-                hash=i.get("hash"),
-                mime_type=i.get("mime_type"),
-                size=i.get("size"),
-                producer=i.get("producer"),
-                task_id=i.get("task_id"),
-                metadata=i.get("metadata") or {},
-            )
-            for i in items
-            if isinstance(i, dict)
-        )
-    if kind == "MutationRef":
-        return tuple(
-            MutationRef(
-                id=i.get("id", ""),
-                resource=i.get("resource", ""),
-                operation=i.get("operation", ""),
-                reversible=bool(i.get("reversible", False)),
-            )
-            for i in items
-            if isinstance(i, dict)
-        )
-    return ()

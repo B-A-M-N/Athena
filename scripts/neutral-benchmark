@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Run the implementation-neutral benchmark with explicit adapter commands."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+from pathlib import Path
+import shlex
+import subprocess
+import time
+from typing import Any
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from athena.evaluation.corpus import default_benchmark_cases  # noqa: E402
+from athena.evaluation.neutral import EvaluationCase, NeutralEvaluationHarness  # noqa: E402
+
+
+def _parse_adapter(value: str) -> tuple[str, list[str]]:
+    name, separator, command = value.partition("=")
+    if not separator or not name.strip() or not command.strip():
+        raise argparse.ArgumentTypeError("adapter must be name=command")
+    return name.strip(), shlex.split(command)
+
+
+def _command_adapter(command: list[str], case: EvaluationCase, seed: int):
+    payload = {
+        "case_id": case.id,
+        "prompt": case.prompt,
+        "required_evidence": list(case.required_evidence),
+        "forbidden_safety_events": list(case.forbidden_safety_events),
+        "metadata": dict(case.metadata),
+        "seed": seed,
+    }
+    started = time.perf_counter()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            input=json.dumps(payload) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        if result.returncode:
+            return {
+                "case_id": case.id,
+                "status": "failed",
+                "metadata": {"adapter_error": result.stdout[-2000:]},
+            }
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict):
+            raise ValueError("adapter output must be a JSON object")
+        value.setdefault("case_id", case.id)
+        value.setdefault("metadata", {})["adapter_wall_clock_ms"] = (
+            time.perf_counter() - started
+        ) * 1000
+        return value
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        return {"case_id": case.id, "status": "failed", "metadata": {"adapter_error": str(exc)}}
+
+
+async def _run(args: argparse.Namespace) -> int:
+    adapters = dict(args.adapters)
+    cases = default_benchmark_cases()
+    runs: list[dict[str, Any]] = []
+    for repeat in range(args.repeats):
+        seed = args.seed + repeat
+        seeded_cases = tuple(
+            EvaluationCase(
+                id=case.id,
+                prompt=case.prompt,
+                required_evidence=case.required_evidence,
+                forbidden_safety_events=case.forbidden_safety_events,
+                metadata={**case.metadata, "seed": seed, "repeat": repeat},
+            )
+            for case in cases
+        )
+        run = await NeutralEvaluationHarness().run(
+            seeded_cases,
+            {
+                name: (
+                    lambda case, command=command, seed=seed: _command_adapter(command, case, seed)
+                )
+                for name, command in adapters.items()
+            },
+        )
+        runs.append({"repeat": repeat, "seed": seed, "report": run})
+    artifact = {
+        "kind": "athena_neutral_benchmark",
+        "schema_version": 1,
+        "corpus": [case.id for case in cases],
+        "adapters": {name: command for name, command in adapters.items()},
+        "repeats": args.repeats,
+        "seed": args.seed,
+        "runs": runs,
+        "artifact_sha256": hashlib.sha256(
+            json.dumps(runs, sort_keys=True, default=str).encode()
+        ).hexdigest(),
+    }
+    args.output.write_text(
+        json.dumps(artifact, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(artifact, sort_keys=True, default=str))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--adapter", dest="adapters", action="append", type=_parse_adapter, required=True
+    )
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--output", type=Path, default=Path("neutral-benchmark.json"))
+    args = parser.parse_args()
+    if args.repeats < 1 or args.repeats > 100:
+        parser.error("repeats must be between 1 and 100")
+    args.adapters = dict(args.adapters)
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

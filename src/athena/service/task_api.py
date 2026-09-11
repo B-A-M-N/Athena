@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 from athena.protocol.ids import new_id
-from athena.protocol.tasks import TERMINAL_STATUSES, AgentRequest, TaskSpec
+from athena.protocol.tasks import TERMINAL_STATUSES, AgentRequest, TaskSpec, TaskStatus
 from athena.tasks.manager import TaskManager
 
 __all__ = ["TaskAPI"]
@@ -52,6 +53,7 @@ class TaskAPI:
         wait: bool = False,
         user_request: Any | None = None,
         trusted: bool = False,
+        enqueue: bool = True,
     ) -> TaskSpec:
         """Submit an already-decoded task through the service intake.
 
@@ -75,7 +77,13 @@ class TaskAPI:
                     principal_id=self._svc.config.cache_namespace,
                     project_id=getattr(spec.workspace, "id", None),
                 )
-        return await self._enqueue_spec(tm, spec, wait=wait, user_request=user_request)
+        return await self._enqueue_spec(
+            tm,
+            spec,
+            wait=wait,
+            user_request=user_request,
+            enqueue=enqueue,
+        )
 
     async def _enqueue_spec(
         self,
@@ -84,23 +92,118 @@ class TaskAPI:
         *,
         wait: bool,
         user_request: AgentRequest | None = None,
+        enqueue: bool = True,
     ):
+        if wait and not enqueue:
+            raise ValueError("wait=True requires enqueue=True")
+        intake_owner = (
+            "scheduler" if not enqueue and spec.metadata.get("_occurrence") else "ordinary"
+        )
+        metadata = dict(spec.metadata)
+        metadata.setdefault("_intake_owner", intake_owner)
+        metadata.setdefault("_intake_phase", "task_created")
+        spec = replace(spec, metadata=metadata)
+        try:
+            existing = await task_manager.get(spec.id)
+        except KeyError:
+            existing = None
+        if existing is not None:
+            if (
+                existing.objective != spec.objective
+                or existing.session_id != spec.session_id
+                or existing.parent_task_id != spec.parent_task_id
+            ):
+                raise ValueError(f"task id {spec.id!r} already identifies different work")
+            if (existing.metadata or {}).get("status") == TaskStatus.CREATED.value:
+                await self._repair_created_intake(
+                    existing, user_request=user_request, enqueue=enqueue
+                )
+                existing = await task_manager.get(spec.id)
+                if wait:
+                    await self.wait_for(existing.id)
+            return existing
         created = await task_manager.create(spec)
         # Every task gets a durable causal root before it can run. Transport
         # callers provide the original request; internal/scheduled callers
         # use the TaskSpec objective. This prevents same-session tasks from
         # inheriting whichever unrelated turn happened to be most recent.
         await self._svc._record_canonical_user_turn(user_request or created, created)
+        await self._mark_intake_phase(created.id, "canonical_user_turn_persisted")
         # Precompute the revisioned static context concurrently with worker
         # pickup (P1: precompute before first inference). The compile path
         # remains the sole authority — this only warms its cache, guarded by
         # the same revisions, so a stale warm entry is recomputed, never
         # trusted. Failure is swallowed: prefetch must never fail admission.
         self._svc._spawn_static_prefetch(created)
-        await task_manager.enqueue(created.id)
+        if enqueue:
+            await task_manager.enqueue(created.id)
+            await self._mark_intake_phase(created.id, "enqueued")
         if wait:
             await self.wait_for(created.id)
         return created
+
+    async def _mark_intake_phase(self, task_id: str, phase: str) -> None:
+        store = getattr(self._svc, "_store_tasks", None)
+        update = getattr(store, "update_metadata", None)
+        if callable(update):
+            await update(
+                str(task_id),
+                {
+                    "_intake_phase": phase,
+                    "_intake_phase_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+    async def _repair_created_intake(
+        self,
+        task: TaskSpec,
+        *,
+        user_request: AgentRequest | None,
+        enqueue: bool,
+    ) -> None:
+        """Complete a previously interrupted ordinary intake idempotently."""
+        metadata = dict(task.metadata or {})
+        if metadata.get("_intake_owner") == "scheduler" or metadata.get("_occurrence"):
+            # Scheduler reconciliation owns occurrence claims and must finish
+            # its task/claim transition before generic intake can enqueue it.
+            return
+        try:
+            await self._svc._record_canonical_user_turn(user_request or task, task)
+            await self._mark_intake_phase(task.id, "canonical_user_turn_persisted")
+            if enqueue:
+                await self._svc._require_task_manager().enqueue(task.id)
+                await self._mark_intake_phase(task.id, "enqueued")
+        except Exception:
+            # A CREATED row is authoritative. If its causal root cannot be
+            # reconstructed or queued, make the operator-visible recovery
+            # state explicit instead of leaving inert work behind.
+            manager = self._svc._require_task_manager()
+            await manager.transition(
+                task.id,
+                TaskStatus.RECOVERY_REQUIRED,
+                reason="task intake recovery could not complete canonical persistence/enqueue",
+            )
+            raise
+
+    async def reconcile_created_intake(self) -> dict[str, int]:
+        """Repair ordinary CREATED tasks before workers begin claiming work."""
+        manager = self._svc._require_task_manager()
+        rows = await manager.list_by_status(TaskStatus.CREATED)
+        recovered = 0
+        quarantined = 0
+        skipped = 0
+        for task in rows:
+            metadata = dict(task.metadata or {})
+            if metadata.get("_intake_owner") == "scheduler" or metadata.get("_occurrence"):
+                skipped += 1
+                continue
+            try:
+                await self._repair_created_intake(task, user_request=None, enqueue=True)
+            except Exception:
+                quarantined += 1
+                continue
+            recovered += 1
+        return {"recovered": recovered, "quarantined": quarantined, "skipped": skipped}
 
     # ------------------------------------------------------------------ #
     # Observation

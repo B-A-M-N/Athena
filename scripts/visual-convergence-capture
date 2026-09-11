@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
 
 if [[ -n "${ATHENA_VISUAL_LOOP_DIR:-}" ]]; then
   loop_dir="$ATHENA_VISUAL_LOOP_DIR"
@@ -43,7 +44,7 @@ projection="${projection//\"SEARCH\"/\"${scene_mode^^}\"}"
 projection="${projection//\"owl\"/\"$mascot\"}"
 
 wait_for_presentation() {
-  PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" python3 - <<'PY'
+  PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" "$system_python" - <<'PY'
 import json
 import os
 import time
@@ -78,13 +79,15 @@ printf '%s\n' "$projection" | \
   EXPECTED_WIDTH="$expected_width" \
   EXPECTED_HEIGHT="$expected_height" \
   MASCOT="$mascot" \
+  ATHENA_RELEASE_SYSTEM_PYTHON="$system_python" \
   xvfb-run -a -s '-screen 0 1920x1080x24 -ac' bash -c '
     set -euo pipefail
+    system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
     wait_for_window() {
       timeout 10s xdotool search --sync --name "ATHENA" 2>/dev/null | head -1
     }
     wait_for_presentation() {
-      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" python3 - <<"PY"
+      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" "$system_python" - <<"PY"
 import json
 import os
 import time
@@ -137,7 +140,7 @@ dimensions="$(identify -format "%wx%h" "$capture_path")"
 
 cp "$capture_path" "$out_path"
 
-python3 - "$state_path" "$out_path" <<'PY'
+"$system_python" - "$state_path" "$out_path" <<'PY'
 import fcntl
 import json
 import os

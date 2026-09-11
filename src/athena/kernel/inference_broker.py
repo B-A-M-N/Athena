@@ -13,6 +13,8 @@ reconciled.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from dataclasses import replace
@@ -31,6 +33,7 @@ from athena.models.router import (
 from athena.protocol.errors import (
     ContextOverflow,
     ModelUnavailable,
+    ProviderOutcomeUnknown,
     ProviderError,
     RequestCancelled,
     TaskBudgetExceeded,
@@ -103,6 +106,39 @@ __all__ = ["InferenceBroker"]
 _logger = logging.getLogger("athena.kernel")
 
 
+def _request_fingerprint(
+    task: TaskSpec,
+    request: ModelRequest,
+    *,
+    inference_kind: str | None,
+    attempt: int,
+) -> str:
+    """Hash the exact logical provider prompt, excluding random request IDs."""
+    from athena.state.sessions import _serialize_block
+
+    payload = {
+        "task_id": task.id,
+        "kind": inference_kind or "primary",
+        "attempt": attempt,
+        "provider": request.provider,
+        "model": request.model,
+        "system": request.system,
+        "max_tokens": request.max_tokens,
+        "stop": list(request.stop),
+        "messages": [
+            {
+                "role": message.role.value,
+                "blocks": [_serialize_block(block) for block in message.blocks],
+                "metadata": dict(message.metadata or {}),
+            }
+            for message in request.messages
+        ],
+        "capabilities": [vars(capability) for capability in request.capabilities],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 class InferenceBroker:
     """Per-attempt inference mechanism owned by AgentKernel."""
 
@@ -111,6 +147,106 @@ class InferenceBroker:
         # Module constant bound lazily so the broker can be imported from the
         # partially-initialized kernel module without an import cycle.
         self._fallback_attempts = _mod()._FALLBACK_ATTEMPTS
+
+    async def _fault_point(self, name: str) -> None:
+        hook = getattr(self._k, "_inference_fault_injector", None)
+        if hook is None:
+            return
+        result = hook(name)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def _reconcile_receipt(
+        self,
+        task: TaskSpec,
+        receipt: Mapping[str, Any],
+        *,
+        response: ModelResponse,
+        request: ModelRequest,
+        estimator: ModelTokenEstimator,
+        selection: ModelSelection,
+    ) -> None:
+        """Finish durable budget/provider accounting before replay returns."""
+        attempt_id = str(receipt.get("attempt_id") or "")
+        if not attempt_id:
+            return
+        budget_done = self._k._budgets is None or bool(receipt.get("budget_accounted_at"))
+        usage_done = self._k._provider_usage_store is None or bool(
+            receipt.get("provider_usage_completed_at")
+        )
+        if budget_done and usage_done:
+            return
+        input_tokens = int(
+            receipt.get("actual_input_tokens")
+            or _input_tokens_of(response, request, estimator=estimator)
+        )
+        output_tokens = int(receipt.get("actual_output_tokens") or _output_tokens_of(response))
+        raw_cost = receipt.get("actual_cost")
+        actual_cost = (
+            Decimal(str(raw_cost))
+            if raw_cost not in (None, "")
+            else _actual_model_cost(selection.info, response, request, estimator=estimator)
+        )
+        response_store = getattr(self._k, "_model_response_store", None)
+        if response_store is not None:
+            await response_store.set_actual_usage(
+                attempt_id=attempt_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=actual_cost,
+            )
+        raw_reserved = receipt.get("reservation_amount")
+        reserved = Decimal(str(raw_reserved)) if raw_reserved not in (None, "") else Decimal("0")
+        if self._k._budgets is not None:
+            await self._k._budgets.apply_model_accounting(
+                task.id,
+                attempt_id,
+                reserved=reserved,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                actual_cost=actual_cost,
+                reservation_id=attempt_id,
+            )
+            await self._fault_point("budget-charge")
+            await self._fault_point("budget-checkpoint")
+            if response_store is not None:
+                await response_store.mark_budget_accounted(attempt_id=attempt_id)
+        usage_id = str(receipt.get("provider_usage_id") or "")
+        if self._k._provider_usage_store is not None:
+            if not usage_id:
+                # The response receipt can outlive a crash in the bookkeeping
+                # window between the provider call and its usage row. Reuse
+                # the durable attempt ID so recovery creates at most one row.
+                usage_id = await self._k._provider_usage_store.record_attempt(
+                    provider=selection.provider,
+                    model=selection.model,
+                    task_id=task.id,
+                    session_id=task.session_id,
+                    metadata={"state": "recovered", "attempt_id": attempt_id},
+                    usage_id=attempt_id,
+                )
+                if response_store is not None:
+                    await response_store.set_provider_usage_id(
+                        attempt_id=attempt_id,
+                        provider_usage_id=usage_id,
+                    )
+                    await response_store.mark_provider_usage_started(attempt_id=attempt_id)
+            await self._k._provider_usage_store.record_completion(
+                usage_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=str(actual_cost) if actual_cost is not None else None,
+                metadata={"state": "success", "attempt_id": attempt_id},
+            )
+            if response_store is not None:
+                await response_store.mark_provider_usage_started(attempt_id=attempt_id)
+            await self._fault_point("usage-completion")
+            if response_store is not None:
+                await response_store.mark_provider_usage_completed(attempt_id=attempt_id)
+        if response_store is not None:
+            await response_store.mark_accounting_applied(
+                attempt_id=attempt_id,
+            )
 
     async def _select_model(
         self,
@@ -177,7 +313,9 @@ class InferenceBroker:
         attempted: set[tuple[str, str]] = set()
         selection_for_attempt = selection
         compiled_for_attempt = compiled
-        for attempt in range(self._fallback_attempts):
+        effective_policy = self._k._router.effective_policy(task.model_policy)
+        max_attempts = min(self._fallback_attempts, effective_policy.max_model_attempts)
+        for attempt in range(max_attempts):
             if state.cancel.is_set():
                 raise RequestCancelled("task cancelled")
             pair = (
@@ -274,13 +412,118 @@ class InferenceBroker:
                     f"bounded model call cost {worst_cost} exceeds "
                     f"ceiling {effective_policy.max_cost_usd} USD"
                 )
+            request_fingerprint = _request_fingerprint(
+                task,
+                request,
+                inference_kind=inference_kind,
+                attempt=attempt,
+            )
+            response_store = getattr(self._k, "_model_response_store", None)
+            receipt: dict[str, Any] = {}
+            if response_store is not None:
+                receipt = await response_store.prepare(
+                    task_id=task.id,
+                    request_fingerprint=request_fingerprint,
+                    request_id=request.request_id,
+                    provider=selection_for_attempt.provider,
+                    model=selection_for_attempt.model,
+                    reservation_amount=worst_cost,
+                    idempotency_semantics=str(
+                        request.metadata.get("idempotency_semantics") or "none"
+                    ),
+                )
+                state.inference_attempt_id = str(receipt.get("attempt_id") or "") or None
+                if self._k._budgets is not None:
+                    for stale in await response_store.list_unreleased_reservations(task.id):
+                        stale_amount = Decimal(str(stale.get("reservation_amount") or "0"))
+                        if stale_amount > 0:
+                            await self._k._budgets.release_model_cost(
+                                task.id,
+                                stale_amount,
+                                reservation_id=str(stale["attempt_id"]),
+                            )
+                        await response_store.mark_attempt_reservation_released(
+                            str(stale["attempt_id"])
+                        )
+                stored_request_id = str(receipt.get("request_id") or "")
+                if stored_request_id and stored_request_id != request.request_id:
+                    request = replace(request, request_id=stored_request_id)
+                idempotency_key = str(
+                    receipt.get("idempotency_key") or receipt.get("attempt_id") or ""
+                )
+                if idempotency_key and request.metadata.get("idempotency_key") != idempotency_key:
+                    request = replace(
+                        request,
+                        metadata={**dict(request.metadata), "idempotency_key": idempotency_key},
+                    )
+                outcome_status = str(receipt.get("provider_outcome_status") or "").casefold()
+                if outcome_status not in {"", "pending", "known", "failed"}:
+                    raise ProviderOutcomeUnknown(
+                        "provider outcome requires reconciliation before retrying: "
+                        f"{outcome_status}"
+                    )
+                cached_response = response_store.response_from_row(receipt)
+                if cached_response is not None:
+                    await self._reconcile_receipt(
+                        task,
+                        {**receipt, "request_fingerprint": request_fingerprint},
+                        response=cached_response,
+                        request=request,
+                        estimator=token_estimator,
+                        selection=selection_for_attempt,
+                    )
+                    state.request_id = cached_response.request_id
+                    state.provider = cached_response.provider
+                    state.model_calls += 1
+                    state.input_tokens += _input_tokens_of(
+                        cached_response, request, estimator=token_estimator
+                    )
+                    state.output_tokens += _output_tokens_of(cached_response)
+                    cached_cost = _actual_model_cost(
+                        selection_for_attempt.info,
+                        cached_response,
+                        request,
+                        estimator=token_estimator,
+                    )
+                    if cached_cost is None:
+                        state.cost_known = False
+                    state.cost += cached_cost or Decimal("0")
+                    await self._k._emit(
+                        "ModelResponseReplayed",
+                        {
+                            "provider": cached_response.provider,
+                            "model": cached_response.model,
+                            "request_id": cached_response.request_id,
+                            "attempt_index": attempt,
+                        },
+                        task,
+                    )
+                    return cached_response
             reservation = False
             if self._k._budgets is not None and worst_cost is not None:
-                await self._k._budgets.reserve_model_cost(task.id, worst_cost)
+                # Re-assert the reservation on every recovery attempt.  The
+                # receipt marker means the reserve operation committed at
+                # least once; it does not prove that an interrupted caller
+                # still has an in-memory reservation after cleanup.  The
+                # budget ledger makes this operation idempotent by attempt id,
+                # so this also repairs a crash between reservation release and
+                # the next replay.
+                reservation_id = str(receipt.get("attempt_id") or request.request_id)
+                await self._k._budgets.reserve_model_cost(
+                    task.id,
+                    worst_cost,
+                    reservation_id=reservation_id,
+                )
+                if response_store is not None and not receipt.get("reservation_applied_at"):
+                    await response_store.mark_reservation_applied(
+                        attempt_id=str(receipt["attempt_id"])
+                    )
                 reservation = True
+                await self._fault_point("reservation")
             # One durable row and one inspectable event per actual provider /
             # model attempt. Fallbacks must never overwrite the first row.
             attempt_usage_id: str | None = None
+            provider_started = False
             attempt_started = time.monotonic()
             # Inference-kind metadata (P1-8): auxiliary subturns carry the
             # same lifecycle events as primary inference — emitted here, once
@@ -312,20 +555,44 @@ class InferenceBroker:
                             "attempt_index": attempt,
                             "state": "started",
                         },
+                        usage_id=str(
+                            receipt.get("provider_usage_id") or receipt.get("attempt_id") or ""
+                        )
+                        or None,
                     )
+                    if response_store is not None:
+                        await response_store.set_provider_usage_id(
+                            attempt_id=str(receipt["attempt_id"]),
+                            provider_usage_id=attempt_usage_id,
+                        )
                 except Exception as exc:
                     # P1-11: usage evidence must not vanish silently.
                     _bookkeeping_failure("provider usage attempt record", task, exc)
+                await self._fault_point("provider-usage-start")
             try:
+                provider_started = True
                 if self._k._budgets is not None:
                     async with self._k._budgets.model_call_lease(task.id):
                         response = await self._k._consume(
-                            task, state, provider, request, estimator=token_estimator
+                            task,
+                            state,
+                            provider,
+                            request,
+                            estimator=token_estimator,
+                            request_fingerprint=request_fingerprint,
+                            attempt_id=str(receipt.get("attempt_id") or "") or None,
                         )
                 else:
                     response = await self._k._consume(
-                        task, state, provider, request, estimator=token_estimator
+                        task,
+                        state,
+                        provider,
+                        request,
+                        estimator=token_estimator,
+                        request_fingerprint=request_fingerprint,
+                        attempt_id=str(receipt.get("attempt_id") or "") or None,
                     )
+                await self._fault_point("provider-return")
                 response_completed_payload: dict[str, Any] = {
                     "provider": selection_for_attempt.provider,
                     "model": selection_for_attempt.model,
@@ -345,6 +612,13 @@ class InferenceBroker:
                 )
                 if actual_cost is None:
                     state.cost_known = False
+                if response_store is not None:
+                    await response_store.set_actual_usage(
+                        attempt_id=str(receipt["attempt_id"]),
+                        input_tokens=_input_tokens_of(response, request, estimator=token_estimator),
+                        output_tokens=_output_tokens_of(response),
+                        cost_usd=actual_cost,
+                    )
                 if self._k._budgets is not None:
                     # Persist actual usage at the model boundary. The final
                     # TaskResult is an aggregate and BudgetTracker consumes
@@ -361,22 +635,27 @@ class InferenceBroker:
                     # charge in the owner ledger.
                     if actual_cost is not None and not reservation:
                         usage_kwargs["cost"] = actual_cost
-                    self._k._budgets.consume(task.id, **usage_kwargs)
-                    if reservation and worst_cost is not None:
-                        if actual_cost is None:
-                            await self._k._budgets.release_model_cost(task.id, worst_cost)
-                        else:
-                            await self._k._budgets.reconcile_model_cost(
-                                task.id,
-                                reserved=worst_cost,
-                                actual=actual_cost,
-                            )
-                    persist_budget = getattr(self._k._budgets, "_persist_usage", None)
-                    if persist_budget is not None:
-                        await persist_budget(task.id)
+                    await self._k._budgets.apply_model_accounting(
+                        task.id,
+                        str(receipt.get("attempt_id") or request.request_id),
+                        reserved=worst_cost
+                        if reservation and worst_cost is not None
+                        else Decimal("0"),
+                        input_tokens=int(usage_kwargs["input_tokens"]),
+                        output_tokens=int(usage_kwargs["output_tokens"]),
+                        actual_cost=actual_cost,
+                        reservation_id=str(receipt.get("attempt_id") or request.request_id),
+                    )
+                    await self._fault_point("budget-charge")
+                    await self._fault_point("budget-checkpoint")
+                    if response_store is not None:
+                        await response_store.mark_budget_accounted(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
                 state.cost += actual_cost or Decimal("0")
                 reservation = False
                 # Record final usage
+                usage_completion_ok = True
                 if self._k._provider_usage_store is not None and attempt_usage_id is not None:
                     try:
                         usage = response.usage if response else None
@@ -400,11 +679,36 @@ class InferenceBroker:
                         )
                     except Exception as exc:
                         # P1-11: cost/audit evidence must not vanish silently.
+                        usage_completion_ok = False
                         _bookkeeping_failure("provider usage completion record", task, exc)
+                    if usage_completion_ok and response_store is not None:
+                        await response_store.mark_provider_usage_completed(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
+                    await self._fault_point("usage-completion")
+                if response_store is not None and usage_completion_ok:
+                    await response_store.mark_accounting_applied(
+                        attempt_id=str(receipt["attempt_id"]),
+                    )
                 return response
             except ProviderError as exc:
+                if response_store is not None:
+                    try:
+                        await response_store.fail(
+                            attempt_id=str(receipt["attempt_id"]),
+                        )
+                    except Exception as receipt_exc:
+                        _bookkeeping_failure("model response failure receipt", task, receipt_exc)
                 if self._k._budgets is not None and reservation and worst_cost is not None:
-                    await self._k._budgets.release_model_cost(task.id, worst_cost)
+                    await self._k._budgets.release_model_cost(
+                        task.id,
+                        worst_cost,
+                        reservation_id=str(receipt.get("attempt_id") or request.request_id),
+                    )
+                    if response_store is not None:
+                        await response_store.mark_reservation_released(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
                 last_err = exc
                 state.request_id = None
                 if self._k._provider_usage_store is not None and attempt_usage_id is not None:
@@ -435,7 +739,7 @@ class InferenceBroker:
                         _bookkeeping_failure("provider usage failure record", task, record_exc)
                 if not _is_retryable(exc):
                     raise
-                if attempt >= self._fallback_attempts - 1:
+                if attempt >= max_attempts - 1:
                     break
                 # Exclude the failed (provider, model) pair only; sibling
                 # models on the same provider remain candidates.
@@ -459,9 +763,36 @@ class InferenceBroker:
                         compiled_for_attempt = await self._k._compile(
                             task, context_window=int(fallback_limit)
                         )
-            except BaseException:
-                if self._k._budgets is not None and reservation and worst_cost is not None:
-                    await self._k._budgets.release_model_cost(task.id, worst_cost)
+            except BaseException as exc:
+                outcome_unknown = False
+                if provider_started and response_store is not None:
+                    current = await response_store.get_receipt(
+                        task_id=task.id, request_fingerprint=request_fingerprint
+                    )
+                    if current is not None and str(current.get("status") or "") == "PENDING":
+                        outcome_unknown = await response_store.mark_provider_outcome_unknown(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
+                if (
+                    self._k._budgets is not None
+                    and reservation
+                    and worst_cost is not None
+                    and not outcome_unknown
+                ):
+                    await self._k._budgets.release_model_cost(
+                        task.id,
+                        worst_cost,
+                        reservation_id=str(receipt.get("attempt_id") or request.request_id),
+                    )
+                    if response_store is not None:
+                        await response_store.mark_reservation_released(
+                            attempt_id=str(receipt["attempt_id"])
+                        )
+                if outcome_unknown:
+                    raise ProviderOutcomeUnknown(
+                        "provider outcome became unknown after the request was sent; "
+                        f"attempt {receipt.get('attempt_id') or 'unknown'} requires reconciliation"
+                    ) from exc
                 raise
         raise last_err or ModelUnavailable("no model available")
 
@@ -769,6 +1100,7 @@ class InferenceBroker:
             "tool_repair_mode": compatibility.tool_repair,
             "max_tool_correction_cycles": compatibility.max_tool_correction_cycles,
             "protocol": getattr(profile, "protocol", "openai-compat"),
+            "idempotency_semantics": getattr(profile, "idempotency_semantics", "none"),
             "model_profile": (dict(vars(model_profile)) if model_profile is not None else None),
         }
 
@@ -944,6 +1276,8 @@ class InferenceBroker:
         request: ModelRequest,
         *,
         estimator: ModelTokenEstimator | None = None,
+        request_fingerprint: str | None = None,
+        attempt_id: str | None = None,
     ) -> ModelResponse:
         accumulator = ModelResponseAccumulator(request)
 
@@ -994,6 +1328,7 @@ class InferenceBroker:
             "compatibility_profile",
             "model_profile",
             "protocol",
+            "idempotency_semantics",
             "tool_repair_mode",
             "max_tool_correction_cycles",
             "cache_mode",
@@ -1007,6 +1342,8 @@ class InferenceBroker:
             if key in request.metadata and key not in response_metadata:
                 response_metadata[key] = request.metadata[key]
         response_metadata["request_id"] = request.request_id
+        if attempt_id:
+            response_metadata["inference_attempt_id"] = attempt_id
         from athena.models.compat.caching import UsageRecord
 
         usage_metadata = dict(final.usage.provider_metadata or {})
@@ -1030,6 +1367,19 @@ class InferenceBroker:
             provider_metadata={**usage_metadata, "normalized": normalized.to_dict()},
         )
         final = replace(final, usage=usage, metadata=response_metadata)
+        response_store = getattr(self._k, "_model_response_store", None)
+        if response_store is not None and request_fingerprint is not None:
+            # This is the last local point before the durable response commit.
+            # A crash/fault here means the provider outcome may be real but is
+            # not locally observable; the caller must record UNKNOWN and must
+            # not silently retry a non-idempotent request.
+            await self._fault_point("provider-assembled-before-receipt")
+            await response_store.complete(
+                attempt_id=attempt_id or "",
+                response=final,
+                provider_response_id=str(final.metadata.get("response_id") or "") or None,
+            )
+            await self._fault_point("response-receipt-commit")
         state.input_tokens += _input_tokens_of(final, request, estimator=estimator)
         state.output_tokens += _output_tokens_of(final)
         return final

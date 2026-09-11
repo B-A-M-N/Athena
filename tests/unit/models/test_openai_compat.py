@@ -87,9 +87,14 @@ def _user_request(text: str = "hello") -> ModelRequest:
 
 def test_openai_compatible_authentication_policy_is_explicit_and_topology_aware():
     loopback = OpenAICompatProvider(base_url="http://127.0.0.1:11434", api_key="")
-    private = OpenAICompatProvider(base_url="http://10.1.2.3:11434", api_key="")
+    private = OpenAICompatProvider(
+        base_url="http://10.1.2.3:11434", api_key="", allow_insecure_remote=True
+    )
     explicitly_open = OpenAICompatProvider(
-        base_url="http://10.1.2.3:11434", api_key="", authentication="none"
+        base_url="http://10.1.2.3:11434",
+        api_key="",
+        authentication="none",
+        allow_insecure_remote=True,
     )
 
     assert loopback.readiness()["state"] == "ready"

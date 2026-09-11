@@ -189,6 +189,7 @@ class ModelRouter:
             require_declared_quality=bool(
                 policy.require_declared_quality or role_policy.require_declared_quality
             ),
+            max_model_attempts=min(policy.max_model_attempts, role_policy.max_model_attempts),
             routing_preference=(
                 policy.routing_preference
                 if policy.routing_preference != "balanced"

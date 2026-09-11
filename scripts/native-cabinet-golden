@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
 
 for command in xvfb-run import identify xdotool; do
   command -v "$command" >/dev/null || {
@@ -27,10 +28,12 @@ capture_path="$tmp_dir/cabinet.png"
 xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
   env NATIVE_BIN="$native_bin" \
   CAPTURE_PATH="$capture_path" GOLDEN_PATH="$golden_path" \
+  ATHENA_RELEASE_SYSTEM_PYTHON="$system_python" \
   bash -c '
     set -euo pipefail
+    system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
     wait_for_presentation() {
-      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" python3 - <<'PY'
+      PRESENTATION_PATH="$1" MIN_SEQUENCE="$2" EXPECTED_WIDTH="$3" EXPECTED_HEIGHT="$4" "$system_python" - <<'PY'
 import json
 import os
 import time
@@ -70,7 +73,7 @@ PY
     xdotool windowfocus --sync "$window"
     xdotool windowsize --sync "$window" 1280 800
     wait_for_presentation "$sync_path" 1 1280 800
-    sequence="$(SYNC_PATH="$sync_path" python3 - <<'PY'
+    sequence="$(SYNC_PATH="$sync_path" "$system_python" - <<'PY'
 import json
 import os
 from pathlib import Path

@@ -195,3 +195,17 @@ async def test_inspect_survives_service_without_usage_store(capsys):
     assert code == 0
     assert "fake/fake-standard" in out
     assert "<no inference records>" not in out
+
+
+@pytest.mark.asyncio
+async def test_inspect_does_not_hide_provider_recovery_read_failure(capsys):
+    class _UnavailableRecoveryService(_Service):
+        async def list_provider_outcome_recoveries(self, task_id):
+            raise OSError("database is unavailable")
+
+    code = await run_inspect(_UnavailableRecoveryService(_Task(), []), "task-1")
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert "provider outcome recovery is unavailable" in captured.err
+    assert "liability state is not certified" in captured.out

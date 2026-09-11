@@ -30,7 +30,12 @@ from athena.capabilities.artifacts import ArtifactCapability
 from athena.capabilities.workflow import WorkflowCapability
 from athena.capabilities.synthesis import SynthesisCapability
 from athena.capabilities.scratch import ScratchCapability
-from athena.capabilities.research import ResearchCapability
+from athena.capabilities.research import (
+    BraveSearchProvider,
+    HttpDiscoveryProvider,
+    ResearchCapability,
+    TavilySearchProvider,
+)
 from athena.capabilities.maintain import MaintenanceCapability
 from athena.capabilities.git import GitCapability
 from athena.capabilities.observer import ObserverCapability
@@ -56,6 +61,9 @@ __all__ = [
     "SynthesisCapability",
     "ScratchCapability",
     "ResearchCapability",
+    "HttpDiscoveryProvider",
+    "BraveSearchProvider",
+    "TavilySearchProvider",
     "MaintenanceCapability",
     "GitCapability",
     "ObserverCapability",

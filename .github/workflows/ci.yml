@@ -12,8 +12,12 @@ permissions:
 
 jobs:
   normal:
-    runs-on: ubuntu-24.04
+    # The native companion promises imported GLIBC symbols <= 2.34. Build it
+    # on the compatible Ubuntu 22.04 baseline; sandbox preparation below is
+    # still required for the generated-capability tests.
+    runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
@@ -27,24 +31,64 @@ jobs:
         uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315 # 1.85.0
       - name: Install uv
         run: python -m pip install uv==0.11.21
+      - name: Prepare Bubblewrap sandbox
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            bubblewrap libx11-dev libxft-dev libgl1-mesa-dev
+
+          # Bubblewrap needs unprivileged user namespaces.
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+          # Ubuntu 24.04+ AppArmor otherwise blocks Bubblewrap's network setup.
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+          command -v bwrap
+          bwrap --version
+          bwrap \
+            --die-with-parent \
+            --new-session \
+            --unshare-pid \
+            --unshare-net \
+            --proc /proc \
+            --dev /dev \
+            --ro-bind /usr /usr \
+            --ro-bind /bin /bin \
+            --ro-bind /lib /lib \
+            --ro-bind /lib64 /lib64 \
+            /usr/bin/true
       - name: Bootstrap locked Rust dependencies
         run: cargo fetch --manifest-path native/Cargo.toml --locked
-      - name: Run release checks
+      - name: Run ordinary CI checks
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          scripts/release-check --sha "$GITHUB_SHA" --skip-e2e
+          make check
 
   # This lane is intentionally protected: it needs a real X11/WM environment
   # for the desktop acceptance suite. Hermes is an optional integration and
-  # is certified by a separate job below.
+  # is certified by a separate job below. Python 3.12 is the beta certification
+  # interpreter; Python 3.13 remains compatibility-tested by ordinary CI until
+  # a protected release lane is added for it.
   core-release-certification:
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' ||
       startsWith(github.ref, 'refs/tags/'))
-    runs-on: ubuntu-24.04
+    # Keep release builds on the GLIBC-compatible baseline used by the native
+    # artifact policy; Ubuntu 24.04 emits newer imported symbols.
+    runs-on: ubuntu-22.04
     environment: core-release
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -56,10 +100,47 @@ jobs:
         uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315 # 1.85.0
       - name: Install protected desktop dependencies
         run: |
+          set -euo pipefail
+
           sudo apt-get update
-          sudo apt-get install -y imagemagick xdotool xvfb openbox
+          sudo apt-get install -y \
+            bubblewrap libx11-dev libxft-dev libgl1-mesa-dev \
+            imagemagick xdotool xvfb openbox xclip x11-utils python3-xlib ripgrep
+
+          # Bubblewrap needs unprivileged user namespaces.
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+          # Ubuntu 24.04+ AppArmor otherwise blocks Bubblewrap's network setup.
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+          command -v bwrap
+          bwrap --version
+          bwrap \
+            --die-with-parent \
+            --new-session \
+            --unshare-pid \
+            --unshare-net \
+            --proc /proc \
+            --dev /dev \
+            --ro-bind /usr /usr \
+            --ro-bind /bin /bin \
+            --ro-bind /lib /lib \
+            --ro-bind /lib64 /lib64 \
+            /usr/bin/true
       - name: Install uv
         run: python -m pip install uv==0.11.21
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.4
+      - name: Check cosign
+        run: cosign version
       - name: Record runner identity
         run: |
           mkdir -p "$RUNNER_TEMP/athena-release-evidence"
@@ -74,6 +155,9 @@ jobs:
       - name: Run protected release checks
         env:
           PYTHONUNBUFFERED: "1"
+          ATHENA_COSIGN: cosign
+          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
         run: |
           xvfb-run -a -s '-screen 0 1920x1080x24 -ac' \
             bash -ceu '
@@ -82,6 +166,8 @@ jobs:
               trap "kill $wm_pid 2>/dev/null || true" EXIT
               scripts/release-check \
                 --sha "$GITHUB_SHA" \
+                --bootstrap \
+                --defer-signing \
                 --evidence-dir "$RUNNER_TEMP/athena-release-evidence"
             '
       - name: Upload certified release artifacts and evidence
@@ -89,6 +175,62 @@ jobs:
         with:
           name: athena-release-core-${{ github.sha }}
           path: ${{ runner.temp }}/athena-release-evidence
+
+  release-signer:
+    # Only this minimal job receives OIDC signing authority. It consumes the
+    # frozen evidence payload; it does not build, test, or execute the release.
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/')) &&
+      needs.core-release-certification.result == 'success'
+    needs: [core-release-certification]
+    runs-on: ubuntu-24.04
+    environment: core-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.4
+      - name: Download unsigned certified evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: athena-release-core-${{ github.sha }}
+          path: release-evidence
+      - name: Sign the complete certification payload
+        env:
+          ATHENA_COSIGN: cosign
+          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          set -euo pipefail
+          root="release-evidence/$GITHUB_SHA/$GITHUB_RUN_ID"
+          scripts/sign-release-provenance \
+            "$root/release-provenance.json" \
+            "$root/release-provenance.sig"
+          python scripts/create-certification-manifest \
+            --evidence-dir "$root" \
+            --source-sha "$GITHUB_SHA" \
+            --release-run-id "$GITHUB_RUN_ID" \
+            --output "$root/release-certification-manifest.json"
+          scripts/sign-release-provenance \
+            "$root/release-certification-manifest.json" \
+            "$root/release-certification.sig"
+      - name: Upload signed certification payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: athena-release-signed-${{ github.sha }}
+          path: release-evidence
 
   # Hermes is an optional read-only self-host supervision integration. Its
   # live evidence is opt-in and is never a prerequisite for core publication.
@@ -142,8 +284,8 @@ jobs:
     if: >-
       github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/') &&
-      needs.core-release-certification.result == 'success'
-    needs: [core-release-certification]
+      needs.release-signer.result == 'success'
+    needs: [release-signer]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -155,13 +297,34 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.4
+      - name: Check cosign
+        run: cosign version
       - name: Download protected certified artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: athena-release-core-${{ github.sha }}
+          name: athena-release-signed-${{ github.sha }}
           path: release-evidence
       - name: Verify certified identity, manifest, and hashes
+        env:
+          ATHENA_COSIGN: cosign
+          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
         run: |
+          root="release-evidence/$GITHUB_SHA/$GITHUB_RUN_ID"
+          python scripts/verify-release-provenance \
+            "$root/release-provenance.json" \
+            "$root/release-provenance.sig" \
+            --certificate "$root/release-provenance.crt" \
+            --metadata "$root/release-provenance-verification.json"
+          python scripts/verify-release-provenance \
+            "$root/release-certification-manifest.json" \
+            "$root/release-certification.sig" \
+            --certificate "$root/release-certification.crt" \
+            --metadata "$root/release-certification-verification.json"
           python scripts/verify-release-evidence \
             --evidence-dir release-evidence \
             --sha "$GITHUB_SHA" \

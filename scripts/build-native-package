@@ -7,7 +7,7 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/athena-uv-cache}"
 # This script is also invoked directly by the release lane before the main
 # distribution build.  ``--no-sync`` can leave the shared release venv empty,
 # so provision the declared locked build dependency here as well.
-build_python=(uv run --frozen --extra dev python)
+build_python=("${ATHENA_RELEASE_UV:-uv}" run --frozen --extra dev python)
 
 output_dir="dist"
 if [[ "${1:-}" == "--output-dir" ]]; then

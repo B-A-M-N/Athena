@@ -8,6 +8,15 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import tomllib
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from athena.release.provenance import (  # noqa: E402
+    ProvenanceVerificationError,
+    verify_provenance,
+)
 
 
 def sha256(path: Path) -> str:
@@ -21,6 +30,135 @@ def sha256(path: Path) -> str:
 def fail(message: str) -> int:
     print(f"verify-release-evidence: FAIL {message}", file=sys.stderr)
     return 1
+
+
+CERTIFICATION_EXCLUDED = {
+    "release-certification-manifest.json",
+    "release-certification.sig",
+    "release-certification.crt",
+    "release-certification-verification.json",
+    "release-provenance-verification.json",
+}
+
+
+def _load_release_policy() -> dict[str, object]:
+    path = REPO_ROOT / "scripts" / "release-policy-v1.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("release policy is not an object")
+    return value
+
+
+def _check_certification_root(
+    evidence: Path,
+    *,
+    commit_sha: str,
+    release_run_id: str,
+) -> str | None:
+    manifest_path = evidence / "release-certification-manifest.json"
+    signature_path = evidence / "release-certification.sig"
+    certificate_path = evidence / "release-certification.crt"
+    verification_path = evidence / "release-certification-verification.json"
+    if (
+        not manifest_path.is_file()
+        or not signature_path.is_file()
+        or not signature_path.stat().st_size
+    ):
+        return "releasable evidence has no certification-root signature"
+    if not verification_path.is_file():
+        return "certification-root verification record is missing"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        verification = json.loads(verification_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"invalid certification root: {exc}"
+    try:
+        verified = verify_provenance(
+            manifest_path,
+            signature_path,
+            certificate=certificate_path if certificate_path.is_file() else None,
+        )
+    except ProvenanceVerificationError as exc:
+        return str(exc)
+    if not isinstance(verification, dict) or verification.get("status") != "PASS":
+        return "certification-root verification record is not a PASS"
+    for key in ("mechanism", "cosign_version", "signer_identity", "oidc_issuer", "key_fingerprint"):
+        if verification.get(key) != verified.get(key):
+            return f"certification-root verification metadata mismatch: {key}"
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("kind") != "athena_release_certification_manifest"
+        or manifest.get("schema_version") != 1
+        or manifest.get("source_sha") != commit_sha
+        or manifest.get("release_run_id") != release_run_id
+        or not isinstance(manifest.get("files"), list)
+    ):
+        return "certification-root manifest is not bound to the certified release"
+    expected: dict[str, tuple[str, int]] = {}
+    for item in manifest["files"]:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            return "certification-root file record is malformed"
+        relative = Path(item["path"])
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() in CERTIFICATION_EXCLUDED
+        ):
+            return f"certification-root contains an invalid path: {item['path']}"
+        digest = item.get("sha256")
+        size = item.get("size")
+        if not isinstance(digest, str) or len(digest) != 64 or not isinstance(size, int):
+            return f"certification-root file record is incomplete: {item['path']}"
+        if relative.as_posix() in expected:
+            return f"certification-root contains a duplicate path: {item['path']}"
+        expected[relative.as_posix()] = (digest, size)
+    actual: dict[str, tuple[str, int]] = {}
+    for path in evidence.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(evidence).as_posix()
+        if relative in CERTIFICATION_EXCLUDED:
+            continue
+        actual[relative] = (sha256(path), path.stat().st_size)
+    if expected != actual:
+        return "certification-root does not cover the exact evidence tree"
+    return None
+
+
+def _check_release_lanes(result: dict[str, object]) -> str | None:
+    try:
+        policy = _load_release_policy()
+    except (OSError, ValueError, TypeError) as exc:
+        return f"cannot load release lane policy: {exc}"
+    if result.get("release_policy") != policy.get("policy_version"):
+        return "final result does not identify the configured release lane policy"
+    mandatory = policy.get("mandatory_lanes")
+    allowed_extra = policy.get("allowed_extra_lanes")
+    if not isinstance(mandatory, list) or not all(isinstance(name, str) for name in mandatory):
+        return "release lane policy is malformed"
+    if not isinstance(allowed_extra, list) or not all(
+        isinstance(name, str) for name in allowed_extra
+    ):
+        return "release lane policy extras are malformed"
+    lanes = result.get("lanes")
+    if not isinstance(lanes, list):
+        return "final result lanes are not a list"
+    names: list[str] = []
+    for lane in lanes:
+        if not isinstance(lane, dict) or not isinstance(lane.get("name"), str):
+            return "final result contains a malformed lane record"
+        name = lane["name"]
+        if name in names:
+            return f"release lane appears more than once: {name}"
+        names.append(name)
+        if name not in mandatory and name not in allowed_extra:
+            return f"release lane is not allowed by policy: {name}"
+        if type(lane.get("exit_code")) is not int or lane.get("exit_code") != 0:
+            return f"release lane did not pass: {name}"
+    missing = [name for name in mandatory if name not in names]
+    if missing:
+        return "release result is missing mandatory lanes: " + ", ".join(missing)
+    return None
 
 
 def _check_identity(
@@ -59,6 +197,8 @@ def _check_records(
         )
         if error:
             return error
+        if value.get("exit_code") != 0:
+            return f"{label}[{index}] did not pass"
     return None
 
 
@@ -113,6 +253,15 @@ def main(argv: list[str] | None = None) -> int:
         evidence / "static-checks.json",
         evidence / "pytest-summary.json",
         evidence / "release-scenarios.json",
+        evidence / "backend-passport.json",
+        evidence / "toolchain-passport.json",
+        evidence / "support-matrix.json",
+        evidence / "release-sbom.spdx.json",
+        evidence / "rust-supply-chain.json",
+        evidence / "cargo-deny-bootstrap.json",
+        evidence / "release-provenance-verification.json",
+        evidence / "release-certification-manifest.json",
+        evidence / "release-certification-verification.json",
     )
     for path in required_json:
         if not path.is_file():
@@ -130,6 +279,20 @@ def main(argv: list[str] | None = None) -> int:
         static_checks = json.loads((evidence / "static-checks.json").read_text(encoding="utf-8"))
         pytest_summary = json.loads((evidence / "pytest-summary.json").read_text(encoding="utf-8"))
         scenarios = json.loads((evidence / "release-scenarios.json").read_text(encoding="utf-8"))
+        backend_passport = json.loads(
+            (evidence / "backend-passport.json").read_text(encoding="utf-8")
+        )
+        toolchain_passport = json.loads(
+            (evidence / "toolchain-passport.json").read_text(encoding="utf-8")
+        )
+        support_matrix = json.loads((evidence / "support-matrix.json").read_text(encoding="utf-8"))
+        sbom = json.loads((evidence / "release-sbom.spdx.json").read_text(encoding="utf-8"))
+        rust_supply_chain = json.loads(
+            (evidence / "rust-supply-chain.json").read_text(encoding="utf-8")
+        )
+        cargo_deny_bootstrap = json.loads(
+            (evidence / "cargo-deny-bootstrap.json").read_text(encoding="utf-8")
+        )
     except (OSError, ValueError) as exc:
         return fail(f"invalid evidence JSON: {exc}")
 
@@ -149,10 +312,172 @@ def main(argv: list[str] | None = None) -> int:
 
     if result.get("status") != "PASS" or result.get("releasable") is not True:
         return fail("protected release result is not a releasable PASS")
+    lane_error = _check_release_lanes(result)
+    if lane_error:
+        return fail(lane_error)
+    if identity.get("release_policy") != result.get("release_policy"):
+        return fail("release identity and final result use different release policies")
+    certification_error = _check_certification_root(
+        evidence,
+        commit_sha=args.sha,
+        release_run_id=release_run_id,
+    )
+    if certification_error:
+        return fail(certification_error)
+    provenance_path = evidence / "release-provenance.json"
+    signature_path = evidence / "release-provenance.sig"
+    certificate_path = evidence / "release-provenance.crt"
+    verification_path = evidence / "release-provenance-verification.json"
+    if (
+        not provenance_path.is_file()
+        or not signature_path.is_file()
+        or not signature_path.stat().st_size
+    ):
+        return fail("releasable evidence has no signed release provenance payload")
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        verification = json.loads(verification_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return fail(f"invalid release provenance: {exc}")
+    try:
+        verified = verify_provenance(
+            provenance_path,
+            signature_path,
+            certificate=certificate_path if certificate_path.is_file() else None,
+        )
+    except ProvenanceVerificationError as exc:
+        return fail(str(exc))
+    if not isinstance(verification, dict) or verification.get("status") != "PASS":
+        return fail("release provenance verification record is not a PASS")
+    for key in ("mechanism", "cosign_version", "signer_identity", "oidc_issuer", "key_fingerprint"):
+        if verification.get(key) != verified.get(key):
+            return fail(f"release provenance verification metadata mismatch: {key}")
+    if not isinstance(provenance, dict):
+        return fail("release provenance is not an object")
+    if provenance.get("kind") != "athena_release_provenance":
+        return fail("release provenance kind is invalid")
+    if provenance.get("source_sha") != args.sha:
+        return fail("release provenance source does not match certified SHA")
+    if provenance.get("release_run_id") != release_run_id:
+        return fail("release provenance run does not match certified run")
+    if provenance.get("manifest_sha256") != sha256(manifest_path):
+        return fail("release provenance manifest hash does not match evidence")
+    provenance_artifacts = provenance.get("artifacts")
+    if not isinstance(provenance_artifacts, list) or not provenance_artifacts:
+        return fail("release provenance has no artifact hashes")
+    for item in provenance_artifacts:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            return fail("release provenance artifact record is malformed")
+        artifact = evidence / item["path"]
+        if not artifact.is_file() or sha256(artifact) != item.get("sha256"):
+            return fail(f"release provenance artifact hash mismatch: {item.get('path')}")
+    actual_provenance_paths = {
+        f"distributions/{path.relative_to(artifact_dir).as_posix()}"
+        for path in artifact_dir.rglob("*")
+        if path.is_file()
+    }
+    if {str(item.get("path")) for item in provenance_artifacts} != actual_provenance_paths:
+        return fail("release provenance does not cover exactly the certified distributions")
     if result.get("commit_sha") != args.sha:
         return fail("result commit does not match certified SHA")
     if result.get("release_run_id") != release_run_id:
         return fail("result release run does not match certified run")
+    passport_error = _check_identity(
+        backend_passport,
+        label="backend passport",
+        commit_sha=args.sha,
+        release_run_id=release_run_id,
+        source_key="release_sha",
+    )
+    if passport_error:
+        return fail(passport_error)
+    if (
+        backend_passport.get("kind") != "athena_backend_passport"
+        or backend_passport.get("status") != "PASS"
+        or not isinstance(backend_passport.get("cells"), list)
+        or not backend_passport["cells"]
+    ):
+        return fail("backend passport is not a complete PASS")
+    for index, cell in enumerate(backend_passport["cells"]):
+        if not isinstance(cell, dict) or cell.get("passed") is not True:
+            return fail(f"backend passport cell [{index}] did not pass")
+        if cell.get("unverified_claims"):
+            return fail(f"backend passport cell [{index}] has unverified claims")
+    if (
+        not isinstance(toolchain_passport, dict)
+        or toolchain_passport.get("kind") != "athena_toolchain_passport"
+        or toolchain_passport.get("status") != "PASS"
+        or toolchain_passport.get("release_sha") != args.sha
+        or toolchain_passport.get("release_run_id") != release_run_id
+    ):
+        return fail("toolchain passport is not a bound PASS")
+    if toolchain_passport.get("policy_errors") != [] or not isinstance(
+        toolchain_passport.get("policy"), dict
+    ):
+        return fail("toolchain passport does not prove the configured toolchain policy")
+    lock_hashes = toolchain_passport.get("lock_hashes")
+    if (
+        not isinstance(lock_hashes, dict)
+        or lock_hashes.get("cargo_lock_sha256") != manifest.get("cargo_lock_sha256")
+        or lock_hashes.get("uv_lock_sha256") != manifest.get("uv_lock_sha256")
+    ):
+        return fail("toolchain passport lock hashes do not match the release manifest")
+    if (
+        not isinstance(rust_supply_chain, dict)
+        or rust_supply_chain.get("status") != "PASS"
+        or rust_supply_chain.get("source_sha") != args.sha
+        or rust_supply_chain.get("release_run_id") != release_run_id
+        or not isinstance(cargo_deny_bootstrap, dict)
+        or cargo_deny_bootstrap.get("status") != "PASS"
+        or cargo_deny_bootstrap.get("version") != "0.20.2"
+    ):
+        return fail("Rust supply-chain/bootstrap evidence is not a bound PASS")
+    if not isinstance(support_matrix, dict):
+        return fail("generated support matrix is not an object")
+    matrix_binding = support_matrix.get("release_binding")
+    generated_from = support_matrix.get("generated_from")
+    behavioral_evidence = (
+        generated_from.get("behavioral_evidence") if isinstance(generated_from, dict) else None
+    )
+    passport_evidence = (
+        behavioral_evidence.get("backend_passport")
+        if isinstance(behavioral_evidence, dict)
+        else None
+    )
+    if (
+        support_matrix.get("generated_by") != "scripts/generate-support-matrix"
+        or matrix_binding != {"source_sha": args.sha, "release_run_id": release_run_id}
+        or not isinstance(generated_from, dict)
+        or generated_from.get("release_sha") != args.sha
+        or generated_from.get("release_run_id") != release_run_id
+        or not isinstance(passport_evidence, dict)
+        or passport_evidence.get("status") != "PASS"
+    ):
+        return fail("generated support matrix is not bound to the certified backend passport")
+    surfaces = support_matrix.get("surfaces")
+    if not isinstance(surfaces, dict) or not surfaces:
+        return fail("generated support matrix has no surfaces")
+    for name, surface in surfaces.items():
+        proof = surface.get("proof") if isinstance(surface, dict) else None
+        if (
+            not isinstance(surface, dict)
+            or surface.get("implementation_status") not in {"implemented", "partial"}
+            or surface.get("certification_status") != "certified"
+            or not isinstance(surface.get("certified_versions"), list)
+            or not surface.get("certified_versions")
+            or not isinstance(surface.get("certified_platforms"), list)
+            or not surface.get("certified_platforms")
+            or not isinstance(surface.get("evidence_lane"), list)
+            or not surface.get("evidence_lane")
+            or not isinstance(surface.get("evidence_receipt"), dict)
+            or surface["evidence_receipt"].get("source_sha") != args.sha
+            or surface["evidence_receipt"].get("release_run_id") != release_run_id
+            or surface["evidence_receipt"].get("status") != "PASS"
+            or not isinstance(proof, dict)
+            or proof.get("status") != "certified"
+            or not proof.get("evidence")
+        ):
+            return fail(f"support surface {name} is not certified by executable evidence")
     if manifest.get("source_sha") != args.sha:
         return fail("manifest source does not match certified SHA")
     if manifest.get("release_run_id") != release_run_id:
@@ -161,8 +486,164 @@ def main(argv: list[str] | None = None) -> int:
         return fail("identity commit does not match certified SHA")
     if identity.get("skip_e2e") is not False:
         return fail("certified evidence skipped installed-artifact acceptance")
+    if identity.get("include_endurance") is not True:
+        return fail("releasable evidence must include the mandatory beta endurance lane")
+    endurance_path = evidence / "endurance-receipt.json"
+    if not endurance_path.is_file():
+        return fail("mandatory endurance receipt is missing")
+    try:
+        endurance = json.loads(endurance_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return fail(f"invalid endurance receipt: {exc}")
+    try:
+        endurance_duration = float(endurance.get("duration_hours") or 0)
+    except (AttributeError, TypeError, ValueError):
+        endurance_duration = 0.0
+    if (
+        not isinstance(endurance, dict)
+        or endurance.get("kind") != "athena_endurance_receipt"
+        or endurance.get("status") != "PASS"
+        or endurance.get("source_sha") != args.sha
+        or endurance.get("release_run_id") != release_run_id
+        or endurance_duration < 0.5
+    ):
+        return fail("endurance receipt is not a bound 30-minute PASS")
     if manifest.get("source_status") != "frozen-clean":
         return fail("artifact manifest does not identify a frozen clean source")
+    sbom_record = manifest.get("sbom")
+    if not isinstance(sbom_record, dict):
+        return fail("artifact manifest has no SBOM record")
+    if sbom_record.get("path") != "release-sbom.spdx.json":
+        return fail("artifact manifest SBOM path is not the certified evidence file")
+    sbom_binding = sbom.get("athenaBinding")
+    if not isinstance(sbom_binding, dict):
+        return fail("SBOM has no Athena source binding")
+    if sbom_binding.get("source_sha") != args.sha:
+        return fail("SBOM source binding does not match certified SHA")
+    if sbom_binding.get("cargo_lock_sha256") != manifest.get("cargo_lock_sha256"):
+        return fail("SBOM Cargo.lock binding does not match manifest")
+    if sbom_binding.get("uv_lock_sha256") != manifest.get("uv_lock_sha256"):
+        return fail("SBOM uv.lock binding does not match manifest")
+    packages = sbom.get("packages")
+    python_packages = (
+        [
+            package
+            for package in packages
+            if isinstance(package, dict)
+            and str(package.get("SPDXID", "")).startswith("SPDXRef-Python-")
+        ]
+        if isinstance(packages, list)
+        else []
+    )
+    if not python_packages or sbom_record.get("python_package_count") != len(python_packages):
+        return fail("SBOM does not enumerate the locked Python dependency set")
+    native_packages = (
+        [
+            package
+            for package in packages
+            if isinstance(package, dict)
+            and package.get("SPDXID") == "SPDXRef-AthenaNativeDistribution"
+        ]
+        if isinstance(packages, list)
+        else []
+    )
+    if len(native_packages) != 1 or sbom_record.get("native_distribution_count") != 1:
+        return fail("SBOM does not enumerate the native companion distribution")
+    for package in [*python_packages, *native_packages]:
+        license_declared = package.get("licenseDeclared")
+        license_metadata = package.get("athena_license_metadata")
+        if not isinstance(license_declared, str) or not license_declared.strip():
+            return fail(f"SBOM package has no license declaration: {package.get('name')}")
+        if not isinstance(license_metadata, dict) or not isinstance(
+            license_metadata.get("source"), str
+        ):
+            return fail(f"SBOM package has no license provenance: {package.get('name')}")
+        if (
+            not isinstance(package.get("downloadLocation"), str)
+            or not package["downloadLocation"].strip()
+        ):
+            return fail(f"SBOM package has no source location: {package.get('name')}")
+    allowed_scopes = {"project", "python-runtime-direct", "python-transitive"}
+    for package in python_packages:
+        scope = package.get("athena_dependency_scope")
+        if not isinstance(scope, str) or not (
+            scope in allowed_scopes or scope.startswith("python-optional-direct:")
+        ):
+            return fail(
+                f"SBOM Python package has an invalid dependency scope: {package.get('name')}"
+            )
+    uv_lock_path = REPO_ROOT / "uv.lock"
+    if uv_lock_path.is_file() and sha256(uv_lock_path) == manifest.get("uv_lock_sha256"):
+        try:
+            uv_lock = tomllib.loads(uv_lock_path.read_text(encoding="utf-8"))
+            expected_python = {
+                (str(item.get("name")), str(item.get("version")))
+                for item in uv_lock.get("package", [])
+                if isinstance(item, dict)
+            }
+            actual_python = {
+                (str(item.get("name")), str(item.get("versionInfo"))) for item in python_packages
+            }
+        except (OSError, ValueError, TypeError) as exc:
+            return fail(f"cannot inspect the locked Python dependency set: {exc}")
+        if actual_python != expected_python:
+            return fail("SBOM Python components differ from uv.lock")
+        expected_project = "athena-agent"
+        locked_packages = {
+            (str(item.get("name")), str(item.get("version"))): item
+            for item in uv_lock.get("package", [])
+            if isinstance(item, dict)
+        }
+        for package in python_packages:
+            name = str(package.get("name"))
+            if name == expected_project:
+                if package.get("athena_dependency_scope") != "project":
+                    return fail("SBOM Athena project package has the wrong scope")
+                continue
+            checksums = package.get("checksums")
+            if not isinstance(checksums, list) or not any(
+                isinstance(item, dict)
+                and item.get("algorithm") == "SHA256"
+                and isinstance(item.get("checksumValue"), str)
+                and len(item["checksumValue"]) == 64
+                for item in checksums
+            ):
+                return fail(f"SBOM Python package has no lock checksum: {name}")
+            locked = locked_packages.get((name, str(package.get("versionInfo"))), {})
+            expected_hashes = set()
+            sdist = locked.get("sdist")
+            if isinstance(sdist, dict) and isinstance(sdist.get("hash"), str):
+                expected_hashes.add(sdist["hash"].removeprefix("sha256:"))
+            for wheel in locked.get("wheels", []) or []:
+                if isinstance(wheel, dict) and isinstance(wheel.get("hash"), str):
+                    expected_hashes.add(wheel["hash"].removeprefix("sha256:"))
+            recorded_hashes = {
+                str(item.get("checksumValue"))
+                for item in checksums
+                if isinstance(item, dict) and item.get("algorithm") == "SHA256"
+            }
+            if expected_hashes.isdisjoint(recorded_hashes):
+                return fail(f"SBOM Python package checksum is not present in uv.lock: {name}")
+    native_artifact_path = native_packages[0].get("athena_artifact_path")
+    native_checksums = native_packages[0].get("checksums")
+    if isinstance(native_artifact_path, str) and isinstance(native_checksums, list):
+        native_artifact = evidence / native_artifact_path
+        expected_native_sha = next(
+            (
+                item.get("checksumValue")
+                for item in native_checksums
+                if isinstance(item, dict) and item.get("algorithm") == "SHA256"
+            ),
+            None,
+        )
+        if (
+            not native_artifact.is_file()
+            or not isinstance(expected_native_sha, str)
+            or sha256(native_artifact) != expected_native_sha
+        ):
+            return fail("SBOM native companion checksum does not match its artifact")
+    if sha256(evidence / "release-sbom.spdx.json") != sbom_record.get("sha256"):
+        return fail("SBOM SHA-256 does not match the artifact manifest")
 
     for label, payload in (
         ("optional integrations", optional_integrations),
@@ -216,6 +697,37 @@ def main(argv: list[str] | None = None) -> int:
         return fail(error)
     if not static_checks.get("lanes"):
         return fail("static checks have no lane records")
+    desktop_lane = next(
+        (
+            lane
+            for lane in result.get("lanes", [])
+            if lane.get("name") == "native-desktop-acceptance"
+        ),
+        None,
+    )
+    if isinstance(desktop_lane, dict) and int(desktop_lane.get("exit_code") or 0) == 0:
+        desktop_path = evidence / "native-desktop-acceptance.json"
+        if not desktop_path.is_file():
+            return fail("desktop acceptance PASS has no native desktop receipt")
+        try:
+            desktop = json.loads(desktop_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return fail(f"invalid native desktop receipt: {exc}")
+        if (
+            not isinstance(desktop, dict)
+            or desktop.get("kind") != "athena_native_desktop_receipt"
+            or desktop.get("status") != "PASS"
+            or desktop.get("source_sha") != args.sha
+            or desktop.get("release_run_id") != release_run_id
+            or not desktop.get("display")
+            or not desktop.get("session_type")
+            or not desktop.get("wm")
+            or not desktop.get("xserver")
+            or not desktop.get("window_strategy")
+            or "active_strategy" not in desktop
+            or "fallback_reason" not in desktop
+        ):
+            return fail("native desktop receipt lacks a complete X11/WM environment identity")
     error = _check_identity(
         pytest_summary.get("lane"),
         label="pytest lane",

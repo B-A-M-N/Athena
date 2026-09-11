@@ -17,6 +17,8 @@ budget pressure like any other droppable block.
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
+
 from athena.protocol.messages import (
     ContentBlock,
     Provenance,
@@ -48,9 +50,23 @@ class MCPPromptProvider:
 
     def __init__(self, clients: dict[str, MCPClient] | None = None) -> None:
         self._clients: dict[str, MCPClient] = dict(clients or {})
+        self._policies: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
 
-    def add_client(self, connection_id: str, client: MCPClient) -> None:
+    def add_client(
+        self,
+        connection_id: str,
+        client: MCPClient,
+        *,
+        allowed: tuple[str, ...] = (),
+        denied: tuple[str, ...] = (),
+    ) -> None:
         self._clients[connection_id] = client
+        self._policies[connection_id] = (tuple(allowed), tuple(denied))
+
+    def remove_client(self, connection_id: str) -> None:
+        """Remove a dead connection so prompts are not advertised stale."""
+        self._clients.pop(str(connection_id), None)
+        self._policies.pop(str(connection_id), None)
 
     async def available(self) -> list[MCPPromptRef]:
         """Discover prompts across all connected servers (live query)."""
@@ -62,6 +78,8 @@ class MCPPromptProvider:
             except Exception:
                 continue  # discovery is best-effort; one dead server stays dead
             for ref in refs:
+                if not self._visible(connection_id, ref.name):
+                    continue
                 key = (ref.server or connection_id, ref.name)
                 if key in seen:
                     continue
@@ -83,6 +101,8 @@ class MCPPromptProvider:
         budget pressure, and never authority.
         """
         client = self._pick(connection_id, name)
+        if not self._visible(client.connection_id, name):
+            raise LookupError(f"MCP prompt {name!r} is not exposed by policy")
         messages = await client.get_prompt(name, arguments or {})
         provenance = mcp_prompt_provenance(client.connection_id, name)
         blocks: list[ContentBlock] = []
@@ -114,13 +134,24 @@ class MCPPromptProvider:
             client = self._clients.get(connection_id)
             if client is None:
                 raise LookupError(f"unknown MCP connection: {connection_id}")
+            if not self._visible(connection_id, name):
+                raise LookupError(f"MCP prompt {name!r} is not exposed by policy")
             return client
         if len(self._clients) == 1:
             return next(iter(self._clients.values()))
         for client in self._clients.values():
-            if any(ref.name == name for ref in (getattr(client, "_prompt_cache", None) or ())):
+            cache = getattr(client, "_prompt_cache", None) or {}
+            if self._visible(client.connection_id, name) and (
+                name in cache or any(ref.name == name for ref in cache.values())
+            ):
                 return client
         raise LookupError("cannot resolve MCP prompt; specify connection_id or list prompts first")
+
+    def _visible(self, connection_id: str, name: str) -> bool:
+        allowed, denied = self._policies.get(connection_id, ((), ()))
+        if any(fnmatchcase(str(name), pattern) for pattern in denied):
+            return False
+        return not allowed or any(fnmatchcase(str(name), pattern) for pattern in allowed)
 
 
 __all__ = ["MCPPromptProvider", "mcp_prompt_provenance"]

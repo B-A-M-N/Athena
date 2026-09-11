@@ -39,6 +39,7 @@ class PackState:
     installed_at: str
     source_integrity: str
     health: str = "unknown"
+    provenance: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def id(self) -> str:
@@ -51,6 +52,7 @@ class PackState:
             "enabled": self.enabled,
             "installed_at": self.installed_at,
             "health": self.health,
+            "provenance": dict(self.provenance),
         }
 
 

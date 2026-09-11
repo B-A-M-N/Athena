@@ -1,0 +1,100 @@
+{
+  "schema": 2,
+  "product": "athena-agent",
+  "release_channel": "beta",
+  "generated_by": "scripts/support-matrix-check",
+  "support_contract": {
+    "python_certified_version": "3.12",
+    "python_compatibility_only_versions": ["3.13"],
+    "native_certification_cell": "linux-x86_64-x11-openbox",
+    "certification_rule": "A surface is certified only by a passing release-bound evidence run; this checked-in contract is not itself certification evidence."
+  },
+  "generated_from": {
+    "contracts": [
+      "pyproject.toml",
+      "uv.lock",
+      "src/athena/mcp/sdk_compat.py",
+      "src/athena/models/compat/anthropic_sdk.py",
+      "src/athena/execution/conformance.py",
+      "scripts/backend-passport",
+      "scripts/generate-support-matrix",
+      "scripts/endurance-runner",
+      "src/athena/release/gates.py"
+    ],
+    "proof_policy": "implementation claims are separate from release certification; certified claims require a passing executable release lane"
+  },
+  "surfaces": {
+    "python": {
+      "claimed_versions": ["3.12"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "release-check:python-version",
+      "proof": {"status": "not_certified", "evidence": []}
+    },
+    "mcp": {
+      "claimed_versions": ["2.1.1"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "mcp-streamable-http-and-stdio-e2e",
+      "proof": {"status": "not_certified", "evidence": []}
+    },
+    "anthropic_sdk": {
+      "claimed_versions": ["1.0.0"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "locked-sdk-compatibility-tests",
+      "proof": {"status": "not_certified", "evidence": []}
+    },
+    "native": {
+      "claimed_versions": ["beta"],
+      "claimed_platforms": ["linux-x86_64-x11-openbox"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "native-check-and-native-test",
+      "proof": {"status": "not_certified", "evidence": []}
+    },
+    "remote_packs": {
+      "claimed_versions": ["https-with-operator-pinned-sha256"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "pack-provenance-tests",
+      "proof": {"status": "not_certified", "evidence": []}
+    },
+    "rollback": {
+      "claimed_versions": ["durable-pack-upgrade", "frozen-artifact-reinstall"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "release-black-box-and-upgrade-tests",
+      "proof": {"status": "not_certified", "evidence": []}
+    },
+    "execution_backend_passport": {
+      "claimed_versions": ["local-supervised:python", "local-supervised:shell", "local-supervised:node"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "release-check:backend-passport",
+      "proof": {"status": "not_certified", "evidence": []}
+    },
+    "endurance": {
+      "claimed_versions": ["beta-30-minute"],
+      "claimed_platforms": ["linux-x86_64"],
+      "implementation_status": "implemented",
+      "certification_status": "not_certified",
+      "verification": "release-check:mandatory-endurance",
+      "proof": {"status": "not_certified", "evidence": []}
+    }
+  },
+  "unsupported_claims": [
+    "macOS and non-Linux native certification without a matching release lane",
+    "MCP SDK versions other than the exact locked beta pin",
+    "Anthropic SDK versions other than the exact locked beta pin",
+    "credentialed non-loopback HTTP",
+    "unsigned release provenance",
+    "unverified model-originated pack installation"
+  ]
+}

@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from athena.service.service import AthenaService
+from athena.service.task_api import TaskAPI
 from athena.protocol.capabilities import (
     CapabilityRequest,
     CapabilityRequestOrigin,
@@ -60,6 +61,152 @@ async def test_submit_records_one_canonical_user_turn_before_enqueue(service):
     assert len(user_turns) == 1
     assert user_turns[0].metadata["task_id"] == spec.id
     assert user_turns[0].text() == "remember this intake"
+
+
+async def test_created_intake_is_restart_reconcilable_after_canonical_write_crash(
+    service, monkeypatch
+):
+    request = _req("recover this interrupted intake")
+    request = type(request)(prompt=request.prompt, session_id="session-intake-crash")
+    spec = service._build_task_spec(request, request.session_id)
+    original = service._record_canonical_user_turn
+
+    async def crash(*args, **kwargs):
+        raise RuntimeError("crash between task row and canonical turn")
+
+    monkeypatch.setattr(service, "_record_canonical_user_turn", crash)
+    with pytest.raises(RuntimeError, match="canonical turn"):
+        await service._enqueue_spec(
+            service._task_manager,
+            spec,
+            wait=False,
+            user_request=request,
+        )
+
+    created = await service._store_tasks.get(spec.id)
+    assert created is not None
+    assert created["status"] == TaskStatus.CREATED.value
+    assert created["metadata"]["_intake_phase"] == "task_created"
+
+    monkeypatch.setattr(service, "_record_canonical_user_turn", original)
+    result = await service._reconcile_created_intake()
+    assert result == {"recovered": 1, "quarantined": 0, "skipped": 0}
+
+    recovered = await service._store_tasks.get(spec.id)
+    assert recovered is not None
+    assert recovered["status"] != TaskStatus.CREATED.value
+    assert recovered["metadata"]["_intake_phase"] == "enqueued"
+    messages = await service._store_messages.list_session_messages(spec.session_id)
+    canonical = [
+        message
+        for message in messages
+        if (message.metadata or {}).get("canonical_user_turn") is True
+    ]
+    assert len(canonical) == 1
+    assert canonical[0].id == f"msg_user_{spec.id}"
+
+
+async def test_existing_created_task_retries_the_same_intake_protocol(service, monkeypatch):
+    request = _req("retry the same durable intake")
+    request = type(request)(prompt=request.prompt, session_id="session-intake-existing")
+    spec = service._build_task_spec(request, request.session_id)
+    original = service._record_canonical_user_turn
+
+    async def crash(*args, **kwargs):
+        raise RuntimeError("canonical turn write interrupted")
+
+    monkeypatch.setattr(service, "_record_canonical_user_turn", crash)
+    with pytest.raises(RuntimeError, match="canonical turn"):
+        await service._enqueue_spec(
+            service._task_manager,
+            spec,
+            wait=False,
+            user_request=request,
+        )
+
+    monkeypatch.setattr(service, "_record_canonical_user_turn", original)
+    retried = await service._enqueue_spec(
+        service._task_manager,
+        spec,
+        wait=False,
+        user_request=request,
+    )
+
+    assert retried.id == spec.id
+    row = await service._store_tasks.get(spec.id)
+    assert row is not None and row["status"] != TaskStatus.CREATED.value
+    messages = await service._store_messages.list_session_messages(spec.session_id)
+    canonical = [
+        message
+        for message in messages
+        if (message.metadata or {}).get("canonical_user_turn") is True
+    ]
+    assert len(canonical) == 1
+    assert canonical[0].id == f"msg_user_{spec.id}"
+
+
+async def test_created_intake_recovers_after_enqueue_failure(service, monkeypatch):
+    request = _req("recover after enqueue failure")
+    request = type(request)(prompt=request.prompt, session_id="session-intake-enqueue")
+    spec = service._build_task_spec(request, request.session_id)
+    original_enqueue = service._task_manager.enqueue
+
+    async def crash(task_id):
+        raise RuntimeError("enqueue interrupted")
+
+    monkeypatch.setattr(service._task_manager, "enqueue", crash)
+    with pytest.raises(RuntimeError, match="enqueue interrupted"):
+        await service._enqueue_spec(
+            service._task_manager,
+            spec,
+            wait=False,
+            user_request=request,
+        )
+
+    created = await service._store_tasks.get(spec.id)
+    assert created is not None
+    assert created["status"] == TaskStatus.CREATED.value
+    assert created["metadata"]["_intake_phase"] == "canonical_user_turn_persisted"
+
+    monkeypatch.setattr(service._task_manager, "enqueue", original_enqueue)
+    result = await service._reconcile_created_intake()
+    assert result == {"recovered": 1, "quarantined": 0, "skipped": 0}
+    recovered = await service._store_tasks.get(spec.id)
+    assert recovered is not None
+    assert recovered["status"] != TaskStatus.CREATED.value
+    assert recovered["metadata"]["_intake_phase"] == "enqueued"
+
+
+async def test_intake_remains_queued_if_phase_receipt_fails_after_enqueue(service, monkeypatch):
+    request = _req("recover after enqueue receipt failure")
+    request = type(request)(prompt=request.prompt, session_id="session-intake-receipt")
+    spec = service._build_task_spec(request, request.session_id)
+    original_mark = TaskAPI._mark_intake_phase
+
+    async def crash_after_enqueue(owner, task_id, phase):
+        if phase == "enqueued":
+            raise RuntimeError("enqueue receipt interrupted")
+        await original_mark(owner, task_id, phase)
+
+    monkeypatch.setattr(TaskAPI, "_mark_intake_phase", crash_after_enqueue)
+    with pytest.raises(RuntimeError, match="enqueue receipt interrupted"):
+        await service._enqueue_spec(
+            service._task_manager,
+            spec,
+            wait=False,
+            user_request=request,
+        )
+
+    row = await service._store_tasks.get(spec.id)
+    assert row is not None
+    assert row["status"] != TaskStatus.CREATED.value
+    messages = await service._store_messages.list_session_messages(spec.session_id)
+    canonical = [
+        message
+        for message in messages
+        if (message.metadata or {}).get("canonical_user_turn") is True
+    ]
+    assert len(canonical) == 1
 
 
 def _req(prompt: str):

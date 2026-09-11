@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Provision the exact cargo-deny release used by the Rust supply-chain lane.
+# The digest is intentionally checked after installation: a version string
+# alone is not a toolchain identity.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+output_dir="${ATHENA_CARGO_DENY_BOOTSTRAP_DIR:-$repo_root/.release-toolchain/cargo-deny}"
+if [[ "${1:-}" == "--output-dir" ]]; then
+  output_dir="${2:-}"
+fi
+[[ -n "$output_dir" ]] || {
+  printf '%s\n' 'bootstrap-cargo-deny: usage: --output-dir DIRECTORY' >&2
+  exit 2
+}
+
+policy_file="native/cargo-deny-build-policy.json"
+version_file="native/cargo-deny.version"
+system_python="${ATHENA_RELEASE_SYSTEM_PYTHON:-python3}"
+expected_version="$("$system_python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["cargo_deny_version"])' "$policy_file")"
+[[ "$(tr -d '[:space:]' < "$version_file")" == "$expected_version" ]] || {
+  printf '%s\n' 'bootstrap-cargo-deny: FAIL — cargo-deny version declarations disagree' >&2
+  exit 1
+}
+expected_mode="$("$system_python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["install_mode"])' "$policy_file")"
+[[ "$expected_mode" == "cargo-install-locked" ]] || {
+  printf '%s\n' 'bootstrap-cargo-deny: FAIL — unsupported cargo-deny build policy' >&2
+  exit 1
+}
+binary="$output_dir/bin/cargo-deny"
+mkdir -p "$output_dir"
+
+if [[ ! -x "$binary" ]]; then
+  cargo install cargo-deny --version "$expected_version" --locked --root "$output_dir"
+fi
+
+[[ -x "$binary" ]] || {
+  printf '%s\n' 'bootstrap-cargo-deny: FAIL — cargo install produced no cargo-deny binary' >&2
+  exit 1
+}
+actual_version="$("$binary" --version | awk 'NR==1 {print $2}')"
+[[ "$actual_version" == "$expected_version" ]] || {
+  printf 'bootstrap-cargo-deny: FAIL — expected %s, found %s\n' "$expected_version" "${actual_version:-unknown}" >&2
+  exit 1
+}
+actual_digest="$(sha256sum "$binary" | awk '{print $1}')"
+rustc_verbose="$(rustc -vV)"
+cargo_version="$(cargo --version)"
+
+receipt="${ATHENA_CARGO_DENY_RECEIPT:-$output_dir/cargo-deny-bootstrap.json}"
+mkdir -p "$(dirname "$receipt")"
+uv_bin="${ATHENA_RELEASE_UV:-uv}"
+ATHENA_RELEASE_UV="$uv_bin" "$uv_bin" run --frozen --extra dev python - \
+  "$receipt" "$binary" "$expected_version" "$actual_digest" "$rustc_verbose" "$cargo_version" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+output, executable, version, digest, rustc_verbose, cargo_version = sys.argv[1:]
+Path(output).write_text(
+    json.dumps(
+        {
+            "kind": "athena_cargo_deny_bootstrap",
+            "status": "PASS",
+            "version": version,
+            "executable": str(Path(executable).resolve()),
+            "executable_sha256": digest,
+            "source": "cargo-install-locked",
+            "cargo_version": cargo_version,
+            "rustc_verbose": rustc_verbose,
+            "binary_digest_scope": "this-platform-and-toolchain",
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+printf 'bootstrap-cargo-deny: PASS — %s (%s)\n' "$binary" "$actual_digest"

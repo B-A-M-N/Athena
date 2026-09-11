@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -211,6 +212,54 @@ async def test_anthropic_stream_accumulates_reasoning_text_and_tool_call():
     assert done.usage.output_tokens == 20
     assert done.metadata["provider_profile_id"] == "anthropic-hosted"
     assert done.metadata["provider_profile_fingerprint"] == "fp-anthropic"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sdk_path_uses_compat_client_and_custom_headers(monkeypatch):
+    """The SDK route must use the same configured headers as REST."""
+    import anthropic
+
+    from athena.models.compat import anthropic_sdk
+
+    captured: dict[str, object] = {}
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            captured["request"] = kwargs
+            return SimpleNamespace(
+                id="msg-sdk",
+                stop_reason="end_turn",
+                content=[SimpleNamespace(type="text", text="sdk response")],
+                usage=SimpleNamespace(input_tokens=3, output_tokens=2),
+            )
+
+    class FakeClient:
+        messages = FakeMessages()
+
+        async def close(self):
+            captured["closed"] = True
+
+    def build(_sdk, **kwargs):
+        assert _sdk is anthropic
+        captured["headers"] = dict(kwargs["headers"])
+        captured["trust_env"] = kwargs["trust_env"]
+        return FakeClient()
+
+    monkeypatch.setattr(anthropic_sdk, "build_async_client", build)
+    provider = AnthropicProvider(
+        api_key="test-key",
+        headers={"X-Tenant": "tenant-a"},
+        use_sdk=True,
+        trust_env=False,
+    )
+    events = [event async for event in provider.complete(_request())]
+
+    assert events[-1].response is not None
+    assert events[-1].response.blocks[0].text == "sdk response"
+    assert captured["headers"] == {"X-Tenant": "tenant-a"}
+    assert captured["trust_env"] is False
+    assert captured["request"]["model"] == "claude-test"
+    assert captured["closed"] is True
 
 
 def test_anthropic_usage_total_includes_cache_subdivisions():

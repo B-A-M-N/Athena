@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Emit a release-bound behavioral passport for the local execution backend."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from athena.execution.conformance import run_backend_passport  # noqa: E402
+from athena.execution.manager import ExecutionManager  # noqa: E402
+from athena.execution.runtimes import NodeRuntime, PythonRuntime, ShellRuntime  # noqa: E402
+from athena.execution.runtime_host import (  # noqa: E402
+    LocalRuntimeSupervisor,
+    SupervisedLocalBackend,
+)
+
+
+def _validate_interpreter() -> str:
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    requires_python = str(project["project"]["requires-python"])
+    version = sys.version_info[:3]
+    if version < (3, 12) or version >= (3, 14):
+        raise RuntimeError(
+            f"backend passport requires {requires_python}; refusing {sys.executable} "
+            f"({platform.python_version()})"
+        )
+    return requires_python
+
+
+def _release_sha() -> str:
+    configured = os.environ.get("ATHENA_RELEASE_SHA")
+    if configured:
+        return configured
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+async def _run(args: argparse.Namespace) -> int:
+    requires_python = _validate_interpreter()
+    # The supervised host is a separate Python process.  Make the checkout
+    # importable there when this script is run directly from a source tree;
+    # release-check already supplies the same binding for its frozen checkout.
+    source_path = str(REPO_ROOT / "src")
+    os.environ["PYTHONPATH"] = source_path + (
+        os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""
+    )
+    manager = ExecutionManager()
+    manager.register_runtime(PythonRuntime())
+    manager.register_runtime(ShellRuntime())
+    if NodeRuntime is not None and NodeRuntime.available():
+        manager.register_runtime(NodeRuntime())
+    probe_root = tempfile.TemporaryDirectory(prefix="athena-backend-passport-")
+    workspace_root = Path(probe_root.name) / "workspace"
+    workspace_root.mkdir()
+    supervisor = LocalRuntimeSupervisor(str(Path(probe_root.name) / "runtime-host"))
+    manager.register_backend(SupervisedLocalBackend(supervisor))
+    try:
+        passport = await run_backend_passport(
+            manager,
+            backend=args.backend,
+            release_sha=_release_sha(),
+            environment={
+                "python": platform.python_version(),
+                "requires_python": requires_python,
+                "platform": platform.platform(),
+                "executable": sys.executable,
+                "runtimes": manager.available_runtimes(),
+            },
+            require_all_claims=args.require_all_claims,
+            workspace_root=str(workspace_root),
+            release_run_id=os.environ.get("ATHENA_RELEASE_RUN_ID"),
+        )
+        record = passport.to_record()
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps(record, sort_keys=True))
+        return 0 if passport.status == "PASS" else 1
+    finally:
+        await manager.close_all()
+        probe_root.cleanup()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", default="local-supervised")
+    parser.add_argument("--output", default="backend-passport.json")
+    parser.add_argument("--require-all-claims", action="store_true")
+    args = parser.parse_args()
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

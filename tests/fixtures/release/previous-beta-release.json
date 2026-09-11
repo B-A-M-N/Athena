@@ -1,0 +1,30 @@
+{
+  "release": "0.1.0b1",
+  "source_sha": "5a402414de71c650aef9b18c002f19f206ae7f6a",
+  "schema_migration_version": "038",
+  "schema_fixture": "previous-beta-schema.sql",
+  "schema_fixture_sha256": "29907f04a2859cbe160b776ffd954fc0aa3ab7e92ae14a70583ec33f3641984b",
+  "schema_fingerprint_sha256": "1667375befab68da2ac0d575fae2db86451c92a9c22c730fdc356adb803a566e",
+  "schema_object_count": 51,
+  "migration_manifest": "previous-beta-migration-digests.json",
+  "migration_manifest_sha256": "8b3954e7c30d4ed3f03bb6becd07b3bd5ebc287951da7c9fc4b92159bc5d2d0f",
+  "generation_command": "scripts/generate-previous-release-fixture --wheel retained/athena_agent-0.1.0b1-py3-none-any.whl --source-sha 5a402414de71c650aef9b18c002f19f206ae7f6a --output previous-beta-schema.sql --metadata previous-beta-release.json --migration-manifest previous-beta-migration-digests.json",
+  "previous_release_artifacts": {
+    "python_wheel": {
+      "name": "athena_agent-0.1.0b1-py3-none-any.whl",
+      "sha256": "347cd8cfe44817e2264d25e4ac1ec9399d4faa452a18a97093ca25c1655a3dab"
+    },
+    "source_distribution": {
+      "name": "athena_agent-0.1.0b1.tar.gz",
+      "sha256": "7966fd40d6132f4b5bc41a346d20250920fe4161e2c94635ab98649733dbe8de"
+    }
+  },
+  "purpose": "clean-install-upgrade-rollback starts from the database produced by the previous beta wheel",
+  "upgrade_contract": {
+    "previous_schema_is_artifact_derived": true,
+    "must_apply_new_migrations": true,
+    "must_retry_failed_migration": true,
+    "must_preserve_existing_rows": true,
+    "must_exercise_application_repositories": true
+  }
+}

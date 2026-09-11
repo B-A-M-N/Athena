@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 import time
+import hashlib
 
 # Identity prefixes per the implementation spec.
 _PREFIXES = {
@@ -55,4 +56,13 @@ def fake_id(kind: str, n: int = 1) -> str:
     return f"{kind}_{n:010d}"
 
 
-__all__ = ["new_id", "fake_id"]
+def stable_id(kind: str, *parts: object) -> str:
+    """Create a deterministic opaque identifier from stable identity parts."""
+    digest = hashlib.sha256("\x1f".join(str(part) for part in parts).encode("utf-8")).hexdigest()[
+        :32
+    ]
+    prefix = _PREFIXES.get(kind, kind)
+    return f"{prefix}_{digest}"
+
+
+__all__ = ["new_id", "fake_id", "stable_id"]

@@ -131,6 +131,11 @@ async def test_local_research_discover_capture_evidence_and_contradiction(tmp_pa
                 "excerpt": "status=ready",
             },
         )
+        assert (
+            first_evidence["evidence"]["metadata"]["source_content_hash"]
+            == first_source["content_hash"]
+        )
+        assert first_evidence["evidence"]["metadata"]["excerpt_hash"]
         second_evidence = await invoke(
             "evidence-b",
             {
@@ -147,6 +152,14 @@ async def test_local_research_discover_capture_evidence_and_contradiction(tmp_pa
         )
         assert verified["status"] == "verified"
         assert second_evidence["evidence"]["contradicts"] == [first_evidence["evidence"]["id"]]
+
+        critique = await invoke(
+            "critique",
+            {"operation": "critique", "min_independent_groups": 2},
+        )
+        assert critique["contradiction_evidence_ids"] == [second_evidence["evidence"]["id"]]
+        assert critique["single_group_warning"] is True
+        assert critique["meets_independence_threshold"] is False
 
         bundle = await invoke("bundle", {"operation": "bundle", "limit": 10})
         assert {item["id"] for item in bundle["sources"]} == {

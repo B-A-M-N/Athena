@@ -73,6 +73,8 @@ class KnowledgePipeline:
         # enough for a durable memory or reusable procedure.
         if _memory_learning_eligible(task, transcript, successful_calls, result):
             await self._ingest_memory(task, result, transcript=transcript)
+        if str(status) == "COMPLETE":
+            await self._ingest_job_memory(task, result)
         if _skill_learning_eligible(task, transcript, successful_calls):
             await self._propose_skill(task, result, transcript=transcript)
         # A partial task can contain useful history for memory/skill review,
@@ -314,6 +316,75 @@ class KnowledgePipeline:
                     await compact(512)
             except Exception as exc:
                 _logger.warning("pending memory candidate retention failed: %s", exc)
+
+    async def _ingest_job_memory(self, task: Any, result: Any) -> None:
+        """Persist compact, successful recurring-job state in JOB scope.
+
+        This is intentionally separate from ordinary lesson candidates: only
+        schedules that explicitly selected ``job_memory`` can create it, and
+        the record is bounded to the last few occurrences so a recurring job
+        cannot grow an unbounded transcript-shaped memory stream.
+        """
+        if self._memory is None:
+            return
+        metadata = getattr(task, "metadata", None) or {}
+        lineage = metadata.get("_schedule_lineage") if isinstance(metadata, Mapping) else None
+        if not isinstance(lineage, Mapping) or lineage.get("continuity") != "job_memory":
+            return
+        job_id = str(lineage.get("job_id") or "").strip()
+        if not job_id:
+            return
+        try:
+            from athena.memory.store import new_memory_id
+            from athena.protocol.memory import MemoryKind, MemoryScope, MemoryRecord
+            from athena.protocol.messages import Provenance, SourceType, TrustClass
+
+            status = getattr(result.status, "value", result.status)
+            unresolved = tuple(str(item) for item in (getattr(result, "unresolved", ()) or ()))
+            summary = str(getattr(result, "summary", "") or "").strip()
+            content = (
+                f"scheduled job {job_id} completed: {summary[:1200]}"
+                + (f"; unresolved: {', '.join(unresolved[:8])}" if unresolved else "")
+            )[:2000]
+            record = MemoryRecord(
+                id=new_memory_id(MemoryKind.EPISODIC),
+                kind=MemoryKind.EPISODIC,
+                scope=MemoryScope.JOB,
+                content=content,
+                summary="compact successful scheduled-job state",
+                source=Provenance(
+                    source_type=SourceType.TASK,
+                    source_id=str(getattr(task, "id", "")),
+                    trust=TrustClass.AGENT_CURATED,
+                    scope=f"job:{job_id}",
+                ),
+                trust=TrustClass.AGENT_CURATED,
+                metadata={
+                    "scope_id": job_id,
+                    "job_id": job_id,
+                    "task_id": getattr(task, "id", None),
+                    "status": status,
+                    "promotion": "automatic_job_state",
+                    "candidate_type": "scheduled_job_state",
+                    "pending_promotion": False,
+                },
+            )
+            await self._memory.save_with_outcome(record)
+            list_by_scope = getattr(self._memory, "list_by_scope", None)
+            delete = getattr(self._memory, "delete", None)
+            if callable(list_by_scope) and callable(delete):
+                existing = await list_by_scope(MemoryScope.JOB, job_id)
+                states = [
+                    item
+                    for item in existing
+                    if (getattr(item, "metadata", {}) or {}).get("candidate_type")
+                    == "scheduled_job_state"
+                ]
+                states.sort(key=lambda item: (getattr(item, "created_at", utcnow()), item.id))
+                for stale in states[:-8]:
+                    await delete(stale.id)
+        except Exception as exc:
+            _logger.warning("scheduled job memory ingestion failed: %s", exc)
 
     async def _propose_skill(
         self, task: Any, result: Any, *, transcript: list[Any] | None = None

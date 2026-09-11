@@ -11,13 +11,12 @@ wants a whole response.
 from __future__ import annotations
 
 import json
-import ipaddress
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
 import math
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
-from urllib.parse import urlsplit
-
 import httpx
 
 from athena.models.compat.candidates import ToolCallCandidate, record_raw_candidate
@@ -57,6 +56,8 @@ from athena.protocol.models import (
     PrivacyClass,
     UsageInfo,
 )
+from athena.network import validate_endpoint
+from athena.network.endpoint_security import headers_are_credentialed, merge_provider_headers
 
 _logger = logging.getLogger("athena.provider.openai_compat")
 
@@ -72,25 +73,6 @@ _ROLE_MAP: dict[Role, str] = {
     # generic fallback silently turn a digest into ordinary user input.
     Role.COMPRESSION: "user",
 }
-
-
-def _is_loopback_host(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-def _is_local_host(host: str) -> bool:
-    if _is_loopback_host(host):
-        return True
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return address.is_private or address.is_link_local
 
 
 def _reported_cost_usd(raw: Any) -> float | None:
@@ -230,17 +212,30 @@ class OpenAICompatProvider:
         cost: CostInfo | Mapping[str, object] | None = None,
         latency_class: str | None = None,
         vision: bool = False,
+        audio_input: bool = False,
+        audio_output: bool = False,
+        allow_insecure_remote: bool = False,
+        trust_env: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.provider = provider
         self._privacy_class = privacy_class
-        self._api_key_configured = bool(api_key)
+        configured_headers = dict(headers or {})
+        self._api_key_configured = bool(api_key) or headers_are_credentialed(configured_headers)
         if authentication is not None:
             authentication = authentication.strip().casefold()
             if authentication not in {"none", "bearer", "required"}:
                 raise ValueError("authentication must be one of: none, bearer, required")
         self._authentication = authentication
+        endpoint = validate_endpoint(
+            self.base_url,
+            credentialed=(self._api_key_configured or authentication in {"bearer", "required"}),
+            allow_insecure_remote=allow_insecure_remote,
+            trust_env=trust_env,
+        )
+        self._endpoint_classification = endpoint.classification
+        self._trust_env = endpoint.trust_env
         if isinstance(cost, Mapping):
             cost = CostInfo(
                 per_1m_input=_optional_float(cost.get("per_1m_input")),
@@ -252,10 +247,25 @@ class OpenAICompatProvider:
         self._cost = cost
         self._latency_class = latency_class
         self._vision = bool(vision)
+        self._audio_input = bool(audio_input)
+        self._audio_output = bool(audio_output)
+        self.voice_capabilities = frozenset(
+            capability
+            for capability, enabled in (
+                ("transcription", self._audio_input),
+                ("synthesis", self._audio_output),
+            )
+            if enabled
+        )
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             http2=http2,
-            headers={"Authorization": f"Bearer {api_key}", **(headers or {})},
+            trust_env=self._trust_env,
+            headers=merge_provider_headers(
+                {"Authorization": f"Bearer {api_key}"} if api_key else {},
+                configured_headers,
+                protected=("Authorization",),
+            ),
         )
         # P2-67: per-instance stream tracking — multiple configured
         # OpenAI-compatible routes must not share cancellation bookkeeping.
@@ -269,21 +279,22 @@ class OpenAICompatProvider:
                 streaming=True,
                 tool_calling=True,
                 vision=self._vision,
+                audio_input=self._audio_input,
+                audio_output=self._audio_output,
                 privacy_class=self._privacy_class,
                 cost=self._cost,
                 latency_class=self._latency_class,
             )
         ]
 
-    def readiness(self) -> dict[str, str | bool]:
-        host = (urlsplit(self.base_url).hostname or "").lower()
-        local = _is_local_host(host)
+    def readiness(self) -> dict[str, Any]:
+        local = self._endpoint_classification != "public"
         authentication = self._authentication
         if authentication is None:
             # Loopback is the only automatic no-credential default. Private
             # and link-local topology is reported as local but still requires
             # explicit authentication policy or a bearer credential.
-            authentication = "none" if _is_loopback_host(host) else "required"
+            authentication = "none" if self._endpoint_classification == "loopback" else "required"
         if authentication != "none" and not self._api_key_configured:
             return {
                 "state": "auth_missing",
@@ -296,12 +307,19 @@ class OpenAICompatProvider:
             "kind": "openai-compatible",
             "local": local,
             "authentication": authentication,
+            "voice_capabilities": sorted(self.voice_capabilities),
         }
 
     async def complete(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         payload = self._build_request(request)
+        headers = {}
+        idempotency_key = request.metadata.get("idempotency_key")
+        if idempotency_key:
+            headers["Idempotency-Key"] = str(idempotency_key)
         try:
-            async with self._client.stream("POST", self.base_url + _PATH, json=payload) as resp:
+            async with self._client.stream(
+                "POST", self.base_url + _PATH, json=payload, headers=headers or None
+            ) as resp:
                 if resp.status_code >= 400:
                     raise await self._map_err(resp)
                 # Register active stream for cancellation
@@ -330,6 +348,70 @@ class OpenAICompatProvider:
             self._active_streams.pop(request_id, None)
         else:
             _logger.info("cancel requested for request %s (no active stream)", request_id)
+
+    async def transcribe_audio(
+        self,
+        data: bytes,
+        *,
+        filename: str,
+        mime_type: str,
+        model: str,
+        language: str | None = None,
+    ) -> str | dict[str, Any]:
+        """Call the OpenAI-compatible speech-to-text endpoint.
+
+        This is deliberately a provider capability rather than a second
+        model-provider registry. VoiceManager selects the already configured
+        provider and keeps credentials inside this adapter.
+        """
+        form: dict[str, str] = {"model": model}
+        if language:
+            form["language"] = language
+        try:
+            response = await self._client.post(
+                self.base_url + "/audio/transcriptions",
+                files={"file": (filename, data, mime_type)},
+                data=form,
+            )
+            if response.status_code >= 400:
+                raise await self._map_err(response)
+            return await self._read_json(response)
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeout(f"{self.provider} transcription timed out", cause=exc) from exc
+        except httpx.RequestError as exc:
+            raise ProviderUnavailable(
+                f"{self.provider} transcription endpoint unreachable: {exc}", cause=exc
+            ) from exc
+
+    async def synthesize_audio(
+        self,
+        text: str,
+        *,
+        model: str,
+        voice: str,
+        response_format: str,
+    ) -> bytes:
+        """Call the OpenAI-compatible text-to-speech endpoint."""
+        payload = {
+            "model": model,
+            "input": text,
+            "voice": voice,
+            "response_format": response_format,
+        }
+        try:
+            response = await self._client.post(
+                self.base_url + "/audio/speech",
+                json=payload,
+            )
+            if response.status_code >= 400:
+                raise await self._map_err(response)
+            return response.content
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeout(f"{self.provider} speech synthesis timed out", cause=exc) from exc
+        except httpx.RequestError as exc:
+            raise ProviderUnavailable(
+                f"{self.provider} speech endpoint unreachable: {exc}", cause=exc
+            ) from exc
 
     # -- translation (provider-specific shape lives only here) -----------------
     def _build_request(self, request: ModelRequest) -> dict[str, Any]:
@@ -677,7 +759,10 @@ class OpenAICompatProvider:
         if code in (401, 403):
             return ProviderAuthenticationError(message)
         if code == 429:
-            return ProviderRateLimitError(message)
+            return ProviderRateLimitError(
+                message,
+                retry_after=_retry_after_seconds(resp.headers.get("Retry-After")),
+            )
         if code == 400 and ("context" in body.lower() or "max tokens" in body.lower()):
             return ContextOverflow(message)
         if code == 404:
@@ -694,6 +779,21 @@ def _optional_float(value: object) -> float | None:
         return float(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _retry_after_seconds(value: object) -> float | None:
+    try:
+        return max(0.0, float(str(value))) if value is not None else None
+    except (TypeError, ValueError):
+        if value is None:
+            return None
+        try:
+            parsed = parsedate_to_datetime(str(value))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 __all__ = ["OpenAICompatProvider", "parse_tool_arguments", "serialize_tool_result"]

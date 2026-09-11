@@ -21,6 +21,7 @@ pseudocode (BUILDSPEC §§17-18):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 from dataclasses import dataclass, field, replace
@@ -36,6 +37,7 @@ from athena.models.router import (
 )
 from athena.protocol.errors import (
     ContextIntegrityError,
+    ProviderOutcomeUnknown,
     ProviderError,
     RequestCancelled,
     TaskBudgetExceeded,
@@ -98,7 +100,8 @@ __all__ = ["AgentKernel"]
 
 _logger = logging.getLogger("athena.kernel")
 
-_FALLBACK_ATTEMPTS = 2
+# Hard process-wide safety ceiling; task/role policy may narrow this further.
+_FALLBACK_ATTEMPTS = 8
 
 
 def _bookkeeping_failure(what: str, task: TaskSpec | str | None, exc: BaseException) -> None:
@@ -209,6 +212,7 @@ class RunState:
     cost_known: bool = True
     request_id: str | None = None
     provider: str | None = None
+    inference_attempt_id: str | None = None
     budget_wall_time_remaining_s: float | None = None
     budget_wall_time_checkpoint_s: float = 0.0
     tool_correction_counts: dict[str, int] = field(default_factory=dict)
@@ -313,8 +317,16 @@ def _assistant_message(task: TaskSpec, response: ModelResponse) -> Message:
         metadata["inference_receipt"] = receipt.to_dict()
     except Exception as exc:
         _logger.warning("could not build inference receipt: %s", exc)
+    if response.request_id:
+        identity = hashlib.sha256(
+            f"assistant-response\0{task.id}\0{response.request_id}".encode("utf-8")
+        ).hexdigest()[:32]
+        message_id = f"msg_assistant_{identity}"
+        metadata["response_identity"] = f"{task.id}:{response.request_id}"
+    else:
+        message_id = new_id("msg")
     return Message(
-        id=new_id("msg"),
+        id=message_id,
         role=Role.ASSISTANT,
         blocks=blocks,
         created_at=utcnow(),
@@ -483,14 +495,18 @@ class AgentKernel:
         budgets=None,
         cancellations=None,
         provider_usage_store=None,
+        model_response_store=None,
         continuation_store=None,
         workflow_run_store=None,
         input_request_store=None,
+        steering_store=None,
         parked_slot_wait_s: float = 300.0,
         router: "ModelRouter",
         interpreter=None,
         reality_coordinator: Any = None,
         secret_manager=None,
+        workflow_store=None,
+        workflow_fabric=None,
     ) -> None:
         self._task_store = task_store
         self._events = events
@@ -512,12 +528,14 @@ class AgentKernel:
         self._token_sink = token_sink
         self._dispatch_factory = dispatch_factory
         self._provider_usage_store = provider_usage_store
+        self._model_response_store = model_response_store
         self._continuation_store = continuation_store
         self._workflow_run_store = workflow_run_store
         # Operator-clarification continuation: a model-issued request_input
         # call parks the SAME task in WAITING_INPUT with the question durable;
         # the operator's answer resumes the identical task.
         self._input_request_store = input_request_store
+        self._steering_store = steering_store
         # Worker slot release (P1-17): how long a parked wait (WAITING_INPUT,
         # WAITING_APPROVAL) may hold its worker coroutine. Past this, the run
         # returns with the task left in its paused status and the worker slot
@@ -525,12 +543,16 @@ class AgentKernel:
         # survives, and the resumer (provide_input / approve / startup
         # recovery) relaunches the task on a fresh worker.
         self._parked_slot_wait_s = max(float(parked_slot_wait_s), 0.0)
+        self._parked_resource_releaser = None
+        self._parked_resource_resumption_handler = None
         # Secret manager for runtime secrets supplied via request_input.
         self._secret_manager = secret_manager
         # Reality completion authority: intercepts terminal decisions to bind
         # acceptance evidence to an active candidate branch and promote only
         # proven reality.
         self._reality_coordinator = reality_coordinator
+        self._workflow_store = workflow_store
+        self._workflow_fabric = workflow_fabric
         # Kernel-owned interpreter fusion hook (audit P0.2). The extension
         # itself carries no authority — it receives observations and returns
         # proposals; every subturn and every dispatch routes through the
@@ -561,7 +583,9 @@ class AgentKernel:
         # timeout/notification handoff window.
         self._resume_armed: set[str] = set()
         self._resume_locks: dict[str, asyncio.Lock] = {}
-        self._stored_responses: set[str] = set()
+        # Ephemeral duplicate-append fast path only; durable message receipts
+        # remain the correctness boundary across restarts.
+        self._response_append_cache: set[str] = set()
         self._prefix_trackers: dict[tuple[str, str, str], Any] = {}
 
     def set_budget_tracker(self, budgets) -> None:
@@ -594,6 +618,9 @@ class AgentKernel:
                 await begin_compute(task.id)
                 compute_started = True
             await self._bootstrap(task, state)
+            invocation = (task.metadata or {}).get("_pack_hook_invocation")
+            if invocation is not None:
+                return await self._run_pack_hook_workflow(task, state, invocation)
             return await self._loop(task, state)
         except BudgetStateUnavailable as exc:
             return await self._finalize(
@@ -608,6 +635,123 @@ class AgentKernel:
             self._runs.pop(task_id, None)
             self._resume_armed.discard(task_id)
             completion.set()
+
+    async def _run_pack_hook_workflow(
+        self,
+        task: TaskSpec,
+        state: RunState,
+        invocation: Mapping[str, Any],
+    ) -> TaskResult:
+        """Execute a pack hook's declared workflow without model mediation."""
+        workflow_id = str(invocation.get("workflow_id") or "")
+        pack_id = str(invocation.get("pack_id") or "")
+        if not workflow_id or not pack_id or self._workflow_store is None:
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.FAILED,
+                "pack hook workflow invocation is incomplete",
+            )
+        workspace = task.workspace
+        if workspace is None:
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.FAILED,
+                "pack hook workflow requires a workspace",
+            )
+        try:
+            workflow = await self._workflow_store.get(
+                workflow_id,
+                task_id=task.id,
+                project_id=workspace.id,
+                user_id=None,
+            )
+            if workflow is None:
+                raise ValueError(f"declared pack hook workflow not found: {workflow_id}")
+            provenance = dict(workflow.provenance or {})
+            if provenance.get("pack_id") != pack_id:
+                raise ValueError("pack hook workflow provenance does not match its pack")
+            if not workflow.enabled or workflow.lifecycle_state != "ACTIVE":
+                raise ValueError("declared pack hook workflow is not active")
+            if self._workflow_fabric is None or self._dispatch_factory is None:
+                raise RuntimeError("pack hook workflow execution is not wired")
+
+            from athena.capabilities.workflow import WorkflowCapability
+            from athena.workflows.executor import WorkflowExecutor
+
+            shim = self._dispatch_factory(task)
+            dispatcher = getattr(shim, "_dispatcher", None)
+            if dispatcher is None:
+                raise RuntimeError("pack hook workflow dispatcher is unavailable")
+            workflow_capability = WorkflowCapability(
+                self._workflow_store,
+                dispatcher,
+                self._workflow_fabric,
+                run_store=self._workflow_run_store,
+            )
+            graph = await workflow_capability._load_graph(  # noqa: SLF001
+                workflow,
+                task_id=task.id,
+                project_id=workspace.id,
+                user_id=None,
+            )
+
+            def resolver(identifier):
+                nested = graph.get(identifier)
+                if nested is not None:
+                    return nested
+                return self._workflow_fabric.executor_for(
+                    identifier,
+                    task_id=task.id,
+                    project_id=workspace.id,
+                    user_id=None,
+                ).descriptor
+
+            event_payload = invocation.get("event_payload")
+            inputs = {
+                "event": dict(event_payload) if isinstance(event_payload, Mapping) else {},
+                "event_id": str(invocation.get("event_id") or ""),
+                "hook_id": str(invocation.get("hook_id") or ""),
+                "pack_id": pack_id,
+            }
+            outcome = await WorkflowExecutor(
+                dispatcher,
+                resolver=resolver,
+                run_store=self._workflow_run_store,
+            ).run(
+                graph[workflow.id],
+                task_id=task.id,
+                workspace=workspace,
+                session_id=task.session_id,
+                inputs=inputs,
+                task_policy=task.capability_policy,
+                task_budget=task.resource_budget,
+            )
+            if outcome.suspended is not None:
+                await self._transition(task, TaskStatus.WAITING_APPROVAL)
+                return await self._paused_result(
+                    task,
+                    state,
+                    TaskStatus.WAITING_APPROVAL,
+                    "pack hook workflow is awaiting approval",
+                )
+            if outcome.status == "completed":
+                return await self._finalize(
+                    task,
+                    state,
+                    TaskStatus.COMPLETE,
+                    f"pack hook workflow {workflow.id} completed",
+                )
+            reason = "; ".join(outcome.failures) or f"workflow status: {outcome.status}"
+            return await self._finalize(task, state, TaskStatus.FAILED, reason)
+        except Exception as exc:  # workflow failures become truthful task results
+            return await self._finalize(
+                task,
+                state,
+                TaskStatus.FAILED,
+                f"pack hook workflow failed: {exc}",
+            )
 
     async def wait_for_completion(self, task_id: str, *, timeout: float | None = None) -> None:
         """Wait until the kernel has finished post-result cleanup for a run."""
@@ -659,6 +803,9 @@ class AgentKernel:
                 _bookkeeping_failure("provider stream interrupt", task_id, exc)
 
     async def notify_approval_resolved(self, task_id: str, decision: str) -> bool:
+        cancel_release = getattr(self, "_cancel_parked_resource_release", None)
+        if callable(cancel_release):
+            await cancel_release(task_id)
         self._resume_decision[task_id] = decision
         event = self._resume.setdefault(task_id, asyncio.Event())
         async with self._resume_locks.setdefault(task_id, asyncio.Lock()):
@@ -678,6 +825,9 @@ class AgentKernel:
         # The answer has already been committed by InputRequestStore.  Keep
         # plaintext out of process-local side channels; the durable row is the
         # authority and the event only reduces resume latency.
+        cancel_release = getattr(self, "_cancel_parked_resource_release", None)
+        if callable(cancel_release):
+            await cancel_release(task_id)
         event = self._resume.setdefault(task_id, asyncio.Event())
         async with self._resume_locks.setdefault(task_id, asyncio.Lock()):
             armed = task_id in self._resume_armed
@@ -719,6 +869,36 @@ class AgentKernel:
 
     def _park_wait(self, task, state):
         return ContinuationCoordinator(self)._park_wait(task, state)
+
+    def set_parked_resource_releaser(self, releaser) -> None:
+        """Bind the service-owned parked-resource retention authority."""
+        self._parked_resource_releaser = releaser
+
+    def set_parked_resource_resumption_handler(self, handler) -> None:
+        """Bind cancellation of a delayed parked-resource release."""
+        self._parked_resource_resumption_handler = handler
+
+    async def _cancel_parked_resource_release(self, task_id: str) -> None:
+        handler = self._parked_resource_resumption_handler
+        if not callable(handler):
+            return
+        try:
+            result = handler(task_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # parked cleanup is evidence, not a resume blocker
+            _logger.warning("parked resource release cancellation failed for %s: %s", task_id, exc)
+
+    async def _release_parked_resources(self, task) -> None:
+        releaser = self._parked_resource_releaser
+        if not callable(releaser):
+            return
+        try:
+            outcome = releaser(task.id)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception as exc:  # parked cleanup is evidence, not a crash path
+            _logger.warning("parked resource release failed for %s: %s", task.id, exc)
 
     async def _paused_result(self, task, state, status: TaskStatus, reason: str) -> TaskResult:
         return await RunFinalizer(self)._paused_result(task, state, status, reason)
@@ -790,6 +970,8 @@ class AgentKernel:
                     return approval_result
                 continue
 
+            await self._apply_pending_steering(task)
+
             try:
                 compiled = await self._compile(task)
             except ContextIntegrityError as exc:
@@ -815,6 +997,16 @@ class AgentKernel:
                 return await self._finalize(task, state, TaskStatus.PARTIAL, "deadline exceeded")
             except TaskBudgetExceeded as exc:
                 return await self._finalize(task, state, TaskStatus.PARTIAL, str(exc))
+            except ProviderOutcomeUnknown as exc:
+                attempt_id = state.inference_attempt_id or "unknown"
+                return await self._finalize(
+                    task,
+                    state,
+                    TaskStatus.RECOVERY_REQUIRED,
+                    "provider outcome unknown; recovery required before retry "
+                    f"(attempt={attempt_id}, provider={state.provider or 'unknown'}, "
+                    f"request={state.request_id or 'unknown'}): {exc}",
+                )
             except ProviderError:
                 return await self._finalize(task, state, TaskStatus.FAILED, "model unavailable")
             except Exception as exc:  # kernel never crashes; truthful terminal.
@@ -912,6 +1104,71 @@ class AgentKernel:
                 task,
             )
         return compiled
+
+    async def _apply_pending_steering(self, task: TaskSpec) -> None:
+        """Materialize queued steering as durable user content at a safe boundary."""
+        store = self._steering_store
+        if store is None or not task.session_id:
+            return
+        for item in await store.list_pending(task.id):
+            message_id = f"msg_steer_{item['id']}"
+            source = str(item.get("source") or "").strip().lower()
+            if not source:
+                source = "parent_task" if item.get("source_task_id") else "operator"
+            if source == "parent_task":
+                source_type = SourceType.TASK
+                trust = TrustClass.AGENT_CURATED
+                prefix = "[Parent-task steering for the current task; consider it at this reasoning boundary]\n"
+            elif source == "system":
+                source_type = SourceType.SYSTEM
+                trust = TrustClass.AUTHORITY
+                prefix = "[System steering for the current task]\n"
+            else:
+                source_type = SourceType.USER
+                trust = TrustClass.USER_CONTENT
+                prefix = "[Operator steering for the current task; consider it at this reasoning boundary]\n"
+            message = Message(
+                id=message_id,
+                role=Role.USER,
+                blocks=(
+                    TextBlock(
+                        text=(prefix + str(item["text"])),
+                        provenance=Provenance(
+                            source_type=source_type,
+                            source_id=str(item["id"]),
+                            trust=trust,
+                            scope=f"task:{task.id}",
+                            created_at=utcnow(),
+                        ),
+                    ),
+                ),
+                created_at=utcnow(),
+                provenance=Provenance(
+                    source_type=source_type,
+                    source_id=str(item["id"]),
+                    trust=trust,
+                    scope=f"task:{task.id}",
+                    created_at=utcnow(),
+                ),
+                metadata={
+                    "session_id": task.session_id,
+                    "task_id": task.id,
+                    "steering_id": item["id"],
+                    "source_task_id": item.get("source_task_id"),
+                    "source": source,
+                },
+            )
+            await self._messages.append_user_turn(task.session_id, message)
+            await store.mark_consumed(item["id"])
+            await self._emit(
+                "TaskSteered",
+                {
+                    "steering_id": item["id"],
+                    "principal_id": item["principal_id"],
+                    "source_task_id": item.get("source_task_id"),
+                },
+                task,
+            )
 
     async def _select_model(
         self,
@@ -1225,9 +1482,17 @@ class AgentKernel:
         request: ModelRequest,
         *,
         estimator: ModelTokenEstimator | None = None,
+        request_fingerprint: str | None = None,
+        attempt_id: str | None = None,
     ) -> ModelResponse:
         return await InferenceBroker(self)._consume(
-            task, state, provider, request, estimator=estimator
+            task,
+            state,
+            provider,
+            request,
+            estimator=estimator,
+            request_fingerprint=request_fingerprint,
+            attempt_id=attempt_id,
         )
 
     async def _relay_delta(self, task: TaskSpec, delta: ModelDelta) -> None:
@@ -1500,10 +1765,14 @@ class AgentKernel:
         state.budget_wall_time_checkpoint_s = state.elapsed_ms / 1000
 
     async def _append_response(self, task: TaskSpec, response: ModelResponse) -> None:
-        if response.request_id and response.request_id in self._stored_responses:
+        if response.request_id and response.request_id in self._response_append_cache:
             return
         message = _assistant_message(task, response)
-        await self._messages.append(message)
+        appended = await self._append_assistant_message(message)
+        if not appended:
+            if response.request_id:
+                self._response_append_cache.add(response.request_id)
+            return
         await self._emit(
             "TaskMessage",
             {
@@ -1514,7 +1783,27 @@ class AgentKernel:
             task,
         )
         if response.request_id:
-            self._stored_responses.add(response.request_id)
+            self._response_append_cache.add(response.request_id)
+
+    async def _append_assistant_message(self, message: Message) -> bool:
+        """Persist an assistant response through the durable replay boundary."""
+        append_idempotent = getattr(self._messages, "append_idempotent", None)
+        if append_idempotent is not None:
+            result = bool(await append_idempotent(message))
+            receipt = (message.metadata or {}).get("inference_receipt") or {}
+            provider_metadata = receipt.get("provider_metadata") or {}
+            attempt_id = provider_metadata.get("inference_attempt_id")
+            hook = getattr(self, "_inference_fault_injector", None)
+            if result and hook is not None:
+                value = hook("assistant-message-append")
+                if inspect.isawaitable(value):
+                    await value
+            if attempt_id and self._model_response_store is not None:
+                await self._model_response_store.mark_assistant_appended(str(attempt_id))
+            return result
+        # Narrow compatibility path for test doubles and legacy adapters.
+        await self._messages.append(message)
+        return True
 
     async def _append_final_response(self, task: TaskSpec, response: ModelResponse) -> None:
         return await RunFinalizer(self)._append_final_response(task, response)

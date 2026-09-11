@@ -8,6 +8,7 @@ The model-facing primitive supports structured operations (P0-17):
     delegate.spawn   -> create + enqueue a child, return child id
     delegate.status  -> query child status (RUNNING/COMPLETE/etc.)
     delegate.collect -> wait for and return the child's TaskResult
+    delegate.steer   -> queue bounded guidance for a live child
     delegate.cancel  -> cancel the child
 """
 
@@ -25,7 +26,7 @@ from athena.protocol.capabilities import (
 from athena.protocol.ids import new_id
 from athena.protocol.tasks import ContextRef, TaskStatus
 
-_OPERATIONS = ("spawn", "status", "collect", "cancel")
+_OPERATIONS = ("spawn", "status", "collect", "steer", "cancel")
 
 _INPUT_SCHEMA = {
     "type": "object",
@@ -35,6 +36,7 @@ _INPUT_SCHEMA = {
         "operation": {"type": "string", "enum": list(_OPERATIONS)},
         "objective": {"type": "string", "minLength": 1, "maxLength": 10000},
         "child_task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "text": {"type": "string", "minLength": 1, "maxLength": 12000},
         "timeout": {"type": "number", "minimum": 0, "maximum": 3600},
         "metadata": {"type": "object", "maxProperties": 32},
         "context": {
@@ -79,7 +81,7 @@ _INPUT_SCHEMA = {
     "oneOf": [
         {"properties": {"operation": {"const": "spawn"}}, "required": ["objective"]},
         {
-            "properties": {"operation": {"enum": ["status", "collect", "cancel"]}},
+            "properties": {"operation": {"enum": ["status", "collect", "steer", "cancel"]}},
             "required": ["child_task_id"],
         },
     ],
@@ -92,10 +94,13 @@ class DelegateCapability:
         description=(
             "Delegate a unit of work to a child Task. Supports spawn (create and "
             "enqueue a child, returning its id), status (query the child state), "
-            "collect (wait for and return the child result), and cancel."
+            "collect (wait for and return the child result), steer (queue guidance "
+            "for a live descendant), and cancel."
         ),
         input_schema=_INPUT_SCHEMA,
-        effects=frozenset({EffectClass.READ_LOCAL, EffectClass.SPAWN_PROCESS}),
+        effects=frozenset(
+            {EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL, EffectClass.SPAWN_PROCESS}
+        ),
         tags=frozenset({"delegate", "parallel", "child", "specialist"}),
         origin=CapabilityOrigin.NATIVE,
     )
@@ -139,6 +144,8 @@ class DelegateCapability:
                 return await self._status(request, args, call_id)
             if operation == "collect":
                 return await self._collect(request, args, call_id)
+            if operation == "steer":
+                return await self._steer(request, args, call_id)
             if operation == "cancel":
                 return await self._cancel(request, args, call_id)
             return CapabilityResult(
@@ -282,6 +289,43 @@ class DelegateCapability:
             output=f"cancelled child {child_id}",
             ref_uri=f"task:{child_id}",
             metadata={"operation": "cancel", "child_task_id": child_id, "status": status.value},
+        )
+
+    async def _steer(
+        self, request: CapabilityRequest, args: dict, call_id: str
+    ) -> CapabilityResult:
+        child_id = args.get("child_task_id")
+        text = args.get("text")
+        if not child_id or not text:
+            return CapabilityResult(
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
+                error="delegate.steer requires child_task_id and text",
+            )
+        if not await self._owns_child(request.task_id, child_id):
+            return self._ownership_failure(call_id, child_id)
+        steer = getattr(self._handle, "steer", None)
+        if not callable(steer):
+            return CapabilityResult(
+                call_id,
+                self.descriptor.id,
+                CapabilityResultStatus.FAILED,
+                error="delegation handle does not support steering",
+            )
+        record = await steer(
+            request.task_id,
+            str(child_id),
+            str(text),
+            principal_id=getattr(request, "principal_id", None),
+        )
+        return CapabilityResult(
+            call_id,
+            self.descriptor.id,
+            CapabilityResultStatus.OK,
+            output=f"steering queued for child {child_id}",
+            ref_uri=f"task:{child_id}",
+            metadata={"operation": "steer", **dict(record or {})},
         )
 
     async def _owns_child(self, parent_task_id: str | None, child_id: str) -> bool:

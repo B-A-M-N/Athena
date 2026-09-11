@@ -198,6 +198,13 @@ class ContextRetrieval:
             scopes: list[tuple[MemoryScope, str | None]] = []
             if task.session_id:
                 scopes.append((MemoryScope.SESSION, task.session_id))
+            lineage = (task.metadata or {}).get("_schedule_lineage")
+            if (
+                isinstance(lineage, Mapping)
+                and lineage.get("continuity") == "job_memory"
+                and lineage.get("job_id")
+            ):
+                scopes.append((MemoryScope.JOB, str(lineage["job_id"])))
             scopes.append((MemoryScope.PROJECT, task.workspace.id if task.workspace else None))
             scopes.append((MemoryScope.USER, self._c._principal_id))
             scopes.append((MemoryScope.GLOBAL, None))
@@ -245,6 +252,22 @@ class ContextRetrieval:
                 )
         except Exception as exc:
             self._c._record_degradation("memory", exc, scope="session")
+        lineage = (task.metadata or {}).get("_schedule_lineage")
+        if (
+            isinstance(lineage, Mapping)
+            and lineage.get("continuity") == "job_memory"
+            and lineage.get("job_id")
+        ):
+            try:
+                out.extend(
+                    await store.search(
+                        task.objective,
+                        scope=MemoryScope.JOB,
+                        scope_id=str(lineage["job_id"]),
+                    )
+                )
+            except Exception as exc:
+                self._c._record_degradation("memory", exc, scope="job")
         try:
             out.extend(
                 await store.search(

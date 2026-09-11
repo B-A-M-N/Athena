@@ -1,0 +1,15 @@
+{
+  "fingerprint_version": 2,
+  "format": 2,
+  "packages": {
+    "demo": {
+      "fingerprint_version": 2,
+      "manager": "python",
+      "name": "demo",
+      "record_entry_count": 1,
+      "record_hashes": ["demo.py:sha256=abc"],
+      "record_manifest_sha256": "manifest",
+      "resolved_version": "1.0.0"
+    }
+  }
+}

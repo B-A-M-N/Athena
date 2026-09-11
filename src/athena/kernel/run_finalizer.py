@@ -176,14 +176,19 @@ class RunFinalizer:
         The non-terminal path appends assistant responses so resumed sessions
         see the animated transcript. A final answer (no capability calls) was
         previously never stored, so a resumed session missed it. Persist it here,
-        guarding against double-append via ``_stored_responses``.
+        guarding only the current-process duplicate-append fast path. Durable
+        message receipts remain the correctness boundary across restarts.
         """
-        if response.request_id in self._k._stored_responses:
+        if response.request_id in self._k._response_append_cache:
             return
         message = _assistant_message(task, response)
         if not any((getattr(b, "text", "") or "") for b in message.blocks):
             return
-        await self._k._messages.append(message)
+        appended = await self._k._append_assistant_message(message)
+        if not appended:
+            if response.request_id:
+                self._k._response_append_cache.add(response.request_id)
+            return
         await self._k._emit(
             "TaskMessage",
             {
@@ -193,7 +198,7 @@ class RunFinalizer:
             },
             task,
         )
-        self._k._stored_responses.add(response.request_id)
+        self._k._response_append_cache.add(response.request_id)
 
     async def _append_results(self, task: TaskSpec, blocks, *, calls=()) -> None:
         if not blocks:

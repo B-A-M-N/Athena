@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export UV_CACHE_DIR="${ATHENA_UV_CACHE_DIR:-/tmp/athena-uv-cache}"
+
+# Release-critical async/security surfaces get stricter lint than the broad
+# repository pass. The two async rules below are intentionally excluded:
+# ASYNC109 is a public timeout API shape and ASYNC240 covers audited blocking
+# probes whose ownership is already explicit. New violations in the remaining
+# async rules fail this lane.
+critical=(
+  src/athena/capabilities
+  src/athena/execution
+  src/athena/mcp
+  src/athena/models/providers
+  src/athena/network
+  src/athena/packs
+  src/athena/policy
+  src/athena/service
+  src/athena/state
+)
+
+uv_bin="${ATHENA_RELEASE_UV:-uv}"
+"$uv_bin" run --frozen --extra dev ruff check --no-cache --select B "${critical[@]}"
+"$uv_bin" run --frozen --extra dev ruff check --no-cache \
+  --select ASYNC --ignore ASYNC109,ASYNC240 "${critical[@]}"
+"$uv_bin" run --frozen --extra dev ruff check --no-cache \
+  --select BLE001 \
+  src/athena/mcp/client.py \
+  src/athena/models/providers \
+  src/athena/network \
+  src/athena/packs/manager.py
+
+# BLE001 is deliberately scoped above to integration boundaries where broad
+# recovery is sometimes necessary. Each such catch must carry an inline
+# ``noqa: BLE001`` rationale; this prevents a new catch from silently joining
+# the recovery paths without a reviewable reason.
+"$uv_bin" run --frozen --extra dev python - <<'PY'
+import ast
+from pathlib import Path
+
+roots = (
+    Path("src/athena/mcp/client.py"),
+    Path("src/athena/models/providers"),
+    Path("src/athena/network"),
+    Path("src/athena/packs/manager.py"),
+)
+violations = []
+for root in roots:
+    files = [root] if root.is_file() else sorted(root.rglob("*.py"))
+    for path in files:
+        source = path.read_text(encoding="utf-8").splitlines()
+        tree = ast.parse("\n".join(source), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            is_broad = node.type is None or (
+                isinstance(node.type, ast.Name) and node.type.id in {"Exception", "BaseException"}
+            )
+            if is_broad and "noqa: BLE001" not in source[node.lineno - 1]:
+                violations.append(f"{path}:{node.lineno}: broad exception needs a BLE001 rationale")
+
+if violations:
+    raise SystemExit("\n".join(violations))
+PY
+
+printf '%s\n' 'static-critical: PASS'

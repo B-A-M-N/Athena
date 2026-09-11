@@ -22,6 +22,7 @@ from athena.capabilities.schedule import ScheduleCapability
 from athena.context.compiler import ContextCompiler
 from athena.context.digest import ContextDigestStore
 from athena.execution.container import ContainerBackend
+from athena.execution.ssh import SSHBackend, SSHProfile
 from athena.execution.manager import ExecutionManager
 from athena.execution.runtimes import PythonRuntime
 from athena.execution.runtimes import ShellRuntime
@@ -32,11 +33,13 @@ from athena.kernel.kernel import AgentKernel
 from athena.kernel.termination import TerminationEvaluator
 from athena.knowledge.pipeline import KnowledgePipeline
 from athena.mcp.adapter import MCPAdapter
+from athena.mcp.prompts import MCPPromptProvider
+from athena.mcp.resources import MCPResourceProvider
 from athena.memory.store import MemoryStore
 from athena.memory.embeddings import FastEmbedProvider
 from athena.models.registry import ProviderRegistry
 from athena.packs.store import PackStore
-from athena.policy.credentials import SecretManager
+from athena.policy.credentials import BitwardenSource, OnePasswordSource, SecretManager
 from athena.policy.engine import PolicyEngine
 from athena.project.index.builder import ProjectIndexBuilder
 from athena.project.index.coordinator import ProjectIndexCoordinator
@@ -63,10 +66,12 @@ from athena.state.messages import MessageStore
 from athena.state.mutations import MutationStore
 from athena.state.runtime_sessions import RuntimeSessionStore
 from athena.state.resource_obligations import ResourceObligationStore
+from athena.state.task_finalizations import TaskFinalizationStore
 from athena.state.schedules import ScheduleStore
 from athena.state.self_host import SelfHostMissionStore
 from athena.state.sessions import SessionRepository
 from athena.state.tasks import TaskStore
+from athena.state.steering import TaskSteeringStore
 from athena.state.tool_repairs import ToolRepairStore
 from athena.tasks.budgets import BudgetTracker
 from athena.tasks.cancellation import CancellationManager
@@ -138,8 +143,23 @@ class ServiceLifecycle:
         # 1. State: DB + stores (migrations apply lazily on first query).
         db_path = cfg.db_path or DEFAULT_DB_PATH()
         db = Database(db_path)
-        await db._ensure_ready()  # noqa: SLF001 - apply migrations exactly once, deterministically
         self._svc._db = db
+        try:
+            await db._ensure_ready()  # noqa: SLF001 - apply migrations exactly once, deterministically
+        except Exception as exc:
+            diagnostics = await db.diagnostics()
+            self._svc._startup_health["checks"]["database"] = {
+                "status": "recovery_required",
+                "blocking": True,
+                "error": f"{type(exc).__name__}: {exc}",
+                "diagnostics": diagnostics,
+            }
+            raise
+        self._svc._startup_health["checks"]["database"] = {
+            "status": "ok",
+            "blocking": False,
+            "diagnostics": await db.diagnostics(),
+        }
         self._svc._runtime_state_root = (
             tempfile.mkdtemp(prefix="athena-runtime-")
             if db_path == ":memory:"
@@ -164,9 +184,11 @@ class ServiceLifecycle:
         self._svc._store_mutations = mutations
         self._svc._external_effect_store = ExternalEffectStore(db)
         self._svc._resource_obligation_store = ResourceObligationStore(db)
+        self._svc._pending_finalization_store = TaskFinalizationStore(db)
         self._svc._store_schedules = schedules
         self._svc._store_continuations = continuations
         self._svc._store_input_requests = input_requests
+        self._svc._steering_store = TaskSteeringStore(db)
         from athena.worldstate import WorldStateStore
 
         self._svc._world_state_store = WorldStateStore(db)
@@ -183,6 +205,9 @@ class ServiceLifecycle:
         from athena.state.provider_usage import ProviderUsageStore
 
         self._svc._provider_usage_store = ProviderUsageStore(db)
+        from athena.state.model_responses import ModelResponseStore
+
+        self._svc._model_response_store = ModelResponseStore(db)
         self._svc._project_index_store = ProjectIndexStore(db)
         self._svc._project_index_builder = ProjectIndexBuilder()
         self._svc._project_index_coordinator = ProjectIndexCoordinator(
@@ -193,6 +218,19 @@ class ServiceLifecycle:
 
         # 2. Credentials (SecretManager owns resolution + leases).
         self._svc._secrets = SecretManager()
+        # CLI vaults are explicit opt-ins. Their binaries remain absent from
+        # the default lookup path, but operators can enable either store
+        # without writing its secret into Athena configuration.
+        onepassword_vault = os.environ.get("ATHENA_1PASSWORD_VAULT", "").strip()
+        if onepassword_vault:
+            self._svc._secrets.register_source(OnePasswordSource(vault=onepassword_vault))
+        if os.environ.get("ATHENA_BITWARDEN_ENABLED", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            self._svc._secrets.register_source(BitwardenSource())
         self._svc._configure_hermes_referee()
         await self._svc._preflight_hermes_referee()
 
@@ -205,10 +243,50 @@ class ServiceLifecycle:
             event_sink=self._svc._forward_events(events),
             durability_mandatory=True,
         )
+        if cfg.local_runtime_supervisor:
+            from athena.execution.runtime_host import (
+                LocalRuntimeSupervisor,
+                SupervisedLocalBackend,
+            )
+
+            runtime_host = LocalRuntimeSupervisor(
+                os.path.join(str(self._svc._runtime_state_root), "runtime-host")
+            )
+            execution.set_local_backend(SupervisedLocalBackend(runtime_host))
+            self._svc._runtime_host_supervisor = runtime_host
         # Keep container execution optional, but register the real backend so
         # a workspace selecting ``execution_backend="container"`` reaches the
         # same canonical execution authority as local execution.
         execution.register_backend(ContainerBackend())
+        for backend_name, raw_profile in cfg.execution_backends.items():
+            if str(raw_profile.get("kind", "ssh")).casefold() != "ssh":
+                _logger.warning("unsupported execution backend kind for %s", backend_name)
+                continue
+            try:
+                profile = SSHProfile(
+                    name=str(backend_name),
+                    host=str(raw_profile["host"]),
+                    user=str(raw_profile["user"]),
+                    port=int(raw_profile.get("port", 22)),
+                    credential_id=(
+                        str(raw_profile["credential_id"])
+                        if raw_profile.get("credential_id")
+                        else None
+                    ),
+                    identity_file=(
+                        str(raw_profile["identity_file"])
+                        if raw_profile.get("identity_file")
+                        else None
+                    ),
+                    known_hosts=str(raw_profile["known_hosts"]),
+                    remote_root=str(raw_profile.get("remote_root", "~/athena-workspaces")),
+                    connect_timeout=float(raw_profile.get("connect_timeout", 15.0)),
+                )
+                execution.register_backend(SSHBackend(profile, secret_manager=self._svc._secrets))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"invalid SSH execution backend profile {backend_name!r}: {exc}"
+                ) from exc
         execution.register_runtime(PythonRuntime())
         execution.register_runtime(ShellRuntime())
         if PowerShellRuntime.available():
@@ -222,6 +300,9 @@ class ServiceLifecycle:
         self._svc._tool_repair_store = ToolRepairStore(db)
         self._svc._context_block_store = ContextBlockStore(db)
         self._svc._pack_store = PackStore(db)
+        from athena.state.pack_hooks import PackHookOutbox
+
+        self._svc._pack_hook_outbox = PackHookOutbox(db)
         from athena.packs.manager import PackManager
 
         self._svc._pack_manager = PackManager(
@@ -334,7 +415,10 @@ class ServiceLifecycle:
             budgets=budgets,
             admission=self._svc.require_task_ready,
             principal_id=cfg.cache_namespace,
+            finalizations=self._svc._pending_finalization_store,
+            steering_store=self._svc._steering_store,
         )
+        task_manager.set_model_response_store(self._svc._model_response_store)
         self._svc._task_manager = task_manager
         execution.set_recovery_sink(self._svc._mark_execution_uncertain)
 
@@ -376,6 +460,13 @@ class ServiceLifecycle:
         model_registry = ProviderRegistry()
         self._svc._register_providers(model_registry)
         self._svc._model_registry = model_registry
+        from athena.voice import VoiceManager
+
+        self._svc._voice = VoiceManager(
+            model_registry,
+            cfg.voice,
+            self._svc._artifacts,
+        )
         provider_readiness = model_registry.readiness()
         if provider_readiness.get("state") == "ready":
             self._svc._startup_health["checks"]["model_provider"] = {
@@ -469,11 +560,15 @@ class ServiceLifecycle:
             continuation_store=continuations,
             workflow_run_store=self._svc._workflow_run_store,
             input_request_store=input_requests,
+            steering_store=self._svc._steering_store,
             parked_slot_wait_s=cfg.parked_slot_wait_s,
             provider_usage_store=self._svc._provider_usage_store,
+            model_response_store=self._svc._model_response_store,
             interpreter=self._svc._make_interpreter(),
             reality_coordinator=coordinator,
             secret_manager=self._svc._secrets,
+            workflow_store=self._svc._workflow_store,
+            workflow_fabric=self._svc._fabric,
         )
         self._svc._kernel = kernel
 
@@ -525,20 +620,32 @@ class ServiceLifecycle:
             kernel=kernel,
             budgets=budgets,
             cancellations=cancellations,
+            steering_store=self._svc._steering_store,
             execution_manager=execution,
             principal_id=cfg.cache_namespace,
         )
         self._svc._delegation = delegation
 
-        from athena.service.resource_finalizer import TaskResourceFinalizer
+        from athena.service.resource_finalizer import (
+            TaskResourceFinalizer,
+            TaskResourceRetentionPolicy,
+        )
 
         # Install the resource barrier before capability observers are
         # registered. Logical affordance observers may run afterward, but no
         # process/session owner can be forgotten before this proof runs.
-        finalizer = TaskResourceFinalizer(event_sink=self._svc._forward_events(events))
+        finalizer = TaskResourceFinalizer(
+            event_sink=self._svc._forward_events(events),
+            retention_policy=TaskResourceRetentionPolicy(
+                mode=cfg.parked_resource_retention_mode,
+                retain_seconds=cfg.parked_resource_retain_seconds,
+            ),
+        )
         finalizer.bind_obligation_store(self._svc._resource_obligation_store)
         finalizer.bind_service(self._svc)
         self._svc._resource_finalizer = finalizer
+        kernel.set_parked_resource_releaser(finalizer.release_parked)
+        kernel.set_parked_resource_resumption_handler(finalizer.cancel_parked_release)
         task_manager.set_finalization_barrier(finalizer.quiesce)
         task_manager.add_finalize_observer(finalizer.finalize)
 
@@ -627,6 +734,7 @@ class ServiceLifecycle:
         self._svc._scheduler = scheduler
         events.subscribe(scheduler.notify_event, exclude_event_types=FAST_EVENT_TYPES)
         schedule_api = ScheduleAPI(scheduler, task_manager)
+        self._svc._schedule_api = schedule_api
         registry.register(ScheduleCapability(schedule_api))
         # Maintenance contracts are rehydrated before the core capability
         # bundle finishes registering. Create the live watcher owner first so
@@ -674,6 +782,19 @@ class ServiceLifecycle:
             "unresolved_count": resource_health["unresolved_count"],
         }
 
+        # A terminal claim may have been write-ahead before a crash and parked
+        # in RECOVERY_REQUIRED. Retry resource closure and commit the exact
+        # retained result before generic recovery or worker startup can move
+        # the task elsewhere.
+        pending_recovered = await task_manager.reconcile_pending_finalizations(finalizer)
+        pending_remaining = await self._svc._pending_finalization_store.list_recoverable()
+        self._svc._startup_health["checks"]["pending_finalizations"] = {
+            "status": "ok" if not pending_remaining else "degraded",
+            "blocking": bool(pending_remaining),
+            "recovered": pending_recovered,
+            "remaining": len(pending_remaining),
+        }
+
         # A proven reality commit may have completed just before a process
         # stopped, leaving the task row non-terminal. Finish that saga before
         # generic RUNNING -> INTERRUPTED recovery can hide the proven result.
@@ -704,6 +825,25 @@ class ServiceLifecycle:
             )
         if any(recovery_result.summary.values()):
             _logger.info("crash recovery reconciled: %s", recovery_result.summary)
+
+        # Provider dispositions are committed separately from task effects.
+        # Replay the task-side half before workers start so a crash after the
+        # provider resolution cannot leave a terminal disposition attached to
+        # an inert RECOVERY_REQUIRED task (or a retry authorization unused).
+        provider_recovery = await self._svc.reconcile_provider_outcomes()
+        unresolved_provider = await self._svc._model_response_store.list_unresolved_attempts()
+        self._svc._provider_recovery_health = {
+            "state": "degraded" if unresolved_provider else "ready",
+            "unresolved_count": len(unresolved_provider),
+            "replayed": provider_recovery["replayed"],
+            "error": None,
+        }
+        self._svc._startup_health["checks"]["provider_outcomes"] = {
+            "status": "degraded" if unresolved_provider else "ok",
+            "blocking": bool(unresolved_provider),
+            "unresolved_count": len(unresolved_provider),
+            "replayed": provider_recovery["replayed"],
+        }
 
         # Reconcile transaction ownership after the mutation ledger has
         # classified any in-flight effects, but before workers can route new
@@ -770,7 +910,13 @@ class ServiceLifecycle:
 
         # 13. MCP (best-effort).
         self._svc._mcp = MCPAdapter(registry)
+        self._svc._mcp_resources = MCPResourceProvider()
+        self._svc._mcp_prompts = MCPPromptProvider()
         await self._svc._connect_mcp()
+        from athena.capabilities.mcp_context import MCPContextCapability
+
+        registry.register(MCPContextCapability(self._svc._mcp_resources, self._svc._mcp_prompts))
+        await self._svc.start_mcp_supervisor()
 
         # Packs are rehydrated only after every native capability, durable
         # generated overlay, and configured MCP surface is available. This
@@ -784,9 +930,16 @@ class ServiceLifecycle:
                 dispatcher=self._svc._dispatcher,
                 mcp_adapter=self._svc._mcp,
                 mcp_client_sink=self._svc._mcp_clients.append,
+                event_store=events,
+                hook_outbox=self._svc._pack_hook_outbox,
+                task_intake=self._svc.submit,
+                task_lookup=task_manager.get,
+                workspace=workspace,
             )
             try:
                 activated = await self._svc._pack_manager.rehydrate_enabled()
+                await self._svc._pack_manager.replay_hook_outbox()
+                await self._svc._pack_manager.start_hook_dispatcher()
                 failures = self._svc._pack_manager.rehydration_failures()
                 unavailable = {str(item["pack_id"]) for item in failures}
                 quarantined = await self._svc._quarantine_tasks_for_packs(
@@ -819,6 +972,17 @@ class ServiceLifecycle:
                 f"{item['id']}: {item['reason']}" for item in capability_profile.get("missing", ())
             )
             raise RuntimeError(f"required capability profile is not ready: {missing}")
+
+        # Ordinary intake has a three-step durable protocol: task row, causal
+        # user turn, then queue transition. Repair CREATED rows left between
+        # those steps before a worker can start claiming work. Scheduler-owned
+        # occurrence rows are intentionally left to scheduler reconciliation.
+        intake_recovery = await self._svc._reconcile_created_intake()
+        self._svc._startup_health["checks"]["task_intake"] = {
+            "status": "degraded" if intake_recovery["quarantined"] else "ok",
+            "blocking": bool(intake_recovery["quarantined"]),
+            **intake_recovery,
+        }
 
         # 14. Worker + scheduler. Packs and any dependent resumable tasks are
         # settled before a worker can claim fresh work.
@@ -933,6 +1097,12 @@ class ServiceLifecycle:
                 _logger.warning("watch poller teardown failed: %s", exc)
             self._svc._watch_poll_task = None
 
+        if self._svc._resource_finalizer is not None:
+            try:
+                await self._svc._resource_finalizer.shutdown()
+            except Exception as exc:
+                _logger.warning("parked-resource retention teardown failed: %s", exc)
+
         # Capability-owned resources via shutdown registry (P1-32).
         hook_outcome = await self._svc._run_shutdown_hooks()
         self._svc._computer = None
@@ -950,6 +1120,11 @@ class ServiceLifecycle:
         }
 
         # MCP clients.
+        if self._svc._pack_manager is not None:
+            await self._svc._pack_manager.stop_hook_dispatcher()
+        if self._svc._mcp_supervisor is not None:
+            await self._svc._mcp_supervisor.stop()
+            self._svc._mcp_supervisor = None
         for client in self._svc._mcp_clients:
             try:
                 await client.close()
@@ -1061,6 +1236,7 @@ class ServiceLifecycle:
         self._svc._context_block_store = None
         self._svc._pack_store = None
         self._svc._pack_manager = None
+        self._svc._pack_hook_outbox = None
         self._svc._skill_lifecycle = None
         self._svc._delegate_session_store = None
         self._svc._external_delegate_manager = None

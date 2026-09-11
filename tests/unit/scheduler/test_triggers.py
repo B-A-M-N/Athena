@@ -4,8 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
 
-from athena.scheduler.triggers import TriggerSpec, TriggerType, next_fire
+from athena.scheduler.triggers import (
+    TriggerSpec,
+    TriggerType,
+    _load_tz,
+    _local_utc_candidates,
+    next_fire,
+)
 from athena.scheduler.scheduler import _template_from_job
 
 UTC = timezone.utc
@@ -52,11 +59,82 @@ async def test_interval_without_times_fires_indefinitely():
         prev = nxt
 
 
+async def test_interval_rejects_datetime_as_interval():
+    with pytest.raises(ValueError, match="interval_seconds"):
+        TriggerSpec(type=TriggerType.INTERVAL, at=_dt(2026, 1, 1))
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "*/0 * * * *",
+        "61 * * * *",
+        "* 24 * * *",
+        "* * 0 * *",
+        "* * * 13 *",
+        "* * * * 0",
+        "* * 5-2 * *",
+        "* * * * nope",
+    ),
+)
+async def test_cron_rejects_invalid_fields(expression):
+    with pytest.raises(ValueError):
+        TriggerSpec(type=TriggerType.CRON, cron=expression)
+
+
+async def test_cron_accepts_named_ranges_and_steps():
+    trigger = TriggerSpec(type=TriggerType.CRON, cron="*/15 9-17 * jan-mar mon-fri")
+    assert next_fire(trigger, _dt(2026, 1, 5, 8, 59)) == _dt(2026, 1, 5, 9, 0)
+
+
 async def test_cron_every_minute_advances_one_minute():
     trigger = TriggerSpec(type=TriggerType.CRON, cron="* * * * *")
     t0 = _dt(2026, 3, 15, 10, 30, 15)
     nxt = next_fire(trigger, t0)
     assert nxt == _dt(2026, 3, 15, 10, 31, 0)
+
+
+async def test_cron_dst_fall_back_preserves_real_occurrences():
+    trigger = TriggerSpec(type=TriggerType.CRON, cron="0 1 * * *", timezone="America/Chicago")
+    first = next_fire(trigger, datetime(2026, 11, 1, 0, 59, tzinfo=UTC))
+    assert first == datetime(2026, 11, 1, 6, 0, tzinfo=UTC)
+    second = next_fire(trigger, datetime(2026, 11, 1, 6, 1, tzinfo=UTC))
+    assert second == datetime(2026, 11, 2, 7, 0, tzinfo=UTC)
+
+
+async def test_cron_dst_fall_back_returns_second_fold_after_first_fold():
+    trigger = TriggerSpec(type=TriggerType.CRON, cron="0 1 * * *", timezone="America/Chicago")
+    first = datetime(2026, 11, 1, 6, 0, tzinfo=UTC)
+    assert next_fire(trigger, first) == datetime(2026, 11, 1, 7, 0, tzinfo=UTC)
+
+
+async def test_cron_dst_end_at_stops_between_fall_back_occurrences():
+    trigger = TriggerSpec(
+        type=TriggerType.CRON,
+        cron="0 1 * * *",
+        timezone="America/Chicago",
+        end_at=datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+    )
+    first = datetime(2026, 11, 1, 5, 59, tzinfo=UTC)
+    assert next_fire(trigger, first) == datetime(2026, 11, 1, 6, 0, tzinfo=UTC)
+    assert next_fire(trigger, datetime(2026, 11, 1, 6, 0, tzinfo=UTC)) is None
+
+
+async def test_local_dst_resolution_rejects_gap_and_preserves_both_folds():
+    chicago = _load_tz("America/Chicago")
+    nonexistent = _local_utc_candidates(datetime(2026, 3, 8, 2, 30), chicago)
+    repeated = _local_utc_candidates(datetime(2026, 11, 1, 1, 30), chicago)
+    assert nonexistent == ()
+    assert repeated == (
+        datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+        datetime(2026, 11, 1, 7, 30, tzinfo=UTC),
+    )
+
+
+async def test_cron_dst_spring_forward_skips_nonexistent_wall_time():
+    trigger = TriggerSpec(type=TriggerType.CRON, cron="30 2 * * *", timezone="America/Chicago")
+    next_occurrence = next_fire(trigger, datetime(2026, 3, 8, 7, 59, tzinfo=UTC))
+    assert next_occurrence == datetime(2026, 3, 9, 7, 30, tzinfo=UTC)
 
 
 async def test_event_trigger_is_advanced_by_event_delivery():

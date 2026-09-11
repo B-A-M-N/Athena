@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Run repeatable crash/restart endurance evidence for a bounded duration."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+from pathlib import Path
+import statistics
+import sqlite3
+import subprocess
+import sys
+import time
+import signal
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+PROFILES = {
+    "beta": {"duration_hours": 0.5, "interval_seconds": 30.0},
+    "nightly": {"duration_hours": 6.0, "interval_seconds": 60.0},
+}
+
+
+async def _event_loop_lag_ms() -> float:
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    future = loop.create_future()
+    loop.call_later(0.01, future.set_result, None)
+    await future
+    return max(0.0, (loop.time() - started - 0.01) * 1000.0)
+
+
+def _proc_status() -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    try:
+        status = Path(f"/proc/{os.getpid()}/status").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        status = ""
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        if key in {"VmRSS", "Threads"}:
+            try:
+                metrics[{"VmRSS": "rss_bytes", "Threads": "threads"}[key]] = float(
+                    value.strip().split()[0]
+                ) * (1024 if key == "VmRSS" else 1)
+            except (IndexError, ValueError):
+                pass
+    try:
+        metrics["open_fds"] = float(len(list(Path(f"/proc/{os.getpid()}/fd").iterdir())))
+    except OSError:
+        pass
+    metrics["child_processes"] = float(_descendant_count(os.getpid()))
+    return metrics
+
+
+def _descendant_count(root_pid: int) -> int:
+    parents: dict[int, int] = {}
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            fields = entry.joinpath("stat").read_text(encoding="utf-8").split()
+            parents[int(fields[0])] = int(fields[3])
+        except (FileNotFoundError, OSError, IndexError, ValueError):
+            continue
+    descendants = 0
+    frontier = [root_pid]
+    while frontier:
+        parent = frontier.pop()
+        children = [pid for pid, ppid in parents.items() if ppid == parent]
+        descendants += len(children)
+        frontier.extend(children)
+    return descendants
+
+
+def _sqlite_bytes(root: Path) -> float:
+    if not root.exists():
+        return 0.0
+    total = 0
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {
+            ".db",
+            ".sqlite",
+            ".sqlite3",
+            ".wal",
+            ".shm",
+        }:
+            continue
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return float(total)
+
+
+def _sqlite_counts(root: Path) -> dict[str, float]:
+    """Read durable continuation/runtime counts without mutating state."""
+    counts = {"continuations": 0.0, "runtime_sessions": 0.0}
+    paths = (
+        [root]
+        if root.is_file()
+        else [
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+        ]
+        if root.exists()
+        else []
+    )
+    for path in paths:
+        try:
+            connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            if "runtime_sessions" in tables:
+                counts["runtime_sessions"] += float(
+                    connection.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
+                )
+            if "input_requests" in tables:
+                counts["continuations"] += float(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM input_requests WHERE status = 'OPEN'"
+                    ).fetchone()[0]
+                )
+            if "workflow_step_runs" in tables:
+                counts["continuations"] += float(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM workflow_step_runs "
+                        "WHERE continuation_id IS NOT NULL AND continuation_id != ''"
+                    ).fetchone()[0]
+                )
+            connection.close()
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            continue
+    return counts
+
+
+def _sample(*, state_root: Path) -> dict[str, float]:
+    metrics = _proc_status()
+    metrics["sqlite_bytes"] = _sqlite_bytes(state_root)
+    metrics.update(_sqlite_counts(state_root))
+    metrics["event_loop_lag_ms"] = asyncio.run(_event_loop_lag_ms())
+    return metrics
+
+
+def _slope(samples: list[dict[str, float]], key: str) -> float | None:
+    points = [(item["elapsed_seconds"], item.get(key)) for item in samples]
+    points = [(x, y) for x, y in points if y is not None]
+    if len(points) < 2 or points[-1][0] <= points[0][0]:
+        return None
+    x0 = points[0][0]
+    xs = [x - x0 for x, _ in points]
+    ys = [float(y) for _, y in points]
+    mean_x = statistics.fmean(xs)
+    mean_y = statistics.fmean(ys)
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator == 0:
+        return 0.0
+    return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
+
+
+def _thresholds(profile: str) -> dict[str, float]:
+    del profile
+    return {
+        "rss_slope_bytes_per_hour": 32 * 1024 * 1024,
+        "open_fds_slope_per_hour": 100.0,
+        "threads_slope_per_hour": 10.0,
+        "child_processes_slope_per_hour": 10.0,
+        "sqlite_slope_bytes_per_hour": 64 * 1024 * 1024,
+        "continuations_slope_per_hour": 100.0,
+        "runtime_sessions_slope_per_hour": 100.0,
+        "event_loop_lag_p95_ms": 500.0,
+    }
+
+
+def _evaluate(samples: list[dict[str, float]], thresholds: dict[str, float]) -> list[str]:
+    failures: list[str] = []
+    slope_keys = {
+        "rss_bytes": "rss_slope_bytes_per_hour",
+        "open_fds": "open_fds_slope_per_hour",
+        "threads": "threads_slope_per_hour",
+        "child_processes": "child_processes_slope_per_hour",
+        "sqlite_bytes": "sqlite_slope_bytes_per_hour",
+        "continuations": "continuations_slope_per_hour",
+        "runtime_sessions": "runtime_sessions_slope_per_hour",
+    }
+    for metric, threshold_name in slope_keys.items():
+        slope = _slope(samples, metric)
+        if slope is not None and slope * 3600.0 > thresholds[threshold_name]:
+            failures.append(f"{metric} slope exceeds {threshold_name}")
+    lags = sorted(item["event_loop_lag_ms"] for item in samples if "event_loop_lag_ms" in item)
+    if (
+        lags
+        and lags[min(len(lags) - 1, int(len(lags) * 0.95))] > thresholds["event_loop_lag_p95_ms"]
+    ):
+        failures.append("event loop lag p95 exceeds event_loop_lag_p95_ms")
+    return failures
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", choices=tuple(PROFILES), default="beta")
+    parser.add_argument("--duration-hours", type=float)
+    parser.add_argument("--interval-seconds", type=float)
+    # The slot-saturation soak case has five recovered tasks and a bounded
+    # 30-second-per-task polling window across three attempts. Keep the cycle
+    # finite, but above that legitimate worst-case recovery envelope.
+    parser.add_argument("--cycle-timeout-seconds", type=float, default=600.0)
+    parser.add_argument("--state-root", type=Path, default=Path("."))
+    parser.add_argument("--output", type=Path, default=Path("endurance-receipt.json"))
+    args = parser.parse_args()
+    duration_hours = args.duration_hours or PROFILES[args.profile]["duration_hours"]
+    interval_seconds = args.interval_seconds or PROFILES[args.profile]["interval_seconds"]
+    if duration_hours <= 0 or interval_seconds <= 0 or args.cycle_timeout_seconds <= 0:
+        parser.error("duration and interval must be positive")
+    started_at = time.time()
+    started_monotonic = time.monotonic()
+    deadline = started_monotonic + duration_hours * 3600.0
+    cycles = 0
+    failures: list[str] = []
+    samples: list[dict[str, float]] = []
+    cycle_command = [sys.executable, "-m", "pytest", "-q", "tests/crash/test_soak_matrix.py"]
+    cycle_environment = os.environ.copy()
+    source_path = str(REPO_ROOT / "src")
+    cycle_environment["PYTHONPATH"] = source_path + (
+        os.pathsep + cycle_environment["PYTHONPATH"] if cycle_environment.get("PYTHONPATH") else ""
+    )
+    while time.monotonic() < deadline:
+        process = subprocess.Popen(
+            cycle_command,
+            cwd=REPO_ROOT,
+            env=cycle_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            output, _ = process.communicate(timeout=args.cycle_timeout_seconds)
+            result = subprocess.CompletedProcess(cycle_command, process.returncode, output)
+        except subprocess.TimeoutExpired as exc:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            else:
+                process.kill()
+            output, _ = process.communicate()
+            cycles += 1
+            sample = _sample(state_root=args.state_root)
+            sample["elapsed_seconds"] = time.monotonic() - started_monotonic
+            samples.append(sample)
+            failures.append(
+                f"soak cycle exceeded {args.cycle_timeout_seconds:g}s: "
+                f"{str(output or exc.output or '')[-2000:]}"
+            )
+            break
+        cycles += 1
+        sample = _sample(state_root=args.state_root)
+        sample["elapsed_seconds"] = time.monotonic() - started_monotonic
+        samples.append(sample)
+        if result.returncode:
+            failures.append(result.stdout[-2000:])
+            break
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining:
+            time.sleep(min(interval_seconds, remaining))
+    thresholds = _thresholds(args.profile)
+    failures.extend(_evaluate(samples, thresholds))
+    finished_at = time.time()
+    slopes = {
+        key: (value * 3600.0 if value is not None else None)
+        for key in (
+            "rss_bytes",
+            "open_fds",
+            "threads",
+            "child_processes",
+            "sqlite_bytes",
+            "continuations",
+            "runtime_sessions",
+        )
+        if (value := _slope(samples, key)) is not None
+    }
+    receipt = {
+        "kind": "athena_endurance_receipt",
+        "source_sha": os.environ.get("ATHENA_RELEASE_SHA"),
+        "release_run_id": os.environ.get("ATHENA_RELEASE_RUN_ID"),
+        "status": "PASS" if not failures and time.monotonic() >= deadline else "FAIL",
+        "profile": args.profile,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_hours": duration_hours,
+        "interval_seconds": interval_seconds,
+        "cycle_timeout_seconds": args.cycle_timeout_seconds,
+        "cycle_command": cycle_command,
+        "cycles": cycles,
+        "samples": samples,
+        "slopes_per_hour": slopes,
+        "thresholds": thresholds,
+        "telemetry_coverage": {
+            "rss": True,
+            "file_descriptors": True,
+            "threads": True,
+            "child_processes": True,
+            "sqlite_wal_and_database": True,
+            "event_loop_lag": True,
+            "continuations": True,
+            "runtime_sessions": True,
+        },
+        "failures": failures,
+    }
+    args.output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps(receipt, sort_keys=True))
+    return 0 if receipt["status"] == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

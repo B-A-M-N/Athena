@@ -22,6 +22,7 @@ class MemoryKind(str, enum.Enum):
 
 
 class MemoryScope(str, enum.Enum):
+    JOB = "job"
     SESSION = "session"
     TASK = "task"
     PROJECT = "project"
@@ -42,6 +43,7 @@ class RetrievalMode(str, enum.Enum):
     SEMANTIC = "semantic"
     HYBRID = "hybrid"
     RECENCY = "recency"
+    HISTORY = "history"
 
 
 @dataclass(frozen=True)

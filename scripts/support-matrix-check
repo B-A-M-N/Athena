@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Validate the machine-readable product support matrix."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+
+
+def main() -> int:
+    path = Path(__file__).resolve().parent.parent / "docs" / "support-matrix.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"support-matrix-check: FAIL — {exc}", file=sys.stderr)
+        return 1
+    surfaces = record.get("surfaces")
+    if (
+        record.get("schema") != 2
+        or record.get("generated_by") != "scripts/support-matrix-check"
+        or not isinstance(record.get("generated_from"), dict)
+        or not isinstance(surfaces, dict)
+        or not surfaces
+    ):
+        print("support-matrix-check: FAIL — malformed support matrix", file=sys.stderr)
+        return 1
+    contracts = record["generated_from"].get("contracts")
+    if not isinstance(contracts, list) or not contracts:
+        print("support-matrix-check: FAIL — generated contract list is empty", file=sys.stderr)
+        return 1
+    support_contract = record.get("support_contract")
+    if (
+        not isinstance(support_contract, dict)
+        or support_contract.get("python_certified_version") != "3.12"
+        or support_contract.get("python_compatibility_only_versions") != ["3.13"]
+        or support_contract.get("native_certification_cell") != "linux-x86_64-x11-openbox"
+        or not isinstance(support_contract.get("certification_rule"), str)
+    ):
+        print("support-matrix-check: FAIL — support contract is not explicit", file=sys.stderr)
+        return 1
+    for contract in contracts:
+        if not isinstance(contract, str) or not (path.parent.parent / contract).exists():
+            print(
+                f"support-matrix-check: FAIL — missing generated contract {contract}",
+                file=sys.stderr,
+            )
+            return 1
+    for name, surface in surfaces.items():
+        proof = surface.get("proof") if isinstance(surface, dict) else None
+        if (
+            not isinstance(surface, dict)
+            or not isinstance(surface.get("claimed_versions"), list)
+            or not isinstance(surface.get("claimed_platforms"), list)
+            or surface.get("implementation_status") not in {"implemented", "partial"}
+            or surface.get("certification_status") != "not_certified"
+            or not surface.get("verification")
+            or not isinstance(proof, dict)
+            or proof.get("status") != "not_certified"
+            or not isinstance(proof.get("evidence"), list)
+        ):
+            print(f"support-matrix-check: FAIL — incomplete surface {name}", file=sys.stderr)
+            return 1
+        for evidence in proof["evidence"]:
+            if not isinstance(evidence, str):
+                print(
+                    f"support-matrix-check: FAIL — malformed evidence for {name}", file=sys.stderr
+                )
+                return 1
+            if (
+                evidence.startswith(("tests/", "src/", "scripts/", "native/", "docs/"))
+                and not (path.parent.parent / evidence).exists()
+            ):
+                print(f"support-matrix-check: FAIL — missing evidence {evidence}", file=sys.stderr)
+                return 1
+    print(f"support-matrix-check: PASS — {len(surfaces)} surfaces")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

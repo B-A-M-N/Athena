@@ -21,6 +21,10 @@ from athena.protocol.events import Event
 _SECTIONS = "—" * 60
 
 
+class ProviderRecoveryUnavailable(RuntimeError):
+    """The liability store could not be read; this is not an empty result."""
+
+
 def _fmt(v: Any) -> str:
     if v is None:
         return "—"
@@ -75,6 +79,36 @@ async def _get_provider_usage(service: Any, task_id: Any) -> list[dict]:
         return []
     except Exception:  # pragma: no cover - inspection must not crash on I/O
         return []
+
+
+async def _get_provider_recoveries(service: Any, task_id: Any) -> list[dict]:
+    """Read durable provider-outcome liabilities for task inspection."""
+    getter = getattr(service, "list_provider_outcome_recoveries", None)
+    if getter is None:
+        return []
+    try:
+        return list(await getter(task_id=str(task_id)))
+    except Exception as exc:  # pragma: no cover - inspection must remain read-only
+        raise ProviderRecoveryUnavailable(
+            f"provider outcome recovery is unavailable: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _render_provider_recoveries(rows: list[dict]) -> None:
+    if not rows:
+        return
+    print()
+    print(chat.bold("Provider outcome recovery"))
+    print(_SECTIONS)
+    for row in rows:
+        print(
+            f"  attempt   : {row.get('attempt_id')}  "
+            f"{row.get('provider') or '?'}/{row.get('model') or '?'}"
+        )
+        print(f"  outcome   : {row.get('provider_outcome_status') or 'unknown'}")
+        print(f"  liability : {'yes' if row.get('reservation_released_at') is None else 'no'}")
+        if row.get("provider_outcome_note"):
+            print(f"  note      : {row['provider_outcome_note']}")
 
 
 def _inference_role(record: dict) -> str:
@@ -338,6 +372,16 @@ async def run_inspect(service: Any, task_id: str, *, verbose: bool = False) -> i
 
     usage_records = await _get_provider_usage(service, task_id)
     _render_inference(events, usage_records)
+    try:
+        recoveries = await _get_provider_recoveries(service, task_id)
+    except ProviderRecoveryUnavailable as exc:
+        print(f"WARNING: {exc}", file=sys.stderr)
+        print()
+        print(chat.bold("Provider outcome recovery"))
+        print(_SECTIONS)
+        print("  <unavailable — liability state is not certified>")
+        return 2
+    _render_provider_recoveries(recoveries)
 
     _render_events(events)
 

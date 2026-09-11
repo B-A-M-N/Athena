@@ -45,6 +45,7 @@ __all__ = [
     "HermesRefereeConfig",
     "ProviderConfig",
     "MCPConfig",
+    "VoiceConfig",
     "DEFAULT_DB_PATH",
     "load_config",
     "merge_configs",
@@ -109,6 +110,7 @@ class ProviderConfig:
     name: str = "fake"
     model: str = "fake-1"
     credential_id: str | None = None
+    credential_ids: tuple[str, ...] = ()
     api_key: str | None = None
     base_url: str | None = None
     # Authentication is explicit route policy: ``none`` is appropriate for a
@@ -127,6 +129,8 @@ class ProviderConfig:
         kwargs.setdefault("model", self.model)
         if self.credential_id is not None:
             kwargs.setdefault("credential_id", self.credential_id)
+        if self.credential_ids:
+            kwargs.setdefault("credential_ids", tuple(self.credential_ids))
         if self.api_key is not None:
             kwargs.setdefault("api_key", self.api_key)
         if self.base_url is not None:
@@ -146,10 +150,65 @@ class MCPConfig:
     command: str | None = None
     args: tuple[str, ...] = ()
     url: str | None = None
+    credential_id: str | None = None
+    auth_scheme: str | None = None
     env: Mapping[str, str] = field(default_factory=dict)
     secret_env: Mapping[str, str] = field(default_factory=dict)
+    headers: Mapping[str, str] = field(default_factory=dict)
+    secret_headers: Mapping[str, str] = field(default_factory=dict)
+    allowed_tools: tuple[str, ...] = ()
+    denied_tools: tuple[str, ...] = ()
+    allowed_resources: tuple[str, ...] = ()
+    denied_resources: tuple[str, ...] = ()
+    allowed_prompts: tuple[str, ...] = ()
+    denied_prompts: tuple[str, ...] = ()
     connect_timeout: float = 10.0
     required: bool = False
+    allow_insecure_remote: bool = False
+    trust_env: bool = False
+
+
+@dataclass(frozen=True)
+class VoiceConfig:
+    """Explicit provider routes and bounds for voice input/output.
+
+    Voice stays opt-in because it can send audio to a remote provider and may
+    incur separate provider charges. Providers are named registry entries;
+    credentials remain owned by the normal provider/SecretManager path.
+    """
+
+    enabled: bool = False
+    transcription_provider: str | None = None
+    transcription_model: str = "whisper-1"
+    synthesis_provider: str | None = None
+    synthesis_model: str = "gpt-4o-mini-tts"
+    voice: str = "alloy"
+    response_format: str = "mp3"
+    max_input_bytes: int = 25 * 1024 * 1024
+    max_output_bytes: int = 25 * 1024 * 1024
+    max_text_chars: int = 12_000
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "transcription_provider",
+            "transcription_model",
+            "synthesis_provider",
+            "synthesis_model",
+            "voice",
+            "response_format",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and not str(value).strip():
+                raise ValueError(f"voice.{field_name} cannot be empty")
+        for field_name in ("max_input_bytes", "max_output_bytes", "max_text_chars"):
+            value = int(getattr(self, field_name))
+            if value <= 0:
+                raise ValueError(f"voice.{field_name} must be positive")
+            object.__setattr__(self, field_name, value)
+        response_format = str(self.response_format).strip().lower()
+        if response_format not in {"mp3", "mpeg", "wav", "opus", "aac", "flac", "pcm"}:
+            raise ValueError("voice.response_format must be a supported audio format")
+        object.__setattr__(self, "response_format", response_format)
 
 
 class HermesSupervisionMode(StrEnum):
@@ -229,7 +288,12 @@ class AthenaConfig:
     artifact_root: str | None = None
     skills_paths: tuple[str, ...] = ()
     providers: tuple[ProviderConfig, ...] = ()
+    # Operator-owned execution backend profiles. Values are declarative
+    # records; model/task input can only reference a profile name.
+    execution_backends: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     mcp_servers: tuple[MCPConfig, ...] = ()
+    voice: VoiceConfig = field(default_factory=VoiceConfig)
+    local_runtime_supervisor: bool = False
     hermes_referee: HermesRefereeConfig = field(default_factory=HermesRefereeConfig)
     context_window: int = 128_000
     reserve_output: int = 4096
@@ -255,6 +319,8 @@ class AthenaConfig:
     # and the slot frees. The durable continuation (open question / pending
     # approval) relaunches the task on the operator's action.
     parked_slot_wait_s: float = 300.0
+    parked_resource_retention_mode: str = "release"
+    parked_resource_retain_seconds: float = 300.0
     # Worker task lease (P0-1): how long a claimed task's lease runs before it
     # could be reclaimed, and the heartbeat cadence divisor. The heartbeat
     # renews at lease_duration/divisor, so a live worker never lets a healthy
@@ -288,6 +354,10 @@ class AthenaConfig:
     # singular field remains a compatibility alias for older config files.
     research_discovery_endpoints: tuple[str, ...] = ()
     research_discovery_timeout: float = 10.0
+    # Credential names for optional first-party search adapters. Raw API keys
+    # stay in SecretManager; these fields are only opaque credential IDs.
+    research_brave_api_key_credential: str | None = None
+    research_tavily_api_key_credential: str | None = None
     # Structured browser automation (P1-28): a zero-arg callable returning a
     # BrowserDriver (Playwright-shaped). ``browser_enabled`` opts into the
     # first-party Playwright launcher for file/TOML configuration; the
@@ -302,6 +372,14 @@ class AthenaConfig:
     browser_session_scope: str = "task"
     browser_timeout_ms: int = 12_000
     browser_viewport: tuple[int, int] | None = (1024, 768)
+    # Operator-owned DNS-pinned browser proxy bounds. These values are
+    # decoded from configuration and are never accepted from task arguments.
+    browser_proxy_max_connections: int = 32
+    browser_proxy_idle_timeout_seconds: float = 60.0
+    browser_proxy_max_connection_seconds: float = 300.0
+    # Operator-owned browser profiles. Models may select only the opaque key;
+    # cookies/tokens and file paths never travel through task arguments.
+    browser_auth_profiles: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     browser_driver_factory: Any | None = None
     # Terminal UI: which mascot/buddy the surfaces show (a registered
     # character name, or "off" to hide the mascot column). ``mascots``
@@ -324,6 +402,18 @@ class AthenaConfig:
         # loaded; it is an alias, not a second concurrency authority.
         self.worker_max_parallel = self.max_parallel_tasks
         self.parked_slot_wait_s = max(0.0, float(self.parked_slot_wait_s))
+        self.parked_resource_retention_mode = (
+            str(self.parked_resource_retention_mode or "release").strip().lower()
+        )
+        if self.parked_resource_retention_mode not in {
+            "retain",
+            "checkpoint_and_release",
+            "release",
+        }:
+            raise ValueError(
+                "parked_resource_retention_mode must be retain, checkpoint_and_release, or release"
+            )
+        self.parked_resource_retain_seconds = max(0.0, float(self.parked_resource_retain_seconds))
         self.worker_lease_duration_seconds = max(1.0, float(self.worker_lease_duration_seconds))
         self.worker_lease_renewal_divisor = max(1.0, float(self.worker_lease_renewal_divisor))
         self.research_discovery_timeout = max(0.1, float(self.research_discovery_timeout))
@@ -335,6 +425,11 @@ class AthenaConfig:
             if (profile_name := str(name).strip())
         }
         self.capability_profiles = profiles
+        self.execution_backends = {
+            str(name): dict(value)
+            for name, value in dict(self.execution_backends or {}).items()
+            if isinstance(value, Mapping)
+        }
         if self.capability_profile is not None:
             selected = str(self.capability_profile).strip()
             self.capability_profile = selected or None
@@ -373,6 +468,15 @@ class AthenaConfig:
             if width <= 0 or height <= 0:
                 raise ValueError("browser_viewport dimensions must be positive")
             self.browser_viewport = (width, height)
+        self.browser_proxy_max_connections = int(self.browser_proxy_max_connections)
+        self.browser_proxy_idle_timeout_seconds = float(self.browser_proxy_idle_timeout_seconds)
+        self.browser_proxy_max_connection_seconds = float(self.browser_proxy_max_connection_seconds)
+        if not 1 <= self.browser_proxy_max_connections <= 1024:
+            raise ValueError("browser_proxy_max_connections must be between 1 and 1024")
+        if not 0.1 <= self.browser_proxy_idle_timeout_seconds <= 3600.0:
+            raise ValueError("browser_proxy_idle_timeout_seconds must be between 0.1 and 3600")
+        if not 0.1 <= self.browser_proxy_max_connection_seconds <= 86_400.0:
+            raise ValueError("browser_proxy_max_connection_seconds must be between 0.1 and 86400")
 
     @property
     def autonomy_level(self) -> AutonomyLevel:
@@ -386,6 +490,10 @@ class AthenaConfig:
         values = list(self.required_capabilities)
         if self.capability_profile:
             values.extend(self.capability_profiles.get(self.capability_profile, ()))
+        # A configured required MCP transport is itself a readiness
+        # prerequisite; tool discovery is not a substitute for transport
+        # health and must not silently downgrade this contract.
+        values.extend(f"mcp:{server.name}" for server in self.mcp_servers if server.required)
         return _normalize_capability_ids(values)
 
 
@@ -461,6 +569,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         "name",
         "model",
         "credential_id",
+        "credential_ids",
         "api_key",
         "base_url",
         "authentication",
@@ -476,6 +585,7 @@ def _parse_provider(data: dict[str, Any]) -> ProviderConfig:
         name=data.get("name", "fake"),
         model=data.get("model", "fake-1"),
         credential_id=data.get("credential_id"),
+        credential_ids=tuple(str(item) for item in data.get("credential_ids") or ()),
         api_key=data.get("api_key"),
         base_url=data.get("base_url"),
         authentication=data.get("authentication"),
@@ -497,10 +607,22 @@ def _parse_mcp(data: dict[str, Any]) -> MCPConfig:
         command=data.get("command"),
         args=args or (),
         url=data.get("url"),
+        credential_id=data.get("credential_id"),
+        auth_scheme=data.get("auth_scheme"),
         env=data.get("env") or {},
         secret_env=data.get("secret_env") or {},
+        headers=data.get("headers") or {},
+        secret_headers=data.get("secret_headers") or {},
+        allowed_tools=tuple(str(item) for item in data.get("allowed_tools") or ()),
+        denied_tools=tuple(str(item) for item in data.get("denied_tools") or ()),
+        allowed_resources=tuple(str(item) for item in data.get("allowed_resources") or ()),
+        denied_resources=tuple(str(item) for item in data.get("denied_resources") or ()),
+        allowed_prompts=tuple(str(item) for item in data.get("allowed_prompts") or ()),
+        denied_prompts=tuple(str(item) for item in data.get("denied_prompts") or ()),
         connect_timeout=float(data.get("connect_timeout", 10.0)),
         required=bool(data.get("required", False)),
+        allow_insecure_remote=bool(data.get("allow_insecure_remote", False)),
+        trust_env=bool(data.get("trust_env", False)),
     )
 
 
@@ -581,6 +703,10 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["max_parallel_tasks"] = config.max_parallel_tasks
     if config.parked_slot_wait_s != 300.0:
         d["parked_slot_wait_s"] = config.parked_slot_wait_s
+    if config.parked_resource_retention_mode != "release":
+        d["parked_resource_retention_mode"] = config.parked_resource_retention_mode
+    if config.parked_resource_retain_seconds != 300.0:
+        d["parked_resource_retain_seconds"] = config.parked_resource_retain_seconds
     if config.worker_lease_duration_seconds != 300.0:
         d["worker_lease_duration_seconds"] = config.worker_lease_duration_seconds
     if config.worker_lease_renewal_divisor != 3.0:
@@ -609,6 +735,7 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
                     "name": p.name,
                     "model": p.model,
                     "credential_id": p.credential_id,
+                    "credential_ids": list(p.credential_ids),
                     "base_url": p.base_url,
                     "authentication": p.authentication,
                     "cache_mode": p.cache_mode,
@@ -623,6 +750,12 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
             }
             for p in config.providers
         ]
+    if config.local_runtime_supervisor:
+        d["local_runtime_supervisor"] = True
+    if config.execution_backends:
+        d["execution_backends"] = {
+            str(name): dict(value) for name, value in config.execution_backends.items()
+        }
     if config.mcp_servers:
         d["mcp_servers"] = [
             {
@@ -632,15 +765,44 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
                     "command": m.command,
                     "args": list(m.args),
                     "url": m.url,
+                    "credential_id": m.credential_id,
+                    "auth_scheme": m.auth_scheme,
                     "env": dict(m.env),
                     "secret_env": dict(m.secret_env),
+                    "headers": dict(m.headers),
+                    "secret_headers": dict(m.secret_headers),
+                    "allowed_tools": list(m.allowed_tools),
+                    "denied_tools": list(m.denied_tools),
+                    "allowed_resources": list(m.allowed_resources),
+                    "denied_resources": list(m.denied_resources),
+                    "allowed_prompts": list(m.allowed_prompts),
+                    "denied_prompts": list(m.denied_prompts),
                     "connect_timeout": m.connect_timeout,
                     "required": m.required,
+                    "allow_insecure_remote": m.allow_insecure_remote,
+                    "trust_env": m.trust_env,
                 }.items()
                 if value is not None
             }
             for m in config.mcp_servers
         ]
+    if config.voice != VoiceConfig():
+        d["voice"] = {
+            key: value
+            for key, value in {
+                "enabled": config.voice.enabled,
+                "transcription_provider": config.voice.transcription_provider,
+                "transcription_model": config.voice.transcription_model,
+                "synthesis_provider": config.voice.synthesis_provider,
+                "synthesis_model": config.voice.synthesis_model,
+                "voice": config.voice.voice,
+                "response_format": config.voice.response_format,
+                "max_input_bytes": config.voice.max_input_bytes,
+                "max_output_bytes": config.voice.max_output_bytes,
+                "max_text_chars": config.voice.max_text_chars,
+            }.items()
+            if value is not None
+        }
     if config.hermes_referee != HermesRefereeConfig():
         d["hermes_referee"] = {
             "enabled": config.hermes_referee.enabled,
@@ -676,6 +838,10 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["research_discovery_endpoint"] = config.research_discovery_endpoint
     if config.research_discovery_timeout != 10.0:
         d["research_discovery_timeout"] = config.research_discovery_timeout
+    if config.research_brave_api_key_credential is not None:
+        d["research_brave_api_key_credential"] = config.research_brave_api_key_credential
+    if config.research_tavily_api_key_credential is not None:
+        d["research_tavily_api_key_credential"] = config.research_tavily_api_key_credential
     if config.browser_enabled:
         d["browser_enabled"] = True
     if config.browser_engine != "chromium":
@@ -696,6 +862,16 @@ def config_to_dict(config: AthenaConfig) -> dict[str, Any]:
         d["browser_timeout_ms"] = config.browser_timeout_ms
     if config.browser_viewport != (1024, 768):
         d["browser_viewport"] = list(config.browser_viewport) if config.browser_viewport else None
+    if config.browser_proxy_max_connections != 32:
+        d["browser_proxy_max_connections"] = config.browser_proxy_max_connections
+    if config.browser_proxy_idle_timeout_seconds != 60.0:
+        d["browser_proxy_idle_timeout_seconds"] = config.browser_proxy_idle_timeout_seconds
+    if config.browser_proxy_max_connection_seconds != 300.0:
+        d["browser_proxy_max_connection_seconds"] = config.browser_proxy_max_connection_seconds
+    if config.browser_auth_profiles:
+        d["browser_auth_profiles"] = {
+            str(name): dict(profile) for name, profile in config.browser_auth_profiles.items()
+        }
     if config.mascot is not None:
         d["mascot"] = config.mascot
     if config.mascots:
@@ -716,6 +892,27 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
     # Handle nested sub-configs
     providers = tuple(_parse_provider(p) for p in data.get("providers", ()) if isinstance(p, dict))
     mcp_servers = tuple(_parse_mcp(m) for m in data.get("mcp_servers", ()) if isinstance(m, dict))
+    voice_data = data.get("voice")
+    if not isinstance(voice_data, Mapping):
+        voice_data = {}
+    voice = VoiceConfig(
+        enabled=bool(voice_data.get("enabled", False)),
+        transcription_provider=(
+            str(voice_data["transcription_provider"])
+            if voice_data.get("transcription_provider")
+            else None
+        ),
+        transcription_model=str(voice_data.get("transcription_model", "whisper-1")),
+        synthesis_provider=(
+            str(voice_data["synthesis_provider"]) if voice_data.get("synthesis_provider") else None
+        ),
+        synthesis_model=str(voice_data.get("synthesis_model", "gpt-4o-mini-tts")),
+        voice=str(voice_data.get("voice", "alloy")),
+        response_format=str(voice_data.get("response_format", "mp3")),
+        max_input_bytes=int(voice_data.get("max_input_bytes", 25 * 1024 * 1024)),
+        max_output_bytes=int(voice_data.get("max_output_bytes", 25 * 1024 * 1024)),
+        max_text_chars=int(voice_data.get("max_text_chars", 12_000)),
+    )
     # skills_paths may be a list in TOML
     skills = data.get("skills_paths", ())
     if isinstance(skills, list):
@@ -759,7 +956,10 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         artifact_root=data.get("artifact_root"),
         skills_paths=skills,
         providers=providers,
+        execution_backends=dict(data.get("execution_backends") or {}),
         mcp_servers=mcp_servers,
+        voice=voice,
+        local_runtime_supervisor=bool(data.get("local_runtime_supervisor", False)),
         hermes_referee=_parse_hermes_referee(data.get("hermes_referee")),
         context_window=int(data.get("context_window", 128_000)),
         reserve_output=int(data.get("reserve_output", 4096)),
@@ -778,6 +978,8 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         ),
         max_parallel_tasks=int(data.get("max_parallel_tasks", data.get("worker_max_parallel", 4))),
         parked_slot_wait_s=float(data.get("parked_slot_wait_s", 300.0)),
+        parked_resource_retention_mode=str(data.get("parked_resource_retention_mode", "release")),
+        parked_resource_retain_seconds=float(data.get("parked_resource_retain_seconds", 300.0)),
         worker_lease_duration_seconds=float(data.get("worker_lease_duration_seconds", 300.0)),
         worker_lease_renewal_divisor=float(data.get("worker_lease_renewal_divisor", 3.0)),
         scheduler_interval_seconds=float(data.get("scheduler_interval_seconds", 1.0)),
@@ -795,6 +997,28 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         research_discovery_endpoint=legacy_discovery_endpoint,
         research_discovery_endpoints=discovery_endpoints,
         research_discovery_timeout=float(data.get("research_discovery_timeout", 10.0)),
+        research_brave_api_key_credential=(
+            str(
+                data.get(
+                    "research_brave_api_key_credential",
+                    data.get("research_brave_credential"),
+                )
+            ).strip()
+            if data.get("research_brave_api_key_credential", data.get("research_brave_credential"))
+            else None
+        ),
+        research_tavily_api_key_credential=(
+            str(
+                data.get(
+                    "research_tavily_api_key_credential",
+                    data.get("research_tavily_credential"),
+                )
+            ).strip()
+            if data.get(
+                "research_tavily_api_key_credential", data.get("research_tavily_credential")
+            )
+            else None
+        ),
         browser_enabled=bool(data.get("browser_enabled", False)),
         browser_engine=str(data.get("browser_engine", "chromium") or "chromium"),
         browser_headless=bool(data.get("browser_headless", True)),
@@ -809,6 +1033,18 @@ def config_from_dict(data: dict[str, Any]) -> AthenaConfig:
         browser_session_scope=str(data.get("browser_session_scope", "task")),
         browser_timeout_ms=int(data.get("browser_timeout_ms", 12_000)),
         browser_viewport=viewport if "browser_viewport" in data else (1024, 768),
+        browser_proxy_max_connections=int(data.get("browser_proxy_max_connections", 32)),
+        browser_proxy_idle_timeout_seconds=float(
+            data.get("browser_proxy_idle_timeout_seconds", 60.0)
+        ),
+        browser_proxy_max_connection_seconds=float(
+            data.get("browser_proxy_max_connection_seconds", 300.0)
+        ),
+        browser_auth_profiles={
+            str(name): dict(profile)
+            for name, profile in (data.get("browser_auth_profiles") or {}).items()
+            if isinstance(profile, dict)
+        },
         mascot=data.get("mascot"),
         mascots={
             str(k): dict(v) for k, v in (data.get("mascots") or {}).items() if isinstance(v, dict)
@@ -837,7 +1073,10 @@ def _env_map() -> dict[str, Any]:
         ATHENA_SCHEDULER_MAX_CONCURRENT, ATHENA_PROFILE,
         ATHENA_CAPABILITY_PROFILE, ATHENA_REQUIRED_CAPABILITIES,
         ATHENA_SKILLS_PATHS (comma-separated), ATHENA_MASCOT,
-        ATHENA_DISPLAY, ATHENA_ANIMATIONS, ATHENA_REDUCED_MOTION
+        ATHENA_DISPLAY, ATHENA_ANIMATIONS, ATHENA_REDUCED_MOTION,
+        ATHENA_VOICE_ENABLED, ATHENA_VOICE_TRANSCRIPTION_PROVIDER,
+        ATHENA_VOICE_SYNTHESIS_PROVIDER,
+        ATHENA_LOCAL_RUNTIME_SUPERVISOR
     """
     result: dict[str, Any] = {}
     env_map: dict[str, tuple[str, Callable[[Any], Any]]] = {
@@ -846,6 +1085,10 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_WORKSPACE": ("workspace_root", str),
         "ATHENA_WORKSPACE_PATH": ("workspace_root", str),
         "ATHENA_AUTONOMY": ("autonomy", str),
+        "ATHENA_LOCAL_RUNTIME_SUPERVISOR": (
+            "local_runtime_supervisor",
+            lambda v: str(v).strip().lower() in {"1", "true", "yes", "on"},
+        ),
         "ATHENA_ARTIFACT_ROOT": ("artifact_root", str),
         "ATHENA_CONTEXT_WINDOW": ("context_window", int),
         "ATHENA_RESERVE_OUTPUT": ("reserve_output", int),
@@ -854,6 +1097,14 @@ def _env_map() -> dict[str, Any]:
         "ATHENA_MEMORY_EMBEDDING_CACHE_DIR": ("memory_embedding_cache_dir", str),
         "ATHENA_MAX_PARALLEL_TASKS": ("max_parallel_tasks", int),
         "ATHENA_PARKED_SLOT_WAIT_S": ("parked_slot_wait_s", float),
+        "ATHENA_PARKED_RESOURCE_RETENTION_MODE": (
+            "parked_resource_retention_mode",
+            str,
+        ),
+        "ATHENA_PARKED_RESOURCE_RETAIN_SECONDS": (
+            "parked_resource_retain_seconds",
+            float,
+        ),
         "ATHENA_WORKER_LEASE_DURATION_SECONDS": ("worker_lease_duration_seconds", float),
         "ATHENA_WORKER_LEASE_RENEWAL_DIVISOR": ("worker_lease_renewal_divisor", float),
         # Deprecated alias; canonical serialization always writes
@@ -903,6 +1154,14 @@ def _env_map() -> dict[str, Any]:
             lambda v: tuple(p.strip() for p in v.split(",") if p.strip()),
         ),
         "ATHENA_RESEARCH_DISCOVERY_TIMEOUT": ("research_discovery_timeout", float),
+        "ATHENA_RESEARCH_BRAVE_API_KEY_CREDENTIAL": (
+            "research_brave_api_key_credential",
+            str,
+        ),
+        "ATHENA_RESEARCH_TAVILY_API_KEY_CREDENTIAL": (
+            "research_tavily_api_key_credential",
+            str,
+        ),
     }
     for env_name, (key, cast) in env_map.items():
         value = os.environ.get(env_name)
@@ -934,6 +1193,33 @@ def _env_map() -> dict[str, Any]:
             continue
     if hermes:
         result["hermes_referee"] = hermes
+    voice: dict[str, Any] = {}
+    voice_env: tuple[tuple[str, str, Callable[[Any], Any]], ...] = (
+        (
+            "ATHENA_VOICE_ENABLED",
+            "enabled",
+            lambda v: str(v).strip().lower() in {"1", "true", "yes", "on"},
+        ),
+        ("ATHENA_VOICE_TRANSCRIPTION_PROVIDER", "transcription_provider", str),
+        ("ATHENA_VOICE_TRANSCRIPTION_MODEL", "transcription_model", str),
+        ("ATHENA_VOICE_SYNTHESIS_PROVIDER", "synthesis_provider", str),
+        ("ATHENA_VOICE_SYNTHESIS_MODEL", "synthesis_model", str),
+        ("ATHENA_VOICE_NAME", "voice", str),
+        ("ATHENA_VOICE_RESPONSE_FORMAT", "response_format", str),
+        ("ATHENA_VOICE_MAX_INPUT_BYTES", "max_input_bytes", int),
+        ("ATHENA_VOICE_MAX_OUTPUT_BYTES", "max_output_bytes", int),
+        ("ATHENA_VOICE_MAX_TEXT_CHARS", "max_text_chars", int),
+    )
+    for env_name, key, cast in voice_env:
+        value = os.environ.get(env_name)
+        if not value:
+            continue
+        try:
+            voice[key] = cast(value)
+        except (ValueError, TypeError):
+            continue
+    if voice:
+        result["voice"] = voice
     return result
 
 

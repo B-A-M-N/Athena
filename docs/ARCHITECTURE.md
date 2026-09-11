@@ -52,6 +52,26 @@ Only `AgentKernel` decides what to do next. A workflow is deterministic
 composition, not another reasoning authority. A delegated child is an
 ordinary bounded Task, not a different agent architecture.
 
+## 1.1 Bounded beta support and size governance
+
+The public beta is intentionally bounded. The certified native desktop cell is
+Linux x86_64 with X11 and Openbox; Python 3.12 is the certification
+interpreter, while Python 3.13 is compatibility-tested by ordinary CI. Other
+desktop environments, operating systems, and integrations are compatibility
+targets unless a release-bound evidence lane certifies them. The checked-in
+[`docs/support-matrix.json`](support-matrix.json) is the machine-readable
+contract, and a checked-in contract is never certification evidence by itself.
+
+The original 45k–70k production-source estimate remains historical planning
+context. The expanded beta surface adds durable recovery/accounting,
+research/evidence, governed runtime backends, native rendering, and release
+provenance infrastructure without turning the kernel into a second
+architecture. Current size control is therefore enforced by the per-module
+ratchet in [`docs/architecture-size-baseline.json`](architecture-size-baseline.json)
+and [`scripts/architecture-lint`](../scripts/architecture-lint); crossing the
+approximately 80k standard-source review trigger requires an explicit
+architecture review, decomposition, or written rationale.
+
 ## 2. Five cooperating layers
 
 ```text
@@ -116,8 +136,10 @@ The effective surface may contain:
 | Scratch program | Cheap task-local computation that is not automatically retained. |
 
 The registry is an ergonomic and governed inventory. It is not the boundary
-of Athena's agency: universal execution remains the escape hatch for building
-new deterministic machinery, subject to the same authority wall.
+of Athena's agency: governed multi-runtime/programmable execution remains the
+escape hatch for building new deterministic machinery, subject to the same
+authority wall. It is not a
+promise that every generated or remote runtime has identical host isolation.
 
 ### Reflection
 
@@ -170,8 +192,8 @@ core operating model rather than optional polish:
 
 | Augmentation | Athena contract | Current status |
 | --- | --- | --- |
-| Persistent computational sessions | Runtime state is keyed by Task/runtime session, serialized through the ExecutionManager path, and audited with execution events. | **Live**; container sessions carry proof-checked identity and can reattach after restart. Local in-process sessions remain service-lifetime only and emit `RuntimeStateLost`; full backend conformance remains incomplete. |
-| Reflection and progressive disclosure | The fabric can search/describe visible capabilities, workflows, and skills; ContextCompiler selects ranked relevant affordances while retaining foundational creation/reflection routes. | **Live for the current surface**; runtime/device/permission/dependency discovery remains partial. |
+| Persistent computational sessions | Runtime state is keyed by Task/runtime session, serialized through the ExecutionManager path, and audited with execution events. | **Live**; container sessions carry proof-checked identity and can reattach after restart. Local in-process sessions remain service-lifetime only and emit `RuntimeStateLost`; release qualification uses the executable BackendPassport lane. |
+| Reflection and progressive disclosure | The fabric can search/describe visible capabilities, workflows, and skills; ContextCompiler selects ranked relevant affordances while retaining foundational creation/reflection routes. | **Live for the current surface**; runtime/device/permission/dependency discovery is source- and freshness-labeled, with unsupported host probes reported explicitly. |
 | One canonical response accumulator | Provider deltas and terminal responses assemble into one mixed `ModelResponse`, preserving text, reasoning, and parallel tool calls exactly once. | **Live** in kernel and registry collection paths. |
 | Adaptive output artifacts | Large/structured execution output is retained as immutable, task-owned artifacts with bounded previews and explicit list/read/slice/search follow-up operations. | **Live for local artifacts**; richer MIME-aware extraction and fully nonblocking large-file I/O remain incomplete. |
 | Independent generated-source checks | Generated machinery passes tiered parse/interface/security checks plus Ruff and, for durable scopes, Mypy before sandbox trials and registration. | **Live as an admission gate**; property-based tests, evidence scoring, and stronger external analyzers remain future work. |
@@ -350,7 +372,11 @@ records, excerpt verification, and deterministic `research:plan`,
 `research:run` composes an explicit objective, requirements, selected captures,
 exact evidence excerpts, contradiction checks, and a final readiness bundle.
 These operations only close gaps backed by verified captured evidence.
-Open-ended autonomous acquisition/critique remains future work.
+Autonomous acquisition is bounded by rounds, source count, query count, and a
+research-byte budget. Later rounds derive queries from still-open required
+gaps rather than replaying the initial query set. A task that marks research
+evidence as required remains partial until a typed ready-bundle receipt exists;
+capability invocation alone never proves completion.
 
 Archivist's in-memory planner/critic loop is intentionally not imported. A
 future `research.deep` or `research.verify_claim` workflow may extend the
@@ -441,6 +467,39 @@ dependency.resolve
 Dependency records must include manager, name, version constraint, purpose,
 owner/provenance, and the resulting environment fingerprint. Package managers
 and network access are policy-controlled effects.
+
+The lock container is versioned. New locks use `format: 2` and
+`fingerprint_version: 2`; the latter means the canonical package-closure
+fingerprint includes the recorded runtime identity. Format-1 locks remain
+readable with their original package-only fingerprint semantics. A verifier
+rejects unsupported future container or fingerprint versions rather than
+silently changing hash meaning.
+
+The stable shape is:
+
+```json
+{
+  "format": 2,
+  "fingerprint_version": 2,
+  "manager": "python",
+  "environment_id": "<sha256>",
+  "packages": {
+    "example": {
+      "name": "example",
+      "manager": "python",
+      "requested_version": ">=1",
+      "resolved_version": "1.2.3",
+      "closure": [],
+      "record_hashes": [],
+      "runtime_identity": "<identity>",
+      "environment_fingerprint": "<sha256>"
+    }
+  }
+}
+```
+
+Node records use the same versioned container and replace Python RECORD data
+with `package_lock_sha256` and `package_lock_identity`.
 
 ## 9. Validation tiers
 
@@ -536,12 +595,12 @@ complete.
 | Scratch lifecycle | **Live for 0.1 support scope**; the kernel emits bounded `StrategySelected` guidance across direct, compose, synthesize, evidence, and fusion routes while retaining model authority over actual calls. |
 | GeneratedCapability | **Live for 0.1 support scope**; model-visible task-scoped creation, hashes, dependency locks, proof evolution, candidate retention, project/user rehydration, and explicit promotion/deprecation exist. Native-window and platform-specific sandbox parity remain incomplete. |
 | Declarative nested workflows | **Live for 0.1 support scope**; models, SQLite storage, validation, nested execution, approval/failure handling, replay, and strategy-to-workflow release evidence are covered. Broader workflow authoring ergonomics remain. |
-| Reflection | **Partial**; scoped/ranked capability reflection, workflow/skill search and description, runtime/dependency/permission/device inventories, and availability passports are live; broader resource discovery and fuller dependency-manager coverage are incomplete. |
-| Evidence/Research Fabric | **Partial**; durable source/evidence/gap records, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, optional local FastEmbed semantic/hybrid retrieval, and deterministic plan/assess/bundle/run operations are live; autonomous acquisition/critique and full completion verification remain incomplete. |
+| Reflection | **Supported for the bounded beta surface**; scoped/ranked capability reflection, workflow/skill search and description, source- and freshness-labeled runtime/dependency/permission/device/resource inventories, and availability passports are live; platform-specific probes may remain unavailable. |
+| Evidence/Research Fabric | **Supported for the bounded beta surface**; durable source/evidence/gap records now retain revision, content hash, acquisition receipt, confidence calibration, corroboration, contradiction state, artifact-backed excerpt verification, claim links, pre-acquisition source policy, bounded lexical indexing, optional local FastEmbed semantic/hybrid retrieval, deterministic plan/assess/bundle/run operations, byte-bounded adaptive acquisition, and typed evidence-required completion receipts are live. |
 | Dependency acquisition | **Partial**; a governed Python route records resolved versions, source metadata, file hashes, exact runtime identity, and environment fingerprints, and rejects lock replay on mismatch; manager breadth and full policy coverage remain. |
 | Tiered validation | **Partial**; task admission now records parse/interface/security/format/lint checks, candidate/project/user tiers can require Ruff/Mypy, and exact JSON Schema is compiled; generated-test planning, independent evidence, and optional Semgrep remain incomplete. |
 | Promotion and retention | **Live for 0.1 support scope**; `/candidates`, `/candidate`, `/promote`, and `/deprecate` provide explicit project/user review and lifecycle control with durable proof, history, quality scoring, and garbage collection. Richer review/supersession UX remains. |
-| Authority inheritance and isolation | **Supported on Linux for 0.1 scope**; generated, scratch, shadow, verification, workflow, and self-host paths inherit the canonical restricted backend, with an explicit Bubblewrap confinement/process-tree release matrix. Platform parity remains incomplete. |
+| Authority inheritance and isolation | **Supported on the Linux x86_64 release cell for 0.1 scope**; generated, scratch, shadow, verification, workflow, and self-host paths inherit the canonical restricted backend, with an explicit Bubblewrap confinement/process-tree release matrix. Platform parity remains incomplete. |
 
 This table is an alignment guard. It prevents class names, comments, or
 documentation from being treated as evidence that a subsystem is complete.

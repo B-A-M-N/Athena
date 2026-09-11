@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "policy": "ratchet: each reviewed module may stay at or below this committed line count; reduce the baseline when decomposing",
+  "python": {
+    "service/service.py": 3981,
+    "kernel/kernel.py": 2010,
+    "cli/app.py": 2504,
+    "capabilities/research.py": 1765,
+    "packs/manager.py": 1788
+  },
+  "rust": {
+    "main.rs": 1658,
+    "x11.rs": 3294,
+    "render/oi.rs": 2890,
+    "render/chassis.rs": 1169
+  }
+}

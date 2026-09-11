@@ -960,8 +960,7 @@ class DualPaneSurface(OperatorSurface):
         if not self._full_screen:
             super().render_idle()
             return
-        self.projection.status = "READY"
-        self.projection.status_message = "Type a request below."
+        self.projection.set_status("READY", "Type a request below.")
         self.repaint_oi(force=True)
 
     def render_user_message(self, text: str) -> None:
@@ -973,8 +972,7 @@ class DualPaneSurface(OperatorSurface):
             return
         self.projection.add_chat("user", text)
         self._left_scroll = self._right_scroll = 0
-        self.projection.status = "THINKING"
-        self.projection.status_message = "Athena is reading your request."
+        self.projection.set_status("THINKING", "Athena is reading your request.")
         self.repaint_oi(force=True)
 
     def render_result(self, summary: str = "", *, status: str | None = None) -> None:
@@ -987,8 +985,9 @@ class DualPaneSurface(OperatorSurface):
             self._append_chat("assistant", summary)
             self._last_assistant = summary
         if status:
-            self.projection.status = str(status).upper()
-            self.projection.status_message = "Task finished; send another request when ready."
+            self.projection.set_status(
+                str(status).upper(), "Task finished; send another request when ready."
+            )
         self.repaint_oi(force=True)
 
     def render_notice(self, text: str, *, status: str | None = None) -> None:
@@ -996,11 +995,11 @@ class DualPaneSurface(OperatorSurface):
             super().render_notice(text, status=status)
             return
         notice = _terminal_text(text)
-        self.projection.status_message = notice
+        self.projection.set_status_message(notice)
         if notice:
             self.projection.add_recent("·", notice)
         if status:
-            self.projection.status = str(status).upper()
+            self.projection.set_status(str(status).upper())
         self.repaint_oi(force=True)
 
     def _append_chat(self, role: str, text: str) -> None:
@@ -1627,9 +1626,9 @@ class DualPaneSurface(OperatorSurface):
             self.mascot.observe(
                 "TaskCompleted" if ok else "TaskFailed", {"exit_code": result.get("exit_code")}
             )
-            self.projection.status = "SUCCESS" if ok else "FAILURE"
-            self.projection.status_message = (
-                "Direct command complete." if ok else "Direct command failed."
+            self.projection.set_status(
+                "SUCCESS" if ok else "FAILURE",
+                "Direct command complete." if ok else "Direct command failed.",
             )
             if self._full_screen:
                 self.repaint_oi(force=True)

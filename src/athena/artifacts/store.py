@@ -117,6 +117,53 @@ class ArtifactStore:
                 await self._budget_tracker.release_artifact(task_id, len(data))
             raise
 
+    async def save_file(
+        self,
+        *,
+        task_id: str | None = None,
+        path: str | Path,
+        max_bytes: int,
+        mime_type: str = "application/octet-stream",
+        producer: Provenance | str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> ArtifactRef:
+        """Stream a bounded file into immutable storage without materialising it."""
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        staging = self._blobs / ".staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        staged_path, digest, size = await self._io(_stage_file, Path(path), staging, int(max_bytes))
+        reserved = False
+        committed = False
+        try:
+            if task_id and self._budget_tracker is not None:
+                await self._budget_tracker.reserve_artifact(task_id, size)
+                reserved = True
+            await self._io(_install_staged, staged_path, self._blob_path(digest))
+            ref = ArtifactRef(
+                id=f"artifact://{SHA256_ALGO}/{digest}",
+                uri=f"artifact://{SHA256_ALGO}/{digest}",
+                hash=digest,
+                mime_type=mime_type,
+                size=size,
+                storage_path=str(self._blob_path(digest)),
+                created_at=utcnow(),
+                producer=_producer_str(producer),
+                task_id=task_id,
+                metadata=dict(metadata or {}),
+            )
+            await self._persist_meta(ref)
+            if reserved:
+                await self._budget_tracker.commit_artifact(task_id, size)
+                committed = True
+            return ref
+        except BaseException:
+            if reserved and not committed:
+                await self._budget_tracker.release_artifact(task_id, size)
+            if staged_path.exists():
+                await self._io(staged_path.unlink)
+            raise
+
     async def _persist_meta(self, ref: ArtifactRef) -> None:
         """Append this occurrence's provenance to the digest sidecar (BHV-067).
 
@@ -450,6 +497,50 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             raise
 
     _write()
+
+
+def _stage_file(source: Path, staging: Path, max_bytes: int) -> tuple[Path, str, int]:
+    if not source.is_file():
+        raise FileNotFoundError(f"artifact source file not found: {source}")
+    staging.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=str(staging), prefix=".athena-file-", suffix=".tmp")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with source.open("rb") as source_handle, os.fdopen(fd, "wb") as target:
+            while True:
+                chunk = source_handle.read(min(1024 * 1024, max_bytes - size + 1))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise ValueError(f"artifact source exceeds max_bytes={max_bytes}")
+                digest.update(chunk)
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        return Path(temporary), digest.hexdigest(), size
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _install_staged(staged: Path, target: Path) -> None:
+    if target.exists():
+        staged.unlink(missing_ok=True)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(staged, target)
+    except FileExistsError:
+        staged.unlink(missing_ok=True)
 
 
 def _read_range_sync(path: Path, offset: int, limit: int) -> bytes:

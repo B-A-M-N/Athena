@@ -142,10 +142,10 @@ def _artifact_identity() -> dict[str, object]:
         }
 
 # Keep the scenario-process allowance aligned with scripts/render-demo's
-# default timeout (420s) plus a small parent-process margin.  This used to
+# default timeout (600s) plus a small parent-process margin.  This used to
 # default to 120s here, so a valid ~90s recording could be killed during VHS
 # encoding before render-demo's own timeout was reached.
-DEFAULT_DEMO_TIMEOUT = 420.0
+DEFAULT_DEMO_TIMEOUT = 600.0
 
 
 def _python() -> str:

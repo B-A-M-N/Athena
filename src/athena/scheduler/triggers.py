@@ -37,23 +37,28 @@ class TriggerSpec:
         kind = self.type
         if kind is TriggerType.INTERVAL:
             if self.interval_seconds is None:
-                if self.at is None:
-                    raise ValueError("INTERVAL trigger requires interval_seconds or at")
-                # NOTE: latent bug - `datetime` has no total_seconds(); the
-                # attr is typed as datetime but total_seconds belongs to
-                # timedelta. Leaving runtime behavior unchanged for now.
-                object.__setattr__(
-                    self,
-                    "interval_seconds",
-                    self.at.total_seconds(),  # type: ignore[attr-defined]
-                )
-            assert self.interval_seconds is not None
-            if self.interval_seconds <= 0:
+                raise ValueError("INTERVAL trigger requires interval_seconds")
+            if isinstance(self.interval_seconds, bool) or not isinstance(
+                self.interval_seconds, (int, float)
+            ):
+                raise ValueError("INTERVAL interval_seconds must be numeric")
+            if not (self.interval_seconds > 0):
                 raise ValueError("INTERVAL must be positive")
-        elif kind is TriggerType.CRON and not self.cron:
-            raise ValueError("CRON trigger requires a cron expression")
+        elif kind is TriggerType.CRON:
+            if not self.cron:
+                raise ValueError("CRON trigger requires a cron expression")
+            _validate_cron(self.cron)
         elif kind is TriggerType.ONCE and self.at is None:
             raise ValueError("ONCE trigger requires a fire time")
+        if self.times is not None and (
+            isinstance(self.times, bool) or not isinstance(self.times, int) or self.times < 1
+        ):
+            raise ValueError("trigger.times must be a positive integer")
+        if self.timezone not in (None, "", "UTC", "utc", "GMT"):
+            try:
+                _load_tz(self.timezone)
+            except Exception as exc:
+                raise ValueError(f"invalid trigger timezone: {self.timezone}") from exc
 
 
 def next_fire(trigger: TriggerSpec, after: datetime) -> datetime | None:
@@ -101,7 +106,7 @@ def _next_interval(trigger: TriggerSpec, after: datetime) -> datetime | None:
 def _next_cron(trigger: TriggerSpec, after: datetime) -> datetime | None:
     parts = (trigger.cron or "").split()
     if len(parts) != 5:
-        return None
+        raise ValueError("CRON trigger requires exactly five fields")
     minute, hour, dom, month, dow = parts
     base = _ensure_aware(after)
     if base is None:
@@ -112,13 +117,23 @@ def _next_cron(trigger: TriggerSpec, after: datetime) -> datetime | None:
     # minutes in the configured timezone (DST-safe), then convert the matched
     # minute to UTC for comparison and storage.
     local_after = base.astimezone(tz)
-    current = local_after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    # Start at the current local minute.  On a fall-back transition the
+    # second occurrence of that minute may still be strictly after ``after``;
+    # advancing unconditionally would silently drop it.
+    current = local_after.replace(second=0, microsecond=0)
     for _ in range(24 * 60 * 366 * 5):  # scan ~5 years of minutes
-        current_utc = _local_to_utc(current, tz)
-        if end_at is not None and current_utc > end_at:
-            return None
         if _cron_matches(current, minute, hour, dom, month, dow):
-            return current_utc
+            # A fall-back minute has two real instants. Choose the first one
+            # after ``after`` and, when that has passed, the second. A
+            # spring-forward phantom minute has no valid candidate.
+            candidates = [
+                candidate for candidate in _local_utc_candidates(current, tz) if candidate > base
+            ]
+            if candidates:
+                current_utc = min(candidates)
+                if end_at is not None and current_utc > end_at:
+                    return None
+                return current_utc
         current = current + timedelta(minutes=1)
     return None
 
@@ -132,12 +147,29 @@ def _load_tz(name: str | None):
 
 
 def _local_to_utc(naive: datetime, tz) -> datetime:
-    """Interpret a naive local wall-clock as tz-aware and convert to UTC.
+    """Return the earliest real UTC instant for a local wall-clock minute."""
+    candidates = _local_utc_candidates(naive, tz)
+    return min(candidates) if candidates else naive.replace(tzinfo=tz).astimezone(timezone.utc)
 
-    ``fold=1`` selects the later (post-fall-back) instance of an ambiguous
-    fall-back minute so the immediately prior UTC instant is never revisited.
-    """
-    return naive.replace(tzinfo=tz, fold=1).astimezone(timezone.utc)
+
+def _local_utc_candidates(naive: datetime, tz) -> tuple[datetime, ...]:
+    """Resolve both DST folds, filtering nonexistent wall-clock minutes."""
+    # Callers walk local time with an aware ``datetime`` so that arithmetic
+    # remains attached to the configured zone.  Fold resolution, however,
+    # must compare the resulting wall clock against a naive wall-clock value;
+    # retaining the input tzinfo makes every valid candidate look mismatched.
+    naive = naive.replace(tzinfo=None)
+    candidates: set[datetime] = set()
+    for fold in (0, 1):
+        aware = naive.replace(tzinfo=tz, fold=fold)
+        # A direct aware -> same-zone conversion preserves a nonexistent wall
+        # time instead of normalizing it.  Round-trip through UTC so spring
+        # gaps are rejected and fall-back folds retain both real instants.
+        utc = aware.astimezone(timezone.utc)
+        round_tripped = utc.astimezone(tz).replace(tzinfo=None)
+        if round_tripped == naive:
+            candidates.add(utc)
+    return tuple(sorted(candidates))
 
 
 def _cron_matches(dt: datetime, minute: str, hour: str, dom: str, month: str, dow: str) -> bool:
@@ -178,29 +210,78 @@ _MONTH_NAMES = {
 
 
 def _normalize_month(spec: str) -> str:
-    out = []
-    for part in spec.split(","):
-        base = part.split("/")[0].strip().lower()
-        if base in _MONTH_NAMES:
-            left = str(_MONTH_NAMES[base])
-            step = "/" + part.split("/", 1)[1] if "/" in part else ""
-            out.append(left + step)
-        else:
-            out.append(part)
-    return ",".join(out)
+    return _normalize_named_field(spec, _MONTH_NAMES)
 
 
 def _normalize_dow(spec: str) -> str:
-    out = []
+    return _normalize_named_field(spec, _DAY_NAMES)
+
+
+def _normalize_named_field(spec: str, names: Mapping[str, int]) -> str:
+    out: list[str] = []
     for part in spec.split(","):
-        base = part.split("/")[0].strip().lower()
-        if base in _DAY_NAMES:
-            left = str(_DAY_NAMES[base])
-            step = "/" + part.split("/", 1)[1] if "/" in part else ""
-            out.append(left + step)
-        else:
-            out.append(part)
+        base, separator, step = part.partition("/")
+        endpoints = base.split("-")
+        normalized = []
+        for endpoint in endpoints:
+            normalized.append(str(names.get(endpoint.strip().lower(), endpoint.strip())))
+        out.append("-".join(normalized) + (f"/{step}" if separator else ""))
     return ",".join(out)
+
+
+def _validate_cron(expression: str) -> None:
+    parts = expression.split()
+    if len(parts) != 5:
+        raise ValueError("CRON trigger requires exactly five fields")
+    minute, hour, dom, month, dow = parts
+    _validate_field(minute, 0, 59, {}, "minute")
+    _validate_field(hour, 0, 23, {}, "hour")
+    _validate_field(dom, 1, 31, {}, "day-of-month")
+    _validate_field(month, 1, 12, _MONTH_NAMES, "month")
+    _validate_field(dow, 1, 7, _DAY_NAMES, "day-of-week")
+
+
+def _validate_field(
+    spec: str,
+    lo: int,
+    hi: int,
+    names: Mapping[str, int],
+    label: str,
+) -> None:
+    if not spec or len(spec) > 128:
+        raise ValueError(f"invalid cron {label} field")
+    for raw_part in spec.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError(f"invalid empty cron {label} field")
+        base, separator, step_text = part.partition("/")
+        if separator:
+            if "/" in step_text or not step_text.isdigit() or int(step_text) <= 0:
+                raise ValueError(f"invalid cron {label} step")
+        elif not step_text == "":
+            raise ValueError(f"invalid cron {label} field")
+        if base in ("", "*"):
+            if not separator and base == "":
+                raise ValueError(f"invalid cron {label} field")
+            continue
+        endpoints = base.split("-")
+        if len(endpoints) > 2 or any(not endpoint.strip() for endpoint in endpoints):
+            raise ValueError(f"invalid cron {label} range")
+        values: list[int] = []
+        for endpoint in endpoints:
+            token = endpoint.strip().lower()
+            if token in names:
+                values.append(names[token])
+                continue
+            if not token.isdigit():
+                raise ValueError(f"invalid cron {label} value")
+            values.append(int(token))
+        if any(value < lo or value > hi for value in values):
+            raise ValueError(f"cron {label} value out of range")
+        if len(values) == 2 and values[0] > values[1]:
+            raise ValueError(f"reversed cron {label} range")
+        if separator and int(step_text) > hi - lo + 1:
+            raise ValueError(f"cron {label} step out of range")
 
 
 def _field_matches(value: int, spec: str, lo: int, hi: int) -> bool:
@@ -214,9 +295,14 @@ def _field_matches(value: int, spec: str, lo: int, hi: int) -> bool:
             base, _, step_s = part.partition("/")
             try:
                 step = int(step_s)
-            except ValueError:
+                if step <= 0:
+                    continue
+            except (TypeError, ValueError):
                 continue
-            start = lo if base in ("", "*") else int(base)
+            try:
+                start = lo if base in ("", "*") else int(base)
+            except (TypeError, ValueError):
+                continue
             if value >= start and (value - start) % step == 0:
                 return True
             continue

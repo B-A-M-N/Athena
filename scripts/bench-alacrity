@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from athena.state.database import Database
 from athena.state.events import EventStore
+from athena.release.qualification import qualify_benchmark_environment
 
 
 async def _run(count: int) -> dict[str, object]:
@@ -51,7 +52,17 @@ def main() -> int:
     args = parser.parse_args()
     if args.events < 1 or args.events > 100_000:
         parser.error("--events must be between 1 and 100000")
+    environment = qualify_benchmark_environment()
+    if environment["status"] != "QUALIFIED":
+        print(
+            json.dumps(
+                {"status": environment["status"], "environment": environment}, sort_keys=True
+            )
+        )
+        return 125
     result = asyncio.run(_run(args.events))
+    result["benchmark_name"] = "alacrity.event_producer"
+    result["environment"] = environment
     print(json.dumps(result, sort_keys=True))
     rate = float(result.get("producer_events_per_second") or 0)
     if rate < args.min_producer_events_per_second:

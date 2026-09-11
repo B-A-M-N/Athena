@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export UV_CACHE_DIR="${ATHENA_UV_CACHE_DIR:-/tmp/athena-uv-cache}"
+uv_bin="${ATHENA_RELEASE_UV:-uv}"
+artifacts="${1:-}"
+if [[ "${artifacts}" == "--preflight" ]]; then
+  "$uv_bin" run --frozen --extra dev python - <<'PY'
+import json
+import sqlite3
+from pathlib import Path
+import re
+
+fixture_path = Path("tests/fixtures/release/previous-beta-release.json")
+fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+previous_version = str(fixture.get("schema_migration_version") or "")
+if not re.fullmatch(r"[0-9]{3}", previous_version):
+    raise SystemExit("clean-install-upgrade-rollback: previous-release fixture has no valid schema version")
+schema_fixture = fixture_path.parent / str(fixture.get("schema_fixture", ""))
+connection = sqlite3.connect(":memory:")
+connection.executescript(schema_fixture.read_text(encoding="utf-8"))
+table_count = connection.execute(
+    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+).fetchone()[0]
+if table_count < 50:
+    raise SystemExit(f"clean-install-upgrade-rollback: N-1 schema is incomplete ({table_count} tables)")
+if connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] != int(previous_version):
+    raise SystemExit("clean-install-upgrade-rollback: N-1 migration history is incomplete")
+if connection.execute(
+    "SELECT version FROM schema_migrations ORDER BY CAST(version AS INTEGER) DESC LIMIT 1"
+).fetchone()[0] != previous_version:
+    raise SystemExit("clean-install-upgrade-rollback: N-1 migration head does not match metadata")
+for table, key in (("sessions", "previous-session"), ("tasks", "previous-task"), ("messages", "previous-message")):
+    if connection.execute(f"SELECT 1 FROM {table} WHERE id = ?", (key,)).fetchone() is None:
+        raise SystemExit(f"clean-install-upgrade-rollback: missing representative {table} row")
+connection.close()
+print("clean-install-upgrade-rollback: PREFLIGHT PASS")
+PY
+  exit 0
+fi
+if [[ "${artifacts}" == "--artifacts" ]]; then
+  artifacts="${2:-}"
+fi
+[[ -n "${artifacts}" && -d "${artifacts}" ]] || {
+  printf '%s\n' 'clean-install-upgrade-rollback: usage: --preflight or --artifacts DISTRIBUTIONS_DIR' >&2
+  exit 2
+}
+
+"$uv_bin" run --frozen --extra dev python - "${artifacts}" <<'PY'
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import venv
+
+
+artifacts = Path(sys.argv[1]).resolve()
+fixture_path = Path.cwd() / "tests" / "fixtures" / "release" / "previous-beta-release.json"
+fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+previous_version = str(fixture.get("schema_migration_version") or "")
+if not re.fullmatch(r"[0-9]{3}", previous_version):
+    raise SystemExit("clean-install-upgrade-rollback: previous-release fixture has no valid schema version")
+schema_fixture = fixture_path.parent / str(fixture.get("schema_fixture", ""))
+if not schema_fixture.is_file():
+    raise SystemExit("clean-install-upgrade-rollback: fixed previous-release schema is missing")
+python_wheels = sorted(artifacts.glob("athena_agent-*.whl"))
+native_wheels = sorted(artifacts.glob("athena_agent_native-*.whl"))
+if not python_wheels or not native_wheels:
+    raise SystemExit("clean-install-upgrade-rollback: both Python and native wheels are required")
+
+
+with tempfile.TemporaryDirectory(prefix="athena-release-venv-") as raw_venv:
+    venv_dir = Path(raw_venv)
+    venv.EnvBuilder(with_pip=True, clear=True).create(venv_dir)
+    installed_python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    wheelhouse = venv_dir / "wheelhouse"
+    wheelhouse.mkdir()
+    requirements = venv_dir / "locked-requirements.txt"
+    subprocess.run(
+        [
+            os.environ.get("ATHENA_RELEASE_UV", "uv"), "export", "--frozen", "--no-dev", "--no-emit-project",
+            "--format", "requirements.txt", "--output-file", str(requirements),
+        ],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "download",
+            "--require-hashes",
+            "-r",
+            str(requirements),
+            "--dest",
+            str(wheelhouse),
+        ],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    subprocess.run(
+        [
+            str(installed_python), "-m", "pip", "install", "--no-index",
+            "--find-links", str(wheelhouse), "--require-hashes", "-r", str(requirements),
+        ],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    subprocess.run(
+        [
+            str(installed_python), "-m", "pip", "install", "--no-index",
+            "--find-links", str(wheelhouse), "--find-links", str(artifacts),
+            "--force-reinstall", str(python_wheels[-1]), str(native_wheels[-1]),
+        ],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env["PYTHONNOUSERSITE"] = "1"
+    probe = venv_dir / "database_probe.py"
+    probe.write_text(
+        r'''from __future__ import annotations
+
+import asyncio
+import sqlite3
+import tempfile
+from pathlib import Path
+
+from athena.memory.store import MemoryStore
+from athena.packs.store import PackStore
+from athena.state.approvals import ApprovalStore
+from athena.state.database import Database
+from athena.kernel.continuations import ContinuationStore
+from athena.state.messages import MessageStore
+from athena.state.mutations import MutationStore
+from athena.state.provider_usage import ProviderUsageStore
+from athena.state.schedules import ScheduleStore
+from athena.state.self_host import SelfHostMissionStore
+from athena.state.sessions import SessionRepository
+from athena.state.tasks import TaskStore
+from athena.workflows.store import WorkflowStore
+
+
+schema_fixture = Path("__SCHEMA_FIXTURE__")
+
+
+def make_previous_release(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    connection.executescript(schema_fixture.read_text(encoding="utf-8"))
+    connection.commit()
+    connection.close()
+
+
+async def main() -> None:
+    with tempfile.TemporaryDirectory(prefix="athena-installed-release-") as raw_root:
+        root = Path(raw_root)
+        fresh = root / "fresh.sqlite"
+        first = Database(str(fresh))
+        await first._ensure_ready()
+        await SessionRepository(first).create("installed-session")
+        await first.execute(
+            "INSERT INTO tasks(id, status, autonomy, objective, created_at, updated_at) "
+            "VALUES ('installed-task', 'QUEUED', 'supervised', 'installed', '2026-01-01', '2026-01-01')"
+        )
+        await first.close()
+        reopened = Database(str(fresh))
+        await reopened._ensure_ready()
+        assert await reopened.fetch_one("SELECT id FROM tasks WHERE id = 'installed-task'")
+        await reopened.close()
+
+        previous = root / "previous-release.sqlite"
+        make_previous_release(previous)
+        upgraded = Database(str(previous))
+        await upgraded._ensure_ready()
+        assert await upgraded.fetch_one("SELECT version FROM schema_migrations WHERE version = '049'")
+        assert await upgraded.fetch_one("SELECT version FROM schema_migrations WHERE version = '050'")
+        columns = await upgraded.fetch_all("PRAGMA table_info(model_response_attempts)")
+        assert any(row["name"] == "actual_cost" for row in columns)
+        assert await upgraded.fetch_one("SELECT id FROM sessions WHERE id = 'previous-session'")
+        assert await upgraded.fetch_one("SELECT id FROM tasks WHERE id = 'previous-task'")
+        assert await upgraded.fetch_one("SELECT id FROM messages WHERE id = 'previous-message'")
+        # SQL row preservation is necessary but insufficient: prove the
+        # current application repositories can decode the old wire shapes.
+        assert await SessionRepository(upgraded).get("previous-session")
+        assert any(
+            message.id == "previous-message"
+            for message in await MessageStore(upgraded).list_session_messages("previous-session")
+        )
+        assert await TaskStore(upgraded).get("previous-task")
+        assert await ScheduleStore(upgraded).get_job("previous-job")
+        assert await ApprovalStore(upgraded).get("previous-approval")
+        assert await MutationStore(upgraded).get("previous-mutation")
+        assert await MemoryStore(upgraded).get("previous-memory")
+        assert await WorkflowStore(upgraded).get(
+            "previous-workflow", task_id="previous-task"
+        )
+        assert await PackStore(upgraded).get("previous-pack")
+        assert await SelfHostMissionStore(upgraded).get("previous-mission")
+        continuation = await ContinuationStore(upgraded).claim_resolved("previous-task")
+        assert continuation is not None
+        assert continuation["id"] == "previous-continuation"
+        assert continuation["canonical_arguments"] == {
+            "path": "workspace/file.txt",
+            "content": "old beta",
+        }
+        assert any(
+            row["id"] == "previous-usage"
+            for row in await ProviderUsageStore(upgraded).list_for_task("previous-task")
+        )
+        for table, key in (
+            ("memories", "previous-memory"),
+            ("scheduled_jobs", "previous-job"),
+            ("approvals", "previous-approval"),
+            ("mutations", "previous-mutation"),
+            ("workflows", "previous-workflow"),
+            ("workflow_runs", "previous-workflow-run"),
+            ("capability_packs", "previous-pack"),
+            ("provider_usage", "previous-usage"),
+        ):
+            assert await upgraded.fetch_one(f"SELECT id FROM {table} WHERE id = ?", (key,))
+        assert await upgraded.fetch_one(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'model_response_receipts'"
+        )
+        await upgraded.close()
+
+        failed_path = root / "failed-upgrade.sqlite"
+        make_previous_release(failed_path)
+        failure = {"armed": True}
+
+        def fail_latest(version: str, body: str) -> str:
+            if version == "049" and failure["armed"]:
+                failure["armed"] = False
+                return body + "\nSELECT athena_release_migration_failure();\n"
+            return body
+
+        failing = Database(str(failed_path), migration_fault_injector=fail_latest)
+        try:
+            try:
+                await failing._ensure_ready()
+            except Exception:
+                pass
+            else:
+                raise AssertionError("faulted migration unexpectedly committed")
+            assert failing._conn is None and failing._closed is False
+            await failing._ensure_ready()
+        finally:
+            await failing.close()
+
+
+asyncio.run(main())
+'''.replace("__SCHEMA_FIXTURE__", str(schema_fixture).replace("\\", "\\\\").replace('"', '\\"')),
+        encoding="utf-8",
+    )
+    subprocess.run([str(installed_python), str(probe)], check=True, env=env, text=True)
+
+print("clean-install-upgrade-rollback: PASS")
+PY

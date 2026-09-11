@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+# Source this file before local release-toolchain or provenance commands:
+#   source scripts/cosign-env
+# The keyless identity is intentionally not guessed locally; CI supplies its
+# GitHub Actions workflow identity and OIDC token.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  printf '%s\n' 'cosign-env: source this file; do not execute it' >&2
+  exit 2
+fi
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cosign_bin="$repo_root/.release-toolchain/bin/cosign"
+[[ -x "$cosign_bin" ]] || {
+  printf 'cosign-env: missing executable: %s\n' "$cosign_bin" >&2
+  return 1
+}
+
+# Pin release commands to the provisioned project environment.  The host may
+# expose an older ``python3`` (the current host does), while Athena's certified
+# runtime is the locked 3.12/3.13 UV environment.  Native X11 helpers use the
+# separately named system interpreter below and never redefine Athena's one.
+uv_bin="${ATHENA_RELEASE_UV:-$(command -v uv || true)}"
+[[ -n "$uv_bin" && -x "$uv_bin" ]] || {
+  printf '%s\n' 'cosign-env: uv is unavailable; install uv before sourcing this helper' >&2
+  return 1
+}
+if [[ -x "$repo_root/.venv/bin/python" ]]; then
+  release_python_default="$repo_root/.venv/bin/python"
+else
+  release_python_default=""
+fi
+release_python="${ATHENA_RELEASE_PYTHON:-$release_python_default}"
+[[ -n "$release_python" && -x "$release_python" ]] || {
+  printf '%s\n' 'cosign-env: project .venv is missing; run uv sync --frozen first' >&2
+  return 1
+}
+export ATHENA_RELEASE_UV="$(cd "$(dirname "$uv_bin")" && pwd)/$(basename "$uv_bin")"
+export ATHENA_RELEASE_PYTHON="$(cd "$(dirname "$release_python")" && pwd)/$(basename "$release_python")"
+export PATH="$(dirname "$ATHENA_RELEASE_PYTHON"):$PATH"
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$repo_root/.venv}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$repo_root/.release-toolchain/uv-cache}"
+system_python_default="$(command -v python3 || true)"
+if [[ -x /usr/bin/python3 ]] && /usr/bin/python3 -c 'import Xlib' >/dev/null 2>&1; then
+  system_python_default="/usr/bin/python3"
+fi
+if [[ -n "$system_python_default" ]]; then
+  export ATHENA_RELEASE_SYSTEM_PYTHON="${ATHENA_RELEASE_SYSTEM_PYTHON:-$system_python_default}"
+fi
+
+export ATHENA_COSIGN="$cosign_bin"
+export COSIGN_BIN="$cosign_bin"
+export COSIGN_CERTIFICATE_OIDC_ISSUER="${COSIGN_CERTIFICATE_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+
+# Keep local release checks self-contained and bind them to the provisioned
+# cargo-deny build instead of a mutable host installation.  CI may override
+# CARGO_HOME when it provides its own runner cache.
+export CARGO_HOME="${CARGO_HOME:-$repo_root/.release-toolchain/cargo-home}"
+cargo_deny_bin="$repo_root/.release-toolchain/cargo-deny/bin/cargo-deny"
+if [[ -x "$cargo_deny_bin" ]]; then
+  export ATHENA_CARGO_DENY_BIN="$cargo_deny_bin"
+fi
+printf 'cosign-env: configured uv=%s python=%s system-python=%s cosign=%s\n' \
+  "$ATHENA_RELEASE_UV" "$ATHENA_RELEASE_PYTHON" \
+  "${ATHENA_RELEASE_SYSTEM_PYTHON:-unavailable}" "$ATHENA_COSIGN" >&2

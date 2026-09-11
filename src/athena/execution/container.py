@@ -20,13 +20,15 @@ import subprocess
 import threading
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
 
-from athena.execution.backend import ExecutionBackend
+from athena.execution.backend import BackendCapabilities, ExecutionBackend
 from athena.execution.async_call import run_blocking
 from athena.execution.process_tree import spawn_owned
 from athena.execution.runtimes.base import BaseRuntime
 from athena.execution.runtimes.python import _PythonSession, _WORKER_SOURCE
+from athena.execution.runtimes.node import _NODE_WORKER, _NodeSession
 from athena.execution.runtimes.shell import _SubprocessSession
 from athena.state.runtime_sessions import environment_fingerprint, sanitize_environment
 from athena.protocol.execution import (
@@ -45,6 +47,33 @@ _CONTAINER_CWD = "/workspace"
 
 class _DockerPythonSession(_PythonSession):
     """The normal Athena Python worker launched through ``docker exec``."""
+
+    def __init__(self, *, command: list[str], env: Mapping[str, str] | None = None) -> None:
+        super().__init__(env=dict(env or {}), cwd=None, sandbox_root=None, network_policy=None)
+        self._command = command
+
+    def start(self) -> None:
+        self.process = spawn_owned(
+            self._command,
+            env={},
+            cwd=None,
+            sandbox_root=None,
+            network_policy=None,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if self.process.stdout is not None:
+            threading.Thread(
+                target=self._read_loop, args=(self.process.stdout,), daemon=True
+            ).start()
+
+
+class _DockerNodeSession(_NodeSession):
+    """The normal Athena Node worker launched through ``docker attach``."""
 
     def __init__(self, *, command: list[str], env: Mapping[str, str] | None = None) -> None:
         super().__init__(env=dict(env or {}), cwd=None, sandbox_root=None, network_policy=None)
@@ -120,9 +149,7 @@ class ContainerBackend(ExecutionBackend):
     """Run Athena's persistent runtimes inside Docker.
 
     The backend intentionally supports the runtimes whose worker protocols
-    are defined by Athena today: Python and shell.  Node can be added when its
-    worker is made a stable shared protocol; silently treating it as a shell
-    would be a correctness and policy bug.
+    are defined by Athena today: Python, shell, and Node.
     """
 
     name = "container"
@@ -135,21 +162,51 @@ class ContainerBackend(ExecutionBackend):
         "bash": "shell",
         "sh": "shell",
         "zsh": "shell",
+        "node": "node",
+        "nodejs": "node",
+        "javascript": "node",
+        "js": "node",
     }
 
     def __init__(
         self,
         image: str = "python:3.13-slim",
         *,
+        runtime_images: Mapping[str, str] | None = None,
         docker_command: str = "docker",
         runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     ) -> None:
         self.image = image
+        self.runtime_images = {
+            "node": "node:22-slim",
+            **{str(key).casefold(): str(value) for key, value in (runtime_images or {}).items()},
+        }
         self.docker_command = docker_command
         self._runner = runner or subprocess.run
         self._sessions: dict[str, _ContainerSession] = {}
         self._tasks: dict[str, list[str]] = {}
         self._exec_sessions: dict[str, _ContainerSession] = {}
+
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            supported_runtimes=("node", "python", "shell"),
+            persistent_sessions=True,
+            persistent_runtime_state=True,
+            reattach=True,
+            filesystem_persistence=True,
+            network_modes=("allow", "deny", "restricted"),
+            secret_materialization=True,
+            interactive_stdin=True,
+            process_signals=True,
+            dependency_installation=("python", "node"),
+            runtime_capabilities={
+                runtime: {
+                    "filesystem_containment": True,
+                    "network_containment": True,
+                }
+                for runtime in ("python", "shell")
+            },
+        )
 
     def available(self) -> bool:
         """Return whether Docker can actually service a request."""
@@ -174,6 +231,10 @@ class ContainerBackend(ExecutionBackend):
         image_ref, image_digest = self._resolve_image()
         return {"image": image_ref, "image_digest": image_digest}
 
+    def _image_for_runtime(self, runtime: str) -> str:
+        canonical = self._canonical_runtime(runtime)
+        return self.runtime_images.get(canonical, self.image)
+
     def _require(self) -> None:
         if not self.available():
             raise RuntimeError(
@@ -187,7 +248,7 @@ class ContainerBackend(ExecutionBackend):
         if canonical is None:
             raise ValueError(
                 f"container backend does not support runtime {runtime!r}; "
-                "supported runtimes: python, shell"
+                "supported runtimes: node, python, shell"
             )
         return canonical
 
@@ -258,7 +319,7 @@ class ContainerBackend(ExecutionBackend):
             raise RuntimeError(f"Docker returned no metadata for container {container_id}")
         return value
 
-    def _resolve_image(self) -> tuple[str, str]:
+    def _resolve_image(self, image: str | None = None) -> tuple[str, str]:
         """Resolve the configured image to an immutable local identity.
 
         A tag is only a lookup name: it can point at different content on a
@@ -267,13 +328,14 @@ class ContainerBackend(ExecutionBackend):
         This also prevents an execution from implicitly pulling a changed tag
         after its proof identity was established.
         """
+        selected_image = str(image or self.image)
         raw = self._run_docker(
             [
                 "image",
                 "inspect",
                 "--format",
                 "{{json .}}",
-                self.image,
+                selected_image,
             ]
         )
         try:
@@ -297,7 +359,7 @@ class ContainerBackend(ExecutionBackend):
         if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
             return image_id, image_id
         raise RuntimeError(
-            f"container image {self.image!r} has no immutable digest; "
+            f"container image {selected_image!r} has no immutable digest; "
             "use a digest-pinned image or build a local image"
         )
 
@@ -334,6 +396,18 @@ class ContainerBackend(ExecutionBackend):
             "--workdir",
             _CONTAINER_CWD,
         ]
+        # Dependency acquisition has a narrow, operator-defined writable
+        # enclave. The source workspace remains read-only, while Python/npm
+        # installs can persist their reproducibility records across sessions.
+        for relative in (".athena/dependencies", ".athena/node", ".athena/environments"):
+            writable = Path(root, relative)
+            writable.mkdir(parents=True, exist_ok=True)
+            command.extend(
+                (
+                    "--mount",
+                    f"type=bind,source={writable},target={_WORKSPACE_MOUNT}/{relative},rw",
+                )
+            )
         for key, value in self._validate_env(env).items():
             command.extend(("--env", f"{key}={value}"))
         labels: dict[str, str | None] = {
@@ -352,9 +426,12 @@ class ContainerBackend(ExecutionBackend):
             command.extend(("--network", "none"))
         if runtime == "shell":
             container_program: tuple[str, ...] = ("bash", "--norc", "--noprofile")
+        elif runtime == "node":
+            container_program = ("node", "-e", _NODE_WORKER)
         else:
             container_program = ("python", "-u", "-c", _WORKER_SOURCE)
-        command.extend((image_ref or self._resolve_image()[0], *container_program))
+        selected_ref = image_ref or self._resolve_image(self._image_for_runtime(runtime))[0]
+        command.extend((selected_ref, *container_program))
         container_id = self._run_docker(command)
         if not container_id:
             raise RuntimeError("Docker returned an empty container id")
@@ -391,7 +468,7 @@ class ContainerBackend(ExecutionBackend):
         root = self._workspace_root(workspace_root)
         container_cwd = self._workspace_cwd(root, cwd)
         values = self._validate_env(env)
-        image_ref, image_digest = self._resolve_image()
+        image_ref, image_digest = self._resolve_image(self._image_for_runtime(canonical))
         container_id = self._create_container(
             task_id=task_id,
             workspace_root=root,
@@ -421,6 +498,8 @@ class ContainerBackend(ExecutionBackend):
                     sandbox_root=None,
                     network_policy=None,
                 )
+            elif canonical == "node":
+                worker = _DockerNodeSession(command=command, env=values)
             else:
                 worker = _DockerPythonSession(command=command, env=values)
             worker.start()
@@ -567,6 +646,8 @@ class ContainerBackend(ExecutionBackend):
             worker = _SubprocessSession(
                 env={}, cwd=None, start_cmd=command, sandbox_root=None, network_policy=None
             )
+        elif runtime == "node":
+            worker = _DockerNodeSession(command=command, env=env)
         else:
             worker = _DockerPythonSession(command=command, env=env)
         worker.start()

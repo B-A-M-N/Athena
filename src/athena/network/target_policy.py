@@ -41,8 +41,17 @@ def validate_target(
     raw = str(target or "").strip()
     if not raw:
         return None, "network target is required"
-    parsed = urlsplit(raw if "://" in raw else f"//{raw}")
-    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    try:
+        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        if parsed.scheme and parsed.scheme.casefold() not in {"http", "https"}:
+            return None, "network target must use http or https"
+        if parsed.username is not None or parsed.password is not None:
+            return None, "network target must not contain URL userinfo"
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            return None, "network target contains an invalid port"
+    except ValueError:
+        return None, "network target has malformed URL authority"
     if not hostname:
         return None, f"network target has no hostname: {target}"
     if policy_name == "deny":

@@ -20,6 +20,7 @@ marks every MCP-served capability as untrusted so policy stays authoritative.
 from __future__ import annotations
 
 import re
+import json
 from typing import Any, Mapping
 
 from athena.protocol.capabilities import EffectClass
@@ -83,7 +84,10 @@ _NETWORK_TOKENS = (
     "socket",
 )
 
-_KNOWN_TYPES = frozenset({"string", "boolean", "number", "integer", "object", "array", "null"})
+_MAX_MCP_SCHEMA_BYTES = 256 * 1024
+# Keep the MCP boundary aligned with the canonical registry validator. Local
+# recursive $refs are valid; only the concrete schema tree is depth-bounded.
+_MAX_MCP_SCHEMA_DEPTH = 32
 
 
 def sanitize_server_name(name: str) -> str:
@@ -176,29 +180,31 @@ def infer_effects(
 def tool_schema_to_descriptor_input(
     input_schema: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Translate an MCP JsonSchema to the registry's JSON-schema subset.
+    """Preserve a bounded local MCP JSON Schema for Athena validation.
 
-    The registry validator (:mod:`athena.capabilities.registry.validate_schema`)
-    understands ``type``, ``properties``, ``required``, ``enum`` and
-    ``allow_extra``. This translation keeps those keys and the type-strings the
-    validator needs, folding unknown MCP schema features away safely.
+    Athena's registry validates Draft 2020-12 schemas directly, so flattening
+    nested objects and combinators would only reduce interoperability. The
+    boundary still rejects external references and pathological size/depth;
+    remote content must never turn schema validation into network access or a
+    recursion/DoS primitive.
     """
     if not isinstance(input_schema, Mapping):
         return _default_schema()
-    raw_props = input_schema.get("properties")
-    properties: dict[str, Any] = {}
-    if isinstance(raw_props, Mapping):
-        for prop_name, spec in raw_props.items():
-            properties[str(prop_name)] = _normalize_property(spec)
-    required_raw = input_schema.get("required")
-    required = [str(r) for r in required_raw] if isinstance(required_raw, list) else []
-    extra = bool(input_schema.get("additionalProperties", False))
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "allow_extra": extra,
-    }
+    normalized = _normalize_schema(input_schema)
+    if normalized.get("type") is None and not any(
+        key in normalized for key in ("oneOf", "anyOf", "allOf", "$ref")
+    ):
+        normalized["type"] = "object"
+    if normalized.get("type") == "object" and "properties" not in normalized:
+        normalized["properties"] = {}
+    if "additionalProperties" not in normalized and "allow_extra" not in normalized:
+        # MCP's JSON Schema follows the JSON Schema default: extra properties
+        # are valid unless the server explicitly closes the object.
+        normalized["additionalProperties"] = True
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > _MAX_MCP_SCHEMA_BYTES:
+        raise ValueError("MCP tool schema exceeds the maximum allowed size")
+    return normalized
 
 
 def effect_note(annotations: Mapping[str, Any] | None) -> str:
@@ -209,21 +215,50 @@ def effect_note(annotations: Mapping[str, Any] | None) -> str:
     return f"server-asserted hints: {', '.join(hints)}" if hints else ""
 
 
-def _normalize_property(spec: Any) -> dict[str, Any]:
-    if not isinstance(spec, dict):
-        return {"type": "string"}
-    out: dict[str, Any] = {}
-    ptype = spec.get("type")
-    if ptype in _KNOWN_TYPES:
-        out["type"] = ptype
-    among = spec.get("enum")
-    if isinstance(among, list):
-        out["enum"] = list(among)
-    return out or {"type": "string"}
+def _normalize_schema(node: Any, depth: int = 0) -> Any:
+    if depth > _MAX_MCP_SCHEMA_DEPTH:
+        raise ValueError(f"MCP tool schema exceeds maximum nesting depth {_MAX_MCP_SCHEMA_DEPTH}")
+    if isinstance(node, Mapping):
+        out: dict[str, Any] = {}
+        for raw_key, value in node.items():
+            key = str(raw_key)
+            if key == "$ref":
+                ref = str(value)
+                if not ref.startswith("#/"):
+                    raise ValueError("MCP tool schema may only use local $ref values")
+                out[key] = ref
+            elif key in {
+                "properties",
+                "$defs",
+                "definitions",
+                "patternProperties",
+                "dependentSchemas",
+            }:
+                if not isinstance(value, Mapping):
+                    raise ValueError(f"MCP schema field {key!r} must be an object")
+                out[key] = {
+                    str(child_key): _normalize_schema(child_value, depth + 1)
+                    for child_key, child_value in value.items()
+                }
+            elif key in {"oneOf", "anyOf", "allOf", "prefixItems", "items", "contains"}:
+                out[key] = _normalize_schema(value, depth + 1)
+            else:
+                out[key] = _normalize_schema(value, depth + 1)
+        return out
+    if isinstance(node, list):
+        return [_normalize_schema(item, depth + 1) for item in node]
+    if isinstance(node, tuple):
+        return [_normalize_schema(item, depth + 1) for item in node]
+    return node
 
 
 def _default_schema() -> dict[str, Any]:
-    return {"type": "object", "properties": {}, "required": [], "allow_extra": True}
+    return {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": True,
+    }
 
 
 def _first_word(name: str) -> str:

@@ -24,6 +24,7 @@ from athena.tasks.budgets import BudgetStateUnavailable, BudgetTracker
 from athena.state.database import Database
 from athena.state.events import EventStore
 from athena.state.messages import MessageStore
+from athena.state.model_responses import ModelResponseStore
 from athena.state.sessions import SessionRepository
 from athena.state.tasks import TaskStore
 from athena.tasks.manager import TaskManager
@@ -327,6 +328,53 @@ async def test_budget_failure_during_bootstrap_is_recovery_required_and_not_leak
     assert result.status == TaskStatus.RECOVERY_REQUIRED
     assert calls == [f"begin:{spec.id}"]
     assert (await stack.tasks.get(spec.id))["status"] == TaskStatus.RECOVERY_REQUIRED.value
+
+
+async def test_provider_send_failure_is_recovery_required_with_durable_attempt(stack):
+    """A failure after provider send must not become an ordinary task failure."""
+    response_store = ModelResponseStore(stack.db)
+    stack.kernel._model_response_store = response_store
+    stack.manager.set_model_response_store(response_store)
+
+    async def lost_after_send(_request):
+        raise ConnectionError("provider connection ended after send")
+        yield  # pragma: no cover - keep this an async generator
+
+    stack.provider.complete = lost_after_send
+    spec = await _create(stack, "provider uncertainty")
+    result = await stack.kernel.run_task(spec.id)
+
+    assert result.status is TaskStatus.RECOVERY_REQUIRED
+    assert "provider outcome unknown" in result.summary
+    attempts = await response_store.list_unresolved_attempts(spec.id)
+    assert len(attempts) == 1
+    assert attempts[0]["provider_outcome_status"] == "unknown"
+    assert attempts[0]["attempt_id"] in result.summary
+
+
+async def test_provider_assembled_before_receipt_fault_is_unknown(stack):
+    """The exact post-assembly/pre-receipt boundary retains UNKNOWN."""
+    response_store = ModelResponseStore(stack.db)
+    stack.kernel._model_response_store = response_store
+    stack.manager.set_model_response_store(response_store)
+    stack.provider._scripts = [{"respond": {"text": "assembled", "done": True}}]
+
+    async def fault(name: str) -> None:
+        if name == "provider-assembled-before-receipt":
+            raise RuntimeError("fault between provider assembly and receipt commit")
+
+    stack.kernel._inference_fault_injector = fault
+    spec = await _create(stack, "assembled response boundary")
+    result = await stack.kernel.run_task(spec.id)
+
+    assert result.status is TaskStatus.RECOVERY_REQUIRED
+    attempts = await response_store.list_unresolved_attempts(spec.id)
+    assert len(attempts) == 1
+    assert attempts[0]["provider_outcome_status"] == "unknown"
+    assert await response_store.get_receipt(
+        task_id=spec.id,
+        request_fingerprint=attempts[0]["request_fingerprint"],
+    )
 
 
 async def test_successful_model_calls_reconcile_cost_before_next_reservation(stack):

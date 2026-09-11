@@ -112,3 +112,56 @@ async def test_transport_failure_degrades_health_and_fails_closed():
     assert client.health()["state"] == "failed"
     with pytest.raises(MCPError, match="not connected"):
         await client.list_tools()
+
+
+@pytest.mark.asyncio
+async def test_mcp_discovery_rejects_oversized_inventory_and_metadata():
+    from types import SimpleNamespace
+
+    client = MCPClient("bounded", command="unused-do-not-connect")
+    client._session = SimpleNamespace(
+        list_tools=lambda: _async_result(
+            SimpleNamespace(tools=[SimpleNamespace(name="x", description="d") for _ in range(4097)])
+        )
+    )
+    client._connected = True
+    with pytest.raises(MCPError, match="inventory"):
+        await client.list_tools()
+
+    client._session = SimpleNamespace(
+        list_tools=lambda: _async_result(
+            SimpleNamespace(tools=[SimpleNamespace(name="x", description="d" * 20_000)])
+        )
+    )
+    with pytest.raises(MCPError, match="description"):
+        await client.list_tools()
+
+    recursive: dict = {}
+    cursor = recursive
+    for _ in range(40):
+        cursor["nested"] = {}
+        cursor = cursor["nested"]
+    client._session = SimpleNamespace(
+        list_tools=lambda: _async_result(
+            SimpleNamespace(tools=[SimpleNamespace(name="recursive", inputSchema=recursive)])
+        )
+    )
+    with pytest.raises(MCPError, match="depth"):
+        await client.list_tools()
+
+    client._session = SimpleNamespace(
+        list_tools=lambda: _async_result(
+            SimpleNamespace(
+                tools=[
+                    SimpleNamespace(name="duplicate"),
+                    SimpleNamespace(name="duplicate"),
+                ]
+            )
+        )
+    )
+    with pytest.raises(MCPError, match="duplicate"):
+        await client.list_tools()
+
+
+async def _async_result(value):
+    return value

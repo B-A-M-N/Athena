@@ -1,0 +1,43 @@
+{
+  "default_action": "fail_on_new_or_changed_unclassified_broad_catch",
+  "directories": {
+    "execution": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported.",
+    "kernel": "Kernel loops convert boundary failures into durable task outcomes; broad catches preserve completion truth.",
+    "policy": "Credential/policy parsing rejects malformed optional input without breaking policy evaluation.",
+    "reality": "Verification/reality boundaries fail closed and retain evidence instead of allowing an unverified mutation.",
+    "scheduler": "Scheduler loop failures are isolated per trigger and surfaced as durable degraded/retry state.",
+    "state": "Durability/recovery boundaries must retain truthful terminal evidence."
+  },
+  "files": {
+    "src/athena/execution/async_call.py": {"sha256": "399ec332b6bb2af16baa6ca0aa8e8571995db4bd0c38da7bf3cb18623823aaf1", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/container.py": {"sha256": "b9db69afc2346e749a0ed35bc31c5a9e499391ddc8640eaa2c0d5b54cdaf38ec", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/manager.py": {"sha256": "9078bf58fda0899e3a64ae8df0f4de776ab09a349b83c106d05ea0593d505d63", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/process_tree.py": {"sha256": "8c25e80f0da85b8c1eef292b2b5afa5ed4783732b0b0d068d6a0960f62125554", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/runtime_host.py": {"sha256": "bef01e50f7109f9eb9d51bdf31c9dc29e3697bb3e56e5bde8220e373ae95a608", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/runtimes/__init__.py": {"sha256": "26c0507a7119a0425144073b5a9b8b084653302a48b5bd6fde6bc8dc781a790f", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/runtimes/base.py": {"sha256": "b63a2d2b7fb02e2dd397d413b743e97376a8599c46adbebb320718874150cdb9", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/runtimes/node.py": {"sha256": "7fd803d282ace97123d3217eb880e83555f10558cb51471d6d81e7171573b210", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/runtimes/powershell.py": {"sha256": "9b0869fbcfc2b0ea548ed9c944f80278c90384bcadcf94a05b5d5e2353ff111f", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/runtimes/python.py": {"sha256": "0808d018a9976af5f132ae2baedfbe02f4bf17a895e3c9774f3106bf49517f24", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/runtimes/shell.py": {"sha256": "efba9455dd87be4d1bc7aa7b6bb35f0ca40c25959a831588774dc996799c6e2c", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/execution/ssh.py": {"sha256": "07b800c2df345fa59fdefebd1428ca4a5c385603dce973677ceac61760291695", "rationale": "Runtime adapters contain process/transport failures so owned execution resources can be cleaned up and reported."},
+    "src/athena/kernel/continuations.py": {"sha256": "8287e187d50f20c4d3b29942600f8b633ea6e8fbd417571c559cf8a111607364", "rationale": "Kernel loops convert boundary failures into durable task outcomes; broad catches preserve completion truth."},
+    "src/athena/kernel/continuations_coordinator.py": {"sha256": "d0b1e00a56ccac1d0004004dffb335cf759c246a156ec76b6576624aa4569abf", "rationale": "Kernel loops convert boundary failures into durable task outcomes; broad catches preserve completion truth."},
+    "src/athena/kernel/inference_broker.py": {"sha256": "df4613e7fa4ff0b95d9115bac93ef2e0ad200f345f6afa072f2acf8e1804a819", "rationale": "Kernel loops convert boundary failures into durable task outcomes; broad catches preserve completion truth."},
+    "src/athena/kernel/kernel.py": {"sha256": "088a485533cf8340af226b6f3f3c928dcbdc09972c0b341184a7aa9a025d1ce2", "rationale": "Kernel loops convert boundary failures into durable task outcomes; broad catches preserve completion truth."},
+    "src/athena/kernel/run_finalizer.py": {"sha256": "608dfb42828e293702eb5d3b808f355a3a0d20678a3b09fd3a2054edbcb33cc2", "rationale": "Kernel loops convert boundary failures into durable task outcomes; broad catches preserve completion truth."},
+    "src/athena/kernel/termination.py": {"sha256": "a2a5bc8aa61b912037db267e329ee23cc30ff0fd9c0d79e67618dea8c0b2d11e", "rationale": "Kernel loops convert boundary failures into durable task outcomes; broad catches preserve completion truth."},
+    "src/athena/kernel/verifiers.py": {"sha256": "92b0fe2b50a82e1dec522eced8a4815a5c475f70601d3a55b02c3a2dd8c6d1ff", "rationale": "Kernel loops convert boundary failures into durable task outcomes; broad catches preserve completion truth."},
+    "src/athena/policy/credentials.py": {"sha256": "481e1c39bc754f0fdf2fcd181eca44aaf82015d9430669d2519605c747cb8832", "rationale": "Credential/policy parsing rejects malformed optional input without breaking policy evaluation."},
+    "src/athena/reality/coordinator.py": {"sha256": "9703a7514444a2b05358af7d5fc1e3e6eb5fca0178416a43ffd792d2929ba8b5", "rationale": "Verification/reality boundaries fail closed and retain evidence instead of allowing an unverified mutation."},
+    "src/athena/reality/gate.py": {"sha256": "db7e80a7f1bfd6a4b1acf1e9b977d17bd62df9eb6b15f7981ecfd6daf38dc848", "rationale": "Verification/reality boundaries fail closed and retain evidence instead of allowing an unverified mutation."},
+    "src/athena/scheduler/scheduler.py": {"sha256": "0a0306b359fa24ce9188d2c1131e3bd9085c7cac0f16692471dc302252dd9e3c", "rationale": "Scheduler loop failures are isolated per trigger and surfaced as durable degraded/retry state."},
+    "src/athena/scheduler/triggers.py": {"sha256": "9c1006cba1653aed02d0bd910120887eab92a44195d2fbbe21a978517fa7d25c", "rationale": "Scheduler loop failures are isolated per trigger and surfaced as durable degraded/retry state."},
+    "src/athena/state/database.py": {"sha256": "7b594898cdbdaa81c4ccc9f27ec69b3fde8b0ea83a4b557323573f094f893e44", "rationale": "Durability/recovery boundaries must retain truthful terminal evidence."},
+    "src/athena/state/events.py": {"sha256": "d6dc8d22e99c40de94483eed9df11e6a08d82227ea3fadf9d346f8fd17108fe3", "rationale": "Durability/recovery boundaries must retain truthful terminal evidence."},
+    "src/athena/state/input_requests.py": {"sha256": "bc179c80df8af3d755e75cba30ddb3921210ce3101881bc76c3ea2873293086e", "rationale": "Durability/recovery boundaries must retain truthful terminal evidence."},
+    "src/athena/state/rollback.py": {"sha256": "eb6fa7c8893402872599792855327b1067d8bda34724ecf44f2ead8c0aa5b004", "rationale": "Durability/recovery boundaries must retain truthful terminal evidence."},
+    "src/athena/state/schedules.py": {"sha256": "c55e1b156e899eb71d2dcd6426eaff63cf8d6fa6ea2fd60a6fb968f104f7cfb9", "rationale": "Durability/recovery boundaries must retain truthful terminal evidence."}
+  },
+  "schema": 1
+}

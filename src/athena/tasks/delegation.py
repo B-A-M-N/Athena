@@ -66,6 +66,7 @@ class DelegationManager:
         budgets: Any = None,
         sessions: Any = None,
         cancellations: Any = None,
+        steering_store: Any = None,
         execution_manager: Any = None,
         principal_id: str | None = None,
         default_max_depth: int = _DEFAULT_MAX_DEPTH,
@@ -82,6 +83,7 @@ class DelegationManager:
             if cancellations is not None
             else getattr(task_manager, "_cancellations", None)
         )
+        self._steering_store = steering_store
         self._execution = (
             execution_manager
             if execution_manager is not None
@@ -278,6 +280,32 @@ class DelegationManager:
         if status not in TERMINAL_STATUSES:
             await self._tasks.transition(child_task_id, TaskStatus.CANCELLED)
         return TaskStatus.CANCELLED
+
+    async def steer(
+        self,
+        parent_task_id: str,
+        child_task_id: str,
+        text: str,
+        *,
+        principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Queue guidance for a live descendant at a kernel-safe boundary."""
+        if self._steering_store is None:
+            raise DelegationError("task steering is not configured")
+        if not await self.is_descendant(parent_task_id, child_task_id):
+            raise DelegationError(
+                f"child task {child_task_id!r} is not a descendant of {parent_task_id!r}"
+            )
+        status = await self.status_of(child_task_id)
+        if status in TERMINAL_STATUSES:
+            raise DelegationError(f"child task is no longer steerable (status={status.value})")
+        return await self._steering_store.enqueue(
+            child_task_id,
+            text,
+            principal_id=str(principal_id or self._principal_id or "delegation"),
+            source_task_id=parent_task_id,
+            source="parent_task",
+        )
 
     async def collect_results(self, child_task_id: str) -> TaskResult:
         result = await self._tasks.get_result(child_task_id)
@@ -501,6 +529,7 @@ def _scope_model_policy(parent: TaskSpec, child):
         require_declared_quality=bool(
             base.require_declared_quality or child_v.require_declared_quality
         ),
+        max_model_attempts=min(base.max_model_attempts, child_v.max_model_attempts),
     )
 
 
@@ -518,6 +547,7 @@ def _as_model_policy(value):
         routing_preference=getattr(value, "routing_preference", "balanced"),
         min_quality_tier=getattr(value, "min_quality_tier", None),
         require_declared_quality=bool(getattr(value, "require_declared_quality", False)),
+        max_model_attempts=int(getattr(value, "max_model_attempts", 2)),
     )
 
 
@@ -642,57 +672,16 @@ def _is_strict_descendant(child: Path, parent: Path) -> bool:
 
 
 def _restrict_paths(parent_rules, child_rules, parent_root: Path, child_root: Path):
-    """Return the canonical intersection of two prefix path policies.
+    from athena.policy.path_scope import intersect_path_rules
 
-    An empty rule tuple means the corresponding workspace root is implicitly
-    allowed.  The returned policy is always explicit, including a deny rule
-    at ``child_root`` when the intersection is empty.  This matters because
-    downstream scope checkers interpret an empty tuple as unrestricted.
-
-    ``Path.resolve(strict=False)`` canonicalizes existing symlink components;
-    every candidate is then checked against both roots and both allow sets.
-    Deny rules are retained when they overlap the surviving allow region, so
-    a parent deny cannot be erased by a child allow rule.
-    """
-    from athena.protocol.tasks import PathRule
-
-    parent = _canonical_rules(parent_rules, parent_root, parent_root)
-    child = _canonical_rules(child_rules, child_root, child_root)
-    if not parent:
-        parent = [(parent_root, True)]
-    if not child:
-        child = [(child_root, True)]
-
-    parent_allows = [path for path, allow in parent if allow and _is_within(path, parent_root)]
-    child_allows = [path for path, allow in child if allow and _is_within(path, child_root)]
-    candidates: list[Path] = []
-    for parent_allow in parent_allows:
-        for child_allow in child_allows:
-            overlap = _prefix_intersection(parent_allow, child_allow)
-            if overlap is None:
-                continue
-            if _is_within(overlap, parent_root) and _is_within(overlap, child_root):
-                candidates.append(overlap)
-
-    denies = [
-        path
-        for path, allow in (*parent, *child)
-        if not allow and (_is_within(path, parent_root) or _is_within(path, child_root))
-    ]
-    surviving: list[Path] = []
-    for candidate in _unique_paths(candidates):
-        # A deny ancestor/equal to the candidate removes that whole region.
-        if any(_is_within(candidate, deny) for deny in denies):
-            continue
-        surviving.append(candidate)
-
-    out: list[PathRule] = [PathRule(path=str(path), allow=True) for path in surviving]
-    for deny in _unique_paths(denies):
-        if any(_is_within(deny, candidate) for candidate in surviving):
-            out.append(PathRule(path=str(deny), allow=False))
-    if not out:
-        out.append(PathRule(path=str(child_root), allow=False))
-    return tuple(out)
+    return intersect_path_rules(
+        parent_rules,
+        child_rules,
+        left_base=parent_root,
+        right_base=child_root,
+        result_base=child_root,
+        scope=child_root,
+    )
 
 
 def _canonical_workspace_path(value: str | None, base: Path) -> Path | None:
@@ -700,37 +689,6 @@ def _canonical_workspace_path(value: str | None, base: Path) -> Path | None:
         return None
     raw = Path(value)
     return (raw if raw.is_absolute() else base / raw).resolve(strict=False)
-
-
-def _canonical_rules(rules, base: Path, root: Path) -> list[tuple[Path, bool]]:
-    result: list[tuple[Path, bool]] = []
-    for rule in rules or ():
-        if not getattr(rule, "path", None):
-            continue
-        path = _canonical_workspace_path(str(rule.path), base)
-        if path is None:
-            continue
-        result.append((path, bool(rule.allow)))
-    return result
-
-
-def _prefix_intersection(left: Path, right: Path) -> Path | None:
-    if _is_within(left, right):
-        return left
-    if _is_within(right, left):
-        return right
-    return None
-
-
-def _unique_paths(paths: list[Path]) -> list[Path]:
-    result: list[Path] = []
-    seen: set[str] = set()
-    for path in paths:
-        value = str(path)
-        if value not in seen:
-            seen.add(value)
-            result.append(path)
-    return result
 
 
 def _monotonic_backend(parent: str, child: str) -> str:

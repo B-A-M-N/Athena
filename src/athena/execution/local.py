@@ -10,18 +10,40 @@ from __future__ import annotations
 import asyncio
 from typing import AsyncIterator, Mapping
 
-from athena.execution.backend import ExecutionBackend
+from athena.execution.backend import BackendCapabilities, ExecutionBackend
 from athena.execution.manager import ExecutionManager
+from athena.execution.runtime_host import LocalRuntimeSupervisor, SupervisedLocalBackend
 from athena.protocol.execution import (
     ExecutionEvent,
     ExecutionRequest,
 )
 
-__all__ = ["LocalBackend"]
+__all__ = ["LocalBackend", "LocalRuntimeSupervisor", "SupervisedLocalBackend"]
 
 
 class LocalBackend(ExecutionBackend):
     name = "local"
+
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            supported_runtimes=tuple(self.manager.available_runtimes()),
+            persistent_sessions=True,
+            persistent_runtime_state=True,
+            reattach=False,
+            filesystem_persistence=True,
+            network_modes=("allow", "deny", "restricted"),
+            secret_materialization=True,
+            interactive_stdin=True,
+            process_signals=True,
+            dependency_installation=("python", "node"),
+            runtime_capabilities={
+                runtime: {
+                    "filesystem_containment": True,
+                    "network_containment": True,
+                }
+                for runtime in ("python", "shell")
+            },
+        )
 
     def __init__(self, manager: ExecutionManager | None = None) -> None:
         self.manager = manager if manager is not None else ExecutionManager()

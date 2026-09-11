@@ -12,7 +12,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from athena.protocol.capabilities import (
     CapabilityDescriptor,
@@ -22,8 +22,15 @@ from athena.protocol.capabilities import (
     CapabilityResultStatus,
     EffectClass,
 )
-from athena.execution.dependencies import environment_fingerprint, record_hashes
-from athena.execution.dependencies import resolve_dependency_environment
+from athena.execution.dependencies import (
+    dependency_environment_id,
+    dependency_environment_target,
+    environment_fingerprint,
+    record_manifest,
+    resolve_dependency_environment,
+    verify_record_files,
+)
+from athena.execution.dependency_lock import parse_dependency_lock, sha256_file
 from athena.affordances.models import DependencyRequirement
 from athena.protocol.execution import ExecutionRequest
 from athena.protocol.messages import utcnow
@@ -41,7 +48,7 @@ class DependencyManager(Protocol):
 
     def package_spec(self, name: str, version: str) -> str: ...
 
-    def target(self, root: str) -> str: ...
+    def target(self, root: str, environment_id: str | None = None) -> str: ...
 
 
 class PythonDependencyManager:
@@ -54,8 +61,24 @@ class PythonDependencyManager:
         return f"{name}=={version}"
 
     @staticmethod
-    def target(root: str) -> str:
-        return str(Path(root) / ".athena" / "dependencies")
+    def target(root: str, environment_id: str | None = None) -> str:
+        return str(dependency_environment_target(root, environment_id, "python"))
+
+
+class NodeDependencyManager:
+    """Structured npm acquisition into a workspace-local prefix."""
+
+    name = "node"
+
+    @staticmethod
+    def package_spec(name: str, version: str) -> str:
+        if not re.fullmatch(r"(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+", name):
+            raise ValueError("invalid npm package name")
+        return f"{name}@{version}" if version else name
+
+    @staticmethod
+    def target(root: str, environment_id: str | None = None) -> str:
+        return str(dependency_environment_target(root, environment_id, "node"))
 
 
 class DependencyCapability:
@@ -76,7 +99,7 @@ class DependencyCapability:
                     "enum": ["inspect", "resolve", "install", "replay"],
                 },
                 "name": {"type": "string", "minLength": 1, "maxLength": 128},
-                "manager": {"type": "string", "enum": ["python"]},
+                "manager": {"type": "string", "enum": ["python", "node"]},
                 "version": {"type": "string", "maxLength": 64},
             },
             "additionalProperties": False,
@@ -95,26 +118,70 @@ class DependencyCapability:
 
     def __init__(self, execution_manager=None) -> None:
         self._execution = execution_manager
-        self._managers: dict[str, DependencyManager] = {"python": PythonDependencyManager()}
+        self._managers: dict[str, DependencyManager] = {
+            "python": PythonDependencyManager(),
+            "node": NodeDependencyManager(),
+        }
 
     async def invoke(self, request: CapabilityRequest, *, context=None, **kw):
         args = dict(request.arguments or {})
         operation = str(args.get("operation") or "")
         name = str(args.get("name") or "").strip()
         manager = str(args.get("manager") or "python")
-        if not _NAME.fullmatch(name):
+        valid_name = _NAME.fullmatch(name) or (
+            manager == "node" and re.fullmatch(r"(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+", name)
+        )
+        if not valid_name:
             return _result(request, ok=False, error="invalid dependency name")
         dependency_manager = self._managers.get(manager)
         if dependency_manager is None:
             return _result(request, ok=False, error=f"unsupported dependency manager: {manager}")
         backend = getattr(getattr(context, "workspace", None), "execution_backend", None) or "local"
+        backend_fn = getattr(self._execution, "backend", None)
+        selected_backend = backend_fn(backend) if callable(backend_fn) else None
+        remote_operation = getattr(selected_backend, "dependency_operation", None)
         if operation in {"inspect", "resolve"}:
-            lock = _read_lock(context)
+            try:
+                lock = _read_lock(context)
+            except ValueError as exc:
+                return _result(request, ok=False, error=str(exc))
             record = _lock_record(lock, name) if lock else None
-            host_installed = importlib.util.find_spec(name.replace("-", "_")) is not None
-            task_runtime_available = await self._runtime_probe(
-                request, context=context, name=name, record=record
+            host_installed = (
+                importlib.util.find_spec(name.replace("-", "_")) is not None
+                if manager == "python"
+                else False
             )
+            remote_inventory: Mapping[str, Any] | None = None
+            if backend not in _HOST_INTERPRETER_BACKENDS and callable(remote_operation):
+                try:
+                    remote_inventory = await remote_operation(
+                        task_id=request.task_id or "dependency-inspect",
+                        manager=manager,
+                        name=name,
+                        operation="inventory",
+                        environment_id=str(_record_environment_id(record) or ""),
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    return _result(
+                        request,
+                        ok=False,
+                        error=f"remote dependency inventory failed: {exc}",
+                    )
+            remote_packages = (
+                remote_inventory.get("packages") if isinstance(remote_inventory, Mapping) else None
+            )
+            remote_package = (
+                remote_packages[0]
+                if isinstance(remote_packages, list)
+                and remote_packages
+                and isinstance(remote_packages[0], Mapping)
+                else None
+            )
+            task_runtime_available = await self._runtime_probe(
+                request, context=context, name=name, record=record, manager=manager
+            )
+            if remote_package is not None:
+                task_runtime_available = True
             metadata = {
                 "name": name,
                 "installed": host_installed,
@@ -129,6 +196,10 @@ class DependencyCapability:
                     "host_interpreter": sys.executable,
                 },
             }
+            if remote_inventory is not None:
+                metadata["remote_inventory"] = dict(remote_inventory)
+                metadata["installed"] = remote_package is not None
+                metadata["task_runtime_available"] = remote_package is not None
             if record:
                 metadata["lock"] = record
                 output = f"{name}: installed ({record.get('resolved_version', 'unknown')})"
@@ -155,26 +226,113 @@ class DependencyCapability:
             return _result(
                 request, ok=False, error="dependency install requires execution workspace"
             )
-        if backend not in _HOST_INTERPRETER_BACKENDS:
+        capabilities_fn = getattr(self._execution, "backend_capabilities", None)
+        capabilities = (
+            capabilities_fn(backend)
+            if callable(capabilities_fn)
+            else {"dependency_installation": ("python",) if backend == "local" else ()}
+        )
+        supported_managers = (
+            tuple(getattr(capabilities, "dependency_installation", ()))
+            if not isinstance(capabilities, dict)
+            else tuple(capabilities.get("dependency_installation", ()))
+        )
+        if manager not in supported_managers:
             return _result(
                 request,
                 ok=False,
                 error=(
                     f"dependency {operation} is unsupported for execution backend {backend!r}; "
-                    "use local, shadow, or sandbox with a known host Python interpreter"
+                    f"backend supports: {', '.join(supported_managers) or 'none'}"
                 ),
             )
         root = context.workspace.root
-        target = dependency_manager.target(root)
         version = str(args.get("version") or "")
+        try:
+            lock = _read_lock(context)
+        except ValueError as exc:
+            return _result(request, ok=False, error=str(exc))
+        environment_id = _requested_environment_id(lock, manager, name, version)
+
+        if backend not in _HOST_INTERPRETER_BACKENDS and callable(remote_operation):
+            try:
+                remote = await remote_operation(
+                    task_id=request.task_id or "dependency",
+                    manager=manager,
+                    name=name,
+                    version=version,
+                    operation="install",
+                    environment_id=environment_id,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                return _result(
+                    request, ok=False, error=f"remote dependency operation failed: {exc}"
+                )
+            if not bool(remote.get("ok")):
+                return _result(
+                    request,
+                    ok=False,
+                    error=str(remote.get("error") or "remote dependency install failed"),
+                    metadata=dict(remote),
+                )
+            packages = remote.get("packages")
+            package_record = packages[0] if isinstance(packages, list) and packages else {}
+            if not isinstance(package_record, Mapping):
+                return _result(
+                    request, ok=False, error="remote dependency returned no package manifest"
+                )
+            lock_record = {
+                "name": name,
+                "manager": manager,
+                "requested_version": version or None,
+                "resolved_version": str(package_record.get("resolved_version") or ""),
+                "source": "remote-supervisor",
+                "target": str(remote.get("target") or ""),
+                "record_hashes": list(package_record.get("record_hashes") or []),
+                "record_entry_count": int(package_record.get("record_entry_count") or 0),
+                "record_manifest_sha256": str(package_record.get("record_manifest_sha256") or ""),
+                "environment_fingerprint": str(remote.get("environment_fingerprint") or ""),
+                "environment_id": environment_id,
+                "runtime_identity": f"ssh:{getattr(selected_backend, 'name', backend)}",
+                "fingerprint_version": 2,
+                "owner": {"task_id": request.task_id, "call_id": request.call_id},
+                "recorded_at": utcnow().isoformat(),
+            }
+            if package_record.get("package_lock_sha256"):
+                lock_record["package_lock_sha256"] = str(package_record["package_lock_sha256"])
+            try:
+                _write_lock(context, lock_record)
+            except (OSError, TypeError, ValueError) as exc:
+                return _result(
+                    request,
+                    ok=False,
+                    error=f"remote dependency installed but lock recording failed: {exc}",
+                )
+            return _result(
+                request,
+                output=f"{name}: installed remotely ({lock_record['resolved_version'] or 'unknown'})",
+                metadata={"remote": True, "lock": lock_record, "inventory": dict(remote)},
+            )
+        target = dependency_manager.target(root, environment_id)
+        Path(target).mkdir(parents=True, exist_ok=True)
+        command_target = target
+        if backend == "container":
+            command_target = _container_target(root, target)
         package = dependency_manager.package_spec(name, version) if version else name
         # This command is deliberately assembled from validated fields.  It
         # still goes through ExecutionManager, whose sandbox/network profile
         # and task cancellation own the actual process.
-        source = (
-            f"{shlex.quote(sys.executable)} -m pip install --disable-pip-version-check --no-input "
-            f"--target {shlex.quote(target)} {shlex.quote(package)}"
-        )
+        if manager == "python":
+            executable = sys.executable if backend in _HOST_INTERPRETER_BACKENDS else "python3"
+            source = (
+                f"{shlex.quote(executable)} -m pip install --disable-pip-version-check --no-input "
+                f"--target {shlex.quote(command_target)} {shlex.quote(package)}"
+            )
+        else:
+            source = (
+                f"npm install --ignore-scripts --no-audit --no-fund --prefix {shlex.quote(command_target)} "
+                f"{shlex.quote(package)}"
+            )
         result = await self._execution.execute(
             ExecutionRequest(
                 runtime="shell",
@@ -188,18 +346,29 @@ class DependencyCapability:
             )
         )
         ok = result.exit_code == 0
-        lock_record = None
+        installed_lock_record: dict[str, Any] | None = None
         lock_error = None
         if ok:
             try:
-                lock_record = _record_installed_package(
-                    target,
-                    name=name,
-                    requested_version=version,
-                    task_id=request.task_id or "dependency",
-                    call_id=request.call_id,
+                installed_lock_record = (
+                    _record_installed_package(
+                        target,
+                        name=name,
+                        requested_version=version,
+                        task_id=request.task_id or "dependency",
+                        call_id=request.call_id,
+                    )
+                    if manager == "python"
+                    else _record_node_package(
+                        target,
+                        name=name,
+                        requested_version=version,
+                        task_id=request.task_id or "dependency",
+                        call_id=request.call_id,
+                    )
                 )
-                _write_lock(context, lock_record)
+                installed_lock_record["environment_id"] = environment_id
+                _write_lock(context, installed_lock_record)
             except (OSError, TypeError, ValueError) as exc:
                 # The package may have been installed, but a successful
                 # acquisition without a reproducibility record is not a
@@ -215,25 +384,42 @@ class DependencyCapability:
                 "exit_code": result.exit_code,
                 "package": package,
                 "target": target,
-                **({"lock": lock_record} if lock_record else {}),
+                **({"lock": installed_lock_record} if installed_lock_record else {}),
             },
         )
 
-    async def _runtime_probe(self, request, *, context, name: str, record: dict | None):
+    async def _runtime_probe(
+        self, request, *, context, name: str, record: dict | None, manager: str
+    ):
         """Probe the actual task Python, rather than reporting host imports."""
         if self._execution is None or context is None:
             return None
         backend = getattr(context.workspace, "execution_backend", None) or "local"
         if backend not in _HOST_INTERPRETER_BACKENDS:
             return None
-        target = PythonDependencyManager.target(context.workspace.root)
-        source = (
-            "import importlib.util; "
-            f"print('1' if importlib.util.find_spec({name.replace('-', '_')!r}) else '0')"
-        )
+        if manager == "node":
+            target = NodeDependencyManager.target(
+                context.workspace.root,
+                _record_environment_id(record),
+            )
+            source = (
+                "try { require.resolve(" + repr(name) + ", {paths: [" + repr(target) + "]}); "
+                "console.log('1'); } catch (_) { console.log('0'); }"
+            )
+            runtime = "node"
+        else:
+            target = PythonDependencyManager.target(
+                context.workspace.root,
+                _record_environment_id(record),
+            )
+            source = (
+                "import importlib.util; "
+                f"print('1' if importlib.util.find_spec({name.replace('-', '_')!r}) else '0')"
+            )
+            runtime = "python"
         result = await self._execution.execute(
             ExecutionRequest(
-                runtime="python",
+                runtime=runtime,
                 source=source,
                 task_id=request.task_id or "dependency-inspect",
                 workspace_id=context.workspace.id,
@@ -241,7 +427,7 @@ class DependencyCapability:
                 cwd=context.workspace.root,
                 network_policy=context.workspace.network_policy,
                 workspace_root=context.workspace.root,
-                env={"PYTHONPATH": target} if os.path.isdir(target) else {},
+                env={"PYTHONPATH": target} if manager == "python" and os.path.isdir(target) else {},
             )
         )
         if result.exit_code != 0:
@@ -262,16 +448,30 @@ class DependencyCapability:
                 request, ok=False, error="dependency replay requires execution workspace"
             )
         backend = getattr(context.workspace, "execution_backend", None) or "local"
-        if backend not in _HOST_INTERPRETER_BACKENDS:
+        capabilities_fn = getattr(self._execution, "backend_capabilities", None)
+        capabilities = (
+            capabilities_fn(backend)
+            if callable(capabilities_fn)
+            else {"dependency_installation": ("python",) if backend == "local" else ()}
+        )
+        supported_managers = (
+            tuple(getattr(capabilities, "dependency_installation", ()))
+            if not isinstance(capabilities, dict)
+            else tuple(capabilities.get("dependency_installation", ()))
+        )
+        if manager.name not in supported_managers:
             return _result(
                 request,
                 ok=False,
                 error=(
                     f"dependency replay is unsupported for execution backend {backend!r}; "
-                    "use local, shadow, or sandbox with a known host Python interpreter"
+                    f"backend supports: {', '.join(supported_managers) or 'none'}"
                 ),
             )
-        lock = _read_lock(context)
+        try:
+            lock = _read_lock(context)
+        except ValueError as exc:
+            return _result(request, ok=False, error=str(exc))
         record = _lock_record(lock, name)
         if record is None:
             return _result(request, ok=False, error=f"dependency {name!r} is not in the lock")
@@ -280,6 +480,40 @@ class DependencyCapability:
                 request, ok=False, error="locked dependency manager does not match request"
             )
         version = str(record.get("resolved_version") or "")
+        backend_fn = getattr(self._execution, "backend", None)
+        selected_backend = backend_fn(backend) if callable(backend_fn) else None
+        remote_operation = getattr(selected_backend, "dependency_operation", None)
+        if backend not in _HOST_INTERPRETER_BACKENDS and callable(remote_operation):
+            try:
+                remote = await remote_operation(
+                    task_id=request.task_id or "dependency",
+                    manager=manager.name,
+                    name=name,
+                    version=version,
+                    operation="verify",
+                    environment_id=str(record.get("environment_id") or ""),
+                    expected={
+                        "environment_fingerprint": record.get("environment_fingerprint"),
+                        "record_entry_count": record.get("record_entry_count"),
+                        "record_manifest_sha256": record.get("record_manifest_sha256"),
+                    },
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                return _result(
+                    request, ok=False, error=f"remote dependency verification failed: {exc}"
+                )
+            if not bool(remote.get("ok")):
+                return _result(
+                    request,
+                    ok=False,
+                    error=str(remote.get("error") or "remote dependency verification failed"),
+                    metadata=dict(remote),
+                )
+            return _result(
+                request,
+                output=f"{name}: remote dependency verified",
+                metadata={"remote": True, "inventory": dict(remote), "lock": dict(record)},
+            )
         expected_hashes = sorted(str(item) for item in record.get("record_hashes") or ())
         if not version or not expected_hashes:
             return _result(
@@ -288,12 +522,35 @@ class DependencyCapability:
                 error="lock entry lacks a resolved version or content hashes; replay refused",
             )
         root = str(context.workspace.root)
-        target = manager.target(root)
-        source = (
-            f"{shlex.quote(sys.executable)} -m pip install --disable-pip-version-check --no-input --no-deps "
-            f"--upgrade --target {shlex.quote(target)} "
-            f"{shlex.quote(manager.package_spec(name, version))}"
-        )
+        target = manager.target(root, _record_environment_id(record))
+        Path(target).mkdir(parents=True, exist_ok=True)
+        command_target = target
+        if backend == "container":
+            command_target = _container_target(root, target)
+        if manager.name == "python":
+            executable = sys.executable if backend in _HOST_INTERPRETER_BACKENDS else "python3"
+            locked_closure = record.get("closure")
+            replay_packages = (
+                locked_closure if isinstance(locked_closure, list) and locked_closure else [record]
+            )
+            package_specs = " ".join(
+                shlex.quote(manager.package_spec(package_name, package_version))
+                for item in replay_packages
+                for package_name, package_version in [
+                    (
+                        str(item.get("name") or (name if item is record else "")),
+                        str(item.get("resolved_version") or ""),
+                    )
+                ]
+                if package_name and package_version
+            )
+            source = (
+                f"{shlex.quote(executable)} -m pip install --disable-pip-version-check --no-input --no-deps "
+                f"--upgrade --target {shlex.quote(command_target)} "
+                f"{package_specs}"
+            )
+        else:
+            source = f"npm ci --ignore-scripts --no-audit --no-fund --prefix {shlex.quote(command_target)}"
         result = await self._execution.execute(
             ExecutionRequest(
                 runtime="shell",
@@ -314,8 +571,44 @@ class DependencyCapability:
                 error=result.stderr or "dependency replay failed",
                 metadata={"exit_code": result.exit_code, "target": target},
             )
+        if manager.name == "node":
+            try:
+                node_verified = _record_node_package(
+                    target,
+                    name=name,
+                    requested_version=version,
+                    task_id=request.task_id or "dependency",
+                    call_id=request.call_id,
+                )
+                if expected_hashes and sorted(node_verified["record_hashes"]) != expected_hashes:
+                    raise ValueError("npm package metadata hash mismatch")
+                expected_lock_hash = str(record.get("package_lock_sha256") or "")
+                if (
+                    expected_lock_hash
+                    and node_verified.get("package_lock_sha256") != expected_lock_hash
+                ):
+                    raise ValueError("npm package-lock.json hash mismatch")
+            except (OSError, TypeError, ValueError) as exc:
+                return _result(
+                    request,
+                    ok=False,
+                    output=result.stdout,
+                    error=f"dependency replay verification failed: {exc}",
+                    metadata={"exit_code": result.exit_code, "target": target},
+                )
+            return _result(
+                request,
+                output=result.stdout,
+                metadata={
+                    "exit_code": result.exit_code,
+                    "target": target,
+                    "manager": manager.name,
+                    "lock": dict(record),
+                    "environment": {"target": target, "manager": manager.name},
+                },
+            )
         try:
-            verified = resolve_dependency_environment(
+            environment = resolve_dependency_environment(
                 root,
                 (
                     DependencyRequirement(
@@ -342,7 +635,7 @@ class DependencyCapability:
                 "target": target,
                 "manager": manager.name,
                 "lock": dict(record),
-                "environment": verified.to_metadata(),
+                "environment": environment.to_metadata(),
                 "provenance": {
                     "task_id": request.task_id,
                     "call_id": request.call_id,
@@ -361,10 +654,10 @@ def _lock_path(context) -> Path:
 
 def _read_lock(context) -> dict:
     try:
-        data = json.loads(_lock_path(context).read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, TypeError, ValueError):
+        raw = _lock_path(context).read_bytes()
+    except (FileNotFoundError, OSError):
         return {}
-    return data if isinstance(data, dict) else {}
+    return parse_dependency_lock(raw)
 
 
 def _lock_record(lock: dict, name: str) -> dict[str, Any] | None:
@@ -376,6 +669,45 @@ def _lock_record(lock: dict, name: str) -> dict[str, Any] | None:
         if str(key).replace("-", "_").casefold() == wanted and isinstance(value, dict):
             return value
     return None
+
+
+def _record_environment_id(record: Mapping[str, Any] | None) -> str | None:
+    value = str((record or {}).get("environment_id") or "")
+    return value or None
+
+
+def _requested_environment_id(
+    lock: Mapping[str, Any], manager: str, name: str, version: str
+) -> str:
+    """Address an acquisition before it mutates the lock.
+
+    The request is part of the address so the first install has a stable,
+    isolated destination; the resulting id is persisted in the lock record
+    and is used for every later replay.
+    """
+    existing = str(lock.get("environment_id") or "")
+    if existing and isinstance(lock.get("packages"), Mapping):
+        return existing
+    return dependency_environment_id(
+        {
+            "format": 2,
+            "fingerprint_version": 2,
+            "manager": manager,
+            "name": name,
+            "version": version,
+            "packages": lock.get("packages") or {},
+        }
+    )
+
+
+def _container_target(root: str, target: str) -> str:
+    root_path = Path(root).resolve()
+    target_path = Path(target).resolve()
+    try:
+        relative = target_path.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError("dependency target escaped workspace") from exc
+    return "/workspace/" + relative.as_posix()
 
 
 def _record_installed_package(
@@ -401,7 +733,8 @@ def _record_installed_package(
     resolved_version = str(distribution.version or "")
     if not resolved_version:
         raise ValueError(f"could not resolve installed version for {name}")
-    hashes = record_hashes(distribution)
+    hashes, record_entry_count, record_manifest_sha256 = record_manifest(distribution)
+    closure = _python_dependency_closure(target, distribution)
     runtime_identity = _runtime_identity()
     record = {
         "name": name,
@@ -411,6 +744,9 @@ def _record_installed_package(
         "source": "python-index",
         "target": target,
         "record_hashes": hashes,
+        "record_entry_count": record_entry_count,
+        "record_manifest_sha256": record_manifest_sha256,
+        "closure": closure,
         "environment": {
             "python": platform.python_version(),
             "implementation": platform.python_implementation(),
@@ -418,20 +754,127 @@ def _record_installed_package(
             "platform": platform.platform(),
         },
         "runtime_identity": runtime_identity,
+        "fingerprint_version": 2,
         "owner": {"task_id": task_id, "call_id": call_id},
         "recorded_at": utcnow().isoformat(),
     }
     record["environment_fingerprint"] = environment_fingerprint(
-        (
+        [
             {
-                "name": name,
-                "resolved_version": resolved_version,
-                "record_hashes": hashes,
-            },
-        ),
+                "name": item["name"],
+                "resolved_version": item["resolved_version"],
+                "record_hashes": item["record_hashes"],
+                "record_entry_count": item["record_entry_count"],
+                "record_manifest_sha256": item["record_manifest_sha256"],
+            }
+            for item in closure
+        ],
         runtime_identity=runtime_identity,
     )
     return record
+
+
+def _python_dependency_closure(target: str, root_distribution: Any) -> list[dict[str, Any]]:
+    """Capture the installed transitive closure, not just the requested root."""
+    distributions = {
+        str(item.metadata.get("Name") or "").replace("-", "_").casefold(): item
+        for item in importlib.metadata.distributions(path=[target])
+        if item.metadata.get("Name")
+    }
+    queue = [root_distribution]
+    visited: set[str] = set()
+    closure: list[dict[str, Any]] = []
+    while queue:
+        distribution = queue.pop(0)
+        name = str(distribution.metadata.get("Name") or "").strip()
+        normalized = name.replace("-", "_").casefold()
+        if not name or normalized in visited:
+            continue
+        visited.add(normalized)
+        if callable(getattr(distribution, "locate_file", None)):
+            verify_record_files(distribution)
+        hashes, record_entry_count, record_manifest_sha256 = record_manifest(distribution)
+        closure.append(
+            {
+                "name": name,
+                "resolved_version": str(distribution.version or ""),
+                "record_hashes": hashes,
+                "record_entry_count": record_entry_count,
+                "record_manifest_sha256": record_manifest_sha256,
+                "runtime_identity": _runtime_identity(),
+            }
+        )
+        for raw_requirement in getattr(distribution, "requires", None) or ():
+            dependency_name = _requirement_name(raw_requirement)
+            dependency = distributions.get(dependency_name.replace("-", "_").casefold())
+            if dependency is not None:
+                queue.append(dependency)
+    if not closure:
+        raise ValueError("installed dependency closure is empty")
+    return sorted(closure, key=lambda item: str(item["name"]).casefold())
+
+
+def _requirement_name(raw_requirement: str) -> str:
+    try:
+        from packaging.requirements import Requirement
+
+        return Requirement(str(raw_requirement)).name
+    except (ImportError, TypeError, ValueError):
+        return re.split(r"[ <>=!~;\[]", str(raw_requirement), maxsplit=1)[0].strip()
+
+
+def _record_node_package(
+    target: str,
+    *,
+    name: str,
+    requested_version: str,
+    task_id: str,
+    call_id: str,
+) -> dict:
+    package_json = Path(target) / "node_modules" / Path(name) / "package.json"
+    try:
+        raw = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"could not find installed npm package metadata for {name}") from exc
+    resolved_version = str(raw.get("version") or "")
+    if not resolved_version:
+        raise ValueError(f"npm package {name!r} has no resolved version")
+    package_hash = _sha256_file(package_json)
+    lock_path = Path(target) / "package-lock.json"
+    if not lock_path.is_file():
+        raise ValueError("npm package-lock.json is missing; reproducible replay is refused")
+    lock_hash = _sha256_file(lock_path)
+    lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock_packages = lock_data.get("packages") if isinstance(lock_data, dict) else None
+    if not isinstance(lock_packages, dict):
+        raise ValueError("npm package-lock.json has no package map")
+    identity = lock_packages.get(f"node_modules/{name}") or {}
+    if not isinstance(identity, dict) or str(identity.get("version") or "") != resolved_version:
+        raise ValueError("npm package identity does not match package-lock.json")
+    return {
+        "name": name,
+        "manager": "node",
+        "requested_version": requested_version or None,
+        "resolved_version": resolved_version,
+        "source": "npm-registry",
+        "target": target,
+        "record_hashes": [f"package.json:sha256={package_hash}"],
+        "package_lock_sha256": lock_hash,
+        "package_lock_identity": {
+            "name": name,
+            "version": resolved_version,
+            "resolved": identity.get("resolved"),
+            "integrity": identity.get("integrity"),
+        },
+        "runtime_identity": "node",
+        "fingerprint_version": 2,
+        "owner": {"task_id": task_id, "call_id": call_id},
+        "recorded_at": utcnow().isoformat(),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    return sha256_file(path)
 
 
 def _runtime_identity() -> str:
@@ -444,8 +887,17 @@ def _write_lock(context, record: dict) -> None:
     path = _lock_path(context)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = _read_lock(context)
-    lock.setdefault("format", 1)
-    lock.setdefault("packages", {})[str(record["name"])] = record
+    packages = lock.setdefault("packages", {})
+    for existing in packages.values():
+        if isinstance(existing, dict) and "fingerprint_version" not in existing:
+            # Preserve legacy package fingerprints while upgrading the
+            # container schema for the newly recorded package.
+            existing["fingerprint_version"] = 1
+    lock["format"] = max(2, int(lock.get("format") or 1))
+    lock["fingerprint_version"] = 2
+    packages[str(record["name"])] = record
+    if record.get("environment_id"):
+        lock["environment_id"] = str(record["environment_id"])
     fd, tmp_name = tempfile.mkstemp(prefix="dependencies.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

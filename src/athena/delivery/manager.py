@@ -113,7 +113,12 @@ class DeliveryManager:
             last = outcome
             if attempt < self._max_attempts:
                 await asyncio.sleep(
-                    min(self._base_backoff_s * (2 ** (attempt - 1)), _MAX_BACKOFF_S)
+                    min(
+                        outcome.retry_after
+                        if outcome.retry_after is not None
+                        else self._base_backoff_s * (2 ** (attempt - 1)),
+                        _MAX_BACKOFF_S,
+                    )
                 )
         assert last is not None
         if not last.ok:
@@ -148,6 +153,7 @@ class DeliveryManager:
                 result,
                 task_id=result.task_id,
                 session_id=task.session_id,
+                network_policy=getattr(getattr(task, "workspace", None), "network_policy", None),
             )
         except Exception as exc:  # adapter contract violation is still retryable
             _logger.warning(
@@ -201,6 +207,9 @@ class DeliveryManager:
                 receipt,
                 task_id=result.task_id,
                 session_id=task.session_id,
+                id=(
+                    f"delivery:{result.task_id}:{receipt.get('delivery_channel')}:{receipt.get('delivery_status')}"
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - bookkeeping must not propagate
             _logger.warning(

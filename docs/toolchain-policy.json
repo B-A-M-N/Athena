@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "uv_version": "0.11.21",
+  "cosign_version": "2.6.4",
+  "cargo_deny_policy_sha256": "0c691e15630bc7ab61452fffc517b30f3864bc39b97ba71c736369ab7e326997",
+  "cargo_deny_version": "0.20.2"
+}

@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Enforce immutable historical migrations and append-only evolution."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+
+def digest(path: Path) -> str:
+    value = hashlib.sha256()
+    value.update(path.read_bytes())
+    return value.hexdigest()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--migrations", type=Path, default=Path("src/athena/state/migrations"))
+    parser.add_argument("--baseline", type=Path, default=Path("docs/migration-baseline.json"))
+    args = parser.parse_args()
+    try:
+        baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"verify-migration-baseline: FAIL — {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(baseline, dict) or not baseline:
+        print("verify-migration-baseline: FAIL — empty historical baseline", file=sys.stderr)
+        return 1
+    files = {path.name: path for path in args.migrations.glob("*.sql") if path.name[:3].isdigit()}
+    for filename, expected in baseline.items():
+        path = files.get(filename)
+        if path is None:
+            print(
+                f"verify-migration-baseline: FAIL — removed historical migration {filename}",
+                file=sys.stderr,
+            )
+            return 1
+        if digest(path) != expected:
+            print(
+                f"verify-migration-baseline: FAIL — historical migration changed: {filename}",
+                file=sys.stderr,
+            )
+            return 1
+    current_versions = sorted(int(name.split("_", 1)[0]) for name in files)
+    baseline_versions = sorted(int(name.split("_", 1)[0]) for name in baseline)
+    if current_versions[: len(baseline_versions)] != baseline_versions:
+        print(
+            "verify-migration-baseline: FAIL — migration history is not append-only",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"verify-migration-baseline: PASS — {len(baseline)} immutable migrations, "
+        f"latest {current_versions[-1]:03d}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

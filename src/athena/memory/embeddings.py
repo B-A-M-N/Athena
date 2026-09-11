@@ -9,12 +9,13 @@ installed.
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
+
+from athena.execution.async_call import run_blocking
 
 DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
@@ -82,10 +83,14 @@ class FastEmbedProvider:
             raise SemanticRetrievalUnavailable(
                 "semantic retrieval unavailable: cannot embed empty text"
             )
-        model = await asyncio.to_thread(self._load_model)
 
         def _embed_one() -> Sequence[float]:
             try:
+                # Keep initialization and inference in one worker operation.
+                # Besides avoiding a needless executor handoff, this ensures
+                # callers never observe a half-initialized provider if the
+                # event loop is cancelled between the two phases.
+                model = self._load_model()
                 vectors = getattr(model, "embed")([text], batch_size=1)
                 vector = next(iter(vectors))
                 return tuple(float(item) for item in vector)
@@ -98,7 +103,7 @@ class FastEmbedProvider:
                     "semantic retrieval unavailable: FastEmbed failed to embed text"
                 ) from exc
 
-        return await asyncio.to_thread(_embed_one)
+        return await run_blocking(_embed_one)
 
     def health(self) -> dict[str, object]:
         """Return availability without triggering model download/initialization."""

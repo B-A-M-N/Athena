@@ -188,6 +188,8 @@ def encode_criteria(criteria: tuple[Criterion, ...] | None) -> str:
                 "id": criterion.id,
                 "description": criterion.description,
                 "required": criterion.required,
+                "evidence_required": criterion.evidence_required,
+                "evidence_requirement_id": criterion.evidence_requirement_id,
                 "verification": (
                     {
                         "type": verification.type.value,
@@ -228,6 +230,7 @@ def decode_criteria(raw: Any) -> tuple[Criterion, ...]:
                     description=description,
                     verification=verification,
                     required=True,
+                    evidence_required=False,
                 )
             )
             continue
@@ -254,6 +257,12 @@ def decode_criteria(raw: Any) -> tuple[Criterion, ...]:
                 description=str(item.get("description") or ""),
                 verification=verification,
                 required=bool(item.get("required", True)),
+                evidence_required=bool(item.get("evidence_required", False)),
+                evidence_requirement_id=(
+                    str(item["evidence_requirement_id"])
+                    if item.get("evidence_requirement_id") is not None
+                    else None
+                ),
             )
         )
     return tuple(result)
@@ -312,6 +321,7 @@ def encode_model_policy(policy: ModelPolicy | None) -> str:
             "routing_preference": policy.routing_preference,
             "min_quality_tier": policy.min_quality_tier,
             "require_declared_quality": policy.require_declared_quality,
+            "max_model_attempts": policy.max_model_attempts,
         },
         sort_keys=True,
     )
@@ -333,6 +343,7 @@ def decode_model_policy(raw: Any) -> ModelPolicy:
             str(data["min_quality_tier"]) if data.get("min_quality_tier") is not None else None
         ),
         require_declared_quality=bool(data.get("require_declared_quality", False)),
+        max_model_attempts=int(data.get("max_model_attempts", 2)),
     )
 
 

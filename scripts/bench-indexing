@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from athena.project.index.builder import ProjectIndexBuilder  # noqa: E402
+from athena.release.qualification import qualify_benchmark_environment  # noqa: E402
 
 
 def main() -> int:
@@ -37,6 +38,14 @@ def main() -> int:
     parser.add_argument("--max-source-revision-ms", type=float, default=500.0)
     parser.add_argument("--max-impact-ms", type=float, default=50.0)
     args = parser.parse_args()
+    environment = qualify_benchmark_environment()
+    if environment["status"] != "QUALIFIED":
+        print(
+            json.dumps(
+                {"status": environment["status"], "environment": environment}, sort_keys=True
+            )
+        )
+        return 125
     if args.samples < 1 or args.samples > 20:
         parser.error("--samples must be between 1 and 20")
     root = args.root.resolve()
@@ -57,9 +66,7 @@ def main() -> int:
     # This is the only cold-start/index sample.  It includes the first
     # filesystem traversal and parser/cache warm-up for this process.
     builder = ProjectIndexBuilder()
-    index, cold_start_seconds, cold_start_cpu_seconds = measure(
-        lambda: builder.build(str(root))
-    )
+    index, cold_start_seconds, cold_start_cpu_seconds = measure(lambda: builder.build(str(root)))
 
     # Same builder, same process, repeated full indexes.  These are the warm
     # repeat measurements used by the normal full-build budget.
@@ -101,13 +108,13 @@ def main() -> int:
     warm_full_seconds = full_seconds
     cache_warmup_seconds = max(0.0, cold_start_seconds - warm_full_seconds)
     result = {
+        "benchmark_name": "indexing.revision_and_impact",
+        "environment": environment,
         "root": str(root),
         "files": len(refreshed.files),
         "cold_start_index_seconds": round(cold_start_seconds, 6),
         "cold_start_index_cpu_seconds": round(cold_start_cpu_seconds, 6),
-        "cold_start_io_seconds": round(
-            max(0.0, cold_start_seconds - cold_start_cpu_seconds), 6
-        ),
+        "cold_start_io_seconds": round(max(0.0, cold_start_seconds - cold_start_cpu_seconds), 6),
         "warm_repeat_seconds": round(warm_full_seconds, 6),
         "warm_repeat_seconds_max": round(max(warm_samples), 6),
         "warm_repeat_seconds_samples": [round(value, 6) for value in warm_samples],

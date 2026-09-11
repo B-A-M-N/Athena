@@ -131,6 +131,25 @@ class TaskStore:
         )
         return [_decode_task_row(r) for r in rows]
 
+    async def update_metadata(self, task_id: str, updates: dict[str, Any]) -> bool:
+        """Merge durable metadata fields without changing task authority state."""
+        async with self._db.transaction() as db:
+            row = await db.fetch_one_raw("SELECT metadata FROM tasks WHERE id = ?", (task_id,))
+            if row is None:
+                return False
+            try:
+                metadata = json.loads(row.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.update(dict(updates))
+            cursor = await db.execute_raw(
+                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(metadata, default=str), utcnow().isoformat(), task_id),
+            )
+            return cursor.rowcount == 1
+
     async def list_children(self, parent_task_id: str) -> list[dict]:
         """Every task whose ``parent_task_id`` points at the given task."""
         rows = await self._db.fetch_all(
@@ -227,6 +246,9 @@ class TaskStore:
         backend: str | None = None,
         runtime: str | None = None,
         cwd: str | None = None,
+        released_resources: dict[str, Any] | None = None,
+        checkpoint_id: str | None = None,
+        resume_consequence: str | None = None,
     ) -> None:
         """Persist a fail-closed hint for the next context compilation.
 
@@ -251,6 +273,9 @@ class TaskStore:
             "recovery_route": "execute",
             "replay_command": False,
             "recovery_action": "reestablish_runtime",
+            "released_resources": dict(released_resources or {}),
+            "checkpoint_id": str(checkpoint_id) if checkpoint_id else None,
+            "resume_consequence": resume_consequence,
             "message": (
                 "Runtime state was lost across restart. Do not assume prior "
                 "process variables or session state exist; invoke execute with a fresh "
@@ -310,6 +335,8 @@ class TaskStore:
         unresolved: Any,
         usage: Any,
         allow_recovery_completion: bool = False,
+        recovery_finalization: bool = False,
+        commit_pending: bool = False,
     ) -> None:
         """Atomically transition a task to a terminal status and persist its
         result in a single transaction (BUILDSPEC §86): a crash cannot leave a
@@ -321,12 +348,21 @@ class TaskStore:
                 raise KeyError(f"Task not found: {task_id}")
             current = TaskStatus(row["status"])
             allowed = current.legal_transitions()
+            if recovery_finalization and not (
+                current is TaskStatus.RECOVERY_REQUIRED
+                and status in FINAL_STATUSES
+                and result_status is status
+            ):
+                raise ValueError(
+                    "recovery finalization requires RECOVERY_REQUIRED -> exact final result"
+                )
             if (
                 not (
                     allow_recovery_completion
                     and current in {TaskStatus.INTERRUPTED, TaskStatus.RECOVERY_REQUIRED}
-                    and status is TaskStatus.COMPLETE
+                    and status in FINAL_STATUSES
                 )
+                and not recovery_finalization
                 and status not in allowed
             ):
                 raise ValueError(
@@ -358,6 +394,15 @@ class TaskStore:
                     task_id,
                 ),
             )
+            # The pending write-ahead record and the task/result commit share
+            # this transaction. A crash after the task row is visible but
+            # before observers run therefore leaves a durable replay point.
+            if commit_pending:
+                await self._db.execute_raw(
+                    "UPDATE pending_task_finalizations SET phase = 'COMMITTED', "
+                    "updated_at = ? WHERE task_id = ?",
+                    (now, task_id),
+                )
 
     async def claim_next(self, target_statuses: tuple[TaskStatus, ...]) -> dict | None:
         """Atomically claim one schedulable task.

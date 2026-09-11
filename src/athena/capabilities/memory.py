@@ -37,6 +37,7 @@ _KIND_ALIASES = {
     "semantic": MemoryKind.SEMANTIC,
 }
 _SCOPE_ALIASES = {
+    "job": MemoryScope.JOB,
     "session": MemoryScope.SESSION,
     "task": MemoryScope.TASK,
     "project": MemoryScope.PROJECT,
@@ -85,7 +86,7 @@ class MemoryCapability:
         description=(
             "Long-term memory: recall relevant memories using bounded lexical, "
             "semantic, or hybrid search, or persist a new memory entry. Supports "
-            "isolated session, project, user, and global scopes."
+            "isolated job, session, project, user, and global scopes."
         ),
         tags=frozenset({"memory", "remember", "preference", "recall"}),
         input_schema=_INPUT_SCHEMA,
@@ -227,7 +228,24 @@ def _visible_scopes(
         return [], f"unknown memory scope: {requested}"
 
     workspace = getattr(context, "workspace", None)
+    lineage = getattr(request, "metadata", None) or {}
+    if not isinstance(lineage, Mapping):
+        lineage = {}
+    task_metadata = getattr(context, "task_metadata", None) or {}
+    if not isinstance(task_metadata, Mapping):
+        task_metadata = {}
+    schedule_lineage = task_metadata.get("_schedule_lineage") or lineage.get("_schedule_lineage")
+    # JOB memory is a recurring-job state channel, not a generic scheduled
+    # task channel. Fresh, previous-result, and session occurrences must not
+    # silently inherit durable job learning.
+    if isinstance(schedule_lineage, Mapping) and schedule_lineage.get("continuity") != "job_memory":
+        schedule_lineage = None
     owners: dict[MemoryScope, str | None] = {
+        MemoryScope.JOB: (
+            str(schedule_lineage.get("job_id"))
+            if isinstance(schedule_lineage, Mapping) and schedule_lineage.get("job_id")
+            else None
+        ),
         MemoryScope.SESSION: request.session_id,
         MemoryScope.TASK: request.task_id,
         MemoryScope.PROJECT: getattr(workspace, "id", None),
@@ -255,6 +273,7 @@ def _visible_scopes(
             MemoryScope.SESSION: "session_id",
             MemoryScope.TASK: "task_id",
             MemoryScope.PROJECT: "workspace",
+            MemoryScope.JOB: "scheduled job lineage",
             MemoryScope.USER: "principal",
         }[requested_scope]
         return [], f"memory scope {requested_scope.value} requires {required}"

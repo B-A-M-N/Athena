@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import json
 import base64
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,12 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import unquote
 
 from athena.affordances.models import DependencyRequirement
+from athena.execution.dependency_lock import (
+    calculate_environment_fingerprint,
+    parse_dependency_lock,
+    record_manifest as calculate_record_manifest,
+    sha256_file,
+)
 
 
 class DependencyEnvironmentError(ValueError):
@@ -58,15 +65,9 @@ def resolve_dependency_environment(
     turn its dependency declaration into an arbitrary host import path.
     """
     root = Path(workspace_root).resolve()
-    target = (root / ".athena" / "dependencies").resolve()
-    if root not in target.parents:
-        raise DependencyEnvironmentError("dependency target escaped workspace")
-    if not target.is_dir():
-        raise DependencyEnvironmentError(f"dependency environment is missing: {target}")
-
     lock_path = root / ".athena" / "dependencies.lock.json"
     try:
-        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock = parse_dependency_lock(lock_path.read_bytes())
     except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
         raise DependencyEnvironmentError(
             f"dependency lock is missing or invalid: {lock_path}"
@@ -74,8 +75,25 @@ def resolve_dependency_environment(
     packages = lock.get("packages") if isinstance(lock, dict) else None
     if not isinstance(packages, dict):
         raise DependencyEnvironmentError("dependency lock has no package map")
+    try:
+        lock_format = int(lock.get("format") or 1)
+    except (TypeError, ValueError) as exc:
+        raise DependencyEnvironmentError("dependency lock format is invalid") from exc
+    if lock_format not in {1, 2}:
+        raise DependencyEnvironmentError(f"unsupported dependency lock format: {lock_format}")
+    environment_id = str(lock.get("environment_id") or "")
+    if not environment_id:
+        for value in packages.values():
+            if isinstance(value, Mapping) and value.get("environment_id"):
+                environment_id = str(value["environment_id"])
+                break
+    target = dependency_environment_target(root, environment_id or None, "python")
+    if not target.is_dir():
+        raise DependencyEnvironmentError(f"dependency environment is missing: {target}")
 
     verified: list[Mapping[str, Any]] = []
+    verified_names: set[str] = set()
+    runtime_identity = _python_runtime_identity()
     for requirement in requirements:
         if requirement.manager != "python":
             raise DependencyEnvironmentError(
@@ -92,55 +110,107 @@ def resolve_dependency_environment(
                 f"dependency {requirement.name!r} version mismatch: "
                 f"required {requirement.version}, locked {resolved_version}"
             )
-        distribution = _find_distribution(target, requirement.name)
-        if distribution is None:
-            raise DependencyEnvironmentError(
-                f"locked dependency {requirement.name!r} is not installed"
-            )
-        installed_version = str(distribution.version or "")
-        if installed_version != resolved_version:
-            raise DependencyEnvironmentError(
-                f"dependency {requirement.name!r} changed from locked version "
-                f"{resolved_version} to {installed_version}"
-            )
-        hashes = record_hashes(distribution)
-        verify_record_files(distribution)
-        expected_runtime = record.get("runtime_identity")
-        runtime_identity = _python_runtime_identity()
-        if expected_runtime and expected_runtime != runtime_identity:
-            raise DependencyEnvironmentError(
-                f"dependency {requirement.name!r} runtime identity changed"
-            )
-        expected_hashes = sorted(str(item) for item in record.get("record_hashes") or ())
-        if expected_hashes and hashes != expected_hashes:
-            raise DependencyEnvironmentError(
-                f"dependency {requirement.name!r} RECORD hash mismatch"
-            )
-        package = {
-            "name": requirement.name,
-            "resolved_version": installed_version,
-            "record_hashes": hashes,
-        }
-        package_fingerprint = environment_fingerprint(
-            (package,), runtime_identity=runtime_identity if expected_runtime else None
-        )
+        closure = record.get("closure")
+        locked_packages = closure if isinstance(closure, list) else [record]
+        for index, locked in enumerate(locked_packages):
+            if not isinstance(locked, Mapping):
+                raise DependencyEnvironmentError(
+                    "dependency lock contains an invalid closure entry"
+                )
+            package_name = str(locked.get("name") or (requirement.name if index == 0 else ""))
+            normalized_name = _normalize(package_name)
+            if not package_name or normalized_name in verified_names:
+                continue
+            distribution = _find_distribution(target, package_name)
+            if distribution is None:
+                raise DependencyEnvironmentError(
+                    f"locked dependency {package_name!r} is not installed"
+                )
+            installed_version = str(distribution.version or "")
+            locked_version = str(locked.get("resolved_version") or "")
+            if installed_version != locked_version:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} changed from locked version "
+                    f"{locked_version} to {installed_version}"
+                )
+            hashes, record_entry_count, record_manifest_sha256 = record_manifest(distribution)
+            verify_record_files(distribution)
+            expected_runtime = locked.get("runtime_identity") or record.get("runtime_identity")
+            if expected_runtime and expected_runtime != runtime_identity:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} runtime identity changed"
+                )
+            expected_hashes = sorted(str(item) for item in locked.get("record_hashes") or ())
+            if expected_hashes and hashes != expected_hashes:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} RECORD hash mismatch"
+                )
+            expected_count = locked.get("record_entry_count")
+            if expected_count is not None and int(expected_count) != record_entry_count:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} RECORD entry count mismatch"
+                )
+            expected_manifest = str(locked.get("record_manifest_sha256") or "")
+            if expected_manifest and expected_manifest != record_manifest_sha256:
+                raise DependencyEnvironmentError(
+                    f"dependency {package_name!r} RECORD manifest mismatch"
+                )
+            package: dict[str, Any] = {
+                "name": package_name,
+                "resolved_version": installed_version,
+                "record_hashes": hashes,
+            }
+            if (
+                locked.get("record_manifest_sha256")
+                and locked.get("record_entry_count") is not None
+            ):
+                package["record_entry_count"] = record_entry_count
+                package["record_manifest_sha256"] = record_manifest_sha256
+            verified_names.add(normalized_name)
+            verified.append(package)
         expected_package_fingerprint = record.get("environment_fingerprint")
-        if expected_package_fingerprint and expected_package_fingerprint != package_fingerprint:
-            raise DependencyEnvironmentError(
-                f"dependency {requirement.name!r} environment fingerprint mismatch"
+        if expected_package_fingerprint:
+            fingerprint_version = _fingerprint_version(lock, record, lock_format)
+            closure_packages = [
+                {
+                    "name": str(item.get("name") or (requirement.name if index == 0 else "")),
+                    "resolved_version": str(item.get("resolved_version") or ""),
+                    "record_hashes": sorted(
+                        str(value) for value in item.get("record_hashes") or ()
+                    ),
+                    **(
+                        {
+                            "record_entry_count": int(item["record_entry_count"]),
+                            "record_manifest_sha256": str(item["record_manifest_sha256"]),
+                        }
+                        if item.get("record_manifest_sha256")
+                        and item.get("record_entry_count") is not None
+                        else {}
+                    ),
+                }
+                for index, item in enumerate(locked_packages)
+                if isinstance(item, Mapping)
+            ]
+            package_fingerprint = environment_fingerprint(
+                closure_packages,
+                runtime_identity=runtime_identity if fingerprint_version >= 2 else None,
             )
-        verified.append(package)
+            if expected_package_fingerprint != package_fingerprint:
+                raise DependencyEnvironmentError(
+                    f"dependency {requirement.name!r} environment fingerprint mismatch"
+                )
 
-    runtime_identity = _python_runtime_identity()
-    fingerprint = environment_fingerprint(
-        verified,
-        runtime_identity=runtime_identity
-        if any(
-            record.get("runtime_identity")
+    fingerprint_version = max(
+        (
+            _fingerprint_version(lock, record, lock_format)
             for record in packages.values()
             if isinstance(record, Mapping)
-        )
-        else None,
+        ),
+        default=1,
+    )
+    fingerprint = environment_fingerprint(
+        verified,
+        runtime_identity=runtime_identity if fingerprint_version >= 2 else None,
     )
     if expected_fingerprint and fingerprint != expected_fingerprint:
         raise DependencyEnvironmentError(
@@ -155,15 +225,12 @@ def resolve_dependency_environment(
 
 def record_hashes(distribution: Any) -> list[str]:
     """Return the canonical hashed entries from a distribution RECORD file."""
-    record_text = distribution.read_text("RECORD")
-    hashes: list[str] = []
-    if record_text:
-        for line in record_text.splitlines():
-            parts = line.split(",", 2)
-            if len(parts) >= 2 and parts[1].startswith("sha256="):
-                hashes.append(f"{parts[0]}:{parts[1]}")
-    hashes.sort()
-    return hashes[:10_000]
+    return record_manifest(distribution)[0]
+
+
+def record_manifest(distribution: Any) -> tuple[list[str], int, str]:
+    """Return a bounded preview plus a digest of every hashed RECORD entry."""
+    return calculate_record_manifest(distribution.read_text("RECORD"))
 
 
 def verify_record_files(distribution: Any) -> None:
@@ -181,7 +248,7 @@ def verify_record_files(distribution: Any) -> None:
         if not candidate.is_file():
             raise DependencyEnvironmentError(f"dependency RECORD entry is missing: {path}")
         actual = (
-            base64.urlsafe_b64encode(hashlib.sha256(candidate.read_bytes()).digest())
+            base64.urlsafe_b64encode(bytes.fromhex(sha256_file(candidate)))
             .rstrip(b"=")
             .decode("ascii")
         )
@@ -192,11 +259,22 @@ def verify_record_files(distribution: Any) -> None:
 def environment_fingerprint(
     packages: Sequence[Mapping[str, Any]], *, runtime_identity: str | None = None
 ) -> str:
-    payload: Any = list(packages)
-    if runtime_identity:
-        payload = {"packages": payload, "runtime_identity": runtime_identity}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return calculate_environment_fingerprint(packages, runtime_identity=runtime_identity)
+
+
+def _fingerprint_version(
+    lock: Mapping[str, Any], record: Mapping[str, Any], lock_format: int
+) -> int:
+    raw = record.get("fingerprint_version", lock.get("fingerprint_version"))
+    if raw is None:
+        return 2 if lock_format >= 2 else 1
+    try:
+        version = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise DependencyEnvironmentError("dependency fingerprint version is invalid") from exc
+    if version not in {1, 2}:
+        raise DependencyEnvironmentError(f"unsupported dependency fingerprint version: {version}")
+    return version
 
 
 def _python_runtime_identity() -> str:
@@ -227,11 +305,43 @@ def _normalize(value: str) -> str:
     return value.replace("-", "_").casefold()
 
 
+def dependency_environment_id(lock: Mapping[str, Any]) -> str:
+    """Return the stable content address for a dependency lock snapshot."""
+    payload = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def dependency_environment_target(
+    workspace_root: str | Path,
+    environment_id: str | None,
+    manager: str,
+) -> Path:
+    """Resolve an isolated environment path from its lock content address.
+
+    Legacy locks without an environment id remain readable for migration, but
+    every new install/replay path is addressed under ``.athena/environments``.
+    """
+    root = Path(workspace_root).resolve()
+    if environment_id:
+        if not re.fullmatch(r"[0-9a-f]{64}", str(environment_id)):
+            raise DependencyEnvironmentError("dependency environment id is not a SHA-256 digest")
+        target = root / ".athena" / "environments" / str(environment_id) / str(manager)
+    else:
+        target = root / ".athena" / "dependencies"
+    target = target.resolve()
+    if root not in target.parents:
+        raise DependencyEnvironmentError("dependency target escaped workspace")
+    return target
+
+
 __all__ = [
     "DependencyEnvironment",
     "DependencyEnvironmentError",
+    "dependency_environment_id",
+    "dependency_environment_target",
     "environment_fingerprint",
     "record_hashes",
+    "record_manifest",
     "resolve_dependency_environment",
     "verify_record_files",
 ]

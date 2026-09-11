@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Mapping
@@ -40,12 +43,17 @@ from athena.scheduler.triggers import TriggerType, TriggerSpec, next_fire
 from athena.state.schedules import ScheduleStore
 
 _logger = logging.getLogger("athena.scheduler")
+_claim_context: ContextVar[bool] = ContextVar("athena_scheduler_claim_context", default=False)
 
 
 @dataclass(frozen=True)
 class TaskTemplate:
     objective: str
+    # ``session_id`` remains a legacy input for hand-authored templates. A
+    # schedule-owned continuity session is persisted separately so changing
+    # the mode to ``fresh`` never accidentally reuses it.
     session_id: str | None = None
+    continuity_session_id: str | None = None
     parent_task_id: str | None = None
     workspace_id: str | None = None
     workspace_root: str | None = None
@@ -56,6 +64,8 @@ class TaskTemplate:
     max_agent_iterations: int | None = None
     deadline: datetime | None = None
     delivery_channel: str | None = None
+    delivery: DeliverySpec | None = None
+    continuity: str = "fresh"
     acceptance_criteria: tuple[Criterion, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
     capability_policy: CapabilityPolicy | None = None
@@ -123,6 +133,11 @@ class TaskTemplate:
             # snapshot is supplied.
             capability_policy = CapabilityPolicy(deny=("*",))
         metadata = dict(self.metadata)
+        lineage = dict(metadata.get("_schedule_lineage") or {})
+        lineage["continuity"] = self.continuity
+        if self.authority_snapshot.get("principal") and "principal_id" not in lineage:
+            lineage["principal_id"] = self.authority_snapshot["principal"].get("principal_id")
+        metadata["_schedule_lineage"] = lineage
         if occurrence_key is not None:
             metadata["_occurrence"] = occurrence_key
         metadata.setdefault(
@@ -130,11 +145,21 @@ class TaskTemplate:
         )
         if self.authority_snapshot:
             metadata["_authority_snapshot"] = dict(self.authority_snapshot)
-        # A template without a persistent session minted one fresh session per
-        # occurrence (the default). TaskManager._ensure_session creates the
-        # row; the lineage in metadata ties the occurrence back to its
-        # schedule and the conversation that scheduled it.
-        session_id = self.session_id or new_id("session")
+        # Fresh/previous-result/job-memory occurrences always mint a new
+        # execution session. Only the explicit ``session`` continuity mode may
+        # use the schedule-owned stable session. The fallback to session_id is
+        # for old persisted templates and is never used for fresh mode.
+        session_id = (
+            self.continuity_session_id or self.session_id or new_id("session")
+            if self.continuity == "session"
+            else new_id("session")
+        )
+        scheduled_delivery = (
+            _delivery_from_record(self.authority_snapshot.get("delivery"))
+            if "delivery" in self.authority_snapshot
+            else self.delivery
+            or (None if not self.delivery_channel else DeliverySpec(channel=self.delivery_channel))
+        )
         return TaskSpec(
             id=new_id("task"),
             objective=self.objective,
@@ -146,9 +171,7 @@ class TaskTemplate:
             model_policy=model_policy,
             resource_budget=budget,
             deadline=self.deadline,
-            delivery=(
-                None if not self.delivery_channel else DeliverySpec(channel=self.delivery_channel)
-            ),
+            delivery=scheduled_delivery,
             metadata=metadata,
         )
 
@@ -235,6 +258,7 @@ def _template_from_job(job: dict) -> TaskTemplate:
     return TaskTemplate(
         objective=active.get("objective") or job.get("name") or "",
         session_id=active.get("session_id"),
+        continuity_session_id=active.get("continuity_session_id"),
         parent_task_id=active.get("parent_task_id"),
         workspace_id=active.get("workspace_id"),
         workspace_root=active.get("workspace_root"),
@@ -245,6 +269,8 @@ def _template_from_job(job: dict) -> TaskTemplate:
         max_agent_iterations=active.get("max_agent_iterations"),
         deadline=deadline,
         delivery_channel=active.get("delivery_channel"),
+        delivery=_delivery_from_record(active.get("delivery")),
+        continuity=str(active.get("continuity") or "fresh"),
         acceptance_criteria=_criteria_from_records(active.get("acceptance_criteria")),
         metadata=dict(active.get("metadata") or {}),
         authority_snapshot=authority,
@@ -260,6 +286,15 @@ def _path_rules(raw: Any) -> tuple:
         PathRule(path=str(item.get("path") or ""), allow=bool(item.get("allow", True)))
         for item in raw
         if isinstance(item, Mapping) and item.get("path")
+    )
+
+
+def _delivery_from_record(raw: Any) -> DeliverySpec | None:
+    if not isinstance(raw, Mapping) or not raw.get("channel"):
+        return None
+    return DeliverySpec(
+        channel=str(raw["channel"]),
+        destination=(str(raw["destination"]) if raw.get("destination") is not None else None),
     )
 
 
@@ -316,6 +351,12 @@ def _criteria_from_records(value: Any) -> tuple[Criterion, ...]:
                 description=str(item.get("description") or ""),
                 verification=verification,
                 required=bool(item.get("required", True)),
+                evidence_required=bool(item.get("evidence_required", False)),
+                evidence_requirement_id=(
+                    str(item["evidence_requirement_id"])
+                    if item.get("evidence_requirement_id") is not None
+                    else None
+                ),
             )
         )
     return tuple(criteria)
@@ -342,6 +383,13 @@ class Scheduler:
         self._loop_interval = loop_interval_seconds
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # Every claim-producing entry point shares one boundary.  The
+        # background tick loop, an operator-triggered run, and an event
+        # callback can otherwise race on the same SQLite-backed schedule and
+        # make a valid task look failed under lock contention.
+        self._claim_lock = asyncio.Lock()
+        self._deferred_events: deque[Any] = deque()
+        self._event_drain_task: asyncio.Task | None = None
         self._health: dict[str, Any] = {
             "started_at": None,
             "last_tick_at": None,
@@ -355,20 +403,21 @@ class Scheduler:
 
     async def tick(self, now: datetime | None = None) -> int:
         """Claim and enqueue due jobs for this tick. Returns number fired."""
-        now = now or utcnow()
-        fires = 0
-        while True:
-            if self._max_concurrent and fires >= self._max_concurrent:
-                break
-            claim = await claim_next(self._store, now)
-            if claim is None:
-                break
-            job = await self._store.get_job_id(claim.job_id)
-            if job is None:
-                break
-            await self._fire_claim(job, claim)
-            fires += 1
-        return fires
+        async with self._claim_boundary():
+            now = now or utcnow()
+            fires = 0
+            while True:
+                if self._max_concurrent and fires >= self._max_concurrent:
+                    break
+                claim = await claim_next(self._store, now)
+                if claim is None:
+                    break
+                job = await self._store.get_job_id(claim.job_id)
+                if job is None:
+                    break
+                await self._fire_claim(job, claim)
+                fires += 1
+            return fires
 
     async def run_now(self, job_id: str) -> str | None:
         """Run one enabled job occurrence through the normal claim path.
@@ -378,28 +427,68 @@ class Scheduler:
         second execution loop and are deliberately refused for disabled or
         missing jobs.
         """
-        job = await self._store.get_job_id(job_id)
-        if job is None or not bool(job.get("enabled")):
-            return None
-        scheduled_for = utcnow().isoformat()
-        claim = await self._store.claim_next_due(job_id, scheduled_for)
-        if claim is None:
-            return None
-        try:
-            await self._fire_claim(job, _to_claim(claim))
-        except Exception:
-            # _fire_claim releases an unmaterialized claim; preserve the
-            # exception for the operator instead of reporting a false run.
-            raise
-        run = await self._store.last_run(job_id)
-        return str(run.get("task_id")) if run and run.get("task_id") else None
+        async with self._claim_boundary():
+            job = await self._store.get_job_id(job_id)
+            if job is None or not bool(job.get("enabled")):
+                return None
+            scheduled_for = utcnow().isoformat()
+            claim = await self._store.claim_next_due(job_id, scheduled_for)
+            if claim is None:
+                return None
+            try:
+                await self._fire_claim(job, _to_claim(claim))
+            except Exception:
+                # _fire_claim releases an unmaterialized claim; preserve the
+                # exception for the operator instead of reporting a false run.
+                raise
+            run = await self._store.last_run(job_id)
+            return str(run.get("task_id")) if run and run.get("task_id") else None
 
     async def notify_event(self, event: Any) -> int:
+        # EventStore delivers durable callbacks synchronously. If a task
+        # creation event is emitted while tick/run_now already owns the claim
+        # boundary, queue the event and drain it through that same serialized
+        # boundary after the owner releases it. External event deliveries take
+        # the boundary directly, so all three claim entry points share one
+        # concurrency model.
+        if _claim_context.get():
+            self._deferred_events.append(event)
+            self._ensure_event_drain()
+            return 0
         try:
-            return await self._notify_event(event)
+            async with self._claim_boundary():
+                return await self._notify_event(event)
         except Exception as exc:
             self._record_error(exc)
             raise
+
+    @asynccontextmanager
+    async def _claim_boundary(self):
+        async with self._claim_lock:
+            token = _claim_context.set(True)
+            try:
+                yield
+            finally:
+                _claim_context.reset(token)
+
+    def _ensure_event_drain(self) -> None:
+        if self._event_drain_task is None or self._event_drain_task.done():
+            self._event_drain_task = asyncio.create_task(self._drain_deferred_events())
+
+    async def _drain_deferred_events(self) -> None:
+        try:
+            while self._deferred_events:
+                event = self._deferred_events.popleft()
+                async with self._claim_boundary():
+                    await self._notify_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_error(exc)
+            _logger.warning("deferred scheduler event failed: %s", exc)
+        finally:
+            if self._deferred_events and not self._stop.is_set():
+                self._ensure_event_drain()
 
     async def _notify_event(self, event: Any) -> int:
         """Fire matching EVENT jobs using the same durable claim path.
@@ -454,12 +543,27 @@ class Scheduler:
                 "type": getattr(event, "type", None),
                 "payload": dict(getattr(event, "payload", {}) or {}),
             }
+        if template.continuity in {"previous_result", "job_memory"}:
+            prior = await self._store.previous_completed_run(job["id"], claim.scheduled_for)
+            if prior and prior.get("task_id"):
+                result = await self._tm.get_result(str(prior["task_id"]))
+                if result is not None:
+                    metadata["_schedule_previous_result"] = {
+                        "task_id": str(result.task_id),
+                        "status": result.status.value,
+                        "summary": str(result.summary or "")[:12_000],
+                        "unresolved": list(result.unresolved)[:64],
+                    }
+                    if template.continuity == "job_memory":
+                        metadata["_schedule_job_memory"] = dict(
+                            metadata["_schedule_previous_result"]
+                        )
         template = replace(template, metadata=metadata)
         spec = template.build_task_spec(job["id"], occurrence_key=occurrence_key)
         created = None
         try:
             if self._intake is not None:
-                result = self._intake(spec, wait=False, trusted=True)
+                result = self._intake(spec, wait=False, trusted=True, enqueue=False)
                 created = await result if asyncio.iscoroutine(result) else result
             else:
                 if self._admission is not None:
@@ -471,7 +575,6 @@ class Scheduler:
                     raise RuntimeError(
                         "TaskManager.create returned no Task for scheduled occurrence"
                     )
-                await self._tm.enqueue(created.id)
             if created is None:
                 raise RuntimeError("TaskManager.create returned no Task for scheduled occurrence")
         except Exception:
@@ -482,6 +585,11 @@ class Scheduler:
                 await self._store.release_claim(claim.claim_id, job["id"], claim.scheduled_for)
             raise
         task_id = created.id
+        # Enqueue only after the durable task row exists, but before marking
+        # the occurrence FIRED.  If enqueue fails, the claim remains CLAIMED
+        # and startup reconciliation can retry the existing task without
+        # creating a duplicate occurrence.
+        await self._tm.enqueue(task_id)
         trigger = _trigger_from_job(job)
         disable = bool(
             trigger is not None
@@ -575,6 +683,15 @@ class Scheduler:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
             self._task = None
+        drain = self._event_drain_task
+        if drain is not None and not drain.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(drain), timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                drain.cancel()
+            except Exception as exc:
+                self._record_error(exc)
+        self._event_drain_task = None
         self._health["health"] = "stopped"
 
     def is_running(self) -> bool:

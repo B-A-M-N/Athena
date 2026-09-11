@@ -5,6 +5,7 @@ from athena.artifacts.refs import (
     maybe_artifactize,
 )
 from athena.artifacts.store import ArtifactStore, uri_digest
+from athena.artifacts.extractors import ArtifactDescription, ArtifactExtractionService
 
 __all__ = [
     "cleanup",
@@ -13,4 +14,6 @@ __all__ = [
     "artifactize_output",
     "maybe_artifactize",
     "build_uri",
+    "ArtifactDescription",
+    "ArtifactExtractionService",
 ]

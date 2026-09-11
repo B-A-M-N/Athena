@@ -188,9 +188,11 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
     },
     "packs": {
         "search": frozenset({EffectClass.READ_LOCAL}),
+        "fetch": frozenset({EffectClass.NETWORK_READ, EffectClass.WRITE_LOCAL}),
         "inspect": frozenset({EffectClass.READ_LOCAL}),
         "health": frozenset({EffectClass.READ_LOCAL}),
         "install": frozenset({EffectClass.WRITE_LOCAL}),
+        "install_remote": frozenset({EffectClass.NETWORK_READ, EffectClass.WRITE_LOCAL}),
         "upgrade": frozenset({EffectClass.WRITE_LOCAL}),
         "enable": frozenset({EffectClass.WRITE_LOCAL}),
         "disable": frozenset({EffectClass.WRITE_LOCAL}),
@@ -200,6 +202,7 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "spawn": frozenset({EffectClass.SPAWN_PROCESS}),
         "status": frozenset({EffectClass.READ_LOCAL}),
         "collect": frozenset({EffectClass.READ_LOCAL}),
+        "steer": frozenset({EffectClass.WRITE_LOCAL}),
         "cancel": frozenset({EffectClass.SPAWN_PROCESS}),
     },
     "delegate.external": {
@@ -216,6 +219,8 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "enable": frozenset({EffectClass.WRITE_LOCAL}),
         "disable": frozenset({EffectClass.WRITE_LOCAL}),
         "delete": frozenset({EffectClass.WRITE_LOCAL}),
+        "update": frozenset({EffectClass.WRITE_LOCAL}),
+        "run": frozenset({EffectClass.WRITE_LOCAL}),
     },
     "maintain": {
         "create": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
@@ -298,6 +303,7 @@ OPERATION_EFFECTS: dict[str, dict[str, frozenset[EffectClass]]] = {
         "verify": frozenset({EffectClass.READ_LOCAL}),
         "plan": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
         "assess": frozenset({EffectClass.READ_LOCAL, EffectClass.WRITE_LOCAL}),
+        "critique": frozenset({EffectClass.READ_LOCAL}),
         "bundle": frozenset({EffectClass.READ_LOCAL}),
         # The bounded workflow may capture allowlisted sources, persist
         # evidence/gaps, and verify a task-scoped packet in one dispatch.
@@ -444,6 +450,6 @@ def resolve_operation_effects(
         return ()
     try:
         effects = descriptor.resolve_effects(arguments)
-    except ValueError as exc:
+    except Exception as exc:  # noqa: BLE001 - effect resolution is a fail-closed boundary
         raise CapabilityEffectError(f"capability {descriptor.id}: {exc}") from None
     return tuple(sorted(effects or (), key=lambda e: e.value))
