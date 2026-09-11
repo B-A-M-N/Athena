@@ -69,6 +69,20 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           make check
+      - name: Report failed scenario evidence
+        if: ${{ failure() }}
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = Path("scenarios-manifest.json")
+          if manifest.is_file():
+              for scenario in json.loads(manifest.read_text())["scenarios"]:
+                  if scenario["status"] == "failed":
+                      print(f"--- {scenario['scenario']} ---")
+                      print(json.dumps(scenario.get("evidence", []), indent=2))
+          PY
 
   # This lane is intentionally protected: it needs a real X11/WM environment
   # for the desktop acceptance suite. Hermes is an optional integration and
